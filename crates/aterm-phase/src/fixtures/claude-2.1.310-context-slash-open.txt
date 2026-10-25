@@ -1,0 +1,40 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.133.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the / menu open from an empty composer with the context indicator up (long stub replies (CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=20)): it stands in the mode row's place
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn.
+
+✻ Cooked for 0s · done 11:33 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ❯ /add-dir                    Add a new working directory
+    /autocompact                Set how full the context gets before auto-summarizing
+    /background                 Send this session to the background and free the terminal
+    /branch                     Create a branch of the current conversation at this point
+    /btw                        Ask a quick side question without interrupting the main conversation
+    /bug                        Report a bug or share your conversation
+    /cd                         Move this session to a new working directory
+    /clear                      Start a new session with empty context; previous session stays on disk (resumable with
+                                /resume)
+    /color                      Set the prompt bar color for this session
+    /compact                    Free up context by summarizing the conversation so far
+    /config                     Open settings
+    /context                    Visualize current context usage as a colored grid
+    /copy                       Copy Claude's last response to clipboard (or /copy N for the Nth-latest)
+    /design-login               Authorize design-system access for /design-sync with your claude.ai account
+    /diff                       Toggle the diff panel showing uncommitted changes
+    /effort                     Set effort level for model usage
+    /exit                       Exit the CLI
+    /export                     Export the current conversation to a file or clipboard
+    /fast                       Toggle fast mode (Opus 5.5)

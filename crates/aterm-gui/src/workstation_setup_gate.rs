@@ -6,7 +6,7 @@
 //! window's own Apply admitted, and the token it alone mints ([`AdmittedAccess`]).
 //!
 //! The compiler holds the token to its door. `AdmittedAccess` is a braced struct whose fields are
-//! private to this module, one of them of a private type ([`AdmissionSeal`]) that is neither
+//! private to this module, one of them of a private type (`AdmissionSeal`) that is neither
 //! `Clone`, `Copy` nor `Default`, and the gate's fields are private too. A private field is
 //! visible only in its module and that module's children, and this module has none, so nothing
 //! outside this file (`workstation_setup` included) can build or copy an admission in safe Rust,

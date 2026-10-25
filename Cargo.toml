@@ -19,7 +19,7 @@ default-members = [
     "crates/aterm-converge",
     "crates/aterm-core", "crates/aterm-ctl",
     "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskwalk", "crates/aterm-dl",
-    "crates/aterm-durable",
+    "crates/aterm-durable", "crates/aterm-db", "crates/aterm-db-core",
     "crates/aterm-document-features",
     "crates/aterm-effects", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
@@ -30,7 +30,7 @@ default-members = [
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-log-shim", "crates/aterm-lz4",
     "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
-    "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
+    "crates/aterm-models-db", "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
     "crates/aterm-models-session", "crates/aterm-models-update",
     "crates/aterm-observe", "crates/aterm-once-cell", "crates/aterm-parser",
@@ -80,7 +80,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.134.0"
+version = "0.135.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -145,6 +145,8 @@ aterm-diskwalk = { path = "crates/aterm-diskwalk" }
 # File durability (F_FULLFSYNC on Apple) or ordering (F_BARRIERFSYNC via
 # astream-sys), with a counting seam for tests.
 aterm-durable = { path = "crates/aterm-durable" }
+aterm-db = { path = "crates/aterm-db" }
+aterm-db-core = { path = "crates/aterm-db-core" }
 aterm-effects = { path = "crates/aterm-effects" }
 # First-party sfnt table reader, GSUB shaper, and optional `hint` autohinter.
 # Default features off so only grid-fitting consumers (aterm-render on Linux and
@@ -185,6 +187,7 @@ aterm-models-agh = { path = "crates/aterm-models-agh" }
 aterm-models-aos = { path = "crates/aterm-models-aos" }
 aterm-models-atpkg = { path = "crates/aterm-models-atpkg" }
 aterm-models-core = { path = "crates/aterm-models-core" }
+aterm-models-db = { path = "crates/aterm-models-db" }
 aterm-models-effects = { path = "crates/aterm-models-effects" }
 aterm-models-gui = { path = "crates/aterm-models-gui" }
 aterm-models-harness = { path = "crates/aterm-models-harness" }

@@ -199,23 +199,6 @@ impl Arch {
     }
 }
 
-/// `text` with XML's five special characters escaped.
-#[must_use]
-pub fn xml_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// Registry values Windows Setup reads (`HKLM\SYSTEM\Setup\LabConfig`) to skip hardware checks.
 pub const LAB_CONFIG: [&str; 4] = [
     "BypassTPMCheck",
@@ -244,7 +227,7 @@ fn component(name: &str, body: &str) -> String {
 /// `autounattend.xml`: Windows 11 Pro installed on the whole first disk (efi, msr, NTFS).
 #[must_use]
 pub fn autounattend(password: &str) -> String {
-    let pw = xml_escape(password);
+    let pw = aterm_codec::xml::escape(password);
     let mut lab = String::new();
     for (i, key) in LAB_CONFIG.iter().enumerate() {
         let _ = writeln!(
@@ -346,7 +329,7 @@ pub fn autounattend(password: &str) -> String {
           <Description>aterm lane first logon</Description>\n\
         </SynchronousCommand>\n\
       </FirstLogonCommands>\n",
-            xml_escape(&first_logon_command())
+            aterm_codec::xml::escape(&first_logon_command())
         ),
     ));
     format!(
@@ -1143,7 +1126,7 @@ mod tests {
         let c = first_logon_command();
         assert!(c.contains("%d:\\aterm-lane.ps1"));
         assert!(c.contains("in (D E F"));
-        assert!(autounattend("x").contains(&xml_escape(&c)));
+        assert!(autounattend("x").contains(&aterm_codec::xml::escape(&c)));
         let script = first_logon_script();
         assert!(!script.contains("\r\r"));
         assert!(script.contains("OpenSSH.Server~~~~0.0.1.0"));

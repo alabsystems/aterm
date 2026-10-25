@@ -254,6 +254,9 @@ pub struct Starter {
     pub env: Vec<(String, String)>,
     /// Carried starter argv flags ([`WorkerCli::flags`]), or `Err` on an unrecognized flag.
     pub args: Result<Vec<String>, String>,
+    /// Variables the worker's line removes from its environment: a pooled login's
+    /// ([`super::relaunch::pool_args`]), none of a starter's own.
+    pub unset: Vec<&'static str>,
 }
 
 impl WorkerCli {
@@ -271,6 +274,7 @@ impl WorkerCli {
             exe: PathBuf::from(self.word),
             env: Vec::new(),
             args: Ok(Vec::new()),
+            unset: Vec::new(),
         }
     }
 
@@ -313,6 +317,7 @@ pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
             exe: c.exe,
             env,
             args: Ok(Vec::new()),
+            unset: Vec::new(),
         });
     }
     let args = atpkg::caller_shell::process_args(pid)?;
@@ -355,6 +360,7 @@ pub(crate) fn starter_of(
         exe,
         env: (cli.homes)(args, home),
         args: (cli.flags)(&args.argv),
+        unset: Vec::new(),
     })
 }
 
@@ -409,7 +415,8 @@ pub(crate) fn session_id_of(mut b: [u8; 16]) -> String {
 ///
 /// # Errors
 /// The line exceeds its budget, a carried directory is relative, the starter's argv holds a flag
-/// no table knows, `model` starts with `-`, or the trusted-folders file is not an absolute path.
+/// no table knows, `model` starts with `-`, the trusted-folders file is not an absolute path, or
+/// a variable [`Starter::unset`] removes is one its environment sets.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -427,7 +434,15 @@ pub fn line(
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
-    line_of(cli, dialect, &starter.exe, args, &env, fresh)
+    line_of(
+        cli,
+        dialect,
+        &starter.exe,
+        args,
+        &env,
+        &starter.unset,
+        fresh,
+    )
 }
 
 /// Whether `name` is an XDG base directory's variable, which the XDG rule
@@ -443,6 +458,7 @@ pub(super) fn line_of(
     exe: &Path,
     args: &[String],
     env: &[(&str, &str)],
+    unset: &[&str],
     fresh: &Fresh<'_>,
 ) -> Result<String, String> {
     // A rootless value would resolve under the worker's own folder, not the starter's; a root
@@ -502,8 +518,8 @@ pub(super) fn line_of(
         .copied()
         .chain(cli.nicety.iter().copied())
         .collect();
-    upgrade::task_line_env(dialect, &both, exe, &flags, cli.operand)
-        .or_else(|_| upgrade::task_line_env(dialect, &env, exe, &flags, cli.operand))
+    upgrade::task_line_env_clear(dialect, &both, unset, exe, &flags, cli.operand)
+        .or_else(|_| upgrade::task_line_env_clear(dialect, &env, unset, exe, &flags, cli.operand))
 }
 
 #[cfg(test)]

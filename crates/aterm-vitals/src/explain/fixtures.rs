@@ -42,6 +42,10 @@ pub struct Coal {
     pub exited: u64,
     /// Excess of QoS bucket sum over CPU time in the window (millicores).
     pub qos_over_mc: u64,
+    /// Its tasks made and reaped inside each window, which no sweep saw
+    /// (a build's compilers): its task counters move by them, as each
+    /// process of it born or gone inside the window moves them.
+    pub reaped: u64,
     /// Its footprint, bytes (64 MiB unless set).
     pub footprint: Option<u64>,
 }
@@ -100,6 +104,11 @@ pub struct Proc {
     pub footprint: u64,
     /// When it is swept.
     pub span: Span,
+    /// How far its coalition's counter ran ahead of its own CPU time as
+    /// the sweep read it, ns, at the first split tick and at later ones:
+    /// the skew between a coalition's counter and its members' times
+    /// (RD §7.3).
+    pub ahead_ns: (u64, u64),
 }
 
 impl Proc {
@@ -125,6 +134,17 @@ impl Proc {
             fast_mc: mc,
             footprint: 16 << 20,
             span: Span::Whole,
+            ahead_ns: (0, 0),
+        }
+    }
+
+    /// The same, its coalition's counter `first_ns` ahead of its own time
+    /// at the first split tick and `later_ns` at later ones.
+    #[must_use]
+    pub fn skewed(self, first_ns: u64, later_ns: u64) -> Self {
+        Self {
+            ahead_ns: (first_ns, later_ns),
+            ..self
         }
     }
 
@@ -294,6 +314,29 @@ impl Scene {
                 .iter()
                 .filter(|c| there(c.span))
                 .map(|c| {
+                    let members = || self.procs.iter().filter(|p| p.coalition == c.id);
+                    let ahead: u64 = members()
+                        .filter(|p| there(p.span))
+                        .map(|p| {
+                            if at_ms == 0 {
+                                p.ahead_ns.0
+                            } else {
+                                p.ahead_ns.1
+                            }
+                        })
+                        .sum();
+                    let count = |n: usize| u64::try_from(n).unwrap_or(0);
+                    let made = count(
+                        members()
+                            .filter(|p| p.span == Span::Born && there(p.span))
+                            .count(),
+                    );
+                    let gone = count(
+                        members()
+                            .filter(|p| p.span == Span::Gone && !there(p.span))
+                            .count(),
+                    );
+                    let reaped = c.reaped * (at_ms / w);
                     let base = if c.span == Span::Born { 0 } else { CPU0_NS };
                     let read = if c.span == Span::Born { 0 } else { 1 << 30 };
                     let mut eqos_ns = [0; super::QOS_CLASSES];
@@ -302,9 +345,9 @@ impl Scene {
                     eqos_ns[4] = base / 2 + (c.mc - c.deferred_mc + c.qos_over_mc) * at_ms * 1000;
                     CoalUsage {
                         id: c.id,
-                        tasks_started: c.started,
-                        tasks_exited: c.exited,
-                        cpu_ns: base + c.mc * at_ms * 1000,
+                        tasks_started: c.started + made + reaped,
+                        tasks_exited: c.exited + gone + reaped,
+                        cpu_ns: base + c.mc * at_ms * 1000 + ahead,
                         bytes_read: read + c.read_bps * at_ms / 1000,
                         eqos_ns,
                         footprint: Some(c.footprint.unwrap_or(64 << 20)),
@@ -716,6 +759,7 @@ pub fn finished_1032() -> Scene {
     for c in &mut scene.coalitions {
         if c.id == 1342 {
             c.mc += 3000;
+            c.reaped = 40;
         }
     }
     scene
@@ -749,7 +793,10 @@ pub fn calm_1510() -> Scene {
         self_uid: 501,
         tabs: vec![tab(1, 1200)],
         coalitions: vec![
-            Coal::new(1342, 200),
+            Coal {
+                started: 3,
+                ..Coal::new(1342, 200)
+            },
             Coal::new(896, 10),
             Coal::new(393, 90),
             Coal {
@@ -797,6 +844,45 @@ pub fn reaped_1510() -> Scene {
     let mut scene = calm_1510();
     scene.busy_mc += 1500;
     scene.coalitions.push(Coal::new(2000, 1500).gone());
+    scene
+}
+
+/// The calm Mac with tab 1 idle and aterm (200 mc, its coalition's all)
+/// as the headless run read it on 2026-10-23 (RD §7.3): at the first split
+/// tick aterm's coalition's counter stood 3.26 ms further behind its
+/// members' times than at the second, so over the 5 s window it moved
+/// 3.26 ms (1 mc) past them, while its task counters show no member made
+/// or reaped and hold the three swept.
+#[must_use]
+pub fn idle_skewed_1510() -> Scene {
+    let mut scene = calm_1510();
+    for p in &mut scene.procs {
+        match p.pid {
+            1187 => {
+                *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "aterm", 200)
+                    .skewed(0, 3_260_000);
+            }
+            1210 => *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "claude", 0),
+            _ => {}
+        }
+    }
+    scene
+}
+
+/// [`idle_skewed_1510`] with a `git` in tab 1 that ran 3 mc and exited
+/// inside the window: its coalition's task counters show a member reaped,
+/// so the work no live process holds may be the tab's.
+#[must_use]
+pub fn exited_skewed_1510() -> Scene {
+    let mut scene = idle_skewed_1510();
+    scene.busy_mc += 3;
+    for c in scene.coalitions.iter_mut().filter(|c| c.id == 1342) {
+        c.mc += 3;
+        c.started += 1;
+    }
+    scene
+        .procs
+        .push(Proc::new(1220, 1200, 501, 1342, USERSPACE_MS + 300_000, "git", 3).gone());
     scene
 }
 

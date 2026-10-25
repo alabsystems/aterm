@@ -1712,7 +1712,7 @@ fn lock_seq_file(path: &str) -> io::Result<std::fs::File> {
             &lock_path,
         )
     };
-    let f = match open(false) {
+    let f: std::fs::File = match open(false) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => match open(true) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open(false),
             other => other,

@@ -166,6 +166,7 @@ pub fn supervisor_turn_end_model() -> Model {
             var typed_futile = 0;
             var run = 0;
             var typed_run = 0;
+            var quiet = 0;
 
             action BoxAppears when (box_up == 0 && pending == 0 && other == 0) {
                 box_up = 1;
@@ -181,7 +182,8 @@ pub fn supervisor_turn_end_model() -> Model {
                 same = 0;
                 tries = 0;
                 retried = 0;
-                run = 0;
+                run = if same == 0 { 0 } else if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if same == 0 { 0 } else if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action WallDue when (wall == 1) {
                 wall = 2;
@@ -218,6 +220,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 held = 0;
                 same = 0;
                 run = 0;
+                quiet = 0;
             }
             action OtherTurnRuns when (
                 pending == 0 && box_up == 0 && wall == 0 && draft == 0 && other == 0
@@ -234,6 +237,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 tasked = if Buggy == 1 { 1 } else { tasked };
                 same = 1;
                 run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action HarnessTurnLong when (
                 harness <= 1 && pending == 0 && box_up == 0 && wall == 0 && draft == 0 &&
@@ -248,6 +252,40 @@ pub fn supervisor_turn_end_model() -> Model {
                 claim = 0;
                 same = 0;
                 run = 0;
+                quiet = 0;
+            }
+            action ProgramTurn when (
+                same > 0 && pending == 0 && box_up == 0 && wall == 0 && draft == 0 &&
+                other == 0 && person == 0
+            ) {
+                short = if short <= Streak - 1 { short + 1 } else { short };
+                backoff = 1;
+                earned = 1;
+                long = 0;
+                claim = 0;
+                same = if Buggy == 8 { 0 } else { 1 };
+                run = if Buggy == 8 { 0 } else if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
+            }
+            action ProgramTurnUnseen when (
+                same > 0 && claim == 0 && pending == 0 && box_up == 0 && wall == 0 &&
+                draft == 0 && other == 0 && person == 0
+            ) {
+                same = 1;
+                run = if Buggy == 8 { 0 } else if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
+            }
+            action ProgramTurnSame when (
+                same > 0 && claim == 0 && pending == 0 && box_up == 0 && wall == 0 &&
+                draft == 0 && other == 0 && person == 0
+            ) {
+                short = if short <= Streak - 1 { short + 1 } else { short };
+                backoff = 1;
+                earned = 1;
+                long = 0;
+                same = if Buggy == 8 { 1 } else { 2 };
+                run = if Buggy == 8 { 0 } else if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action Continue when (
                 pending == 0 && wall == 0 && other == 0 && rested == 0 && held == 0 &&
@@ -261,7 +299,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 typed_over = if draft == 1 { 1 } else { typed_over };
                 typed_early = if backoff == 1 { 1 } else { typed_early };
                 typed_same = if same == 2 { 1 } else { typed_same };
-                typed_run = if run > NoWork - 1 { 1 } else { typed_run };
+                typed_run = if quiet > NoWork - 1 { 1 } else { typed_run };
                 used = if Budget == 0 { used } else { used + 1 };
                 pending = 1;
             }
@@ -274,6 +312,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 claim = 0;
                 same = 1;
                 run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action WorkedShortSame when (pending == 1 && same > 0 && claim == 0) {
                 pending = 0;
@@ -284,6 +323,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 claim = 0;
                 same = 2;
                 run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action WorkedHitsTheWall when (pending == 1) {
                 pending = 0;
@@ -295,6 +335,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 tries = if Buggy == 6 { 1 } else { 0 };
                 retried = 0;
                 run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action WorkedLong when (pending == 1) {
                 pending = 0;
@@ -305,6 +346,28 @@ pub fn supervisor_turn_end_model() -> Model {
                 claim = 0;
                 same = 0;
                 run = 0;
+                quiet = 0;
+            }
+            action WorkedLongQuiet when (pending == 1) {
+                pending = 0;
+                short = 0;
+                backoff = 0;
+                earned = 0;
+                long = 1;
+                claim = 0;
+                same = 1;
+                run = 0;
+                quiet = 0;
+            }
+            action WorkedLongQuietSame when (pending == 1 && same > 0 && claim == 0) {
+                pending = 0;
+                short = if short <= Streak - 1 { short + 1 } else { short };
+                backoff = 1;
+                earned = 1;
+                long = 0;
+                same = 2;
+                run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action WorkedClaimsDone when (pending == 1) {
                 pending = 0;
@@ -316,6 +379,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 rested = if Buggy == 1 { 1 } else { rested };
                 same = 0;
                 run = 0;
+                quiet = 0;
             }
             action WorkedNeeds when (pending == 1) {
                 pending = 0;
@@ -328,6 +392,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 held = if Buggy == 1 { 1 } else { held };
                 same = 0;
                 run = 0;
+                quiet = 0;
             }
             action ReplyUnseen when (pending == 1) {
                 pending = 3;
@@ -356,7 +421,7 @@ pub fn supervisor_turn_end_model() -> Model {
                 typed_blocked = if box_up == 1 || person == 1 { 1 } else { typed_blocked };
                 typed_over = if draft == 1 { 1 } else { typed_over };
                 typed_futile = if tries == Futile { 1 } else { typed_futile };
-                typed_run = if run > NoWork + Futile - 1 { 1 } else { typed_run };
+                typed_run = if quiet > NoWork + Futile - 1 { 1 } else { typed_run };
                 used = if Budget == 0 { used } else { used + 1 };
                 retried = if retried <= Futile { retried + 1 } else { retried };
                 pending = 2;
@@ -384,12 +449,14 @@ pub fn supervisor_turn_end_model() -> Model {
                 tries = 0;
                 retried = 0;
                 run = 0;
+                quiet = 0;
             }
             action RetryHitsTheWall when (pending == 2) {
                 pending = 0;
                 wall = 1;
                 tries = if tries <= Futile - 1 { tries + 1 } else { tries };
                 run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action Escalate when (
                 pending == 0 && box_up == 0 && person == 0 && tasked == 1 &&

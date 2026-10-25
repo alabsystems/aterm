@@ -166,6 +166,12 @@ impl SessionSetup {
         &self.holder
     }
 
+    /// The turn-end policy's timings the session starts from (a tape's, as its header says).
+    #[must_use]
+    pub const fn turn_end_timing(&self) -> &TurnEndTiming {
+        &self.turn_end_timing
+    }
+
     /// The approval ledger, if one was given.
     #[must_use]
     pub fn ledger_path(&self) -> Option<&Path> {

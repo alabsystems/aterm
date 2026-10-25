@@ -3368,10 +3368,7 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                 }
                 None => {
                     lines.retain(|l| !l.starts_with("plan limit"));
-                    lines.push(
-                        "No current plan reading: Claude Code writes one when you open /usage"
-                            .into(),
-                    );
+                    lines.push("No current plan reading on this machine".into());
                 }
             }
             lines.push("Codex, Gemini and agy tabs are not counted".into());
@@ -3840,6 +3837,7 @@ impl crate::App {
                 platform: Platform::host(),
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
             },
+            needs: Vec::new(),
         }
     }
 

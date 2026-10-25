@@ -35,54 +35,70 @@ impl GlowStyle {
     /// Whether this style string asks for the full-body pet companion ([`crate::kitty_pet`]) rather than the flying kitty.
     #[inline]
     #[must_use]
-    pub fn style_names_kitty_pet(s: &str) -> bool {
+    pub const fn style_names_kitty_pet(s: &str) -> bool {
+        let Some(c) = spellings::canonical(s) else {
+            return false;
+        };
         matches!(
-            spellings::canonical(s),
-            Some("rainbow kitty pet" | "rainbow kitty underline" | "rainbow kitty flat")
+            c.as_bytes(),
+            b"rainbow kitty pet" | b"rainbow kitty underline" | b"rainbow kitty flat"
         )
     }
 
     /// Whether this style string explicitly requests the flying kitty head.
     #[must_use]
     #[cfg(test)]
-    pub fn style_names_flying_kitty(s: &str) -> bool {
-        spellings::canonical(s) == Some("rainbow kitty flying")
+    pub const fn style_names_flying_kitty(s: &str) -> bool {
+        let Some(c) = spellings::canonical(s) else {
+            return false;
+        };
+        matches!(c.as_bytes(), b"rainbow kitty flying")
     }
 
     /// Whether this style string asks for the pet drawn as a dog ([`crate::kitty_pet::PetSpecies::Dog`]).
     #[inline]
     #[must_use]
-    pub fn style_names_dog_pet(s: &str) -> bool {
-        spellings::canonical(s) == Some("rainbow dog pet")
+    pub const fn style_names_dog_pet(s: &str) -> bool {
+        let Some(c) = spellings::canonical(s) else {
+            return false;
+        };
+        matches!(c.as_bytes(), b"rainbow dog pet")
     }
 
     /// Whether this style string selects a full-body pet in any species.
     #[inline]
     #[must_use]
-    pub fn style_names_any_pet(s: &str) -> bool {
+    pub const fn style_names_any_pet(s: &str) -> bool {
+        let Some(c) = spellings::canonical(s) else {
+            return false;
+        };
         matches!(
-            spellings::canonical(s),
-            Some(
-                "rainbow kitty pet"
-                    | "rainbow kitty underline"
-                    | "rainbow kitty flat"
-                    | "rainbow dog pet"
-            )
+            c.as_bytes(),
+            b"rainbow kitty pet"
+                | b"rainbow kitty underline"
+                | b"rainbow kitty flat"
+                | b"rainbow dog pet"
         )
     }
 
     /// Whether this style string selects the highlighter-plus-under-baseline ribbon: `rainbow kitty underline` and its aliases.
     #[inline]
     #[must_use]
-    pub fn style_names_underline_ribbon(s: &str) -> bool {
-        spellings::canonical(s) == Some("rainbow kitty underline")
+    pub const fn style_names_underline_ribbon(s: &str) -> bool {
+        let Some(c) = spellings::canonical(s) else {
+            return false;
+        };
+        matches!(c.as_bytes(), b"rainbow kitty underline")
     }
 
     /// Whether this style string selects the flat rainbow ribbon body.
     #[inline]
     #[must_use]
-    pub fn style_names_flat_ribbon(s: &str) -> bool {
-        spellings::canonical(s) == Some("rainbow kitty flat")
+    pub const fn style_names_flat_ribbon(s: &str) -> bool {
+        let Some(c) = spellings::canonical(s) else {
+            return false;
+        };
+        matches!(c.as_bytes(), b"rainbow kitty flat")
     }
 
     /// Diagnostic name of the resolved style.
@@ -106,20 +122,22 @@ impl GlowStyle {
     /// Whether a `classic` spelling selects the two-tone monochrome face.
     #[inline]
     #[must_use]
-    pub fn style_names_classic_mono(style_raw: &str) -> bool {
-        let s = style_raw.trim();
-        ["classic mono", "classic lumen", "mono classic"]
-            .iter()
-            .any(|o| s.eq_ignore_ascii_case(o))
+    pub const fn style_names_classic_mono(style_raw: &str) -> bool {
+        let s = spellings::trim_whitespace_bytes(style_raw);
+        spellings::eq_ascii_ci(s, "classic mono")
+            || spellings::eq_ascii_ci(s, "classic lumen")
+            || spellings::eq_ascii_ci(s, "mono classic")
     }
 
     /// Parse a config string (trimmed, case-insensitive) through [`spellings::canonical`].
     #[inline]
-    pub fn parse(s: &str) -> Self {
-        let s = s.trim();
-        spellings::row(s)
-            .and_then(|row| row.style)
-            .unwrap_or(Self::Lumen)
+    pub const fn parse(s: &str) -> Self {
+        match spellings::row(s) {
+            Some(spellings::TrailStyleRow {
+                style: Some(style), ..
+            }) => *style,
+            _ => Self::Lumen,
+        }
     }
 
     /// Whether this style spawns particles (sparks / embers / droplets / laser-ablation sparks / beam stardust / comet debris glitter).
@@ -194,7 +212,7 @@ pub enum TrailKnob {
 }
 
 /// Context flags that determine whether a [`TrailKnob`] affects a frame.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KnobContext {
     /// The ground is dark.
     pub dark: bool,
@@ -208,7 +226,23 @@ pub struct KnobContext {
     pub over_text: bool,
 }
 
+impl Default for KnobContext {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl KnobContext {
+    /// Zeroed knob context.
+    pub const EMPTY: Self = Self {
+        dark: false,
+        bar: false,
+        ring: false,
+        classic_tinted: false,
+        over_text: false,
+    };
+
     /// Context where knobs apply most broadly for `bar`.
     #[inline]
     #[must_use]
@@ -270,8 +304,8 @@ impl GlowStyle {
 /// Whether a raw `cursor_trail_style` string draws its own additive comet beam.
 #[inline]
 #[must_use]
-pub fn style_has_beam(style_raw: &str) -> bool {
-    style_has_beam_of(GlowStyle::parse(style_raw.trim()), style_raw)
+pub const fn style_has_beam(style_raw: &str) -> bool {
+    style_has_beam_of(GlowStyle::parse(style_raw), style_raw)
 }
 
 /// [`style_has_beam`] for an already-parsed [`GlowStyle`].

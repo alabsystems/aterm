@@ -420,6 +420,7 @@ fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
             exe: exe.clone(),
             env: vec![("HOME".to_string(), "/homes/a".to_string())],
             args: Ok(vec!["--provider".to_string(), "p".to_string()]),
+            unset: Vec::new(),
         };
         assert_eq!(
             line_starter(cli, Some(starter())),
@@ -438,6 +439,7 @@ fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
                 exe: PathBuf::from(cli.word),
                 env: Vec::new(),
                 args: Ok(Vec::new()),
+                unset: Vec::new(),
             },
             "a starter that runs no {}: its plain word",
             cli.agent.product()
@@ -685,4 +687,102 @@ fn a_quit_removes_its_workers_task_files_and_no_other() {
     assert!(untasked.exists(), "a session with no task record keeps it");
     assert!(untasked_result.exists());
     assert!(elsewhere.exists(), "a file no session here names stays");
+}
+
+/// A pooled worker's starter on a row of its own exports the row's login and removes the
+/// credential variables its CLI carries in place of it: a Codex worker's exact line removes
+/// Codex's own two and leaves `OPENAI_API_KEY`; a Grok Build row also names its own leader socket
+/// in the grok home its starter carries, else `~/.grok`, and drops the starter's.
+#[test]
+fn a_pooled_worker_runs_on_its_rows_login_alone() {
+    use aterm_agent::harness::accounts::Cli;
+    use aterm_agent::harness::accounts_pool::LoginEnv;
+    use aterm_agent::harness::worker::{Fresh, Starter, line, worker_cli};
+    let words = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let home = Path::new("/Users//u");
+    let codex = Starter {
+        exe: PathBuf::from("/opt/twin/codex"),
+        env: Vec::new(),
+        args: Ok(words(&["-c", "x=1"])),
+        unset: Vec::new(),
+    };
+    let pick = LoginEnv {
+        label: "work".to_string(),
+        var: "CODEX_HOME",
+        value: Some("/c/work".to_string()),
+    };
+    let onto = pool_onto(codex, Cli::Codex, &pick, home).expect("codex row");
+    let cli = worker_cli(Program::Codex).expect("codex worker row");
+    assert_eq!(
+        line(cli, Dialect::Zsh, &onto, &Fresh::default()).expect("codex line"),
+        concat!(
+            " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_HOME=/c/work'",
+            " '/opt/twin/codex' '-c' 'x=1' -- \"$(command cat -- \"$ATERM_TASK_FILE\")\""
+        )
+    );
+
+    let grok = |env: &[(&str, &str)]| Starter {
+        exe: PathBuf::from("/opt/grok/bin/grok"),
+        env: env
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+            .collect(),
+        args: Ok(words(&[
+            "--leader-socket",
+            "/Users//u/.grok/leader-old.sock",
+            "-m",
+            "grok-4",
+        ])),
+        unset: Vec::new(),
+    };
+    let work = LoginEnv {
+        label: "work".to_string(),
+        var: "GROK_AUTH_PATH",
+        value: Some("/g/work/auth.json".to_string()),
+    };
+    let onto = pool_onto(grok(&[]), Cli::Grok, &work, home).expect("grok row");
+    assert_eq!(
+        onto.args,
+        Ok(words(&[
+            "-m",
+            "grok-4",
+            "--leader-socket",
+            "/Users//u/.grok/leader-work-9ca20914.sock"
+        ]))
+    );
+    assert_eq!(onto.unset, ["GROK_AUTH", "GROK_LEADER_SOCKET"]);
+    assert_eq!(
+        onto.env,
+        [(
+            "GROK_AUTH_PATH".to_string(),
+            "/g/work/auth.json".to_string()
+        )]
+    );
+    let carried = pool_onto(grok(&[("GROK_HOME", "/g/home")]), Cli::Grok, &work, home)
+        .expect("grok row in its starter's home");
+    assert_eq!(
+        carried.args,
+        Ok(words(&[
+            "-m",
+            "grok-4",
+            "--leader-socket",
+            "/g/home/leader-work-9ca20914.sock"
+        ]))
+    );
+
+    // Negative: the default row adds no socket or login (it still drops the starter's socket and
+    // removes `GROK_AUTH`), and a grok home that cannot be read names no row's socket.
+    let main = LoginEnv {
+        label: "main".to_string(),
+        value: None,
+        ..work.clone()
+    };
+    let onto = pool_onto(grok(&[]), Cli::Grok, &main, home).expect("default row");
+    assert_eq!(onto.args, Ok(words(&["-m", "grok-4"])));
+    assert_eq!(onto.unset, ["GROK_AUTH"]);
+    assert!(onto.env.is_empty(), "{:?}", onto.env);
+    assert!(
+        pool_onto(grok(&[("GROK_HOME", "rel")]), Cli::Grok, &work, home).is_err(),
+        "a relative GROK_HOME"
+    );
 }

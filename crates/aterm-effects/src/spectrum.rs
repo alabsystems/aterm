@@ -239,9 +239,10 @@ pub(crate) fn spectrum_table_at_cap(cap: f64) -> SpectrumTable {
                 let d = spectrum_path_hue(cur) - spectrum_path_hue(prev);
                 (d - 360.0 * (d / 180.0).trunc()).abs()
             };
-            acc[2] += (0..3)
-                .map(|k| (prev[k] - cur[k]).abs())
-                .fold(0.0f64, f64::max);
+            acc[2] += (prev[0] - cur[0])
+                .abs()
+                .max((prev[1] - cur[1]).abs())
+                .max((prev[2] - cur[2]).abs());
             cum.push((x, acc));
             prev = cur;
         }
@@ -356,7 +357,7 @@ pub(crate) fn spectrum_crossing_position() -> f32 {
 /// Width of the green→blue leg in `t`.
 #[cfg(test)]
 #[must_use]
-pub(crate) fn spectrum_crossing_span() -> f32 {
+pub(crate) const fn spectrum_crossing_span() -> f32 {
     (SPECTRUM_ANCHOR_AT[SPECTRUM_CROSSING_SEG + 1] - SPECTRUM_ANCHOR_AT[SPECTRUM_CROSSING_SEG])
         as f32
         / (SPECTRUM_LUT_LEN - 1) as f32
@@ -513,12 +514,25 @@ pub const fn spectrum_snap(t: f32) -> u32 {
 /// The arc's steepest byte rate.
 #[must_use]
 #[cfg(test)]
-pub(crate) fn spectrum_max_byte_rate() -> f32 {
+pub(crate) const fn spectrum_max_byte_rate() -> f32 {
     let mut worst = 0u32;
-    for pair in SPECTRUM_LUT.windows(2) {
-        for shift in [16u32, 8, 0] {
-            worst = worst.max(((pair[0] >> shift) & 0xff).abs_diff((pair[1] >> shift) & 0xff));
+    let mut i = 0;
+    while i + 1 < SPECTRUM_LUT.len() {
+        let a = SPECTRUM_LUT[i];
+        let b = SPECTRUM_LUT[i + 1];
+        let dr = ((a >> 16) & 0xff).abs_diff((b >> 16) & 0xff);
+        let dg = ((a >> 8) & 0xff).abs_diff((b >> 8) & 0xff);
+        let db = (a & 0xff).abs_diff(b & 0xff);
+        if dr > worst {
+            worst = dr;
         }
+        if dg > worst {
+            worst = dg;
+        }
+        if db > worst {
+            worst = db;
+        }
+        i += 1;
     }
     worst as f32 * (SPECTRUM_LUT_LEN - 1) as f32
 }

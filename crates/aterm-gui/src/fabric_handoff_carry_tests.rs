@@ -649,6 +649,100 @@ fn a_keeper_recovery_goes_on_counting_dropped() {
     });
 }
 
+/// THE GIVE-UP GOES ON BEING NAMED ACROSS A PTY KEEPER RECOVERY (B22 land), as `dropped=` does:
+/// the META carries the range the bridge told (`link gap`) with the log its offsets are on; the
+/// recovered session's `inbox` header names it and its log, which a keeper recovery starts over,
+/// marks it once (`mail-gap`), the broker's re-tell being a repeat; a bridge that reports another
+/// log forgets it. A META that names the range without its log, or the rung that sheds it,
+/// carries nothing. NEGATIVE CONTROL (run, B22 land): a `keeper_carry` that leaves the range out
+/// fails it.
+#[cfg(unix)]
+#[test]
+fn a_keeper_recovery_goes_on_naming_the_given_up_mail() {
+    with_link(|| {
+        let store = new_store();
+        let (_sid, ctx) = registered(&store, 1);
+        let generation = next_bridge_generation();
+        bridge_attached(generation);
+        let log = format!("{}.0", "ab".repeat(16));
+        let link = |store: &Store, line: &str| cmd_link(store, line, Some(generation));
+        assert_eq!(link(&store, &format!("log {log}")), "OK\n");
+        assert_eq!(link(&store, "gap from=10 to=42 records=3"), "OK\n");
+        let told = GivenUp {
+            from: 10,
+            to: 42,
+            records: Some(3),
+        };
+        let carry = ctx.fabric.keeper_carry();
+        assert_eq!(
+            (carry.given_up, carry.given_up_log.as_deref()),
+            (Some(told), Some(log.as_str())),
+            "the range, beside its log"
+        );
+        assert!(
+            carry.rungs()[1..]
+                .iter()
+                .all(|rung| rung.given_up.is_none() && rung.given_up_log.is_none()),
+            "every shed rung sheds it"
+        );
+        let screen = aterm_core::terminal::Terminal::new(24, 80).carry_meta_abandoning_partial();
+        let meta = crate::seamless::keeper_meta_of(screen, Some(&carry)).expect("a META");
+        let recovered = crate::seamless::recovered_fabric(&meta);
+        let successor = new_store();
+        let fresh = test_handle(1);
+        crate::spawn::seed_adopted_fabric(
+            &fresh.ctx.fabric,
+            &fresh.ctx.timeline,
+            &recovered.topics,
+            &recovered.holds,
+            &recovered.carry,
+        );
+        let new_ctx = fresh.ctx.clone();
+        successor.write().unwrap().register(fresh);
+        let header = |ctx: &SessionCtx| {
+            let out = cmd_inbox(ctx, "--peek");
+            out.lines().next().unwrap_or_default().to_string()
+        };
+        let marks = |ctx: &SessionCtx| -> usize {
+            let g = ctx.timeline.lock().unwrap();
+            g.slog()
+                .log()
+                .window()
+                .filter(|r| r.k == aterm_slog::Kind::MailGap)
+                .count()
+        };
+        assert!(
+            header(&new_ctx).ends_with(" given_up=@10..@42 given_up_count=3"),
+            "{}",
+            header(&new_ctx)
+        );
+        assert_eq!(marks(&new_ctx), 1, "the new log marks it");
+        assert_eq!(link(&successor, &format!("log {log}")), "OK\n");
+        assert_eq!(link(&successor, "gap from=10 to=42"), "OK\n");
+        assert_eq!(marks(&new_ctx), 1, "the broker's re-tell is a repeat");
+        assert!(header(&new_ctx).contains(" given_up=@10..@42"));
+        let other = format!("{}.0", "cd".repeat(16));
+        assert_eq!(link(&successor, &format!("log {other}")), "OK forgot=1\n");
+        assert!(
+            !header(&new_ctx).contains("given_up"),
+            "another log forgets it: {}",
+            header(&new_ctx)
+        );
+
+        for meta in [
+            &br#"{"fabric":{"given_up":{"from":1,"to":2}}}"#[..],
+            br#"{"fabric":{"given_up_log":"x"}}"#,
+        ] {
+            let recovered = crate::seamless::recovered_fabric(meta);
+            assert_eq!(
+                (recovered.carry.given_up, recovered.carry.bus_log),
+                (None, None),
+                "the range is carried with its log or not at all"
+            );
+        }
+    });
+}
+
 /// THE COMMIT SEES THE OUTBOX MOVE, and a move past its reading WAITS: a
 /// post queued, a receipt owed or a post retired after the park changes
 /// [`SessionFabric::carry_serial`] (the Commit then stands down, a lossless

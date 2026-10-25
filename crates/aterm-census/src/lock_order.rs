@@ -1792,6 +1792,13 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut fns: Vec<FnLockFacts> = Vec::new();
     let mut field_types = FieldTypes::default();
     for crate_dir in &scan.scan_dirs {
+        if scan
+            .vendored_scanned
+            .iter()
+            .any(|entry| entry.scan_dir == *crate_dir)
+        {
+            continue;
+        }
         let mut files = Vec::new();
         let _ = collect_rs_files(&root.join(crate_dir), &mut files);
         files.retain(|p| !is_test_file(p));
@@ -2360,7 +2367,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     if !scan.vendored_scanned.is_empty() {
         let _ = writeln!(
             log,
-            "    vendored [patch] crates in the graph (vendored-identity mode: every \
+            "    isolated libraries in the graph (vendored or external-workspace identity mode: every \
              identity in the crate's own namespace, so foreign receiver names can \
              never merge with aterm identities or each other; cross-boundary holds \
              are visible only at DIRECT call sites, one hop):"
@@ -3824,6 +3831,45 @@ mod tests {
             "both crates' nestings must be tracked, separately:\n{}",
             out.log
         );
+    }
+
+    #[test]
+    fn external_workspace_libraries_are_isolated_but_their_own_cycles_still_fail() {
+        for cycle in [false, true] {
+            let mut files = synth_helper_files();
+            let gui = files
+                .iter_mut()
+                .find(|(path, _)| path == "crates/aterm-gui/Cargo.toml")
+                .unwrap();
+            gui.1
+                .push_str("\n[dependencies.foreign]\npath = \"../../foreign/lib\"\n");
+            files.push(("crates/aterm-gui/src/extra.rs".into(), "fn caller() {\n let a = beta_lock.lock().unwrap();\n let b = alpha_lock.lock().unwrap();\n}\n".into()));
+            files.push((
+                "foreign/Cargo.toml".into(),
+                "[workspace]\nmembers = [\"lib\"]\n".into(),
+            ));
+            files.push((
+                "foreign/lib/Cargo.toml".into(),
+                "[package]\nname = \"foreign\"\n".into(),
+            ));
+            let mut source = "fn forward() {\n let a = alpha_lock.lock().unwrap();\n let b = beta_lock.lock().unwrap();\n}\n".to_string();
+            if cycle {
+                source.push_str("fn backward() {\n let a = beta_lock.lock().unwrap();\n let b = alpha_lock.lock().unwrap();\n}\n");
+            }
+            files.push(("foreign/lib/src/lib.rs".into(), source));
+            files.push(("foreign/lib/src/bin/dev.rs".into(), "fn dev() {}\n".into()));
+            let result = run_lock_order_census(&synth_tree(
+                "aterm-lock-census",
+                "external-workspace",
+                &files,
+            ));
+            assert_eq!(result.ok, !cycle, "{}", result.log);
+            assert!(
+                result.log.contains("external::foreign::alpha_lock"),
+                "{}",
+                result.log
+            );
+        }
     }
 
     #[test]

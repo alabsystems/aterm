@@ -65,10 +65,13 @@ pub(crate) fn push_grid_quad(
 /// Premultiplied `0x00RRGGBB` light scaled by `share` (`0..=1`), rounding per channel.
 #[inline]
 #[must_use]
-pub(crate) fn scale_premul(c: u32, share: f32) -> u32 {
+pub(crate) const fn scale_premul(c: u32, share: f32) -> u32 {
     let share = share.clamp(0.0, 1.0);
-    let ch = |sh: u32| ((((c >> sh) & 0xff) as f32 * share).round() as u32).min(255) << sh;
-    ch(16) | ch(8) | ch(0)
+    const fn ch(c: u32, share: f32, sh: u32) -> u32 {
+        let v = (((c >> sh) & 0xff) as f32 * share).round() as u32;
+        (if v < 255 { v } else { 255 }) << sh
+    }
+    ch(c, share, 16) | ch(c, share, 8) | ch(c, share, 0)
 }
 
 /// How far inside the effects box's top and bottom edges a light that crosses them eases to
@@ -85,7 +88,7 @@ pub(crate) const FX_EDGE_FADE_X: f32 = 0.6;
 /// this it fades out instead.
 #[inline]
 #[must_use]
-pub(crate) fn fx_fade_y(geom: Geom, y: f32) -> f32 {
+pub(crate) const fn fx_fade_y(geom: Geom, y: f32) -> f32 {
     let reach = (geom.ch as f32 * FX_EDGE_FADE).max(1.0);
     let d = (y - geom.fx_top() as f32).min(geom.fx_bot() as f32 - y);
     let k = (d / reach).clamp(0.0, 1.0);
@@ -96,7 +99,7 @@ pub(crate) fn fx_fade_y(geom: Geom, y: f32) -> f32 {
 /// [`FX_EDGE_FADE_X`] of a cell width.
 #[inline]
 #[must_use]
-pub(crate) fn fx_fade_x(geom: Geom, x: f32) -> f32 {
+pub(crate) const fn fx_fade_x(geom: Geom, x: f32) -> f32 {
     let reach = (geom.cw as f32 * FX_EDGE_FADE_X).max(1.0);
     let d = (x - geom.fx_left() as f32).min(geom.fx_right() as f32 - x);
     let k = (d / reach).clamp(0.0, 1.0);
@@ -289,14 +292,14 @@ pub(crate) const fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
 
 /// Clamped per-channel RGB mix (`t` from `a` to `b`), rounded to nearest.
 #[inline]
-pub(crate) fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
+pub(crate) const fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
-    let ch = |sh: u32| {
+    const fn ch(a: u32, b: u32, t: f32, sh: u32) -> u32 {
         let ca = ((a >> sh) & 0xff) as f32;
         let cb = ((b >> sh) & 0xff) as f32;
         ((ca + (cb - ca) * t).round().clamp(0.0, 255.0) as u32) << sh
-    };
-    ch(16) | ch(8) | ch(0)
+    }
+    ch(a, b, t, 16) | ch(a, b, t, 8) | ch(a, b, t, 0)
 }
 
 /// `a + (b - a) t`, `t` clamped to 0..1.
@@ -492,20 +495,29 @@ pub(crate) const fn twinkle_peak(env: f32) -> bool {
 
 /// Integer arm thickness (px) of the additive star for half-length `arm`.
 #[inline]
-pub(crate) fn star_waist_px(arm: i32) -> i32 {
-    ((2.0 * arm as f32 * STAR_WAIST).round() as i32).max(1)
+pub(crate) const fn star_waist_px(arm: i32) -> i32 {
+    let w = (2.0 * arm as f32 * STAR_WAIST).round() as i32;
+    if w > 1 { w } else { 1 }
 }
 
 /// The additive star's integer nucleus side (px), from the shared [`STAR_CORE`].
 #[inline]
-pub(crate) fn star_core_px(arm: i32) -> i32 {
-    ((2.0 * arm as f32 * STAR_CORE).round() as i32).max(1)
+pub(crate) const fn star_core_px(arm: i32) -> i32 {
+    let c = (2.0 * arm as f32 * STAR_CORE).round() as i32;
+    if c > 1 { c } else { 1 }
 }
 
 /// Integer full-coverage body half-length (px) of the additive star for half-length `arm`.
 #[inline]
-pub(crate) fn star_body_px(arm: i32) -> i32 {
-    ((arm as f32 * STAR_TAPER_BODY).round() as i32).clamp(1, arm)
+pub(crate) const fn star_body_px(arm: i32) -> i32 {
+    let b = (arm as f32 * STAR_TAPER_BODY).round() as i32;
+    if b < 1 {
+        1
+    } else if b > arm {
+        arm
+    } else {
+        b
+    }
 }
 
 /// Which paint a piece of the star takes ([`star_pieces`]).
@@ -558,35 +570,58 @@ pub(crate) struct StarPieces {
     n: usize,
 }
 
+impl StarPieces {
+    /// Borrow the active pieces slice.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn as_slice(&self) -> &[StarPiece] {
+        self.pieces.split_at(self.n).0
+    }
+}
+
 impl std::ops::Deref for StarPieces {
     type Target = [StarPiece];
 
     #[inline]
     fn deref(&self) -> &[StarPiece] {
-        &self.pieces[..self.n]
+        self.as_slice()
     }
 }
 
 /// Compute the geometry pieces of the 4-point twinkle star of half-length `arm`.
 #[must_use]
 #[inline]
-pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
+pub(crate) const fn star_pieces(arm: i32, gold: bool) -> StarPieces {
     const CACHED_ARMS: usize = 16;
-    static CACHE: std::sync::OnceLock<[[StarPieces; 2]; CACHED_ARMS]> = std::sync::OnceLock::new();
-    if (1..=CACHED_ARMS as i32).contains(&arm) {
-        let table = CACHE.get_or_init(|| {
-            std::array::from_fn(|idx| {
-                let a = (idx + 1) as i32;
-                [build_star_pieces(a, false), build_star_pieces(a, true)]
-            })
-        });
-        return table[(arm - 1) as usize][usize::from(gold)];
+    const CACHE: [[StarPieces; 2]; CACHED_ARMS] = {
+        let none = StarPiece {
+            part: StarPart::Body,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let empty = StarPieces {
+            pieces: [none; STAR_PIECES_MAX],
+            n: 0,
+        };
+        let mut table = [[empty; 2]; CACHED_ARMS];
+        let mut idx = 0;
+        while idx < CACHED_ARMS {
+            let a = (idx + 1) as i32;
+            table[idx] = [build_star_pieces(a, false), build_star_pieces(a, true)];
+            idx += 1;
+        }
+        table
+    };
+    if arm >= 1 && arm <= CACHED_ARMS as i32 {
+        return CACHE[(arm - 1) as usize][gold as usize];
     }
     build_star_pieces(arm, gold)
 }
 
 #[must_use]
-fn build_star_pieces(arm: i32, gold: bool) -> StarPieces {
+const fn build_star_pieces(arm: i32, gold: bool) -> StarPieces {
     let none = StarPiece {
         part: StarPart::Body,
         x: 0,
@@ -601,40 +636,96 @@ fn build_star_pieces(arm: i32, gold: bool) -> StarPieces {
     if arm < 1 {
         return out;
     }
-    let mut push = |part: StarPart, x: i32, y: i32, w: i32, h: i32| {
-        out.pieces[out.n] = StarPiece { part, x, y, w, h };
-        out.n += 1;
-    };
     let t = star_waist_px(arm);
     let half = (t - 1) / 2;
     let b = star_body_px(arm);
-    push(StarPart::Body, -b, -half, 2 * b + 1, t);
-    push(StarPart::Body, -half, -b, t, 2 * b + 1);
+    out.pieces[out.n] = StarPiece {
+        part: StarPart::Body,
+        x: -b,
+        y: -half,
+        w: 2 * b + 1,
+        h: t,
+    };
+    out.n += 1;
+    out.pieces[out.n] = StarPiece {
+        part: StarPart::Body,
+        x: -half,
+        y: -b,
+        w: t,
+        h: 2 * b + 1,
+    };
+    out.n += 1;
     let c = star_core_px(arm);
     let cc = (c - 1) / 2;
-    push(StarPart::Core, -cc, -cc, c, c);
+    out.pieces[out.n] = StarPiece {
+        part: StarPart::Core,
+        x: -cc,
+        y: -cc,
+        w: c,
+        h: c,
+    };
+    out.n += 1;
     let run = arm - b;
-    let steps = run.clamp(0, STAR_TAPER_STEPS);
-    for k in 0..steps {
+    let steps = if run < 0 {
+        0
+    } else if run > STAR_TAPER_STEPS {
+        STAR_TAPER_STEPS
+    } else {
+        run
+    };
+    let mut k = 0;
+    while k < steps {
         let d0 = b + run * k / steps;
         let d1 = b + run * (k + 1) / steps;
         let taper = star_taper_cov(((d0 + d1) as f32 * 0.5 - b as f32) / run as f32);
-        let tt = ((t as f32 * taper).round() as i32).max(1);
+        let tt_raw = (t as f32 * taper).round() as i32;
+        let tt = if tt_raw > 1 { tt_raw } else { 1 };
         let th = (tt - 1) / 2;
         let len = d1 - d0;
         let part = StarPart::Tip {
             step: k as u8,
             taper,
         };
-        for off in [d0 + 1, -d1] {
-            push(part, off, -th, len, tt);
-            push(part, -th, off, tt, len);
+        let offs = [d0 + 1, -d1];
+        let mut oi = 0;
+        while oi < 2 {
+            let off = offs[oi];
+            out.pieces[out.n] = StarPiece {
+                part,
+                x: off,
+                y: -th,
+                w: len,
+                h: tt,
+            };
+            out.n += 1;
+            out.pieces[out.n] = StarPiece {
+                part,
+                x: -th,
+                y: off,
+                w: tt,
+                h: len,
+            };
+            out.n += 1;
+            oi += 1;
         }
+        k += 1;
     }
     if gold {
-        let d = ((arm as f32 * STAR_GLINT).round() as i32).max(1);
-        for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
-            push(StarPart::Glint, ox, oy, 1, 1);
+        let d_raw = (arm as f32 * STAR_GLINT).round() as i32;
+        let d = if d_raw > 1 { d_raw } else { 1 };
+        let glints = [(-d, -d), (d, -d), (-d, d), (d, d)];
+        let mut gi = 0;
+        while gi < 4 {
+            let (ox, oy) = glints[gi];
+            out.pieces[out.n] = StarPiece {
+                part: StarPart::Glint,
+                x: ox,
+                y: oy,
+                w: 1,
+                h: 1,
+            };
+            out.n += 1;
+            gi += 1;
         }
     }
     out

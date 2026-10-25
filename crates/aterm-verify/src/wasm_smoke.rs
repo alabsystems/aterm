@@ -24,7 +24,8 @@ pub(crate) fn build_dir(ctx: &Ctx) -> PathBuf {
     crate::plan::cells_dir(ctx).join("wasm-smoke")
 }
 
-/// Both web modules built in the DEV profile for wasm32 on rustup's stable ([`build_dir`]).
+/// Both web modules built in the DEV profile for wasm32 on rustup's stable, into [`build_dir`]:
+/// the directory the `.wasm` files land in, or `None` once a refusal is recorded on `r`.
 pub(crate) fn build_dev(
     ctx: &Ctx,
     r: &mut Report,

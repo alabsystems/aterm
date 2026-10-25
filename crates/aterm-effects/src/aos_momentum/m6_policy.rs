@@ -276,7 +276,7 @@ impl SetTag {
         }
     }
 
-    /// Whether it is a real pair's set, which only a `RealSets` value opens.
+    /// Whether it is a real pair's set, which only the real sets' capability opens.
     #[must_use]
     pub const fn real(self) -> bool {
         matches!(self, SetTag::HeldOut | SetTag::Report)
@@ -326,6 +326,25 @@ fn keyed(domain: &[u8], pool: &PoolId, plan: &SchedulePlan) -> u64 {
             &plan.encode(),
         ],
     ))
+}
+
+/// `plan`'s class under `m6-w1 v1` ([`W1_RULE`]): 0 for `NextStep` or `Cadence`, else 1.
+#[must_use]
+pub const fn w1_class(plan: &SchedulePlan) -> u8 {
+    match plan.wake() {
+        Wake::NextStep | Wake::Cadence => 0,
+        _ => 1,
+    }
+}
+
+/// `plan`'s class under `m6-w2 v1` ([`W2_RULE`]): 0 for `SettleAtStep ∧ NextStep`, else 1 plus
+/// its W1 class.
+#[must_use]
+pub const fn w2_class(plan: &SchedulePlan) -> u8 {
+    match (plan.split(), plan.wake()) {
+        (Split::SettleAtStep { .. }, Wake::NextStep) => 0,
+        _ => 1 + w1_class(plan),
+    }
 }
 
 /// The tie key of `plan` in `pool`, ascending in every ranking.
@@ -947,6 +966,13 @@ impl RankerPolicy {
     #[must_use]
     pub const fn id(&self) -> &ArtifactId {
         &self.id
+    }
+
+    /// The M4 acceptance policy's digest it binds, which a store records.
+    #[inline]
+    #[must_use]
+    pub const fn acceptance(&self) -> Digest {
+        self.terms.acceptance
     }
 
     fn check_pin(&self) -> Result<(), RankerRefusal> {

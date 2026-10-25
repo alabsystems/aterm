@@ -74,6 +74,18 @@ pub struct DropletFrame {
     pub fp: u64,
 }
 
+impl DropletFrame {
+    /// Dormant frame output (`fill: None, fp: 0`).
+    pub const DORMANT: Self = Self { fill: None, fp: 0 };
+}
+
+impl Default for DropletFrame {
+    #[inline]
+    fn default() -> Self {
+        Self::DORMANT
+    }
+}
+
 /// The band of water-ramp positions whose colour keeps
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 fn ramp_band_on(ground: u32) -> (f32, f32) {
@@ -120,7 +132,6 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
 }
 
 /// Per-window state for the liquid droplet cursor effect.
-#[derive(Default)]
 pub struct CursorDroplet {
     /// Rolling slosh (caustic shimmer) phase in turns `0..1`.
     slosh: f32,
@@ -140,13 +151,36 @@ pub struct CursorDroplet {
     uncut: bool,
 }
 
+impl Default for CursorDroplet {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorDroplet {
+    /// Fresh dormant droplet-cursor animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slosh: 0.0,
+            ripple: 0.0,
+            drip: 0.0,
+            last: None,
+            surge: 0.0,
+            band_memo: None,
+            #[cfg(test)]
+            uncut: false,
+        }
+    }
+
     /// Reset animation state while preserving the contrast-band memo.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         *self = Self {
             band_memo: self.band_memo,
-            ..Self::default()
+            ..Self::new()
         };
     }
 
@@ -171,7 +205,7 @@ impl CursorDroplet {
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.surge = 0.0;
             self.last = Some(now);
-            return DropletFrame { fill: None, fp: 0 };
+            return DropletFrame::DORMANT;
         }
         self.surge = e;
 

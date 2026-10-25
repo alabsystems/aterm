@@ -744,8 +744,22 @@ pub fn task_line_env(
     args: &[String],
     operand: &str,
 ) -> Result<String, String> {
+    task_line_env_clear(dialect, env, &[], exe, args, operand)
+}
+
+/// [`task_line_env`] with each of `unset` removed from the worker's environment
+/// (`/usr/bin/env -u`, as [`relaunch_line_env_clear`] spells it); with none, the same line.
+pub fn task_line_env_clear(
+    dialect: Dialect,
+    env: &[(&str, &str)],
+    unset: &[&str],
+    exe: &Path,
+    args: &[String],
+    operand: &str,
+) -> Result<String, String> {
     let tty = LineDiscipline::HOST;
-    let line = relaunch_line_on(tty, dialect, None, None, env, exe, args)?;
+    let unset = Some(unset).filter(|names| !names.is_empty());
+    let line = relaunch_line_with_clear(tty, dialect, None, None, env, unset, exe, args)?;
     let line = format!("{line} {operand}");
     let max = tty.max_line();
     if line.len() > max {

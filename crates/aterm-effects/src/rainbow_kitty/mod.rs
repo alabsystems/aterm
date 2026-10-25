@@ -185,11 +185,27 @@ impl Config {
 }
 
 /// The caret seam (§7.1).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct CaretSeam {
     pub flare_at: Option<Instant>,
     pub field_t: f32,
     pub paint: f32,
+}
+
+impl CaretSeam {
+    /// Unflared caret seam at `field_t = 0.0`, `paint = 0.0`.
+    pub const EMPTY: Self = Self {
+        flare_at: None,
+        field_t: 0.0,
+        paint: 0.0,
+    };
+}
+
+impl Default for CaretSeam {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// One impulse, two bodies (D13, §7.2): the pet or the flying head reads it
@@ -252,17 +268,14 @@ impl Ctx<'_> {
     /// own light keeps them off, and this is false.
     #[inline]
     #[must_use]
-    pub fn near_paper_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
+    pub const fn near_paper_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
         let (row, col) = self.caret;
-        if self.cfg.dark_theme
-            || usize::from(row) >= self.geom.rows
-            || usize::from(col) >= self.geom.cols
-        {
+        if self.cfg.dark_theme || row as usize >= self.geom.rows || col as usize >= self.geom.cols {
             return false;
         }
         let (cw, ch) = (self.geom.cw as i32, self.geom.ch as i32);
-        let x0 = i32::from(self.geom.origin_x) + i32::from(col) * cw;
-        let y0 = i32::from(self.geom.origin_y) + i32::from(row) * ch;
+        let x0 = self.geom.origin_x as i32 + col as i32 * cw;
+        let y0 = self.geom.origin_y as i32 + row as i32 * ch;
         x + reach >= x0 - cw
             && x - reach < x0 + 2 * cw
             && y + reach >= y0 - ch
@@ -271,7 +284,7 @@ impl Ctx<'_> {
 }
 
 /// `trail status`'s v2 rows (seam point 12).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Status {
     pub quads: u32,
     pub halos: u32,
@@ -286,6 +299,32 @@ pub struct Status {
     pub flow: Flow,
     pub tokens: f32,
     pub fp: u64,
+}
+
+impl Status {
+    /// Zeroed status snapshot.
+    pub const EMPTY: Self = Self {
+        quads: 0,
+        halos: 0,
+        stars: 0,
+        meteors: 0,
+        cells: 0,
+        bridged: 0,
+        retired: 0,
+        followed: 0,
+        follow_missed: 0,
+        disp: 0.0,
+        flow: Flow::EMPTY,
+        tokens: 0.0,
+        fp: 0,
+    };
+}
+
+impl Default for Status {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// The frame cadence a producer asks for while something on glass moves every frame.
@@ -403,12 +442,9 @@ pub struct EchoLedger {
 }
 
 impl Default for EchoLedger {
+    #[inline]
     fn default() -> Self {
-        Self {
-            slots: [None; ECHO_LEDGER_DEPTH],
-            #[cfg(test)]
-            tally: LedgerTally::default(),
-        }
+        Self::EMPTY
     }
 }
 
@@ -421,7 +457,23 @@ struct LedgerTally {
     expired: u32,
 }
 
+#[cfg(test)]
+impl LedgerTally {
+    const EMPTY: Self = Self {
+        banked: 0,
+        spent: 0,
+        forfeited: 0,
+        expired: 0,
+    };
+}
+
 impl EchoLedger {
+    /// Empty echo ledger.
+    pub const EMPTY: Self = Self {
+        slots: [None; ECHO_LEDGER_DEPTH],
+        #[cfg(test)]
+        tally: LedgerTally::EMPTY,
+    };
     #[inline]
     fn bank(&mut self, at: Instant, cells: u16) {
         if cells == 0 {
@@ -490,8 +542,17 @@ impl EchoLedger {
     }
 
     #[inline]
-    fn total(&self) -> usize {
-        self.cells_where(|_| true)
+    const fn total(&self) -> usize {
+        let mut sum = 0;
+        let mut i = 0;
+        while i < ECHO_LEDGER_DEPTH {
+            let Some((_, cells)) = self.slots[i] else {
+                break;
+            };
+            sum += cells as usize;
+            i += 1;
+        }
+        sum
     }
 
     #[inline]
@@ -513,22 +574,31 @@ impl EchoLedger {
     }
 
     #[inline]
-    fn spend(&mut self, mut cells: usize) {
+    const fn spend(&mut self, mut cells: usize) {
         let mut any = false;
-        for slot in &mut self.slots {
+        let mut i = 0;
+        while i < ECHO_LEDGER_DEPTH {
             if cells == 0 {
                 break;
             }
-            let Some((at, have)) = *slot else { break };
-            let take = usize::from(have).min(cells);
+            let Some((at, have)) = self.slots[i] else {
+                break;
+            };
+            let have_usize = have as usize;
+            let take = if have_usize < cells {
+                have_usize
+            } else {
+                cells
+            };
             cells -= take;
             #[cfg(test)]
             {
                 self.tally.spent += take as u32;
             }
             let left = have - take as u16;
-            *slot = (left > 0).then_some((at, left));
+            self.slots[i] = if left > 0 { Some((at, left)) } else { None };
             any |= left == 0;
+            i += 1;
         }
         if any {
             self.repack();
@@ -536,7 +606,7 @@ impl EchoLedger {
     }
 
     #[inline]
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         #[cfg(test)]
         {
             self.tally.forfeited += self.total() as u32;
@@ -625,6 +695,7 @@ pub struct Engine {
 }
 
 impl Default for Engine {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -641,12 +712,12 @@ impl Engine {
             spine: Spine::new(),
             ribbon: Ribbon::new(),
             stardust: Stardust::new(),
-            meteor: Meteors::default(),
-            caret_seam: CaretSeam::default(),
+            meteor: Meteors::new(),
+            caret_seam: CaretSeam::EMPTY,
             caret: (0, 0),
             caret_known: false,
             caret_seen: None,
-            echo: EchoLedger::default(),
+            echo: EchoLedger::EMPTY,
             bridged: 0,
             #[cfg(test)]
             last_host_sweep_at: None,
@@ -663,7 +734,7 @@ impl Engine {
             companion: None,
             paint_at: None,
             fp: 0,
-            status: Status::default(),
+            status: Status::EMPTY,
             brisk: false,
             party: None,
             witness: Witness::new(),
@@ -834,8 +905,8 @@ impl Engine {
     }
 
     #[inline]
-    fn host_sweep_for(&self, from: (u16, u16), to: (u16, u16)) -> Option<Instant> {
-        match self.events.last() {
+    const fn host_sweep_for(&self, from: (u16, u16), to: (u16, u16)) -> Option<Instant> {
+        match self.events.as_slice().last() {
             Some(&(Event::Sweep { row, col0, col1 }, at))
                 if row == to.0 && col0 == from.1 && col1 == to.1 =>
             {
@@ -987,34 +1058,52 @@ impl Engine {
     }
 
     #[inline]
-    fn unechoed_tail_start(&self) -> usize {
+    const fn unechoed_tail_start(&self) -> usize {
+        let events = self.events.as_slice();
+        let mut i = events.len();
+        while i > 0 {
+            i -= 1;
+            if matches!(events[i].0, Event::Move { .. } | Event::Rewrite { .. }) {
+                return i + 1;
+            }
+        }
+        0
+    }
+
+    #[inline]
+    const fn unechoed_tail(&self) -> &[(Event, Instant)] {
         self.events
-            .iter()
-            .rposition(|(ev, _)| matches!(ev, Event::Move { .. } | Event::Rewrite { .. }))
-            .map_or(0, |i| i + 1)
+            .as_slice()
+            .split_at(self.unechoed_tail_start())
+            .1
     }
 
     #[inline]
-    fn unechoed_tail(&self) -> &[(Event, Instant)] {
-        &self.events[self.unechoed_tail_start()..]
+    const fn is_erase_retreat(&self, from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
+        if !matches!(licence, Licence::Typed) || to.0 != from.0 || to.1 >= from.1 {
+            return false;
+        }
+        let tail = self.unechoed_tail();
+        let mut i = 0;
+        while i < tail.len() {
+            if matches!(tail[i].0, Event::Erase | Event::Kill { .. }) {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
-    fn is_erase_retreat(&self, from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
-        licence == Licence::Typed
-            && to.0 == from.0
-            && to.1 < from.1
-            && self
-                .unechoed_tail()
-                .iter()
-                .any(|(ev, _)| matches!(ev, Event::Erase | Event::Kill { .. }))
-    }
-
-    #[inline]
-    fn record_pre_move(&mut self, from: (u16, u16), to: (u16, u16), licence: Licence) {
+    const fn record_pre_move(&mut self, from: (u16, u16), to: (u16, u16), licence: Licence) {
         let one_shot = !licence.is_echo() || self.is_erase_retreat(from, to, licence);
         if one_shot && self.pre_move.is_none() {
-            self.pre_move = Some((self.events.len(), self.caret_known.then_some(self.caret)));
+            let caret = if self.caret_known {
+                Some(self.caret)
+            } else {
+                None
+            };
+            self.pre_move = Some((self.events.len(), caret));
         }
     }
 
@@ -1549,7 +1638,7 @@ impl Engine {
 
     /// Bind the seam's exact content-and-key proof to this cross-row rewrap.
     #[inline]
-    pub(crate) fn prove_typed_rewrap(
+    pub(crate) const fn prove_typed_rewrap(
         &mut self,
         from: (u16, u16),
         to: (u16, u16),
@@ -1924,7 +2013,7 @@ impl Engine {
     /// Seam point 4.
     #[inline]
     #[must_use]
-    pub fn field_at(&self, row: u16, col: u16) -> Option<f32> {
+    pub const fn field_at(&self, row: u16, col: u16) -> Option<f32> {
         self.ribbon.field_at(row, col)
     }
 
@@ -1945,8 +2034,8 @@ impl Engine {
     /// `trail status`'s `ribbon_segments=` while v2 owns the frame.
     #[inline]
     #[must_use]
-    pub fn ribbon_segments(&self) -> usize {
-        self.ribbon.lit_segments().count()
+    pub const fn ribbon_segments(&self) -> usize {
+        self.ribbon.lit_segment_count()
     }
 
     /// `trail status`'s `ribbon_drawn=` while v2 owns the frame.
@@ -2065,13 +2154,10 @@ impl Engine {
             return None;
         }
         let mut cad = Cadence::at(now);
-        for d in [
-            self.meteor.next_change_deadline(now),
-            self.ribbon.next_change_deadline(now),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(d) = self.meteor.next_change_deadline(now) {
+            cad.edge(d);
+        }
+        if let Some(d) = self.ribbon.next_change_deadline(now) {
             cad.edge(d);
         }
         if !cad.best.is_some_and(|b| b <= now + FRAME_CADENCE)
@@ -2121,7 +2207,7 @@ impl Engine {
         let Some(pet) = pet else {
             return companion::PetOffer {
                 perk_at,
-                ..companion::PetOffer::default()
+                ..companion::PetOffer::EMPTY
             };
         };
         let (lo, hi) = pet.span();
@@ -2197,14 +2283,14 @@ impl Engine {
     /// Each star the sky painted this frame ([`stardust::SkyMark`]).
     #[inline]
     #[must_use]
-    pub fn sky_marks(&self) -> &[stardust::SkyMark] {
+    pub const fn sky_marks(&self) -> &[stardust::SkyMark] {
         self.stardust.marks()
     }
 
     /// The keys of the lights this frame's stars painted ([`stardust::SkyMark::lights`]).
     #[inline]
     #[must_use]
-    pub fn sky_mark_lights(&self) -> &[u64] {
+    pub const fn sky_mark_lights(&self) -> &[u64] {
         self.stardust.mark_lights()
     }
 
@@ -2218,7 +2304,7 @@ impl Engine {
     /// The boxes the sky and the ribbon last kept off ([`companion::KeepOut::boxes`]).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
+    pub const fn keep_out(&self) -> &[(i32, i32, i32, i32)] {
         self.stardust.keep_out.boxes()
     }
 
@@ -2242,7 +2328,7 @@ impl Engine {
             retired: self.retired,
             followed: self.followed,
             follow_missed: self.follow_missed,
-            ..Status::default()
+            ..Status::EMPTY
         };
         self.brisk = self.ribbon.brisk(now);
     }
@@ -2271,7 +2357,7 @@ impl Engine {
             retired: self.retired,
             followed: self.followed,
             follow_missed: self.follow_missed,
-            ..Status::default()
+            ..Status::EMPTY
         };
         self.brisk = false;
     }
@@ -2281,7 +2367,7 @@ impl Engine {
         self.spine.reset();
         self.stardust.reset();
         self.meteor.reset();
-        self.caret_seam = CaretSeam::default();
+        self.caret_seam = CaretSeam::EMPTY;
         self.caret = (0, 0);
         self.caret_known = false;
         self.caret_seen = None;
@@ -2437,8 +2523,11 @@ impl Engine {
     }
 }
 
-fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(u16, u16)> {
-    let Event::Sweep { row, col0, col1 } = events.get(index)?.0 else {
+const fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(u16, u16)> {
+    if index + 1 >= events.len() {
+        return None;
+    }
+    let Event::Sweep { row, col0, col1 } = events[index].0 else {
         return None;
     };
     let Event::Move {
@@ -2446,29 +2535,38 @@ fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(u16, u
         to,
         licence: Licence::Typed,
         ..
-    } = events.get(index.checked_add(1)?)?.0
+    } = events[index + 1].0
     else {
         return None;
     };
-    if from != (row, col0) || to != (row, col1) || col1 <= col0 {
+    if from.0 != row || from.1 != col0 || to.0 != row || to.1 != col1 || col1 <= col0 {
         return None;
     }
     let mut remaining = col1 - col0;
     let mut space = None;
-    for &(event, _) in events[..index].iter().rev() {
-        let Event::Typed { cells, class, .. } = event else {
+    let mut i = index;
+    while i > 0 {
+        i -= 1;
+        let Event::Typed { cells, class, .. } = events[i].0 else {
             break;
         };
-        if cells == 0 || (class == TypedClass::Space && cells != 1) {
+        let is_space = matches!(class, TypedClass::Space);
+        if cells == 0 || (is_space && cells != 1) {
             return None;
         }
-        remaining = remaining.checked_sub(cells)?;
-        if space.is_none() && class == TypedClass::Space {
+        let Some(next_rem) = remaining.checked_sub(cells) else {
+            return None;
+        };
+        remaining = next_rem;
+        if space.is_none() && is_space {
             space = Some(col0 + remaining);
         }
     }
     if remaining == 0 {
-        space.map(|col| (row, col))
+        match space {
+            Some(col) => Some((row, col)),
+            None => None,
+        }
     } else {
         None
     }
@@ -2564,16 +2662,17 @@ mod swept_space_tests {
 }
 
 #[inline]
-fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
+const fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
     if !licence.is_keyed_nav() || from.0 != to.0 {
         return false;
     }
-    (1..JUMP_MIN_CELLS).contains(&to.1.abs_diff(from.1))
+    let d = to.1.abs_diff(from.1);
+    d >= 1 && d < JUMP_MIN_CELLS
 }
 
 #[inline]
-fn liveness(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
-    u64::from(!(under.is_empty() && out.is_empty() && halos.is_empty()))
+const fn liveness(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
+    !(under.is_empty() && out.is_empty() && halos.is_empty()) as u64
 }
 
 #[cfg(test)]

@@ -74,7 +74,7 @@ pub const SURGE_FULL_RISE: f32 = 0.25;
 
 /// The flow state: the value on the `trail status` row an agent can hold its turn on, and the
 /// number every flowing consumer lerps against.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Flow {
     /// Unit flow heat from zero below the ease to full flow at [`FLOW_ENTRY_KEYS`].
     pub heat: f32,
@@ -84,7 +84,21 @@ pub struct Flow {
     pub best: u32,
 }
 
+impl Default for Flow {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl Flow {
+    /// Idle flow state (`heat = 0.0`, `combo = 0`, `best = 0`).
+    pub const EMPTY: Self = Self {
+        heat: 0.0,
+        combo: 0,
+        best: 0,
+    };
+
     /// Whether the run has reached [`FLOW_ENTRY_KEYS`] without breaking.
     #[inline]
     #[must_use]
@@ -115,7 +129,7 @@ pub struct EraseMark {
 }
 
 /// The one momentum integrator and its display follower.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Spine {
     /// The canonical metric (`crate::typing_momentum`), the raw 0..1 leaky
     /// integrator, gained only in [`Spine::target`]; consumers want
@@ -157,6 +171,13 @@ pub struct Spine {
     /// [`VERDICT_WINDOW_S`], which floors one birth at [`VERDICT_BIRTH_DISP`]
     /// and is spent by it ([`Spine::note_keys`]).
     verdict: Option<Instant>,
+}
+
+impl Default for Spine {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Spine {
@@ -315,9 +336,9 @@ impl Spine {
                 DISP_ATTACK_S
             };
             self.disp += rise * (1.0 - (-dt / ease).exp());
-            if self.disp < DISP_SNAP_ZERO {
-                self.disp = 0.0;
-            }
+        }
+        if self.disp < DISP_SNAP_ZERO {
+            self.disp = 0.0;
         }
         self.disp_peak = if self.disp >= self.disp_peak {
             self.disp
@@ -710,6 +731,16 @@ mod tests {
                 s.momentum(t)
             );
         }
+
+        let mut tiny = Spine::new();
+        tiny.drive(t0, 0.001);
+        tiny.update(t0);
+        assert!(tiny.disp() > 0.0 && tiny.disp() < DISP_SNAP_ZERO);
+        // Hold the first tick's target exactly: no spring step is needed, but the snap is.
+        let next = t0 + ms(16);
+        tiny.drive(next, 0.001);
+        tiny.update(next);
+        assert_eq!(tiny.disp(), 0.0, "a steady sub-snap target reaches zero");
     }
 
     #[test]

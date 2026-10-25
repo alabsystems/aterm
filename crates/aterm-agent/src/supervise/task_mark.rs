@@ -136,7 +136,8 @@ pub(crate) struct TaskRead {
     /// What moved it to its state (`why=`), when something said.
     pub(crate) why: Option<String>,
     /// The fact word the occupancy loop's task door noted on it (`fact=`), read as the closed
-    /// word only ([`FactWord::parse`]): `-`, or any other text, is none.
+    /// word only ([`crate::supervise::occupancy::FactWord::parse`]): `-`, or any other text, is
+    /// none.
     pub(crate) fact: Option<crate::supervise::occupancy::FactWord>,
 }
 

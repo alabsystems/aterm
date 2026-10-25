@@ -542,10 +542,12 @@ fn footer_busy(row: &str) -> Option<&'static str> {
     }
 }
 
-/// `N <noun> still running` / `N <noun>s still running` somewhere in `row`.
+/// `N <noun> still running` / `N <noun>s still running` somewhere in `row`; a row that
+/// never says ` still running` is not searched for either.
 fn still_running(row: &str, noun: &str) -> bool {
-    number_then(row, "", &format!(" {noun} still running"))
-        || number_then(row, "", &format!(" {noun}s still running"))
+    crate::text::contains(row, " still running")
+        && (number_then(row, "", &format!(" {noun} still running"))
+            || number_then(row, "", &format!(" {noun}s still running")))
 }
 
 /// `N <noun>` or `N <noun>s` as one footer item.
@@ -686,6 +688,148 @@ fn is_retry_status(text: &str) -> bool {
     }
 }
 
+/// The network or no-response class an API-retry row names ([`api_retry_row`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The last try never reached the API: `Can't reach the API server — …`, `Connection
+    /// dropped (…)`, `No internet route — …` (Claude Code 2.1.310's connection-error texts for
+    /// a name that does not resolve, a socket the network dropped, and no route).
+    Unreachable,
+    /// The try in flight has had no first byte: `No response from the API after …`.
+    NoResponse,
+    /// The stream went quiet: `Waiting for API response · will retry in … · check your network`.
+    Stalled,
+}
+
+/// The leads of the rows [`api_retry_row`] reads, by class. Every other lead the vendor's retry
+/// row carries (a usage or rate limit, `Your request is queued`, `Auto mode check
+/// unavailable`, an overload, a refused connection, a proxy) is a wait of the vendor's own or a
+/// cause no network coming back cures, and reads as none.
+const RETRY_LEADS: [(&str, RetryCause); 5] = [
+    ("Can't reach the API server", RetryCause::Unreachable),
+    ("Connection dropped (", RetryCause::Unreachable),
+    ("No internet route", RetryCause::Unreachable),
+    ("No response from the API after ", RetryCause::NoResponse),
+    ("Waiting for API response", RetryCause::Stalled),
+];
+
+/// Claude Code's API-retry status row of a network or no-response class ([`api_retry_row`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRetryRow {
+    /// The row's index.
+    pub row: usize,
+    pub cause: RetryCause,
+    /// The countdown to the next try, in seconds (`Retrying in 32s`, `will retry in 5s`);
+    /// `None` where the row counts the try in flight instead (`retrying, waiting up to 1m`).
+    pub next_try_s: Option<u64>,
+    /// How long the try in flight has had no response (`No response from the API after 1m 5s`),
+    /// where the row says it whole.
+    pub waited_s: Option<u64>,
+    /// The row's text past its spinner glyph.
+    pub text: String,
+    /// A `key if=` guard that matches this row while it stands, whatever glyph its spinner shows
+    /// and whatever its countdown and attempt read: the glyph's column, then the lead and the
+    /// retry clause's words as literals, nothing after them.
+    pub guard: String,
+}
+
+/// Claude Code's live API-retry status row, where it names a network or no-response class
+/// ([`RetryCause`]) and sits on one row directly above the composer's frame; `None` for every
+/// other status row, a retry row of another class, or one wrapped across rows.
+#[must_use]
+pub fn api_retry_row(rows: &[String]) -> Option<ApiRetryRow> {
+    let frame = composer_frame(rows)?;
+    let block = status_block(rows, frame.top);
+    let at = block.status.filter(|&i| block.end == i)?;
+    let row = rows[at].as_str();
+    if !is_activity_row(row) {
+        return None;
+    }
+    let t = crate::text::trim_start(row);
+    let mut cs = t.chars();
+    cs.next()?;
+    let text = crate::text::trim(cs.as_str());
+    if !is_retry_status(text) {
+        return None;
+    }
+    let items: Vec<&str> = text.split(" · ").map(crate::text::trim_end).collect();
+    let lead = items.first()?;
+    let cause = RETRY_LEADS
+        .iter()
+        .find(|(head, _)| lead.starts_with(head))
+        .map(|&(_, cause)| cause)?;
+    const COUNTDOWNS: [&str; 3] = ["Retrying in ", "will retry in ", "next try in "];
+    const IN_FLIGHT: [&str; 2] = ["retrying once, waiting up to ", "retrying, waiting up to "];
+    let (clause, next_try_s) = items.iter().skip(1).find_map(|item| {
+        COUNTDOWNS
+            .iter()
+            .find_map(|c| {
+                item.strip_prefix(c).map(|wait| {
+                    let wait = wait.split_once(" (").map_or(wait, |(w, _)| w);
+                    (*c, wait_secs(wait))
+                })
+            })
+            .or_else(|| {
+                IN_FLIGHT
+                    .iter()
+                    .find(|c| item.starts_with(**c))
+                    .map(|c| (*c, None))
+            })
+    })?;
+    let waited_s = match cause {
+        RetryCause::NoResponse => lead
+            .strip_prefix("No response from the API after ")
+            .and_then(wait_secs),
+        RetryCause::Unreachable | RetryCause::Stalled => None,
+    };
+    // The lead as the screen shows it, but where it counts the try's own wait (`after 31s`),
+    // which moves every second: its words up to the count.
+    let fixed = match cause {
+        RetryCause::NoResponse => "No response from the API after ".to_string(),
+        RetryCause::Unreachable | RetryCause::Stalled => format!("{lead} · {clause}"),
+    };
+    let literal: String = fixed
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let glyph: String = NOT_SPINNER.iter().collect();
+    Some(ApiRetryRow {
+        row: at,
+        cause,
+        next_try_s,
+        waited_s,
+        text: text.to_string(),
+        guard: format!(
+            "^\\s*[^\\s{glyph}]\\s+{}",
+            crate::anchors::guard_regex(&literal)
+        ),
+    })
+}
+
+/// A retry row's wait (`32s`, `1m 30s`, `2d 3h`) in seconds; `None` for anything else, a wait the
+/// row cut (`1m…`) among them.
+fn wait_secs(s: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for w in crate::text::trim(s).split(' ') {
+        let unit = w.chars().next_back()?;
+        let n = &w[..w.len() - unit.len_utf8()];
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let per = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        total = total.checked_add(n.parse::<u64>().ok()?.checked_mul(per)?)?;
+        any = true;
+    }
+    any.then_some(total)
+}
+
 /// `<prefix><digits><suffix>` somewhere in `row`.
 fn number_then(row: &str, prefix: &str, suffix: &str) -> bool {
     let mut from = 0;
@@ -819,11 +963,17 @@ pub fn composer_frame_torn(rows: &[String]) -> bool {
 
 /// Claude Code's prompt box in shell mode.
 pub(crate) fn has_shell_mode_frame(rows: &[String]) -> bool {
-    (1..rows.len()).rev().any(|i| {
+    shell_mode_frame(rows).is_some()
+}
+
+/// The frame of Claude Code's prompt box in shell mode: the lowest `!` caret row (alone, or
+/// before a space) under a rule, down to the first rule under it.
+fn shell_mode_frame(rows: &[String]) -> Option<Frame> {
+    (1..rows.len()).rev().find_map(|i| {
         let caret = rows[i]
             .strip_prefix('!')
             .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{a0}']));
-        caret && is_rule(&rows[i - 1]) && rows[i + 1..].iter().any(|r| is_rule(r))
+        caret.then(|| frame_at(rows, i)).flatten()
     })
 }
 
@@ -1165,22 +1315,75 @@ pub fn survey_open(rows: &[String]) -> bool {
     crate::survey::survey_block(rows).is_some()
 }
 
-/// How much of the worker's context is left before Claude Code auto-compacts it.
+/// How much of the worker's context is left before Claude Code auto-compacts it, as its screen
+/// shows it: the one reading of Claude Code's indicator, which the supervisor's watch
+/// (`EVENT context`), `aterm drive phase` and the window's displays all take.
+///
+/// Every build measured (2.1.281, 2.1.282, 2.1.304 and 2.1.310) draws the indicator under the
+/// composer's bottom rule, against the rule's right edge (`context_under`), and keeps it there in
+/// shell mode, whose box has a `!` caret (`context_fixtures::SHELL_MODE`). 2.1.267 and 2.1.268
+/// drew it in the live zone above the composer's top rule (`context_above`,
+/// `context_fixtures::ABOVE_OLDER`), which is read when the footer holds none: the move came
+/// between 2.1.268 and 2.1.281.
 pub fn context_left(rows: &[String]) -> Option<u8> {
-    let frame = composer_frame(rows)?;
-    context_above(rows, frame, rule_width(rows, frame))
+    let frame = composer_frame(rows).or_else(|| shell_mode_frame(rows))?;
+    let width = rule_width(rows, frame);
+    context_under(rows, frame, width).or_else(|| context_above(rows, frame, width))
 }
 
-/// The context left as a screen shows it, for a display of the reading (aterm's footer).
-pub fn context_left_shown(rows: &[String]) -> Option<u8> {
-    let frame = composer_frame(rows)?;
-    let width = rule_width(rows, frame);
-    rows.get(frame.bottom + 1)
-        .map(|row| crate::text::trim_end(row))
-        .filter(|row| row.chars().count() + 3 >= width)
-        .and_then(|row| row.rsplit("  ").next())
-        .and_then(|run| context_reading(crate::text::trim(run)))
-        .or_else(|| context_above(rows, frame, width))
+/// [`context_left`]'s reading under `frame`, its rule `width` cells: the indicator ending a row
+/// of the footer (the rows down to a blank) against the rule's right edge. It is the mode row's
+/// last run, after many spaces where the row has room and after one where it has little, and on a
+/// row of its own under the mode row where the pane is too narrow for both (measured on 2.1.310
+/// at 120, 60 and 44 columns, `context_fixtures`). A recognized footer row establishes the
+/// reading's start, after a custom status line if present: completion-menu descriptions and
+/// custom status lines occupy the same space and can end in those words too.
+fn context_under(rows: &[String], frame: Frame, width: usize) -> Option<u8> {
+    let from = frame.bottom + 1;
+    let footer = &rows[from..footer_end(rows, from)];
+    let first = footer.iter().position(|row| {
+        let text = crate::text::trim_start(row);
+        let mode = text
+            .strip_prefix(crate::anchor!("vim.insert"))
+            .and_then(|after| after.strip_prefix(' '))
+            .unwrap_or(text);
+        let bare = ["footer.shortcuts", "footer.clear", "busy.interrupt"]
+            .into_iter()
+            .any(|id| text.starts_with(crate::anchor(id)));
+        let shell = text.starts_with("! for shell mode") && shell_mode_frame(rows) == Some(frame);
+        is_mode_row(mode) || bare || shell
+    })?;
+    footer[first..]
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (i, crate::text::trim_end(row)))
+        .filter(|(_, row)| row.chars().count() + 3 >= width)
+        .find_map(|(i, row)| {
+            if i == 0 {
+                context_at_end(row)
+            } else {
+                context_reading(crate::text::trim(row))
+            }
+        })
+}
+
+/// The percentage an indicator ending `row` reads: the indicator's words alone, or after the
+/// row's other words and a space.
+fn context_at_end(row: &str) -> Option<u8> {
+    let t = crate::text::trim(row);
+    let digits = |head: &str| head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let start = t
+        .strip_suffix("% until auto-compact")
+        .map(digits)
+        .or_else(|| {
+            let head = &t[..digits(t.strip_suffix('%')?)];
+            head.strip_suffix("Context left until auto-compact: ")
+                .map(str::len)
+        })?;
+    let (words, indicator) = t.split_at(start);
+    (words.is_empty() || words.ends_with(' '))
+        .then(|| context_reading(indicator))
+        .flatten()
 }
 
 /// The cells of the composer's bottom rule in `frame`, trimmed.
@@ -1188,7 +1391,8 @@ fn rule_width(rows: &[String], frame: Frame) -> usize {
     crate::text::trim_end(&rows[frame.bottom]).chars().count()
 }
 
-/// [`context_left`]'s reading in `frame`, its rule `width` cells.
+/// [`context_left`]'s reading in the live zone above `frame` (Claude Code 2.1.267 and 2.1.268), its
+/// rule `width` cells.
 fn context_above(rows: &[String], frame: Frame, width: usize) -> Option<u8> {
     let from = status_block(rows, frame.top).from;
     rows[from..frame.top]
@@ -2069,8 +2273,13 @@ fn is_summary_label(text: &str) -> bool {
 
 /// Whether `text`, a column-2 `⎿` row's past its `⎿`, is the row a hook's error opens.
 fn is_hook_error_row(text: &str) -> bool {
-    ["hook.error", "hook.blocking_error"].iter().any(|id| {
-        text.strip_suffix(crate::anchors::anchor(id))
+    [
+        crate::anchor!("hook.error"),
+        crate::anchor!("hook.blocking_error"),
+    ]
+    .iter()
+    .any(|tail| {
+        text.strip_suffix(tail)
             .is_some_and(|name| !name.is_empty() && !name.contains(char::is_whitespace))
     })
 }
@@ -2515,6 +2724,67 @@ fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
             .get(i..i + n)
             .is_some_and(|b| b.eq_ignore_ascii_case(needle.as_bytes()))
     })
+}
+
+/// Claude Code's context indicator on recorded screens (rows by `prompt::fixtures::screen`), for
+/// the tests of [`context_left`] and of what takes its reading: the supervisor's watch and the
+/// window's footer.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod context_fixtures {
+    /// 2.1.310 at rest after a long stub reply: `14% until auto-compact` ends the mode row.
+    pub const MODE_ROW_14: &str =
+        include_str!("fixtures/claude-2.1.310-context-mode-row-turn1.txt");
+    /// 2.1.310 after the next reply: `7% until auto-compact`, under the watch's threshold of 10.
+    pub const MODE_ROW_7: &str = include_str!("fixtures/claude-2.1.310-context-mode-row-turn2.txt");
+    /// [`MODE_ROW_7`] narrowed to 60 columns: one space between the mode row's words and it.
+    pub const MODE_ROW_60COL: &str =
+        include_str!("fixtures/claude-2.1.310-context-mode-row-60col.txt");
+    /// [`MODE_ROW_7`] narrowed to 44 columns: on a row of its own under the mode row.
+    pub const MODE_ROW_44COL: &str =
+        include_str!("fixtures/claude-2.1.310-context-mode-row-44col.txt");
+    /// The `/` menu open over [`MODE_ROW_7`]: it stands in the mode row's place.
+    pub const SLASH_MENU: &str = include_str!("fixtures/claude-2.1.310-context-slash-open.txt");
+    /// The `@` menu open over [`MODE_ROW_7`].
+    pub const AT_MENU: &str = include_str!("fixtures/claude-2.1.310-context-at-open.txt");
+    /// The `?` shortcuts open over [`MODE_ROW_7`].
+    pub const SHORTCUTS: &str = include_str!("fixtures/claude-2.1.310-context-help-open.txt");
+    /// 1 s after `/compact`: Claude Code's `◐ medium · /effort` notice in the indicator's slot.
+    pub const COMPACTED_EFFORT: &str =
+        include_str!("fixtures/claude-2.1.310-context-compacted-effort.txt");
+    /// 15 s after `/compact`: the slot empty.
+    pub const COMPACTED: &str = include_str!("fixtures/claude-2.1.310-context-compacted.txt");
+    /// 15 s after `/compact` at 44 columns: the slot empty (no effort notice stood in it at 1 s).
+    pub const COMPACTED_44COL: &str =
+        include_str!("fixtures/claude-2.1.310-context-compacted-44col.txt");
+    /// 2.1.281, the oldest build measured (2.1.281, 2.1.282, 2.1.304 and 2.1.310 all draw it on
+    /// the mode row): `0% until auto-compact` ends the mode row.
+    pub const MODE_ROW_2_1_281: &str =
+        include_str!("fixtures/claude-2.1.281-context-mode-row-turn1.txt");
+    /// 2.1.310 in shell mode (`!` typed into an empty composer over [`MODE_ROW_7`]): the box's
+    /// caret is `!` and the indicator stays at the mode row's end.
+    pub const SHELL_MODE: &str = include_str!("fixtures/claude-2.1.310-context-shell-mode.txt");
+    /// 2.1.267/2.1.268, the builds a driven worker ran when the watch was written (seen
+    /// 2026-09-13, cc86c5cfe9; recorded 2026-09-14): `1% until auto-compact` above the composer's
+    /// top rule. The indicator moved to the mode row between 2.1.268 and 2.1.281.
+    pub const ABOVE_OLDER: &str = include_str!("fixtures/context-low.txt");
+
+    /// A constructed agent-menu description ending exactly at the rule's right edge, where
+    /// the real indicator sits. The recorded menu's composer and other entries stay intact.
+    pub fn menu_description(left: u8) -> String {
+        let mut rows = crate::prompt::fixtures::screen(AT_MENU);
+        let frame = super::composer_frame(&rows).expect("the recorded menu's composer");
+        let width = super::rule_width(&rows, frame);
+        let prefix = "    * audit (agent) – ";
+        let suffix = format!("{left}% until auto-compact");
+        let pad = width - prefix.chars().count() - suffix.chars().count() - 1;
+        let entry = rows
+            .iter_mut()
+            .find(|row| row.starts_with("    * claude (agent)"))
+            .expect("the recorded menu's agent entry");
+        *entry = format!("{prefix}{} {suffix}", "a".repeat(pad));
+        rows.join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -4008,6 +4278,118 @@ mod tests {
     }
 
     #[test]
+    fn only_the_network_and_no_response_retry_rows_read_as_an_api_retry_row() {
+        let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+        let read =
+            |row: &str| api_retry_row(&screen(&["⏺ Reading the parser.", "", row, ""], footer));
+        for (row, cause, next, waited) in [
+            (
+                "✻ Waiting for API response · will retry in 5s · check your network",
+                RetryCause::Stalled,
+                Some(5),
+                None,
+            ),
+            (
+                "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+                RetryCause::NoResponse,
+                None,
+                Some(30),
+            ),
+            (
+                "✶ No response from the API after 1m 5s · retrying once, waiting up to 1m",
+                RetryCause::NoResponse,
+                None,
+                Some(65),
+            ),
+            (
+                "✻ Connection dropped (ECONNRESET) · Retrying in 1m 4s · attempt 8/10",
+                RetryCause::Unreachable,
+                Some(64),
+                None,
+            ),
+            (
+                "✳ No internet route — check your connection or VPN (ENETUNREACH) · Retrying in \
+                 9s · attempt 4/10",
+                RetryCause::Unreachable,
+                Some(9),
+                None,
+            ),
+        ] {
+            let r = read(row).unwrap_or_else(|| panic!("read: {row}"));
+            assert_eq!(
+                (r.row, r.cause, r.next_try_s, r.waited_s),
+                (2, cause, next, waited),
+                "{row}"
+            );
+        }
+        for row in [
+            "✻ Auto mode check unavailable · next try in 5s · attempt 2/10 · esc to interrupt",
+            "✻ Your request is queued · next try in 5s · attempt 2 · esc to interrupt",
+            "✻ Usage limit reached · Retrying in 14s (9:50pm) · attempt 3/10",
+            "✻ Usage limit reached · Retrying in 2d 3h · attempt 3/10",
+            "✻ Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED) · \
+             Retrying in 9s · attempt 4/10",
+            "✻ API Error (500 Internal server error) · Retrying in 9s · attempt 4/10",
+            "✻ Can't reach the API server… (12s · ↓ 1.1k tokens)",
+            "⏺ Can't reach the API server — check your internet or DNS (ENOTFOUND) · Retrying in \
+             2s · attempt 5/10",
+        ] {
+            assert_eq!(read(row), None, "{row}");
+        }
+        let said = screen(
+            &["⏺ It printed · Retrying in 5s · attempt 2/10", ""],
+            footer,
+        );
+        assert_eq!(api_retry_row(&said), None, "prose");
+        let wrapped = pane(
+            &[
+                "⏺ Reading the parser.",
+                "",
+                "✻ Can't reach the API server — check your internet or DNS (ENOTFOUND) ·",
+                "  Retrying in 14s · attempt 6/10",
+            ],
+            72,
+            "  ⏵⏵ auto mode on (shift+tab to",
+        );
+        assert_eq!(api_retry_row(&wrapped), None, "wrapped across rows");
+        use crate::prompt::fixtures::{
+            API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED, API_RETRYING_QUEUED_80_MEASURED,
+            API_RETRYING_QUEUED_DRAFT_MEASURED, API_RETRYING_QUEUED_MEASURED, screen as measured,
+        };
+        for (text, next) in [
+            (API_RETRYING_MEASURED, 2),
+            (API_RETRYING_DRAFT_MEASURED, 14),
+            (API_RETRYING_QUEUED_MEASURED, 13),
+            (API_RETRYING_QUEUED_80_MEASURED, 30),
+            (API_RETRYING_QUEUED_DRAFT_MEASURED, 28),
+        ] {
+            let rows = measured(text);
+            let r = api_retry_row(&rows).expect("the measured retry row");
+            assert_eq!(
+                (r.cause, r.next_try_s),
+                (RetryCause::Unreachable, Some(next))
+            );
+            assert!(rows[r.row].contains(&r.text), "{:?}", r.text);
+        }
+        let r = api_retry_row(&measured(API_RETRYING_MEASURED)).expect("read");
+        assert_eq!(
+            r.guard,
+            "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+Can't.reach.the.API.server.—.check.your.internet.or.DNS.\
+             \\(ENOTFOUND\\).·.Retrying.in."
+        );
+        let r = read(
+            "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+        )
+        .expect("read");
+        assert_eq!(
+            r.guard, "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+No.response.from.the.API.after.",
+            "the try's own count moves: the guard stops before it"
+        );
+        assert_eq!(wait_secs("1m…"), None, "a cut wait");
+        assert_eq!(wait_secs("2d 3h"), Some(2 * 86_400 + 3 * 3600));
+    }
+
+    #[test]
     fn a_status_line_join_never_loses_the_rows_own_busy_reading() {
         let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
         let hint = "A proxy or gateway that buffers streaming responses can cause this · set \
@@ -4709,7 +5091,7 @@ mod tests {
     }
 
     #[test]
-    fn the_context_indicator_on_the_mode_row_is_shown() {
+    fn the_context_indicator_on_the_mode_row_is_read() {
         let on_mode_row = |width: usize, hints: &str, end: &str| {
             let mut r = rows(&[
                 "⏺ Hi! I am the local lab stub, not a model. (reply 1)",
@@ -4724,18 +5106,25 @@ mod tests {
         };
         let idle = "  ⏸ manual mode on · ? for shortcuts";
         for width in [80, 144] {
-            for hints in [idle, "  ⏸ manual mode on · esc to interrupt"] {
+            for hints in [
+                idle,
+                "  ⏸ manual mode on · esc to interrupt",
+                "  -- INSERT -- ⏸ manual mode on",
+                "  ? for shortcuts",
+                "  esc to clear",
+                "  esc to interrupt",
+            ] {
                 for (end, left) in [
                     ("0% until auto-compact", 0),
                     ("37% until auto-compact", 37),
                     ("Context left until auto-compact: 8%", 8),
                 ] {
                     let r = on_mode_row(width, hints, end);
-                    assert_eq!(context_left_shown(&r), Some(left), "{width} {hints} {end}");
+                    assert_eq!(context_left(&r), Some(left), "{width} {hints} {end}");
                 }
             }
         }
-        assert_eq!(context_left_shown(&saved_screen(CONTEXT_LOW)), Some(1));
+        assert_eq!(context_left(&saved_screen(CONTEXT_LOW)), Some(1));
         for (what, r) in [
             (
                 "short of the edge",
@@ -4761,8 +5150,94 @@ mod tests {
                 "no composer",
                 rows(&["⏺ Done.", "", "                0% until auto-compact"]),
             ),
+            (
+                "glued to the mode row's words",
+                on_mode_row(80, "", &format!("{idle}7% until auto-compact")),
+            ),
+            (
+                "glued to a version",
+                on_mode_row(80, idle, "v2.17% until auto-compact"),
+            ),
+            (
+                "the long form glued to the mode row's words",
+                on_mode_row(
+                    80,
+                    "",
+                    &format!("{idle}Context left until auto-compact: 8%"),
+                ),
+            ),
         ] {
-            assert_eq!(context_left_shown(&r), None, "{what}");
+            assert_eq!(context_left(&r), None, "{what}");
+        }
+        let mut statusline = crate::prompt::fixtures::screen(include_str!(
+            "fixtures/claude-2.1.304-statusline-login-words-after-reply.txt"
+        ));
+        let frame = composer_frame(&statusline).expect("the recorded composer");
+        let width = rule_width(&statusline, frame);
+        let mode = frame.bottom + 2;
+        assert!(is_mode_row(&statusline[mode]));
+        let at_edge = |row: &str, left: u8| {
+            let indicator = format!("{left}% until auto-compact");
+            let pad = width - row.chars().count() - indicator.chars().count();
+            format!("{row}{}{indicator}", " ".repeat(pad))
+        };
+        statusline[mode] = at_edge(&statusline[mode], 7);
+        assert_eq!(context_left(&statusline), Some(7));
+        statusline[frame.bottom + 1] = at_edge(&statusline[frame.bottom + 1], 50);
+        assert_eq!(context_left(&statusline), Some(7));
+    }
+
+    /// The one reading on recorded screens of each build: at the mode row's end at any width and
+    /// in shell mode (2.1.281 to 2.1.310), above the composer on 2.1.267/2.1.268, and none while a
+    /// menu, the shortcuts or a notice stands in its slot, or after `/compact`.
+    #[test]
+    fn claude_codes_context_indicator_is_read_where_each_build_draws_it() {
+        use super::context_fixtures as f;
+        let low_menu = f::menu_description(7);
+        let high_menu = f::menu_description(50);
+        for (what, text, left) in [
+            ("2.1.310 at 120 columns", f::MODE_ROW_14, Some(14)),
+            ("2.1.310 lower", f::MODE_ROW_7, Some(7)),
+            (
+                "2.1.310 at 60 columns, after one space",
+                f::MODE_ROW_60COL,
+                Some(7),
+            ),
+            (
+                "2.1.310 at 44 columns, on a row of its own",
+                f::MODE_ROW_44COL,
+                Some(7),
+            ),
+            ("2.1.281", f::MODE_ROW_2_1_281, Some(0)),
+            ("2.1.310 in shell mode", f::SHELL_MODE, Some(7)),
+            (
+                "2.1.267/2.1.268, above the composer",
+                f::ABOVE_OLDER,
+                Some(1),
+            ),
+            ("the / menu", f::SLASH_MENU, None),
+            ("the @ menu", f::AT_MENU, None),
+            (
+                "a low percentage in an agent description",
+                low_menu.as_str(),
+                None,
+            ),
+            (
+                "a rising percentage in an agent description",
+                high_menu.as_str(),
+                None,
+            ),
+            ("the shortcuts", f::SHORTCUTS, None),
+            (
+                "the effort notice after /compact",
+                f::COMPACTED_EFFORT,
+                None,
+            ),
+            ("after /compact", f::COMPACTED, None),
+            ("after /compact at 44 columns", f::COMPACTED_44COL, None),
+        ] {
+            let r = crate::prompt::fixtures::screen(text);
+            assert_eq!(context_left(&r), left, "{what}");
         }
     }
 

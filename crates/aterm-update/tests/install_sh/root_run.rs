@@ -3234,7 +3234,13 @@ fn an_interrupted_root_run_leaves_no_staging_folder_behind() {
 /// either. Before, the run ended at the step the Ctrl-C killed and left
 /// the staging copy, the set-aside old copy and the download behind. A
 /// set-aside copy the cleanup could not put back stays, and it says where, and
-/// so does an image no detach could release, which rm never walks into.
+/// so does an image no detach could release, which rm never walks into. A
+/// Ctrl-\ (SIGQUIT) never cuts it short either, in the removal of the staging
+/// copy (quit) or of the download, and cuts a wedged detach as a Ctrl-C does
+/// (detachquit: the hdiutil stand-in sends the row's signal). Nothing dies of
+/// a QUIT, a death by a core-dump signal, for which macOS writes a crash
+/// report: the rm stand-in starts with it ignored, and the hdiutil one, which
+/// the detach's cut leaves it at its default, catches it and exits.
 #[test]
 fn a_ctrl_c_never_cuts_the_cleanup_short() {
     let scratch = Scratch::new();
@@ -3244,7 +3250,7 @@ fn a_ctrl_c_never_cuts_the_cleanup_short() {
         "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/rm\" <<'EOF'
 #!/bin/sh
 for last; do :; done
-[ \"$last\" != \"$CUT\" ] || { echo cut >>\"$TMPDIR/cut-$ROW\"; kill -s INT 0; }
+[ \"$last\" != \"$CUT\" ] || { echo cut >>\"$TMPDIR/cut-$ROW\"; kill -s \"$SIG\" 0; }
 exec /bin/rm \"$@\"
 EOF
 cat >\"$TMPDIR/bin/hdiutil\" <<'EOF'
@@ -3252,7 +3258,8 @@ cat >\"$TMPDIR/bin/hdiutil\" <<'EOF'
 echo \"$3\" >>\"$TMPDIR/hdiutil-$ROW\"
 [ \"$ROW\" != mounted ] || exit 1
 [ \"$3\" = -force ] && exit 0
-kill -s INT 0
+trap 'exit 1' QUIT
+kill -s \"$SIG\" 0
 exec /bin/sleep 30
 EOF
 chmod +x \"$TMPDIR/bin/rm\" \"$TMPDIR/bin/hdiutil\" && cat >\"$TMPDIR/cleanup.bash\" <<'EOF'
@@ -3262,20 +3269,30 @@ ATERM_INSTALL_LIBRARY_ONLY=1
 DEST=\"$TMPDIR/$1\" TMP=\"$TMPDIR/$1.[t]mp\" CONTAINER_KIND=zip STAGE_DIR=\"\"
 MNT=\"$TMP/mnt\" STAGE=\"$DEST/aterm.app.installing.x\" OLD=\"$DEST/.aterm.app.old.x\"
 mkdir -p \"$DEST/aterm.app\" \"$STAGE\" \"$OLD\" \"$MNT\"
-# rm sends the Ctrl-C as it starts on CUT.
-export ROW=$1 CUT=\"$STAGE\"
+# rm sends the Ctrl-C (a Ctrl-\\ in the quit row) as it starts on CUT.
+export ROW=$1 CUT=\"$STAGE\" SIG=INT
 PATH=\"$TMPDIR/bin:$PATH\"
 trap install_app_cleanup EXIT
 case \"$1\" in
 refusal) exit 1 ;;
+quit) SIG=QUIT; exit 1 ;;
 second) kill -s INT 0 ;;
 detach) CUT=\"$TMP\" CONTAINER_KIND=dmg; sleep() { :; }; exit 1 ;;
+detachquit) SIG=QUIT CUT=\"$TMP\" CONTAINER_KIND=dmg; sleep() { :; }; exit 1 ;;
 restore) CUT=\"\"; command rmdir \"$DEST/aterm.app\"; mv() { return 1; }; exit 1 ;;
 mounted) CUT=\"\" CONTAINER_KIND=dmg; sleep() { :; }; mkdir \"$MNT/aterm.app\"; : >\"$TMP/aterm.dmg\"; exit 1 ;;
 esac
 EOF",
     );
-    let tags = ["refusal", "second", "detach", "restore", "mounted"];
+    let tags = [
+        "refusal",
+        "second",
+        "detach",
+        "restore",
+        "mounted",
+        "quit",
+        "detachquit",
+    ];
     let calls: Vec<usize> = tags
         .iter()
         .map(|tag| {
@@ -3301,6 +3318,8 @@ EOF",
             calls[4],
             "exit 1 aterm.app tmp mnt -quiet -force",
         ),
+        ("quit", calls[5], "exit 1 aterm.app cut"),
+        ("detachquit", calls[6], "exit 1 aterm.app -quiet -force cut"),
     ] {
         assert_eq!(recs[call].out, want, "{tag}: {}", recs[call].err);
     }
@@ -3318,6 +3337,175 @@ EOF",
         "{}",
         recs[calls[4]].err
     );
+}
+
+/// A NOTE's command pastes back as the words it names, whatever a path holds,
+/// and starts with sudo only when acting in its folder needs it: in a root
+/// run's, or in one this account cannot write.
+#[test]
+fn a_note_command_pastes_back_as_its_words() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "d=\"$TMPDIR/it's [a] dir\"; mkdir -p \"$d/ro\" && chmod 555 \"$d/ro\"; \
+         sudo() { printf 'sudo:'; \"$@\"; }; mv() { printf '<%s>' \"$@\"; }; \
+         pasted() { [ \"$(eval \"$(note_command \"$1\" mv \"$d/a b\" \"$d/c'd\")\")\" = \"$2<$d/a b><$d/c'd>\" ] && echo pasted; }",
+    );
+    let own = lib.call("pasted \"$d\" ''", &[]);
+    let unwritable = lib.call("pasted \"$d/ro\" sudo:", &[]);
+    let root = lib.call("installer_uid() { echo 0; }; pasted \"$d\" sudo:", &[]);
+    let recs = lib.run(&scratch);
+    for (label, call) in [("own", own), ("unwritable", unwritable), ("root", root)] {
+        assert_eq!(recs[call].out, "pasted", "{label}: {}", recs[call].err);
+    }
+}
+
+/// Each NOTE the cleanup and the swap print pastes back as the command it names,
+/// whatever DEST and TMPDIR hold (here a quote, a space and a bracket):
+/// restoring the set-aside bundle, detaching an image still mounted, and
+/// removing an old copy the swap could not, which names sudo whatever the
+/// folder, as that rm just failed as this account.
+#[test]
+fn the_cleanup_notes_paste_back_as_their_words() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        "d=\"$TMPDIR/it's [a] dir\"; DEST=\"$d/de st\" TMP=\"$d/t'mp\"; MNT=\"$TMP/mnt\" STAGE=\"\" STAGE_DIR=\"\" OLD=\"\"; \
+         words() { printf '<%s>' \"$@\"; }; \
+         pasted() { local cmd; cmd=\"$(grep NOTE | sed -n 's/.* with: \\(.*\\))$/\\1/p')\"; \
+         ( sudo() { printf sudo:; \"$@\"; }; mv() { printf mv; words \"$@\"; }; rm() { printf rm; words \"$@\"; }; \
+         hdiutil() { printf hdiutil; words \"$@\"; }; eval \"$cmd\" ); }",
+    );
+    let restore = lib.call(
+        "( OLD=\"$DEST/.aterm.app.old.x\" CONTAINER_KIND=zip; mkdir -p \"$OLD\" \"$TMP\"; mv() { return 1; }; \
+         [ \"$(install_app_cleanup 2>&1 >/dev/null | pasted)\" = \"mv<$OLD><$DEST/aterm.app>\" ] && echo pasted )",
+        &[],
+    );
+    let mounted = lib.call(
+        "( CONTAINER_KIND=dmg; mkdir -p \"$MNT/aterm.app\"; hdiutil() { return 1; }; sleep() { :; }; \
+         [ \"$(install_app_cleanup 2>&1 >/dev/null | pasted)\" = \"hdiutil<detach><-force><$MNT>\" ] && echo pasted )",
+        &[],
+    );
+    let removal = lib.call(
+        "( mkdir -p \"$DEST/aterm.app/Contents/MacOS\" \"$d/stage\"; STAGE=\"$d/stage\"; \
+         rm() { [ \"$2\" != \"$OLD\" ] || return 1; command rm \"$@\"; }; \
+         note=\"$(swap_staged_bundle \"$DEST\" 2>&1 >/dev/null)\"; \
+         [[ \"$(printf '%s\\n' \"$note\" | pasted)\" == \"sudo:rm<-rf><$DEST/.aterm.app.old.\"*\">\" ]] && echo pasted )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    for (label, call) in [
+        ("restore", restore),
+        ("mounted", mounted),
+        ("removal", removal),
+    ] {
+        assert_eq!(recs[call].out, "pasted", "{label}: {}", recs[call].err);
+    }
+}
+
+/// A TERM or a HUP sent to the installer's shell alone, while ditto stages the
+/// bundle (the term and hup rows), while ditto expands the lean zip (unpack),
+/// or while the swap sets the old bundle aside (swap), ends the run once that
+/// step is done, and the cleanup then leaves what it should: no staging copy,
+/// no expanded download, the old bundle back in place. Before, bash ended at
+/// once and ran the cleanup while the step went on, so the copy or the
+/// expansion made after it stayed, and the rename the cleanup did not wait for
+/// left no aterm.app. Each stand-in signals its parent first and does its work
+/// a second later. Once the swap is done, a TERM or a HUP ends the run at once
+/// again (the later rows), never after the child it lands in, as the toolset
+/// seed's minutes would be.
+#[test]
+fn a_term_to_the_shell_alone_never_leaves_a_staging_copy() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/ditto\" <<'EOF'
+#!/bin/sh
+case \"$ROW:$1\" in
+term:* | hup:* | unpack*:-x) kill -s \"$SIG\" \"$PPID\"; /bin/sleep 1; cut=1 ;;
+esac
+if [ \"$1\" = -x ]; then
+\tmkdir -p \"$4/aterm.app/Contents\" && : >\"$4/aterm.app/Contents/new\"
+else
+\tmkdir -p \"$2\" && cp -R \"$1/.\" \"$2\"
+fi
+[ -z \"${cut:-}\" ] || : >\"$DONE\"
+EOF
+cat >\"$TMPDIR/bin/mv\" <<'EOF'
+#!/bin/sh
+case \"$ROW:$1\" in
+swap*:*/aterm.app) kill -s \"$SIG\" \"$PPID\"; /bin/sleep 1; cut=1 ;;
+esac
+/bin/mv \"$@\"; s=$?
+[ -z \"${cut:-}\" ] || : >\"$DONE\"
+exit $s
+EOF
+cat >\"$TMPDIR/bin/later\" <<'EOF'
+#!/bin/sh
+kill -s \"$SIG\" \"$PPID\"
+i=0
+while kill -0 \"$PPID\" 2>/dev/null && [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
+if kill -0 \"$PPID\" 2>/dev/null; then echo waited >\"$DONE\"; else echo ended >\"$DONE\"; fi
+EOF
+chmod +x \"$TMPDIR/bin/ditto\" \"$TMPDIR/bin/mv\" \"$TMPDIR/bin/later\" && cat >\"$TMPDIR/place.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+DEST=\"$TMPDIR/$1\" TMP=\"$TMPDIR/$1.tmp\" CONTAINER_KIND=zip STAGE=\"\" STAGE_DIR=\"\" OLD=\"\"
+MNT=\"$TMP/mnt\"
+mkdir -p \"$DEST\" \"$TMP\"
+case \"$1\" in
+unpack*) : >\"$TMP/aterm.zip\" ;;
+*) mkdir -p \"$MNT/aterm.app/Contents\" && : >\"$MNT/aterm.app/Contents/new\" ;;
+esac
+# A fresh install in the later and unpack rows, so the swap asks no
+# may_replace; the old bundle in the swap rows has no program to ask.
+case \"$1\" in
+later* | unpack*) ;;
+swap*) mkdir -p \"$DEST/aterm.app/Contents/MacOS\" && : >\"$DEST/aterm.app/Contents/old\" ;;
+*) mkdir \"$DEST/aterm.app\" ;;
+esac
+export ROW=\"$1\" SIG=\"$2\" DONE=\"$TMPDIR/done-$1\"
+PATH=\"$TMPDIR/bin:$PATH\"
+trap install_app_cleanup EXIT
+case \"$1\" in
+unpack*) unpack_container \"$TMP/aterm.zip\" \"$MNT\" ;;
+esac
+place_bundle \"$MNT/aterm.app\" \"$DEST\"
+case \"$1\" in
+later*) later ;;
+esac
+echo went on
+EOF",
+    );
+    let rows = [
+        ("term", "TERM", "signal 15 aterm.app"),
+        ("hup", "HUP", "signal 1 aterm.app"),
+        ("swap", "TERM", "signal 15 aterm.app MacOS old"),
+        ("swaphup", "HUP", "signal 1 aterm.app MacOS old"),
+        ("unpack", "TERM", "signal 15"),
+        ("unpackhup", "HUP", "signal 1"),
+        ("later", "TERM", "signal 15 aterm.app new ended"),
+        ("laterhup", "HUP", "signal 1 aterm.app new ended"),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(tag, sig, _)| {
+            lib.call(
+                format!(
+                    "r=\"$({})\"; i=0; until [ -e \"$TMPDIR/done-{tag}\" ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i + 1)); done; \
+                     echo \"$r\" $(ls -A \"$TMPDIR/{tag}\") $(ls \"$TMPDIR/{tag}/aterm.app/Contents\" 2>/dev/null) \
+                     $([ ! -e \"$TMPDIR/{tag}.tmp\" ] || echo tmp) $(cat \"$TMPDIR/done-{tag}\")",
+                    group_run(&format!("\"$TMPDIR/place.bash\" {tag} {sig}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((tag, _, want), call) in rows.iter().zip(calls) {
+        assert_eq!(recs[call].out, *want, "{tag}: {}", recs[call].err);
+    }
 }
 
 fn gid(path: &std::path::Path) -> u32 {

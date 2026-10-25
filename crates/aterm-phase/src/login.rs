@@ -114,8 +114,8 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
         .map(|r| trim_end(r))
         .filter(|r| !r.is_empty())
         .collect();
-    let has = |id: &str| body.iter().any(|r| contains(r, anchor_text_of(id)));
-    if has("login.success") {
+    let has = |text: &str| body.iter().any(|r| contains(r, text));
+    if has(crate::anchor!("login.success")) {
         let row = body
             .iter()
             .find(|r| contains(r, crate::anchor!("login.success")))
@@ -123,7 +123,7 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
             .unwrap_or_default();
         return Some(LoginScreen::Success { row });
     }
-    if has("login.method") {
+    if has(crate::anchor!("login.method")) {
         let mut methods = Vec::new();
         let mut focused = None;
         for r in &body {
@@ -154,17 +154,16 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
             title_row: title.clone(),
         }));
     }
-    if has("login.console_how") {
+    if has(crate::anchor!("login.console_how")) {
         return Some(LoginScreen::ConsoleMenu);
     }
-    if has("login.opening") || has("login.no_browser") || has("login.paste") {
+    if has(crate::anchor!("login.opening"))
+        || has(crate::anchor!("login.no_browser"))
+        || has(crate::anchor!("login.paste"))
+    {
         return Some(LoginScreen::Browser);
     }
     Some(LoginScreen::Failed)
-}
-
-fn anchor_text_of(id: &str) -> &'static str {
-    crate::anchors::anchor(id)
 }
 
 /// Whether the last thing said is `⎿  Login interrupted` under `❯ /login`.

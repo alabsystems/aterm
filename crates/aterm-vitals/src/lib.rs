@@ -10,6 +10,7 @@ pub mod events;
 pub mod explain;
 #[cfg(any(test, debug_assertions))]
 pub mod fixtures;
+pub mod glance;
 pub mod gpu_clients;
 pub mod history;
 pub mod ink;

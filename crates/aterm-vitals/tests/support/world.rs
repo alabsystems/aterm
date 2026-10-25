@@ -47,7 +47,7 @@ pub struct Proc {
     /// Page-ins a second.
     pub pageins_per_s: u64,
     pub counters: JobCounters,
-    /// Counters refused (another user, or an injected EPERM).
+    /// Counters and descriptors refused (another user, or an injected EPERM).
     pub refused: bool,
     /// Descriptors besides the output file.
     pub fds: Vec<Fd>,
@@ -153,6 +153,9 @@ pub struct World {
     /// The word of each nested session's terminal aterm's user may open, by its leader.
     pub terms: HashMap<u32, TermWord>,
     looked: HashMap<(u32, u64, u64), u64>,
+    /// The reader reads pid versions (macOS): with none (Linux), only a command's text tells
+    /// the engine its shell ran `exec`.
+    pub versions: bool,
 }
 
 impl Default for World {
@@ -179,6 +182,7 @@ impl World {
             limit: Some(5333),
             vars: HashMap::new(),
             looked: HashMap::new(),
+            versions: true,
         };
         let mut aterm = Proc::new(100, 1, "aterm");
         aterm.sid = 100;
@@ -584,10 +588,11 @@ impl World {
                 }]
             }),
             wchan: p.wchan.clone(),
-            fds: (want_fds && !zombie).then_some(fds),
+            fds: (want_fds && !zombie && !p.refused).then_some(fds),
             program_check: p.held
                 && p.wait == aterm_vitals::jobs::StartWait::ProgramCheck
                 && !zombie,
+            version: (self.versions && !zombie).then_some(p.exec),
         }
     }
 

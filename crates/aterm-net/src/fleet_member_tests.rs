@@ -13,6 +13,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const HANG: Duration = Duration::from_secs(60);
 
+fn waiting<R>(
+    wait: Duration,
+    told: Option<std::sync::mpsc::Sender<()>>,
+    run: impl FnOnce() -> R,
+) -> R {
+    TEST_WAIT.with_borrow_mut(|seam| *seam = Some((wait, told)));
+    let ran = run();
+    TEST_WAIT.with_borrow_mut(|seam| *seam = None);
+    ran
+}
+
+fn refused_at_once(dir: &Path) -> io::Error {
+    waiting(Duration::ZERO, None, || node_identity(dir)).unwrap_err()
+}
+
 fn secret(byte: u8) -> FleetSecret {
     FleetSecret::new(&[byte; SECRET_LEN]).unwrap()
 }
@@ -280,7 +295,7 @@ fn a_node_key_is_minted_once_and_read_back_as_itself() {
     {
         let _claim = BookLock::take(state.dir(), Duration::ZERO).unwrap();
         assert_eq!(
-            node_identity(state.dir()).unwrap_err().kind(),
+            refused_at_once(state.dir()).kind(),
             io::ErrorKind::WouldBlock
         );
         assert!(read_node_id(state.dir()).unwrap().is_none());
@@ -294,7 +309,7 @@ fn a_node_key_is_minted_once_and_read_back_as_itself() {
     {
         let _claim = BookLock::take(state.dir(), Duration::ZERO).unwrap();
         assert_eq!(
-            node_identity(state.dir()).unwrap_err().kind(),
+            refused_at_once(state.dir()).kind(),
             io::ErrorKind::WouldBlock
         );
         assert_eq!(
@@ -317,7 +332,7 @@ fn a_node_key_is_minted_once_and_read_back_as_itself() {
     {
         let _claim = BookLock::take(state.dir(), Duration::ZERO).unwrap();
         assert_eq!(
-            node_identity(state.dir()).unwrap_err().kind(),
+            refused_at_once(state.dir()).kind(),
             io::ErrorKind::WouldBlock
         );
         let kept = read_node_identity(state.dir()).unwrap().unwrap();
@@ -642,7 +657,9 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     );
     let other = BookLock::take(dir, Duration::ZERO).unwrap();
     mode(dir, 0o750);
-    let refused = leave_held(dir, |_| ()).unwrap_err().to_string();
+    let refused = waiting(Duration::ZERO, None, || leave_held(dir, |_| ()))
+        .unwrap_err()
+        .to_string();
     assert!(refused.contains("(750), and is 0700 now"), "{refused}");
     let shown = dir.display().to_string();
     assert_eq!(refused.matches(&shown).count(), 1, "{refused}");
@@ -693,10 +710,26 @@ fn a_lock_refusal_names_the_directory_once() {
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     once(node_identity(dir).unwrap_err().to_string());
     std::fs::remove_file(&lock).unwrap();
-    let _other = BookLock::take(dir, Duration::ZERO).unwrap();
-    let busy = node_identity(dir).unwrap_err();
+    let other = BookLock::take(dir, Duration::ZERO).unwrap();
+    let busy = refused_at_once(dir);
     assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
     once(busy.to_string());
+    let (told, held) = std::sync::mpsc::channel();
+    let minting = std::thread::spawn({
+        let dir = dir.to_path_buf();
+        move || waiting(HANG, Some(told), || node_identity(&dir)).map(|me| me.key())
+    });
+    held.recv_timeout(HANG)
+        .expect("the writer finds the lock held and waits");
+    drop(other);
+    let minted = minting
+        .join()
+        .unwrap()
+        .expect("a writer that ends is waited out");
+    assert_eq!(
+        read_node_identity(dir).unwrap().map(|me| me.key()),
+        Some(minted)
+    );
 }
 
 #[test]
@@ -4767,6 +4800,39 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     }
     running.store(false, Ordering::Release);
     serving.join().unwrap();
+}
+
+#[test]
+fn a_listener_that_hangs_up_in_the_handshake_is_said_to() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hanging = std::thread::spawn(move || drop(listener.accept().unwrap()));
+    let dialled = dial(
+        "127.0.0.1",
+        None,
+        port,
+        (&secret(6), None),
+        FleetOp::Survey,
+        HANG,
+    );
+    hanging.join().unwrap();
+    let Err(why) = dialled else {
+        panic!("a listener that hung up served");
+    };
+    assert!(why.hung_up(), "{why:?}");
+    let said = why.to_string();
+    assert!(
+        said.contains("hung up mid-handshake") && said.contains("try again"),
+        "{said}"
+    );
+    let at = SocketAddr::from(([192, 168, 1, 23], 7100));
+    for not in [
+        Unreached::Handshake(at, FleetError::AddressBusy),
+        Unreached::Handshake(at, FleetError::Tls(io::ErrorKind::InvalidData.into())),
+        Unreached::Connect(at, io::ErrorKind::ConnectionReset.into()),
+    ] {
+        assert!(!not.hung_up(), "{not:?}");
+    }
 }
 
 #[test]

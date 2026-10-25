@@ -1179,8 +1179,15 @@ impl ProcessLogin {
     /// variable names; for a [`Seam::LoginFile`], the named file's directory, where the file has
     /// the seam's name (one of another name is no stored login of the pool's). Its home is the
     /// default unless a home variable of its own, other than the seam's, is set. Two different
-    /// values of the seam variable, or a credential variable it reads ahead of a stored login
-    /// ([`crate::ai::connector::Connector::credential_env`]), mean it runs on no stored login.
+    /// values of the seam variable, or a credential variable the CLI reads ahead of or in place
+    /// of its stored login ([`crate::harness::relaunch::ahead_env`], the ones a pooled line
+    /// removes), mean it runs on no stored login. Any non-empty value of such a variable judges
+    /// so, even one the CLI ignores and runs on its stored login with (measured on Kimi Code
+    /// 2.3.1: a `KIMI_MODEL_API_KEY` with no `KIMI_MODEL_NAME`, a name of only spaces, a
+    /// `KIMI_CODE_CUSTOM_HEADERS` with no `Authorization` line), which holds a move rather than
+    /// makes one. One read behind the stored login (grok's `XAI_API_KEY`) or that is no login of
+    /// the CLI's (`OPENAI_API_KEY` for Codex) judges nothing, so the line that moves a session
+    /// and the judge of where it runs agree.
     #[must_use]
     pub fn of_env_for<'a>(
         cli: Cli,
@@ -1192,6 +1199,7 @@ impl ProcessLogin {
         let connector = cli.connector();
         let seam = cli.accounts().seam;
         let home_var = connector.home.var.filter(|var| *var != seam.var());
+        let ahead = super::relaunch::ahead_env(cli);
         let mut login: Option<&str> = None;
         let mut out = ProcessLogin {
             login: None,
@@ -1212,7 +1220,7 @@ impl ProcessLogin {
             if Some(name) == home_var {
                 out.default_home = false;
             }
-            if connector.credential_env.contains(&name) {
+            if ahead.contains(&name) {
                 out.stored_login = false;
             }
         }
@@ -1451,7 +1459,7 @@ pub(super) fn read_renewal_checkpoint(
     read_renewal_checkpoint_for(Cli::Claude, staging, actual_dir, now)
 }
 
-/// [`read_renewal_checkpoint`] of a checkpoint `cli`'s renewal wrote: one naming another CLI's
+/// `read_renewal_checkpoint` of a checkpoint `cli`'s renewal wrote: one naming another CLI's
 /// program is not this pool's.
 #[must_use]
 pub(super) fn read_renewal_checkpoint_for(
@@ -1527,6 +1535,58 @@ pub struct Binding {
     /// bound it ([`note_proof`]); a Claude Code renewal's proof is its status check, never
     /// written.
     pub proved_by: Option<Proof>,
+    /// The remaining human step of a renewal, cleared by a successful sign-in.
+    pub sign_in_task: Option<SignInTask>,
+}
+
+/// The human step a vendor renewal could not finish, without its page or error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignInAction {
+    /// Sign the row's browser profile in once, then retry its renewal.
+    Browser,
+    /// Approve the CLI's own sign-in on a terminal.
+    Login,
+}
+
+impl SignInAction {
+    /// The stored action word.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => "browser",
+            Self::Login => "login",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "browser" => Some(Self::Browser),
+            "login" => Some(Self::Login),
+            _ => None,
+        }
+    }
+
+    /// The next step for this action on `label` in `cli`'s pool.
+    #[must_use]
+    pub fn next_step(self, cli: Cli, label: &str) -> String {
+        let id = cli.id();
+        match self {
+            Self::Browser => format!(
+                "Run aterm harness accounts browser {label} --cli {id}, then aterm harness \
+                 accounts renew {label} --cli {id}"
+            ),
+            Self::Login => format!("Run aterm harness accounts login {label} --cli {id}"),
+        }
+    }
+}
+
+/// A durable renewal task. Its timestamp is evidence, never a login identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignInTask {
+    /// The remaining step.
+    pub action: SignInAction,
+    /// When the renewal stopped for a person, in Unix seconds.
+    pub at: i64,
 }
 
 /// What proved a sign-in made the row's account ([`Binding::proved_by`]).
@@ -1574,6 +1634,7 @@ impl Default for Binding {
             wrong_at: None,
             was: Vec::new(),
             proved_by: None,
+            sign_in_task: None,
         }
     }
 }
@@ -1649,6 +1710,12 @@ impl Logins {
                 if let Some(proof) = b.proved_by {
                     m.insert("proved_by".to_owned(), Value::from(proof.as_str()));
                 }
+                if let Some(task) = b.sign_in_task {
+                    let mut pending = Map::new();
+                    pending.insert("action".into(), Value::from(task.action.as_str()));
+                    pending.insert("at".into(), Value::from(task.at));
+                    m.insert("sign_in_task".into(), Value::Object(pending));
+                }
                 (label.clone(), Value::Object(m))
             })
             .collect();
@@ -1711,6 +1778,24 @@ impl Logins {
                 }
             };
             let v = value;
+            let sign_in_task = match v.get("sign_in_task") {
+                None | Some(Value::Null) => None,
+                Some(task) => {
+                    let action = task
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .and_then(SignInAction::parse)
+                        .ok_or_else(|| {
+                            Unread::NotOurs(format!(
+                                "binding `{label}` has an unknown sign-in task"
+                            ))
+                        })?;
+                    let at = stamp(task.get("at"), now).ok_or_else(|| {
+                        Unread::NotOurs(format!("binding `{label}` has no sign-in task timestamp"))
+                    })?;
+                    Some(SignInTask { action, at })
+                }
+            };
             let binding = Binding {
                 dir,
                 renewed_at: stamp(v.get("renewed_at"), now),
@@ -1727,6 +1812,7 @@ impl Logins {
                     .get("proved_by")
                     .and_then(Value::as_str)
                     .and_then(Proof::parse),
+                sign_in_task,
             };
             labels.insert(label.clone(), binding);
         }
@@ -1882,6 +1968,26 @@ pub fn wrong_accounts(roster: &Roster, logins: &Logins) -> Vec<String> {
         .collect()
 }
 
+/// The roster's pending human sign-in actions, in roster order.
+#[must_use]
+pub fn sign_in_tasks(roster: &Roster, logins: &Logins) -> Vec<(String, SignInAction)> {
+    roster
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let task = logins.get(&row.label)?.sign_in_task?;
+            Some((row.label.clone(), task.action))
+        })
+        .collect()
+}
+
+/// Records a renewal's remaining human action without changing its login binding.
+pub fn note_sign_in_task(logins: &mut Logins, label: &str, action: SignInAction, at: i64) {
+    if let Some(binding) = logins.entry(label) {
+        binding.sign_in_task = Some(SignInTask { action, at });
+    }
+}
+
 /// Records a login wall hit at `at` on `label`'s bound login and updates learned lifetime.
 pub fn note_login_end(state: &mut State, logins: &mut Logins, label: &str, at: i64) -> Vec<Event> {
     let mut out = if state.account(label).auth == Auth::SignedOut {
@@ -1986,6 +2092,7 @@ pub fn note_renewed(
     binding.ended_at = None;
     binding.wrong_at = None;
     binding.proved_by = None;
+    binding.sign_in_task = None;
     binding.subscription = subscription
         .map(|s| one_line(s, SUBSCRIPTION_MAX))
         .filter(|s| !s.is_empty());
@@ -2007,6 +2114,7 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
     match logins.entry(label) {
         Some(binding) => {
             binding.wrong_at = Some(at);
+            binding.sign_in_task = None;
             vec![Event::new(at, Kind::WrongAccount, label)]
         }
         None => Vec::new(),
@@ -4001,8 +4109,13 @@ pub fn advise_for(
     } else {
         advise_past_probe(roster, state, enrolled, me, point, mode, now)
     };
+    held_unless_measured(advice, cli.accounts().measured)
+}
+
+/// `advice`, a move in it held as [`StayWhy::Unmeasured`] where the seam is not `measured`.
+fn held_unless_measured(advice: Advice, measured: bool) -> Advice {
     match advice {
-        Advice::Move { .. } if !cli.accounts().measured => Advice::Stay(StayWhy::Unmeasured),
+        Advice::Move { .. } if !measured => Advice::Stay(StayWhy::Unmeasured),
         advice => advice,
     }
 }

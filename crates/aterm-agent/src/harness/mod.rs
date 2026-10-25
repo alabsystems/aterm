@@ -25,6 +25,7 @@ pub mod browser_window;
 pub mod cli;
 pub mod codex_alab;
 pub mod codex_app_login;
+pub mod codex_facts;
 pub mod codex_rollout;
 pub mod codex_steps;
 pub mod codex_tap;

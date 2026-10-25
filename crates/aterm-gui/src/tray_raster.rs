@@ -3787,6 +3787,27 @@ pub(crate) fn render_specimen_frame_for_test(
 
 impl Canvas {
     fn round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, c: [u8; 4]) {
+        self.round_rect_under(x, y, w, h, r, c, None);
+    }
+
+    /// [`Self::round_rect`], leaving `hole` (device pixels a later opaque panel fills whole:
+    /// [`covered_by_a_later_panel`]) out of its rows' inner spans.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "primitive rounded-rect fill: rect (x,y,w,h) + radius + color + the device \
+                  rect it may leave out are all irreducible inputs; bundling them into a \
+                  struct would only move the argument count to its two call sites"
+    )]
+    fn round_rect_under(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        c: [u8; 4],
+        hole: Option<DeviceRect>,
+    ) {
         let (cx, cy, hx, hy) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
         let r = r.min(hx).min(hy);
         let mut x0 = (x - 1.0).floor() as i32;
@@ -3836,7 +3857,13 @@ impl Canvas {
             let (left_end, right_start) = full_span.unwrap_or((x1, x1));
             self.round_rect_rim(x0, left_end, py, (cx, cy, hx, hy, r), c, &mut rim);
             if let Some((start, end)) = full_span {
-                self.blend_span(start, end, py, c, 1.0, &mut rim);
+                match hole.filter(|&(_, top, _, bottom)| (top..bottom).contains(&py)) {
+                    Some((left, _, right, _)) => {
+                        self.blend_span(start, end.min(left).max(start), py, c, 1.0, &mut rim);
+                        self.blend_span(start.max(right).min(end), end, py, c, 1.0, &mut rim);
+                    }
+                    None => self.blend_span(start, end, py, c, 1.0, &mut rim),
+                }
             }
             self.round_rect_rim(right_start, x1, py, (cx, cy, hx, hy, r), c, &mut rim);
         }
@@ -4227,8 +4254,25 @@ impl Canvas {
             (x + w + sw + 1.0).ceil() as i32,
             (y + h + sw + 1.0).ceil() as i32,
         );
+        // The box `m` inside the rect's edges is ink-free: there both of the distance's axes are
+        // within the straight sides (`m ≥ r`), so `sd_round_box ≤ -m` and `|sd| - hw ≥ 2`, which
+        // `cov` makes 0. Its pixels are skipped, so a stroke costs its rim, not its whole box.
+        let m = r.max(hw + 1.0) + 1.0;
+        let hole_x = (
+            (cx - hx + m - 0.5).ceil() as i32,
+            (cx + hx - m - 0.5).floor() as i32 + 1,
+        );
+        let hole_y = (
+            (cy - hy + m - 0.5).ceil() as i32,
+            (cy + hy - m - 0.5).floor() as i32 + 1,
+        );
         for py in y0..y1 {
-            for px in x0..x1 {
+            let gap = if hole_x.0 < hole_x.1 && (hole_y.0..hole_y.1).contains(&py) {
+                hole_x.0.clamp(x0, x1)..hole_x.1.clamp(x0, x1)
+            } else {
+                x1..x1
+            };
+            for px in (x0..gap.start).chain(gap.end..x1) {
                 let d =
                     sd_round_box(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hx, hy, r).abs() - hw;
                 self.blend(px, py, c, cov(d));
@@ -4731,6 +4775,45 @@ fn baked_image(art: crate::widget::ImageArt, width: u32, height: u32) -> Rc<[u8]
     })
 }
 
+/// The device pixels the first opaque [`DrawPrim::Panel`] after `prims[at]`, in the unbroken run
+/// of panels that follows it within `..end`, fills whole: its rect inset past its corners
+/// (`r + 2`), where [`Canvas::round_rect`] paints each row's inner span opaque, replacing what is
+/// under it. A translucent panel under it (a card's drop shadow) need not ink them: whatever it
+/// inks there is overwritten before anything else draws.
+fn covered_by_a_later_panel(
+    prims: &[DrawPrim],
+    at: usize,
+    end: usize,
+    s: f32,
+) -> Option<DeviceRect> {
+    for p in prims.iter().take(end).skip(at + 1) {
+        let DrawPrim::Panel {
+            x,
+            y,
+            w,
+            h,
+            radius,
+            fill,
+        } = p
+        else {
+            return None;
+        };
+        if fill[3] < u8::MAX {
+            continue;
+        }
+        let (x, y, w, h) = (x * s, y * s, w * s, h * s);
+        let m = (radius * s).min(w / 2.0).min(h / 2.0).max(0.0) + 2.0;
+        let hole = (
+            (x + m - 0.5).ceil() as i32,
+            (y + m - 0.5).ceil() as i32,
+            (x + w - m - 0.5).floor() as i32 + 1,
+            (y + h - m - 0.5).floor() as i32 + 1,
+        );
+        return (hole.0 < hole.2 && hole.1 < hole.3).then_some(hole);
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_tray(
     cv: &mut Canvas,
@@ -4795,7 +4878,12 @@ fn replay_tray(
                 radius,
                 fill,
                 ..
-            } => cv.round_rect(x * s, y * s, w * s, h * s, radius * s, *fill),
+            } => {
+                let hole = (fill[3] < u8::MAX)
+                    .then(|| covered_by_a_later_panel(prims, index, range.end, s))
+                    .flatten();
+                cv.round_rect_under(x * s, y * s, w * s, h * s, radius * s, *fill, hole);
+            }
             DrawPrim::Ring {
                 cx,
                 cy,
@@ -7623,6 +7711,167 @@ mod tests {
                     "geometry=({x},{y},{width},{height},{radius}) color={color:?}"
                 );
             }
+        }
+    }
+
+    /// A rounded stroke inks exactly what the distance field over its whole box inks, though it
+    /// visits only its rim.
+    #[test]
+    fn a_rounded_stroke_skips_only_pixels_it_cannot_ink() {
+        let cases = [
+            (2.0, 3.0, 61.0, 42.0, 8.0, 1.0),
+            (1.25, 2.75, 54.5, 35.25, 11.5, 1.5),
+            (-4.0, -3.0, 41.0, 36.0, 5.0, 2.0),
+            (7.5, 5.5, 9.0, 37.0, 4.0, 1.0),
+            (4.0, 8.0, 59.0, 17.0, 0.75, 3.0),
+            (3.3, 4.1, 50.0, 30.0, 14.0, 1.0),
+            (0.5, 0.5, 63.0, 47.0, 28.0, 2.0),
+        ];
+        let paints = [
+            ([0, 0, 0, 0], [18, 28, 42, 255]),
+            ([31, 47, 63, 255], [92, 176, 255, 0xE0]),
+        ];
+        for clip in [None, Some((1.5, 1.25, 55.0, 40.5))] {
+            for &(backdrop, color) in &paints {
+                for &(x, y, w, h, r, width) in &cases {
+                    let (mut rim_only, mut every) =
+                        (Canvas::new(66, 52, backdrop), Canvas::new(66, 52, backdrop));
+                    if let Some((cx, cy, cw, ch)) = clip {
+                        rim_only.push_clip(cx, cy, cw, ch);
+                        every.push_clip(cx, cy, cw, ch);
+                    }
+                    rim_only.stroke_rect(x, y, w, h, r, width, color);
+
+                    let sw = f32::max(width, 1.0);
+                    let (cx, cy, hx, hy) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+                    let r = f32::min(r, hx).min(hy);
+                    let (x0, y0, x1, y1) = every.clipped_bounds(
+                        (x - sw - 1.0).floor() as i32,
+                        (y - sw - 1.0).floor() as i32,
+                        (x + w + sw + 1.0).ceil() as i32,
+                        (y + h + sw + 1.0).ceil() as i32,
+                    );
+                    for py in y0..y1 {
+                        for px in x0..x1 {
+                            let d =
+                                sd_round_box(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hx, hy, r);
+                            every.blend(px, py, color, cov(d.abs() - sw / 2.0));
+                        }
+                    }
+                    assert!(
+                        rim_only.px == every.px,
+                        "stroke ({x},{y},{w},{h}) r={r} width={width} colour={color:?} clip={clip:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A translucent panel under an opaque one (a card's drop shadow) inks only what the opaque
+    /// panel leaves showing, and the raster is the same as when it inks all of itself: on the
+    /// Overview's and the palette's cards, Day and Night, at 1x and 2x, and on loose panels.
+    #[test]
+    fn a_shadow_under_an_opaque_panel_rasterizes_as_if_inked_whole() {
+        let day = Theme {
+            fg: 0x0010_1010,
+            bg: 0x00FA_FAFA,
+            ..Theme::default()
+        };
+        let mut trays = Vec::new();
+        for theme in [Theme::default(), day] {
+            for k in [1.0, 2.0] {
+                let g = crate::settings::SettingsGeom {
+                    cw: 7.0 * k,
+                    ch: 16.0 * k,
+                    font_px: 13.0 * k,
+                    cols: 144,
+                    panel_rows: 40,
+                    px_per_pt: k,
+                };
+                let (w, h) = (
+                    (g.cols as f32 * g.cw) as u32,
+                    (g.panel_rows as f32 * g.ch) as u32,
+                );
+                let overview = crate::overview::closing_scene();
+                let palette = crate::palette::PaletteState::new();
+                trays.push((
+                    crate::overview::overview_tray(&overview, &g, theme).prims,
+                    w,
+                    h,
+                    1.0,
+                ));
+                trays.push((
+                    crate::palette::palette_tray(&palette, &g, theme).prims,
+                    w,
+                    h,
+                    1.0,
+                ));
+            }
+        }
+        let panel = |x: f32, y: f32, w: f32, h: f32, radius: f32, a: u8| DrawPrim::Panel {
+            x,
+            y,
+            w,
+            h,
+            radius,
+            fill: [40, 120, 200, a],
+        };
+        for (shadow, card) in [
+            (
+                (9.5, 12.25, 70.0, 41.0, 13.0),
+                (12.5, 10.25, 64.0, 35.0, 10.0),
+            ),
+            ((3.0, 4.0, 30.0, 20.0, 0.0), (5.3, 6.6, 41.0, 31.0, 0.0)),
+            ((20.0, 10.0, 50.0, 40.0, 6.0), (2.0, 2.0, 30.0, 30.0, 15.0)),
+        ] {
+            for scale in [1.0, 2.0] {
+                let mut prims = vec![
+                    panel(shadow.0, shadow.1, shadow.2, shadow.3, shadow.4, 0x2A),
+                    panel(card.0, card.1, card.2, card.3, card.4 + 1.0, 0x30),
+                    panel(card.0, card.1, card.2, card.3, card.4, 0xFF),
+                ];
+                trays.push((prims.clone(), 90, 60, scale));
+                prims.insert(
+                    0,
+                    DrawPrim::ClipPush {
+                        x: 4.0,
+                        y: 3.0,
+                        w: 60.0,
+                        h: 50.0,
+                    },
+                );
+                prims.push(DrawPrim::ClipPop);
+                trays.push((prims, 90, 60, scale));
+            }
+        }
+        for (prims, w, h, scale) in trays {
+            let whole: Vec<DrawPrim> = prims
+                .iter()
+                .flat_map(|p| {
+                    let barrier = matches!(p, DrawPrim::Panel { fill, .. } if fill[3] < u8::MAX);
+                    let mut run = vec![p.clone()];
+                    if barrier {
+                        // a clip of the whole canvas draws nothing and ends the run of panels
+                        run.push(DrawPrim::ClipPush {
+                            x: -1e6,
+                            y: -1e6,
+                            w: 2e6,
+                            h: 2e6,
+                        });
+                        run.push(DrawPrim::ClipPop);
+                    }
+                    run
+                })
+                .collect();
+            assert!(
+                whole.len() > prims.len(),
+                "the tray has a translucent panel"
+            );
+            assert!(
+                rasterize_tray(&prims, w, h, scale, [0; 4])
+                    == rasterize_tray(&whole, w, h, scale, [0; 4]),
+                "a {w}x{h} tray at {scale}x rasterizes the same with its shadows inked whole"
+            );
         }
     }
 

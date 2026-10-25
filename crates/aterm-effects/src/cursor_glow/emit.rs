@@ -176,7 +176,7 @@ impl CursorGlow {
             if fire {
                 self.probed_text_spans()
             } else {
-                TextSpans::default()
+                TextSpans::EMPTY
             },
             Some(&self.frame_text),
         );
@@ -2005,7 +2005,8 @@ impl CursorGlow {
     /// How far a tongue in the air stands its root (and its gold core's)
     /// off the air's floor, px, at row height `chf`: its share of
     /// [`Self::FIRE_DARK_ROOT_LIFT`]; 0 for a tongue kept in its row.
-    fn air_root_lift(&self, chf: f32, tg: &DarkTongue, kept: bool) -> f32 {
+    #[inline]
+    const fn air_root_lift(&self, chf: f32, tg: &DarkTongue, kept: bool) -> f32 {
         #[cfg(test)]
         let even = self.fire_even_cores;
         #[cfg(not(test))]
@@ -2022,9 +2023,15 @@ impl CursorGlow {
     /// neighbours by their footprints, so the flame's root rises and falls
     /// along the row with no step where one tongue's body gives way to the
     /// next.
-    fn air_floor_lift(&self, chf: f32, tongues: &[DarkTongue], u: f32) -> f32 {
+    const fn air_floor_lift(&self, chf: f32, tongues: &[DarkTongue], u: f32) -> f32 {
         let (mut num, mut den) = (0.0f32, 0.0f32);
-        for tg in tongues.iter().filter(|tg| !tg.kept) {
+        let mut i = 0;
+        while i < tongues.len() {
+            let tg = &tongues[i];
+            i += 1;
+            if tg.kept {
+                continue;
+            }
             let d = ((u - tg.u) / tg.half.max(1e-3)).abs();
             if d >= 1.0 {
                 continue;
@@ -2828,10 +2835,10 @@ impl CursorGlow {
 
     /// Claim one water cell for this frame's newest-visible-owner pass.
     #[inline]
-    pub(super) fn claim_water_cell(seen: &mut [u64], row: u16, col: u16) -> bool {
+    pub(super) const fn claim_water_cell(seen: &mut [u64], row: u16, col: u16) -> bool {
         debug_assert!(seen.len().is_power_of_two());
-        let encoded = (u32::from(row) << 16) | u32::from(col);
-        let key = u64::from(encoded) + 1;
+        let encoded = ((row as u32) << 16) | (col as u32);
+        let key = (encoded as u64) + 1;
         let mask = seen.len() - 1;
         let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & mask;
         loop {
@@ -3066,7 +3073,8 @@ impl CursorGlow {
 
     /// The water's crest colour at path position `pos` (tail 0, head 1) and heat `heat`.
     #[inline]
-    pub(super) fn water_crest_color(pos: f32, heat: f32) -> u32 {
+    #[must_use]
+    pub(super) const fn water_crest_color(pos: f32, heat: f32) -> u32 {
         water_ramp(0.66 + 0.24 * pos + 0.10 * heat)
     }
 
@@ -3625,10 +3633,11 @@ impl CursorGlow {
             let page = cfg.theme_bg & 0x00FF_FFFF;
             let text = self.text_view();
             let above = i32::from(cr) - 1;
+            let above_known = above >= 0 && text.knows_row(above);
             !unheld
                 && above >= 0
                 && (i32::from(cc) - 1..=i32::from(cc) + 1).any(|c| {
-                    (text.knows_row(above) && text.covers_cell(above, c))
+                    (above_known && text.covers_cell(above, c))
                         || self.frame_text.pair(above, c).is_some_and(|(ink, ground)| {
                             ink.is_some() || !reads_as_page(ground, page)
                         })
@@ -3913,7 +3922,9 @@ impl CursorGlow {
     /// orange-red cooling to red. A bloom thins to nothing at its rim, and a
     /// thin yellow over the dark reads as a dim khaki disc, no colour of fire;
     /// orange-red stays warm however thin it lies.
-    pub(super) fn fire_dark_flash(t: f32) -> u32 {
+    #[inline]
+    #[must_use]
+    pub(super) const fn fire_dark_flash(t: f32) -> u32 {
         fire_ramp(0.55 - 0.25 * t.clamp(0.0, 1.0))
     }
 
@@ -4080,14 +4091,17 @@ impl CursorGlow {
                 || (c_l != col && text.covers_cell(row, c_l))
                 || (c_r != col && text.covers_cell(row, c_r))
         };
-        let glyph_band = |y: f32| -> Option<(i32, f32)> {
-            let row = ((y - oyf) / ch).floor() as i32;
+        let glyph_band_at = |row: i32, y: f32| -> Option<(i32, f32)> {
             let top = oyf + row as f32 * ch;
             let k = (y - top) / ch;
             ((Self::GLYPH_BAND.0..Self::GLYPH_BAND.1).contains(&k)
                 && text.knows_row(row)
                 && !text.row_is_blank(row))
             .then_some((row, top))
+        };
+        let glyph_band = |y: f32| -> Option<(i32, f32)> {
+            let row = ((y - oyf) / ch).floor() as i32;
+            glyph_band_at(row, y)
         };
         let caret_row = self.last.map(|(r, _)| i32::from(r));
         let caret = self.last.map(|(r, c)| Self::caret_box(geom, r, c));
@@ -4178,7 +4192,7 @@ impl CursorGlow {
             if (sparkle || beam)
                 && (near_text_from(x, y, row, col)
                     || (Some(row) != caret_row
-                        && glyph_band(y)
+                        && glyph_band_at(row, y)
                             .is_some_and(|(r, _)| (-2..=2).any(|d| text.covers_cell(r, col + d)))))
             {
                 continue;
@@ -4779,9 +4793,9 @@ pub(super) fn reads_as_page(ground: u32, page: u32) -> bool {
     if g == p {
         return true;
     }
-    let near = [16u32, 8, 0]
-        .iter()
-        .all(|&sh| ((g >> sh) & 0xff).abs_diff((p >> sh) & 0xff) <= SURFACE_CHANNEL);
+    let near = ((g >> 16) & 0xff).abs_diff((p >> 16) & 0xff) <= SURFACE_CHANNEL
+        && ((g >> 8) & 0xff).abs_diff((p >> 8) & 0xff) <= SURFACE_CHANNEL
+        && (g & 0xff).abs_diff(p & 0xff) <= SURFACE_CHANNEL;
     near && crate::color_math::contrast_ratio(g, p) < SURFACE_CONTRAST
 }
 
@@ -4851,7 +4865,7 @@ impl FlameGlyph {
 }
 
 /// One dark tongue ([`CursorGlow::dark_tongues`]).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct DarkTongue {
     pub(super) u: f32,
     pub(super) half: f32,
@@ -4863,6 +4877,24 @@ pub(super) struct DarkTongue {
     pub(super) lift: f32,
 }
 
+impl DarkTongue {
+    pub(super) const EMPTY: Self = Self {
+        u: 0.0,
+        half: 0.0,
+        size: 0.0,
+        e: 0.0,
+        kept: false,
+        lift: 0.0,
+    };
+}
+
+impl Default for DarkTongue {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// A burning row's dark tongues, allocation-free.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DarkTongues {
@@ -4871,18 +4903,21 @@ pub(super) struct DarkTongues {
 }
 
 impl Default for DarkTongues {
+    #[inline]
     fn default() -> Self {
-        Self {
-            buf: [DarkTongue::default(); 48],
-            n: 0,
-        }
+        Self::EMPTY
     }
 }
 
 impl DarkTongues {
+    pub(super) const EMPTY: Self = Self {
+        buf: [DarkTongue::EMPTY; 48],
+        n: 0,
+    };
+
     #[inline]
-    pub(super) fn as_slice(&self) -> &[DarkTongue] {
-        &self.buf[..self.n]
+    pub(super) const fn as_slice(&self) -> &[DarkTongue] {
+        self.buf.split_at(self.n).0
     }
 
     #[inline]
@@ -4902,9 +4937,9 @@ const FLAME_CORE_STOPS: [(f32, u32); 4] = [
 ];
 
 #[inline]
-fn flame_core_ramp(rise: f32) -> u32 {
+const fn flame_core_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
-    let i = usize::from(rise >= FLAME_CORE_STOPS[1].0) + usize::from(rise >= FLAME_CORE_STOPS[2].0);
+    let i = (rise >= FLAME_CORE_STOPS[1].0) as usize + (rise >= FLAME_CORE_STOPS[2].0) as usize;
     let (a, b) = (FLAME_CORE_STOPS[i], FLAME_CORE_STOPS[i + 1]);
     lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
 }
@@ -4967,9 +5002,11 @@ fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f
 const FLAME_LEVEL_STEP: i32 = 64;
 
 #[inline]
-fn flame_level_of(idx: i32) -> usize {
-    let level = (idx.max(0) + FLAME_LEVEL_STEP - 1) / FLAME_LEVEL_STEP;
-    (level as usize).min(CursorGlow::FIRE_DARK_HELD_LEVELS - 1)
+const fn flame_level_of(idx: i32) -> usize {
+    let clamped = if idx > 0 { idx } else { 0 };
+    let level = ((clamped + FLAME_LEVEL_STEP - 1) / FLAME_LEVEL_STEP) as usize;
+    let max_level = CursorGlow::FIRE_DARK_HELD_LEVELS - 1;
+    if level < max_level { level } else { max_level }
 }
 
 #[inline]
@@ -4986,7 +5023,7 @@ const fn flame_level_light(level: usize) -> u32 {
 /// Thinned only to a quarter there, the tongues would end cut flat,
 /// straight-sided and blunt as an equaliser's bars.
 #[inline]
-fn flame_tip_fade(rise: f32) -> f32 {
+const fn flame_tip_fade(rise: f32) -> f32 {
     const HOLD: f32 = 0.33;
     if rise <= HOLD {
         1.0
@@ -5020,10 +5057,9 @@ const fn flame_light_paint_bounds() -> (u32, u32) {
 }
 
 #[inline]
-fn flame_light_ramp(rise: f32) -> u32 {
+const fn flame_light_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
-    let i =
-        usize::from(rise >= FLAME_LIGHT_STOPS[1].0) + usize::from(rise >= FLAME_LIGHT_STOPS[2].0);
+    let i = (rise >= FLAME_LIGHT_STOPS[1].0) as usize + (rise >= FLAME_LIGHT_STOPS[2].0) as usize;
     let (a, b) = (FLAME_LIGHT_STOPS[i], FLAME_LIGHT_STOPS[i + 1]);
     lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
 }
@@ -5043,9 +5079,9 @@ fn fire_band_lifts(
         let one = layer_stack_lift(std::slice::from_ref(layer), color, pos);
         for (band, lift) in lifts.iter_mut().enumerate() {
             if reach_max >= reaches[band] {
-                for (l, o) in lift.iter_mut().zip(one) {
-                    *l += o;
-                }
+                lift[0] += one[0];
+                lift[1] += one[1];
+                lift[2] += one[2];
             }
         }
     }
@@ -5100,13 +5136,16 @@ impl CometRuns<'_> {
     }
 }
 
-fn breaks_comet_run(prev: Option<(u16, u16)>, here: (u16, u16)) -> bool {
-    prev.is_some_and(|(pr, pc)| {
-        (here.0 as i32 - pr as i32)
-            .abs()
-            .max((here.1 as i32 - pc as i32).abs())
-            > 1
-    })
+#[inline]
+const fn breaks_comet_run(prev: Option<(u16, u16)>, here: (u16, u16)) -> bool {
+    match prev {
+        Some((pr, pc)) => {
+            let dr = (here.0 as i32 - pr as i32).abs();
+            let dc = (here.1 as i32 - pc as i32).abs();
+            dr > 1 || dc > 1
+        }
+        None => false,
+    }
 }
 
 #[inline]

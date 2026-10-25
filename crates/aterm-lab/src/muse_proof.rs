@@ -751,7 +751,10 @@ mod tests {
         use crate::selftest::open_files_report;
         let wrote = vec![".config/muse/session".to_string()];
         let judge = |paths: std::io::Result<&[&str]>| {
-            let read = paths.map(|p| p.iter().map(std::path::PathBuf::from).collect());
+            let read = paths.map(|p| crate::procs::OpenPaths {
+                paths: p.iter().map(std::path::PathBuf::from).collect(),
+                complete: true,
+            });
             let seen = open_files_report(7, read);
             owner_verdict(
                 &held_under(&seen.text, &["/Users//owner".to_string()]),

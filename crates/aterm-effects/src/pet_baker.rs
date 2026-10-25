@@ -536,9 +536,11 @@ pub struct ExactTileBaker<K> {
     version: u64,
 }
 
-impl<K> Default for ExactTileBaker<K> {
+impl<K> ExactTileBaker<K> {
+    /// Construct an empty exact-size tile baker with zero resident bytes and no scratch buffers.
     #[inline]
-    fn default() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             slots: Vec::new(),
             tile_scratch: None,
@@ -550,6 +552,13 @@ impl<K> Default for ExactTileBaker<K> {
             bakes_left: 0,
             version: 0,
         }
+    }
+}
+
+impl<K> Default for ExactTileBaker<K> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -928,7 +937,7 @@ mod tests {
                         return false;
                     }
                     let i = ((y as u32 * w + x as u32) * 4) as usize;
-                    px[i + 3] == 255 && px[i..i + 3].iter().all(|&c| c < 64)
+                    px[i + 3] == 255 && px[i] < 64 && px[i + 1] < 64 && px[i + 2] < 64
                 };
                 for layer in PET_GLYPHS[id as usize].layers {
                     if layer.role != GlyphRole::Eye {

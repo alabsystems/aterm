@@ -1251,7 +1251,7 @@ impl Proof {
             .requests("continue")
             .into_iter()
             .filter(|r| {
-                r.get("u")
+                r.get("u_full")
                     .and_then(J::as_str)
                     .is_some_and(|u| u.contains(KEEP_GOING))
             })
@@ -1396,7 +1396,76 @@ impl Proof {
                     );
                 }
             }
+            self.survey_leg(leg)?;
         }
+        Ok(())
+    }
+
+    /// The leg's `survey` record, `--json`.
+    fn survey_of(&self, sid: &str) -> Option<J> {
+        let reply = self.inst.ctl(&["survey", "--json", "--sid", sid]);
+        J::parse(&reply.stdout)
+            .ok()?
+            .as_arr()?
+            .iter()
+            .flat_map(|i| i.get("sessions").and_then(J::as_arr).unwrap_or_default())
+            .find(|s| s.get("sid").and_then(J::as_str) == Some(sid))
+            .cloned()
+    }
+
+    /// A codex-alab row says what codex-alab says of itself (OSC 7501) and what its rollout
+    /// holds, as a Claude Code row says its screen and footer: an agent word, the model it asked
+    /// the lab for, its last words and its folder.
+    fn survey_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
+        let asked = self
+            .requests(leg.name)
+            .iter()
+            .rev()
+            .find_map(|r| r.get("model").and_then(J::as_str).map(str::to_string));
+        let folder = leg
+            .proj
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let read = |s: &J, k: &str| s.get(k).and_then(J::as_str).unwrap_or("-").to_string();
+        let holds = |s: &J| {
+            matches!(
+                read(s, "agent").as_str(),
+                "busy" | "idle" | "prompt" | "question"
+            ) && asked.as_deref() == Some(read(s, "model").as_str())
+                && read(s, "said") != "-"
+                && read(s, "cwd").rsplit('/').next() == Some(folder.as_str())
+        };
+        let mut last = None;
+        let held = Self::wait_for(Duration::from_secs(60), Duration::from_millis(500), || {
+            last = self.survey_of(&leg.sid);
+            last.as_ref().is_some_and(holds)
+        })?;
+        let shown = last.as_ref().map_or_else(
+            || "no record".to_string(),
+            |s| {
+                format!(
+                    "agent={} model={} effort={} ctx_left_pct={} doing={} cwd={} said={:?}",
+                    read(s, "agent"),
+                    read(s, "model"),
+                    read(s, "effort"),
+                    s.get("ctx_left_pct")
+                        .and_then(J::as_i64)
+                        .map_or_else(|| read(s, "ctx_left_pct"), |n| n.to_string()),
+                    read(s, "doing"),
+                    read(s, "cwd"),
+                    read(s, "said").chars().take(60).collect::<String>(),
+                )
+            },
+        );
+        self.check(
+            &format!(
+                "{}: its survey record reads codex-alab's own state and its rollout: an agent word, the model it asked the lab for ({}), its last words, its folder ({folder}) ({shown})",
+                leg.name,
+                asked.as_deref().unwrap_or("none asked")
+            ),
+            held,
+        );
         Ok(())
     }
 
@@ -2010,7 +2079,7 @@ impl Proof {
             .requests("carry")
             .iter()
             .filter(|r| {
-                r.get("u")
+                r.get("u_full")
                     .and_then(J::as_str)
                     .is_some_and(|u| u.contains(KEEP_GOING))
                     && r.get("t").and_then(J::as_i64).unwrap_or(0) >= killed_ms

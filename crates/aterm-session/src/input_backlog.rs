@@ -391,7 +391,8 @@ impl InputBacklog {
 /// What a session's input backlog says about the program reading it — the `status input=` word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InputWord {
-    /// No reading: not macOS, or the master is not a tty.
+    /// No reading: the master is not a tty, or nothing counts its unread input
+    /// ([`crate::sink::SinkWriter::unread_input`]: neither macOS nor Linux).
     Unmeasured,
     /// Nothing unread.
     Clear,

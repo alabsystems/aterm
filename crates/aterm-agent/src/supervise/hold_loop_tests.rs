@@ -140,6 +140,9 @@ fn run(m: &mut Mock, host: &Arc<Holds>, ledger: Option<&Path>) -> Vec<String> {
 }
 
 fn a_landing_with_someone_elses_turn() -> Vec<Vec<String>> {
+    // Someone's turn shows their prompt: the program's own turn saying it again would count as an act's answer.
+    let mut theirs = rows(&["❯ Carry on with the lexer.", ""]);
+    theirs.extend(ended(PROGRESS));
     vec![
         busy_screen(),
         ended(PROGRESS),
@@ -148,7 +151,7 @@ fn a_landing_with_someone_elses_turn() -> Vec<Vec<String>> {
         busy_screen(),
         ended(TOKEN),
         busy_screen(),
-        ended(PROGRESS),
+        theirs,
         busy_screen(),
     ]
 }

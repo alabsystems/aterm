@@ -149,7 +149,18 @@ impl JobsPass {
         let readers = self.held;
         let stand_in = (readers.stand_in)();
         let read = self.reader.read_all(&reqs);
-        let procs: Vec<JobProc> = read.iter().map(|p| job_proc(p, stand_in)).collect();
+        // A tab's root's pid version tells the engine it ran a program anew (`exec zsh`).
+        let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
+        let procs: Vec<JobProc> = read
+            .iter()
+            .map(|p| JobProc {
+                version: roots
+                    .contains(&p.pid)
+                    .then(|| (readers.exec)(p.pid))
+                    .flatten(),
+                ..job_proc(p, stand_in)
+            })
+            .collect();
         let read_ms = read_ms();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
@@ -543,6 +554,7 @@ fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)])
                 output_ms: feed.output_ms,
                 line_output_ms: feed.line_output_ms,
                 drawn_ms: feed.drawn_ms,
+                alt_screen: feed.alt_screen,
                 output_bytes: feed.output_bytes,
                 ..JobTab::default()
             }
@@ -573,6 +585,8 @@ struct Fed {
     owed_output: Option<Instant>,
     /// The same of the newest drawing feed.
     owed_drawn: Option<Instant>,
+    /// The terminal showed its alternate screen after the last feed.
+    alt: bool,
     /// The read being fed holds text after its last line feed so far: a line feed in its next
     /// chunk ends a line.
     text: bool,
@@ -606,6 +620,7 @@ pub(crate) struct TabFeed {
     pub(crate) output_ms: Option<u64>,
     pub(crate) line_output_ms: Option<u64>,
     pub(crate) drawn_ms: Option<u64>,
+    pub(crate) alt_screen: bool,
     pub(crate) output_bytes: u64,
     pub(crate) block: Option<Block>,
     pub(crate) ended: Option<Block>,
@@ -659,6 +674,7 @@ impl JobFeed {
         let line = lines.ends && (lines.ended || lines.tail || fed.text);
         fed.text = lines.tail || (fed.text && !lines.ends);
         let marked = marks.is_some() && marks != fed.marks;
+        let alt = term.is_alternate_screen();
         let runs = |c: &aterm_types::OutputBlock| c.state == aterm_types::BlockState::Executing;
         let turn = match (current, fed.block.as_ref()) {
             (Some(c), Some(w)) if c.id == w.id => match (runs(c), w.open) {
@@ -674,9 +690,10 @@ impl JobFeed {
             (Some(c), None) => Turn::Hold(c.id, c.exit_code),
             _ => Turn::Keep,
         };
-        if matches!(turn, Turn::Keep) && !moved && !marked && !line {
+        if matches!(turn, Turn::Keep) && !moved && !marked && !line && alt == fed.alt {
             return;
         }
+        fed.alt = alt;
         let now = now();
         if moved {
             fed.output = Some(now);
@@ -790,6 +807,7 @@ impl JobFeed {
             output_ms: output.map(ms),
             line_output_ms: line.map(ms),
             drawn_ms: drawn.map(ms),
+            alt_screen: fed.alt,
             output_bytes: fed.bytes,
             block: fed.block.as_ref().map(block),
             ended: fed.ended.as_ref().map(block),
@@ -1018,6 +1036,7 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
         program_check: member_start(p, stand_in) == Some(AtStart::Held),
+        version: None,
     }
 }
 
@@ -1211,6 +1230,7 @@ pub(crate) mod tests {
             output_ms: Some(9),
             line_output_ms: Some(8),
             drawn_ms: Some(7),
+            alt_screen: true,
             output_bytes: 120,
             block: Some(Block {
                 id: 3,
@@ -1250,6 +1270,7 @@ pub(crate) mod tests {
                 output_ms: tabs[1].output_ms,
                 line_output_ms: tabs[1].line_output_ms,
                 drawn_ms: tabs[1].drawn_ms,
+                alt_screen: tabs[1].alt_screen,
                 output_bytes: tabs[1].output_bytes,
                 block: tabs[1].block.clone(),
                 ended: tabs[1].ended.clone(),
@@ -1263,7 +1284,7 @@ pub(crate) mod tests {
     /// Every read counts its bytes; only a line feed with text of its read stamps a line (not a
     /// `\r` redraw or a typed Enter's echo, but a record led by its line feed), only a feed that
     /// moved the screen stamps output, and only one that puts the cursor on a row of its own stamps
-    /// a drawing (not a spinner's erase).
+    /// a drawing (not a spinner's erase). The alternate screen reads as the last feed left it.
     #[test]
     fn a_line_feed_stamps_a_line_and_only_a_moving_feed_stamps_output() {
         const RESET: &[u8] = b"\x1b[39m\x1b[0m";
@@ -1322,6 +1343,14 @@ pub(crate) mod tests {
             Some(9_000),
             "nvim's row of its terminal"
         );
+        let mut full = aterm_core::terminal::Terminal::new(24, 80);
+        for (bytes, alt) in [(&b"\x1b[?1049h"[..], true), (b"\x1b[?1049l", false)] {
+            full.process(bytes);
+            feed.fed(&full, bytes, false, || {
+                epoch + Duration::from_millis(10_000)
+            });
+            assert_eq!(feed.at(epoch).alt_screen, alt, "{bytes:?}");
+        }
     }
 
     /// A writer that never stops (`kubectl logs -f`) has a line fed past each pass's clock, which a

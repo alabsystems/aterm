@@ -270,7 +270,7 @@ impl<'a> Reading<'a> {
                 });
                 match x.compressed {
                     Some(0) => clauses.push("nothing compressed".into()),
-                    Some(b) => clauses.push(format!("{} GiB compressed", words::gib_figure(b))),
+                    Some(b) => clauses.push(format!("{} compressed", words::mem(b))),
                     None => {}
                 }
             }

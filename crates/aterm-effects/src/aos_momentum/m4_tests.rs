@@ -14,12 +14,17 @@ use aterm_aos::replay::replay;
 use aterm_time::Instant;
 
 use super::bundle::{BUNDLE_DOMAIN, CandidateBundle, Row, RowVerdict};
+use super::corpus::SplitMix;
 use super::corpus::{Corpus, CorpusSplit, FRAME_INTERVALS_NS, GOLDEN_TRACE, ItemKind};
 use super::fidelity::{CLEARED_BY_END, NO_STEP_SLEPT};
 use super::lane::{Exo, Scenario};
 use super::m4::{
     Admitted, CandidateRefusal, Compared, Evaluator, Fault, GOLDEN_UNREADABLE, LANE_NOT_LOGGED,
-    LANE_NOT_REPRODUCED, NoOutcome,
+    LANE_NOT_REPRODUCED, LabelRefusal, LabelScope, LookToken, MintRefusal, NoOutcome, PracticeSet,
+    ReadToken, ReplayToken, Serial, Spread, TrainLabel, list_digest,
+};
+use super::m6_policy::{
+    JUDGED, LOOK_LIST_CAP, POOL_PLANS, READ_LIST_CAP, SetId, SetTag, Side, draw, set_pools, side,
 };
 use super::plan::{DEMO_PLAN, PlanRefusal, SHIPPED_PLAN, SchedulePlan, Split, Wake};
 use super::policy::{GRID_V1, ITEMS_V1, MAX_PROPOSAL_BYTES, MAX_ROUNDS, Totals};
@@ -828,4 +833,550 @@ fn a_selection_states_training_facts() {
     assert_eq!(s.proposer(), &ProposerId::new("spy", 1, &[]));
     assert_eq!((s.round(), s.index()), (0, 0));
     assert_eq!(s.stats().admitted, 1);
+}
+
+// ---- M6 labels and outcomes (design §13.3, stage B) ----
+
+/// Every job on a scoped thread of its own.
+struct Threads;
+
+impl Spread for Threads {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        std::thread::scope(|s| {
+            for i in 0..n {
+                s.spawn(move || job(i));
+            }
+        });
+    }
+}
+
+/// A token scope over a list.
+type ScopeOf<'a> = dyn Fn(&[[u8; 12]]) -> LabelScope + 'a;
+
+/// The plans of `set`'s pool `p`, as bytes.
+fn pool_bytes(set: SetId, p: usize) -> Vec<[u8; 12]> {
+    set_pools(set).expect("the set fills")[p]
+        .iter()
+        .map(SchedulePlan::encode)
+        .collect()
+}
+
+/// `T_0`'s first pool and its labels, judged once on the shared evaluator.
+fn train_pool() -> &'static (Vec<SchedulePlan>, Vec<TrainLabel>) {
+    static POOL: OnceLock<(Vec<SchedulePlan>, Vec<TrainLabel>)> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let set = SetId {
+            tag: SetTag::Train,
+            index: 0,
+        };
+        let pool = set_pools(set).expect("the train set fills").swap_remove(0);
+        let bytes: Vec<[u8; 12]> = pool.iter().map(SchedulePlan::encode).collect();
+        let labels = evaluator()
+            .label_spread(LabelScope::Train, &bytes, &Threads)
+            .expect("a train pool is in the train scope");
+        (pool, labels)
+    })
+}
+
+/// The first plan a fixed stream draws that `want` takes.
+fn drawn_where(want: impl Fn(&SchedulePlan) -> bool) -> SchedulePlan {
+    let mut r = SplitMix::new(0x6d36_7363_6f70_6573);
+    loop {
+        let p = draw(&mut r).expect("a draw is in range");
+        if want(&p) {
+            return p;
+        }
+    }
+}
+
+#[test]
+fn each_grid_plans_label_is_selects_feedback() {
+    let ev = evaluator();
+    let grid: Vec<SchedulePlan> = GRID_V1
+        .iter()
+        .filter_map(|&(s, w)| SchedulePlan::new(s, w).ok())
+        .collect();
+    let bytes: Vec<[u8; 12]> = grid.iter().map(SchedulePlan::encode).collect();
+    let labels = ev
+        .label_spread(LabelScope::Train, &bytes, &Threads)
+        .expect("the grid is in the train scope");
+    let mut spy = Spy {
+        plans: grid,
+        asked: Vec::new(),
+        shown: Vec::new(),
+    };
+    let _ = ev.select_spread(&mut spy, &Threads);
+    let shown = spy.shown.last().expect("four rounds");
+    assert_eq!((labels.len(), shown.len()), (54, 54));
+    for (label, f) in labels.iter().zip(shown) {
+        assert_eq!(label.id(), f.plan());
+        assert_eq!(label.totals().is_some(), f.is_admitted(), "{label:?}");
+        assert_eq!(label.totals().map(|t| t.ticks), f.ticks(), "{label:?}");
+        assert_eq!(label.law(), f.law(), "{label:?}");
+    }
+}
+
+#[test]
+fn a_pool_outcome_is_selects_outcome() {
+    let ev = evaluator();
+    let (pool, labels) = train_pool();
+    let mut r = SplitMix::new(0x6d36_6469_6666_6572);
+    let mut classes = [0usize; 3];
+    for _ in 0..64 {
+        let mut picked: Vec<usize> = Vec::new();
+        while picked.len() < JUDGED {
+            let i = usize::try_from(r.below(64)).expect("an index");
+            if !picked.contains(&i) {
+                picked.push(i);
+            }
+        }
+        let outcome = ev.pool_outcome(core::array::from_fn(|n| &labels[picked[n]]));
+        classes[usize::from(outcome.class())] += 1;
+        let mut spy = Spy {
+            plans: picked.iter().map(|&i| pool[i]).collect(),
+            asked: Vec::new(),
+            shown: Vec::new(),
+        };
+        let got = (
+            outcome.class(),
+            outcome.plan(),
+            outcome.totals(),
+            outcome.gain(),
+        );
+        let base = ev.policy().totals(CorpusSplit::Train);
+        match ev.select_spread(&mut spy, &Threads) {
+            Ok(s) => assert_eq!(
+                got,
+                (
+                    0,
+                    Some(s.plan()),
+                    s.train(),
+                    (base.ticks - s.train().ticks, base.wasted - s.train().wasted)
+                )
+            ),
+            Err(NoOutcome::NoGain { plan, train, .. }) => {
+                assert_eq!(got, (1, Some(plan), train.candidate, (0, 0)));
+            }
+            Err(NoOutcome::NoneAdmitted { .. }) => {
+                assert_eq!(got, (2, None, Totals::default(), (0, 0)));
+            }
+            Err(other) => panic!("select ended {other:?}"),
+        }
+    }
+    assert!(
+        classes[0] > 0 && classes[1] > 0,
+        "the subsets reach both a selection and NoGain, so the split between them is tested: {classes:?}"
+    );
+}
+
+#[test]
+fn with_k_equal_to_n_every_ranking_gives_one_outcome() {
+    let ev = evaluator();
+    let (_, labels) = train_pool();
+    assert_eq!(labels.len(), POOL_PLANS);
+    let mut refs: Vec<&TrainLabel> = labels.iter().collect();
+    let first = ev.oracle_outcome(&refs);
+    let mut r = SplitMix::new(0x6d36_6f72_6163_6c65);
+    for _ in 0..16 {
+        for i in (1..refs.len()).rev() {
+            let j = usize::try_from(r.below(u64::try_from(i + 1).expect("a length")))
+                .expect("an index");
+            refs.swap(i, j);
+        }
+        assert_eq!(ev.oracle_outcome(&refs), first);
+    }
+    refs.reverse();
+    assert_eq!(ev.oracle_outcome(&refs), first);
+}
+
+#[test]
+fn each_scope_refuses_what_it_does_not_take() {
+    let ev = Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1");
+    let grid = |p: &SchedulePlan| GRID_V1.contains(&(p.split(), p.wake()));
+    let [train, held, report, practice] =
+        [Side::Train, Side::HeldOut, Side::Report, Side::Practice]
+            .map(|s| drawn_where(|p| side(p) == s && !grid(p)).encode());
+    let mismatch = |plan| Err(LabelRefusal::ScopeMismatch { plan });
+    for other in [held, report, practice] {
+        assert_eq!(
+            ev.label_spread(LabelScope::Train, &[train, other], &Serial),
+            mismatch(Some(other)),
+            "the train scope takes side-0 and grid plans alone"
+        );
+    }
+    for other in [train, held, report] {
+        assert_eq!(
+            ev.label_spread(LabelScope::Practice(7), &[practice, other], &Serial),
+            mismatch(Some(other)),
+            "a practice scope takes side-3 plans alone"
+        );
+    }
+    let look_set = PracticeSet::HeldOut(7);
+    let read_set = PracticeSet::Report(7);
+    let look = |l: &[[u8; 12]]| {
+        LabelScope::HeldOut(LookToken::mint_practice(look_set, l).expect("a practice look token"))
+    };
+    let read = |l: &[[u8; 12]]| {
+        LabelScope::Report(ReadToken::mint_practice(read_set, l).expect("a practice read token"))
+    };
+    let replay = |l: &[[u8; 12]]| {
+        LabelScope::Replay(
+            ReplayToken::mint_practice(look_set, l).expect("a practice replay token"),
+        )
+    };
+    let scopes: [(&str, PracticeSet, &ScopeOf<'_>); 3] = [
+        ("look", look_set, &look),
+        ("read", read_set, &read),
+        ("replay", look_set, &replay),
+    ];
+    let mut lists = Vec::new();
+    for (name, set, scope) in scopes {
+        let mut list = pool_bytes(set.set(), 0)[..3].to_vec();
+        list.sort_unstable();
+        assert_eq!(
+            ev.label_spread(scope(&list), &list[..2], &Serial),
+            mismatch(None),
+            "{name}: a token takes its list, not part of it"
+        );
+        let mut more = list.clone();
+        more.push(pool_bytes(set.set(), 1)[0]);
+        assert_eq!(
+            ev.label_spread(scope(&list), &more, &Serial),
+            mismatch(Some(more[3])),
+            "{name}: nor more than it"
+        );
+        let twice = [list[0], list[0], list[1], list[2]];
+        assert_eq!(
+            ev.label_spread(scope(&list), &twice, &Serial),
+            mismatch(None),
+            "{name}: nor a plan twice"
+        );
+        let mut reversed = list.clone();
+        reversed.reverse();
+        assert_eq!(
+            ev.label_spread(scope(&list), &reversed, &Serial),
+            mismatch(None),
+            "{name}: nor its list in another order"
+        );
+        let drawn = set_pools(set.set()).expect("the set fills");
+        let stray =
+            drawn_where(|p| side(p) == Side::Practice && !drawn.iter().flatten().any(|q| q == p))
+                .encode();
+        assert_eq!(
+            ev.label_spread(scope(&[stray]), &[stray], &Serial),
+            mismatch(Some(stray)),
+            "{name}: a token's plans are its set's"
+        );
+        lists.push((name, scope, list));
+    }
+    assert_eq!(
+        ev.reads().train.load(Ordering::Relaxed),
+        0,
+        "a refusal judges nothing"
+    );
+    for (name, scope, list) in lists {
+        let labels = ev
+            .label_spread(scope(&list), &list, &Serial)
+            .unwrap_or_else(|e| panic!("{name}: a token takes its own list: {e}"));
+        assert_eq!(
+            labels.iter().map(TrainLabel::id).collect::<Vec<_>>(),
+            list.iter()
+                .map(|b| SchedulePlan::decode(b).expect("a plan").digest())
+                .collect::<Vec<_>>(),
+            "{name}: in its order"
+        );
+    }
+}
+
+#[test]
+fn a_label_is_judged_once_per_evaluator() {
+    let ev = Evaluator::v1(BUILD, Instant::now())
+        .expect("the pinned policy v1")
+        .capping_labels(2);
+    let (pool, _) = train_pool();
+    let [a, b, c] = [pool[0], pool[1], pool[2]].map(|p| p.encode());
+    let judged = || ev.reads().train.load(Ordering::Relaxed);
+    let first = ev
+        .label_spread(LabelScope::Train, &[a, b, a], &Serial)
+        .expect("two new plans");
+    let after = judged();
+    assert!(after > 0, "the first labels are judged");
+    assert_eq!(first[0], first[2], "a plan twice is labelled once");
+    let again = ev
+        .label_spread(LabelScope::Train, &[b, a], &Serial)
+        .expect("cached plans");
+    assert_eq!(judged(), after, "a cached label is not judged again");
+    assert_eq!(again, [first[1].clone(), first[0].clone()]);
+    assert_eq!(
+        ev.label_spread(LabelScope::Train, &[a, c], &Serial),
+        Err(LabelRefusal::Budget {
+            labelled: 2,
+            asked: 1,
+            cap: 2,
+        })
+    );
+    assert_eq!(judged(), after, "a refusal past the cap judges nothing");
+}
+
+#[test]
+fn a_mint_refuses_a_long_list_a_wrong_side_and_a_wrong_set() {
+    let set = PracticeSet::HeldOut(7);
+    let report = PracticeSet::Report(7);
+    let p = pool_bytes(set.set(), 0)[0];
+    let held = drawn_where(|q| side(q) == Side::HeldOut).encode();
+    assert_eq!(
+        LookToken::mint_practice(set, &vec![p; LOOK_LIST_CAP + 1]).map(|t| t.digest()),
+        Err(MintRefusal::TooLong {
+            len: LOOK_LIST_CAP + 1,
+            cap: LOOK_LIST_CAP,
+        })
+    );
+    assert_eq!(
+        ReplayToken::mint_practice(set, &vec![p; LOOK_LIST_CAP + 1]).map(|t| t.digest()),
+        Err(MintRefusal::TooLong {
+            len: LOOK_LIST_CAP + 1,
+            cap: LOOK_LIST_CAP,
+        })
+    );
+    let q = pool_bytes(report.set(), 0)[0];
+    assert_eq!(
+        ReadToken::mint_practice(report, &vec![q; READ_LIST_CAP + 1]).map(|t| t.digest()),
+        Err(MintRefusal::TooLong {
+            len: READ_LIST_CAP + 1,
+            cap: READ_LIST_CAP,
+        })
+    );
+    assert!(ReadToken::mint_practice(report, &vec![q; READ_LIST_CAP]).is_ok());
+    assert_eq!(
+        LookToken::mint_practice(set, &[p, held]).map(|t| t.digest()),
+        Err(MintRefusal::Side { plan: held })
+    );
+    assert_eq!(
+        LookToken::mint_practice(report, &[q]).map(|t| t.digest()),
+        Err(MintRefusal::WrongSet { set: report.set() })
+    );
+    assert_eq!(
+        ReplayToken::mint_practice(report, &[q]).map(|t| t.digest()),
+        Err(MintRefusal::WrongSet { set: report.set() })
+    );
+    assert_eq!(
+        ReadToken::mint_practice(set, &[p]).map(|t| t.digest()),
+        Err(MintRefusal::WrongSet { set: set.set() })
+    );
+    let token = LookToken::mint_practice(set, &[p, p]).expect("a token");
+    assert_eq!(token.list(), [p], "a token's list is deduplicated");
+    assert_eq!(token.set(), set.set());
+    let mut two = pool_bytes(set.set(), 0)[..2].to_vec();
+    two.sort_unstable();
+    let both = LookToken::mint_practice(set, &[two[1], two[0], two[1]]).expect("a token");
+    assert_eq!(
+        both.digest(),
+        list_digest(&two),
+        "a token holds its list's digest, whatever order and repeats it was minted from"
+    );
+    assert_eq!(list_digest(&[two[1], two[0]]), list_digest(&two));
+    assert_ne!(list_digest(&two[..1]), list_digest(&two));
+}
+
+/// The real sets' capability, named only through `concat!` (design §13.3).
+const REAL: &str = concat!("Real", "Sets");
+
+/// The real-set mints' name, which the mint scan refuses in this file (design §13.3).
+const MINT_REAL: &str = concat!("mint_", "real");
+
+/// The names of the functions of the one `impl {ty} {` block of `src`.
+fn impl_fns<'s>(src: &'s str, ty: &str) -> Vec<&'s str> {
+    let head = format!("impl {ty} {{");
+    assert_eq!(src.matches(&head).count(), 1, "one impl block of {ty}");
+    let at = src.find(&head).expect("its impl");
+    let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+    body.split("fn ")
+        .skip(1)
+        .filter_map(|f| f.split('(').next())
+        .collect()
+}
+
+/// Every `.rs` source of this crate, with its text.
+fn crate_sources() -> Vec<(std::path::PathBuf, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).expect("a readable source dir") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                let text = std::fs::read_to_string(&path).expect("a readable source");
+                out.push((path, text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut out,
+    );
+    out
+}
+
+/// How often `needle` occurs across this crate's sources.
+fn crate_count(needle: &str) -> usize {
+    crate_sources()
+        .iter()
+        .map(|(_, text)| text.matches(needle).count())
+        .sum()
+}
+
+#[test]
+fn a_train_label_stays_private_to_m4() {
+    let src = include_str!("m4.rs");
+    let decl = "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct TrainLabel {\n    id: Digest,\n    plan: SchedulePlan,\n    outcome: Result<Totals, &'static str>,\n}";
+    assert_eq!(
+        src.matches(decl).count(),
+        1,
+        "TrainLabel's fields are private"
+    );
+    let code: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && l.contains("TrainLabel"))
+        .collect();
+    assert_eq!(
+        code,
+        [
+            "labels: Mutex<BTreeMap<Digest, TrainLabel>>,",
+            "pub struct TrainLabel {",
+            "impl TrainLabel {",
+            "fn of(plan: SchedulePlan, judged: Result<TrainAdmitted, CandidateRefusal>) -> TrainLabel {",
+            "TrainLabel {",
+            ") -> Result<Vec<TrainLabel>, LabelRefusal> {",
+            "TrainLabel::of(*p, self.train(&p.encode()))",
+            "pub(super) fn pool_outcome(&self, labels: [&TrainLabel; JUDGED]) -> PoolOutcome {",
+            "pub(super) fn oracle_outcome(&self, labels: &[&TrainLabel]) -> PoolOutcome {",
+            "fn outcome(&self, labels: &[&TrainLabel]) -> PoolOutcome {",
+        ],
+        "every m4 line naming a label: one private constructor, built in one place, which only \
+         label_spread calls, the cache that keeps them, and the folds that read them"
+    );
+    assert!(
+        src.contains("\n    fn of(plan: SchedulePlan, judged"),
+        "the constructor is private to m4"
+    );
+    assert_eq!(
+        impl_fns(src, "TrainLabel"),
+        ["of", "id", "plan", "totals", "law"],
+        "its accessors read training facts alone"
+    );
+    assert_eq!(
+        crate_count(&format!("for {}", "TrainLabel")),
+        0,
+        "no hand-written trait impl anywhere"
+    );
+}
+
+#[test]
+fn the_tokens_stay_private_to_m4() {
+    let src = include_str!("m4.rs");
+    for token in ["LookToken", "ReadToken", "ReplayToken"] {
+        let decl = format!(
+            "#[cfg(any(test, debug_assertions, feature = \"aos-learn\"))]\n#[derive(Debug)]\npub struct {token} {{\n    bound: Bound,\n}}"
+        );
+        assert_eq!(
+            src.matches(&decl).count(),
+            1,
+            "{token}: private, neither Clone nor Copy"
+        );
+        assert_eq!(
+            crate_count(&format!("for {token}")),
+            0,
+            "{token}: no hand-written trait impl anywhere"
+        );
+        assert_eq!(
+            src.matches(&format!("{token} {{ bound }}")).count(),
+            2,
+            "{token}: built only by its two mints"
+        );
+        assert_eq!(
+            impl_fns(src, token),
+            [MINT_REAL, "mint_practice", "set", "list", "digest"],
+            "{token}: its mints and accessors alone"
+        );
+    }
+    assert!(src.contains("#[derive(Debug, PartialEq, Eq)]\nstruct Bound {"));
+    assert_eq!(
+        src.matches("Bound { set, list }").count(),
+        1,
+        "a binding is built only by Bound::mint"
+    );
+}
+
+#[test]
+fn the_mints_are_pinned() {
+    let src = include_str!("m4.rs");
+    for (token, cap) in [
+        ("LookToken", "LOOK_LIST_CAP"),
+        ("ReadToken", "READ_LIST_CAP"),
+        ("ReplayToken", "LOOK_LIST_CAP"),
+    ] {
+        let real = format!(
+            "    pub(super) fn {MINT_REAL}(\n        _sets: &{REAL},\n        i: u32,\n        list: &[[u8; PLAN_LEN]],\n    ) -> Result<{token}, MintRefusal> {{"
+        );
+        assert_eq!(
+            src.matches(&real).count(),
+            1,
+            "{token}'s real mint takes the capability"
+        );
+        let practice = format!(
+            "    pub(super) fn mint_practice(\n        set: PracticeSet,\n        list: &[[u8; PLAN_LEN]],\n    ) -> Result<{token}, MintRefusal> {{"
+        );
+        assert_eq!(
+            src.matches(&practice).count(),
+            1,
+            "{token}'s practice mint takes a practice set"
+        );
+        assert!(src.contains(&format!(
+            "Bound::mint(set, {cap}, list).map(|bound| {token} {{ bound }})"
+        )));
+    }
+    assert_eq!(src.matches(&format!("fn {MINT_REAL}(")).count(), 3);
+    assert_eq!(src.matches("fn mint_practice(").count(), 3);
+    assert_eq!(
+        src.matches("Bound::mint(").count(),
+        6,
+        "every token comes from a mint"
+    );
+}
+
+#[test]
+fn the_real_sets_capability_is_pinned() {
+    let src = include_str!("m4.rs");
+    let decl = format!(
+        "pub struct {REAL}(\n    #[expect(\n        dead_code,\n        reason = \"read by nothing: it makes the zero bit pattern invalid, so `mem::zeroed` panics\"\n    )]\n    NonZeroU64,\n);\n"
+    );
+    assert_eq!(
+        src.matches(&decl).count(),
+        1,
+        "one private NonZeroU64 field, nothing else"
+    );
+    let at = src.find(&decl).expect("its declaration");
+    let attrs: Vec<&str> = src[..at]
+        .lines()
+        .rev()
+        .take_while(|l| !l.starts_with("///"))
+        .collect();
+    assert_eq!(
+        attrs,
+        ["#[cfg(any(test, debug_assertions, feature = \"aos-learn\"))]"],
+        "no derive, between its doc comment and its declaration"
+    );
+    assert_eq!(impl_fns(src, REAL), ["new"], "one constructor");
+    assert!(src.contains(&format!(
+        "    pub const fn new() -> {REAL} {{\n        {REAL}(NonZeroU64::MIN)\n    }}"
+    )));
+    for (needle, n, what) in [
+        (format!("for {REAL}"), 0, "no hand-written trait impl"),
+        (format!("impl {REAL}"), 1, "its one inherent impl"),
+        (format!("-> {REAL}"), 1, "one function returns one"),
+        (format!("{REAL}("), 2, "its declaration and its constructor"),
+    ] {
+        assert_eq!(crate_count(&needle), n, "{what}, anywhere in the crate");
+    }
 }

@@ -51,6 +51,46 @@ const MAX_UNSETTLED_WAITS: u32 = 3;
 
 const QUESTION_STANDIN_QUIET: Duration = Duration::from_secs(10);
 
+/// THE MOST QUIET A PERSON'S INPUT BUYS BEFORE THE LOOP ANSWERS A QUESTION DIALOG: their grace
+/// (`[harness] human_grace_s`, 120 s by default, any length the owner sets), but never more than
+/// this. A keystroke this recent is a person answering now, and their keys are never raced; one
+/// older is no reason to leave the question to them (owner, 2026-10-24: "THE HARNESS MUST DO THIS
+/// STOP ASKING THE USER"), so the dialog is answered without them.
+pub(super) const QUESTION_PERSON_GRACE: Duration = Duration::from_secs(15);
+
+/// The quiet a person's input buys before the loop acts: `[harness] human_grace_s`.
+fn person_grace(opts: &SuperviseOpts) -> Duration {
+    Duration::from_secs(u64::from(opts.policy.human_grace_s))
+}
+
+/// What the loop is about to answer, as far as a person's grace is concerned. The loop answers
+/// only under Cruise or Land (under Off it parks), so this is Autopilot's rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    /// A question dialog: [`QUESTION_PERSON_GRACE`] at most.
+    Question,
+    /// A permission box or any other dialog: the person's whole grace.
+    Other,
+}
+
+impl Dialog {
+    fn of(kind: PromptKind) -> Self {
+        if kind == PromptKind::Question {
+            Self::Question
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// The quiet a person's input buys before the loop answers `dialog` ([`QUESTION_PERSON_GRACE`]).
+fn dialog_grace(opts: &SuperviseOpts, dialog: Dialog) -> Duration {
+    match dialog {
+        Dialog::Question => person_grace(opts).min(QUESTION_PERSON_GRACE),
+        Dialog::Other => person_grace(opts),
+    }
+}
+
 /// What the loop remembers of the question dialog it is answering.
 #[derive(Debug, Default)]
 pub(super) struct QuestionMemory {
@@ -1450,10 +1490,25 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
+        let grace = person_grace(opts);
+        self.held_for_person_within(seq, act, fresh, clock, grace, review)
+    }
+
+    /// [`Self::held_for_person`] with the person's input buying `grace` of quiet
+    /// ([`dialog_grace`] at a box or a question).
+    fn held_for_person_within(
+        &mut self,
+        seq: u64,
+        act: &str,
+        fresh: bool,
+        clock: DenyClock,
+        grace: Duration,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
         if fresh {
             self.program = self.foreground_program()?;
         }
-        let Some(grace_ends) = self.hands_off_until(opts) else {
+        let Some(grace_ends) = self.hands_off_for(grace) else {
             return Ok(false);
         };
         let who = if self.driver {
@@ -1639,17 +1694,21 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    fn box_grace(&self, opts: &SuperviseOpts, screen: &Screen) -> Duration {
+    fn box_grace(&self, opts: &SuperviseOpts, screen: &Screen, dialog: Dialog) -> Duration {
         if self.hold_over(screen) {
             Duration::ZERO
         } else {
-            Duration::from_secs(u64::from(opts.policy.human_grace_s))
+            dialog_grace(opts, dialog)
         }
     }
 
     /// Until when the loop keeps its hands off the session.
     pub(super) fn hands_off_until(&self, opts: &SuperviseOpts) -> Option<Instant> {
-        let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+        self.hands_off_for(person_grace(opts))
+    }
+
+    /// Until when a person's last input keeps the loop's hands off, their input buying `grace`.
+    fn hands_off_for(&self, grace: Duration) -> Option<Instant> {
         self.person
             .and_then(|typed| typed.checked_add(grace))
             .filter(|until| *until > self.fx.mono())
@@ -1771,7 +1830,9 @@ impl<C: Ctl> Session<'_, C> {
             decision,
             Decision::Approve { .. } | Decision::Decline { .. }
         ) && !carried_pick;
-        let launch = if answers && self.hands_off_until(opts).is_some() {
+        let dialog = Dialog::of(p.kind);
+        let grace = dialog_grace(opts, dialog);
+        let launch = if answers && self.hands_off_for(grace).is_some() {
             self.launch_call(&turn.screen, &p, &decision, opts)?
         } else {
             LaunchCall::Held
@@ -1787,11 +1848,12 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(Step::Again { settle: false });
             }
             LaunchCall::Held if answers => {
-                if p.kind == PromptKind::Question && self.hands_off_until(opts).is_some() {
+                if p.kind == PromptKind::Question && self.hands_off_for(grace).is_some() {
                     self.question.person_gave_input();
                 }
                 let clock = self.deny_clock(&turn.screen);
-                if self.held_for_person(seq, "the box's answer", false, clock, opts, review)? {
+                let act = "the box's answer";
+                if self.held_for_person_within(seq, act, false, clock, grace, review)? {
                     return Ok(Step::Review(turn));
                 }
             }
@@ -1858,7 +1920,8 @@ impl<C: Ctl> Session<'_, C> {
                     .enter_target()
                     .is_some_and(|target| answers(&dialog, target));
                 let this_question = question_key(&dialog, &turn.screen.rows);
-                let grace = self.box_grace(opts, &turn.screen);
+                let asked = Dialog::Question;
+                let grace = self.box_grace(opts, &turn.screen, asked);
                 let text_word = self.question.deciding.is_some_and(|w| w.text().is_some());
                 let reask = (answering || text_word).then_some(this_question.as_str());
                 match self.question_hold(
@@ -1943,8 +2006,10 @@ impl<C: Ctl> Session<'_, C> {
             }
             (Act::Approve { .. }, _) => unproven.clone().unwrap_or_default(),
         };
-        let grace = self.box_grace(opts, &turn.screen);
-        let past_hold = self.hold_over(&turn.screen) && self.hands_off_until(opts).is_some();
+        let dialog = Dialog::of(p.kind);
+        let grace = self.box_grace(opts, &turn.screen, dialog);
+        let past_hold = self.hold_over(&turn.screen)
+            && self.hands_off_for(dialog_grace(opts, dialog)).is_some();
         let person = past_hold.then(|| self.person_fence(&turn.screen)).flatten();
         let pressing = match &act {
             Act::Approve {

@@ -385,7 +385,8 @@ pub struct TermWord {
 /// The line discipline of the pseudo-terminal `dev` that `pid` holds (a controlling terminal's
 /// device, as [`ProcFacts::tty`] holds it), and the keys queued in it, read through its device
 /// node (Linux: through `pid`'s own descriptor of it, the node of whichever `devpts` holds it):
-/// `None` when no node is `dev`'s or aterm's user may not open it (a terminal sudo gave root).
+/// `None` when no node is `dev`'s or aterm's user may not open it (a terminal sudo gave root), and
+/// when the queue cannot be counted: an unknown count is no word, never an empty queue.
 #[cfg(unix)]
 #[must_use]
 pub fn term_word(pid: u32, dev: u32) -> Option<TermWord> {
@@ -398,25 +399,39 @@ pub fn term_word(pid: u32, dev: u32) -> Option<TermWord> {
         .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&path)
         .ok()?;
+    word_of(f.as_raw_fd(), queued_on)
+}
+
+/// The word of the terminal open at `fd`, its queue counted by `queued`: `None` when either read
+/// fails.
+#[cfg(unix)]
+fn word_of(fd: i32, queued: impl FnOnce(i32) -> Option<u32>) -> Option<TermWord> {
     // SAFETY: `termios` is plain integers and bytes; all-zero is valid.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: `f` is open for the call and `t` is a writable `termios`.
-    let rc = unsafe { libc::tcgetattr(f.as_raw_fd(), &raw mut t) };
+    // SAFETY: `tcgetattr` fails cleanly on a bad or non-terminal `fd`, and `t` is a writable
+    // `termios`.
+    let rc = unsafe { libc::tcgetattr(fd, &raw mut t) };
     if rc != 0 {
         return None;
     }
-    let mut queued: libc::c_int = 0;
-    // SAFETY: `f` is open for the call and `queued` a writable `int`.
-    let rc = unsafe { libc::ioctl(f.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
     Some(TermWord {
         canonical: t.c_lflag & libc::ICANON != 0,
         echo: t.c_lflag & libc::ECHO != 0,
-        queued: if rc == 0 {
-            u32::try_from(queued).unwrap_or(0)
-        } else {
-            0
-        },
+        queued: queued(fd)?,
     })
+}
+
+/// The bytes queued for the reader of the terminal open at `fd` (`FIONREAD`), `None` where the
+/// call fails or the count is negative.
+#[cfg(unix)]
+fn queued_on(fd: i32) -> Option<u32> {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `ioctl` fails cleanly on a bad `fd`, and `queued` is a writable `int`.
+    let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut queued) };
+    if rc != 0 {
+        return None;
+    }
+    u32::try_from(queued).ok()
 }
 
 /// The node of the pseudo-terminal `dev`: macOS's `/dev/ttysNNN` (major 16, the minor its

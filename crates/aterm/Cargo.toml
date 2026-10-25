@@ -98,6 +98,7 @@ aterm-link = { path = "../aterm-link" }
 # which Windows has none of, so there the verb stays on the roster and
 # refuses by name (`secrets_unavailable` in src/main.rs).
 aterm-secrets = { workspace = true }
+aterm-db = { workspace = true }
 
 # `aterm machines` — a lab of Macs managed from this one over SSH
 # (docs/DESIGN-machines-2026-10-16.md). MACOS ONLY: it drives macOS's own tools

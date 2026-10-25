@@ -50,8 +50,9 @@ pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
 pub use phase::{
-    Phase, background_only, busy_signal, busy_zone_start, context_left, limit_notice, notice_reset,
-    opened_by_own_wake, shells_running, transcript_end, turn_over_background, worker_phase,
+    ApiRetryRow, Phase, RetryCause, api_retry_row, background_only, busy_signal, busy_zone_start,
+    context_left, limit_notice, notice_reset, opened_by_own_wake, shells_running, transcript_end,
+    turn_over_background, worker_phase,
 };
 pub use prompt::{
     Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,

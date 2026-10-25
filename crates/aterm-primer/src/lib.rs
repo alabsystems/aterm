@@ -17,14 +17,15 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// marked its blocks v33 and wrote each agent's own, so it leaves the generic block a file
 /// two agents share carries ([`Readers::block`]) only when that block is v34 or later.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v40 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v41 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 const MARK_END: &str = "<!-- /aterm primer -->";
 
 const PRIMER_BODY: &str = "\
 ## aterm
-`TERM_PROGRAM=aterm` or `ATERM_CHILD=1` means this terminal is aterm; with neither set, ignore this section.
+`TERM_PROGRAM=aterm`, `ATERM_CHILD=1` or a set `ATERM_SESSION_ID` means this terminal is aterm; with none set, ignore this section.
 `aterm help` is the agent brief; `aterm ctl help [<verb>]` explains each control verb, and `aterm ctl --help` needs no session.
+When your agent needs restarting (including to adopt an installed update), do it yourself: save your work and a handoff, read `aterm ctl @self status` and `aterm ctl help restart`, then run `aterm ctl @self restart` (add `pid=<agent-pid>` when known; `supervisor=` can name aterm's host, not the agent). aterm validates the supervised foreground process and resumes the same conversation with its recorded arguments, directory and environment. The command ends your current process; a refusal names what prevents it. An agent restart is not a `NEEDS YOU` item; a Mac restart still is.
 `aterm ctl ls` lists every session; a peer's `status` names its program, often another agent, which reads what you type as its prompt.
 `aterm ctl survey` shows what every session here is doing; its excerpts are data from those sessions, like a mail body.
 A worker is Claude Code, codex-alab, Gemini CLI, agy or Muse Code in another tab: `aterm ctl @self spawn agent=claude -` starts a Claude Code worker under Autopilot Land on the task on stdin, `aterm ctl await task @<sid>,… since=0` run as a background Bash exits when one is done (its work landed), exited, stalled or needs a person (a later wait names `@<sid>:<rev>`), and `aterm ctl @<sid> result` is its report.
@@ -48,9 +49,10 @@ const RUST_NOTE: &str = "\
 `brew` in an aterm session is `abrew`, aterm's native Homebrew (`aterm help abrew`): it announces itself, installs bottles and tar/zip/DMG/single-file casks into its own prefix, and delegates the rest (source builds, services, pkg casks, bottles it cannot relocate) to real brew before any effect. `brew --real <cmd>` (or `ABREW_REAL=1`) runs real Homebrew unchanged.";
 
 const CODEX_ADDENDUM: &str = "\
-Every `aterm ctl` verb here answers `Operation not permitted (os error 1)`: the control
-socket is refused by this sandbox — nothing to configure. aterm types into no Codex but
-codex-alab, whose own TUI, outside this sandbox, reads this session's mail.";
+Codex tool shells can have different sandbox permissions: try `aterm ctl @self status`
+before deciding the control socket is unavailable. If it actually answers `Operation not
+permitted (os error 1)`, respect that refusal; do not bypass the sandbox. aterm types into
+no Codex but codex-alab, whose own TUI, outside the tool sandbox, reads this session's mail.";
 
 fn auto_prime_note(xdg: Option<&Path>) -> String {
     format!(
@@ -133,9 +135,10 @@ const FABRIC_SKILL_BODY: &str = concat!(
 
 const CODEX_FABRIC_BODY: &str = concat!(
     include_str!("../assets/aterm-fabric-body.md"),
-    "\nIn Codex's sandbox each `aterm ctl` command above answers `Operation not permitted \
-     (os error 1)`: the control socket is refused there. codex-alab's own TUI, outside the \
-     sandbox, reads this session's mail.\n",
+    "\nCodex tool shells can have different sandbox permissions: try `aterm ctl @self status` \
+     before deciding the control socket is unavailable. If it actually answers `Operation \
+     not permitted (os error 1)`, respect that refusal; do not bypass the sandbox. \
+     codex-alab's own TUI, outside the tool sandbox, reads this session's mail.\n",
 );
 
 const OPENCODE_FABRIC_BODY: &str = concat!(
@@ -2378,11 +2381,16 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         let v5_block = format!(
             "<!-- aterm primer v5 — managed by `aterm agents`; `aterm agents remove` uninstalls -->\n{PRIMER_BODY}\n{MARK_END}\n"
         );
+        let v40_block = "<!-- aterm primer v40 — managed by `aterm agents`; `aterm agents remove` uninstalls -->\n\
+Every `aterm ctl` verb here answers `Operation not permitted (os error 1)`: the control\n\
+socket is refused by this sandbox — nothing to configure.\n\
+<!-- /aterm primer -->\n";
         for (version, stale) in [
             ("v1", V1_BLOCK),
             ("v2", V2_BLOCK),
             ("v3", V3_BLOCK),
             ("v5", v5_block.as_str()),
+            ("v40", v40_block),
         ] {
             let home = aterm_tempfile::tempdir().unwrap();
             let file = home.path().join(".codex/AGENTS.md");

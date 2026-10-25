@@ -67,6 +67,44 @@ fn a_nodes_hold_refuses_every_writer_but_that_node() {
 }
 
 #[test]
+fn a_nodes_hold_ends_with_its_grant() {
+    let store = new_store();
+    let (sid, ctx) = registered_as(&store, 1);
+    let (other_sid, other) = registered_as(&store, 2);
+    let (m03, m09) = (mac(0x03, "mac-03"), mac(0x09, "mac-09"));
+    assert_eq!(remote(&store, &m03, &format!("{sid} on")), "OK hold=1\n");
+    assert_eq!(
+        remote(&store, &m09, &format!("{other_sid} on")),
+        "OK hold=1\n"
+    );
+    assert_eq!(
+        cmd_hold(&store, &format!("{sid} off"), HoldIssuer::Owner),
+        "OK hold=1\n",
+        "a local off lifts its own slot alone"
+    );
+    let granted = |node: &str| node == m09.node;
+    assert_eq!(lift_ungranted_remote_holds(&store, &granted, &|_| {}), 1);
+    assert!(!ctx.fabric.holds().is_held(), "m03 drives no more");
+    assert!(refusal_to(&ctx, None, "send").is_none());
+    assert_eq!(
+        other.fabric.holds().remote().map(|hold| hold.node.clone()),
+        Some(m09.node.clone()),
+        "a granted node keeps its hold"
+    );
+    assert_eq!(lift_ungranted_remote_holds(&store, &granted, &|_| {}), 0);
+    assert_eq!(lift_ungranted_remote_holds(&store, &|_| false, &|_| {}), 1);
+    assert!(!other.fabric.holds().is_held());
+
+    assert_eq!(person_hold(&ctx, true, &|| {}), PersonHoldOutcome::Moved);
+    assert_eq!(lift_ungranted_remote_holds(&store, &|_| false, &|_| {}), 0);
+    assert_eq!(
+        ctx.fabric.holds().origins(),
+        PERSON_ORIGIN,
+        "the person's hold is no node's"
+    );
+}
+
+#[test]
 fn the_persons_take_over_refuses_and_clears_a_nodes_hold() {
     let store = new_store();
     let (sid, ctx) = registered_as(&store, 1);

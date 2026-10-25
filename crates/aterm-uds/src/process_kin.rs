@@ -526,7 +526,7 @@ pub fn boot_id() -> Option<String> {
 }
 
 /// This process's pid namespace, the one every pid it reads is read in: the inode Linux names
-/// in `/proc/self/ns/pid` ([`namespace_inode`]). Namespaces share a boot, so a record of pids
+/// in `/proc/self/ns/pid` (`namespace_inode`). Namespaces share a boot, so a record of pids
 /// is kept per namespace as well as per boot. `None` where there are none, or it does not read.
 #[must_use]
 pub fn pid_namespace() -> Option<String> {

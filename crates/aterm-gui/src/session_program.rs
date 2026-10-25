@@ -102,7 +102,8 @@ pub(crate) fn argv_head_of(pid: i32) -> Option<(String, Option<String>)> {
     argv_head(&aterm_uds::process::read_process_argv(pid)?)
 }
 
-/// argv[0] where it is not empty, and argv[1] where it is there and not empty, each read as lossy UTF-8.
+/// `argv[0]` where it is not empty, and `argv[1]` where it is there and not empty, each read as
+/// lossy UTF-8.
 fn argv_head(words: &[std::ffi::OsString]) -> Option<(String, Option<String>)> {
     let text = |w: &std::ffi::OsString| w.to_string_lossy().into_owned();
     let argv0 = words.first().filter(|w| !w.is_empty()).map(text)?;

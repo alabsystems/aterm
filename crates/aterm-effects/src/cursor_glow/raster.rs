@@ -666,12 +666,12 @@ pub(crate) fn push_halo_over(
 
 /// Fit a round glow's centre and radii inside the effects box so its radial falloff fades to zero before the box edge.
 #[inline]
-pub(crate) fn fit_glow_in_box(
+pub(crate) const fn fit_glow_in_box(
     geom: Geom,
     (cx, cy): (f32, f32),
     (rx, ry): (f32, f32),
 ) -> ((f32, f32), (f32, f32)) {
-    let fit = |c: f32, r: f32, lo: f32, hi: f32, step: f32| {
+    const fn fit(c: f32, r: f32, lo: f32, hi: f32, step: f32) -> (f32, f32) {
         let mut c = c;
         if c - r < lo {
             c = (c + step).min(lo + r).min(hi);
@@ -680,7 +680,7 @@ pub(crate) fn fit_glow_in_box(
             c = (c - step).max(hi - r).max(lo);
         }
         (c, (c - lo).min(hi - c).max(0.0))
-    };
+    }
     let (cx, room_x) = fit(
         cx,
         rx,
@@ -703,12 +703,14 @@ pub(crate) fn fit_glow_in_box(
 
 /// Clamp a round glow's radii inside the effects box around a fixed centre.
 #[inline]
-pub(crate) fn hold_glow_radii_in_box(
+pub(crate) const fn hold_glow_radii_in_box(
     geom: Geom,
     (cx, cy): (f32, f32),
     (rx, ry): (f32, f32),
 ) -> (f32, f32) {
-    let room = |c: f32, lo: i32, hi: i32| (c - lo as f32).min(hi as f32 - c).max(1.0);
+    const fn room(c: f32, lo: i32, hi: i32) -> f32 {
+        (c - lo as f32).min(hi as f32 - c).max(1.0)
+    }
     (
         rx.min(room(cx, geom.fx_left(), geom.fx_right())),
         ry.min(room(cy, geom.fx_top(), geom.fx_bot())),
@@ -731,9 +733,17 @@ pub(crate) fn push_soft_veil(
     if rx < 1.0 || ry < 1.0 || cap == 0 {
         return;
     }
-    let a = f32::from(cap) / 255.0;
-    let layer = 1.0 - (1.0 - a).powf(1.0 / SOFT_VEIL_LAYERS as f32);
-    let layer_cap = ((layer * 255.0).round() as u32).clamp(1, u32::from(cap));
+    static LAYER_CAP: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let layer_cap = LAYER_CAP.get_or_init(|| {
+        std::array::from_fn(|cap| {
+            if cap == 0 {
+                return 0;
+            }
+            let a = cap as f32 / 255.0;
+            let layer = 1.0 - (1.0 - a).powf(1.0 / SOFT_VEIL_LAYERS as f32);
+            ((layer * 255.0).round() as u32).clamp(1, cap as u32)
+        })
+    })[usize::from(cap)];
     let color = (ink & 0x00FF_FFFF) | (layer_cap << 24);
     for k in 0..SOFT_VEIL_LAYERS {
         let shrink = 1.0 - k as f32 / SOFT_VEIL_LAYERS as f32;

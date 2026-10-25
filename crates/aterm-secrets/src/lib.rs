@@ -5,6 +5,10 @@
 //! Client and service flows ([`materialize`], [`client`], [`service`], [`cli`]).
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    all(unix, anchor_rules, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
@@ -12,6 +16,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 pub mod age;
 pub mod b64;
 pub mod bech32;
+pub mod commons;
 pub mod envelope;
 pub mod join;
 pub mod text;

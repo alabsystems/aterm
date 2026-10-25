@@ -170,7 +170,7 @@ pub fn forge_cursor_fill(
 }
 
 /// The cursor-body fills one tick can produce (plus the momentum tint), in precedence order.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct BlockFillSplice {
     pub rainbow: Option<u32>,
     pub forge: Option<u32>,
@@ -181,6 +181,27 @@ pub struct BlockFillSplice {
     pub beamrod: Option<u32>,
     /// The typing-momentum tint, last, so a style body always wins the caret.
     pub momentum: Option<u32>,
+}
+
+impl Default for BlockFillSplice {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl BlockFillSplice {
+    /// No cursor-body fill produced.
+    pub const NONE: Self = Self {
+        rainbow: None,
+        forge: None,
+        phaser: None,
+        bolt: None,
+        comet: None,
+        droplet: None,
+        beamrod: None,
+        momentum: None,
+    };
 }
 
 /// The blink law, by who owns the caret.
@@ -480,11 +501,18 @@ impl GlowSpelling {
     /// A page's reading of a raw spelling.
     #[inline]
     #[must_use]
-    pub fn parse(raw: &str) -> Self {
-        let token = crate::cursor_glow::spellings::canonical(raw).unwrap_or(raw);
+    pub const fn parse(raw: &str) -> Self {
+        let token = match crate::cursor_glow::spellings::canonical(raw) {
+            Some(c) => c,
+            None => raw,
+        };
         let style = GlowStyle::parse(token);
         Self {
-            style: (token != "off").then_some(style),
+            style: if matches!(token.as_bytes(), b"off") {
+                None
+            } else {
+                Some(style)
+            },
             beam: crate::cursor_glow::style_has_beam_of(style, token),
             ribbon_tall: !GlowStyle::style_names_underline_ribbon(token),
             ribbon_flat: GlowStyle::style_names_flat_ribbon(token),
@@ -495,14 +523,16 @@ impl GlowSpelling {
     /// The companion a page's raw spelling names.
     #[inline]
     #[must_use]
-    pub fn pet_of(raw: &str) -> Option<crate::kitty_pet::PetSpecies> {
-        GlowStyle::style_names_any_pet(raw).then(|| {
-            if GlowStyle::style_names_dog_pet(raw) {
+    pub const fn pet_of(raw: &str) -> Option<crate::kitty_pet::PetSpecies> {
+        if GlowStyle::style_names_any_pet(raw) {
+            Some(if GlowStyle::style_names_dog_pet(raw) {
                 crate::kitty_pet::PetSpecies::Dog
             } else {
                 crate::kitty_pet::PetSpecies::Cat
-            }
-        })
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -602,7 +632,7 @@ pub const fn automatic_glow_color(
 
 /// The cursor family's config law.
 #[must_use]
-pub fn resolve_glow_config(
+pub const fn resolve_glow_config(
     knobs: GlowKnobs,
     spelling: GlowSpelling,
     theme_cursor: u32,
@@ -612,19 +642,39 @@ pub fn resolve_glow_config(
     head_dx: f32,
 ) -> GlowConfig {
     use crate::cursor_glow::{KnobContext, TrailKnob};
-    let glow_style = spelling.style.unwrap_or(GlowStyle::Lumen);
+    let glow_style = match spelling.style {
+        Some(style) => style,
+        None => GlowStyle::Lumen,
+    };
     let default_color = automatic_glow_color(glow_style, theme_cursor, false);
-    let color = knobs.color.unwrap_or(default_color) & 0x00ff_ffff;
+    let color = (match knobs.color {
+        Some(c) => c,
+        None => default_color,
+    }) & 0x00ff_ffff;
     let accent_base = if glow_style.draws_trail_color() {
         color
     } else {
         default_color & 0x00ff_ffff
     };
-    let accent = knobs
-        .accent
-        .map(|value| value & 0x00ff_ffff)
-        .unwrap_or_else(|| brighten(accent_base, 1.5));
+    let accent = match knobs.accent {
+        Some(value) => value & 0x00ff_ffff,
+        None => brighten(accent_base, 1.5),
+    };
     let widest = KnobContext::widest(false);
+    let duration_ms = if knobs.duration_ms < 30 {
+        30
+    } else if knobs.duration_ms > 2_000 {
+        2_000
+    } else {
+        knobs.duration_ms
+    };
+    let length = if knobs.length < 1 {
+        1
+    } else if knobs.length > 512 {
+        512
+    } else {
+        knobs.length
+    };
     GlowConfig {
         theme_fg,
         theme_bg,
@@ -632,8 +682,8 @@ pub fn resolve_glow_config(
         style: glow_style,
         color,
         accent,
-        duration: std::time::Duration::from_millis(knobs.duration_ms.clamp(30, 2_000)),
-        length: knobs.length.clamp(1, 512),
+        duration: std::time::Duration::from_millis(duration_ms),
+        length,
         intensity: finite_clamp_or_off(knobs.intensity, 0.0, 1.0),
         audible: false,
         radius: if glow_style.reads_knob(TrailKnob::Radius, widest) {
@@ -648,7 +698,7 @@ pub fn resolve_glow_config(
         ribbon_tall: spelling.ribbon_tall,
         ribbon_flat: spelling.ribbon_flat,
         classic_mono: spelling.classic_mono
-            || (glow_style == GlowStyle::Classic && knobs.color.is_some()),
+            || (matches!(glow_style, GlowStyle::Classic) && knobs.color.is_some()),
     }
 }
 
@@ -842,10 +892,18 @@ pub const fn follow_live_cursor(
     }
 }
 
-#[derive(Default)]
 struct OverInkShares(u64);
 
+impl Default for OverInkShares {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl OverInkShares {
+    const EMPTY: Self = Self(0);
+
     #[inline]
     const fn fold(&mut self, share: f32) {
         if share < 1.0 {
@@ -878,7 +936,7 @@ impl CursorFx {
     pub fn retire_bodies(&mut self) {
         self.retire_body_geometry();
         self.momentum.reset();
-        self.cadence = TypingCadence::default();
+        self.cadence = TypingCadence::DEFAULT;
     }
 
     /// The caret's coordinate space was replaced (re-grid, new owner, alternate screen swap, torn
@@ -1080,7 +1138,7 @@ impl CursorFx {
             },
             &mut self.glow_scratch,
         );
-        let mut shares = OverInkShares::default();
+        let mut shares = OverInkShares::EMPTY;
         let body_to = self.glow_scratch.len();
         shares.fold(self.glow.admit_over_ink(
             &mut self.glow_scratch,

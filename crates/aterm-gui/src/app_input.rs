@@ -7869,7 +7869,7 @@ impl App {
         self.drop_front_scroll_motion(wid);
     }
 
-    /// Drop the window's wheel glide.
+    /// Drop the window's wheel glide, residual and bounce, unless the glide is another pane's.
     pub(crate) fn drop_front_scroll_motion(&mut self, wid: WindowId) {
         let front = self
             .front_terminal(wid)

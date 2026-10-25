@@ -1,0 +1,17 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-24: a reply whose prose quotes Grok Build's login-ended texts and the ones that are no ended login of the row's, assembled as grok-1.0.70-hand-built-wall-auth-token-invalid is, with no error row — every row is the reply's own words, so none opens with a login text
+  ~/proj
+
+  › which grok errors mean I must sign in again?
+
+  Run `grok login` again when it says "Your auth token is invalid or expired.",
+  "Token expired. Run `grok login` to re-authenticate.", "Session expired. Run
+  `grok login` to re-authenticate." or "Your team sign-in was rejected."; it
+  also says "Not signed in. Run `grok login` to authenticate" when no login is
+  stored. These need no sign-in: "Authentication is temporarily unavailable.",
+  "Access token expired or nearly expired, refreshing." (an MCP server's), and
+  "Your GROK_DEPLOYMENT_KEY is invalid or expired." (a team's deployment key).
+
+
+
+
+                                                 ctrl+q  quit

@@ -4216,6 +4216,7 @@ fn another_pools_due_line_follows_its_note_and_leaves_claudes_alone() {
         cli: Cli::Kimi,
         due: vec!["kimi-1".to_string()],
         wrong: Vec::new(),
+        sign_in: Vec::new(),
     }]));
     let mut both = vec![mr::ACCOUNTS_DUE_KEY.to_string(), kimi_due.clone()];
     both.sort();
@@ -4233,5 +4234,43 @@ fn another_pools_due_line_follows_its_note_and_leaves_claudes_alone() {
         keys(&app),
         [mr::ACCOUNTS_DUE_KEY.to_string()],
         "CONTROL: Claude Code's line stands; Kimi's is cleared"
+    );
+}
+
+#[test]
+fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
+    use crate::harness_host::PoolSaid;
+    use aterm_agent::harness::accounts::{Cli, SignInAction};
+    let mut app = App::headless_for_test();
+    let key = mr::pool_notice_key(Cli::Kimi, "sign-in");
+    for (action, word) in [
+        (SignInAction::Browser, "accounts browser"),
+        (SignInAction::Login, "accounts login"),
+    ] {
+        app.note_harness_host(HostNote::Pools(vec![PoolSaid {
+            cli: Cli::Kimi,
+            due: Vec::new(),
+            wrong: Vec::new(),
+            sign_in: vec![("kimi-one".into(), action)],
+        }]));
+        let digest = app.messages.digest();
+        let entry = digest
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("human step shown");
+        assert!(
+            entry.then.contains(word) && entry.then.contains("--cli kimi"),
+            "{}",
+            entry.then
+        );
+    }
+    app.note_harness_host(HostNote::Pools(Vec::new()));
+    assert!(
+        !app.messages
+            .digest()
+            .entries
+            .iter()
+            .any(|entry| entry.key == key)
     );
 }

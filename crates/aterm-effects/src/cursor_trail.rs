@@ -124,7 +124,7 @@ pub const fn hide_bridge_reach(
 }
 
 /// Hidden→visible relocations the trail's hide bridge has judged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BridgeTally {
     /// Relocations the bridge admitted a source cell for.
     pub bridged: u64,
@@ -132,8 +132,23 @@ pub struct BridgeTally {
     pub declined: u64,
 }
 
+impl Default for BridgeTally {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl BridgeTally {
+    /// Zeroed bridge tally.
+    pub const EMPTY: Self = Self {
+        bridged: 0,
+        declined: 0,
+    };
+}
+
 #[inline]
-fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
+const fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
     let q = q.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * q).round() as u32
 }
@@ -210,15 +225,29 @@ struct Spark {
     life_ms: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct DedupSlot {
     epoch: u64,
     key: u32,
     out_idx: u32,
 }
 
+impl Default for DedupSlot {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl DedupSlot {
+    const EMPTY: Self = Self {
+        epoch: 0,
+        key: 0,
+        out_idx: 0,
+    };
+}
+
 /// Per-window trail animation state.
-#[derive(Default)]
 pub struct CursorTrail {
     sparks: Vec<Spark>,
     last: Option<(u16, u16)>,
@@ -235,6 +264,13 @@ pub struct CursorTrail {
     spawn_path: Vec<(i32, i32)>,
 }
 
+impl Default for CursorTrail {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorTrail {
     const MAX_SPARKS: usize = 512;
     const DEDUP_SLOTS: usize = 1024;
@@ -242,6 +278,27 @@ impl CursorTrail {
     const BLINK_HINT_FRESH: f32 = 0.5;
     const NAV_HINT_FRESH: f32 = 0.25;
     const MOVE_HINT_FRESH: f32 = 0.25;
+
+    /// Fresh dormant trail animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            sparks: Vec::new(),
+            last: None,
+            last_visible: None,
+            type_hint: TypedStamps::EMPTY,
+            nav_hint: None,
+            move_hint: None,
+            blink_hint: None,
+            ctx_alt: false,
+            pane_columns: None,
+            bridge_tally: BridgeTally::EMPTY,
+            dedup: Vec::new(),
+            dedup_epoch: 0,
+            spawn_path: Vec::new(),
+        }
+    }
 
     /// Hidden→visible relocations the hide bridge admitted or declined ([`BridgeTally`]).
     #[must_use]
@@ -508,7 +565,7 @@ impl CursorTrail {
 
         if !self.sparks.is_empty() {
             if self.dedup.is_empty() {
-                self.dedup = vec![DedupSlot::default(); Self::DEDUP_SLOTS];
+                self.dedup = vec![DedupSlot::EMPTY; Self::DEDUP_SLOTS];
             }
             self.dedup_epoch += 1;
             let epoch = self.dedup_epoch;
@@ -672,15 +729,20 @@ pub struct CadenceParams {
     pub knee_hi: f32,
 }
 
+impl CadenceParams {
+    /// Default cadence tunables.
+    pub const DEFAULT: Self = Self {
+        gain: 1.0,
+        half_life: Duration::from_millis(220),
+        knee_lo: 2.0,
+        knee_hi: 6.5,
+    };
+}
+
 impl Default for CadenceParams {
     #[inline]
     fn default() -> Self {
-        Self {
-            gain: 1.0,
-            half_life: Duration::from_millis(220),
-            knee_lo: 2.0,
-            knee_hi: 6.5,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -718,11 +780,14 @@ pub struct TypingCadence {
 impl Default for TypingCadence {
     #[inline]
     fn default() -> Self {
-        Self::new(CadenceParams::default())
+        Self::DEFAULT
     }
 }
 
 impl TypingCadence {
+    /// Cold tracker with [`CadenceParams::DEFAULT`].
+    pub const DEFAULT: Self = Self::new(CadenceParams::DEFAULT);
+
     /// A cold tracker (no heat) with the given tunables.
     #[must_use]
     #[inline]
@@ -737,7 +802,9 @@ impl TypingCadence {
     /// Register one keystroke at `now`, decaying standing heat and adding one `gain` quantum.
     #[inline]
     pub fn on_keystroke(&mut self, now: Instant) {
-        if let Some(last) = self.last {
+        if self.heat > 0.0
+            && let Some(last) = self.last
+        {
             let dt = now.saturating_duration_since(last);
             self.heat = decay_heat(self.heat, dt, self.params.half_life);
         }
@@ -747,6 +814,9 @@ impl TypingCadence {
 
     #[inline]
     fn heat_at(&self, now: Instant) -> f32 {
+        if self.heat <= 0.0 {
+            return 0.0;
+        }
         match self.last {
             Some(last) => {
                 let dt = now.saturating_duration_since(last);
@@ -789,24 +859,25 @@ impl TypingCadence {
 }
 
 #[inline]
-fn heat_color(base: u32, q: f32) -> u32 {
+const fn heat_color(base: u32, q: f32) -> u32 {
     const HOT: u32 = crate::cursor_comet::ICE_WHITE;
     const HEAT_COLOR_MAX: f32 = 0.5;
     let t = (q.clamp(0.0, 1.0) * HEAT_COLOR_MAX).clamp(0.0, 1.0);
     if t == 0.0 {
         return base & 0x00FF_FFFF;
     }
-    let lerp = |sh: u32| {
+    const fn lerp(base: u32, hot: u32, t: f32, sh: u32) -> u32 {
         let a = ((base >> sh) & 0xff) as f32;
-        let b = ((HOT >> sh) & 0xff) as f32;
-        ((a + (b - a) * t).round() as u32).min(255)
-    };
-    (lerp(16) << 16) | (lerp(8) << 8) | lerp(0)
+        let b = ((hot >> sh) & 0xff) as f32;
+        let v = (a + (b - a) * t).round() as u32;
+        if v < 255 { v } else { 255 }
+    }
+    (lerp(base, HOT, t, 16) << 16) | (lerp(base, HOT, t, 8) << 8) | lerp(base, HOT, t, 0)
 }
 
 /// Stamp `intensity` and `warmth` onto `cfg` and heat its colour toward ice white.
 #[inline]
-pub fn ignite(cfg: &mut TrailConfig, intensity: f32, warmth: f32) {
+pub const fn ignite(cfg: &mut TrailConfig, intensity: f32, warmth: f32) {
     let q = intensity.clamp(0.0, 1.0);
     cfg.intensity = q;
     cfg.warmth = warmth.clamp(0.0, 1.0);

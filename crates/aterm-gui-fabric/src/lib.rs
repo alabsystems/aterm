@@ -119,6 +119,13 @@ pub enum FabricFact<'a> {
     /// A parked `inbox get @<off>` asked the bridge for the record at `off` (the `fetch` row the
     /// bridge drains).
     Fetch { off: u64 },
+    /// The broker's retention gave up this node's unread mail at offsets `from..to`, `records` of
+    /// it where the broker counted ([`GivenUp`], `link gap`).
+    MailGap {
+        from: u64,
+        to: u64,
+        records: Option<u64>,
+    },
 }
 
 /// What the two bridge verbs need of the registry.
@@ -719,7 +726,37 @@ pub struct Inbox {
     next_receipt_id: u64,
     outbox_moves: u64,
     msg_id_ceiling: Option<u64>,
+    /// The newest give-up the bridge told of (`link gap`), which the `inbox` header names.
+    given_up: Option<GivenUp>,
     closed: bool,
+}
+
+/// Unread mail the broker's retention gave up before this node's bridge read it (astream's
+/// `Gap`, A9): offsets `from..to` of the log, and `records` of it where the broker counted (`None`
+/// after a broker restart, or when its ledger could not say).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GivenUp {
+    pub from: u64,
+    pub to: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records: Option<u64>,
+}
+
+impl GivenUp {
+    /// Whether `later` only says again what `self` said: the same range, with the same count or
+    /// none (a re-subscription is told the range again, and after a broker restart without its
+    /// count).
+    fn repeated_by(&self, later: &Self) -> bool {
+        self.from == later.from
+            && self.to == later.to
+            && (later.records.is_none() || later.records == self.records)
+    }
+
+    fn carriable(&self) -> bool {
+        self.from <= self.to
+            && self.to <= CARRY_INT_MAX
+            && self.records.is_none_or(|n| n <= CARRY_INT_MAX)
+    }
 }
 
 #[derive(Debug)]
@@ -815,6 +852,11 @@ pub struct FabricCarry {
     /// would hold the mail twice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marked: Vec<u64>,
+    /// The newest give-up of this session's unread mail on [`Self::bus_log`] the bridge told of
+    /// ([`GivenUp`]), so the successor's `inbox` still names it; a successor whose log is not the
+    /// carried one ([`Timeline::log_carried`]) marks it in its own log, once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub given_up: Option<GivenUp>,
 }
 
 fn mark_cost(off: u64) -> usize {
@@ -1006,6 +1048,15 @@ pub struct KeeperCarry {
     /// goes on counting from.
     #[serde(skip_serializing_if = "is_zero")]
     pub dropped: u64,
+    /// The newest give-up of the session's unread mail the bridge told of ([`GivenUp`]), which the
+    /// recovered session's `inbox` goes on naming and its new log marks: the broker tells it again
+    /// only while the group's cursor is still below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub given_up: Option<GivenUp>,
+    /// The log [`Self::given_up`]'s offsets are on, beside it and never alone: a recovered session
+    /// whose bridge reports another log forgets the range, as a moved one does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub given_up_log: Option<String>,
 }
 
 #[cfg(unix)]
@@ -1016,6 +1067,8 @@ impl KeeperCarry {
         let mut unnamed = self.clone();
         unnamed.queued_lost = unnamed.queued_lost.saturating_add(count(self.queued.len()));
         unnamed.queued.clear();
+        unnamed.given_up = None;
+        unnamed.given_up_log = None;
         let mut bare = unnamed.clone();
         bare.topics_lost = bare.topics_lost.saturating_add(count(self.topics.len()));
         bare.topics.clear();
@@ -1188,6 +1241,7 @@ impl Inbox {
         self.dedup_set.retain(|off| kept(*off));
         self.carried_marks.retain(|off| kept(*off));
         self.oldest_on_bus = self.oldest_on_bus.filter(|off| kept(*off));
+        self.given_up = self.given_up.filter(|g| g.to <= fork);
         self.addressed_head = self.addressed_head.and_then(|h| {
             if kept(h) {
                 Some(h)
@@ -1243,6 +1297,7 @@ impl Inbox {
             || !self.receipts.is_empty()
             || !self.fetches.is_empty()
             || !self.carried_marks.is_empty()
+            || self.given_up.is_some()
             || self
                 .posts
                 .iter()
@@ -1710,6 +1765,7 @@ impl SessionFabric {
             dropped: inbox.dropped.min(CARRY_INT_MAX),
             broadcasts_uncarried: count(unread_broadcasts),
             broadcasts_refilled: count(refilled_broadcasts),
+            given_up: inbox.given_up.filter(GivenUp::carriable),
             ..FabricCarry::default()
         };
         for post in inbox.posts.iter().filter(|p| p.off.is_none() && !p.dead) {
@@ -1776,6 +1832,10 @@ impl SessionFabric {
         let topics = render_topics(&self.topics());
         let inbox = self.lock();
         let mut holds = render_holds(&inbox.holds).into_iter();
+        let given_up = inbox
+            .given_up
+            .filter(GivenUp::carriable)
+            .zip(inbox.bus_log.clone());
         KeeperCarry {
             hold: holds.next(),
             more_holds: holds.collect(),
@@ -1795,6 +1855,8 @@ impl SessionFabric {
             queued_lost: 0,
             owed: u64::try_from(inbox.receipts.len()).unwrap_or(u64::MAX),
             dropped: inbox.dropped.min(CARRY_INT_MAX),
+            given_up: given_up.as_ref().map(|(g, _)| *g),
+            given_up_log: given_up.map(|(_, log)| log),
         }
     }
 
@@ -1847,6 +1909,21 @@ impl SessionFabric {
             });
         }
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let given_up = carry
+            .given_up
+            .filter(|g| inbox.bus_log.is_some() && g.carriable())
+            .filter(|g| !inbox.given_up.is_some_and(|told| told.repeated_by(g)));
+        if let Some(g) = given_up {
+            inbox.given_up = Some(g);
+            if !tl.log_carried() {
+                let fact = FabricFact::MailGap {
+                    from: g.from,
+                    to: g.to,
+                    records: g.records,
+                };
+                let _ = tl.record_fact("inbox-gap", fact);
+            }
+        }
         if tl.log_carried() {
             inbox.carried_marks = carry
                 .marked
@@ -2786,6 +2863,81 @@ fn cmd_link_quarantine<'a>(
     .unwrap_or_else(|| "OK stale=1\n".to_string())
 }
 
+/// `link gap from=<a> to=<b> [records=<n>]` (bridge lane [`LINK_GAP_LANE`]): the broker's
+/// retention gave up this node's unread mail at offsets `a..b`, `n` of it where the broker counted.
+/// The subjects went with the records, so every session this node serves is told: its `inbox`
+/// header names the range and count (`given_up=`, `given_up_count=`) and its log marks it
+/// (`mail-gap`), once per range, a re-tell of the same range being a repeat.
+///
+/// [`LINK_GAP_LANE`]: aterm_types::control_verbs::LINK_GAP_LANE
+fn cmd_link_gap<'a>(
+    store: &Store,
+    toks: impl Iterator<Item = &'a str>,
+    generation: Option<BridgeGeneration>,
+    wake: &dyn Fn(&SessionId),
+) -> String {
+    let (mut from, mut to, mut records) = (None, None, None);
+    for tok in toks {
+        let slot = if let Some(v) = kv(tok, "from") {
+            (&mut from, v)
+        } else if let Some(v) = kv(tok, "to") {
+            (&mut to, v)
+        } else if let Some(v) = kv(tok, "records") {
+            (&mut records, v)
+        } else {
+            return LINK_USAGE.to_string();
+        };
+        match (slot.0.is_none(), slot.1.parse::<u64>()) {
+            (true, Ok(n)) => *slot.0 = Some(n),
+            _ => return LINK_USAGE.to_string(),
+        }
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        return LINK_USAGE.to_string();
+    };
+    if from > to {
+        return LINK_USAGE.to_string();
+    }
+    let gap = GivenUp { from, to, records };
+    let owed = with_current_bridge(generation, || {
+        let live: Vec<_> = {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            g.sessions()
+        };
+        live.into_iter()
+            .filter(|ctx| note_given_up(ctx.as_ref(), gap))
+            .map(|ctx| ctx.self_id().clone())
+            .collect::<Vec<_>>()
+    });
+    let Some(owed) = owed else {
+        return "OK stale=1\n".to_string();
+    };
+    for sid in &owed {
+        wake(sid);
+    }
+    "OK\n".to_string()
+}
+
+/// Tell `ctx` its node's unread mail at `gap` was given up ([`cmd_link_gap`]); returns whether its
+/// log's readers were owed a wake. A repeat of the newest range told is not marked again.
+fn note_given_up(ctx: &dyn FabricSession, gap: GivenUp) -> bool {
+    let mut inbox = ctx.fabric().lock();
+    if inbox.given_up.is_some_and(|told| told.repeated_by(&gap)) {
+        return false;
+    }
+    inbox.given_up = Some(gap);
+    let fact = FabricFact::MailGap {
+        from: gap.from,
+        to: gap.to,
+        records: gap.records,
+    };
+    let owed = ctx.record_fact("inbox-gap", fact);
+    drop(inbox);
+    ctx.fabric().changed.notify_all();
+    ctx.fabric_changed();
+    owed
+}
+
 /// The endpoint answered one of `generation`'s bridge-only lines `ERR usage`.
 pub fn note_lane_fault(generation: Option<BridgeGeneration>) {
     #[cfg(any(test, debug_assertions))]
@@ -2815,7 +2967,8 @@ const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token>
                           link bye <quit|handoff> | \
                           link mirror on|stopped|capped|budget|unretained [reason=<token>] | \
                           link set-aside files=<n> | \
-                          link quarantine torn=<k>\n";
+                          link quarantine torn=<k> | \
+                          link gap from=<off> to=<off> [records=<n>]\n";
 
 static BYES_TAKEN: Mutex<u64> = Mutex::new(0);
 
@@ -2859,7 +3012,8 @@ fn note_bye_taken(generation: Option<BridgeGeneration>) -> bool {
 
 /// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]` / `link log <identity>` /
 /// `link bye <quit|handoff>` / `link mirror …` / `link set-aside files=<n>` /
-/// `link quarantine torn=<k>`, from the bridge lane of `generation`.
+/// `link quarantine torn=<k>` / `link gap from=<a> to=<b> [records=<n>]`, from the bridge lane of
+/// `generation`.
 pub fn cmd_link(store: &impl AsStore, rest: &str, generation: Option<BridgeGeneration>) -> String {
     cmd_link_after_log_switch(store, rest, generation, || {})
 }
@@ -2871,6 +3025,18 @@ pub fn cmd_link_after_log_switch(
     rest: &str,
     generation: Option<BridgeGeneration>,
     on_forgot: impl FnOnce(),
+) -> String {
+    cmd_link_waking(store, rest, generation, on_forgot, &|_| {})
+}
+
+/// [`cmd_link_after_log_switch`], waking each session's log readers through `wake` when a
+/// `link gap` marked its log.
+pub fn cmd_link_waking(
+    store: &impl AsStore,
+    rest: &str,
+    generation: Option<BridgeGeneration>,
+    on_forgot: impl FnOnce(),
+    wake: &dyn Fn(&SessionId),
 ) -> String {
     let store = &store.as_store();
     let mut toks = rest.split_whitespace();
@@ -2916,6 +3082,7 @@ pub fn cmd_link_after_log_switch(
         Some("mirror") => return cmd_link_mirror(toks, generation),
         Some("set-aside") => return cmd_link_set_aside(store, toks, generation),
         Some("quarantine") => return cmd_link_quarantine(store, toks, generation),
+        Some("gap") => return cmd_link_gap(store, toks, generation, wake),
         _ => return LINK_USAGE.to_string(),
     };
     let mut rtt: Option<u64> = None;
@@ -3853,6 +4020,42 @@ pub fn cmd_hold_within_waking(
             format!("OK hold={}\n", u8::from(held))
         }
     }
+}
+
+/// Lift each remote hold whose node may drive no more, as its `hold off` would: how many it lifted.
+pub fn lift_ungranted_remote_holds(
+    store: &impl AsStore,
+    granted: &dyn Fn(&str) -> bool,
+    wake: &dyn Fn(&SessionId),
+) -> usize {
+    let store = &store.as_store();
+    let ctxs: Vec<_> = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        g.sessions()
+    };
+    let mut lifted = 0;
+    for ctx in ctxs {
+        let Some(node) = ctx
+            .fabric()
+            .holds()
+            .remote()
+            .map(|hold| hold.node.clone())
+            .filter(|node| !granted(node))
+        else {
+            continue;
+        };
+        let applied = apply_hold(
+            ctx.as_ref(),
+            HoldAct::LiftRemote(Some(&node)),
+            HoldIssuer::Remote,
+            Some(ctx.fabric().fence_wait()),
+            &|| wake(ctx.self_id()),
+        );
+        if matches!(applied, Applied::Changed { .. }) {
+            lifted += 1;
+        }
+    }
+    lifted
 }
 
 /// What the window's Take Over or Hand Back did ([`person_hold`]).
@@ -4969,9 +5172,16 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
         .map_or_else(|| "-".to_string(), |o| format!("@{o}"));
     let mut out = format!(
         "OK {sent} hold={hold_flag} holder={holder} seen={} bus_head={} oldest_on_bus={oldest} \
-         dropped={} pending={pending}\n",
+         dropped={} pending={pending}",
         inbox.seen, inbox.bus_head, inbox.dropped,
     );
+    if let Some(g) = inbox.given_up {
+        let _ = write!(out, " given_up=@{}..@{}", g.from, g.to);
+        if let Some(n) = g.records {
+            let _ = write!(out, " given_up_count={n}");
+        }
+    }
+    out.push('\n');
     drop(inbox);
     out.push_str(&body);
     out
@@ -5824,6 +6034,10 @@ mod test_support {
                 format!("1 reason={reason} origin={origin}")
             }
             FabricFact::Fetch { off } => format!("off={off}"),
+            FabricFact::MailGap { from, to, records } => format!(
+                "from={from} to={to} records={}",
+                records.map_or_else(|| "-".to_string(), |n| n.to_string())
+            ),
         }
     }
 
@@ -6972,6 +7186,136 @@ mod inbox_hold {
                 store.read().unwrap().set_aside.lock().unwrap().is_empty(),
                 "a count held is never one set aside"
             );
+        });
+    }
+
+    /// A9: `link gap` tells every session its node serves, once per range: the `inbox` header
+    /// names the range and the broker's count, and the log marks it (`inbox-gap`), each told
+    /// session's log readers woken; a repeat of the range marks nothing; a log replaced past the
+    /// range forgets it, and a seamless update carries it, a successor whose log started over
+    /// marking it there. NC (run, B22): a `note_given_up` that records nothing fails it. NC (run,
+    /// B22 land): a `seed_carry` that takes the range without marking an uncarried log fails it.
+    #[test]
+    fn a_link_gap_tells_every_session_its_given_up_mail_once_in_header_and_log() {
+        with_link(|| {
+            let store = new_store();
+            let (sa, a) = registered_as(&store, 1);
+            let (sb, b) = registered_as(&store, 2);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let log = format!("{}.0", "c".repeat(32));
+            assert_eq!(
+                cmd_link(&store, &format!("log {log}"), Some(generation)),
+                "OK\n"
+            );
+            let woke = Mutex::new(Vec::new());
+            let tell = |line: &str| {
+                cmd_link_waking(&store, line, Some(generation), || {}, &|sid| {
+                    woke.lock().unwrap().push(sid.as_str().to_string());
+                })
+            };
+            let header = |ctx: &SessionCtx| {
+                let out = cmd_inbox(ctx, "--peek --meta");
+                out.lines().next().unwrap_or_default().to_string()
+            };
+            let marks = |ctx: &SessionCtx| -> Vec<String> {
+                let tl = ctx.timeline.lock().unwrap();
+                tl.facts
+                    .iter()
+                    .filter(|f| f.starts_with("inbox-gap: "))
+                    .cloned()
+                    .collect()
+            };
+            assert!(!header(&a).contains("given_up"), "{}", header(&a));
+
+            assert_eq!(tell("gap from=10 to=42 records=3"), "OK\n");
+            let first = "inbox-gap: MailGap { from: 10, to: 42, records: Some(3) }";
+            for ctx in [&a, &b] {
+                assert!(
+                    header(ctx).ends_with(" pending=0 given_up=@10..@42 given_up_count=3"),
+                    "{}",
+                    header(ctx)
+                );
+                assert_eq!(marks(ctx), [first]);
+            }
+            assert_eq!(*woke.lock().unwrap(), [sa.clone(), sb.clone()]);
+
+            for repeat in ["gap from=10 to=42", "gap to=42 from=10 records=3"] {
+                assert_eq!(tell(repeat), "OK\n", "{repeat}");
+            }
+            assert_eq!(marks(&a), [first], "a repeat is not marked again");
+            assert!(header(&a).ends_with(" given_up_count=3"), "{}", header(&a));
+            assert_eq!(woke.lock().unwrap().len(), 2, "nor wakes anyone");
+
+            assert_eq!(tell("gap from=42 to=50"), "OK\n");
+            assert!(header(&b).ends_with(" given_up=@42..@50"), "{}", header(&b));
+            assert_eq!(marks(&b).len(), 2);
+
+            let ghost = next_bridge_generation();
+            assert_eq!(
+                cmd_link(&store, "gap from=60 to=70", Some(ghost)),
+                "OK stale=1\n"
+            );
+            assert_eq!(cmd_link(&store, "gap from=60 to=70", None), "OK stale=1\n");
+            for bad in [
+                "gap",
+                "gap from=1",
+                "gap to=2",
+                "gap from=3 to=2",
+                "gap from=1 to=2 records=x",
+                "gap from=1 from=1 to=2",
+                "gap from=1 to=2 records=1 records=1",
+                "gap from=-1 to=2",
+                "gap from=1 to=2 more",
+            ] {
+                assert!(
+                    cmd_link(&store, bad, Some(generation)).starts_with("ERR usage"),
+                    "{bad}"
+                );
+            }
+            assert_eq!(
+                marks(&a).len(),
+                2,
+                "a stale or malformed line tells nothing"
+            );
+
+            let mut budget = CARRY_MAIL_BYTES;
+            let carry = a.fabric.handoff_carry(&mut budget);
+            let wire = aterm_toml::to_string(&carry).expect("writes");
+            let carry: FabricCarry = aterm_toml::from_str(&wire).expect("reads back");
+            let carried_mark = "inbox-gap: MailGap { from: 42, to: 50, records: None }";
+            for (local_id, log_carried) in [(3, false), (4, true)] {
+                let (_, successor) = registered_as(&store, local_id);
+                successor.timeline.lock().unwrap().log_carried = log_carried;
+                successor.fabric.seed_carry(&carry, &successor.timeline);
+                assert!(header(&successor).ends_with(" given_up=@42..@50"), "{wire}");
+                let want: &[&str] = if log_carried { &[] } else { &[carried_mark] };
+                assert_eq!(
+                    marks(&successor),
+                    want,
+                    "a log that is not the carried one marks the give-up its header names, once; \
+                     the carried one has its mark (log carried: {log_carried})"
+                );
+                assert_eq!(tell("gap from=42 to=50"), "OK\n");
+                assert_eq!(marks(&successor), want, "a re-tell is a repeat");
+            }
+
+            let moved = format!("{}.1", "c".repeat(32));
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {moved} continues=50 was={log}"),
+                    Some(generation)
+                ),
+                "OK forgot=1\n"
+            );
+            assert!(header(&a).ends_with(" given_up=@42..@50"), "below the fork");
+            let other = format!("{}.0", "d".repeat(32));
+            assert_eq!(
+                cmd_link(&store, &format!("log {other}"), Some(generation)),
+                "OK forgot=1\n"
+            );
+            assert!(!header(&a).contains("given_up"), "{}", header(&a));
         });
     }
 

@@ -5137,6 +5137,14 @@ pub(crate) fn recovered_fabric(meta: &[u8]) -> RecoveredFabric {
         .unwrap_or_default();
     carry.receipts_uncarried = count("owed");
     carry.dropped = count("dropped");
+    let given_up = section
+        .get("given_up")
+        .and_then(|g| aterm_json::from_value::<crate::fabric::GivenUp>(g.clone()).ok());
+    let given_up_log = section.get("given_up_log").and_then(Value::as_str);
+    if let (Some(given_up), Some(log)) = (given_up, given_up_log) {
+        carry.given_up = Some(given_up);
+        carry.bus_log = Some(log.to_owned());
+    }
     let row = |hold: &Value| hold.as_str().unwrap_or_default().to_owned();
     let mut holds: Vec<String> = section.get("hold").map(row).into_iter().collect();
     match section.get("more_holds") {

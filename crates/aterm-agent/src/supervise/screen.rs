@@ -421,6 +421,37 @@ pub fn cell_is_placeholder(line: &str, hint_fg: Option<&str>) -> Option<bool> {
     }
 }
 
+/// THE CELL PAST A DRAWN CARET: when the `cell` reply at `col` is an `inverse` glyph — a caret the
+/// program draws itself, over text it may type or may only suggest — the column of the glyph
+/// after it, whose cell says which the text is; `None` when the reply's own cell says so.
+/// Claude Code 2.1.310 draws its grey suggestion's first glyph inverse under its caret and the
+/// rest `dim` (measured 2026-10-24 in the real-Claude lab), and a typed draft's first glyph the
+/// same way with the rest plain. A `wide` glyph spans two columns; a reply of an unfinished frame
+/// (` frame=open`) is no caret.
+#[must_use]
+pub fn past_drawn_caret(line: &str, col: usize) -> Option<usize> {
+    let style = aterm_codec::cell::parse_style(line)?;
+    style
+        .inverse
+        .then_some(col + if style.wide { 2 } else { 1 })
+}
+
+/// The column a composer's first glyph is drawn at, after its `❯ `.
+pub const COMPOSER_COL: usize = 2;
+
+/// THE COMPOSER'S FIRST GLYPH, READ WHERE ITS CELL SAYS WHAT THE TEXT IS: `read(col)` is the
+/// composer row's `cell` reply at `col` (`None` where none came). Column [`COMPOSER_COL`], or, where
+/// the program draws its own caret over that glyph, the glyph after it ([`past_drawn_caret`]).
+/// The one read behind the loop's `composer_draft` and Claude Code's and Muse Code's upgrade
+/// gates, so that a suggestion the loop takes for one each gate takes for one too.
+pub fn composer_glyph_cell(mut read: impl FnMut(usize) -> Option<String>) -> Option<String> {
+    let first = read(COMPOSER_COL)?;
+    match past_drawn_caret(&first, COMPOSER_COL) {
+        None => Some(first),
+        Some(col) => read(col),
+    }
+}
+
 /// Whether a `cell` reply's foreground color matches `fg` (case-insensitive hex).
 #[must_use]
 pub fn cell_fg_is(line: &str, fg: &str) -> bool {
@@ -782,5 +813,84 @@ mod tests {
         assert!(!cell_fg_is("OK x d0d0d0 111318 none", "8a8f99"));
         assert!(!cell_fg_is("OK x 8a8f99 111318 none frame=open", "8a8f99"));
         assert!(!cell_fg_is("ERR out of range", "8a8f99"));
+    }
+
+    /// [`past_drawn_caret`] over the `cell` replies of Claude Code 2.1.310's composer, read in the
+    /// real-Claude lab with the suggestion `keep going` drawn: its caret cell sends the read one
+    /// glyph on, two past a wide glyph. NEGATIVE CONTROLS: the dim glyphs after it, a plain one,
+    /// an unfinished frame's caret and a refusal send it nowhere.
+    #[test]
+    fn a_drawn_caret_sends_the_placeholder_read_to_the_glyph_after_it() {
+        assert_eq!(past_drawn_caret("OK k 111318 d0d0d0 inverse", 2), Some(3));
+        assert_eq!(
+            past_drawn_caret("OK %E4%BD%A0 111318 d0d0d0 inverse,wide", 2),
+            Some(4)
+        );
+        assert_eq!(
+            past_drawn_caret("OK k 111318 d0d0d0 bold,inverse link=https%3A%2F%2Fa", 5),
+            Some(6)
+        );
+        for not_caret in [
+            "OK e 999999 111318 dim",
+            "OK %20 999999 111318 dim",
+            "OK k d0d0d0 111318 none",
+            "OK k 111318 d0d0d0 inverse frame=open",
+            "OK k 111318 d0d0d0",
+            "ERR out of range",
+        ] {
+            assert_eq!(past_drawn_caret(not_caret, 2), None, "{not_caret}");
+        }
+        assert_eq!(
+            cell_is_placeholder("OK e 999999 111318 dim", None),
+            Some(true)
+        );
+        assert_eq!(
+            cell_is_placeholder("OK k 111318 d0d0d0 inverse", None),
+            Some(false),
+            "the caret's own cell reads as typed text"
+        );
+    }
+
+    /// [`composer_glyph_cell`] reads column 2, and past a drawn caret the column after it, and
+    /// answers that cell. NEGATIVE CONTROLS: a plain first glyph is read alone, and a caret whose
+    /// next cell does not answer gives nothing (never the caret's own cell, a draft's look).
+    #[test]
+    fn the_composers_glyph_is_read_past_a_drawn_caret() {
+        let cells = |row: &'static [(usize, &'static str)]| {
+            let mut asked = Vec::new();
+            let got = composer_glyph_cell(|col| {
+                asked.push(col);
+                row.iter()
+                    .find(|(c, _)| *c == col)
+                    .map(|(_, line)| (*line).to_string())
+            });
+            (got, asked)
+        };
+        assert_eq!(
+            cells(&[
+                (2, "OK k 111318 d0d0d0 inverse"),
+                (3, "OK e 999999 111318 dim")
+            ]),
+            (Some("OK e 999999 111318 dim".to_string()), vec![2, 3])
+        );
+        assert_eq!(
+            cells(&[
+                (2, "OK %E4%BD%A0 111318 d0d0d0 inverse,wide"),
+                (4, "OK e 999999 111318 dim")
+            ]),
+            (Some("OK e 999999 111318 dim".to_string()), vec![2, 4])
+        );
+        assert_eq!(
+            cells(&[
+                (2, "OK k d0d0d0 111318 none"),
+                (3, "OK e 999999 111318 dim")
+            ]),
+            (Some("OK k d0d0d0 111318 none".to_string()), vec![2])
+        );
+        assert_eq!(
+            cells(&[(2, "OK k 111318 d0d0d0 inverse")]),
+            (None, vec![2, 3])
+        );
+        assert_eq!(cells(&[]), (None, vec![2]));
     }
 }

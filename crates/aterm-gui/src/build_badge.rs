@@ -101,6 +101,7 @@ mod tests {
             font_px: 14.0,
             cols: 120,
             panel_rows: 40,
+            px_per_pt: 1.0,
         }
     }
 

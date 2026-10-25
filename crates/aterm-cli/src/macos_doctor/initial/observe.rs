@@ -68,10 +68,7 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
                         .filter(|(tag, _)| *tag == setting)
                         .map(|(_, row)| row)
                         .collect();
-                    at_login(
-                        aterm_machines::init_observe::observation(setting, &rows),
-                        held.contains(setting),
-                    )
+                    workstation_observation(setting, &rows, held)
                 }
                 Err(why) => unread(Subject::Setting(setting), why),
             });
@@ -135,6 +132,22 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
         );
     }
     out
+}
+
+/// One workstation row's reading from its items' rows, "at login" while this login session
+/// holds a change a run made to it for the next login ([`held_at_login`]) and nothing that
+/// change set is live already: the Caps Lock key's live mappings read in place
+/// ([`aterm_machines::init_observe::live_in_place`]) put it in effect now, so only a row that
+/// truly waits for the login (Trackpad scrolling) says so.
+fn workstation_observation(
+    setting: Setting,
+    rows: &[&aterm_machines::model::ItemReport],
+    held: Selection,
+) -> Observation {
+    at_login(
+        aterm_machines::init_observe::observation(setting, rows),
+        held.contains(setting) && !aterm_machines::init_observe::live_in_place(setting, rows),
+    )
 }
 
 /// A row a run changed for macOS to take up at the next login reads "at login" while the value
@@ -358,7 +371,7 @@ const RETYPE: &str = "or retype the join password";
 /// Not syncing, Not set up, In sync, or Sync off (the person's choice, so in place). A stopped or
 /// uninstalled subscriber differs, with a note only on a managed row. `here` is the last ALab
 /// vault probe's note when the plan names that vault ([`scope::VaultHere::note`]): a managed row
-/// not joined waits with it until the next launch.
+/// not joined waits with it until setup asks again.
 fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Observation {
     let subject = Subject::Setting(Setting::Secrets);
     let person = if managed {
@@ -435,6 +448,7 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
         subject,
         standing,
         now: Some(now.to_owned()),
+        after_login: None,
         wanted: wanted.to_owned(),
         note,
         detail: None,
@@ -626,6 +640,54 @@ mod tests {
         assert_eq!(held.standing, Standing::AtLogin);
         assert_eq!(held.now.as_deref(), Some("Control"));
         assert_eq!(at_login(written.clone(), false), written);
+    }
+
+    /// The Caps Lock key a run set reads in place at once, its live mappings read as wanted:
+    /// in effect now, never "at login", though the run's change of its saved mappings is held
+    /// for the next login. Trackpad scrolling, whose keys macOS loads only then, keeps it.
+    #[test]
+    fn only_a_row_with_nothing_live_waits_for_the_login() {
+        use aterm_machines::model::{Effect, ItemReport, Outcome};
+        let item = |effect: Effect, to: &str| ItemReport {
+            id: "item".into(),
+            family: "test".into(),
+            title: "item".into(),
+            outcome: Outcome::Ok,
+            from: None,
+            to: Some(to.to_owned()),
+            why: None,
+            revert: None,
+            effect,
+            detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
+        };
+        let saved = item(Effect::Login, "Caps Lock→Left Control");
+        let live = item(Effect::Now, "Caps Lock acts as Control");
+        let mut held = Selection::none();
+        held.set(Setting::CapsLock, true);
+        held.set(Setting::TrackpadScrolling, true);
+        let caps = workstation_observation(Setting::CapsLock, &[&saved, &live], held);
+        assert_eq!(
+            (caps.standing, caps.now.as_deref()),
+            (Standing::InPlace, Some("Control"))
+        );
+        // No live mapping read (no keyboard attached): nothing is in effect before the login.
+        let caps = workstation_observation(Setting::CapsLock, &[&saved], held);
+        assert_eq!(caps.standing, Standing::AtLogin);
+        let gestures = item(Effect::Login, "true");
+        let trackpad = workstation_observation(Setting::TrackpadScrolling, &[&gestures], held);
+        assert_eq!(
+            (trackpad.standing, trackpad.now.as_deref()),
+            (Standing::AtLogin, Some("All on"))
+        );
+        // Outside the session that made the change, each is in place.
+        let trackpad =
+            workstation_observation(Setting::TrackpadScrolling, &[&gestures], Selection::none());
+        assert_eq!(trackpad.standing, Standing::InPlace);
     }
 
     #[test]

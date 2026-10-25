@@ -122,6 +122,96 @@ fn level_of(allow: Option<&str>) -> Option<(FleetScope, bool)> {
     }
 }
 
+/// The drive grants `[fleet]` names in `text`, none unless it listens at the drive level:
+/// `None` when `text` is no TOML or its `[fleet]` does not read.
+fn granted_in(text: &str) -> Option<Vec<aterm_net::fleet::DriveGrant>> {
+    #[derive(serde::Deserialize)]
+    struct Fleet {
+        fleet: Option<FleetConfig>,
+    }
+    let config = aterm_toml::from_str::<Fleet>(text).ok()?;
+    Some(grants_of(fleet_wanted(config.fleet.as_ref()).as_ref()))
+}
+
+/// The grants `wanted` serves: its `drive_from` at the drive level, none at any other.
+fn grants_of(wanted: Option<&Wanted>) -> Vec<aterm_net::fleet::DriveGrant> {
+    wanted
+        .filter(|wanted| level_of(wanted.allow.as_deref()).is_some_and(|(_, drive)| drive))
+        .map(|wanted| wanted.drive_from.clone())
+        .unwrap_or_default()
+}
+
+/// The grants of `serving` that aterm.toml as read `now` still names: all of them while it is
+/// unread or its `[fleet]` does not read, as the running settings stand then.
+fn granted_now(
+    serving: &[aterm_net::fleet::DriveGrant],
+    now: Option<&str>,
+) -> Vec<aterm_net::fleet::DriveGrant> {
+    let Some(named) = now.and_then(granted_in) else {
+        return serving.to_vec();
+    };
+    serving
+        .iter()
+        .filter(|grant| named.contains(grant))
+        .cloned()
+        .collect()
+}
+
+/// aterm.toml's text as it is on disk now, a missing one's empty: `None` when it cannot be read.
+#[cfg(unix)]
+fn config_now() -> Option<String> {
+    let path = crate::app_config::config_path()?;
+    crate::native_config_service::VersionedConfigService::observe_path(&path, true)
+        .ok()
+        .map(|observation| observation.text)
+}
+
+/// Whether `node` may still drive this Mac under `grants`: one names it with the key `bound`
+/// (this Mac's keyring) binds it to.
+fn still_drives(
+    grants: &[aterm_net::fleet::DriveGrant],
+    bound: impl FnOnce() -> Option<aterm_net::fleet::NodeKey>,
+    node: &str,
+) -> bool {
+    grants
+        .iter()
+        .find(|grant| grant.node == node)
+        .is_some_and(|grant| bound() == Some(grant.key))
+}
+
+/// Lift every remote hold of a node `grants` lets drive no more ([`still_drives`]), as its own
+/// `hold off` would: it can no longer lift it, and a local `hold off` lifts the local slot alone.
+#[cfg(unix)]
+fn lift_undriving_holds(grants: &[aterm_net::fleet::DriveGrant]) {
+    let keys = std::cell::OnceCell::new();
+    let keyring = || {
+        keys.get_or_init(|| {
+            aterm_types::dirs::state_dir()
+                .map(|state| aterm_net::fleet_member::Keyring::read(&state))
+                .unwrap_or_default()
+        })
+    };
+    let lifted = crate::control::lift_ungranted_remote_holds(&|node| {
+        still_drives(grants, || keyring().bound(node), node)
+    });
+    if lifted > 0 {
+        note_fleet(
+            &format!("fleet: {lifted} remote hold(s) lifted: their nodes may drive no more"),
+            false,
+        );
+    }
+}
+
+/// The grants a listener serving `serving` moves to once aterm.toml reads `now`: those it
+/// still names, when it names fewer ([`granted_now`]).
+fn narrowed(
+    serving: &[aterm_net::fleet::DriveGrant],
+    now: Option<&str>,
+) -> Option<Vec<aterm_net::fleet::DriveGrant>> {
+    let named = granted_now(serving, now);
+    (named.len() < serving.len()).then_some(named)
+}
+
 struct FleetDesk {
     wanted: Option<Wanted>,
     /// Moved by every change of `wanted`.
@@ -178,6 +268,33 @@ pub(crate) fn configure_fleet_listener(fleet: Option<&FleetConfig>) {
     if desk.wanted == wanted {
         return;
     }
+    move_fleet(desk, wanted);
+}
+
+/// Serve `drive_from` alone while `generation` is current: aterm.toml names no more of its
+/// grants, whether or not the reload that read it was taken. Whether the listener moved.
+#[cfg(unix)]
+fn narrow_fleet_listener(generation: u64, drive_from: Vec<aterm_net::fleet::DriveGrant>) -> bool {
+    let desk = FLEET_DESK.lock_or_recover();
+    let Some(wanted) = desk
+        .wanted
+        .clone()
+        .filter(|_| desk.generation == generation)
+    else {
+        return false;
+    };
+    move_fleet(
+        desk,
+        Some(Wanted {
+            drive_from,
+            ..wanted
+        }),
+    );
+    true
+}
+
+/// Move the listener to a new generation serving `wanted`, the current one's connections cut.
+fn move_fleet(mut desk: std::sync::MutexGuard<'_, FleetDesk>, wanted: Option<Wanted>) {
     desk.wanted = wanted;
     desk.generation = desk.generation.wrapping_add(1);
     if let Some(stop) = desk.stop.take() {
@@ -211,6 +328,8 @@ fn supervise_fleet_listener() {
 }
 
 fn run_fleet_generation(generation: u64, wanted: Option<Wanted>) {
+    #[cfg(unix)]
+    lift_undriving_holds(&grants_of(wanted.as_ref()));
     let Some(wanted) = wanted else {
         stand_fleet(generation, Standing::Off, "fleet listener off");
         return;
@@ -328,20 +447,31 @@ fn serve_fleet_port(
         let node = read_node_key();
         let rekeyed = Arc::new(AtomicBool::new(false));
         let watching = std::thread::Builder::new()
-            .name("aterm-fleet-key".to_owned())
+            .name("aterm-fleet-watch".to_owned())
             .spawn({
-                let (running, rekeyed, secret) =
-                    (Arc::clone(&running), Arc::clone(&rekeyed), secret.clone());
+                let (running, rekeyed, secret, drivers) = (
+                    Arc::clone(&running),
+                    Arc::clone(&rekeyed),
+                    secret.clone(),
+                    Arc::clone(&drivers),
+                );
                 let proved = node
                     .as_ref()
                     .map(|node| (node.node().to_owned(), node.key()));
-                move || watch_fleet_key(generation, &running, &rekeyed, (&secret, proved))
+                move || {
+                    watch_fleet_generation(
+                        generation,
+                        (&running, &rekeyed),
+                        (&secret, proved),
+                        &drivers,
+                    );
+                }
             });
         if let Err(error) = watching {
             stand_fleet(
                 generation,
                 Standing::Refused("thread"),
-                &format!("fleet listener not started: its key watch could not start: {error}"),
+                &format!("fleet listener not started: its watch could not start: {error}"),
             );
             return;
         }
@@ -449,7 +579,8 @@ fn admit_driver(
 ) -> Result<crate::fabric::Driver, String> {
     use aterm_net::fleet_member::{peer_of, proven_driver};
     let state = aterm_types::dirs::state_dir().ok_or("this Mac has no state directory")?;
-    let node = proven_driver(served, &state, drivers, recheck).map_err(|why| why.to_string())?;
+    let drivers = granted_now(drivers, config_now().as_deref());
+    let node = proven_driver(served, &state, &drivers, recheck).map_err(|why| why.to_string())?;
     let host = driver_name(
         &node,
         peer_of(&state, &node).map(|peer| peer.host).as_deref(),
@@ -457,14 +588,15 @@ fn admit_driver(
     Ok(crate::fabric::Driver { node, host })
 }
 
-/// Whether this Mac lets the peer of `served` drive it.
+/// Whether this Mac lets the peer of `served` drive it, by the grants a drive is admitted by.
 #[cfg(unix)]
 fn lists_driver(
     served: &aterm_net::fleet::Served,
     drivers: &[aterm_net::fleet::DriveGrant],
 ) -> bool {
+    let drivers = granted_now(drivers, config_now().as_deref());
     aterm_types::dirs::state_dir().is_some_and(|state| {
-        aterm_net::fleet_member::listed_driver(served, &state, drivers).is_ok()
+        aterm_net::fleet_member::listed_driver(served, &state, &drivers).is_ok()
     })
 }
 
@@ -628,17 +760,19 @@ fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
     }
 }
 
-/// While `generation` serves `secret` and proves the node `proved` (its id and key), read them
-/// again every [`RETRY`].
+/// While `generation` serves `secret`, proves the node `proved` (its id and key) and lets
+/// `drivers` drive, read them again every [`RETRY`]: a grant aterm.toml names no more moves the
+/// listener to those it names ([`narrow_fleet_listener`]), and a node that may drive no more
+/// keeps no hold ([`lift_undriving_holds`]).
 #[cfg(unix)]
-fn watch_fleet_key(
+fn watch_fleet_generation(
     generation: u64,
-    running: &AtomicBool,
-    rekeyed: &AtomicBool,
+    (running, rekeyed): (&AtomicBool, &AtomicBool),
     (secret, proved): (
         &aterm_net::fleet::FleetSecret,
         Option<(String, aterm_net::fleet::NodeKey)>,
     ),
+    drivers: &[aterm_net::fleet::DriveGrant],
 ) {
     use aterm_net::fleet::KEY_FILE;
     use aterm_net::fleet_member::{NODE_FILE, NODE_KEY_FILE, read_node_identity};
@@ -649,7 +783,12 @@ fn watch_fleet_key(
     };
     while wait_fleet_unchanged(generation) && running.load(Ordering::Acquire) {
         let why = match read_fleet_key() {
-            Ok(now) if now == *secret && node_now() == proved => continue,
+            Ok(now) if now == *secret && node_now() == proved => {
+                if follow_grants(generation, drivers) {
+                    return;
+                }
+                continue;
+            }
             Ok(now) if now == *secret => format!("{NODE_FILE} or {NODE_KEY_FILE} changed"),
             Ok(_) => format!("{KEY_FILE} changed"),
             Err(error) => error.to_string(),
@@ -662,6 +801,28 @@ fn watch_fleet_key(
         );
         return;
     }
+}
+
+/// Follow aterm.toml's grants while `generation` serves `drivers`: move the listener to those it
+/// still names ([`narrowed`]), or lift each hold of a node that may drive no more. Whether it
+/// moved.
+#[cfg(unix)]
+fn follow_grants(generation: u64, drivers: &[aterm_net::fleet::DriveGrant]) -> bool {
+    if drivers.is_empty() {
+        return false;
+    }
+    if let Some(named) = narrowed(drivers, config_now().as_deref())
+        && narrow_fleet_listener(generation, named)
+    {
+        note_fleet(
+            "fleet listener: aterm.toml lets fewer nodes drive this Mac; every fleet connection \
+             is cut",
+            false,
+        );
+        return true;
+    }
+    lift_undriving_holds(drivers);
+    false
 }
 
 fn wait_fleet_unchanged(generation: u64) -> bool {
@@ -857,6 +1018,120 @@ mod tests {
             wanted(Some("drive"), &[]).drive_from.is_empty(),
             "none named: nobody"
         );
+    }
+
+    #[test]
+    fn a_grant_taken_back_admits_no_drive_and_narrows_the_listener() {
+        let grant = |n: u8| {
+            aterm_net::fleet::DriveGrant::from_word(&format!(
+                "{}:{}",
+                format!("{n:02x}").repeat(16),
+                "cd".repeat(32)
+            ))
+            .expect("a grant")
+        };
+        let (a, b) = (grant(0x0a), grant(0x0b));
+        let serving = vec![a.clone(), b.clone()];
+        let toml = |listen: &str, allow: &str, from: &[&aterm_net::fleet::DriveGrant]| {
+            format!(
+                "theme = \"Nord\"\n[fleet]\nlisten = \"{listen}\"\nallow = \"{allow}\"\n\
+                 drive_from = [{}]\n",
+                from.iter()
+                    .map(|grant| format!("\"{}\"", grant.word()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let both = toml("127.0.0.1:7100", "drive", &[&a, &b]);
+        assert_eq!(granted_now(&serving, Some(&both)), serving);
+        assert_eq!(
+            granted_now(&serving, Some(&toml("127.0.0.1:7100", "DRIVE", &[&b]))),
+            vec![b.clone()],
+            "peers rm of a: only b drives"
+        );
+        let unrelated = format!(
+            "font_px = \"not a number\"\n{}",
+            toml("127.0.0.1:7100", "content", &[])
+        );
+        for gone in [
+            toml("127.0.0.1:7100", "content", &[]),
+            toml("127.0.0.1:7100", "facts", &[&a, &b]),
+            toml("", "drive", &[&a, &b]),
+            "theme = \"Nord\"\n".to_owned(),
+            String::new(),
+            unrelated,
+        ] {
+            assert!(granted_now(&serving, Some(&gone)).is_empty(), "{gone}");
+        }
+        for broken in [
+            "[fleet\n".to_owned(),
+            "theme = Nord\n".to_owned(),
+            "[fleet]\nallow = 5\n".to_owned(),
+        ] {
+            assert_eq!(
+                granted_now(&serving, Some(&broken)),
+                serving,
+                "a [fleet] that does not read leaves the running grants: {broken}"
+            );
+        }
+        assert_eq!(
+            granted_now(&serving, None),
+            serving,
+            "so does an aterm.toml that cannot be read"
+        );
+        assert!(
+            granted_now(
+                std::slice::from_ref(&b),
+                Some(&toml("127.0.0.1:7100", "drive", &[&a]))
+            )
+            .is_empty(),
+            "a grant added waits for the listener to serve it"
+        );
+
+        assert_eq!(narrowed(&serving, Some(&both)), None);
+        assert_eq!(narrowed(&serving, Some("[fleet\n")), None);
+        assert_eq!(narrowed(&serving, None), None);
+        assert_eq!(
+            narrowed(&serving, Some(&toml("127.0.0.1:7100", "drive", &[&b]))),
+            Some(vec![b.clone()])
+        );
+        assert_eq!(
+            narrowed(&serving, Some(&toml("127.0.0.1:7100", "facts", &[&a, &b]))),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_node_drives_on_while_a_grant_names_it_with_the_key_it_is_bound_to() {
+        let grant = |n: u8, key: u8| {
+            aterm_net::fleet::DriveGrant::from_word(&format!(
+                "{}:{}",
+                format!("{n:02x}").repeat(16),
+                format!("{key:02x}").repeat(32)
+            ))
+            .expect("a grant")
+        };
+        let (a, b) = (grant(0x0a, 0xcd), grant(0x0b, 0xcd));
+        let grants = [a.clone(), b];
+        let (key, other) = (a.key, grant(0x0a, 0xef).key);
+        assert!(still_drives(&grants, || Some(key), &a.node));
+        assert!(
+            !still_drives(&grants, || Some(other), &a.node),
+            "its issuer's book binds it to another key"
+        );
+        assert!(
+            !still_drives(&grants, || None, &a.node),
+            "its issuer's book names it no more"
+        );
+        assert!(
+            !still_drives(
+                &grants,
+                || unreachable!("no grant names it"),
+                &"0c".repeat(16)
+            ),
+            "no grant names it"
+        );
+        assert!(!still_drives(&[], || Some(key), &a.node));
     }
 
     #[test]

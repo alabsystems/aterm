@@ -970,6 +970,13 @@ mod tests {
             &["-r"],
             &["--resume", "agent"],
             &["-r", "--no-plan"],
+            // A pooled relaunch onto a row of its own (`relaunch::pool_line`).
+            &[
+                "--leader-socket",
+                "/Users//u/.grok/leader-work-99068163.sock",
+                "--resume",
+                "abc",
+            ],
         ] {
             let mut want = argv(&["--always-approve"]);
             want.extend(argv(typed));

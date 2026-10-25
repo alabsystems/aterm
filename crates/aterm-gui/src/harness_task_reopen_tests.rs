@@ -239,62 +239,6 @@ fn a_turn_begun_while_the_landing_is_admitted_reopens_it() {
     }
 }
 
-/// A busy screen read while `landed@v1` is being admitted reopens the landing.
-#[test]
-fn a_busy_read_while_the_landing_is_admitted_reopens_it() {
-    let stamp = |seq: u64| crate::session_timeline::AgentStamp {
-        generation: crate::control::ScreenGen { epoch: 1, seq },
-        fp: seq,
-    };
-    for busy in [true, false] {
-        let mut tab = Tab::new();
-        tab.ctx.timeline.lock().unwrap().publish_agent(
-            "idle",
-            None,
-            None,
-            Some(aterm_phase::Program::Claude),
-            stamp(1),
-        );
-        let ctx = Arc::clone(&tab.ctx);
-        let proven = crate::self_claim::stand_in::running();
-        let prove = move |_: &str| {
-            if busy {
-                ctx.timeline.lock().unwrap().publish_agent(
-                    "busy",
-                    Some("thinking".to_string()),
-                    None,
-                    Some(aterm_phase::Program::Claude),
-                    stamp(2),
-                );
-            }
-            Some(proven.clone())
-        };
-        let (reply, wakes) = crate::control::meta_wakes_proving_for_test(
-            &tab.app.store,
-            &tab.term,
-            tab.session,
-            &tab.ctx,
-            "set harness_act landed@v1",
-            Some(2),
-            &prove,
-        );
-        assert_eq!(reply, "OK\n", "admitted by the kernel's look");
-        tab.apply(wakes);
-        tab.app.reopen_self_claim_landing(tab.session);
-        let want = if busy {
-            TaskFace::Open
-        } else {
-            TaskFace::Landed
-        };
-        assert_eq!(
-            tab.face(),
-            Some(want),
-            "a busy read in the admission: {busy}"
-        );
-        tab.done();
-    }
-}
-
 /// Re-reporting the same state after a terminal handoff does not reopen a landed task.
 #[test]
 fn a_report_written_again_after_a_handoff_reopens_nothing() {
@@ -427,44 +371,6 @@ fn a_turn_counted_before_the_landings_face_reopens_it_as_the_face_lands() {
         assert_eq!(records(&tab), usize::from(change == "renew"));
         tab.done();
     }
-}
-
-/// Screen-based busy verdicts reopen a landing only when a new busy state begins after it.
-#[test]
-fn the_screens_busy_reopens_only_at_a_busy_begun_after_the_landing() {
-    let mut tab = Tab::new();
-    let stamp = |seq: u64| crate::session_timeline::AgentStamp {
-        generation: crate::control::ScreenGen { epoch: 1, seq },
-        fp: seq,
-    };
-    let publish = |tab: &Tab, word: &'static str, detail: Option<&str>, seq: u64| {
-        tab.ctx.timeline.lock().unwrap().publish_agent(
-            word,
-            detail.map(str::to_string),
-            None,
-            Some(aterm_phase::Program::Claude),
-            stamp(seq),
-        )
-    };
-    publish(&tab, "busy", Some("thinking"), 1);
-    tab.lands();
-    assert!(
-        publish(&tab, "busy", Some("reading"), 2),
-        "the verdict moved"
-    );
-    tab.app.reopen_self_claim_landing(tab.session);
-    assert_eq!(
-        tab.face(),
-        Some(TaskFace::Landed),
-        "busy still, from before the landing: no turn begun"
-    );
-    publish(&tab, "idle", None, 3);
-    tab.app.reopen_self_claim_landing(tab.session);
-    assert_eq!(tab.face(), Some(TaskFace::Landed), "at rest");
-    publish(&tab, "busy", Some("thinking"), 4);
-    tab.app.reopen_self_claim_landing(tab.session);
-    assert_eq!(tab.face(), Some(TaskFace::Open), "a busy begun after it");
-    tab.done();
 }
 
 /// An in-place upgrade (`upgrade@v1`) at rest preserves the landed state.
@@ -784,66 +690,6 @@ fn a_landing_whose_acts_outran_its_own_turns_begin_stays_landed() {
             if tab.face() != Some(TaskFace::Open) {
                 wrong.push(format!(
                     "{case}: a turn begun after the landing: {:?}",
-                    tab.face()
-                ));
-            }
-        }
-        tab.done();
-    }
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// A landing whose acts outran the screen reader's first `busy` read of its own turn stays landed (the codex-alab lab's reland leg, 2026-10-23: a land turn answered in 50 ms, its `landed@v1` admitted before the host's reader saw the turn's busy screen, which then reopened it). NEGATIVE CONTROL: the same late `busy` read with no `land@v1` before the landing (no turn owed) reopens it, and so does the next turn's after an owed one.
-#[test]
-fn a_landing_whose_acts_outran_its_own_turns_busy_screen_stays_landed() {
-    let stamp = |seq: u64| crate::session_timeline::AgentStamp {
-        generation: crate::control::ScreenGen { epoch: 1, seq },
-        fp: seq,
-    };
-    let read = |tab: &Tab, word: &'static str, seq: u64| {
-        tab.ctx.timeline.lock().unwrap().publish_agent(
-            word,
-            None,
-            None,
-            Some(aterm_phase::Program::Codex),
-            stamp(seq),
-        );
-    };
-    let mut wrong = Vec::new();
-    for owed in [true, false] {
-        let mut tab = Tab::new();
-        read(&tab, "idle", 1);
-        for bytes in [IDLE, WORKING, DONE] {
-            tab.says(bytes);
-            tab.sweep();
-        }
-        if owed {
-            let wakes = tab.act("land@v1");
-            tab.apply(wakes);
-        }
-        tab.lands();
-        // The land turn's busy screen, read after its landing.
-        read(&tab, "busy", 2);
-        tab.app.reopen_self_claim_landing(tab.session);
-        tab.sweep();
-        let want = if owed {
-            TaskFace::Landed
-        } else {
-            TaskFace::Open
-        };
-        if tab.face() != Some(want) {
-            wrong.push(format!(
-                "owed {owed}: the land turn's busy screen, read after the landing: {:?}",
-                tab.face()
-            ));
-        }
-        if owed {
-            read(&tab, "idle", 3);
-            read(&tab, "busy", 4);
-            tab.app.reopen_self_claim_landing(tab.session);
-            if tab.face() != Some(TaskFace::Open) {
-                wrong.push(format!(
-                    "a turn's busy screen after the owed one: {:?}",
                     tab.face()
                 ));
             }

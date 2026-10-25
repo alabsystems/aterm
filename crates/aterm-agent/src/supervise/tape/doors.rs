@@ -98,3 +98,6 @@ pub const PROBE_ASLEEP: &str = "probe.asleep";
 
 /// Probe for the timestamps of the machine's last sleep and wake.
 pub const PROBE_LAST_SLEEP: &str = "probe.last_sleep";
+
+/// Probe for the wake the machine is in: a full one (graphics up) or macOS's dark wake.
+pub const PROBE_FULL_WAKE: &str = "probe.full_wake";

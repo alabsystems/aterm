@@ -156,7 +156,7 @@ impl Exception {
             }
             .to_string(),
             action: futile_action(program).to_string(),
-            clears: "a new reset or wall, a reset passing, someone's turn, or the agent working",
+            clears: "a new reset or wall, someone's turn, or the agent working",
             escalated: false,
             notice: None,
         }

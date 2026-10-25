@@ -165,7 +165,9 @@ fn row_home(cli: Cli, row: &Row, home: &Path) -> Option<std::path::PathBuf> {
 /// Reads the usage of each of `roster`'s rows of `cli` whose login is here (`enrolled`, or the
 /// default row) and whose sample is older than [`USAGE_FRESH_S`], each in its own home and at
 /// once, with `read`; records each reading under its row in `cli`'s store (its sample, and the
-/// wall it names) in one transaction. The labels recorded.
+/// wall it names) in one transaction. The labels recorded. When an overlay CLI's default row is
+/// due, its default home is read before linking and reading the overlay homes so any shared
+/// suffix file the CLI creates at startup exists there first.
 pub fn record_usage(
     seat: &Seat<'_>,
     cli: Cli,
@@ -177,7 +179,7 @@ pub fn record_usage(
     let Ok((state, _)) = store.load(seat.now) else {
         return Vec::new();
     };
-    let due: Vec<(&Row, std::path::PathBuf)> = roster
+    let due_rows: Vec<&Row> = roster
         .rows
         .iter()
         .filter(|row| row.dir.is_none() || enrolled.contains(&row.label))
@@ -188,24 +190,41 @@ pub fn record_usage(
                 .and_then(|a| a.sample.as_ref())
                 .is_none_or(|s| seat.now.saturating_sub(s.at) >= USAGE_FRESH_S)
         })
-        .filter_map(|row| Some((row, row_home(cli, row, seat.home)?)))
         .collect();
-    if due.is_empty() {
+    if due_rows.is_empty() {
         return Vec::new();
     }
-    let readings: Vec<(String, Usage)> = std::thread::scope(|scope| {
-        let reads: Vec<_> = due
-            .iter()
-            .map(|(row, home)| {
-                let label = row.label.clone();
-                scope.spawn(move || read(cli, home, seat.now).map(|usage| (label, usage)))
-            })
-            .collect();
-        reads
-            .into_iter()
-            .filter_map(|r| r.join().ok().flatten())
-            .collect()
-    });
+    let is_overlay = matches!(cli.accounts().seam, Seam::Overlay { .. });
+    let mut readings: Vec<(String, Usage)> = Vec::new();
+    if is_overlay {
+        for row in due_rows.iter().copied().filter(|row| row.dir.is_none()) {
+            if let Some(home) = row_home(cli, row, seat.home)
+                && let Some(usage) = read(cli, &home, seat.now)
+            {
+                readings.push((row.label.clone(), usage));
+            }
+        }
+    }
+    let parallel_due: Vec<(&Row, std::path::PathBuf)> = due_rows
+        .into_iter()
+        .filter(|row| !is_overlay || row.dir.is_some())
+        .filter_map(|row| Some((row, row_home(cli, row, seat.home)?)))
+        .collect();
+    if !parallel_due.is_empty() {
+        readings.extend(std::thread::scope(|scope| {
+            let reads: Vec<_> = parallel_due
+                .iter()
+                .map(|(row, home)| {
+                    let label = row.label.clone();
+                    scope.spawn(move || read(cli, home, seat.now).map(|usage| (label, usage)))
+                })
+                .collect();
+            reads
+                .into_iter()
+                .filter_map(|r| r.join().ok().flatten())
+                .collect::<Vec<_>>()
+        }));
+    }
     if readings.is_empty() {
         return Vec::new();
     }
@@ -268,7 +287,7 @@ pub fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<Logi
         return None;
     }
     let store = seat.store(cli);
-    let row = if seat.mode() == Mode::Off {
+    if seat.mode() == Mode::Off {
         let (state, _) = store.load(seat.now).ok()?;
         let pinned = state
             .active
@@ -287,13 +306,22 @@ pub fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<Logi
         ) {
             return None;
         }
-        pinned
-    } else {
-        record_usage(seat, cli, &roster, &enrolled, read);
-        let (state, _) = store.load(seat.now).ok()?;
-        accounts::launch_row(&roster, &state, &enrolled, seat.now)?
-    };
-    login_env(cli, row, seat.home).ok()
+        return login_env(cli, pinned, seat.home).ok();
+    }
+    record_usage(seat, cli, &roster, &enrolled, read);
+    let (state, _) = store.load(seat.now).ok()?;
+    let mut candidate_enrolled = enrolled;
+    loop {
+        let row = accounts::launch_row(&roster, &state, &candidate_enrolled, seat.now)?;
+        if let Ok(env) = login_env(cli, row, seat.home) {
+            return Some(env);
+        }
+        if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
+            || !candidate_enrolled.remove(&row.label)
+        {
+            return None;
+        }
+    }
 }
 
 /// A running session of a pooled CLI, as [`session_move`] asks about it.
@@ -393,30 +421,48 @@ pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
         return Moved::stay(StayWhy::NothingDue);
     };
     let enrolled = accounts::enrolled_for(s.cli, &roster);
-    let advice = accounts::advise_session(
-        s.cli,
-        s.supervisor,
-        &roster,
-        &state,
-        &enrolled,
-        &me,
-        &s.point,
-        s.mode,
-        seat.now,
-    );
-    let Advice::Move { to, rotates, .. } = &advice else {
-        return Moved { advice, line: None };
+    let mut candidate_enrolled = enrolled;
+    let mut saw_line_failure = false;
+    let (advice, to, rotates, line) = loop {
+        let advice = accounts::advise_session(
+            s.cli,
+            s.supervisor,
+            &roster,
+            &state,
+            &candidate_enrolled,
+            &me,
+            &s.point,
+            s.mode,
+            seat.now,
+        );
+        let Advice::Move { to, rotates, .. } = &advice else {
+            return if saw_line_failure {
+                Moved::stay(StayWhy::NoLine)
+            } else {
+                Moved { advice, line: None }
+            };
+        };
+        let Some(row) = roster.row(to) else {
+            return Moved::stay(if saw_line_failure {
+                StayWhy::NoLine
+            } else {
+                StayWhy::NoCandidate
+            });
+        };
+        if let Some(line) = login_env(s.cli, row, seat.home)
+            .ok()
+            .and_then(|env| relaunch::pool_line(&s.relaunch, s.cli, &env).ok())
+        {
+            break (advice.clone(), to.clone(), *rotates, line);
+        }
+        saw_line_failure = true;
+        if (state.pinned && state.active.as_deref() == Some(to.as_str()))
+            || !candidate_enrolled.remove(to)
+        {
+            return Moved::stay(StayWhy::NoLine);
+        }
     };
-    let Some(row) = roster.row(to) else {
-        return Moved::stay(StayWhy::NoCandidate);
-    };
-    let Some(line) = login_env(s.cli, row, seat.home)
-        .ok()
-        .and_then(|env| relaunch::pool_line(&s.relaunch, s.cli, &env).ok())
-    else {
-        return Moved::stay(StayWhy::NoLine);
-    };
-    if *rotates {
+    if rotates {
         let Some(from) = me.label() else {
             return Moved::stay(StayWhy::NotListed);
         };
@@ -431,10 +477,10 @@ pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
                 accounts::begin_rotation(
                     held,
                     &roster,
-                    &enrolled,
+                    &candidate_enrolled,
                     expect.as_deref(),
                     mover,
-                    to,
+                    &to,
                     seat.now,
                 )
                 .map(|event| vec![event])

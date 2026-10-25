@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use super::units::runs_exec;
 use super::wait::{JobFacts, Scene, map_leaf_frame, name_job};
 use super::wire::{age_words, phi_text};
 use super::*;
@@ -456,4 +457,47 @@ fn the_tty_names_read_the_fresh_mode_word_only_for_the_foreground_job() {
     };
     let w = name_job(&scene, &j, &leaves, (1, "zsh"));
     assert_eq!((w.name, w.leaf), (WaitName::TtyBuiltinRead, 1));
+}
+
+#[test]
+fn a_command_line_runs_exec_only_as_a_command_word() {
+    for (line, runs) in [
+        ("exec zsh", true),
+        ("cd ~ && exec \"$SHELL\"", true),
+        ("TERM=xterm-256color exec tmux", true),
+        ("if [ -x ./run ]; then exec ./run; fi", true),
+        ("( exec zsh )", true),
+        ("case $SHELL in */zsh) exec zsh -l ;; esac", true),
+        ("cd ~/proj && \\\n  exec zsh", true),
+        (
+            "# don't forget: reload so PATH takes effect\nexec zsh",
+            true,
+        ),
+        (
+            "cat >> ~/.zshrc <<'EOF'\n# pyenv (don't remove)\neval \"$(pyenv init -)\"\nEOF\nexec zsh",
+            true,
+        ),
+        (
+            "ZDOTDIR=${XDG_CONFIG_HOME:-$HOME/.config}/zsh exec zsh",
+            true,
+        ),
+        ("SHELL=$(command -v zsh) exec zsh", true),
+        ("case $SHELL in (*/bash) exec zsh;; esac", true),
+        ("case $x in a|b) echo hi ;; (c) exec zsh ;; esac", true),
+        ("grep -c x <<< 'a b'\necho ${#x}; exec zsh", true),
+        ("case $1 in -n) dry=1 ;; esac; exec zsh", true),
+        (
+            "cat <<-EOF > ~/.zshenv\n\texport EDITOR=vim\n\tEOF\nexec zsh",
+            true,
+        ),
+        ("cat <<-EOF\n\texec zsh\n\tEOF\necho done", false),
+        ("echo done # exec zsh", false),
+        ("echo $(exec cat) `cd /; exec cat`", false),
+        ("docker exec db psql", false),
+        ("Invoke-Sqlcmd -Query \"use db; exec dbo.Nightly\"", false),
+        ("echo $(date) exec", false),
+        ("./execute-migrations.ps1", false),
+    ] {
+        assert_eq!(runs_exec(line), runs, "{line}");
+    }
 }

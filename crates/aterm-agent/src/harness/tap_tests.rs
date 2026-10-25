@@ -840,6 +840,7 @@ fn all_clear<'a>(argv: &'a [String], settings: &'a [(String, Source)]) -> GateFa
         home: None,
         argv,
         settings,
+        user_settings: Some("user"),
         profile_store: false,
     }
 }
@@ -996,14 +997,173 @@ fn each_guard_alone_refuses_the_tap() {
     for at in 0..3 {
         let mut c = quiet.clone();
         c[at].1 = Source::Text(r#"{"statusLine":{"type":"command","command":"x"}}"#.into());
-        refused(
-            all_clear(&argv, &c),
-            &format!("a status line in document {at}"),
-        );
+        if c[at].0 == "user" {
+            assert_eq!(
+                gate(&all_clear(&argv, &c)),
+                settings_value_chained(Path::new(EXE), Some("x")),
+                "the owner's own statusLine in the user's settings.json is carried (R-12)"
+            );
+        } else {
+            refused(
+                all_clear(&argv, &c),
+                &format!("a status line in document {at}"),
+            );
+        }
         let mut c = quiet.clone();
         c[at].1 = Source::Unreadable;
         refused(all_clear(&argv, &c), &format!("document {at} unreadable"));
     }
+}
+
+/// The settings document a person's `~/.claude/settings.json` was on the measured machine
+/// (2026-10-24, Claude Code 2.1.310): another app's statusLine hook, a plain command line, beside
+/// hooks and an `env` block. The command is that file's, with its home replaced.
+#[cfg(unix)]
+const OWNER_SETTINGS_2_1_310: &str = r#"{
+  "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"},
+  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/bin/sh /Users//example/.orca/agent-hooks/claude-hook.sh"}]}]},
+  "statusLine": {"type": "command", "command": "if [ -f '/Users//example/.orca/agent-hooks/claude-statusline.sh' ] && [ -r '/Users//example/.orca/agent-hooks/claude-statusline.sh' ] && [ -x '/Users//example/.orca/agent-hooks/claude-statusline.sh' ]; then /bin/sh '/Users//example/.orca/agent-hooks/claude-statusline.sh'; else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi"},
+  "theme": "dark"
+}"#;
+
+/// THE OWNER'S OWN STATUSLINE IS CARRIED, NOT A REFUSAL (owner ruling R-12, 2026-10-24: "THE
+/// HARNESS MUST DO THIS STOP ASKING THE USER"). On the measured machine every Claude Code footer
+/// read `weekly ? · /usage` because the person's `~/.claude/settings.json` held another app's
+/// statusLine, and the gate refused the tap over any statusLine, so no line carried it and no
+/// figure was ever read. The gate now carries that command (`--then <hex>`), the value is still
+/// exactly ours for every reader (`is_ours`, `carried_by`, the relaunch's shedding), and every
+/// statusLine it cannot carry faithfully still refuses: one in another document, two documents
+/// that set one, another shape, an over-long command.
+#[cfg(unix)]
+#[test]
+fn the_owners_own_statusline_is_carried_and_every_other_still_refuses() {
+    let argv: Vec<String> = ["claude", "--dangerously-skip-permissions"]
+        .map(str::to_owned)
+        .to_vec();
+    let owner = netwatch::settings_of(OWNER_SETTINGS_2_1_310)
+        .and_then(|read| read.status_command)
+        .expect("the measured statusLine is a plain command line");
+    let chain = |user: &str, project: &str| -> Vec<(String, Source)> {
+        vec![
+            ("managed".to_string(), Source::Missing),
+            ("project".to_string(), Source::Text(project.to_string())),
+            ("user".to_string(), Source::Text(user.to_string())),
+        ]
+    };
+    let measured = chain(OWNER_SETTINGS_2_1_310, "{}");
+    let value = gate(&all_clear(&argv, &measured)).expect("the measured machine gets the tap");
+    assert_eq!(
+        value,
+        settings_value_chained(Path::new(EXE), Some(&owner)).expect("a carried value")
+    );
+    assert!(value.contains(" harness tap --then "), "{value}");
+    assert!(
+        !value.contains("orca"),
+        "the owner's command rides hex-encoded, inert to a shell: {value}"
+    );
+    assert!(is_ours(&value));
+    assert_eq!(chained_of(&value), Some(Some(owner.clone())));
+    let carried: Vec<String> = argv
+        .iter()
+        .cloned()
+        .chain(["--settings".to_string(), value.clone()])
+        .collect();
+    assert!(
+        carried_by(&carried),
+        "the footer and the host know the line is tapped"
+    );
+    assert_eq!(
+        gate(&all_clear(&carried, &measured)),
+        Some(value.clone()),
+        "a tapped line is relaunched with the same tap"
+    );
+    let refused = |c: &[(String, Source)], why: &str| {
+        assert_eq!(gate(&all_clear(&argv, c)), None, "{why}");
+    };
+    let line = r#"{"statusLine":{"type":"command","command":"echo mine"}}"#;
+    refused(&chain("{}", line), "a project's statusLine");
+    refused(&chain(line, line), "two documents set one");
+    refused(
+        &[
+            ("managed".to_string(), Source::Text(line.to_string())),
+            ("user".to_string(), Source::Missing),
+        ],
+        "a managed statusLine",
+    );
+    assert_eq!(
+        gate(&GateFacts {
+            user_settings: None,
+            ..all_clear(&argv, &chain(line, "{}"))
+        }),
+        None,
+        "no document named the user's own"
+    );
+    let long = format!(
+        r#"{{"statusLine":{{"type":"command","command":"{}"}}}}"#,
+        "x".repeat(CHAIN_MAX + 1)
+    );
+    for odd in [
+        r#"{"statusLine":{"type":"command","command":"echo mine","refreshInterval":5}}"#,
+        r#"{"statusLine":{"type":"command","command":"echo mine","hideVimModeIndicator":true}}"#,
+        r#"{"statusLine":{"type":"command","command":"echo mine","padding":"2"}}"#,
+        r#"{"statusLine":{"type":"text","command":"echo mine"}}"#,
+        r#"{"statusLine":{"type":"command","command":""}}"#,
+        r#"{"statusLine":{"type":"command","command":["echo"]}}"#,
+        r#"{"statusLine":{"type":"command"}}"#,
+        r#"{"statusLine":"echo mine"}"#,
+        r#"{"statusLine":{"type":"command","command":"echo mine"},"disableAllHooks":true}"#,
+        long.as_str(),
+    ] {
+        refused(&chain(odd, "{}"), odd);
+    }
+    assert_eq!(
+        gate(&all_clear(
+            &argv,
+            &chain(
+                r#"{"statusLine":{"type":"command","command":"echo mine","padding":0}}"#,
+                "{}"
+            )
+        )),
+        settings_value_chained(Path::new(EXE), Some("echo mine")),
+        "a padding beside the command is the owner's presentation, carried by Claude Code's merge"
+    );
+}
+
+/// THE CARRIED VALUE IS EXACT: every near miss of a chained value (another flag, uppercase or odd
+/// hex, a NUL, a key more) is not ours, so the relaunch never sheds or keeps a value aterm did
+/// not write.
+#[cfg(unix)]
+#[test]
+fn the_carried_value_is_exact_and_only_it_is_ours() {
+    let value = settings_value_chained(Path::new(EXE), Some("echo mine")).expect("a value");
+    assert_eq!(
+        value,
+        r#"{"statusLine":{"type":"command","command":"/Applications/aterm.app/Contents/MacOS/aterm harness tap --then 6563686f206d696e65","refreshInterval":10}}"#
+    );
+    assert_eq!(
+        text_of_hex("6563686f206d696e65").as_deref(),
+        Some("echo mine")
+    );
+    let other = |from: &str, to: &str| value.replacen(from, to, 1);
+    for near in [
+        other(" --then ", " --than "),
+        other("6563686f206d696e65", "6563686F206D696E65"),
+        other("6563686f206d696e65", "6563686f206d696e6"),
+        other("6563686f206d696e65", "6563686f00206d696e65"),
+        other("6563686f206d696e65", ""),
+        other(
+            r#""refreshInterval":10"#,
+            r#""refreshInterval":10,"padding":1"#,
+        ),
+        other(" harness tap --then", " harness tap x --then"),
+    ] {
+        assert!(!is_ours(&near), "{near}");
+    }
+    assert_eq!(settings_value_chained(Path::new(EXE), Some("")), None);
+    assert_eq!(
+        settings_value_chained(Path::new(EXE), Some("a\u{0}b")),
+        None
+    );
 }
 
 /// Claude Code 2.1.300's idle screen with the tap's row, at 110x32 and at 80x24 beside the
@@ -1297,4 +1457,92 @@ fn a_lines_refusal_names_its_argv_or_its_own_settings() {
         assert_eq!(line_refusal(&line), refusal, "{words:?}");
         assert_eq!(line_admits(&line), refusal.is_none(), "{words:?}");
     }
+}
+
+/// A Claude Code 2.1.310 status-line payload, composed from that build's own statusLine input
+/// (`workspace`, `context_window`, `prompt_cache`, `effort`, `thinking`, one-decimal
+/// `rate_limits`), with example names.
+const PAYLOAD_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-statusline.json");
+
+/// THE CARRYING TAP WRITES THE READING AND HANDS ON THE PAYLOAD BYTE FOR BYTE (R-12): on Claude
+/// Code 2.1.310's payload it records the week the footer reads (12.3% used, its reset) as the
+/// plain tap does, prints nothing of its own, and returns exactly what Claude Code wrote for the
+/// owner's command; a payload over the cap hands on nothing.
+#[test]
+fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
+    let dir = scratch("chain");
+    let now = 1_792_867_260;
+    let handed = run_chained(
+        &mut PAYLOAD_2_1_310.as_bytes(),
+        false,
+        &vars(),
+        Some(dir.path()),
+        now,
+    )
+    .expect("a payload to hand on");
+    assert_eq!(handed, PAYLOAD_2_1_310.as_bytes());
+    let (reading, _) = Reading::read(dir.path(), SID, 68537, now - 1).expect("the reading");
+    assert_eq!(
+        reading.seven_day,
+        Some(Window {
+            pct: 12,
+            resets_at: 1_793_473_200,
+            pct_x10: Some(123),
+        })
+    );
+    assert_eq!(reading.five_hour.map(|w| w.x10()), Some(375));
+    assert_eq!(reading.version.as_deref(), Some("2.1.310"));
+    assert_eq!(reading.api_ms, 412_000);
+    let over = vec![b' '; STDIN_MAX + 1];
+    assert_eq!(
+        run_chained(&mut &over[..], false, &vars(), Some(dir.path()), now),
+        None
+    );
+}
+
+/// THE OWNER'S COMMAND RUNS AS CLAUDE CODE RUNS IT: `/bin/sh -c`, the payload on its stdin
+/// whatever its size, its own stdout and exit status (the tap execs it; here it is waited on), and
+/// no file left behind for the payload.
+#[cfg(unix)]
+#[test]
+fn the_owners_command_reads_the_payload_and_keeps_its_row_and_status() {
+    let leftovers = || -> Vec<String> {
+        let mine = format!(".aterm-tap-stdin-{}-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|name| name.starts_with(&mine))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let echoed = chain_command("cat", PAYLOAD_2_1_310.as_bytes())
+        .expect("a command")
+        .output()
+        .expect("it ran");
+    assert!(echoed.status.success());
+    assert_eq!(echoed.stdout, PAYLOAD_2_1_310.as_bytes());
+    let big = "x".repeat(200 * 1024);
+    let counted = chain_command("wc -c | tr -d ' '", big.as_bytes())
+        .expect("a command")
+        .output()
+        .expect("it ran");
+    assert_eq!(String::from_utf8_lossy(&counted.stdout).trim(), "204800");
+    let own = chain_command("printf 'mine\\n'; exit 3", b"{}")
+        .expect("a command")
+        .output()
+        .expect("it ran");
+    assert_eq!(own.stdout, b"mine\n");
+    assert_eq!(
+        own.status.code(),
+        Some(3),
+        "its exit status is Claude Code's to read"
+    );
+    assert_eq!(
+        leftovers(),
+        Vec::<String>::new(),
+        "the payload's file is unlinked"
+    );
 }

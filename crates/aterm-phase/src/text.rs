@@ -88,15 +88,17 @@ pub(crate) fn blank(s: &str) -> bool {
     trim(s).is_empty()
 }
 
-/// Byte index of the first occurrence of `needle` in `s`, matching `s.find(needle)`.
+/// Byte index of the first occurrence of `needle` in `s`, matching `s.find(needle)`. A
+/// place is compared whole only when its first and last bytes match the needle's, so a
+/// needle that opens on a space does not compare at every space of a row.
 pub(crate) fn find(s: &str, needle: &str) -> Option<usize> {
     let (b, n) = (s.as_bytes(), needle.as_bytes());
-    let Some(&first) = n.first() else {
+    let (Some(&first), Some(&last)) = (n.first(), n.last()) else {
         return Some(0);
     };
     let mut i = 0;
     while i + n.len() <= b.len() {
-        if b[i] == first && &b[i..i + n.len()] == n {
+        if b[i] == first && b[i + n.len() - 1] == last && &b[i..i + n.len()] == n {
             return Some(i);
         }
         i += 1;
@@ -251,6 +253,7 @@ mod tests {
             "Esc to cancel · Tab to amend",
             "  Esc to Esc to ",
             "aaab",
+            "axb aab",
             "❯ 1. Yes ❯",
             "3 shells · 2 shells ·",
             "·",

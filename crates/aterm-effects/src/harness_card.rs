@@ -691,13 +691,17 @@ struct LineInks {
     ink: [u32; LINE_INK_STEPS + 1],
 }
 
+impl LineInks {
+    const EMPTY: Self = Self {
+        key: None,
+        ink: [0; LINE_INK_STEPS + 1],
+    };
+}
+
 impl Default for LineInks {
     #[inline]
     fn default() -> Self {
-        Self {
-            key: None,
-            ink: [0; LINE_INK_STEPS + 1],
-        }
+        Self::EMPTY
     }
 }
 
@@ -1045,7 +1049,7 @@ pub fn kitty_cols(cw: u16, ch: u16) -> u16 {
 }
 
 /// State machine tracking the harness card's intro episode, ride-in, and continuous ripple flow.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct HarnessCard {
     episode: Episode,
     seed: u64,
@@ -1060,6 +1064,13 @@ pub struct HarnessCard {
     fade0: Option<Instant>,
     drawn: Option<(Instant, Option<(u64, u32)>)>,
     grid_gen: u32,
+}
+
+impl Default for HarnessCard {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1709,14 +1720,29 @@ fn across_trail(b: Rect, (t, amp): (Rect, i64)) -> bool {
     !b.meet(outer).is_empty() && !inside
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct GlintSpot {
     x: i64,
     y: i64,
     phase: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+impl GlintSpot {
+    const EMPTY: Self = Self {
+        x: 0,
+        y: 0,
+        phase: 0.0,
+    };
+}
+
+impl Default for GlintSpot {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Glints {
     spots: [GlintSpot; GLINTS_MAX],
     n: usize,
@@ -1724,7 +1750,21 @@ struct Glints {
     flare: i64,
 }
 
+impl Default for Glints {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl Glints {
+    const EMPTY: Self = Self {
+        spots: [GlintSpot::EMPTY; GLINTS_MAX],
+        n: 0,
+        rest: 0,
+        flare: 0,
+    };
+
     #[inline]
     fn spots(&self) -> &[GlintSpot] {
         &self.spots[..self.n]
@@ -1932,7 +1972,7 @@ fn field_spots_at(
 }
 
 /// Grid placement and hero-word span for the status line beneath the card.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineAt {
     /// Grid row of the line.
     pub row: u16,
@@ -1946,7 +1986,45 @@ pub struct LineAt {
     pub wand: Option<(u16, u16)>,
 }
 
+impl LineAt {
+    /// Empty status-line placement before any row or span is bound.
+    pub const EMPTY: Self = Self {
+        row: 0,
+        col: 0,
+        len: 0,
+        hero: 0..0,
+        wand: None,
+    };
+}
+
+impl Default for LineAt {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl HarnessCard {
+    /// Construct an idle harness card state machine.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            episode: Episode::Idle,
+            seed: 0,
+            palette: CardPalette::Cruise,
+            inks: LineInks::EMPTY,
+            still: false,
+            drew: Drew::Settled,
+            ride: Ride::Ahead,
+            flows: false,
+            glint0: None,
+            hue0: None,
+            fade0: None,
+            drawn: None,
+            grid_gen: 0,
+        }
+    }
     /// Arms an intro episode at `now` with star `seed`, preserving any active ripple clock.
     #[inline]
     pub fn arm(&mut self, now: Instant, seed: u64) {

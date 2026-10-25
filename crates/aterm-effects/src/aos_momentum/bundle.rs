@@ -2,6 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! The provenance bundle of an admitted Aos M4 candidate, and its verification (design §10.7).
+//!
+//! A bundle's parts are [`UncheckedBundle`]'s fields, in their declared order.
+//!
+//! # The bytes
+//!
+//! ```text
+//! BUNDLE_MAGIC ‖ the parts in the order above ‖ Digest::of(BUNDLE_DOMAIN, [everything before it])
+//! ```
+//!
+//! in [`aterm_aos::wire`]'s canonical encoding; [`UncheckedBundle::decode`] refuses any other bytes.
 
 use core::fmt;
 

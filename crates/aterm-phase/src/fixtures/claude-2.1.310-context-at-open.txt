@@ -1,0 +1,26 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.133.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the @ menu open from an empty composer with the context indicator up (long stub replies (CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=20)): it stands in the mode row's place
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn.
+
+✻ Cooked for 0s · done 11:33 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ @
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    * claude (agent) – Catch-all for any task that doesn't fit a more specific age…
+    * claude-code-guide (agent) – Use this agent when the user asks questions ("Can Claude...…
+    * Explore (agent) – Fast read-only search agent for locating code. Use it to fi…
+    * general-purpose (agent) – General-purpose agent for researching complex questions, se…
+    * Plan (agent) – Software architect agent for designing implementation plans…
+    * statusline-setup (agent) – Use this agent to configure the user's Claude Code status l…

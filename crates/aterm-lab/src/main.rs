@@ -20,6 +20,8 @@ mod aos_workers;
 #[cfg(target_os = "macos")]
 mod aos_workers_bench;
 #[cfg(target_os = "macos")]
+mod autopilot_scenes;
+#[cfg(target_os = "macos")]
 mod band;
 #[cfg(target_os = "macos")]
 mod bus;
@@ -347,8 +349,10 @@ usage: targo --unverified lab <command> [tag] [args]
   forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|wall-shift|wall-redraw|wall-switch|wall-unread|wall-day-stop|wall-cruise|wall-relaunch|wall-bucket|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
-                                 - land / cruise / both: L1-L11, L16-L17, C1-C2, P4, N1-N4, Off control, plus Settings >
-                                   Harness window & 20 s idle wake/render checks (--no-surfaces skips window checks)
+                                 - land / cruise / both: L1-L11, L16-L17, C1-C2, HL/HC (same-land, same-cruise), P4,
+                                   N1-N4, Off control, plus Settings > Harness window & 20 s idle wake/render checks
+                                   (--no-surfaces skips window checks); a chain aterm stops typing into is watched 60 s
+                                   past its hold, brought in front twice, and must say `stopped typing`
                                  - cover: L12 prose question, L13 person turn (task=theirs), L14/C3 P2 reads, P5, L15
                                    worker, C4, Off control
                                  - cap: continue_per_hour = 1 escalation and post-hour recovery (~72 min)
@@ -470,6 +474,42 @@ Outside any lab (no jail, no stub):
 Exit: 0 pass, 1 a finding or a refusal (also an unknown command and, on many verbs, a bad argument), 2 usage,
 3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
 ";
+
+/// The lines of [`USAGE`] that name `verb`: its entry and the lines that continue it.
+fn verb_usage(verb: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in USAGE.lines() {
+        if let Some(entry) = line
+            .strip_prefix("  ")
+            .filter(|entry| !entry.starts_with(' '))
+        {
+            let names = entry.split(' ').next().unwrap_or_default();
+            inside = names.split('|').any(|name| name == verb);
+        } else if !line.starts_with("   ") {
+            inside = false;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// A verb with no help of its own that refused `rest` as a usage error answers `-h`/`--help`
+/// before any `--` with its lines of [`USAGE`].
+fn help_instead(verb: &str, rest: &[String], fail: &Fail) -> Option<String> {
+    let asked = rest
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "-h" || arg == "--help");
+    if fail.code == 2 && asked {
+        verb_usage(verb)
+    } else {
+        None
+    }
+}
 
 /// Why a verb ended: a message for stderr (when there is one), its exit status, and the interrupt that cut it short (when one did).
 #[derive(Debug)]
@@ -731,6 +771,10 @@ fn main() -> std::process::ExitCode {
                     match r {
                         Ok(c) => c,
                         Err(f) => {
+                            if let Some(usage) = help_instead(&cmd, rest, &f) {
+                                print!("{usage}");
+                                return std::process::ExitCode::SUCCESS;
+                            }
                             if let Some(m) = f.msg {
                                 eprintln!("aterm-lab: {m}");
                             }
@@ -748,4 +792,30 @@ fn main() -> std::process::ExitCode {
 fn main() -> std::process::ExitCode {
     eprintln!("aterm-lab: macOS only (sandbox-exec is the lab's jail)");
     std::process::ExitCode::from(3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_verb_with_no_help_of_its_own_answers_help_with_its_usage() {
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let refused = Fail::usage("instance: unexpected '--help'");
+        let usage = help_instead("instance", &words(&["--help"]), &refused).expect("its usage");
+        assert!(usage.starts_with("  instance [--window]"), "{usage}");
+        assert!(usage.contains("[-- PROGRAM ARGS]") && usage.contains("--scene band-icons"));
+        assert!(!usage.contains("abrew-admission"), "{usage}");
+        assert!(help_instead("instance", &words(&["-h", "--keep"]), &refused).is_some());
+        for (rest, fail) in [
+            (words(&["--", "/bin/sh", "--help"]), Fail::usage("x")),
+            (words(&["--keep"]), Fail::usage("x")),
+            (words(&["--help"]), Fail::die("x")),
+        ] {
+            assert_eq!(help_instead("instance", &rest, &fail), None, "{rest:?}");
+        }
+        let send = verb_usage("send").expect("turn|send|enter|key");
+        assert!(send.starts_with("  turn|send|enter|key"), "{send}");
+        assert_eq!(verb_usage("no-such-verb"), None);
+    }
 }

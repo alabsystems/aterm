@@ -124,12 +124,27 @@ enum Window {
 }
 
 /// One map-local cell that only the live caret's 3x3 ring protects.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct CaretCell {
     row: usize,
     col: usize,
     /// Would this cell have been [`PetCell::Clear`] with no caret at all?
     blank: bool,
+}
+
+impl CaretCell {
+    const EMPTY: Self = Self {
+        row: 0,
+        col: 0,
+        blank: false,
+    };
+}
+
+impl Default for CaretCell {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Which caret ring cells a clearance reading may discount.
@@ -144,13 +159,20 @@ enum Forgive {
 }
 
 /// The terminal's rectangle in the supplied frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Terminal pane rectangle in the supplied frame.
 pub struct PetPane {
     pub row: usize,
     pub col: usize,
     pub rows: usize,
     pub cols: usize,
+}
+
+impl Default for PetPane {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 impl PetPane {
@@ -185,6 +207,21 @@ pub struct PetSurface {
     pub absolute_row_revision: u64,
     pub history_renumber_epoch: u64,
     pub scroll_invalidation: u64,
+}
+
+impl PetSurface {
+    #[inline]
+    #[must_use]
+    pub const fn eq_surface(self, other: Self) -> bool {
+        self.session == other.session
+            && self.terminal_id == other.terminal_id
+            && self.alt_screen == other.alt_screen
+            && self.rows == other.rows
+            && self.cols == other.cols
+            && self.absolute_row_revision == other.absolute_row_revision
+            && self.history_renumber_epoch == other.history_renumber_epoch
+            && self.scroll_invalidation == other.scroll_invalidation
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,7 +418,17 @@ pub struct PetWorld {
 }
 
 impl Default for PetWorld {
+    #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PetWorld {
+    /// Construct an empty observation world with no allocated cell buffers.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             cells: Vec::new(),
             glyphs: Vec::new(),
@@ -390,11 +437,11 @@ impl Default for PetWorld {
             ground_blocked_prefix: Vec::new(),
             ground_protected_prefix: Vec::new(),
             ground_split: false,
-            ground_caret_cells: [CaretCell::default(); 9],
+            ground_caret_cells: [CaretCell::EMPTY; 9],
             ground_caret_cells_len: 0,
             hull: Vec::new(),
-            coverage: PetPane::default(),
-            caret_cells: [CaretCell::default(); 9],
+            coverage: PetPane::EMPTY,
+            caret_cells: [CaretCell::EMPTY; 9],
             caret_cells_len: 0,
             stamp: None,
             anchors: [None; MAX_WORLD_ANCHORS],
@@ -404,9 +451,7 @@ impl Default for PetWorld {
             examined_cells: 0,
         }
     }
-}
 
-impl PetWorld {
     /// Retire all geometry without reallocating the bounded buffer.
     #[inline]
     /// Retires all observed geometry without reallocating the bounded buffer.
@@ -611,6 +656,15 @@ impl PetWorld {
         self.protected_prefix[..=cols].fill(0);
         let mut n_caret_cells = 0usize;
         let mut n_ground_caret_cells = 0usize;
+        let mut implicit_bg = input.default_bg;
+        let mut implicit = RenderCell {
+            bg: [
+                (implicit_bg >> 16) as u8,
+                (implicit_bg >> 8) as u8,
+                implicit_bg as u8,
+            ],
+            ..RenderCell::default()
+        };
         for r in 0..rows {
             let row_base = r * MAX_WORLD_COLS;
             let prefix_row = (r + 1) * stride;
@@ -686,8 +740,6 @@ impl PetWorld {
             let typed_spans = &typed_spans[..n_typed];
             let mut scan = RowScan::new(input, frame_r);
             let row_has_compounds = scan.has_compounds();
-            let mut implicit_bg = None;
-            let mut implicit = RenderCell::default();
             let cursor_row_near = input.cursor_visible
                 && input.display_offset == 0
                 && frame_r.abs_diff(input.cursor_row) <= 1;
@@ -698,16 +750,13 @@ impl PetWorld {
                 let local_c = self.coverage.col + c;
                 let frame_c = pane.col + local_c;
                 let default_bg = scan.default_bg(frame_c);
-                if !matches!(implicit_bg, Some(bg) if bg == default_bg) {
-                    implicit_bg = Some(default_bg);
-                    implicit = RenderCell {
-                        bg: [
-                            (default_bg >> 16) as u8,
-                            (default_bg >> 8) as u8,
-                            default_bg as u8,
-                        ],
-                        ..RenderCell::default()
-                    };
+                if implicit_bg != default_bg {
+                    implicit_bg = default_bg;
+                    implicit.bg = [
+                        (default_bg >> 16) as u8,
+                        (default_bg >> 8) as u8,
+                        default_bg as u8,
+                    ];
                 }
                 let cell = row.get(frame_c).unwrap_or(&implicit);
                 self.examined_cells += 1;
@@ -749,7 +798,9 @@ impl PetWorld {
                             && neighbour.underline == UnderlineStyle::None
                             && !neighbour.strikethrough
                             && !neighbour.overline
-                            && input.line_size_run_at(frame_r, column).0 == LineSize::SingleWidth
+                            && (scan.is_uniform_single_width()
+                                || input.line_size_run_at(frame_r, column).0
+                                    == LineSize::SingleWidth)
                             && (!row_has_compounds
                                 || (input.cluster_at(frame_r, column).is_none()
                                     && input.combining_at(frame_r, column).is_none()))
@@ -770,21 +821,18 @@ impl PetWorld {
                     PetGlyph::Substantive
                 });
                 let lasting = line != LineSize::SingleWidth
-                    || (!spans.is_empty()
-                        && spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi))
+                    || spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi)
                     || scan.image(frame_c).is_some();
                 let transient = selected
-                    || (!overlay_spans.is_empty()
-                        && overlay_spans
-                            .iter()
-                            .any(|&(lo, hi)| lo <= local_c && local_c < hi));
+                    || overlay_spans
+                        .iter()
+                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
                 let others = lasting || transient;
                 let hull_ink = (glyph && !speck)
                     || bg != default_bg
-                    || (!typed_spans.is_empty()
-                        && typed_spans
-                            .iter()
-                            .any(|&(lo, hi)| lo <= local_c && local_c < hi));
+                    || typed_spans
+                        .iter()
+                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
                 let painted = hull_ink || speck;
                 if hull_ink {
                     hull_lo = hull_lo.min(c as u16);
@@ -972,22 +1020,35 @@ impl PetWorld {
     /// under text (`None` if `first >= end` or any cell in `[first, end)` is unobserved).
     #[inline]
     #[must_use]
-    pub fn locomotion_ink_in_span(&self, row: usize, first: usize, end: usize) -> Option<bool> {
-        self.stamp?;
-        if end <= first {
+    pub const fn locomotion_ink_in_span(
+        &self,
+        row: usize,
+        first: usize,
+        end: usize,
+    ) -> Option<bool> {
+        if self.stamp.is_none() || end <= first {
             return None;
         }
-        let r = row.checked_sub(self.coverage.row)?;
-        let c0 = first.checked_sub(self.coverage.col)?;
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
+        let Some(c0) = first.checked_sub(self.coverage.col) else {
+            return None;
+        };
         let c1 = end - self.coverage.col;
         if r >= self.coverage.rows || c1 > self.coverage.cols {
             return None;
         }
         let row_base = r * MAX_WORLD_COLS;
+        let glyphs = self.glyphs.as_slice();
         let mut occupied = false;
-        for &glyph in &self.glyphs[row_base + c0..row_base + c1] {
-            let glyph = glyph?;
+        let mut c = c0;
+        while c < c1 {
+            let Some(glyph) = glyphs[row_base + c] else {
+                return None;
+            };
             occupied |= matches!(glyph, PetGlyph::Substantive | PetGlyph::Letter);
+            c += 1;
         }
         Some(occupied)
     }
@@ -997,47 +1058,52 @@ impl PetWorld {
     /// where it covers none of them.
     #[inline]
     #[must_use]
-    pub fn last_letter_in_span(
+    pub const fn last_letter_in_span(
         &self,
         row: usize,
         first: usize,
         end: usize,
     ) -> Option<Option<usize>> {
-        self.stamp?;
-        let r = row.checked_sub(self.coverage.row)?;
+        if self.stamp.is_none() {
+            return None;
+        }
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
         if r >= self.coverage.rows {
             return None;
         }
         let cov_start = self.coverage.col;
         let cov_end = cov_start.saturating_add(self.coverage.cols);
-        let s0 = first.max(cov_start);
-        let s1 = end.min(cov_end);
+        let s0 = if first > cov_start { first } else { cov_start };
+        let s1 = if end < cov_end { end } else { cov_end };
         if s1 <= s0 {
             return None;
         }
         let c0 = s0 - cov_start;
         let c1 = s1 - cov_start;
         let row_base = r * MAX_WORLD_COLS;
+        let glyphs = self.glyphs.as_slice();
         let mut seen = false;
-        for (offset, &glyph) in self.glyphs[row_base + c0..row_base + c1]
-            .iter()
-            .enumerate()
-            .rev()
-        {
-            match glyph {
+        let mut offset = c1 - c0;
+        while offset > 0 {
+            offset -= 1;
+            match glyphs[row_base + c0 + offset] {
                 Some(PetGlyph::Letter) => return Some(Some(s0 + offset)),
                 Some(_) => seen = true,
                 None => {}
             }
         }
-        seen.then_some(None)
+        if seen { Some(None) } else { None }
     }
 
     /// Packed occupancy bits for `[c0, c1)` on `row` (up to 32 columns), or `None` if unobserved.
     #[inline]
     #[must_use]
-    pub fn ink_row_bits(&self, row: usize, c0: usize, c1: usize) -> Option<u32> {
-        self.stamp?;
+    pub const fn ink_row_bits(&self, row: usize, c0: usize, c1: usize) -> Option<u32> {
+        if self.stamp.is_none() {
+            return None;
+        }
         if c1 <= c0 {
             return Some(0);
         }
@@ -1045,22 +1111,28 @@ impl PetWorld {
         if width > 32 {
             return None;
         }
-        let r = row.checked_sub(self.coverage.row)?;
-        let mc0 = c0.checked_sub(self.coverage.col)?;
+        let Some(r) = row.checked_sub(self.coverage.row) else {
+            return None;
+        };
+        let Some(mc0) = c0.checked_sub(self.coverage.col) else {
+            return None;
+        };
         let mc1 = mc0 + width;
         if r >= self.coverage.rows || mc1 > self.coverage.cols {
             return None;
         }
         let row_base = r * MAX_WORLD_COLS;
+        let glyphs = self.glyphs.as_slice();
         let mut row_bits = 0u32;
-        for (dc, &glyph) in self.glyphs[row_base + mc0..row_base + mc1]
-            .iter()
-            .enumerate()
-        {
-            let glyph = glyph?;
+        let mut dc = 0;
+        while dc < width {
+            let Some(glyph) = glyphs[row_base + mc0 + dc] else {
+                return None;
+            };
             if !matches!(glyph, PetGlyph::Blank) {
                 row_bits |= 1u32 << dc;
             }
+            dc += 1;
         }
         Some(row_bits)
     }
@@ -1086,48 +1158,63 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Whether all cells touched by `rect` plus `margin` are certified clear.
-    pub fn clear(&self, rect: PetRect, margin: f32) -> bool {
-        self.clearance(rect, margin) == Some(true)
+    pub const fn clear(&self, rect: PetRect, margin: f32) -> bool {
+        matches!(self.clearance(rect, margin), Some(true))
     }
 
     /// The full body may stand behind ordinary text and coloured backgrounds.
     #[inline]
     #[must_use]
     /// Whether `rect` plus `margin` is certified clear or under ordinary text.
-    pub fn under_text_clear(&self, rect: PetRect, margin: f32) -> bool {
-        self.under_text_clearance(rect, margin) == Some(true)
+    pub const fn under_text_clear(&self, rect: PetRect, margin: f32) -> bool {
+        matches!(self.under_text_clearance(rect, margin), Some(true))
     }
 
     /// Three-valued clearance: `Some(true)` free; `Some(false)` blocked or a degenerate query;
     /// `None` unknown.
     #[inline]
     #[must_use]
-    pub fn clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(&self.blocked_prefix, Forgive::Nothing, rect, margin)
+    pub const fn clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
+        self.clearance_in(
+            self.blocked_prefix.as_slice(),
+            Forgive::Nothing,
+            rect,
+            margin,
+        )
     }
 
     /// [`Self::clearance`] for a resident admitted behind ordinary text.
     #[inline]
     #[must_use]
     /// [`Self::clearance`] admitting ordinary text (`Clear` or `UnderText`).
-    pub fn under_text_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(&self.protected_prefix, Forgive::Nothing, rect, margin)
+    pub const fn under_text_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
+        self.clearance_in(
+            self.protected_prefix.as_slice(),
+            Forgive::Nothing,
+            rect,
+            margin,
+        )
     }
 
     /// As [`Self::clearance`].
     #[inline]
     #[must_use]
     /// [`Self::clearance`] ignoring live caret ring cells that would otherwise be clear.
-    pub fn clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(&self.blocked_prefix, Forgive::BlankCaret, rect, margin)
+    pub const fn clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
+        self.clearance_in(
+            self.blocked_prefix.as_slice(),
+            Forgive::BlankCaret,
+            rect,
+            margin,
+        )
     }
 
     /// [`Self::clearance_past_caret`] as a two-valued, fail-closed answer.
     #[inline]
     #[must_use]
     /// Two-valued fail-closed [`Self::clearance_past_caret`].
-    pub fn clear_past_caret(&self, rect: PetRect, margin: f32) -> bool {
-        self.clearance_past_caret(rect, margin) == Some(true)
+    pub const fn clear_past_caret(&self, rect: PetRect, margin: f32) -> bool {
+        matches!(self.clearance_past_caret(rect, margin), Some(true))
     }
 
     /// The visibility verdict the emitted sprite is judged by: a resident may stand under ordinary
@@ -1135,15 +1222,26 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Visibility clearance under ordinary text past the live caret ring.
-    pub fn under_text_clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(&self.protected_prefix, Forgive::AnyCaret, rect, margin)
+    pub const fn under_text_clearance_past_caret(
+        &self,
+        rect: PetRect,
+        margin: f32,
+    ) -> Option<bool> {
+        self.clearance_in(
+            self.protected_prefix.as_slice(),
+            Forgive::AnyCaret,
+            rect,
+            margin,
+        )
     }
 
     /// [`Self::under_text_clearance_past_caret`] over the part of `rect` this map sees.
     #[inline]
     #[must_use]
-    pub fn seen_under_text_clearance_past_caret(&self, rect: PetRect) -> Option<bool> {
-        self.stamp?;
+    pub const fn seen_under_text_clearance_past_caret(&self, rect: PetRect) -> Option<bool> {
+        if self.stamp.is_none() {
+            return None;
+        }
         let whole = self.under_text_clearance_past_caret(rect, 0.0);
         if whole.is_some() {
             return whole;
@@ -1166,12 +1264,12 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Three-valued check whether `rect` plus `margin` is free of text-layer ink.
-    pub fn ink_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
+    pub const fn ink_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_past_caret(rect, margin)
     }
 
     #[inline]
-    fn clearance_in(
+    const fn clearance_in(
         &self,
         prefix: &[u16],
         forgive: Forgive,
@@ -1191,22 +1289,57 @@ impl PetWorld {
             }
     }
 
-    /// The live caret's ring cells a plane forgives.
+    /// Count of live caret ring cells in `[r0..r1, c0..c1)` that `forgive` forgives.
     #[inline]
-    fn carets(&self, ground: bool) -> impl Iterator<Item = &CaretCell> {
-        let extra: &[CaretCell] = if ground && self.ground_split {
-            &self.ground_caret_cells[..usize::from(self.ground_caret_cells_len)]
-        } else {
-            &[]
-        };
-        self.caret_cells[..usize::from(self.caret_cells_len)]
-            .iter()
-            .chain(extra)
+    const fn forgiven_carets(
+        &self,
+        ground: bool,
+        forgive: Forgive,
+        r0: usize,
+        c0: usize,
+        r1: usize,
+        c1: usize,
+    ) -> usize {
+        if matches!(forgive, Forgive::Nothing) {
+            return 0;
+        }
+        let mut count = 0;
+        let len = self.caret_cells_len as usize;
+        let mut i = 0;
+        while i < len {
+            let cell = self.caret_cells[i];
+            if (matches!(forgive, Forgive::AnyCaret) || cell.blank)
+                && cell.row >= r0
+                && cell.row < r1
+                && cell.col >= c0
+                && cell.col < c1
+            {
+                count += 1;
+            }
+            i += 1;
+        }
+        if ground && self.ground_split {
+            let glen = self.ground_caret_cells_len as usize;
+            let mut j = 0;
+            while j < glen {
+                let cell = self.ground_caret_cells[j];
+                if (matches!(forgive, Forgive::AnyCaret) || cell.blank)
+                    && cell.row >= r0
+                    && cell.row < r1
+                    && cell.col >= c0
+                    && cell.col < c1
+                {
+                    count += 1;
+                }
+                j += 1;
+            }
+        }
+        count
     }
 
     /// [`Self::clearance_in`] on the live plane, or (`ground`) the ground plane.
     #[inline]
-    fn clearance_on(
+    const fn clearance_on(
         &self,
         prefix: &[u16],
         ground: bool,
@@ -1214,29 +1347,21 @@ impl PetWorld {
         rect: PetRect,
         margin: f32,
     ) -> Option<bool> {
-        self.stamp?;
+        if self.stamp.is_none() {
+            return None;
+        }
         match self.window(rect, margin) {
             Window::Degenerate => Some(false),
             Window::Outside => None,
             Window::Cells(r0, c0, r1, c1) => {
-                let blocked = usize::from(self.blocked(prefix, r0, c0, r1, c1));
+                let blocked = self.blocked(prefix, r0, c0, r1, c1) as usize;
                 if blocked == 0
                     || matches!(forgive, Forgive::Nothing)
                     || blocked > self.carets_len(ground)
                 {
                     return Some(blocked == 0);
                 }
-                let forgiven = self
-                    .carets(ground)
-                    .filter(|cell| match forgive {
-                        Forgive::Nothing => false,
-                        Forgive::BlankCaret => cell.blank,
-                        Forgive::AnyCaret => true,
-                    })
-                    .filter(|cell| {
-                        cell.row >= r0 && cell.row < r1 && cell.col >= c0 && cell.col < c1
-                    })
-                    .count();
+                let forgiven = self.forgiven_carets(ground, forgive, r0, c0, r1, c1);
                 Some(blocked == forgiven)
             }
         }
@@ -1244,7 +1369,7 @@ impl PetWorld {
 
     /// The half-open map-local cell window a rectangle and its margin touch.
     #[inline]
-    fn window(&self, rect: PetRect, margin: f32) -> Window {
+    const fn window(&self, rect: PetRect, margin: f32) -> Window {
         if !rect.valid() || !margin.is_finite() || margin < 0.0 {
             return Window::Degenerate;
         }
@@ -1281,7 +1406,7 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Swept-body under-text clearance along the corridor between `from` and `to`.
-    pub fn under_text_corridor_clear_past_caret(
+    pub const fn under_text_corridor_clear_past_caret(
         &self,
         from: PetRect,
         to: PetRect,
@@ -1289,7 +1414,10 @@ impl PetWorld {
     ) -> bool {
         from.valid()
             && to.valid()
-            && self.under_text_clearance_past_caret(from.union(to), margin) == Some(true)
+            && matches!(
+                self.under_text_clearance_past_caret(from.union(to), margin),
+                Some(true)
+            )
     }
 
     /// The ground plane's `(blocked, protected)` prefix tables (`ground_cells`).
@@ -1312,21 +1440,24 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// [`Self::clear`] on the ground plane (ignoring live selection and transient overlays).
-    pub fn ground_clear(&self, rect: PetRect, margin: f32) -> bool {
-        self.clearance_on(
-            self.ground_prefixes().0,
-            true,
-            Forgive::Nothing,
-            rect,
-            margin,
-        ) == Some(true)
+    pub const fn ground_clear(&self, rect: PetRect, margin: f32) -> bool {
+        matches!(
+            self.clearance_on(
+                self.ground_prefixes().0,
+                true,
+                Forgive::Nothing,
+                rect,
+                margin,
+            ),
+            Some(true)
+        )
     }
 
     /// [`Self::under_text_clearance_past_caret`] on the GROUND PLANE.
     #[inline]
     #[must_use]
     /// [`Self::under_text_clearance_past_caret`] on the ground plane.
-    pub fn ground_under_text_clearance_past_caret(
+    pub const fn ground_under_text_clearance_past_caret(
         &self,
         rect: PetRect,
         margin: f32,
@@ -1344,12 +1475,14 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Ground-plane under-text clearance for `rect`'s feet row while passing under labels.
-    pub fn passing_under_text_clearance_past_caret(
+    pub const fn passing_under_text_clearance_past_caret(
         &self,
         rect: PetRect,
         margin: f32,
     ) -> Option<bool> {
-        self.stamp?;
+        if self.stamp.is_none() {
+            return None;
+        }
         if !rect.valid() || !margin.is_finite() || margin < 0.0 {
             return Some(false);
         }
@@ -1362,7 +1495,7 @@ impl PetWorld {
             rect.cols,
         );
         let ground = self.under_text_clearance_past_caret(feet, margin);
-        if feet_top <= rect.row || ground == Some(false) {
+        if feet_top <= rect.row || matches!(ground, Some(false)) {
             return ground;
         }
         let over = PetRect::new(rect.row, rect.col, feet_top - rect.row, rect.cols);
@@ -1371,7 +1504,7 @@ impl PetWorld {
             Window::Outside => None,
             Window::Cells(r0, c0, r1, c1) => Some(
                 !self.ground_split
-                    || self.blocked(&self.protected_prefix, r0, c0, r1, c1)
+                    || self.blocked(self.protected_prefix.as_slice(), r0, c0, r1, c1)
                         == self.blocked(self.ground_prefixes().1, r0, c0, r1, c1),
             ),
         };
@@ -1387,7 +1520,7 @@ impl PetWorld {
     #[must_use]
     /// Slice of `rect` lying on its bottom edge's cell row
     /// ([`Self::passing_under_text_clearance_past_caret`]).
-    pub fn feet_row_of(rect: PetRect) -> PetRect {
+    pub const fn feet_row_of(rect: PetRect) -> PetRect {
         let bottom = rect.row + rect.rows;
         let top = ((bottom - 1e-3).ceil() - 1.0).max(rect.row);
         PetRect::new(top, rect.col, (bottom - top).max(f32::EPSILON), rect.cols)
@@ -1398,10 +1531,13 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Whether the ground corridor from `from` to `to` is certified free of permanent protection.
-    pub fn ground_corridor_clear(&self, from: PetRect, to: PetRect) -> bool {
+    pub const fn ground_corridor_clear(&self, from: PetRect, to: PetRect) -> bool {
         from.valid()
             && to.valid()
-            && self.ground_under_text_clearance_past_caret(from.union(to), 0.0) == Some(true)
+            && matches!(
+                self.ground_under_text_clearance_past_caret(from.union(to), 0.0),
+                Some(true)
+            )
     }
 
     /// Whether something that protects the ground for good is OBSERVED between `from` and `to`: a
@@ -1409,25 +1545,36 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Whether any permanently protected cell is observed along the corridor from `from` to `to`.
-    pub fn ground_corridor_walled(&self, from: PetRect, to: PetRect) -> bool {
+    pub const fn ground_corridor_walled(&self, from: PetRect, to: PetRect) -> bool {
         from.valid()
             && to.valid()
-            && self.ground_under_text_clearance_past_caret(from.union(to), 0.0) == Some(false)
+            && matches!(
+                self.ground_under_text_clearance_past_caret(from.union(to), 0.0),
+                Some(false)
+            )
     }
 
     /// Whether `rect` and its margin stay off every observed row's ink hull (`hull`).
     #[inline]
     #[must_use]
     /// Whether `rect` plus `margin` stays outside every observed row's ink hull.
-    pub fn hull_clear(&self, rect: PetRect, margin: f32) -> bool {
+    pub const fn hull_clear(&self, rect: PetRect, margin: f32) -> bool {
         if self.stamp.is_none() {
             return false;
         }
         match self.window(rect, margin) {
-            Window::Cells(r0, c0, r1, c1) => (r0..r1).all(|r| {
-                let (lo, hi) = self.hull[r];
-                lo >= hi || c1 <= usize::from(lo) || c0 >= usize::from(hi)
-            }),
+            Window::Cells(r0, c0, r1, c1) => {
+                let hull = self.hull.as_slice();
+                let mut r = r0;
+                while r < r1 {
+                    let (lo, hi) = hull[r];
+                    if !(lo >= hi || c1 <= lo as usize || c0 >= hi as usize) {
+                        return false;
+                    }
+                    r += 1;
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -1435,15 +1582,12 @@ impl PetWorld {
     /// Cells the ground plane protects in a map-local window, less the live caret's ring
     /// ([`Self::ground_under_text_clearance_past_caret`]).
     #[inline]
-    fn ground_protected_count(&self, r0: usize, c0: usize, r1: usize, c1: usize) -> u16 {
+    const fn ground_protected_count(&self, r0: usize, c0: usize, r1: usize, c1: usize) -> u16 {
         let raw = self.blocked(self.ground_prefixes().1, r0, c0, r1, c1);
         if raw == 0 || self.carets_len(true) == 0 {
             return raw;
         }
-        let forgiven = self
-            .carets(true)
-            .filter(|cell| cell.row >= r0 && cell.row < r1 && cell.col >= c0 && cell.col < c1)
-            .count() as u16;
+        let forgiven = self.forgiven_carets(true, Forgive::AnyCaret, r0, c0, r1, c1) as u16;
         raw.saturating_sub(forgiven)
     }
 
@@ -1451,13 +1595,14 @@ impl PetWorld {
     /// `from = (r0, c0, r1, c1)` can reach on rows `r0..r1` widened to
     /// `rows`, crossing nothing the ground plane protects: the widest span
     /// round its own columns that is clear on every row in between.
-    fn reach_span(
+    const fn reach_span(
         &self,
         from: (usize, usize, usize, usize),
         rows: (usize, usize),
     ) -> Option<(usize, usize)> {
         let (fr0, fc0, fr1, fc1) = from;
-        let (r0, r1) = (rows.0.min(fr0), rows.1.max(fr1));
+        let r0 = if rows.0 < fr0 { rows.0 } else { fr0 };
+        let r1 = if rows.1 > fr1 { rows.1 } else { fr1 };
         if self.ground_protected_count(r0, fc0, r1, fc1) > 0 {
             return None;
         }
@@ -1488,17 +1633,30 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Resolves `anchor` if its owner and row identity fences still hold and it remains clear.
-    pub fn resolve(&self, anchor: PetAnchor) -> Option<PetAnchor> {
-        let stamp = self.stamp?;
-        if stamp.surface != anchor.surface || stamp.surface.alt_screen {
+    pub const fn resolve(&self, anchor: PetAnchor) -> Option<PetAnchor> {
+        let Some(stamp) = self.stamp else {
+            return None;
+        };
+        if !stamp.surface.eq_surface(anchor.surface) || stamp.surface.alt_screen {
             return None;
         }
-        let current = self
-            .anchors
-            .iter()
-            .flatten()
-            .find(|a| a.block_id == anchor.block_id)?;
-        let row = anchor.absolute_row.checked_sub(stamp.top_absolute_row)?;
+        let mut current = None;
+        let mut i = 0;
+        while i < self.anchors.len() {
+            if let Some(a) = self.anchors[i]
+                && a.block_id == anchor.block_id
+            {
+                current = Some(a);
+                break;
+            }
+            i += 1;
+        }
+        let Some(current) = current else {
+            return None;
+        };
+        let Some(row) = anchor.absolute_row.checked_sub(stamp.top_absolute_row) else {
+            return None;
+        };
         if row >= stamp.surface.rows as u64 {
             return None;
         }
@@ -1514,7 +1672,12 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Nearest certified clear perch to `near` within `max_distance`.
-    pub fn nearest_perch(&self, near: PetRect, margin: f32, max_distance: f32) -> Option<PetRect> {
+    pub const fn nearest_perch(
+        &self,
+        near: PetRect,
+        margin: f32,
+        max_distance: f32,
+    ) -> Option<PetRect> {
         self.perch_near((near.foot_row(), near.col), near, margin, max_distance)
     }
 
@@ -1522,20 +1685,26 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Nearest clear perch to `near`, falling back to under-text perch within `max_distance`.
-    pub fn home_perch(&self, near: PetRect, margin: f32, max_distance: f32) -> Option<PetRect> {
+    pub const fn home_perch(
+        &self,
+        near: PetRect,
+        margin: f32,
+        max_distance: f32,
+    ) -> Option<PetRect> {
         if !max_distance.is_finite() || max_distance < 0.0 {
             return None;
         }
         if self.clear(near, margin) {
             return Some(near);
         }
-        self.nearest_perch(near, margin, max_distance).or_else(|| {
-            if self.under_text_clear(near, margin) {
-                Some(near)
-            } else {
-                self.nearest_under_text_perch(near, margin, max_distance)
-            }
-        })
+        if let Some(perch) = self.nearest_perch(near, margin, max_distance) {
+            return Some(perch);
+        }
+        if self.under_text_clear(near, margin) {
+            Some(near)
+        } else {
+            self.nearest_under_text_perch(near, margin, max_distance)
+        }
     }
 
     /// The nearest REST SEAT.
@@ -1707,7 +1876,7 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Closest protected-free placement to `near` within `max_distance`.
-    pub fn nearest_under_text_perch(
+    pub const fn nearest_under_text_perch(
         &self,
         near: PetRect,
         margin: f32,
@@ -1747,7 +1916,7 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Whether `from` can reach `to` on the same ground ([`Self::same_ground`]) without a wall.
-    pub fn reaches(&self, from: PetRect, to: PetRect) -> bool {
+    pub const fn reaches(&self, from: PetRect, to: PetRect) -> bool {
         !Self::same_ground(from, to) || self.ground_corridor_clear(from, to)
     }
 
@@ -1755,7 +1924,7 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Closest protected-free placement to `near` reachable from `from` ([`Self::reaches`]).
-    pub fn nearest_under_text_perch_from(
+    pub const fn nearest_under_text_perch_from(
         &self,
         near: PetRect,
         margin: f32,
@@ -1776,7 +1945,7 @@ impl PetWorld {
     #[inline]
     #[must_use]
     /// Certified clear or under-text perch near attention cell `target`.
-    pub fn perch_near(
+    pub const fn perch_near(
         &self,
         target: (f32, f32),
         body: PetRect,
@@ -1786,7 +1955,7 @@ impl PetWorld {
         self.perch_near_with(target, body, margin, max_distance, false, None)
     }
 
-    fn perch_near_with(
+    const fn perch_near_with(
         &self,
         target: (f32, f32),
         body: PetRect,
@@ -1795,7 +1964,18 @@ impl PetWorld {
         under_text: bool,
         from: Option<PetRect>,
     ) -> Option<PetRect> {
-        self.stamp?;
+        const fn col_reach(max_distance: f32, row_dist: f32, best_d: f32, best_t: f32) -> f32 {
+            let cap = max_distance.min(best_d);
+            if row_dist == best_d {
+                cap.min(best_t - row_dist)
+            } else {
+                cap
+            }
+        }
+
+        let Some(_) = self.stamp else {
+            return None;
+        };
         if !body.valid()
             || !target.0.is_finite()
             || !target.1.is_finite()
@@ -1823,9 +2003,9 @@ impl PetWorld {
         let cov_left = self.coverage.col as f32;
         let cov_right = (self.coverage.col + self.coverage.cols) as f32;
         let prefix = if under_text {
-            &self.protected_prefix
+            self.protected_prefix.as_slice()
         } else {
-            &self.blocked_prefix
+            self.blocked_prefix.as_slice()
         };
         let mut best = None;
         let mut best_distance = f32::INFINITY;
@@ -1835,34 +2015,68 @@ impl PetWorld {
             .max(0.0) as usize;
         let end_col =
             ((target.1 + max_distance - cov_left - margin).floor() + 1.0).max(0.0) as usize;
-        let end_col = end_col.min(self.coverage.cols);
-        for (i, row) in rows.into_iter().enumerate() {
+        let end_col = if end_col < self.coverage.cols {
+            end_col
+        } else {
+            self.coverage.cols
+        };
+        let mut i = 0;
+        while i < rows.len() {
+            let row = rows[i];
+            let mut duplicate = false;
+            let mut j = 0;
+            while j < i {
+                if rows[j] == row {
+                    duplicate = true;
+                    break;
+                }
+                j += 1;
+            }
+            i += 1;
             let r0_f = row - margin;
             let r1_f = row + body.rows + margin;
-            if rows[..i].contains(&row) || !(r0_f >= cov_top && r1_f <= cov_bottom) {
+            if duplicate || !(r0_f >= cov_top && r1_f <= cov_bottom) {
                 continue;
             }
             let row_dist = (row - want_row).abs() * 2.0;
-            if row_dist > max_distance || row_dist > best_distance {
+            if row_dist > max_distance
+                || row_dist > best_distance
+                || (row_dist == best_distance && row_dist >= best_tie)
+            {
                 continue;
             }
             let r0 = r0_f.floor() as usize - self.coverage.row;
             let r1 = r1_f.ceil() as usize - self.coverage.row;
-            let r0_row = &prefix[r0 * (MAX_WORLD_COLS + 1)..];
-            let r1_row = &prefix[r1 * (MAX_WORLD_COLS + 1)..];
+            let r0_base = r0 * (MAX_WORLD_COLS + 1);
+            let r1_base = r1 * (MAX_WORLD_COLS + 1);
             let same_ground_from = if under_text {
-                from.filter(|&f| Self::same_ground(f, PetRect::new(row, 0.0, body.rows, body.cols)))
+                match from {
+                    Some(f)
+                        if Self::same_ground(f, PetRect::new(row, 0.0, body.rows, body.cols)) =>
+                    {
+                        Some(f)
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
-            let mut max_min_best = max_distance.min(best_distance);
-            let row_first_col = ((target.1 - max_min_best - cov_left - margin)
+            let mut max_min_best = col_reach(max_distance, row_dist, best_distance, best_tie);
+            let rfc = (target.1 - max_min_best - cov_left - margin)
                 .floor()
-                .max(0.0) as usize)
-                .max(first_col);
-            let mut stop_after = |col: f32| {
+                .max(0.0) as usize;
+            let row_first_col = if rfc > first_col { rfc } else { first_col };
+            let total_steps = 1 + end_col.saturating_sub(row_first_col);
+            let mut col_step = 0;
+            while col_step < total_steps {
+                let col = if col_step == 0 {
+                    target.1
+                } else {
+                    (self.coverage.col + row_first_col + col_step - 1) as f32 + margin
+                };
+                col_step += 1;
                 if col > target.1 && col - target.1 > max_min_best {
-                    return true;
+                    break;
                 }
                 let col_dist = (col - target.1).abs();
                 let distance = row_dist.max(col_dist);
@@ -1875,28 +2089,28 @@ impl PetWorld {
                     if c0_f >= cov_left && c1_f <= cov_right {
                         let c0 = c0_f.floor() as usize - self.coverage.col;
                         let c1 = c1_f.ceil() as usize - self.coverage.col;
-                        if r1_row[c1] + r0_row[c0] - r1_row[c0] - r0_row[c1] == 0 {
+                        if prefix[r1_base + c1] + prefix[r0_base + c0]
+                            - prefix[r1_base + c0]
+                            - prefix[r0_base + c1]
+                            == 0
+                        {
                             let rect = PetRect::new(row, col, body.rows, body.cols);
-                            if same_ground_from
-                                .is_none_or(|from| self.ground_corridor_clear(from, rect))
-                            {
+                            let corridor_ok = match same_ground_from {
+                                Some(from) => self.ground_corridor_clear(from, rect),
+                                None => true,
+                            };
+                            if corridor_ok {
                                 best = Some(rect);
                                 best_distance = distance;
                                 best_tie = tie;
-                                max_min_best = max_distance.min(best_distance);
-                                return col_dist == 0.0;
+                                max_min_best =
+                                    col_reach(max_distance, row_dist, best_distance, best_tie);
+                                if col_dist == 0.0 {
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-                false
-            };
-            if stop_after(target.1) {
-                continue;
-            }
-            for c in row_first_col..end_col {
-                if stop_after((self.coverage.col + c) as f32 + margin) {
-                    break;
                 }
             }
         }
@@ -1993,6 +2207,11 @@ impl<'a> RowScan<'a> {
     #[inline]
     const fn has_compounds(&self) -> bool {
         !self.clusters.is_empty() || !self.combining.is_empty()
+    }
+
+    #[inline]
+    const fn is_uniform_single_width(&self) -> bool {
+        matches!(self.line, LineRow::Uniform(LineSize::SingleWidth))
     }
     #[inline]
     fn new(input: &'a RenderInput, row: usize) -> Self {

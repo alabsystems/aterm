@@ -271,8 +271,9 @@ pub struct Unheard {
     pub why: Error,
     /// A timeout (a lookup with no answer in time, or a connect or request past its deadline)
     /// or no route to the host: how macOS holds the lookups and LAN connects of an app whose
-    /// Local Network question nobody has answered yet, so a try after the answer can succeed
-    /// (a slow network, a host that sleeps and a server that stalls look the same).
+    /// Local Network question nobody has answered yet, so a try after the answer can succeed,
+    /// and how it refuses them after a Don't Allow (a slow network, a host that sleeps and a
+    /// server that stalls look the same).
     pub held: bool,
 }
 
@@ -336,8 +337,10 @@ fn get_via(
 }
 
 /// Whether `error` is [`Unheard::held`]: aterm-http's resolver gives up on a lookup with no
-/// answer as `TimedOut` (a definite "no such name" is another kind), and a connect macOS
-/// refuses an app it has not let onto the LAN fails `HostUnreachable`.
+/// answer as `TimedOut` (a definite "no such name" is another kind), a connect macOS refuses an
+/// app it has not let onto the LAN fails `HostUnreachable`, and so does a lookup of a `.local`
+/// name mDNSResponder refuses that app, which aterm-http names so (`getaddrinfo` reports the
+/// refusal as "no such name").
 fn held(error: &aterm_http::Error) -> bool {
     matches!(
         error,

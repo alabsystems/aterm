@@ -17,7 +17,7 @@ use aterm_window::keyboard::{
 use super::{LEAVE, Lens, Opened};
 use crate::input::{InputEvent, PasteFraming, Source};
 use crate::menu::{MenuAction, native_menu_checked};
-use crate::stats_deck::StatsBars;
+use crate::stats_deck::{DeckStyle, StatsBars};
 use crate::stats_paint::{Bar, Hit, Instrument};
 use crate::stats_plan::DeckForm;
 use crate::{App, WindowId, term_lock};
@@ -122,7 +122,8 @@ impl Rig {
             let px = (w * ws.scale).round() as usize;
             ws.cols = u16::try_from((px - 2 * pad) / cw).expect("a window's columns");
         }
-        ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, form, ws.scale, cell);
+        ws.metrics.head =
+            crate::stats_deck::deck_px(StatsBars::Deck, DeckStyle::V2, form, ws.scale, cell);
     }
 
     fn rest_on_hit(&mut self, pick: impl Fn(&Hit) -> bool) -> Hit {
@@ -638,7 +639,8 @@ fn a_rest_on_the_decks_header_opens_how_to_read() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    let deck = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    let deck =
+        crate::stats_deck::deck_px(StatsBars::Deck, DeckStyle::V2, ws.deck_form, ws.scale, cell);
     ws.metrics.head = deck;
     let (on, _) = r.hit(|h| h.kind == crate::stats_paint::HitKind::Header);
     r.move_to(on);
@@ -660,7 +662,8 @@ fn why_now_reads_the_front_tab_by_every_pane() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    ws.metrics.head =
+        crate::stats_deck::deck_px(StatsBars::Deck, DeckStyle::V2, ws.deck_form, ws.scale, cell);
     let other = r.app.split_active_stub_tab(r.wid);
     assert!(
         other > r.session,
@@ -710,7 +713,8 @@ fn a_split_front_tab_reads_every_pane() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    ws.metrics.head =
+        crate::stats_deck::deck_px(StatsBars::Deck, DeckStyle::V2, ws.deck_form, ws.scale, cell);
     let other = r.app.split_active_stub_tab(r.wid);
     assert_eq!(
         r.app.deck_tab_panes(r.wid),
@@ -761,7 +765,8 @@ fn the_tree_reads_the_deck_and_its_lens() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
-    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    ws.metrics.head =
+        crate::stats_deck::deck_px(StatsBars::Deck, DeckStyle::V2, ws.deck_form, ws.scale, cell);
 
     let stats = r.app.stats_a11y(r.wid).expect("the deck is read");
     let group = &stats.group;

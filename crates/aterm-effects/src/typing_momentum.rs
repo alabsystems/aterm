@@ -27,12 +27,19 @@ pub const TYPING_MOMENTUM_KILL_DRAIN: f32 = 2.0 * TYPING_MOMENTUM_DELETE_DRAIN;
 const SNAP_ZERO: f32 = 0.000_5;
 
 /// Leaky typing-momentum integrator in `[0, 1]`.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct TypingMomentum {
     /// Stored value at `at`.
     value: f32,
     /// Timestamp of the last build or drain (`None` when at rest).
     at: Option<Instant>,
+}
+
+impl Default for TypingMomentum {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TypingMomentum {

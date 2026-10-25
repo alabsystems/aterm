@@ -35,6 +35,7 @@ mod link_state;
 mod log_mail;
 mod log_mirror;
 mod ls_paging;
+mod mail_gap;
 mod notify;
 mod one_state_dir;
 mod ordered;

@@ -582,7 +582,7 @@ const NOTE_RUN: f32 = 0.30;
 const NOTE_CLIMB: f32 = 0.85;
 
 #[inline]
-fn look_slice(u: f32, steps: f32) -> f32 {
+const fn look_slice(u: f32, steps: f32) -> f32 {
     (u * steps).floor().min(steps - 1.0)
 }
 
@@ -640,39 +640,55 @@ pub(crate) enum CheerAir {
 }
 
 #[inline]
-fn note_lane_step(cell_w: u16, cell_h: u16) -> f32 {
-    let tile = (f32::from(mote_tile_side(cell_h)) * NOTE_SCALE_MAX).round();
-    (tile + 3.0) / f32::from(cell_w.max(1)) + 2.0 * NOTE_SWAY
+const fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+#[inline]
+const fn note_lane_step(cell_w: u16, cell_h: u16) -> f32 {
+    let tile = (mote_tile_side(cell_h) as f32 * NOTE_SCALE_MAX).round();
+    let cw = if cell_w > 1 { cell_w } else { 1 };
+    (tile + 3.0) / cw as f32 + 2.0 * NOTE_SWAY
 }
 
 /// Natural (square) mote tile side, device px, for a cell `cell_h` px tall.
 #[must_use]
 #[inline]
-pub fn mote_tile_side(cell_h: u16) -> u16 {
-    ((f32::from(cell_h.max(4)) * 0.55).round() as u16).max(6)
+pub const fn mote_tile_side(cell_h: u16) -> u16 {
+    let ch = if cell_h > 4 { cell_h } else { 4 };
+    let side = (ch as f32 * 0.55).round() as u16;
+    if side > 6 { side } else { 6 }
 }
 
 /// Where a mote centred at `(col, row)` cells, drawn at `scale` of its tile, lands.
 #[must_use]
 #[inline]
-pub fn mote_box_px(
+pub const fn mote_box_px(
     (col, row): (f32, f32),
     scale: f32,
     (cell_w, cell_h): (u16, u16),
     (cols, rows): (u16, u16),
 ) -> Option<(i32, i32, u16)> {
     let side = mote_tile_side(cell_h);
-    let dest = ((f32::from(side) * scale).round() as i32).clamp(1, i32::from(u16::MAX));
-    let grid_w = i32::from(cols).saturating_mul(i32::from(cell_w));
-    let grid_h = i32::from(rows).saturating_mul(i32::from(cell_h));
+    let dest = clamp_i32((side as f32 * scale).round() as i32, 1, u16::MAX as i32);
+    let grid_w = (cols as i32).saturating_mul(cell_w as i32);
+    let grid_h = (rows as i32).saturating_mul(cell_h as i32);
     if dest > grid_w || dest > grid_h {
         return None;
     }
-    let cx = (col * f32::from(cell_w)).round() as i32;
-    let cy = (row * f32::from(cell_h)).round() as i32;
+    let cx = (col * cell_w as f32).round() as i32;
+    let cy = (row * cell_h as f32).round() as i32;
+    let max_x = if grid_w > dest { grid_w - dest } else { 0 };
+    let max_y = if grid_h > dest { grid_h - dest } else { 0 };
     Some((
-        (cx - dest / 2).clamp(0, (grid_w - dest).max(0)),
-        (cy - dest / 2).clamp(0, (grid_h - dest).max(0)),
+        clamp_i32(cx - dest / 2, 0, max_x),
+        clamp_i32(cy - dest / 2, 0, max_y),
         dest as u16,
     ))
 }
@@ -711,7 +727,7 @@ impl PetDepartureSprite {
     /// The departing body's drawn rect in grid pixels.
     #[must_use]
     #[inline]
-    pub fn body_px(
+    pub const fn body_px(
         &self,
         cell_w: u16,
         cell_h: u16,
@@ -1092,7 +1108,7 @@ impl PetFrame {
     /// The pet's live drawn body this frame in grid pixels.
     #[must_use]
     #[inline]
-    pub fn body_px(
+    pub const fn body_px(
         &self,
         cell_w: u16,
         cell_h: u16,
@@ -1112,25 +1128,35 @@ impl PetFrame {
 }
 
 #[inline]
-fn drawn_body_px(
+const fn drawn_body_px(
     (col, row): (f32, f32),
     stance: Stance,
     (cell_w, cell_h): (u16, u16),
     (cols, rows): (u16, u16),
 ) -> (i32, i32, i32, i32) {
-    let nat_h = (ART_ROWS * f32::from(cell_h)).round();
+    let nat_h = (ART_ROWS * cell_h as f32).round();
     let nat_w = (nat_h * ART_ASPECT).round();
-    let nat_h = (nat_h as i32).clamp(1, i32::from(u16::MAX));
-    let nat_w = (nat_w as i32).clamp(1, i32::from(u16::MAX));
-    let dest_w = ((nat_w as f32 * stance.scale_x).round() as i32).clamp(1, i32::from(u16::MAX));
-    let dest_h = ((nat_h as f32 * stance.scale_y).round() as i32).clamp(1, i32::from(u16::MAX));
-    let grid_w = i32::from(cols).saturating_mul(i32::from(cell_w));
-    let grid_h = i32::from(rows).saturating_mul(i32::from(cell_h));
-    let cx = (col * f32::from(cell_w)).round() as i32 + nat_w / 2;
-    let baseline = ((row + 1.0) * f32::from(cell_h)).round() as i32
-        - (stance.lift * f32::from(cell_h)).round() as i32;
-    let x0 = (cx - dest_w / 2).clamp(0, (grid_w - dest_w).max(0));
-    let y0 = (baseline - dest_h).clamp(0, (grid_h - dest_h).max(0));
+    let nat_h = clamp_i32(nat_h as i32, 1, u16::MAX as i32);
+    let nat_w = clamp_i32(nat_w as i32, 1, u16::MAX as i32);
+    let dest_w = clamp_i32(
+        (nat_w as f32 * stance.scale_x).round() as i32,
+        1,
+        u16::MAX as i32,
+    );
+    let dest_h = clamp_i32(
+        (nat_h as f32 * stance.scale_y).round() as i32,
+        1,
+        u16::MAX as i32,
+    );
+    let grid_w = (cols as i32).saturating_mul(cell_w as i32);
+    let grid_h = (rows as i32).saturating_mul(cell_h as i32);
+    let cx = (col * cell_w as f32).round() as i32 + nat_w / 2;
+    let baseline =
+        ((row + 1.0) * cell_h as f32).round() as i32 - (stance.lift * cell_h as f32).round() as i32;
+    let max_x = if grid_w > dest_w { grid_w - dest_w } else { 0 };
+    let max_y = if grid_h > dest_h { grid_h - dest_h } else { 0 };
+    let x0 = clamp_i32(cx - dest_w / 2, 0, max_x);
+    let y0 = clamp_i32(baseline - dest_h, 0, max_y);
     (x0, x0 + dest_w, y0, y0 + dest_h)
 }
 
@@ -1149,7 +1175,7 @@ enum RoomCue {
 }
 
 /// The inbox as the pet sees it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoomInbox {
     /// The newest row above the handled watermark (`inbox seen`), by per-session id.
     pub unseen: u64,
@@ -1157,6 +1183,22 @@ pub struct RoomInbox {
     pub overdue: bool,
     /// A standing `hold on`.
     pub hold: bool,
+}
+
+impl RoomInbox {
+    /// An empty inbox with no unseen messages, overdue rows, or standing hold.
+    pub const EMPTY: Self = Self {
+        unseen: 0,
+        overdue: false,
+        hold: false,
+    };
+}
+
+impl Default for RoomInbox {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1566,9 +1608,19 @@ pub struct PetBrain {
 }
 
 impl Default for PetBrain {
+    #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PetBrain {
+    /// Construct a fresh resident pet brain in its resting initial state.
+    #[must_use]
+    #[inline]
+    pub const fn new() -> Self {
         Self {
-            console: ConsoleLife::default(),
+            console: ConsoleLife::new(),
             species: PetSpecies::Cat,
             col: 0.0,
             row: 0.0,
@@ -1644,7 +1696,7 @@ impl Default for PetBrain {
             pet_hold_t: 0.0,
             song_left: 0,
             song_next: 0.0,
-            stroke: StrokeDetector::default(),
+            stroke: StrokeDetector::new(),
             watch_heat: 0.0,
             watch_t: 0.0,
             watch_spent: false,
@@ -1997,7 +2049,7 @@ impl PetBrain {
     fn flight_eta(&self, to_col: f32, to_row: f32, cols: u16) -> f32 {
         let vertical = (to_row - self.row).abs() >= 0.5;
         let span = span_eq(to_col - self.col, to_row - self.row);
-        let coil = if self.action == PetAction::Crouch {
+        let coil = if matches!(self.action, PetAction::Crouch) {
             (CROUCH_DUR - self.action_t).max(0.0)
         } else {
             CROUCH_DUR
@@ -2033,11 +2085,12 @@ impl PetBrain {
     }
 
     #[inline]
-    fn at_the_margin(&self, (cr, cc): (u16, u16), cols: u16, width: f32, slack: f32) -> bool {
-        f32::from(cc) + STATION_LEAD + self.standoff() + width + slack > f32::from(cols)
-            && self
-                .ink_span(f32::from(cr))
-                .is_none_or(|(_, end)| end <= f32::from(cc) + 1.5)
+    const fn at_the_margin(&self, (cr, cc): (u16, u16), cols: u16, width: f32, slack: f32) -> bool {
+        cc as f32 + STATION_LEAD + self.standoff() + width + slack > cols as f32
+            && match self.ink_span(cr as f32) {
+                Some((_, end)) => end <= cc as f32 + 1.5,
+                None => true,
+            }
     }
 
     #[inline]
@@ -2176,14 +2229,14 @@ impl PetBrain {
 
     #[inline]
     fn station_now(&self, caret_col: u16, cols: u16, width: f32) -> f32 {
-        let limit = f32::from(cols) - width;
+        let limit = cols as f32 - width;
         if limit <= 0.0 {
             return 0.0;
         }
         if self.wall_side {
-            return (f32::from(caret_col) - width - STATION_LEAD - self.standoff()).max(0.0);
+            return (caret_col as f32 - width - STATION_LEAD - self.standoff()).max(0.0);
         }
-        (f32::from(caret_col) + STATION_LEAD + self.lead() + self.standoff()).clamp(0.0, limit)
+        (caret_col as f32 + STATION_LEAD + self.lead() + self.standoff()).clamp(0.0, limit)
     }
 
     #[inline]
@@ -2662,14 +2715,28 @@ impl PetBrain {
     }
 
     #[inline]
-    fn ink_span_idx(&self, r: i64) -> Option<(f32, f32)> {
-        let idx = usize::try_from(r.checked_sub(i64::from(self.ink_base))?).ok()?;
-        let &(first, end) = self.ink_spans.get(idx)?;
-        (end > first).then(|| (f32::from(first), f32::from(end)))
+    const fn ink_span_idx(&self, r: i64) -> Option<(f32, f32)> {
+        let Some(diff) = r.checked_sub(self.ink_base as i64) else {
+            return None;
+        };
+        if diff < 0 {
+            return None;
+        }
+        let idx = diff as usize;
+        let spans = self.ink_spans.as_slice();
+        if idx >= spans.len() {
+            return None;
+        }
+        let (first, end) = spans[idx];
+        if end > first {
+            Some((first as f32, end as f32))
+        } else {
+            None
+        }
     }
 
     #[inline]
-    fn ink_span(&self, row: f32) -> Option<(f32, f32)> {
+    const fn ink_span(&self, row: f32) -> Option<(f32, f32)> {
         if !row.is_finite() || row < -0.5 {
             return None;
         }
@@ -2677,29 +2744,36 @@ impl PetBrain {
     }
 
     #[inline]
-    fn caret_at_home(&self, row: u16, col: u16) -> bool {
-        if f32::from(col) <= WRAP_SLOP {
+    const fn caret_at_home(&self, row: u16, col: u16) -> bool {
+        if col as f32 <= WRAP_SLOP {
             return true;
         }
-        self.ink_span(f32::from(row))
-            .is_some_and(|(first, end)| first <= WRAP_SLOP && end <= f32::from(col) + 0.5)
+        match self.ink_span(row as f32) {
+            Some((first, end)) => first <= WRAP_SLOP && end <= col as f32 + 0.5,
+            None => false,
+        }
     }
 
     #[inline]
-    fn ink_overlaps(&self, col: f32, row: f32, width: f32) -> bool {
+    const fn ink_overlaps(&self, col: f32, row: f32, width: f32) -> bool {
         let Some((first, end)) = self.ink_span(row) else {
             return false;
         };
         let (a, b) = (col + INK_PAD, col + width - INK_PAD);
-        b > first && a < end && self.observed_ink_overlaps(col, row, width).unwrap_or(true)
+        b > first
+            && a < end
+            && match self.observed_ink_overlaps(col, row, width) {
+                Some(overlaps) => overlaps,
+                None => true,
+            }
     }
 
     #[inline]
-    fn ink_safe_col(&self, want: f32, row: f32, width: f32, cols: u16) -> f32 {
+    const fn ink_safe_col(&self, want: f32, row: f32, width: f32, cols: u16) -> f32 {
         self.ink_safe_col_for(want, row, width, cols, None)
     }
 
-    pub(super) fn ink_safe_col_for(
+    pub(super) const fn ink_safe_col_for(
         &self,
         want: f32,
         row: f32,
@@ -2707,23 +2781,32 @@ impl PetBrain {
         cols: u16,
         caret: Option<(u16, u16)>,
     ) -> f32 {
+        const fn clears_caret(caret_col: Option<f32>, col: f32, width: f32) -> bool {
+            match caret_col {
+                Some(cc) => col >= cc + STATION_LEAD || col + width <= cc - STATION_LEAD,
+                None => true,
+            }
+        }
+
         if !self.ink_overlaps(want, row, width) {
             return want;
         }
         let Some((first, end)) = self.ink_span(row) else {
             return want;
         };
-        let limit = (f32::from(cols) - width).max(0.0);
-        let caret_col = caret
-            .or(self.last_caret)
-            .and_then(|(cr, cc)| ((f32::from(cr) - row).abs() < 0.5).then_some(f32::from(cc)));
-        let clears_caret = |col: f32| {
-            caret_col.is_none_or(|cc| col >= cc + STATION_LEAD || col + width <= cc - STATION_LEAD)
+        let limit = (cols as f32 - width).max(0.0);
+        let active_caret = match caret {
+            Some(c) => Some(c),
+            None => self.last_caret,
+        };
+        let caret_col = match active_caret {
+            Some((cr, cc)) if (cr as f32 - row).abs() < 0.5 => Some(cc as f32),
+            _ => None,
         };
         let right = end + INK_GAP;
         let left = first - width - INK_GAP;
-        let right_ok = right <= limit && clears_caret(right);
-        let left_ok = left >= 0.0 && clears_caret(left);
+        let right_ok = right <= limit && clears_caret(caret_col, right, width);
+        let left_ok = left >= 0.0 && clears_caret(caret_col, left, width);
         let beside = match (right_ok, left_ok) {
             (true, true) if (left - want).abs() < (right - want).abs() => left,
             (true, _) => right,
@@ -2731,24 +2814,36 @@ impl PetBrain {
             (false, false) => want,
         };
         if (beside - want).abs() > INK_EVICT_MAX
-            || !clears_caret(beside)
+            || !clears_caret(caret_col, beside, width)
             || self.ink_overlaps(beside, row, width)
         {
             let right_base = (want + INK_PAD).floor();
             let left_base = (want + width - INK_PAD).ceil() - width;
             let mut fallback = None;
-            for step in 1..=INK_EVICT_MAX as u16 {
-                let step = f32::from(step);
-                for candidate in [right_base + step, left_base - step] {
+            let max_step = INK_EVICT_MAX as u16;
+            let mut step_u16 = 1u16;
+            while step_u16 <= max_step {
+                let step = step_u16 as f32;
+                step_u16 += 1;
+                let candidates = [right_base + step, left_base - step];
+                let mut ci = 0;
+                while ci < 2 {
+                    let candidate = candidates[ci];
+                    ci += 1;
                     if candidate >= 0.0
                         && candidate <= limit
-                        && clears_caret(candidate)
+                        && clears_caret(caret_col, candidate, width)
                         && (candidate - want).abs() <= INK_EVICT_MAX
-                        && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                        && matches!(
+                            self.observed_ink_overlaps(candidate, row, width),
+                            Some(false)
+                        )
                     {
                         if row < 1.0
-                            || self.observed_ink_overlaps(candidate, row - 1.0, width)
-                                == Some(false)
+                            || matches!(
+                                self.observed_ink_overlaps(candidate, row - 1.0, width),
+                                Some(false)
+                            )
                         {
                             return candidate;
                         }
@@ -2761,19 +2856,30 @@ impl PetBrain {
             if let Some(candidate) = fallback {
                 return candidate;
             }
-            if !clears_caret(beside) || self.ink_overlaps(beside, row, width) {
+            if !clears_caret(caret_col, beside, width) || self.ink_overlaps(beside, row, width) {
                 let mut fallback = None;
-                for step in (INK_EVICT_MAX as u16 + 1)..cols {
-                    let step = f32::from(step);
-                    for candidate in [right_base + step, left_base - step] {
+                let mut step_u16 = INK_EVICT_MAX as u16 + 1;
+                while step_u16 < cols {
+                    let step = step_u16 as f32;
+                    step_u16 += 1;
+                    let candidates = [right_base + step, left_base - step];
+                    let mut ci = 0;
+                    while ci < 2 {
+                        let candidate = candidates[ci];
+                        ci += 1;
                         if candidate >= 0.0
                             && candidate <= limit
-                            && clears_caret(candidate)
-                            && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                            && clears_caret(caret_col, candidate, width)
+                            && matches!(
+                                self.observed_ink_overlaps(candidate, row, width),
+                                Some(false)
+                            )
                         {
                             if row < 1.0
-                                || self.observed_ink_overlaps(candidate, row - 1.0, width)
-                                    == Some(false)
+                                || matches!(
+                                    self.observed_ink_overlaps(candidate, row - 1.0, width),
+                                    Some(false)
+                                )
                             {
                                 return candidate;
                             }
@@ -2792,11 +2898,11 @@ impl PetBrain {
     }
 
     #[inline]
-    fn ink_stand(&self, want: f32, row: f32, width: f32, cols: u16, rows: u16) -> (f32, f32) {
+    const fn ink_stand(&self, want: f32, row: f32, width: f32, cols: u16, rows: u16) -> (f32, f32) {
         self.ink_stand_for(want, row, width, cols, rows, None)
     }
 
-    pub(super) fn ink_stand_for(
+    pub(super) const fn ink_stand_for(
         &self,
         want: f32,
         row: f32,
@@ -2812,16 +2918,24 @@ impl PetBrain {
         if (beside - want).abs() <= INK_EVICT_MAX && !self.ink_overlaps(beside, row, width) {
             return (beside, row);
         }
-        for r in [row + 1.0, row - 1.0] {
-            if r >= 0.0 && r < f32::from(rows) && !self.ink_overlaps(want, r, width) {
+        let rows_f = rows as f32;
+        let adj = [row + 1.0, row - 1.0];
+        let mut i = 0;
+        while i < 2 {
+            let r = adj[i];
+            i += 1;
+            if r >= 0.0 && r < rows_f && !self.ink_overlaps(want, r, width) {
                 return (want, r);
             }
         }
-        for r in [row + 1.0, row - 1.0] {
-            if r >= 0.0 && r < f32::from(rows) {
+        let mut j = 0;
+        while j < 2 {
+            let r = adj[j];
+            j += 1;
+            if r >= 0.0 && r < rows_f {
                 let near = self.ink_safe_col_for(want, r, width, cols, caret);
                 if (near - want).abs() <= INK_EVICT_MAX
-                    && self.observed_ink_overlaps(near, r, width) == Some(false)
+                    && matches!(self.observed_ink_overlaps(near, r, width), Some(false))
                 {
                     return (near, r);
                 }
@@ -2882,7 +2996,7 @@ impl PetBrain {
 
     /// THE HEAD LAW: a cat standing beside the caret never rests its head on a line of letters
     /// ([`Self::observed_last_letter`], [`INK_GAP`], [`Self::veil_over_letters`]).
-    fn clear_of_letters_above(
+    const fn clear_of_letters_above(
         &self,
         (col, row): (f32, f32),
         caret: (u16, u16),
@@ -2891,19 +3005,21 @@ impl PetBrain {
     ) -> (f32, f32) {
         let above = row - 1.0;
         if above < 0.0
-            || (row - f32::from(caret.0)).abs() >= 0.5
-            || col < f32::from(caret.1)
+            || (row - caret.0 as f32).abs() >= 0.5
+            || col < caret.1 as f32
             || !width.is_finite()
             || width <= 0.0
             || self.console_executing()
         {
             return (col, row);
         }
-        let limit = (f32::from(cols) - width).max(0.0);
-        let reach = |x: f32| (x + INK_PAD - INK_GAP, x + width - INK_PAD);
+        let limit = (cols as f32 - width).max(0.0);
         let mut x = col;
-        for _ in 0..cols {
-            let (a, b) = reach(x);
+        let mut step = 0u16;
+        while step < cols {
+            step += 1;
+            let a = x + INK_PAD - INK_GAP;
+            let b = x + width - INK_PAD;
             match self.observed_last_letter(above, a, b) {
                 None => return (col, row),
                 Some(None) => {
@@ -2924,7 +3040,7 @@ impl PetBrain {
     }
 
     /// THE HEAD LAW IN FLIGHT ([`HEAD_REACH_MAX`]).
-    fn arc_under_letters(&self, to_col: f32, to_row: f32, width: f32, arc: f32) -> f32 {
+    const fn arc_under_letters(&self, to_col: f32, to_row: f32, width: f32, arc: f32) -> f32 {
         if (to_row - self.row).abs() >= 0.5 || !width.is_finite() || width <= 0.0 {
             return arc;
         }
@@ -2949,31 +3065,43 @@ impl PetBrain {
         }
     }
 
-    fn zee_ink_fade(&self, col: f32, row: f32) -> f32 {
+    const fn zee_ink_fade(&self, col: f32, row: f32) -> f32 {
         if !row.is_finite() {
             return 1.0;
         }
-        let covered = |r: i64| {
-            self.ink_span_idx(r)
-                .is_some_and(|(first, end)| col >= first - INK_PAD && col <= end + INK_PAD)
-        };
         let band = row.floor() as i64;
-        if covered(band) {
+        if let Some((first, end)) = self.ink_span_idx(band)
+            && col >= first - INK_PAD
+            && col <= end + INK_PAD
+        {
             return 0.0;
         }
-        for k in 1..=2i64 {
-            if covered(band - k) {
+        let mut k = 1i64;
+        while k <= 2 {
+            if let Some((first, end)) = self.ink_span_idx(band - k)
+                && col >= first - INK_PAD
+                && col <= end + INK_PAD
+            {
                 let edge = (band - k + 1) as f32;
                 return ((row - edge) / ZEE_INK_FADE_BAND).clamp(0.0, 1.0);
             }
+            k += 1;
         }
         1.0
     }
 
     #[inline]
-    fn mote_px_cell(&self, col: f32, row: f32) -> (f32, f32) {
-        let cw = f32::from(self.last_cell_w.max(1));
-        let ch = f32::from(self.last_cell_h.max(1));
+    const fn mote_px_cell(&self, col: f32, row: f32) -> (f32, f32) {
+        let cw = (if self.last_cell_w > 1 {
+            self.last_cell_w
+        } else {
+            1
+        }) as f32;
+        let ch = (if self.last_cell_h > 1 {
+            self.last_cell_h
+        } else {
+            1
+        }) as f32;
         ((col * cw).round() / cw, (row * ch).round() / ch)
     }
 
@@ -3274,7 +3402,7 @@ impl PetBrain {
     /// once for them.
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letter_arrival_dwells(&mut self, dwells: bool) {
+    pub const fn set_letter_arrival_dwells(&mut self, dwells: bool) {
         self.letter_arrival_dwells = dwells;
     }
 
@@ -3284,7 +3412,7 @@ impl PetBrain {
     /// with no hold, as it did before it stepped once an Enter.
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letter_step_rearms(&mut self, rearms: bool) {
+    pub const fn set_letter_step_rearms(&mut self, rearms: bool) {
         self.letter_step_rearms = rearms;
     }
 
@@ -3894,14 +4022,28 @@ impl PetBrain {
             Some((px, py)) if px.is_finite() && py.is_finite() => {
                 if let Some((lx, ly)) = self.last_pointer
                     && dt > 1e-4
+                    && (px != lx
+                        || py != ly
+                        || self.pointer_vx != 0.0
+                        || self.pointer_vy != 0.0
+                        || self.pointer_speed != 0.0)
                 {
                     let k = 1.0 - (-dt / DASH_WINDOW).exp();
                     let vx_inst = (px - lx) / dt;
                     let vy_inst = (py - ly) / dt;
                     self.pointer_vx += (vx_inst - self.pointer_vx) * k;
                     self.pointer_vy += (vy_inst - self.pointer_vy) * k;
-                    let inst = vx_inst.hypot(vy_inst);
+                    let inst = if vx_inst == 0.0 && vy_inst == 0.0 {
+                        0.0
+                    } else {
+                        vx_inst.hypot(vy_inst)
+                    };
                     self.pointer_speed += (inst - self.pointer_speed) * k;
+                    if px == lx && py == ly && self.pointer_speed < 1e-5 {
+                        self.pointer_vx = 0.0;
+                        self.pointer_vy = 0.0;
+                        self.pointer_speed = 0.0;
+                    }
                 }
                 self.last_pointer = Some((px, py));
                 let speed = self.pointer_speed;
@@ -4879,8 +5021,10 @@ impl PetBrain {
                 // Landing recovery. A big landing also skids the 0.8 cells the
                 // flight aimed short by, ending on the station.
                 if self.land_span > 0.0 && self.skid_dir != 0.0 {
+                    static SKID_NORM: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+                    let denom = *SKID_NORM.get_or_init(|| 1.0 - (-4.0f32).exp());
                     let u = (1.0 - self.land_t / BIG_LAND_DUR).clamp(0.0, 1.0);
-                    let s = (1.0 - (-4.0 * u).exp()) / (1.0 - (-4.0f32).exp());
+                    let s = (1.0 - (-4.0 * u).exp()) / denom;
                     self.col = (self.skid_from + self.skid_dir * SKID_CELLS * s)
                         .clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
                 }
@@ -5076,15 +5220,6 @@ impl PetBrain {
         } else {
             ((gap.abs() * gain).min(top) * gap.signum() + feed).clamp(-top, top)
         };
-        let tau = if self.vrun >= RUN_SPEED
-            && want.abs() > self.speed.abs()
-            && want * self.speed >= 0.0
-        {
-            LAUNCH_TAU
-        } else {
-            SPEED_TAU
-        };
-        let k = 1.0 - (-dt / tau).exp();
         if self.action.settled()
             && self.sit_front
             && self.facing_left
@@ -5111,9 +5246,22 @@ impl PetBrain {
         if stand_held || seat_kept || (self.room_cue_act && at_rest && gap.abs() <= ARRIVED) {
             self.speed = 0.0;
         } else if at_rest && gap.abs() <= ARRIVED && dt > 0.0 && !riding {
-            let rate = gain * (1.0 - (-SETTLE_TICK / SPEED_TAU).exp());
-            self.speed = gap * (1.0 - (-rate * dt).exp()) / dt;
-        } else {
+            if gap == 0.0 {
+                self.speed = 0.0;
+            } else {
+                let rate = gain * (1.0 - (-SETTLE_TICK / SPEED_TAU).exp());
+                self.speed = gap * (1.0 - (-rate * dt).exp()) / dt;
+            }
+        } else if want != self.speed && dt > 0.0 {
+            let tau = if self.vrun >= RUN_SPEED
+                && want.abs() > self.speed.abs()
+                && want * self.speed >= 0.0
+            {
+                LAUNCH_TAU
+            } else {
+                SPEED_TAU
+            };
+            let k = 1.0 - (-dt / tau).exp();
             self.speed += (want - self.speed) * k;
         }
         let skid_leg = feed == 0.0
@@ -5748,7 +5896,7 @@ impl PetBrain {
         let target = self.stride.round();
         if (target - self.stride).abs() < STRIDE_PLANT {
             self.stride = target;
-        } else {
+        } else if dt > 0.0 {
             self.stride += (target - self.stride) * (1.0 - (-dt / STRIDE_EASE).exp());
         }
     }
@@ -6441,34 +6589,41 @@ impl PetBrain {
         }
     }
 
-    fn spawn_dust(&mut self, width: f32) {
+    const fn spawn_dust(&mut self, width: f32) {
         let heel = self.col + width * 0.5;
-        for k in 0..3u8 {
+        let mut k = 0u8;
+        while k < 3 {
             let seed = self.mote_serial.wrapping_add(k);
             self.spawn_mote(Mote {
                 kind: PetMoteKind::Dust,
                 born: self.clock,
-                life: 0.45 + 0.07 * f32::from(k),
-                col: heel + 0.23 + 0.17 * f32::from(k % 3),
+                life: 0.45 + 0.07 * (k as f32),
+                col: heel + 0.23 + 0.17 * ((k % 3) as f32),
                 row: self.row + 0.31,
                 dir: -self.skid_dir,
                 seed,
                 rgb: None,
             });
+            k += 1;
         }
         self.mote_serial = self.mote_serial.wrapping_add(3);
     }
 
-    fn spawn_mote(&mut self, mut m: Mote) {
+    const fn spawn_mote(&mut self, mut m: Mote) {
         if matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart) {
             m.rgb = self.mote_rgb;
         }
-        if let Some(slot) = self.motes.iter_mut().find(|s| s.is_none()) {
-            *slot = Some(m);
+        let mut i = 0;
+        while i < self.motes.len() {
+            if self.motes[i].is_none() {
+                self.motes[i] = Some(m);
+                return;
+            }
+            i += 1;
         }
     }
 
-    fn spawn_dealt(&mut self, kind: PetMoteKind, life: f32, (col, row): (f32, f32)) {
+    const fn spawn_dealt(&mut self, kind: PetMoteKind, life: f32, (col, row): (f32, f32)) {
         let seed = self.mote_serial;
         self.mote_serial = self.mote_serial.wrapping_add(1);
         self.spawn_mote(Mote {
@@ -6589,7 +6744,7 @@ impl PetBrain {
         }
     }
 
-    fn spawn_wake_pop(&mut self, width: f32) {
+    const fn spawn_wake_pop(&mut self, width: f32) {
         self.spawn_dealt(PetMoteKind::ZeePop, ZEE_POP_LIFE, self.head_anchor(width));
     }
 
@@ -7303,7 +7458,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn spawn_bat_dust(&mut self, col: f32, row: f32) {
+    const fn spawn_bat_dust(&mut self, col: f32, row: f32) {
         self.spawn_dealt(PetMoteKind::Dust, 0.5, (col + 0.23, row + 0.12));
     }
 
@@ -7526,16 +7681,19 @@ impl PetBrain {
         clear_of_them.unwrap_or((col, row))
     }
 
-    fn cheer_air(
+    const fn cheer_air(
         &self,
         (col, row): (f32, f32),
         cell: (u16, u16),
         width: f32,
         air: CheerAir,
     ) -> (f32, f32, f32, f32) {
-        let reach_px = f32::from(cell.1.max(6)) * NOTE_SCALE_MAX + 1.0;
-        let rh = reach_px / f32::from(cell.1.max(1));
-        let rw = reach_px / f32::from(cell.0.max(1));
+        let ch6 = if cell.1 > 6 { cell.1 } else { 6 };
+        let ch1 = if cell.1 > 1 { cell.1 } else { 1 };
+        let cw1 = if cell.0 > 1 { cell.0 } else { 1 };
+        let reach_px = (ch6 as f32) * NOTE_SCALE_MAX + 1.0;
+        let rh = reach_px / (ch1 as f32);
+        let rw = reach_px / (cw1 as f32);
         let drift = NOTE_BASE + NOTE_RUN + NOTE_SWAY;
         let bottom = row - 0.27 - 0.3 * NOTE_CLIMB + rh;
         match air {
@@ -7563,7 +7721,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn mote_fade_env(u: f32) -> f32 {
+    const fn mote_fade_env(u: f32) -> f32 {
         (u / 0.15).min(1.0) * ((1.0 - u) / 0.35).clamp(0.0, 1.0)
     }
 
@@ -7659,11 +7817,12 @@ impl PetBrain {
         self.departure_serial
     }
 
-    fn spawn_departure(&mut self, d: Departure) {
+    const fn spawn_departure(&mut self, d: Departure) {
         let mut slot = 0;
         let mut oldest_born = f64::INFINITY;
-        for (i, live) in self.departures.iter().enumerate() {
-            let Some(a) = live else {
+        let mut i = 0;
+        while i < self.departures.len() {
+            let Some(a) = self.departures[i] else {
                 slot = i;
                 break;
             };
@@ -7671,6 +7830,7 @@ impl PetBrain {
                 oldest_born = a.born;
                 slot = i;
             }
+            i += 1;
         }
         self.departures[slot] = Some(d);
     }
@@ -7849,10 +8009,9 @@ impl PetBrain {
                 }
             }
             PetAction::Loaf => {
-                (scale_x, scale_y) = self.loaf_scale(self.quiet, self.clock, false);
-                let since = (self.quiet - self.loaf_after()).max(0.0);
-                let beat = (since / FLICK_EVERY).floor();
-                let phase = since - beat * FLICK_EVERY;
+                let ((sx, sy), beat, phase) =
+                    self.loaf_scale_and_beat(self.quiet, self.clock, false);
+                (scale_x, scale_y) = (sx, sy);
                 if self.twitch_t > 0.0 {
                     ear_frame = true;
                     PetGlyphId::PetLoafEar
@@ -8421,7 +8580,7 @@ impl PetBrain {
     /// Whether a gather of `coil` seconds still waits for its rest veil
     /// ([`Self::veil_over_letters`]).
     #[inline]
-    fn gather_owes_veil(&self, coil: f32) -> bool {
+    const fn gather_owes_veil(&self, coil: f32) -> bool {
         self.veil_gather && self.action_t < coil + LETTER_VEIL_DWELL + LETTER_VEIL_REST_ON_S
     }
 
@@ -8453,7 +8612,7 @@ impl PetBrain {
 
     /// Whether a drawn body's box lays its head on letterforms the console observation
     /// certifies ([`INK_PAD`], [`Self::veil_over_letters`]).
-    fn on_letters(
+    const fn on_letters(
         &self,
         (x0, x1, y0, y1): (i32, i32, i32, i32),
         (cell_w, cell_h): (u16, u16),
@@ -8462,23 +8621,29 @@ impl PetBrain {
         if cell_w == 0 || cell_h == 0 || y1 <= y0 || x1 <= x0 {
             return Some(false);
         }
-        let (cw, ch) = (f32::from(cell_w), i32::from(cell_h));
+        let (cw, ch) = (cell_w as f32, cell_h as i32);
         let (a, b) = (x0 as f32 / cw + INK_PAD, x1 as f32 / cw - INK_PAD);
-        let below = (y1 - 1).div_euclid(ch).min(i32::from(caret_row));
+        let y1_row = (y1 - 1).div_euclid(ch);
+        let cr = caret_row as i32;
+        let below = if y1_row < cr { y1_row } else { cr };
         let mut unknown = false;
-        for row in y0.div_euclid(ch).max(0)..below {
-            let top = (row * ch).max(y0);
-            let bottom = ((row + 1) * ch).min(y1);
-            if (bottom - top) * 4 < ch {
-                continue;
+        let y0_row = y0.div_euclid(ch);
+        let mut row = if y0_row > 0 { y0_row } else { 0 };
+        while row < below {
+            let r_top = row * ch;
+            let top = if r_top > y0 { r_top } else { y0 };
+            let r_bot = (row + 1) * ch;
+            let bottom = if r_bot < y1 { r_bot } else { y1 };
+            if (bottom - top) * 4 >= ch {
+                match self.observed_last_letter(row as f32, a, b) {
+                    Some(Some(_)) => return Some(true),
+                    Some(None) => {}
+                    None => unknown = true,
+                }
             }
-            match self.observed_last_letter(row as f32, a, b) {
-                Some(Some(_)) => return Some(true),
-                Some(None) => {}
-                None => unknown = true,
-            }
+            row += 1;
         }
-        (!unknown).then_some(false)
+        if !unknown { Some(false) } else { None }
     }
 
     /// The part of a drawn body's box that travels over letters: the row its feet are on
@@ -8494,7 +8659,7 @@ impl PetBrain {
         (x0, x1, top, y1)
     }
 
-    fn letter_cover(
+    const fn letter_cover(
         &self,
         (x0, x1, y0, y1): (i32, i32, i32, i32),
         cell_w: u16,
@@ -8503,20 +8668,22 @@ impl PetBrain {
         if cell_w == 0 || cell_h == 0 || y1 <= y0 || x1 <= x0 {
             return 0.0;
         }
-        let (cw, ch) = (i32::from(cell_w), i32::from(cell_h));
+        let (cw, ch) = (cell_w as i32, cell_h as i32);
         let col = x0 as f32 / cw as f32;
         let width = (x1 - x0) as f32 / cw as f32;
         let h = (y1 - y0) as f32;
         let mut cover = 0.0;
-        for row in y0.div_euclid(ch)..=(y1 - 1).div_euclid(ch) {
-            let top = (row * ch).max(y0);
-            let bottom = ((row + 1) * ch).min(y1);
-            if (bottom - top) * 4 < ch {
-                continue;
-            }
-            if self.ink_overlaps(col, row as f32, width) {
+        let mut row = y0.div_euclid(ch);
+        let last_row = (y1 - 1).div_euclid(ch);
+        while row <= last_row {
+            let r_top = row * ch;
+            let top = if r_top > y0 { r_top } else { y0 };
+            let r_bot = (row + 1) * ch;
+            let bottom = if r_bot < y1 { r_bot } else { y1 };
+            if (bottom - top) * 4 >= ch && self.ink_overlaps(col, row as f32, width) {
                 cover += (bottom - top) as f32 / h;
             }
+            row += 1;
         }
         cover
     }
@@ -8722,13 +8889,23 @@ impl PetBrain {
     }
 
     /// Host sync for the pet's identity.
-    pub fn sync_look(&mut self, pair: (u8, u8), arrival: PetArrival) -> SyncLookOutcome {
+    pub const fn sync_look(&mut self, pair: (u8, u8), arrival: PetArrival) -> SyncLookOutcome {
         match self.worn {
             Some(worn) if self.alpha > 0.0 => {
-                let park = (pair != worn).then_some(pair);
-                let parked = park.is_some() && park != self.pending_worn;
-                if park != self.pending_worn {
-                    self.handoff_parked_clock = park.is_some().then_some(self.clock);
+                let same_pair = pair.0 == worn.0 && pair.1 == worn.1;
+                let park = if !same_pair { Some(pair) } else { None };
+                let same_pending = match (park, self.pending_worn) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.0 == b.0 && a.1 == b.1,
+                    _ => false,
+                };
+                let parked = park.is_some() && !same_pending;
+                if !same_pending {
+                    self.handoff_parked_clock = if park.is_some() {
+                        Some(self.clock)
+                    } else {
+                        None
+                    };
                     if park.is_some() {
                         self.pending_arrival = arrival;
                     }
@@ -9295,6 +9472,11 @@ impl PetBrain {
 
     #[inline]
     fn loaf_scale(&self, quiet: f32, clock: f64, tell: bool) -> (f32, f32) {
+        self.loaf_scale_and_beat(quiet, clock, tell).0
+    }
+
+    #[inline]
+    fn loaf_scale_and_beat(&self, quiet: f32, clock: f64, tell: bool) -> ((f32, f32), f32, f32) {
         let loaf_after = self.loaf_after();
         let fold = (1.0 - (quiet - loaf_after) / SIT_FOLD).clamp(0.0, 1.0);
         let mut scale_y = 1.0 + 0.05 * fold;
@@ -9312,7 +9494,7 @@ impl PetBrain {
             scale_y += s * PURR_DEPTH;
             scale_x -= s * PURR_DEPTH * 0.6;
         }
-        (scale_x, scale_y)
+        ((scale_x, scale_y), beat, phase)
     }
 
     /// Earned contentment 0..=1.

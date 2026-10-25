@@ -747,3 +747,249 @@ region = \"global\"
         "rate-limited kimi-1 is skipped and clean kimi-3 runs ahead of wrong_at kimi-2"
     );
 }
+
+#[test]
+fn durable_sign_in_tasks_hold_across_restarts_sort_last_and_unpark_after_browser_sign_in() {
+    let bed = Bed::new("durable-signin-task");
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Kimi);
+    let kimi_fleet_toml = "\
+[[account]]
+label = \"kimi-1\"
+email = \"kimi-one@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+
+[[account]]
+label = \"kimi-2\"
+email = \"kimi-two@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+
+[[account]]
+label = \"kimi-3\"
+email = \"kimi-three@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+";
+    bed.secret(&cli_fleet_file(Cli::Kimi), kimi_fleet_toml);
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 10_000;
+    assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
+    let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+
+    let spawned: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let count = Arc::clone(&spawned);
+    let spawn = move |_work: Box<dyn FnOnce() + Send>| {
+        *count.lock().unwrap() += 1;
+        Ok(())
+    };
+
+    // 1. Durable `sign_in_task` (`Browser` and `Login`) holds across a fresh `AutoRenewGuard`
+    // (simulating restart) within 6h without stamping `last_attempt`.
+    for action in [
+        accounts::SignInAction::Browser,
+        accounts::SignInAction::Login,
+    ] {
+        let mut task_logins = accounts::Logins::default();
+        accounts::note_sign_in_task(&mut task_logins, "kimi-1", action, now - 300);
+        let restarted_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        assert_eq!(
+            spawn_vendor_renewal(
+                Cli::Kimi,
+                &bed.home,
+                &bed.state,
+                &roster,
+                &task_logins,
+                roster.row("kimi-1").cloned().unwrap(),
+                now,
+                &restarted_guard,
+                &spawn,
+            ),
+            RenewalDispatch::Held,
+            "durable {action:?} task must hold across restart within PERSON_BACKOFF"
+        );
+        assert!(
+            !restarted_guard
+                .lock()
+                .unwrap()
+                .last_attempt
+                .contains_key("kimi:kimi-1"),
+            "person-backoff hold must not stamp 15m last_attempt cooldown"
+        );
+    }
+    assert_eq!(*spawned.lock().unwrap(), 0);
+
+    // 2. `renew_pool_due` runs ready rows (`kimi-2`) ahead of person-parked rows (`kimi-1`).
+    for label in ["kimi-1", "kimi-2", "kimi-3"] {
+        signed_out_kimi_login(&bed, label);
+    }
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |_state, logins| {
+            accounts::note_sign_in_task(
+                logins,
+                "kimi-1",
+                accounts::SignInAction::Browser,
+                now - 120,
+            );
+            accounts::note_wrong_account(logins, "kimi-3", now - 60);
+            Ok(vec![
+                accounts::Event::new(now - 120, accounts::Kind::SignIn, "kimi-1")
+                    .because("www.kimi.ai device needs-sign-in"),
+            ])
+        })
+        .unwrap();
+    let pool_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let cooldown = Mutex::new(None);
+    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+    let fx = UpkeepEffects {
+        fetch: &fetch,
+        spawn_renewal: &spawn,
+        sync_cooldown: &cooldown,
+        renew_guard: &pool_guard,
+    };
+    assert!(renew_pool_due(
+        Cli::Kimi,
+        &bed.home,
+        &bed.state,
+        &bed.roster(Cli::Kimi),
+        now,
+        &fx,
+    ));
+    let keys: Vec<String> = pool_guard
+        .lock()
+        .unwrap()
+        .last_attempt
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        ["kimi:kimi-2"],
+        "ready kimi-2 must renew ahead of sign_in_task kimi-1"
+    );
+
+    // 3. Negative controls: `accounts browser` ending with `no-session` or `interrupted
+    // session-unknown` keeps `kimi-1` held even on an in-memory parked guard.
+    let live_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    note_background_end(
+        &live_guard,
+        "kimi:kimi-1",
+        super::super::cli::Renewal::NeedsPerson,
+        Instant::now(),
+    );
+    live_guard
+        .lock()
+        .unwrap()
+        .last_attempt
+        .insert("kimi:kimi-1".to_owned(), Instant::now());
+    let (logins_with_task, _) = store.load_logins(now).unwrap();
+    for unsigned_why in [
+        "www.kimi.ai window done no-session",
+        "www.kimi.ai window interrupted session-unknown",
+        "www.kimi.ai window done untidied",
+    ] {
+        store
+            .append(&[
+                accounts::Event::new(now - 10, accounts::Kind::SignIn, "kimi-1")
+                    .because(unsigned_why),
+            ])
+            .unwrap();
+        assert_eq!(
+            spawn_vendor_renewal(
+                Cli::Kimi,
+                &bed.home,
+                &bed.state,
+                &roster,
+                &logins_with_task,
+                roster.row("kimi-1").cloned().unwrap(),
+                now,
+                &live_guard,
+                &spawn,
+            ),
+            RenewalDispatch::Held,
+            "CONTROL: `{unsigned_why}` must not unpark kimi-1"
+        );
+    }
+
+    // 4. Positive: `accounts browser` recording `window done session-kept` unparks `live_guard`
+    // immediately ONCE, and preserves normal 15m `last_attempt` cooldown if that attempt fails.
+    store
+        .append(&[
+            accounts::Event::new(now - 5, accounts::Kind::SignIn, "kimi-1")
+                .because("www.kimi.ai window done session-kept"),
+        ])
+        .unwrap();
+    let before = *spawned.lock().unwrap();
+    assert_eq!(
+        spawn_vendor_renewal(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &roster,
+            &logins_with_task,
+            roster.row("kimi-1").cloned().unwrap(),
+            now,
+            &live_guard,
+            &spawn,
+        ),
+        RenewalDispatch::Started,
+        "signed-in `accounts browser` window must unpark step-2 headless renewal immediately"
+    );
+    assert_eq!(*spawned.lock().unwrap(), before + 1);
+    assert_eq!(
+        spawn_vendor_renewal(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &roster,
+            &logins_with_task,
+            roster.row("kimi-1").cloned().unwrap(),
+            now + 5,
+            &live_guard,
+            &spawn,
+        ),
+        RenewalDispatch::Held,
+        "CONTROL: the same browser window event must not bypass cooldown a second time"
+    );
+
+    // 5. Wall-clock expiry of `PERSON_BACKOFF` (`>= 6h`) unparks even if monotonic `Instant`
+    // paused during sleep.
+    let mut login_task_logins = accounts::Logins::default();
+    accounts::note_sign_in_task(
+        &mut login_task_logins,
+        "kimi-1",
+        accounts::SignInAction::Login,
+        now,
+    );
+    let slept_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    note_background_end(
+        &slept_guard,
+        "kimi:kimi-1",
+        super::super::cli::Renewal::NeedsPerson,
+        Instant::now(),
+    );
+    assert_eq!(
+        spawn_vendor_renewal(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &roster,
+            &login_task_logins,
+            roster.row("kimi-1").cloned().unwrap(),
+            now + PERSON_BACKOFF_SECS,
+            &slept_guard,
+            &spawn,
+        ),
+        RenewalDispatch::Started,
+        "PERSON_BACKOFF elapsed on wall clock must admit retry after sleep"
+    );
+}

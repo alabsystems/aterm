@@ -530,6 +530,10 @@ pub struct MergedInks {
     pub axis: Rgb,
     /// Words past capacity ("~8 waiting", "6 GiB swap"), beside `over`.
     pub over_text: Rgb,
+    /// A run bar whose reading is too low to show its height: its stub, in
+    /// the slate the mockups draw calm runs in, where the coolest heat would
+    /// fade into the well.
+    pub floor: Rgb,
 }
 
 impl MergedInks {
@@ -584,6 +588,15 @@ const fn this_tab_violet(dark: bool) -> Rgb {
         [0xC6, 0xB6, 0xFF]
     } else {
         [0x54, 0x34, 0xC8]
+    }
+}
+
+/// A run's floor: OKLCH (0.668 0.037 250) on a dark ground, (0.620 0.050 250) on a light one.
+const fn floor_slate(dark: bool) -> Rgb {
+    if dark {
+        [0x84, 0x97, 0xAB]
+    } else {
+        [0x70, 0x89, 0xA4]
     }
 }
 
@@ -712,6 +725,7 @@ fn merged_inks(ground: Rgb, fg: Rgb, track: Rgb, words: Rgb, heat: [Rgb; 7]) -> 
         secondary,
         axis: words_floored(fg, ground, AXIS_T, WORD_AA),
         over_text: floored(over_orange(dark), ground, WORD_AA, dark),
+        floor: pushed(floor_slate(dark), 0.004, dark, |c| shows(c, well)),
     }
 }
 
@@ -1129,6 +1143,7 @@ impl VitalsInks {
                 ("all_tabs".to_owned(), m.all_tabs, m.well, "the well"),
                 ("this_tab".to_owned(), m.this_tab, m.well, "the well"),
                 ("over".to_owned(), self.over, m.well, "the well"),
+                ("floor".to_owned(), m.floor, m.well, "the well"),
                 ("needs".to_owned(), m.needs, m.well, "the well"),
                 (
                     "needs".to_owned(),
@@ -1703,6 +1718,7 @@ mod tests {
         broken.merged.this_tab = m.all_tabs;
         broken.merged.all_tabs_tint = m.secondary;
         broken.merged.heat[6] = m.heat[0];
+        broken.merged.floor = m.heat[0];
         broken.merged_ic.needs = ic.heat[6];
         broken.merged_ic.axis = good.ground;
         broken.merged_ic.well = ic.heat[0];
@@ -1713,6 +1729,7 @@ mod tests {
             "merged secondary at 1.00:1 on all_tabs",
             "merged words at",
             "merged heat 6 at",
+            "merged floor at",
             "merged heat turns back toward the ground",
             "merged_ic needs 0.000 from heat at 24/24",
             "merged_ic axis at 1.00:1 on the ground",
@@ -1905,6 +1922,36 @@ mod tests {
         assert!(least.is_finite(), "CONTROL: inks compared");
     }
 
+    /// A run's stub shows on the well in both polarities, with and without Increase Contrast,
+    /// where the coolest heat stop does not; on the mockups' grounds it is the mockups' slate.
+    #[test]
+    fn a_runs_floor_shows_where_the_coolest_heat_fades() {
+        for ((ground, fg, accent), mockup) in REFERENCE
+            .into_iter()
+            .zip([[0x84, 0x97, 0xAB], [0x70, 0x89, 0xA4]])
+        {
+            let inks = vitals_inks(ground, fg, accent);
+            for m in [inks.merged, inks.merged_ic] {
+                let c = contrast(m.floor, m.well);
+                assert!(c >= NON_TEXT, "{ground:02X?}: the floor at {c:.2}:1");
+            }
+            assert!(
+                contrast(inks.merged.heat[0], inks.merged.well) < NON_TEXT,
+                "CONTROL: {ground:02X?}'s coolest heat is faint on the well"
+            );
+            let d = distance(inks.merged.floor, mockup);
+            assert!(
+                d < 0.02,
+                "{ground:02X?}: the floor is {d:.3} from the mockups'"
+            );
+        }
+        for (ground, fg) in sweep() {
+            let m = vitals_inks(ground, fg, DEFAULT_ACCENT).merged;
+            let c = contrast(m.floor, m.well);
+            assert!(c >= NON_TEXT, "{ground:02X?}: the floor at {c:.2}:1");
+        }
+    }
+
     #[test]
     fn increase_contrast_strengthens_what_the_merged_deck_keeps_faint() {
         for (ground, fg, accent) in REFERENCE {
@@ -1950,6 +1997,7 @@ mod tests {
                 ("secondary", m.secondary, ic.secondary),
                 ("axis", m.axis, ic.axis),
                 ("over_text", m.over_text, ic.over_text),
+                ("floor", m.floor, ic.floor),
             ] {
                 assert!(
                     contrast(more, ground) >= contrast(base, ground),

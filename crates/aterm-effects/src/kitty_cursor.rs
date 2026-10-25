@@ -78,7 +78,8 @@ const LEAD_MAX: f32 = 0.22;
 const HAPPY_GATE: f32 = 0.80;
 const BLINK_PERIOD: f32 = 1.7;
 const BLINK_DUR: f32 = 0.13;
-const BOB_AMP: f32 = 0.09;
+/// The hover bob's amplitude, a fraction of cell height; the footprint keeps this much headroom on the top rows.
+pub(crate) const BOB_AMP: f32 = 0.09;
 const STRIDE_PER_KEY: f32 = 0.5;
 const STRIDE_IDLE_HZ: f32 = 1.4;
 const STRIDE_TAU: f32 = 0.05;
@@ -93,12 +94,27 @@ const SING_SQUASH: f32 = 0.14;
 const SING_SWAY: f32 = 0.12;
 
 /// One frame's sing-along sync from the host: the drive/beat pair the dance rides, shared by both render paths.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SingSync {
     /// Celebration drive 0..=1 (1 armed, easing through the wind-down).
     pub drive: f32,
     /// Beat phase in beats since the arm (fractional).
     pub beat: f32,
+}
+
+impl SingSync {
+    /// No active sing-along drive or beat phase.
+    pub const NONE: Self = Self {
+        drive: 0.0,
+        beat: 0.0,
+    };
+}
+
+impl Default for SingSync {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 /// Smoothstep ramp of `x` across `[lo, hi]` → `0..=1` (eased at both ends).
@@ -453,8 +469,17 @@ pub struct CursorCat {
 impl Default for CursorCat {
     #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CursorCat {
+    /// Construct a fresh cursor-kitty state machine in its resting hidden state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
-            momentum: TypingMomentum::default(),
+            momentum: TypingMomentum::new(),
             sustain: 0.0,
             run_keys: 0,
             last: None,
@@ -466,7 +491,7 @@ impl Default for CursorCat {
             stride_shown: 0.0,
             look: KittyLook {
                 variant: CatGlyphId::SpecStretch,
-                ..KittyLook::default()
+                ..KittyLook::DEFAULT
             },
             pending_look: None,
             reaction: CatReaction::Cruise,
@@ -494,9 +519,7 @@ impl Default for CursorCat {
             rng: 0x2545_F491,
         }
     }
-}
 
-impl CursorCat {
     /// Retire an ordinary cursor-following flight when the caret it follows stops being one coordinate.
     #[inline]
     pub const fn retire_unowned_cursor_motion(&mut self) {
@@ -961,9 +984,11 @@ impl CursorCat {
                 self.stride_shown = wrap(self.stride_shown + gap.floor());
                 gap = gap.fract();
             }
-            let k = 1.0 - (-dt / STRIDE_TAU).exp();
-            let step = (gap * k).clamp(-STRIDE_RATE_MAX * dt, STRIDE_RATE_MAX * dt);
-            self.stride_shown = wrap(self.stride_shown + step);
+            if gap != 0.0 {
+                let k = 1.0 - (-dt / STRIDE_TAU).exp();
+                let step = (gap * k).clamp(-STRIDE_RATE_MAX * dt, STRIDE_RATE_MAX * dt);
+                self.stride_shown = wrap(self.stride_shown + step);
+            }
         }
     }
 
@@ -1309,14 +1334,18 @@ impl CursorCat {
         if !self.collection_hello || self.collection_paused_at.is_some() {
             return None;
         }
-        let reaction_decay = matches!(self.reaction, CatReaction::Startled | CatReaction::Wince)
-            .then_some(self.reaction_until)
-            .flatten();
-        [self.discovery_until, reaction_decay]
-            .into_iter()
-            .flatten()
-            .filter(|deadline| *deadline > now)
-            .min()
+        let d0 = self.discovery_until.filter(|d| *d > now);
+        let d1 = if matches!(self.reaction, CatReaction::Startled | CatReaction::Wince) {
+            self.reaction_until.filter(|d| *d > now)
+        } else {
+            None
+        };
+        match (d0, d1) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     /// Freeze the first footprint palette sample of this visible episode, so later frames keep the same atlas tile when the colours beneath the cat change.
@@ -1426,12 +1455,16 @@ impl CursorCat {
 
     #[inline]
     fn frame_bob(&self) -> f32 {
-        let cruise = self.bob();
-        if self.sing > 0.0 {
-            let dance = (std::f32::consts::TAU * self.sing_beat).sin() * BOB_AMP;
-            cruise + (dance - cruise) * self.sing
+        if self.sing <= 0.0 {
+            self.bob()
         } else {
-            cruise
+            let dance = (std::f32::consts::TAU * self.sing_beat).sin() * BOB_AMP;
+            if self.sing >= 1.0 {
+                dance
+            } else {
+                let cruise = self.bob();
+                cruise + (dance - cruise) * self.sing
+            }
         }
     }
 

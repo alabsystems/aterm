@@ -395,13 +395,132 @@ pub const ANCHORS: &[Anchor] = &[
     // Read in 2.1.268's group renderer: the 2026-09-12 captures that draw it carry no version.
     composed("turn.group.ran", "Ran", "2.1.268"),
     composed("turn.group.called", "Called", "2.1.294"),
+    // Drawn hint-less in wait_bg17.out (`  Pushed to main, rebased onto origin/main`, no version) and read in 2.1.268's group renderer.
+    composed("turn.group.pushed", "Pushed to", "2.1.268"),
+    composed("turn.group.rebased", "Rebased onto", "2.1.268"),
+    // The rest of 2.1.268's group renderer, read in its binary (each clause capitalised where it opens the row): no capture draws them.
+    composed("turn.group.thought", "Thought for", "2.1.268"),
+    composed("turn.group.thinking", "Thinking for", "2.1.268"),
+    composed("turn.group.edited", "Edited", "2.1.268"),
+    composed("turn.group.editing", "Editing", "2.1.268"),
+    composed("turn.group.made", "Made", "2.1.268"),
+    composed("turn.group.making", "Making", "2.1.268"),
+    composed("turn.group.committed", "Committed", "2.1.268"),
+    composed("turn.group.amended", "Amended commit", "2.1.268"),
+    composed("turn.group.cherry_picked", "Cherry-picked", "2.1.268"),
+    composed("turn.group.merged", "Merged", "2.1.268"),
+    composed("turn.group.pr", "PR #", "2.1.268"),
+    composed("turn.group.mr", "MR !", "2.1.268"),
+    // The renderer's pull and merge request verbs besides `edited` and `merged`.
+    composed("turn.group.created", "Created", "2.1.268"),
+    composed("turn.group.commented_on", "Commented on", "2.1.268"),
+    composed("turn.group.closed", "Closed", "2.1.268"),
+    composed("turn.group.reopened", "Reopened", "2.1.268"),
+    composed("turn.group.marked_ready", "Marked ready", "2.1.268"),
+    composed("turn.group.marked_draft", "Marked draft", "2.1.268"),
+    composed(
+        "turn.group.enabled_auto_merge",
+        "Enabled auto-merge on",
+        "2.1.268",
+    ),
+    composed(
+        "turn.group.disabled_auto_merge",
+        "Disabled auto-merge on",
+        "2.1.268",
+    ),
+    composed("turn.group.published", "Published", "2.1.268"),
+    composed("turn.group.publishing", "Publishing", "2.1.268"),
+    composed("turn.group.repld", "REPL'd", "2.1.268"),
+    composed("turn.group.repling", "REPL'ing", "2.1.268"),
+    composed("turn.group.calling", "Calling", "2.1.268"),
+    composed("turn.group.agent_named", "agent · ", "2.1.268"),
+    // How 2.1.268's group renderer draws a lone agent's description (its UWt, the same bytes in 2.1.310): its first word's
+    // irregular past and -ing forms by base, the participles no description opens with, and the prefixes a hyphen joins.
+    lit(
+        "turn.agent.past",
+        r#"begin:"began",bind:"bound",bring:"brought",build:"built",buy:"bought",catch:"caught",choose:"chose",come:"came",cut:"cut",debug:"debugged",dig:"dug",do:"did",draw:"drew",feed:"fed",feel:"felt",fight:"fought",find:"found",fly:"flew",forget:"forgot",freeze:"froze",get:"got",give:"gave",go:"went",have:"had",hide:"hid",hit:"hit",hold:"held",input:"input",keep:"kept",know:"knew",lead:"led",leave:"left",let:"let",lose:"lost",make:"made",mean:"meant",meet:"met",override:"overrode",overwrite:"overwrote",pay:"paid",put:"put",quit:"quit",read:"read",rebuild:"rebuilt",redo:"redid",rerun:"reran",reset:"reset",rewrite:"rewrote",run:"ran",see:"saw",seek:"sought",send:"sent",set:"set",show:"showed",shut:"shut",sit:"sat",sleep:"slept",spend:"spent",spin:"spun",split:"split",spread:"spread",stand:"stood",sweep:"swept",sync:"synced",take:"took",teach:"taught",tear:"tore",tell:"told",think:"thought",throw:"threw",understand:"understood",undo:"undid",unset:"unset",win:"won",unwrap:"unwrapped",unzip:"unzipped",write:"wrote""#,
+        "2.1.268",
+    ),
+    lit(
+        "turn.agent.running",
+        r#"begin:"beginning",commit:"committing",control:"controlling",debug:"debugging",emit:"emitting",equip:"equipping",forget:"forgetting",format:"formatting",input:"inputting",occur:"occurring",omit:"omitting",output:"outputting",permit:"permitting",prefer:"preferring",quit:"quitting",refer:"referring",rerun:"rerunning",reset:"resetting",screenshot:"screenshotting",snapshot:"snapshotting",submit:"submitting",sync:"syncing",transfer:"transferring",unset:"unsetting",unwrap:"unwrapping",unzip:"unzipping""#,
+        "2.1.268",
+    ),
+    lit(
+        "turn.agent.participles",
+        r#""been","broken","chosen","done","drawn","driven","eaten","fallen","forgotten","given","gone","grown","hidden","known","ridden","risen","seen","shown","spoken","taken","thrown","torn","worn","written""#,
+        "2.1.268",
+    ),
+    lit(
+        "turn.agent.prefixes",
+        "re|un|de|pre|co|sub|over|out|mis|auto|post",
+        "2.1.268",
+    ),
+    composed("turn.group.recalled", "Recalled", "2.1.268"),
+    composed("turn.group.recalling", "Recalling", "2.1.268"),
+    composed("turn.group.searched_bare", "Searched", "2.1.268"),
+    composed("turn.group.searching_bare", "Searching", "2.1.268"),
+    composed("turn.group.wrote", "Wrote", "2.1.268"),
+    composed("turn.group.writing", "Writing", "2.1.268"),
     // A hint-less group's nouns, each singular as measured; the plural is the renderer's count agreement (`shell commands` measured at 2.1.283).
     composed("turn.group.file", "file", "2.1.280"),
     composed("turn.group.pattern", "pattern", "2.1.295"),
     composed("turn.group.directory", "directory", "2.1.283"),
     composed("turn.group.shell_command", "shell command", "2.1.283"),
+    // Read in 2.1.268's group renderer, singular and plural.
+    composed("turn.group.agent", "agent", "2.1.268"),
+    composed("turn.group.tool", "tool", "2.1.268"),
+    composed("turn.group.memory", "memory", "2.1.268"),
+    composed("turn.group.team_memory", "team memory", "2.1.268"),
     // TaskStop's userFacingName, read in 2.1.268's binary (its renderToolUseMessage empty, so no `(…)`): the captures that draw it carry no version.
     lit("turn.call.stop_task", "Stop Task", "2.1.268"),
+    // Edit's and Write's userFacingName for a file in the plans directory, read in 2.1.268's binary; measured over `⎿  /plan to preview` at 2.1.308.
+    lit("turn.call.updated_plan", "Updated plan", "2.1.268"),
+    // A background task's notice of its end, its description quoted between head and end: Bash's measured in
+    // claude-2.1.304-verbose-background-command-login-words.txt, a dynamic workflow's in
+    // claude-2.1.283-wall-session-goal-checkin-shell-measured.txt, an agent's in claude-2.1.292-box-bash-rm-glob-subagent.txt
+    // and its wait in claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt; the rest read in 2.1.268's notice builders.
+    composed("turn.task.command", "Background command \"", "2.1.304"),
+    composed("turn.task.workflow", "Dynamic workflow \"", "2.1.283"),
+    composed("turn.task.agent", "Agent \"", "2.1.292"),
+    composed("turn.task.monitor", "Monitor \"", "2.1.268"),
+    composed("turn.task.remote", "Remote task \"", "2.1.268"),
+    composed("turn.task.completed", "completed", "2.1.283"),
+    composed("turn.task.exit_code", " (exit code ", "2.1.304"),
+    composed("turn.task.finished", "finished", "2.1.292"),
+    composed(
+        "turn.task.waiting",
+        "is waiting on its own background work",
+        "2.1.304",
+    ),
+    composed("turn.task.failed", "failed", "2.1.268"),
+    composed("turn.task.with_exit_code", " with exit code ", "2.1.268"),
+    composed("turn.task.failed_with", "failed: ", "2.1.268"),
+    composed("turn.task.was_stopped", "was stopped", "2.1.268"),
+    composed(
+        "turn.task.memory_pressure",
+        " because the system is running low on memory",
+        "2.1.268",
+    ),
+    composed("turn.task.by_claude", " by Claude", "2.1.268"),
+    composed("turn.task.by_user", " by user", "2.1.268"),
+    composed("turn.task.turn_limit", "stopped at its ", "2.1.268"),
+    composed(
+        "turn.task.quiet",
+        "ended without producing output",
+        "2.1.268",
+    ),
+    composed("turn.task.exit", " (exit ", "2.1.268"),
+    composed("turn.task.stream_ended", "stream ended", "2.1.268"),
+    composed("turn.task.script_failed", "script failed", "2.1.268"),
+    composed("turn.task.stopped", "stopped", "2.1.268"),
+    composed("turn.task.succeeded", "completed successfully", "2.1.268"),
+    composed("turn.task.blocked", "is blocked", "2.1.268"),
+    composed(
+        "turn.task.delivered",
+        "delivered to Claude as a ",
+        "2.1.268",
+    ),
     lit(
         "survey.question",
         "How is Claude doing this session",
@@ -1406,7 +1525,12 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
 ];
 
 /// Every string aterm guards on in Grok Build's screen ([`crate::grok`]): the sign-in screen as
-/// 1.0.70 drew it, and the limit and login texts as 1.0.67's and 1.0.70's binaries carry them.
+/// 1.0.70 drew it, the limit and login texts as 1.0.67's and 1.0.70's binaries carry them, and
+/// the team's API rate limit, the `API error (status ` its sampler's limit texts sit after, the
+/// usage and credit upsells' titles and `Try Again` row, and the texts a sweep of 1.0.70's
+/// strings found for a login of its own that is missing, expired, rejected or could not be
+/// renewed (`grok.auth.*`, whose texts aterm-agent's Grok Build login-ended words are read from),
+/// as 1.0.70's carries them.
 pub const GROK_ANCHORS: &[Anchor] = &[
     lit(
         "grok.signin.approve",
@@ -1426,9 +1550,37 @@ pub const GROK_ANCHORS: &[Anchor] = &[
         "1.0.67",
     ),
     lit(
+        "grok.wall.team_rate_limit",
+        "You\u{2019}ve hit your team\u{2019}s API rate limit.",
+        "1.0.70",
+    ),
+    lit("grok.wall.api_error", "API error (status ", "1.0.70"),
+    lit(
         "grok.wall.free_usage",
         "You\u{2019}ve reached your free Grok Build usage limit",
         "1.0.67",
+    ),
+    lit(
+        "grok.wall.free_usage.upsell",
+        "You hit your free usage limit.",
+        "1.0.70",
+    ),
+    lit("grok.wall.weekly", "You hit your weekly limit.", "1.0.70"),
+    lit(
+        "grok.wall.credit_limit",
+        "You\u{2019}ve hit the credit limit for your plan.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.wall.spending_cap",
+        "You\u{2019}ve hit your spending cap.",
+        "1.0.70",
+    ),
+    lit("grok.wall.try_again", "Try Again", "1.0.70"),
+    lit(
+        "grok.wall.try_again.resubmit",
+        "Resubmit the last prompt once you have usage again",
+        "1.0.70",
     ),
     lit(
         "grok.auth.expired",
@@ -1438,6 +1590,131 @@ pub const GROK_ANCHORS: &[Anchor] = &[
     lit(
         "grok.auth.not_logged_in",
         "Not logged in. Run `grok login`.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.token_expired",
+        "Token expired. Run `grok login` to re-authenticate.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.token_invalid",
+        "Your auth token is invalid or expired.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.rejected",
+        "Authentication rejected by server.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.recovery_exhausted",
+        "Auth recovery exhausted; re-authentication required.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.reauth_required",
+        "Session expired, re-authentication required",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.session_expired",
+        "Session expired. Run `grok login` to re-authenticate.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.session_has_expired",
+        "Your session has expired. Run `grok login` to sign in again.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.required",
+        "Authentication required. Run `grok login` to re-authenticate.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_renewed",
+        "Your session expired and your sign-in helper could not renew it in the background.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_renewed.named",
+        "Your session expired and",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_renewed.tail",
+        "could not renew it in the background.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.refresh_failed",
+        "Authentication could not be refreshed.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.team_rejected",
+        "Your team sign-in was rejected.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_signed_in",
+        "Not signed in. Run `grok login` to authenticate",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_signed_in.no_browser",
+        "Not signed in. To authenticate without a browser, run:",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_signed_in.bare",
+        "not signed in \u{2014} run `grok login`",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.not_authenticated",
+        "You are not authenticated.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.no_cached_token",
+        "No cached auth token found",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.failed",
+        "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.no_cached_credentials",
+        "No cached credentials found. Run `grok login` first.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.headless",
+        "Headless mode requires a grok.com session.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.no_session",
+        "preferred_method=oidc but no session is available. Run `grok login` to authenticate.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.signed_out",
+        "Signed out: /feedback works, and /login signs in.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.compaction",
+        "Unauthorized (401): compaction failed \u{2014} re-authenticate with /login and retry.",
+        "1.0.70",
+    ),
+    lit(
+        "grok.auth.compaction.reason",
+        "authentication problem \u{2014} re-authenticate using /login and retry.",
         "1.0.70",
     ),
 ];

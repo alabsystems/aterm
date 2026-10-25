@@ -107,7 +107,11 @@ fn file_holders_are_lsof_s() {
     }
     drop(mine);
     let gone = dir.join("gone.lock");
-    let lsof_after = [lsof_holders(&lock, &among), lsof_holders(&gone, &among)];
+    let still_owned = [quiet.id()];
+    let lsof_after = [
+        lsof_holders(&lock, &still_owned),
+        lsof_holders(&gone, &still_owned),
+    ];
     let _ = quiet.kill();
     let _ = quiet.wait();
     assert_eq!(
@@ -2791,7 +2795,9 @@ fn a_cell_reply_is_dim_only_by_its_attrs() {
 /// A control connection whose server answers each request with the next of
 /// `replies`, and hands back every request it read once the client is gone.
 #[cfg(unix)]
-fn fake_tab(replies: Vec<&'static str>) -> (Client, std::thread::JoinHandle<Vec<String>>) {
+pub(super) fn fake_tab(
+    replies: Vec<&'static str>,
+) -> (Client, std::thread::JoinHandle<Vec<String>>) {
     use std::io::BufRead as _;
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
     let server = std::thread::spawn(move || {
@@ -2945,6 +2951,34 @@ fn continuation_poll_confirms_an_empty_tail_with_the_full_screen() {
         ],
         "tail `first` and full-screen cell coordinates stay distinct"
     );
+}
+
+/// Claude Code 2.1.310's grey suggestion under the caret it draws (the cells read in the
+/// real-Claude lab, 2026-10-24: the first glyph inverse, the rest dim) is an empty composer to the
+/// upgrade's gate, as it is to the loop: the gate reads the glyph after the caret. NEGATIVE
+/// CONTROL: the same caret over plain text is a draft.
+#[cfg(unix)]
+#[test]
+fn a_suggestion_under_a_drawn_caret_is_an_empty_composer() {
+    const SUGGESTED: &str = r#"OK {"rows":["────────────","❯ keep going","────────────"],"cursor":{"row":1,"col":2},"first":0}"#;
+    for (after, empty) in [
+        ("OK e 999999 111318 dim", true),
+        ("OK e d0d0d0 111318 none", false),
+    ] {
+        let (mut c, server) = fake_tab(vec![SUGGESTED, "OK k 111318 d0d0d0 inverse", after]);
+        let mut tail_available = false;
+        assert_eq!(
+            continuation_composer_empty(&mut c, "s-x", &mut tail_available),
+            empty,
+            "{after}"
+        );
+        drop(c);
+        assert_eq!(
+            server.join().expect("server"),
+            ["@s-x text --json", "@s-x cell 1 2", "@s-x cell 1 3"],
+            "{after}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -14107,6 +14141,20 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     ] {
         for text in [status, helper, credential] {
             std::fs::write(&file, text).expect("write");
+            if file == opts.home.join(".claude/settings.json") && text == status {
+                let carried =
+                    tap::settings_value_chained(exe, Some("echo mine")).expect("a carried value");
+                assert_eq!(
+                    planned(&opts, &argv, true),
+                    tapped.replacen(&value, &carried, 1),
+                    "the owner's own statusLine in the user's settings.json is carried (R-12)"
+                );
+                assert!(
+                    super::tap_settings_admit(&opts.home, &argv, &cwd),
+                    "and the footer's reason judges it alike"
+                );
+                continue;
+            }
             assert_eq!(
                 planned(&opts, &argv, true),
                 plain,

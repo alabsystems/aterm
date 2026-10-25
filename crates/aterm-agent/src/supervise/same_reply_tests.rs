@@ -51,6 +51,8 @@ struct Driver<'a> {
     program: &'static str,
     at: i64,
     seq: u64,
+    /// How far the loop's clocks run past each point's whole second, as the shipped loop's do.
+    jitter: Duration,
 }
 
 impl<'a> Driver<'a> {
@@ -88,8 +90,10 @@ impl<'a> Driver<'a> {
         // The ledger's rows carry the replay's time, so a seeded loop reads their ages in it.
         s.test_clock().stamp_by_script();
         if let Some(lifted_off) = seed {
+            // As the shipped loop starts: the books, then the wall they leave open.
             let now_ms = s.fx.stamp_ms();
-            let _ = s.seed_from_ledger(ledger, now_ms, lifted_off);
+            let open = s.seed_from_ledger(ledger, now_ms, lifted_off);
+            s.seed_wall_memory(open);
         }
         Self {
             s,
@@ -97,14 +101,21 @@ impl<'a> Driver<'a> {
             program,
             at: first,
             seq: 0,
+            jitter: Duration::ZERO,
         }
+    }
+
+    /// The loop's monotonic clock runs `333 µs` past each point, so the wall clock's milliseconds lag it as the shipped loop's do.
+    fn jittered(mut self) -> Self {
+        self.jitter = Duration::from_micros(333);
+        self
     }
 
     fn to(&mut self, t: i64) {
         assert!(t >= self.at, "the replay's clock runs forward");
         self.s
             .test_clock()
-            .skip(Duration::from_secs(u64::try_from(t - self.at).unwrap_or(0)));
+            .skip(Duration::from_secs(u64::try_from(t - self.at).unwrap_or(0)) + self.jitter);
         self.at = t;
     }
 
@@ -810,6 +821,220 @@ fn a_vendor_row_no_reader_names_is_typed_into_at_most_once_more_then_held() {
     }
 }
 
+/// Claude Code's walled turn of [`vendor_walled`], then each of `opens` under it answered by [`claude_wall`]: the harness's continuation (`None`), a person's prompt, or a Monitor's event opening the program's own turn, as 2.1.302 draws it (`Some("")`, the same event each time; `Some("+")`, the `k`th open's own step).
+fn self_started(opens: &[Option<&str>]) -> Vec<String> {
+    let base = vendor_walled("claude", &[], claude_wall);
+    let composer = base
+        .iter()
+        .position(|r| r.starts_with("────"))
+        .expect("the composer");
+    let mut out = base[..composer].to_vec();
+    for (k, open) in opens.iter().enumerate() {
+        match open {
+            Some("") => out.push("⏺ Monitor event: build step 3 done · build watch".to_owned()),
+            Some("+") => out.push(format!(
+                "⏺ Monitor event: build step {} done · build watch",
+                k + 3
+            )),
+            open => out.extend([format!("❯ {}", open.unwrap_or(ASK)), String::new()]),
+        }
+        out.extend(claude_wall(0));
+        out.push(String::new());
+    }
+    out.extend(base[composer..].iter().cloned());
+    out
+}
+
+/// A Claude Code loop at [`self_started`]'s wall, each act answered by the wall again: once held, the program opens `own` turns itself an hour apart (`events`, each a Monitor's event, `Some("+")` one of its own; else its own retry, the screen drawn as it stood), each answered by the wall in `took` seconds (`None`, a busy spell the loop never saw), then a person types `hi`. The acts typed, and what the last point told.
+fn own_turns(
+    tag: &str,
+    autopilot: Autopilot,
+    events: Option<&'static str>,
+    own: usize,
+    took_own: Option<u64>,
+) -> (Vec<String>, Option<String>) {
+    let (dir, ledger) = ledger_at(tag);
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+    let (mut opens, mut at, mut took, mut typed) = (Vec::new(), 0, Some(600), None);
+    let (mut out, mut turns, mut person) = (Vec::new(), 0, false);
+    while out.len() < 24 {
+        let o = d.point(&R {
+            typed: typed.take(),
+            ..r(&self_started(&opens), at, took.take())
+        });
+        match (&o.act[..], o.until) {
+            ("wait", Some(u)) => at = u - CAPTURED + 1,
+            ("nothing", _) if turns < own => {
+                turns += 1;
+                at += 3600;
+                if let Some(event) = events {
+                    opens.push(Some(event));
+                }
+                took = took_own;
+            }
+            ("nothing", _) if !person => {
+                person = true;
+                at += 3600;
+                typed = Some(at - 60);
+                opens.push(Some("hi"));
+                took = Some(2);
+            }
+            ("nothing", _) => at += 86_400,
+            _ => {
+                at += 60;
+                opens.push(None);
+                took = Some(3);
+            }
+        }
+        out.push(o);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    let acts = out
+        .iter()
+        .map(|o| o.act.clone())
+        .filter(|a| a.starts_with("act "))
+        .collect();
+    (acts, out.last().and_then(|o| o.told.clone()))
+}
+
+#[test]
+fn a_no_work_turn_the_program_opens_itself_counts_as_an_acts_answer() {
+    use crate::supervise::policy::turn_end::NO_WORK_ACTS;
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        let tag = format!("self-started-{autopilot:?}");
+        let (bare, told) = own_turns(&tag, autopilot, None, 0, Some(3));
+        assert_eq!(
+            bare.len(),
+            3,
+            "{tag}: two acts to the hold, the person's one more: {bare:?}"
+        );
+        assert_eq!(told, held, "{tag}: and its answer holds again");
+        // The program's own retry says the reply again: the hold stands.
+        for own in [1, 4] {
+            let (acts, told) = own_turns(&tag, autopilot, None, own, Some(3));
+            assert_eq!(acts, bare, "{tag}: {own} own retries keep the hold");
+            assert_eq!(told, held, "{tag}");
+        }
+        // A Monitor's event says new words, so the reply changed, but each such turn counts into the run of no-work answers: however many come, the acts stop at the same count.
+        let (four, told) = own_turns(&tag, autopilot, Some(""), 4, Some(3));
+        assert_eq!(told, held, "{tag}: {four:?}");
+        let (eight, told) = own_turns(&tag, autopilot, Some(""), 8, Some(3));
+        assert_eq!(told, held, "{tag}: {eight:?}");
+        assert!(
+            four.len() == eight.len() && four.len() < NO_WORK_ACTS,
+            "{tag}: the run holds the events' turns: {four:?} {eight:?}"
+        );
+        // Each event in words of its own, and each turn one whose busy spell no point saw: the same count, and held.
+        for (event, took) in [(Some("+"), Some(3)), (Some(""), None), (Some("+"), None)] {
+            let (ten, told) = own_turns(&tag, autopilot, event, 10, took);
+            assert!(
+                ten.len() == four.len() && told == held,
+                "{tag}: {event:?} {took:?}: {ten:?} {told:?}"
+            );
+        }
+    }
+}
+
+/// A Claude Code worker waiting on a background suite: `acts` continuations answered by the same words, then `events` Monitor events it answers itself, then `done`, the row that opens its report.
+fn waiting_on_suite(acts: usize, events: usize, done: Option<&str>) -> Vec<String> {
+    let base = vendor_walled("claude", &vec![None; acts], |_| {
+        [
+            "⏺ Still waiting on the background suite.",
+            "",
+            "✻ Churned for 3s",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    });
+    let composer = base
+        .iter()
+        .position(|r| r.starts_with("────"))
+        .expect("the composer");
+    let mut out = base[..composer].to_vec();
+    for e in 3..3 + events {
+        out.extend([
+            format!("⏺ Monitor event: suite step {e} passed · suite watch"),
+            String::new(),
+            format!("⏺ Step {e} passed; waiting for the rest."),
+            String::new(),
+            "✻ Churned for 2s".to_owned(),
+            String::new(),
+        ]);
+    }
+    if let Some(done) = done {
+        out.extend(
+            [
+                done,
+                "",
+                "⏺ The suite passed: 412 of 412.",
+                "",
+                "✻ Churned for 2s",
+                "",
+            ]
+            .map(str::to_owned),
+        );
+    }
+    out.extend(base[composer..].iter().cloned());
+    out
+}
+
+#[test]
+fn a_background_tasks_end_after_monitor_events_is_work() {
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    // As claude-2.1.304-verbose-background-command-login-words.txt draws it, then as 2.1.268's notice builders draw a failure and a monitor's end; the control, in words.
+    let ends = [
+        "⏺ Background command \"Run the division suite\" completed (exit code 0)",
+        "⏺ Background command \"Run the division suite\" failed with exit code 1",
+        "⏺ Monitor \"suite watch\" stream ended",
+    ];
+    let words = "⏺ Background command \"Run the division suite\" is done.";
+    for (done, events, autopilot) in ends.into_iter().chain([words]).flat_map(|done| {
+        [0, 2, 4]
+            .into_iter()
+            .flat_map(move |e| [Autopilot::Cruise, Autopilot::Land].map(move |a| (done, e, a)))
+    }) {
+        let tag = format!("bg-done-{autopilot:?}-{events}-{}", done.len());
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+        let (mut acts, mut at, mut took) = (0, 0, Some(600));
+        // The continuations, to the hold.
+        loop {
+            let o = d.point(&r(&waiting_on_suite(acts, 0, None), at, took.take()));
+            match (&o.act[..], o.until) {
+                ("wait", Some(u)) => at = u - CAPTURED + 1,
+                ("nothing", _) => break,
+                _ => (acts, at, took) = (acts + 1, at + 60, Some(3)),
+            }
+            assert!(acts <= 2, "{tag}: the same words hold: {o:?}");
+        }
+        for e in 1..=events {
+            at += 600;
+            d.point(&r(&waiting_on_suite(acts, e, None), at, Some(2)));
+        }
+        at += 600;
+        let report = waiting_on_suite(acts, events, Some(done));
+        let mut o = d.point(&r(&report, at, Some(2)));
+        if let ("wait", Some(u)) = (&o.act[..], o.until) {
+            o = d.point(&r(&report, u - CAPTURED + 1, None));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        if done != words {
+            assert!(
+                o.act.starts_with("act ") && o.told.is_none(),
+                "{tag}: the task's end is work, so its report is answered: {o:?}"
+            );
+        } else if events > 2 {
+            assert!(
+                o.act == "nothing" && o.told == held,
+                "{tag}: in words it is the run's next no-work turn: {o:?}"
+            );
+        }
+    }
+}
+
 /// [`unnamed`] with its reset a countdown, each answer's a minute count of its own.
 fn counting_down(asks: &[Option<&str>]) -> Vec<String> {
     let mut k = 0;
@@ -981,6 +1206,242 @@ fn a_read_limit_standing_past_its_reset_is_resumed_through_its_tries_then_held()
             "{tag}: a new reset is a new wall, waited for: {then:#?}"
         );
         assert_eq!(then[1].act, "act usage-resume@v1", "{tag}: {then:#?}");
+    }
+}
+
+/// `t` (unix) as the live tab's wall writes a clock, PDT (`5:11 PM`).
+fn wall_clock(t: i64) -> String {
+    let local = (t - 7 * 3600).rem_euclid(86_400);
+    let (h, m) = (local / 3600, (local % 3600) / 60);
+    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+    format!("{h12}:{m:02} {}", if h < 12 { "AM" } else { "PM" })
+}
+
+/// [`before_hi`]'s wall with its reset a clock `lead` seconds past the time each of its answers was first drawn, and the answers to `asks` under it ([`answered`]): a reset moving forward with each answer.
+struct Moving {
+    lead: i64,
+    resets: std::cell::RefCell<Vec<i64>>,
+}
+
+impl Moving {
+    fn new(lead: i64) -> Self {
+        Self {
+            lead,
+            resets: std::cell::RefCell::default(),
+        }
+    }
+
+    /// The screen of `asks` answered at `at` (from [`CAPTURED`]), the wall's message `words`.
+    fn rows(&self, asks: &[Option<&str>], at: i64, words: &str) -> Vec<String> {
+        let mut resets = self.resets.borrow_mut();
+        while resets.len() <= asks.len() {
+            resets.push(CAPTURED + at + self.lead);
+        }
+        let reset = format!("  {words} {}", wall_clock(resets[asks.len()]));
+        drop(resets);
+        let rows: Vec<String> = before_hi()
+            .into_iter()
+            .map(|r| {
+                if r == "  Your usage resets at Oct 25 at 5:00 PM" {
+                    reset.clone()
+                } else {
+                    r
+                }
+            })
+            .collect();
+        answered(&rows, asks)
+    }
+}
+
+impl Moving {
+    /// [`Self::rows`] with every other answer's wall in Muse Code 1.4.10's measured one-line form ([`muse::USAGE_WALL`], its clock's `AM` or `PM` wrapped onto the next row at 144 columns).
+    fn rows_by_turns(&self, asks: &[Option<&str>], at: i64) -> Vec<String> {
+        let rows = self.rows(asks, at, "Your usage resets at");
+        if asks.len().is_multiple_of(2) {
+            return rows;
+        }
+        let wall = rows
+            .iter()
+            .rposition(|r| r.starts_with("  Your usage resets at "))
+            .expect("the last answer's wall");
+        let clock = rows[wall]["  Your usage resets at ".len()..].to_owned();
+        let (h, ampm) = clock.split_once(' ').expect("a clock");
+        let mut out = rows.clone();
+        out[wall - 1] = format!(
+            "◆ Usage limit reached · /upgrade (https://accountscenter.meta.com/muse_code/?ep=xgrade) for \
+             increased limits, or wait for usage to reset at {h}"
+        );
+        out[wall] = format!("  {ampm}");
+        out
+    }
+}
+
+#[test]
+fn two_wordings_of_a_wall_by_turns_at_resets_moving_forward_keep_their_tries() {
+    let reader = aterm_phase::Program::Muse.reader();
+    for lead in [180, 3600] {
+        let wall = Moving::new(lead);
+        let walls: Vec<_> = (0..2)
+            .map(|k| {
+                reader
+                    .wall(&wall.rows_by_turns(&vec![None; k], 0))
+                    .expect("a read wall")
+            })
+            .collect();
+        assert!(
+            walls
+                .iter()
+                .all(|w| w.kind == WallKind::UsageSession && w.reset.is_some())
+                && walls[0].message != walls[1].message,
+            "two wordings of one usage wall, each read with its clock: {walls:#?}"
+        );
+        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+            let tag = format!("by-turns-{autopilot:?}-{lead}");
+            let wall = Moving::new(lead);
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d =
+                Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false).jittered();
+            let first = r(&wall.rows_by_turns(&[], 0), 0, Some(600));
+            let point = |k: usize, at: i64, took: Option<u64>| {
+                r(&wall.rows_by_turns(&vec![None; k], at), at, took)
+            };
+            let (out, _) = follow_r(&mut d, &first, (60, 3), point, 30);
+            let _ = std::fs::remove_dir_all(dir);
+            let resumes = out.iter().filter(|o| o.act.starts_with("act ")).count();
+            // Each wording keeps its own tries: the one that meets its last is held.
+            assert!(
+                resumes < 2 * FUTILE_AFTER_TRIES
+                    && out[out.len() - 4..]
+                        .iter()
+                        .all(|o| o.act == "nothing" && is_futile(o)),
+                "{tag}: {resumes} resumes: {out:#?}"
+            );
+        }
+    }
+}
+
+/// The tab's exception is a futile one ([`Exception::limit_repeats`], or the limit standing an hour past its reset).
+fn is_futile(o: &Out) -> bool {
+    o.told.as_deref().is_some_and(|t| t.starts_with("futile "))
+}
+
+#[test]
+fn a_reset_moving_forward_with_each_answer_keeps_the_walls_tries() {
+    let futile = Some(format!(
+        "futile {}",
+        Exception::limit_repeats(aterm_phase::Program::Muse, true).why
+    ));
+    let reader = aterm_phase::Program::Muse.reader();
+    let words = "Your usage resets at";
+    // An hour's lead crosses midnight: the clock's `PM` turning `AM` is the same reply.
+    for (lead, busy) in [(180, 3), (180, 400), (3600, 3)] {
+        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+            let tag = format!("moving-reset-{autopilot:?}-{lead}-{busy}");
+            let wall = Moving::new(lead);
+            let first = r(&wall.rows(&[], 0, words), 0, Some(600));
+            let w = reader.wall(&first.rows).expect("a read wall");
+            assert!(
+                w.kind == WallKind::UsageSession
+                    && w.reset
+                        .as_deref()
+                        .is_some_and(|r| r.ends_with(" PM") || r.ends_with(" AM")),
+                "{tag}: a usage wall whose reset is a clock: {w:?}"
+            );
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d =
+                Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false).jittered();
+            let point = |k: usize, at: i64, took: Option<u64>| {
+                r(&wall.rows(&vec![None; k], at, words), at, took)
+            };
+            let (out, answers) = follow_r(&mut d, &first, (60, busy), point, 18);
+            let resumes = out.iter().filter(|o| o.act.starts_with("act ")).count();
+            assert_eq!(
+                resumes, FUTILE_AFTER_TRIES,
+                "{tag}: the wall's tries and no more: {out:#?}"
+            );
+            // Held where the last try's answer came, then a day at a time past its reset.
+            let held_at = out.iter().position(|o| o.act == "nothing");
+            assert!(
+                held_at.is_some_and(|h| out[h].told == futile
+                    && out[h..].iter().all(|o| o.act == "nothing" && is_futile(o))),
+                "{tag}: held under the futile exception, its resets passing: {out:#?}"
+            );
+            // Loops that take over an hour apart read the reset the tries met from the ledger: held at once.
+            let (dir3, ledger3) = ledger_at(&format!("{tag}-taken"));
+            let mut m3 = Mock::new(vec![busy_screen()]);
+            let mut d3 =
+                Driver::new(&mut m3, "muse", &ledger3, autopilot, (CAPTURED, 0), false).jittered();
+            let (to_hold, tried) = follow_r(
+                &mut d3,
+                &first,
+                (60, busy),
+                point,
+                held_at.map_or(0, |h| h + 1),
+            );
+            assert!(to_hold.last().is_some_and(is_futile), "{tag}: {to_hold:#?}");
+            let mut at = d3.at;
+            for taken in 1..=3 {
+                at += 3600;
+                let mut m = Mock::new(vec![busy_screen()]);
+                let mut d = Driver::new(&mut m, "muse", &ledger3, autopilot, (CAPTURED, at), true)
+                    .jittered();
+                let over = [
+                    d.point(&point(tried, at, None)),
+                    d.point(&point(tried, at + 600, None)),
+                ];
+                assert!(
+                    over.iter().all(|o| o.act == "nothing" && o.told == futile),
+                    "{tag}: loop {taken} takes over held: {over:#?}"
+                );
+                at += 600;
+            }
+            let _ = std::fs::remove_dir_all(dir3);
+            // A changed wall message is a new reply: the hold lifts.
+            let at = d.at + 600;
+            let changed = d.point(&r(
+                &wall.rows(&vec![None; answers], at, "Your plan's usage resets at"),
+                at,
+                None,
+            ));
+            assert_ne!(changed.act, "nothing", "{tag}: {changed:#?}");
+            // A person's turn lifts it too: one more resume, then held again.
+            let (dir2, ledger2) = ledger_at(&format!("{tag}-person"));
+            let mut m2 = Mock::new(vec![busy_screen()]);
+            let mut d2 = Driver::new(&mut m2, "muse", &ledger2, autopilot, (CAPTURED, 0), false);
+            let (held, answers) = follow_r(&mut d2, &first, (60, busy), point, 18);
+            assert!(held.last().is_some_and(is_futile), "{tag}: {held:#?}");
+            let at = d2.at + 600;
+            let mut asks = vec![None; answers];
+            asks.push(Some("hi"));
+            let hi = R {
+                typed: Some(at - 60),
+                ..r(&wall.rows(&asks, at, words), at, Some(2))
+            };
+            let then = follow_r(
+                &mut d2,
+                &hi,
+                (at + 60, busy),
+                |k, at, took| {
+                    let mut asks = vec![None; answers];
+                    asks.push(Some("hi"));
+                    asks.extend(vec![None; k]);
+                    r(&wall.rows(&asks, at, words), at, took)
+                },
+                18,
+            )
+            .0;
+            let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(dir2));
+            let more = then.iter().filter(|o| o.act.starts_with("act ")).count();
+            assert!(
+                more == 1
+                    && then
+                        .last()
+                        .is_some_and(|o| o.act == "nothing" && is_futile(o)),
+                "{tag}: a person's turn lets one more resume go, then it holds: {then:#?}"
+            );
+        }
     }
 }
 
@@ -1396,8 +1857,13 @@ fn build_fails(group: &'static str) -> impl Fn(usize) -> Vec<String> {
 #[test]
 fn a_build_that_fails_the_same_after_collapsed_shell_commands_is_work_each_time() {
     let reader = aterm_phase::Program::Claude.reader();
-    // The 2026-09-12 capture's and 2.1.283's hint-less rows.
-    for group in ["  Ran 2 shell commands", "  Listed 1 directory"] {
+    // The 2026-09-12 capture's and 2.1.283's hint-less rows, then 2.1.268's renderer's lone agent by its description and by its count.
+    for group in [
+        "  Ran 2 shell commands",
+        "  Listed 1 directory",
+        "⏺ Reviewed the diff (ctrl+o to expand)",
+        "⏺ Ran 1 agent (ctrl+o to expand)",
+    ] {
         let rows = build_fails(group);
         assert!(reader.turn_ran_tools(&rows(2)), "{group:?} is read");
         for autopilot in [Autopilot::Cruise, Autopilot::Land] {
@@ -1410,6 +1876,101 @@ fn a_build_that_fails_the_same_after_collapsed_shell_commands_is_work_each_time(
             assert!(
                 answers == 10 && out.iter().all(|o| o.told.is_none()),
                 "{tag}: {group:?} is work, every act typed: {out:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_git_only_answer_that_says_the_same_is_work_each_time() {
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let reader = aterm_phase::Program::Claude.reader();
+    // wait_bg17.out's measured row and 2.1.268's renderer's (its shell count leaves git commands out), then the shell count's.
+    for group in [
+        "  Pushed to main, rebased onto origin/main",
+        "  Committed 1a2b3c4, pushed to main",
+        "  Ran 2 shell commands",
+    ] {
+        let rows = build_fails(group);
+        assert!(reader.turn_ran_tools(&rows(2)), "{group:?} is read");
+        for (autopilot, busy) in [Autopilot::Cruise, Autopilot::Land]
+            .into_iter()
+            .flat_map(|a| [30, 550].map(|b| (a, b)))
+        {
+            let tag = format!("git-work-{autopilot:?}-{busy}-{}", group.len());
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, busy), &rows, 10);
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(
+                answers > 2 && out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
+                "{tag}: {group:?} is work, every act typed: {out:#?}"
+            );
+        }
+    }
+    // The control: the same answer with the row in words is held.
+    let rows = build_fails("  Pushed to main, then waited for the checks");
+    for (autopilot, busy) in [Autopilot::Cruise, Autopilot::Land]
+        .into_iter()
+        .flat_map(|a| [30, 550].map(|b| (a, b)))
+    {
+        let tag = format!("git-words-{autopilot:?}-{busy}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+        let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, busy), &rows, 10);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            answers == 2
+                && out
+                    .last()
+                    .is_some_and(|o| o.act == "nothing" && o.told == held),
+            "{tag}: {out:#?}"
+        );
+    }
+}
+
+/// A Claude Code answer that ran no tool, its reply's last paragraph `paragraph`.
+fn paragraph_ends(paragraph: &'static str) -> impl Fn(usize) -> Vec<String> {
+    move |k: usize| {
+        let mut said = vec!["⏺ I can't land this until it is reviewed.", ""];
+        if paragraph.starts_with('⏺') {
+            said.clear();
+        }
+        said.extend([paragraph, "", "✻ Worked for 3s"]);
+        vendor_walled("claude", &vec![None; k], |_| {
+            said.iter().map(|&r| r.to_owned()).collect()
+        })
+    }
+}
+
+#[test]
+fn a_reply_ending_in_a_git_clauses_words_said_the_same_is_held() {
+    let held = Some(format!("stalled {}", Exception::repeats().why));
+    let reader = aterm_phase::Program::Claude.reader();
+    for paragraph in [
+        "  Waiting on PR #12",
+        "  Pushed to main",
+        "  Merged cleanly",
+        "  Pushed to main, rebased onto origin/main",
+        "⏺ Pushed to main",
+    ] {
+        let rows = paragraph_ends(paragraph);
+        assert!(!reader.turn_ran_tools(&rows(2)), "{paragraph:?} is words");
+        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+            let tag = format!("git-paragraph-{autopilot:?}-{}", paragraph.len());
+            let (dir, ledger) = ledger_at(&tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
+            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, 3), &rows, 12);
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(
+                answers == 2
+                    && out
+                        .last()
+                        .is_some_and(|o| o.act == "nothing" && o.told == held),
+                "{tag}: {paragraph:?} said the same holds after two acts: {out:#?}"
             );
         }
     }

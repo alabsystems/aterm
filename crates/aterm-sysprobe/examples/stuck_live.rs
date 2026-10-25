@@ -454,5 +454,6 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
         program_check: p.program_check() == Some(AtStart::Held),
+        version: aterm_sysprobe::procs::pid_version(p.pid).and_then(|v| u64::try_from(v).ok()),
     }
 }

@@ -917,7 +917,8 @@ pub(crate) fn probe(
     (backlog, stopped, activity)
 }
 
-/// Give `sink` its input watch.
+/// Give `sink` its input watch: only where its stall's recovery can discard what is unread
+/// ([`aterm_pty::input_queue_len`], macOS's), though Linux counts the unread input too.
 pub(crate) fn watch_input(sink: &SinkWriter, wake: impl Fn() + Send + Sync + 'static) -> bool {
     if aterm_pty::input_queue_len(sink.master()).is_none() {
         return false;

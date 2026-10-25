@@ -57,6 +57,91 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 #[test]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
+    #[cfg(unix)]
+    std::hint::black_box(
+        aterm_db::control::Endpoint::exchange
+            as fn(
+                &aterm_db::control::Endpoint,
+                std::net::TcpStream,
+                aterm_db::control::Side,
+                &mut aterm_db::control::Repair,
+            ) -> aterm_db::Result<aterm_db::control::Report>,
+    );
+    #[cfg(unix)]
+    {
+        use aterm_secrets::{
+            age::Identity,
+            client::Admin,
+            commons::{
+                journal::Journal,
+                roster::{self, Access, Enrollment, Grant},
+            },
+        };
+        std::hint::black_box((
+            roster::current as fn(&Journal, &Identity) -> aterm_secrets::Result<Option<Access>>,
+            Access::is_current as fn(&Access, &Journal) -> bool,
+            Admin::prepare_commons_genesis
+                as fn(
+                    &Admin,
+                    [u8; 16],
+                    Vec<Enrollment>,
+                ) -> aterm_secrets::Result<aterm_secrets::commons::node::Node>,
+            Admin::prepare_commons_rotation
+                as fn(
+                    &Admin,
+                    &Journal,
+                    Vec<Grant>,
+                ) -> aterm_secrets::Result<aterm_secrets::commons::node::Node>,
+            Admin::prepare_commons_retirement
+                as fn(
+                    &Admin,
+                    &Journal,
+                    Vec<Grant>,
+                    &[[u8; 48]],
+                ) -> aterm_secrets::Result<aterm_secrets::commons::node::Node>,
+        ));
+    }
+    #[cfg(unix)]
+    std::hint::black_box(
+        aterm_secrets::client::Admin::approve_commons_member
+            as fn(
+                &aterm_secrets::client::Admin,
+                &aterm_secrets::commons::journal::Journal,
+                &str,
+                aterm_secrets::commons::binding::Possession,
+            )
+                -> aterm_secrets::Result<aterm_secrets::commons::membership::Certificate>,
+    );
+    #[cfg(unix)]
+    {
+        use aterm_secrets::commons::constraints::{Catalog, Constraints, Epoch};
+        std::hint::black_box((
+            Constraints::check_actor as fn(&Constraints, &[u8; 48]) -> aterm_secrets::Result<()>,
+            Constraints::check_device_candidate
+                as fn(
+                    &Constraints,
+                    &aterm_secrets::commons::binding::Binding,
+                ) -> aterm_secrets::Result<()>,
+            Constraints::epoch as fn(&Constraints) -> Epoch,
+            Constraints::catalog as fn(&Constraints, [u8; 32], &_) -> Catalog,
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use aterm_secrets::commons::binding::{Pending, Possession, Request};
+        std::hint::black_box((
+            Pending::issue
+                as fn(&Request, [u8; 16], [u8; 32]) -> aterm_secrets::Result<(Pending, Vec<u8>)>,
+            Pending::verify as fn(&mut Pending, &[u8]) -> aterm_secrets::Result<Possession>,
+        ));
+    }
+    #[cfg(unix)]
+    std::hint::black_box(
+        aterm_secrets::commons::journal::Journal::state
+            as fn(
+                &aterm_secrets::commons::journal::Journal,
+            ) -> aterm_secrets::commons::journal::State,
+    );
     #[expect(
         clippy::disallowed_methods,
         reason = "a link root: the window's entry is named, never called"

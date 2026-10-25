@@ -1496,6 +1496,26 @@ fn the_join_lists_each_choice_made_in_the_persons_name() {
         "Question priority is Recommended",
         "CONTROL: with no key, the why is the policy's word"
     );
+    let passed = format!(
+        "unproven: {CHOSE_FIRST_SAFE}: option 1 would reset, so option 2, the first that names \
+         no destructive act and keeps no answer"
+    );
+    let first = format!("unproven: {CHOSE_UNMARKED}");
+    let marked = format!("unproven: {CHOSE_RECOMMENDED}");
+    assert_eq!(
+        chose_why(&[passed.as_str()], "recommended"),
+        "no option was marked Recommended, so it took the first that names no destructive act",
+        "a passed-over option 1 is said, never read as the policy's word"
+    );
+    assert_eq!(
+        chose_why(&[first.as_str(), passed.as_str()], "recommended"),
+        "no option was marked Recommended, so it took the first that names no destructive act"
+    );
+    assert_eq!(
+        chose_why(&[marked.as_str(), passed.as_str()], "recommended"),
+        "the option marked Recommended where one was, else the first that names no destructive \
+         act"
+    );
     let mut plain = HarnessStats::new(t - 60_000);
     for line in &ledger {
         fold_ledger_line(&mut plain, line);

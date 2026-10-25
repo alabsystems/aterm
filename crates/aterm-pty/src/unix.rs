@@ -1961,7 +1961,10 @@ pub fn tty_passes_every_byte(fd: i32) -> Option<bool> {
 #[cfg(target_os = "macos")]
 const TIOCOUTQ: libc::c_ulong = 0x4004_7473;
 
-/// Returns unread slave input queue bytes (`FIONREAD`) on `fd`.
+/// Returns unread slave input queue bytes (`FIONREAD`) on `fd`, macOS alone: the count
+/// [`flush_input_queue`]'s discard is paired with (Linux's `tcflush` on a master drops the
+/// program's output, not its input). A reader of the program's unread input reads
+/// [`unread_input_len`], which Linux answers too.
 #[must_use]
 pub fn input_queue_len(fd: i32) -> Option<usize> {
     #[cfg(target_os = "macos")]
@@ -1971,6 +1974,56 @@ pub fn input_queue_len(fd: i32) -> Option<usize> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = fd;
+        None
+    }
+}
+
+/// Returns the bytes typed into the terminal behind the pty master `master` that the program at
+/// its slave has not read (canonical mode: whole lines only), or `None` where that is unknown,
+/// never a guess of zero. macOS reads it as [`input_queue_len`] does, by `FIONREAD` on the master.
+/// On Linux the master's own `FIONREAD` counts the program's output waiting for aterm, so this
+/// reads `FIONREAD` on a descriptor of the slave that `TIOCGPTPEER` opens for the call (read-only,
+/// never as a controlling terminal, never waiting) and closes: `None` where that open fails (a
+/// kernel before 4.13, a terminal its program made exclusive) or `master` is no pty master. A
+/// write reaches Linux's slave from a work queue, so a key written a moment before may not count
+/// yet. `None` on every other platform.
+#[must_use]
+pub fn unread_input_len(master: i32) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        queue_len(master, libc::FIONREAD)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        if master < 0 {
+            return None;
+        }
+        // SAFETY: `TIOCGPTPEER` takes its open flags by value and returns a fresh descriptor or
+        // -1; on any fd that is not a pty master it fails cleanly (`ENOTTY`, `EBADF`).
+        let peer = unsafe {
+            libc::ioctl(
+                master,
+                libc::TIOCGPTPEER,
+                libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if peer < 0 {
+            return None;
+        }
+        // SAFETY: `peer` is the descriptor `TIOCGPTPEER` just returned, owned by nothing else.
+        let peer = unsafe { OwnedFd::from_raw_fd(peer) };
+        let mut n: libc::c_int = 0;
+        // SAFETY: `peer` is open for the call and `FIONREAD` writes one `c_int` into `n`.
+        let rc = unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &raw mut n) };
+        if rc != 0 {
+            return None;
+        }
+        usize::try_from(n).ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = master;
         None
     }
 }

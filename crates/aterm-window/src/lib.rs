@@ -88,6 +88,7 @@
 #[cfg(feature = "rwh_06")]
 pub use rwh_06 as raw_window_handle;
 
+// LOCAL PATCH (aterm): this crate's own module, where upstream re-exports the `dpi` crate.
 pub mod dpi;
 
 pub mod application;

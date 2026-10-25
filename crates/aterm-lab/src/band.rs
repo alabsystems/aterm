@@ -172,11 +172,7 @@ fn remove(label: &str) {
 /// launchd's default 10 s: that restart only removes the job, so nothing
 /// gains by the wait.
 fn job_plist(label: &str, args: &[String]) -> String {
-    let esc = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
+    let esc = aterm_codec::xml::escape;
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST \
          1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n",

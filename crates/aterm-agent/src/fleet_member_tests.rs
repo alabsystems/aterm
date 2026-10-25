@@ -601,7 +601,11 @@ fn a_machine_that_takes_a_members_node_id_is_refused() {
         "the member's entry stands"
     );
 
-    ok(peers(&issuer.places, &args(&["rm", short(&node)])));
+    let removed = ok(peers(&issuer.places, &args(&["rm", short(&node)])));
+    assert!(
+        removed.contains("it still reads this fleet's surveys: only `aterm fleet init --rotate`"),
+        "{removed}"
+    );
     ok(join(&taker.places, &opts, &code));
     let rebound = read_peers(&issuer.places.state).unwrap();
     assert_eq!(
@@ -1979,7 +1983,8 @@ fn peers_add_rm_and_leave() {
         peers(&world.places, &args(&["add", "lab mini"])),
         Err(Failure::Usage(_))
     ));
-    ok(peers(&world.places, &args(&["rm", "lab-mini"])));
+    let removed = ok(peers(&world.places, &args(&["rm", "lab-mini"])));
+    assert!(!removed.contains("init --rotate"), "{removed}");
     assert_eq!(hosts(), Vec::<String>::new());
     assert!(matches!(
         peers(&world.places, &args(&["rm", "lab-mini"])),
@@ -2246,6 +2251,79 @@ fn every_reason_a_fleet_read_gives_fits_its_row() {
             aterm_ctl::UNANSWERED_REASON_CHARS
         );
         assert_eq!(fault_of(why), *fault, "{why:?}");
+    }
+}
+
+#[test]
+fn a_member_of_a_loopback_fleet_is_recorded_where_it_listens() {
+    let (issuer, code, _serving) = issuing("loopback-host-issuer");
+    let member = World::new("loopback-host-member");
+    let port = closed_port();
+    for opts in [
+        Opts {
+            port: Some(port),
+            ..Opts::default()
+        },
+        Opts::default(),
+    ] {
+        let joined = ok(join(&member.places, &opts, &code));
+        assert!(
+            joined.contains(&format!("recorded this machine as 127.0.0.1:{port} ")),
+            "{opts:?}: {joined}"
+        );
+    }
+    let book = read_peers(&issuer.places.state).unwrap();
+    assert_eq!(
+        book.iter()
+            .map(|peer| (peer.host.as_str(), peer.port))
+            .collect::<Vec<_>>(),
+        [("127.0.0.1", port)]
+    );
+}
+
+#[test]
+fn peers_beside_a_key_it_cannot_use_refuses_saying_how_it_reads_again() {
+    let (_issuer, code, _serving) = issuing("unusable-issuer");
+    let member = World::new("unusable-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let link = member.places.config.with_file_name("fleet.key.copy");
+    std::fs::hard_link(member.places.state.join(KEY_FILE), &link).unwrap();
+    let refused = peers(&member.places, &[]);
+    assert!(
+        matches!(&refused, Err(Failure::Failed(why)) if why.contains("another link") && why.contains("(0600, one link)")),
+        "{refused:?}"
+    );
+    std::fs::remove_file(&link).unwrap();
+    let listed = ok(peers(&member.places, &[]));
+    assert!(
+        listed.contains(" issuer "),
+        "the book kept its issuer: {listed}"
+    );
+}
+
+#[test]
+fn a_drive_that_meets_a_listener_between_generations_is_asked_again() {
+    use aterm_net::fleet::FleetError;
+    let at = std::net::SocketAddr::from(([127, 0, 0, 1], 7100));
+    for again in [
+        Unreached::Handshake(at, FleetError::Tls(io::ErrorKind::BrokenPipe.into())),
+        Unreached::Handshake(at, FleetError::Io(io::ErrorKind::UnexpectedEof.into())),
+        Unreached::Handshake(at, FleetError::AddressBusy),
+        Unreached::Connect(at, io::ErrorKind::ConnectionRefused.into()),
+    ] {
+        assert!(drive_again(&again), "{again:?}");
+    }
+    for once in [
+        Unreached::Handshake(at, FleetError::ListenerWrongSecret),
+        Unreached::Handshake(at, FleetError::UnknownOp("drive".to_owned())),
+        Unreached::Handshake(at, FleetError::Tls(io::ErrorKind::InvalidData.into())),
+    ] {
+        assert!(!drive_again(&once), "{once:?}");
     }
 }
 
@@ -4652,4 +4730,11 @@ fn an_init_again_of_one_stopped_before_aterm_toml_writes_what_it_asked() {
         matches!(&whole, Err(Failure::Usage(why)) if why.contains("changes nothing without") && why.contains("`aterm fleet allow content`")),
         "{whole:?}"
     );
+    let config_after = world.config();
+    let level = init(places, &args(&["--allow", "facts"]));
+    assert!(
+        matches!(&level, Err(Failure::Usage(why)) if why.ends_with("already the fleet's issuer: a level is set by `aterm fleet allow facts`, not `init`")),
+        "{level:?}"
+    );
+    assert_eq!(world.config(), config_after, "nothing written");
 }

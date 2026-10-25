@@ -26,6 +26,28 @@ pub(crate) struct ClaudeExcerpts {
     pub(crate) transcript_len: Option<u64>,
 }
 
+/// What the rollout tap publishes for a codex process (`SessionTimeline::set_codex_survey`):
+/// the survey's fields a codex screen does not give.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CodexSurvey {
+    /// The rollout's facts ([`aterm_agent::harness::codex_facts`]).
+    pub(crate) facts: aterm_agent::harness::codex_facts::CodexFacts,
+    /// The branch checked out at the rollout's cwd.
+    pub(crate) branch: Option<String>,
+    /// Task prompt head from [`task_prompt_of_env`].
+    pub(crate) task: Option<String>,
+}
+
+impl CodexSurvey {
+    fn excerpts(&self) -> ClaudeExcerpts {
+        ClaudeExcerpts {
+            excerpts: self.facts.excerpts.clone(),
+            task: self.task.clone(),
+            transcript_len: None,
+        }
+    }
+}
+
 /// Which of a session's fields a survey answers with ([the module](self)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Detail level for a session survey ([the module](self)).
@@ -427,7 +449,7 @@ struct Row {
 }
 
 fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: u64) -> Row {
-    let (agent, gauges, task, footer, excerpts, needs, hold_by, ask) = {
+    let (agent, gauges, task, footer, excerpts, codex, shown, needs, hold_by, ask) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let need = timeline.need();
         (
@@ -436,6 +458,8 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
             timeline.task().cloned(),
             timeline.claude_footer_shown(),
             timeline.claude_excerpts().cloned(),
+            timeline.codex_survey().cloned(),
+            timeline.program_shown(),
             need.needs_word(),
             need.hold_word(),
             need.need
@@ -458,6 +482,16 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         )
     };
     let is_agent = agent.reader.is_some();
+    // A reader that names no state (codex's) leaves the word to what the program says itself.
+    let (agent_word, agent_ms) = match shown.filter(|_| agent.word == "unknown") {
+        Some(shown) => (
+            crate::program_state::survey_word(shown.state),
+            shown.age_ms(),
+        ),
+        None => (agent.word, agent.age_ms()),
+    };
+    let codex_facts = codex.as_ref().map(|c| &c.facts);
+    let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
     let engine = engine_read(h, level == SurveyLevel::Content && excerpts.is_none());
     let human = h.ctx.human_input.age_ms(now_us);
     let task_ms = task
@@ -466,8 +500,8 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
     let doing = excerpts.as_ref().and_then(|e| e.excerpts.doing.as_deref());
     let keep = if attention.is_some()
         || needs != "-"
-        || matches!(agent.word, "busy" | "prompt" | "question")
-        || agent.word.starts_with("wall:")
+        || matches!(agent_word, "busy" | "prompt" | "question")
+        || agent_word.starts_with("wall:")
     {
         2
     } else {
@@ -494,18 +528,33 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         h.state.as_str(),
         word_token(agent.program.as_deref()),
         program_kind(is_agent, agent.program.as_deref()),
-        agent.word,
+        agent_word,
         word_token(agent.detail.as_deref()),
-        agent.age_ms(),
+        agent_ms,
         number_token(human),
         number_token(gauges.shells.map(u64::from)),
         task.as_ref().map_or("-", |t| t.state.as_str()),
         task.as_ref().map_or(0, |t| t.rev),
         word_token(task.as_ref().map(|t| t.from.as_str())),
         number_token(task_ms),
-        word_token(footer.as_ref().and_then(|f| f.model.as_deref())),
-        word_token(footer.as_ref().and_then(|f| f.effort.as_deref())),
-        number_token(gauges.ctx_pct.map(u64::from)),
+        word_token(
+            footer
+                .as_ref()
+                .and_then(|f| f.model.as_deref())
+                .or_else(|| codex_facts.and_then(|c| c.model.as_deref()))
+        ),
+        word_token(
+            footer
+                .as_ref()
+                .and_then(|f| f.effort.as_deref())
+                .or_else(|| codex_facts.and_then(|c| c.effort.as_deref()))
+        ),
+        number_token(
+            gauges
+                .ctx_pct
+                .or_else(|| codex_facts.and_then(|c| c.ctx_left_pct))
+                .map(u64::from)
+        ),
         word_token(engine.detail.as_deref()),
         word_token(doing),
         role_token(role.as_deref(), level),
@@ -516,12 +565,20 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         h.ctx.bells.wire(now_unix_ms),
     );
     if level == SurveyLevel::Content {
-        let cwd = footer.as_ref().and_then(|f| f.path.clone()).or(engine.cwd);
+        let cwd = footer
+            .as_ref()
+            .and_then(|f| f.path.clone())
+            .or_else(|| {
+                codex_facts
+                    .and_then(|c| c.cwd.as_deref()?.to_str())
+                    .map(crate::app_tabs::home_abbreviated)
+            })
+            .or(engine.cwd);
         let prompt = prompt_of(h, task.is_some(), excerpts.as_ref());
         let finished = matches!(
             task.as_ref().map(|t| t.state),
             Some(crate::task_record::TaskState::Done | crate::task_record::TaskState::Exited)
-        ) || agent.word == "idle";
+        ) || agent_word == "idle";
         let said = excerpts.as_ref().and_then(|e| {
             if finished {
                 e.excerpts.said_end.as_deref()
@@ -535,7 +592,12 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
             excerpt_token(user_title.as_deref()),
             excerpt_token(engine.title.as_deref()),
             excerpt_token(cwd.as_deref()),
-            branch_token(footer.as_ref().and_then(|f| f.branch.as_deref())),
+            branch_token(
+                footer
+                    .as_ref()
+                    .and_then(|f| f.branch.as_deref())
+                    .or_else(|| codex.as_ref().and_then(|c| c.branch.as_deref()))
+            ),
             excerpt_token(prompt.as_deref()),
             excerpt_token(said),
             excerpt_token(engine.command.as_deref()),

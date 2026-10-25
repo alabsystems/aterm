@@ -1160,7 +1160,7 @@ pub fn harness_login_wall_model() -> Model {
     }
 }
 
-/// The usage tap (aterm-agent's `harness::tap`; the accounts design v2 §3.1, §3.2): one tab's Claude Code across aterm's relaunches, the status-line tap aterm may put on the line, the readings it writes, and the host's read of them at its decided turn ends.
+/// The usage tap (aterm-agent's `harness::tap`; the accounts design v2 §3.1, §3.2): one tab's Claude Code across aterm's relaunches, the status-line tap aterm may put on the line, the readings it writes, and the host's read of them at its decided turn ends. The owner's own statusLine (`userline`) no longer keeps the tap off (owner ruling R-12): the line carries it (`tap --then`), so the owner's row still shows; `NoChainLook` is a gate that taps without looking at the settings chain, putting the plain tap over that row (`displaced`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_usage_tap_model() -> Model {
@@ -1210,10 +1210,7 @@ pub fn harness_usage_tap_model() -> Model {
 
             action Launch when (MaxPid > pid) {
                 pid = pid + 1;
-                tapped = if (
-                    armed == 1 && cred == 1 &&
-                    (userline == 0 || Buggy == 1 || NoChainLook == 1)
-                ) { 1 } else { 0 };
+                tapped = if (armed == 1 && cred == 1) { 1 } else { 0 };
                 displaced = if (
                     armed == 1 && cred == 1 && userline == 1 &&
                     (Buggy == 1 || NoChainLook == 1)

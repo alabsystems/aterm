@@ -2060,6 +2060,8 @@ pub(crate) struct PoolSaid {
     pub(crate) due: Vec<String>,
     /// Its renewals that answered another account (`accounts::wrong_accounts`).
     pub(crate) wrong: Vec<String>,
+    /// Its pending human sign-in steps, kept across restarts in the pool's bindings.
+    pub(crate) sign_in: Vec<(String, accounts::SignInAction)>,
 }
 
 /// What a tab's relaunch says ([`HostNote::Relaunch`]).
@@ -2184,7 +2186,7 @@ pub(crate) struct Acts {
     pub(crate) task_fact: Arc<TaskFactFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
     /// How long an idle point waits for its relaunch snapshot read ([`refresh_snapshot_at_point`]):
-    /// [`POINT_READ_BOUND`] live; [`Acts::inert`]'s a hang detector's minute, so a test's read lands
+    /// [`POINT_READ_BOUND`] live; `Acts::inert`'s a hang detector's minute, so a test's read lands
     /// before its point goes on unless the test shortens the wait.
     pub(crate) point_read: Duration,
     pub(crate) follow: Arc<FollowFn>,
@@ -14835,8 +14837,10 @@ fn pools_said(seat: &AccountSeat) -> Vec<PoolSaid> {
                 cli: pool.cli,
                 due: accounts::renew_due(&roster, &logins, &pool.state, &pool.enrolled, seat.now),
                 wrong: accounts::wrong_accounts(&roster, &logins),
+                sign_in: accounts::sign_in_tasks(&roster, &logins),
             };
-            (!said.due.is_empty() || !said.wrong.is_empty()).then_some(said)
+            (!said.due.is_empty() || !said.wrong.is_empty() || !said.sign_in.is_empty())
+                .then_some(said)
         })
         .collect()
 }

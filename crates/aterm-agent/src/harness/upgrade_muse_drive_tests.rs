@@ -1462,3 +1462,37 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
 
 #[path = "upgrade_muse_live_drive_tests.rs"]
 mod live_tests;
+
+/// Muse Code's gate reads the composer's first glyph as the loop does
+/// ([`crate::supervise::screen::composer_glyph_cell`]): where a caret is drawn inverse over it,
+/// the glyph after it says whether the text is the hint (`676c74`, Muse Code's placeholder ink) or
+/// a draft. NEGATIVE CONTROLS: the same caret over plain text is a draft, and with no caret drawn
+/// the first glyph is read alone, as before.
+#[test]
+fn the_gate_reads_the_composer_past_a_drawn_caret_as_the_loop_does() {
+    let rows = fixture_rows(aterm_phase::muse::fixtures::DRAFT_1_4_10);
+    let (caret, _) = aterm_phase::muse::composer_draft(&rows).expect("a composer");
+    let scr = super::super::Screen {
+        rows,
+        cursor: Some((caret, 2)),
+        seq: 20,
+        first: 0,
+        generation: None,
+        human: crate::supervise::screen::HumanInput::Never,
+    };
+    let caret_cell = "OK a 111318 d0d0d0 inverse";
+    for (cells, empty) in [
+        (vec![caret_cell, "OK %20 676c74 111318 none"], true),
+        (vec![caret_cell, "OK %20 d0d0d0 111318 none"], false),
+        (vec!["OK a 676c74 111318 none"], true),
+        (vec!["OK a d0d0d0 111318 none"], false),
+    ] {
+        let asked: Vec<String> = (0..cells.len())
+            .map(|k| format!("@{TAB} cell {caret} {}", 2 + k))
+            .collect();
+        let (mut c, server) = super::super::tests::fake_tab(cells.clone());
+        assert_eq!(composer_empty(&mut c, TAB, &scr), empty, "{cells:?}");
+        drop(c);
+        assert_eq!(server.join().expect("server"), asked, "{cells:?}");
+    }
+}

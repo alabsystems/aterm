@@ -867,13 +867,13 @@ fn worker_starter_of(
 
 /// `starter` under the login its CLI's pool picks for a launch
 /// ([`aterm_agent::harness::accounts_pool::launch_env`], once each row's usage was read in its
-/// own home on this launcher thread): the pick's seam variable is exported to
-/// the worker where the pick is a row of its own directory and the starter sets none of that
-/// variable (one that does runs on a home of its own, which the pool leaves alone); the machine's
-/// default row leaves the starter as it is. Claude Code's workers keep the starter's login, which
-/// the host's own flow moves.
+/// own home on this launcher thread), where the starter sets none of the pool's seam variable
+/// (one that does runs on a home of its own, which the pool leaves alone): every pick removes
+/// [`pool_onto`]'s variables, and a row of its own directory also exports its seam variable. The
+/// machine's default row leaves the starter's seam as it is. Claude Code's workers keep the
+/// starter's login, which the host's own flow moves.
 fn pooled_starter(
-    mut starter: aterm_agent::harness::worker::Starter,
+    starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
     local: u64,
 ) -> aterm_agent::harness::worker::Starter {
@@ -903,16 +903,58 @@ fn pooled_starter(
         now,
     };
     if let Some(pick) = accounts_pool::launch_env(&seat, pool, &accounts_pool::live_usage) {
-        aterm_log::info!(
-            "worker session {local}: starts under {} account {}",
-            pool.id(),
-            pick.label
-        );
-        if let Some(value) = pick.value {
-            starter.env.push((var.to_string(), value));
+        match pool_onto(starter.clone(), pool, &pick, &home) {
+            Ok(onto) => {
+                aterm_log::info!(
+                    "worker session {local}: starts under {} account {}",
+                    pool.id(),
+                    pick.label
+                );
+                return onto;
+            }
+            Err(why) => aterm_log::warn!(
+                "worker session {local}: not started under {} account {} ({why}); its starter's \
+                 login stays",
+                pool.id(),
+                pick.label
+            ),
         }
     }
     starter
+}
+
+/// `starter` onto `pool`'s login `pick` ([`pooled_starter`]): the variables
+/// [`aterm_agent::harness::relaunch::pool_args`] removes and its flags (Grok Build's own leader
+/// socket for a row of its own, in the home the starter carries, else `~/.grok` under the user's
+/// `home`), and a row of its own's seam variable exported.
+///
+/// # Errors
+///
+/// [`aterm_agent::harness::relaunch::pool_args`]' refusal.
+pub(crate) fn pool_onto(
+    mut starter: aterm_agent::harness::worker::Starter,
+    pool: aterm_agent::harness::accounts::Cli,
+    pick: &aterm_agent::harness::accounts_pool::LoginEnv,
+    home: &Path,
+) -> Result<aterm_agent::harness::worker::Starter, String> {
+    let carried = |name: &str| {
+        starter
+            .env
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
+    };
+    let cli_home = aterm_agent::ai::facts::home_of(pool.connector(), &carried, Some(home)).ok();
+    let flags = starter.args.as_deref().unwrap_or_default();
+    let args = aterm_agent::harness::relaunch::pool_args(pool, pick, cli_home.as_deref(), flags)?;
+    if let Ok(flags) = starter.args.as_mut() {
+        *flags = args.flags;
+    }
+    starter.unset = args.unset;
+    if let Some(value) = pick.value.clone() {
+        starter.env.push((pick.var.to_string(), value));
+    }
+    Ok(starter)
 }
 
 /// The group in front of the session's terminal now (`tcgetpgrp` on its PTY

@@ -422,7 +422,9 @@ Exits 0 when its executable is replaced, its lifeline ends, or its socket path i
 or taken by another socket; exits 75 when its log is poisoned, so its supervisor restarts
 it. Retains `ev` records up to 7 days / 256 MiB, unread mail up to 7 days / 64 MiB, each
 presence row's latest value, and other records up to 7 days / 32 MiB (`<log>.held` keeps
-what compaction must not drop).
+what compaction must not drop). Unread mail given up past its limit is logged here (its
+subject and count) and told to its node's bridge (the range and, where counted, how many),
+so every session that node serves names it in `inbox` (`given_up=`) and marks it in its log.
 ";
     let parsed = match crate::broker_args::BrokerArgs::parse(args) {
         Ok(parsed) => parsed,

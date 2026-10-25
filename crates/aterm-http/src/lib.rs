@@ -7,6 +7,8 @@
 pub mod client;
 /// `TcpStream::connect_timeout`, with a refusal reported promptly on Windows too.
 pub mod connect;
+/// Whether macOS's Local Network privacy refuses this process a `.local` name.
+mod local_network;
 pub mod pem;
 pub mod proxy;
 pub mod stream;

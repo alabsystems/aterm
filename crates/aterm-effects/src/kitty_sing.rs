@@ -191,7 +191,6 @@ pub const SING_REPEAT_GAP: Duration = Duration::from_millis(250);
 pub const SING_WIND_DOWN: f32 = 1.0;
 
 /// Per-window sing-along detector.
-#[derive(Default)]
 pub struct KittySing {
     /// The character of the current same-key run.
     run: Option<char>,
@@ -217,7 +216,33 @@ pub struct KittySing {
     fan_bar: Option<u64>,
 }
 
+impl Default for KittySing {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KittySing {
+    /// Fresh unarmed sing-along detector.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            run: None,
+            count: 0,
+            last: None,
+            session: None,
+            armed_at: None,
+            wind_from: None,
+            handover_from: None,
+            armed_external: None,
+            external: None,
+            last_external_arm: None,
+            fan_bar: None,
+        }
+    }
+
     /// Bind the run to `session`, winding down on a switch.
     #[inline]
     fn rekey(&mut self, now: Instant, session: u64) {
@@ -671,7 +696,17 @@ pub struct MusicNotes {
 }
 
 impl Default for MusicNotes {
+    #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MusicNotes {
+    /// Construct an empty note pool.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             ring: [None; MAX_NOTES],
             live: 0,
@@ -680,9 +715,7 @@ impl Default for MusicNotes {
             rng: 0x9E37_79B9,
         }
     }
-}
 
-impl MusicNotes {
     #[inline]
     const fn rnd(&mut self) -> u32 {
         let mut x = self.rng;
@@ -842,13 +875,14 @@ pub const fn note_host_id(kind: NoteKind, w: u16, h: u16) -> u64 {
 /// Natural note tile size for a cell of height `cell_h`.
 #[inline]
 #[must_use]
-pub fn note_nat_size(kind: NoteKind, cell_h: u16) -> (u16, u16) {
-    let h = (f32::from(cell_h.max(1)) * 0.75).round().max(4.0) as u16;
+pub const fn note_nat_size(kind: NoteKind, cell_h: u16) -> (u16, u16) {
+    let ch = if cell_h > 1 { cell_h } else { 1 };
+    let h = ((ch as f32) * 0.75).round().max(4.0) as u16;
     let aspect = match kind {
         NoteKind::Eighth => 0.72,
         NoteKind::Beamed => 1.05,
     };
-    let w = (f32::from(h) * aspect).round().max(4.0) as u16;
+    let w = ((h as f32) * aspect).round().max(4.0) as u16;
     (w, h)
 }
 

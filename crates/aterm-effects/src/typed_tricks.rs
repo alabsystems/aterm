@@ -91,16 +91,30 @@ impl Cuts {
     };
 }
 
+impl Default for Cuts {
+    #[inline]
+    fn default() -> Self {
+        Self::WHOLE
+    }
+}
+
 const _: () = assert!(WORD_BYTES <= u128::BITS as usize);
 
 /// The answer to one fed press.
 #[must_use = "an unread feed is a lost fire, confirm or revoke"]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TrickFeed<'a> {
     /// What the press meant to the pet, if anything.
     pub event: Option<TrickEvent<'a>>,
     /// Enter submitted a line of nothing but pet vocabulary (at least one word, pure, unpoisoned).
     pub submit_pet_only: bool,
+}
+
+impl Default for TrickFeed<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl TrickFeed<'_> {
@@ -117,6 +131,13 @@ impl TrickFeed<'_> {
 struct Word {
     bytes: [u8; WORD_BYTES],
     len: u8,
+}
+
+impl Default for Word {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 impl Word {
@@ -408,6 +429,13 @@ struct Line {
     last_fire: Option<Instant>,
     /// Which trick that fire asked for (the attention law).
     last_trick: Option<Trick>,
+}
+
+impl Default for Line {
+    #[inline]
+    fn default() -> Self {
+        Self::FRESH
+    }
 }
 
 impl Line {

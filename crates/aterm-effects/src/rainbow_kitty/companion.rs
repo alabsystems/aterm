@@ -468,29 +468,50 @@ impl PetOnGlass {
     /// Read off the pet's published frame; `None` when the pet is not on glass (`alpha == 0`) or the cell metrics are degenerate.
     #[inline]
     #[must_use]
-    pub fn of(frame: &PetFrame, geom: Geom) -> Option<Self> {
-        Self::of_with_body_px(frame, geom).map(|(on_glass, _)| on_glass)
+    pub const fn of(frame: &PetFrame, geom: Geom) -> Option<Self> {
+        match Self::of_with_body_px(frame, geom) {
+            Some((on_glass, _)) => Some(on_glass),
+            None => None,
+        }
     }
 
     /// Read [`PetOnGlass`] and the body's window-pixel box `(x0, x1, y0, y1)` off the pet's published frame in a single pass.
     #[inline]
     #[must_use]
-    pub fn of_with_body_px(frame: &PetFrame, geom: Geom) -> Option<(Self, (i32, i32, i32, i32))> {
-        let cell_w = u16::try_from(geom.cw).ok()?;
-        let cell_h = u16::try_from(geom.ch).ok()?;
-        let cols = u16::try_from(geom.cols).ok()?;
-        let rows = u16::try_from(geom.rows).ok()?;
-        let (x0, x1, y0, y1) = frame.body_px(cell_w, cell_h, cols, rows)?;
-        let cw = f32::from(cell_w);
+    pub const fn of_with_body_px(
+        frame: &PetFrame,
+        geom: Geom,
+    ) -> Option<(Self, (i32, i32, i32, i32))> {
+        if geom.cw > u16::MAX as usize
+            || geom.ch > u16::MAX as usize
+            || geom.cols > u16::MAX as usize
+            || geom.rows > u16::MAX as usize
+        {
+            return None;
+        }
+        let cell_w = geom.cw as u16;
+        let cell_h = geom.ch as u16;
+        let cols = geom.cols as u16;
+        let rows = geom.rows as u16;
+        let Some((x0, x1, y0, y1)) = frame.body_px(cell_w, cell_h, cols, rows) else {
+            return None;
+        };
+        let cw = cell_w as f32;
         if cw <= 0.0 {
             return None;
         }
-        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        let (ox, oy) = (geom.origin_x as i32, geom.origin_y as i32);
+        let row_u32 = frame.row.round().max(0.0) as u32;
+        let row = if row_u32 <= u16::MAX as u32 {
+            row_u32 as u16
+        } else {
+            u16::MAX
+        };
         Some((
             Self {
                 col: x0 as f32 / cw,
                 width: (x1 - x0) as f32 / cw,
-                row: u16::try_from(frame.row.round().max(0.0) as u32).unwrap_or(u16::MAX),
+                row,
                 settled: frame.action.settled(),
                 purr: frame.purr,
                 contented: frame.contented,
@@ -531,13 +552,23 @@ const SHADE_BORDER_CELLS: f32 = 0.30;
 /// the sky emits, so the shade is the body's last box joined with that box
 /// carried on by its last frame's move (the box it is about to be drawn at),
 /// each shaved of the tile's transparent border at the sides.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PetShade {
     /// The last two drawn boxes, `(x0, x1, y0, y1)` in window pixels, newest first.
     boxes: [Option<(i32, i32, i32, i32)>; 2],
 }
 
+impl Default for PetShade {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl PetShade {
+    /// Empty pet shade with no recorded boxes.
+    pub const EMPTY: Self = Self { boxes: [None; 2] };
+
     /// Note the body's drawn box this frame (`None`: off glass), window pixels.
     #[inline]
     pub const fn note(&mut self, body: Option<(i32, i32, i32, i32)>) {
@@ -553,7 +584,7 @@ impl PetShade {
 
     /// Whether a star centred at `(x, y)` (window pixels) lies on the body.
     #[must_use]
-    pub fn hides(&self, (x, y): (i32, i32), cell_w: usize) -> bool {
+    pub const fn hides(&self, (x, y): (i32, i32), cell_w: usize) -> bool {
         let Some(last) = self.boxes[0] else {
             return false;
         };
@@ -579,7 +610,7 @@ impl PetShade {
 /// on, as window-pixel boxes `(x0, x1, y0, y1)`, right and bottom exclusive.
 /// No star is drawn on them and the ribbon's body never feathers up into
 /// them.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct KeepOut {
     /// Every box: the word icons' and the lettered or filled cells'.
     boxes: Vec<(i32, i32, i32, i32)>,
@@ -588,6 +619,13 @@ pub struct KeepOut {
     /// Each lettered row's span, first lettered or filled cell to last, a
     /// row tall ([`Self::behind_text`]).
     rows: Vec<(i32, i32, i32, i32)>,
+}
+
+impl Default for KeepOut {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 impl Clone for KeepOut {
@@ -609,6 +647,12 @@ impl Clone for KeepOut {
 }
 
 impl KeepOut {
+    /// Empty keep-out set.
+    pub const EMPTY: Self = Self {
+        boxes: Vec::new(),
+        cells: Vec::new(),
+        rows: Vec::new(),
+    };
     /// This frame's boxes, window pixels, all of them lettered or filled
     /// cells ([`Self::set_split`] with no icon).
     #[inline]
@@ -644,8 +688,8 @@ impl KeepOut {
     /// The lettered rows' spans ([`Self::set_rows`]).
     #[inline]
     #[must_use]
-    pub fn rows(&self) -> &[(i32, i32, i32, i32)] {
-        &self.rows
+    pub const fn rows(&self) -> &[(i32, i32, i32, i32)] {
+        self.rows.as_slice()
     }
 
     /// How much of a light at `(x, y)` shows in front of the letters: 0
@@ -657,28 +701,43 @@ impl KeepOut {
     /// again below their baseline.
     #[inline]
     #[must_use]
-    pub fn behind_text(&self, (x, y): (f32, f32), band: (f32, f32), pad: f32, feather: f32) -> f32 {
-        if self.rows.is_empty() {
+    pub const fn behind_text(
+        &self,
+        (x, y): (f32, f32),
+        band: (f32, f32),
+        pad: f32,
+        feather: f32,
+    ) -> f32 {
+        let rows = self.rows.as_slice();
+        if rows.is_empty() {
             return 1.0;
         }
         let feather = feather.max(1.0);
+        let inv_feather = 1.0 / feather;
         let mut k = 1.0f32;
-        for &(x0, x1, y0, y1) in &self.rows {
+        let mut i = 0;
+        while i < rows.len() {
+            let (x0, x1, y0, y1) = rows[i];
+            i += 1;
             let (x0, x1) = (x0 as f32 - pad, x1 as f32 + pad);
             let dx = (x - x0).min(x1 - x);
             if dx <= 0.0 {
                 continue;
             }
             let ch = (y1 - y0) as f32;
-            let (b0, b1) = (y0 as f32 + band.0 * ch - pad, y0 as f32 + band.1 * ch + pad);
-            let d = dx.min(y - b0).min(b1 - y);
-            if d <= 0.0 {
+            let b0 = y0 as f32 + band.0 * ch - pad;
+            if y <= b0 {
                 continue;
             }
+            let b1 = y0 as f32 + band.1 * ch + pad;
+            if y >= b1 {
+                continue;
+            }
+            let d = dx.min(y - b0).min(b1 - y);
             if d >= feather {
                 return 0.0;
             }
-            let u = (d / feather).min(1.0);
+            let u = (d * inv_feather).min(1.0);
             k = k.min(1.0 - u * u * (3.0 - 2.0 * u));
         }
         k
@@ -687,19 +746,26 @@ impl KeepOut {
     /// The boxes, window pixels.
     #[inline]
     #[must_use]
-    pub fn boxes(&self) -> &[(i32, i32, i32, i32)] {
-        &self.boxes
+    pub const fn boxes(&self) -> &[(i32, i32, i32, i32)] {
+        self.boxes.as_slice()
     }
 
     /// Whether a mark centred at `(x, y)` that reaches `reach` px round its
     /// centre touches a box.
     #[inline]
     #[must_use]
-    pub fn covers(&self, (x, y): (i32, i32), reach: i32) -> bool {
-        let r = reach.max(0);
-        self.boxes
-            .iter()
-            .any(|&(x0, x1, y0, y1)| x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1)
+    pub const fn covers(&self, (x, y): (i32, i32), reach: i32) -> bool {
+        let r = if reach > 0 { reach } else { 0 };
+        let boxes = self.boxes.as_slice();
+        let mut i = 0;
+        while i < boxes.len() {
+            let (x0, x1, y0, y1) = boxes[i];
+            if x + r >= x0 && x - r < x1 && y + r >= y0 && y - r < y1 {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// What is left of a column's span `(y0, y1)` across `(x0, x1)` once
@@ -710,14 +776,42 @@ impl KeepOut {
     /// sprite box, wider than the face, would notch the sky beside it.
     #[inline]
     #[must_use]
-    pub fn below(&self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> (i32, i32) {
-        let top = self
-            .cells
-            .iter()
-            .filter(|b| b.0 < x1 && x0 < b.1 && b.2 < y1 && y0 < b.3)
-            .map(|b| b.3)
-            .fold(y0, i32::max);
-        (top.min(y1), y1)
+    pub const fn below(&self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> (i32, i32) {
+        let cells = self.cells.as_slice();
+        if cells.is_empty() || y0 >= y1 || x0 >= x1 {
+            return (if y0 < y1 { y0 } else { y1 }, y1);
+        }
+        let mut top = y0;
+        let mut i = 0;
+        while i < cells.len() {
+            let b = cells[i];
+            i += 1;
+            if b.3 > top && b.2 < y1 && b.0 < x1 && x0 < b.1 {
+                top = b.3;
+                if top >= y1 {
+                    return (y1, y1);
+                }
+            }
+        }
+        (if top < y1 { top } else { y1 }, y1)
+    }
+
+    /// Whether any box stands on a row whose top is `row_top` (`row_top - 1.0`
+    /// lies in `[y0, y1)`).
+    #[inline]
+    #[must_use]
+    pub const fn has_ceiling_at(&self, row_top: f32) -> bool {
+        let above = row_top - 1.0;
+        let boxes = self.boxes.as_slice();
+        let mut i = 0;
+        while i < boxes.len() {
+            let (_, _, y0, y1) = boxes[i];
+            if (y0 as f32) <= above && above < y1 as f32 {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// How far up a body standing on a row whose top is `row_top` may reach
@@ -725,13 +819,17 @@ impl KeepOut {
     /// top, easing back to `free` (no ceiling) over `ease` px beside it.
     #[inline]
     #[must_use]
-    pub fn ceiling(&self, x: f32, row_top: f32, free: f32, ease: f32) -> f32 {
-        if self.boxes.is_empty() || ease <= 0.0 || !ease.is_finite() {
+    pub const fn ceiling(&self, x: f32, row_top: f32, free: f32, ease: f32) -> f32 {
+        let boxes = self.boxes.as_slice();
+        if boxes.is_empty() || ease <= 0.0 || !ease.is_finite() {
             return free;
         }
         let above = row_top - 1.0;
         let mut d = ease;
-        for &(x0, x1, y0, y1) in &self.boxes {
+        let mut i = 0;
+        while i < boxes.len() {
+            let (x0, x1, y0, y1) = boxes[i];
+            i += 1;
             if (y0 as f32) <= above && above < y1 as f32 {
                 let dx = (x0 as f32 - x).max(x - x1 as f32);
                 if dx <= 0.0 {
@@ -763,7 +861,7 @@ pub struct StarCatch {
 }
 
 /// What v2 offers the resident pet this frame, minted by `Engine::pet_offer`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PetOffer {
     /// (a) The perk edge `t₀ + T` (D13), the same `Instant` the landing pin, arrival flash, caret flare and audio bell read (§6.7).
     pub perk_at: Option<Instant>,
@@ -775,7 +873,22 @@ pub struct PetOffer {
     pub mote_rgb: Option<u32>,
 }
 
+impl Default for PetOffer {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl PetOffer {
+    /// Empty pet offer.
+    pub const EMPTY: Self = Self {
+        perk_at: None,
+        catch: None,
+        mote_t: None,
+        mote_rgb: None,
+    };
+
     /// True when this frame offers the pet nothing, the common case.
     #[must_use]
     #[cfg(test)]
@@ -793,7 +906,7 @@ impl PetOffer {
 /// past the grid, is unknown.
 #[inline]
 #[must_use]
-pub fn cell_ink(
+pub const fn cell_ink(
     cells: &[Vec<aterm_core::terminal::RenderCell>],
     row: u16,
     col: u16,
@@ -802,11 +915,13 @@ pub fn cell_ink(
     if col >= cols {
         return None;
     }
-    let line = cells.get(usize::from(row))?;
-    Some(
-        line.get(usize::from(col))
-            .is_some_and(|cell| !matches!(cell.ch, ' ' | '\0')),
-    )
+    let r = row as usize;
+    if r >= cells.len() {
+        return None;
+    }
+    let line = cells[r].as_slice();
+    let c = col as usize;
+    Some(c < line.len() && !matches!(line[c].ch, ' ' | '\0'))
 }
 
 /// `at + ms`, saturating. The module's one ms-to-`Instant` conversion, so nothing rounds to

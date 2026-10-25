@@ -245,18 +245,25 @@ impl SoundVoice {
     /// Resolve a spelling (canonical [`SoundVoice::name`] or a [`SoundVoice::ALIASES`] entry, trimmed, ASCII-case-insensitive) to its voice; `None` otherwise.
     #[inline]
     #[must_use]
-    pub fn parse(token: &str) -> Option<Self> {
-        let token = token.trim();
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|v| token.eq_ignore_ascii_case(v.name()))
-            .or_else(|| {
-                Self::ALIASES
-                    .iter()
-                    .find(|(alias, _)| token.eq_ignore_ascii_case(alias))
-                    .map(|&(_, voice)| voice)
-            })
+    pub const fn parse(token: &str) -> Option<Self> {
+        let token = crate::cursor_glow::spellings::trim_whitespace_bytes(token);
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let v = Self::ALL[i];
+            if crate::cursor_glow::spellings::eq_ascii_ci(token, v.name()) {
+                return Some(v);
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j < Self::ALIASES.len() {
+            let (alias, voice) = Self::ALIASES[j];
+            if crate::cursor_glow::spellings::eq_ascii_ci(token, alias) {
+                return Some(voice);
+            }
+            j += 1;
+        }
+        None
     }
 }
 
@@ -284,7 +291,7 @@ pub struct SoundEvent {
 }
 
 /// Side-car scalars for the music box that [`SoundEvent`] does not carry (`docs/design/RAINBOW-KITTY-V2.md` §16).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EventMeta {
     /// The host input-clock stamp in milliseconds, on both the keyed and the observed-echo paths: the melody's one time source (the inter-key gap shapes each note).
     pub at_ms: u32,
@@ -298,6 +305,25 @@ pub struct EventMeta {
     pub block_lead_s: f32,
     /// Flow heat, 0..1: how far into flow state the typist is, from the glow engine's flow counter (fast keys with no delete; a delete, a Kill or a slow key resets it).
     pub flow: f32,
+}
+
+impl Default for EventMeta {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl EventMeta {
+    /// Zeroed event metadata.
+    pub const EMPTY: Self = Self {
+        at_ms: 0,
+        glyph_class: 0,
+        rank: 0,
+        pan_from: 0.0,
+        block_lead_s: 0.0,
+        flow: 0.0,
+    };
 }
 
 const BLOCK_LEAD_MAX_S: f32 = 0.050;
@@ -505,8 +531,8 @@ struct GestureShape {
 }
 
 #[inline]
-fn shift_lift(ev: &SoundEvent, kind: SoundKind) -> i32 {
-    if kind == SoundKind::Typed && ev.shifted {
+const fn shift_lift(ev: &SoundEvent, kind: SoundKind) -> i32 {
+    if matches!(kind, SoundKind::Typed) && ev.shifted {
         SHIFT_GLYPH_LIFT
     } else {
         0
@@ -514,8 +540,8 @@ fn shift_lift(ev: &SoundEvent, kind: SoundKind) -> i32 {
 }
 
 #[inline]
-fn shift_gain(ev: &SoundEvent, kind: SoundKind) -> f32 {
-    if kind == SoundKind::Typed && ev.shifted {
+const fn shift_gain(ev: &SoundEvent, kind: SoundKind) -> f32 {
+    if matches!(kind, SoundKind::Typed) && ev.shifted {
         SHIFT_GLYPH_GAIN
     } else {
         1.0
@@ -528,7 +554,7 @@ fn shift_ratio(ev: &SoundEvent, kind: SoundKind) -> f32 {
 }
 
 #[inline]
-fn gesture_shape(kind: SoundKind) -> GestureShape {
+const fn gesture_shape(kind: SoundKind) -> GestureShape {
     match kind {
         SoundKind::Shift => GestureShape {
             dir: 1,
@@ -540,12 +566,12 @@ fn gesture_shape(kind: SoundKind) -> GestureShape {
             dir,
             notes: 1,
             step: 0,
-            offset: i32::from(dir) * GESTURE_CHAR_STEP,
+            offset: (dir as i32) * GESTURE_CHAR_STEP,
         },
         SoundKind::Sweep { dir } => GestureShape {
             dir,
             notes: CURSOR_SWEEP_RUN,
-            step: i32::from(dir) * GESTURE_CHAR_STEP,
+            step: (dir as i32) * GESTURE_CHAR_STEP,
             offset: 0,
         },
         _ => GestureShape {
@@ -558,7 +584,7 @@ fn gesture_shape(kind: SoundKind) -> GestureShape {
 }
 
 #[inline]
-fn fold_octave(f: f32, lo: f32) -> f32 {
+const fn fold_octave(f: f32, lo: f32) -> f32 {
     let mut f = f.clamp(20.0, 20_000.0);
     while f >= lo * 2.0 {
         f *= 0.5;
@@ -570,12 +596,12 @@ fn fold_octave(f: f32, lo: f32) -> f32 {
 }
 
 #[inline]
-fn bass_octave(anchor: f32) -> f32 {
+const fn bass_octave(anchor: f32) -> f32 {
     fold_octave(anchor, SPACE_BASS_LO_HZ)
 }
 
 #[inline]
-fn gesture_bend(f: f32, dir: i8) -> (f32, f32) {
+const fn gesture_bend(f: f32, dir: i8) -> (f32, f32) {
     if dir >= 0 {
         (f / GESTURE_BEND, f)
     } else {
@@ -612,7 +638,7 @@ const SHIFT_TING_OCTAVE_LEVEL: f32 = 0.14;
 const SHIFT_TING_VOICE_LEVEL: f32 = 0.33;
 
 #[inline]
-fn ting_octave(f: f32) -> f32 {
+const fn ting_octave(f: f32) -> f32 {
     fold_octave(f, SHIFT_TING_LO_HZ)
 }
 
@@ -708,7 +734,7 @@ const SPACE_TWINKLE_DECAY_S: f32 = 0.038;
 const SPACE_TWINKLE_LO_HZ: f32 = SPACE_BASS_LO_HZ * 40.0;
 
 #[inline]
-fn twinkle_hz(root: f32) -> f32 {
+const fn twinkle_hz(root: f32) -> f32 {
     fold_octave(root * SPACE_TWINKLE_RATIO, SPACE_TWINKLE_LO_HZ)
 }
 const GLIDE_KIND_GAIN: f32 = 0.78;
@@ -919,7 +945,7 @@ const fn celebration_sway(pan: f32, deg: i32) -> f32 {
 }
 
 #[inline]
-fn celebration_lead(hz: f32, shimmer: f32, third: Partial) -> [Partial; 3] {
+const fn celebration_lead(hz: f32, shimmer: f32, third: Partial) -> [Partial; 3] {
     [
         Partial {
             lvl: 0.55,
@@ -928,14 +954,14 @@ fn celebration_lead(hz: f32, shimmer: f32, third: Partial) -> [Partial; 3] {
             wave: Wave::Pulse {
                 duty: CELEBRATION_LEAD_DUTY,
             },
-            ..Partial::default()
+            ..Partial::DEFAULT
         },
         Partial {
             lvl: shimmer,
             f0: hz * 2.0,
             f1: hz * 2.0,
             wave: Wave::Pulse { duty: 0.5 },
-            ..Partial::default()
+            ..Partial::DEFAULT
         },
         third,
     ]
@@ -981,6 +1007,28 @@ struct Partial {
     k_f: f32,
     p_e: f32,
     k_p: f32,
+}
+
+impl Partial {
+    pub(super) const DEFAULT: Self = Self {
+        lvl: 0.0,
+        f0: 0.0,
+        f1: 0.0,
+        glide: 0.0,
+        fm_ratio: 0.0,
+        fm_i0: 0.0,
+        fm_tau: 0.0,
+        wave: Wave::Sine,
+        decay: 0.0,
+        ph: 0.0,
+        fm_ph: 0.0,
+        g_e: 0.0,
+        k_g: 0.0,
+        fm_e: 0.0,
+        k_f: 0.0,
+        p_e: 0.0,
+        k_p: 0.0,
+    };
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -1040,6 +1088,60 @@ struct Voice {
 }
 
 impl Voice {
+    pub(super) const DEFAULT: Self = Self {
+        on: false,
+        t: 0.0,
+        delay: 0.0,
+        dur: 0.0,
+        gl: 0.0,
+        gr: 0.0,
+        attack: 0.0,
+        decay: 0.0,
+        p: [Partial::DEFAULT; 3],
+        n_lvl: 0.0,
+        n_f0: 0.0,
+        n_f1: 0.0,
+        n_glide: 0.0,
+        n_q: 0.0,
+        n_lp: 0.0,
+        n_bp: 0.0,
+        env_a: 0.0,
+        env_d: 0.0,
+        k_a: 0.0,
+        k_d: 0.0,
+        n_e: 0.0,
+        k_n: 0.0,
+        env_run: false,
+        env_n: 0,
+        tw_rate: 0.0,
+        tw_depth: 0.0,
+        tw_ph: 0.0,
+        lp_cut: 0.0,
+        lp: 0.0,
+        lp_k: 0.0,
+        n_damp: 0.0,
+        svf_g: 0.0,
+        svf_den: 0.0,
+        duck_exempt: false,
+        celebration: false,
+        bass: false,
+        shimmer: false,
+        damp: 0.0,
+        damp0: 0.0,
+        n_decay: 0.0,
+        nd_e: 0.0,
+        k_nd: 0.0,
+        pan1: 0.0,
+        gl1: 0.0,
+        gr1: 0.0,
+        pan_glide_s: 0.0,
+        pan_k: 0.0,
+        pan_t0: 0.0,
+        lane: 0,
+        born: 0,
+        arm_ttl: 0.0,
+    };
+
     #[inline]
     fn weight(&self) -> f32 {
         if !self.on {
@@ -1074,6 +1176,27 @@ struct Bed {
 }
 
 impl Bed {
+    const DEFAULT: Self = Self {
+        energy: 0.0,
+        level: 0.0,
+        gain: 0.0,
+        ph1: 0.0,
+        ph2: 0.0,
+        ph3: 0.0,
+        lfo1: 0.0,
+        lfo2: 0.0,
+        lp1: 0.0,
+        lp2: 0.0,
+        timer: 0.0,
+        droop: 0.0,
+        var_ph: [0.0; 4],
+        var_f: [0.0; 4],
+        hue_s: 0.0,
+        sky_glide_dt: 0.0,
+        sky_glide: 0.0,
+        sky_detune_arc: 0.0,
+        sky_detune: 0.0,
+    };
     #[inline]
     fn lfo_u1(&self) -> f32 {
         0.5 * (1.0 + sin01(self.lfo1))
@@ -1225,14 +1348,15 @@ const fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
 }
 
 impl TrailSynth {
-    pub fn new(sample_rate: f32, seed: u32) -> Self {
+    #[must_use]
+    pub const fn new(sample_rate: f32, seed: u32) -> Self {
         Self {
             #[cfg(test)]
             ting_unducked: false,
             inv_sr: 1.0 / sample_rate.max(8_000.0),
             rng: seed | 1,
-            voices: [Voice::default(); MAX_VOICES],
-            bed: Bed::default(),
+            voices: [Voice::DEFAULT; MAX_VOICES],
+            bed: Bed::DEFAULT,
             bed_style: GlowStyle::Lumen,
             bed_voice: SoundVoice::Style,
             rate: 0.0,
@@ -1296,18 +1420,31 @@ impl TrailSynth {
 
     /// True once every voice is dead, the bed has decayed and the DC blocker has settled: [`render`](Self::render) then writes exact zeros, so the host can pause its output queue.
     #[inline]
-    pub fn is_quiet(&self) -> bool {
-        self.voices.iter().all(|v| !v.on)
-            && self.bed.level < 1e-3
-            && self.bed.energy < 1e-3
-            && self.dc_y_l == 0.0
-            && self.dc_y_r == 0.0
+    #[must_use]
+    pub const fn is_quiet(&self) -> bool {
+        let mut i = 0;
+        while i < self.voices.len() {
+            if self.voices[i].on {
+                return false;
+            }
+            i += 1;
+        }
+        self.bed.level < 1e-3 && self.bed.energy < 1e-3 && self.dc_y_l == 0.0 && self.dc_y_r == 0.0
     }
 
     /// Number of live voices (test/diagnostic hook).
     #[inline]
-    pub fn live_voices(&self) -> usize {
-        self.voices.iter().filter(|v| v.on).count()
+    #[must_use]
+    pub const fn live_voices(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0;
+        while i < self.voices.len() {
+            if self.voices[i].on {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Voice steals since construction (diagnostic).
@@ -1319,6 +1456,7 @@ impl TrailSynth {
 
     /// Diagnostic: (bed energy, bed level) — demo/tuning hook.
     #[inline]
+    #[must_use]
     pub const fn debug_bed(&self) -> (f32, f32) {
         (self.bed.energy, self.bed.level)
     }
@@ -1421,7 +1559,11 @@ impl TrailSynth {
             self.v2_key_pending = false;
         }
         let pause = self.since_event;
-        self.rate = self.rate * (-self.since_event / 0.6).exp() + 1.0;
+        self.rate = if self.rate > 0.0 && self.since_event > 0.0 {
+            self.rate * (-self.since_event / 0.6).exp() + 1.0
+        } else {
+            self.rate + 1.0
+        };
         self.since_event = 0.0;
         if let SoundGesture::Trail(kind) = ev.kind {
             self.bed_style = ev.style;
@@ -1540,13 +1682,13 @@ impl TrailSynth {
         }
     }
 
-    fn advance_song(&mut self, kind: SoundKind, pause: f32) {
+    const fn advance_song(&mut self, kind: SoundKind, pause: f32) {
         let boundary = matches!(kind, SoundKind::Jump) || pause > PHRASE_PAUSE_S;
         if boundary {
             self.song_pulse = 0;
         }
         let slot = if matches!(kind, SoundKind::Typed) {
-            let s = SONG_PULSE[usize::from(self.song_pulse)];
+            let s = SONG_PULSE[self.song_pulse as usize];
             self.song_pulse = (self.song_pulse + 1) % SONG_PULSE.len() as u8;
             s
         } else {
@@ -1563,19 +1705,15 @@ impl TrailSynth {
         }
     }
 
-    fn advance_melody(&mut self, kind: SoundKind, pause: f32) {
+    const fn advance_melody(&mut self, kind: SoundKind, pause: f32) {
         let (lo, hi) = tone_register(self.tone);
-        let start = usize::from(SONG_FORM[usize::from(self.phrase_idx)]);
-        let end = usize::from(SONG_FORM[usize::from(self.phrase_idx) + 1]);
-        let pos = usize::from(self.theme_pos);
+        let start = SONG_FORM[self.phrase_idx as usize] as usize;
+        let end = SONG_FORM[self.phrase_idx as usize + 1] as usize;
+        let pos = self.theme_pos as usize;
         let ran_out = pos >= end;
         let rest = (matches!(kind, SoundKind::Jump) || pause > PHRASE_PAUSE_S) && pos > start;
         if rest && !ran_out {
-            self.walk = fold_register(
-                i32::from(SONG_THEME[end - 1]) + melody_lean(self.tone),
-                lo,
-                hi,
-            );
+            self.walk = fold_register(SONG_THEME[end - 1] as i32 + melody_lean(self.tone), lo, hi);
             self.open_next_phrase();
             return;
         }
@@ -1583,7 +1721,7 @@ impl TrailSynth {
             self.open_next_phrase();
         }
         self.walk = fold_register(
-            i32::from(SONG_THEME[usize::from(self.theme_pos)]) + melody_lean(self.tone),
+            SONG_THEME[self.theme_pos as usize] as i32 + melody_lean(self.tone),
             lo,
             hi,
         );
@@ -1597,9 +1735,9 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn open_next_phrase(&mut self) {
+    const fn open_next_phrase(&mut self) {
         self.phrase_idx = (self.phrase_idx + 1) % (SONG_FORM.len() as u8 - 1);
-        self.theme_pos = SONG_FORM[usize::from(self.phrase_idx)];
+        self.theme_pos = SONG_FORM[self.phrase_idx as usize];
     }
 
     #[inline]
@@ -2268,12 +2406,15 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn damp_pending_shimmer(&mut self) {
-        for v in &mut self.voices {
+    const fn damp_pending_shimmer(&mut self) {
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &mut self.voices[i];
             if v.on && v.shimmer && v.t < 0.0 && v.damp <= 0.0 {
                 v.damp = ERASE_SHIMMER_DAMP_S;
                 v.damp0 = ERASE_SHIMMER_DAMP_S;
             }
+            i += 1;
         }
     }
 
@@ -2573,7 +2714,12 @@ impl TrailSynth {
         self.since_erase += dt_block;
         self.since_space_step += dt_block;
         self.since_shift += dt_block;
-        self.rate *= (-dt_block / 0.6).exp();
+        if self.rate > 0.0 {
+            self.rate *= (-dt_block / 0.6).exp();
+            if self.rate < 1e-7 {
+                self.rate = 0.0;
+            }
+        }
 
         if self.is_quiet() {
             out.fill(0.0);
@@ -2855,23 +3001,32 @@ impl TrailSynth {
 
     fn tick_bed(&mut self, dt: f32) {
         let b = &mut self.bed;
-        let tau_e = if b.energy < 0.02 { 0.2 } else { 0.7 };
-        b.energy *= (-dt / tau_e).exp();
+        if b.energy > 0.0 {
+            let tau_e = if b.energy < 0.02 { 0.2 } else { 0.7 };
+            b.energy *= (-dt / tau_e).exp();
+        }
         let target = b.energy.min(1.0);
-        let tau = if target > b.level {
-            0.25
-        } else if b.level < 0.02 {
-            0.2
-        } else {
-            0.7
-        };
-        b.level += (target - b.level) * (1.0 - (-dt / tau).exp());
+        if b.level != target {
+            let tau = if target > b.level {
+                0.25
+            } else if b.level < 0.02 {
+                0.2
+            } else {
+                0.7
+            };
+            b.level += (target - b.level) * (1.0 - (-dt / tau).exp());
+        }
         if b.energy < 3e-3 && b.level < 3e-3 {
             b.energy = 0.0;
             b.level = 0.0;
         }
         let dying = (0.35 - b.level).max(0.0) / 0.35;
-        b.droop += (dying - b.droop) * (1.0 - (-dt / 0.4).exp());
+        if b.droop != dying {
+            b.droop += (dying - b.droop) * (1.0 - (-dt / 0.4).exp());
+            if b.level == 0.0 && (dying - b.droop).abs() < 1e-6 {
+                b.droop = dying;
+            }
+        }
 
         if b.level > 0.02 {
             b.timer -= dt;
@@ -5139,22 +5294,44 @@ mod tests {
 
     #[test]
     fn voice_roster_round_trips() {
+        const AUTO: Option<SoundVoice> = SoundVoice::parse("\u{00a0}AUTO\u{2003}");
+        assert_eq!(AUTO, Some(SoundVoice::Style));
         assert_eq!(SoundVoice::parse("auto"), Some(SoundVoice::Style));
         for &v in SoundVoice::ALL {
             assert_eq!(SoundVoice::parse(v.name()), Some(v), "{v:?}");
-            assert_eq!(
-                SoundVoice::parse(&format!("  {}  ", v.name().to_ascii_uppercase())),
-                Some(v)
-            );
+            for padding in ["  ", "\u{00a0}", "\u{2003}\u{3000}"] {
+                assert_eq!(
+                    SoundVoice::parse(&format!(
+                        "{padding}{}{padding}",
+                        v.name().to_ascii_uppercase()
+                    )),
+                    Some(v)
+                );
+            }
         }
         for &(alias, voice) in SoundVoice::ALIASES {
             assert_eq!(SoundVoice::parse(alias), Some(voice), "alias {alias:?}");
+            assert_eq!(
+                SoundVoice::parse(&format!("\u{00a0}{}\u{2003}", alias.to_ascii_uppercase())),
+                Some(voice),
+                "padded alias {alias:?}"
+            );
             assert!(
                 SoundVoice::ALL.iter().all(|v| v.name() != alias),
                 "alias {alias:?} shadows a canonical name"
             );
         }
-        for junk in ["", "  ", "plasma", "glass", "auto bell"] {
+        for junk in [
+            "",
+            "  ",
+            "plasma",
+            "glass",
+            "auto bell",
+            "\u{200b}auto",
+            "auto\u{feff}",
+            "warm  pluck",
+            "music\u{00a0}box",
+        ] {
             assert_eq!(SoundVoice::parse(junk), None, "{junk:?}");
         }
     }

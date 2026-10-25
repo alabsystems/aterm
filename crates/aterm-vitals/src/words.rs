@@ -27,7 +27,7 @@ pub fn cores(c: f32) -> String {
     format!("{:.1}", c.max(0.0))
 }
 
-/// Format memory bytes in binary `MiB` or `GiB`.
+/// Format memory bytes in binary `MiB` or `GiB`; a nonzero amount that rounds to `0 KiB` is `<1 KiB`.
 #[must_use]
 pub fn mem(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
@@ -38,14 +38,27 @@ pub fn mem(bytes: u64) -> String {
     } else if b >= MIB {
         format!("{:.0} MiB", b / MIB)
     } else {
-        format!("{:.0} KiB", b / 1024.0)
+        not_zero(bytes, format!("{:.0}", b / 1024.0), "<1") + " KiB"
     }
 }
 
-/// Format bytes as `GiB` to one decimal place without a unit suffix.
+/// Format bytes as `GiB` to one decimal place without a unit suffix; a nonzero amount that rounds to `0.0` is `<0.1`.
 #[must_use]
 pub fn gib_figure(bytes: u64) -> String {
-    format!("{:.1}", bytes as f64 / f64::from(1u32 << 30))
+    not_zero(
+        bytes,
+        format!("{:.1}", bytes as f64 / f64::from(1u32 << 30)),
+        "<0.1",
+    )
+}
+
+/// `figure`, or `floor` when a nonzero `bytes` rounded to a figure of zeros.
+fn not_zero(bytes: u64, figure: String, floor: &str) -> String {
+    if bytes > 0 && figure.bytes().all(|b| matches!(b, b'0' | b'.')) {
+        floor.to_owned()
+    } else {
+        figure
+    }
 }
 
 /// Format physical memory total in `GiB` (integer when exact).
@@ -2482,6 +2495,7 @@ mod tests {
     fn a_tab_sentence_names_its_program_and_busiest_helper() {
         let t = TabView {
             key: 1,
+            tab: 1,
             label: "Tab 2".into(),
             program: "claude".into(),
             shell_pid: 0,
@@ -2515,6 +2529,14 @@ mod tests {
     fn units_follow_the_platform_conventions() {
         assert_eq!(mem(310 << 20), "310 MiB");
         assert_eq!(mem(2_469_606_195), "2.3 GiB");
+        assert_eq!(mem(16 << 10), "16 KiB");
+        assert_eq!(mem(0), "0 KiB");
+        assert_eq!(mem(1), "<1 KiB", "nonzero is never 0");
+        assert_eq!(mem(512), "<1 KiB");
+        assert_eq!(mem(1 << 10), "1 KiB");
+        assert_eq!(gib_figure(0), "0.0");
+        assert_eq!(gib_figure(18_202_624), "<0.1", "17 MiB is never 0.0 GiB");
+        assert_eq!(gib_figure(3 << 29), "1.5");
         assert_eq!(disk(1_810_000_000_000), "1.81 TB");
         assert_eq!(disk(412_000_000_000), "412 GB");
         assert_eq!(disk(9_400_000_000), "9.4 GB");

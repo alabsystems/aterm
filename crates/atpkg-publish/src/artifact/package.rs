@@ -157,19 +157,62 @@ fn text_of<'a>(v: &'a aterm_json::Value, key: &str, file: &str) -> Result<&'a st
         .ok_or_else(|| Error::refused(format!("{file} names no `{key}`")))
 }
 
-/// The `(count, sha9)` of a version `MAJOR.MINOR.0-dev.<count>+g<sha9>`.
+/// The `(count, sha9)` of a dev version: `MAJOR.MINOR.0-dev.<count>+g<sha9>`, or codex-alab's
+/// compound `MAJOR.MINOR.0-dev.<count>+codex.<A.B.C>.g<sha9>` naming its upstream Codex
+/// baseline (codex-alab `alab/README.md`, Decision 8; [`atpkg::alab::AlabVersion`] reads both).
 #[must_use]
 pub fn dev_version(version: &str) -> Option<(u64, &str)> {
-    let (core, sha) = version.split_once("+g")?;
-    let (line, count) = core.split_once("-dev.")?;
-    let parts: Vec<&str> = line.split('.').collect();
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let line_ok = parts.len() == 3 && parts[..2].iter().all(|p| digits(p)) && parts[2] == "0";
-    let sha_ok = sha.len() == 9 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    if !(line_ok && digits(count) && sha_ok) {
+    let v = atpkg::alab::AlabVersion::parse(version)?;
+    if v.core.2 != 0 {
         return None;
     }
-    Some((count.parse().ok()?, sha))
+    Some((v.dev?, v.sha9?))
+}
+
+/// The upstream Codex baseline a compound version names (`0.164.0` of
+/// `0.1.0-dev.13600+codex.0.164.0.gabcdef012`), checked against what `build` (the package's
+/// `alab-build.json`, named `bj`) records: its `baseline`, which a compound version requires
+/// and any other forbids, and its `upstream.release`, which must be that baseline's tag when
+/// the record has one. One package names one baseline.
+fn baseline_agrees(version: &str, build: &aterm_json::Value, bj: &str) -> Result<()> {
+    let named = atpkg::alab::AlabVersion::parse(version).and_then(|v| v.baseline_text);
+    let recorded = build
+        .get("baseline")
+        .map(|value| value.as_str().filter(|s| !s.is_empty()))
+        .map(|text| {
+            text.ok_or_else(|| Error::refused(format!("{bj}'s `baseline` is not a version string")))
+        })
+        .transpose()?;
+    match (named, recorded) {
+        (None, None) => Ok(()),
+        (Some(named), None) => Err(Error::refused(format!(
+            "version {version} names the upstream baseline codex {named}, but {bj} records no \
+             `baseline` — one package, one baseline"
+        ))),
+        (None, Some(recorded)) => Err(Error::refused(format!(
+            "{bj} records the upstream baseline codex {recorded}, but version {version} names \
+             none — one package, one baseline"
+        ))),
+        (Some(named), Some(recorded)) if named != recorded => Err(Error::refused(format!(
+            "version {version} names the upstream baseline codex {named}, but {bj} records \
+             {recorded} — one package, one baseline"
+        ))),
+        (Some(named), Some(_)) => {
+            let release = build
+                .get("upstream")
+                .and_then(|u| u.get("release"))
+                .and_then(aterm_json::Value::as_str);
+            match release {
+                Some(release) if release != format!("rust-v{named}") => {
+                    Err(Error::refused(format!(
+                        "version {version} names the upstream baseline codex {named}, but {bj}'s \
+                         upstream release is {release} — one package, one baseline"
+                    )))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
 }
 
 fn is_commit(s: &str) -> bool {
@@ -227,10 +270,12 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
     }
     let Some((count, sha9)) = dev_version(&version) else {
         return Err(Error::refused(format!(
-            "version {version} is not MAJOR.MINOR.0-dev.<count>+g<sha9>: a bare stable version \
+            "version {version} is not MAJOR.MINOR.0-dev.<count>+g<sha9> (or codex-alab's \
+             compound MAJOR.MINOR.0-dev.<count>+codex.<A.B.C>.g<sha9>): a bare stable version \
              arms the vendor's own updater, and the dev form is what keeps it off"
         )));
     };
+    baseline_agrees(&version, &build, bj)?;
     if !source.starts_with(sha9) {
         return Err(Error::refused(format!(
             "version {version} names commit {sha9}, but {bj} records source {source}"

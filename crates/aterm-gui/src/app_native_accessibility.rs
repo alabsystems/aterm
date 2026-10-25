@@ -915,6 +915,284 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    mod exact_headline_open {
+        use super::*;
+        use aterm_types::macos_setup::{Access, Standing, Subject};
+
+        thread_local! {
+            static OPENED: std::cell::RefCell<Vec<Access>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+
+        fn reading(access: Option<Access>, busy: bool) -> crate::SetupStatus {
+            let mut status = crate::system_state::fixture_status("set-up").unwrap();
+            status.busy = busy;
+            if let Some(access) = access {
+                let row = status
+                    .observed
+                    .iter_mut()
+                    .find(|row| row.subject == Subject::Access(access))
+                    .unwrap();
+                row.standing = Standing::NeedsYou;
+                row.now = Some("Off".into());
+            }
+            status
+        }
+
+        fn page(access: Access) -> (App, WindowId, ViewId) {
+            use crate::devtools_helper::{Lane, test_arms};
+            use crate::system_state_access::StepsReach;
+            use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+            OPENED.with(|opened| opened.borrow_mut().clear());
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.rows = 90;
+            window.cols = 160;
+            assert!(app.open_system_state_tab());
+            let (_, view) = app.active_native_view(wid).unwrap();
+            app.set_system_state_handlers_for_test(
+                crate::system_state_host::InitialSetupHandlers::inert_for_test(),
+            );
+            // Exercise the windowed hand-over through inert ports, with no
+            // actual OS surface, probe, pane or process-wide dialog guard.
+            assert!(!app.apprt.probe_preferences);
+            assert!(app.windows[&wid].os_window.is_none());
+            app.headless = false;
+            app.consent =
+                crate::consent_state::ConsentState::with_cached_probe_for_test(FdaProbe {
+                    state: FdaState::Denied,
+                    label: ProbeLabel::OpenEperm,
+                });
+            let mut fda = test_arms::fda_opening();
+            fda.open_pane = || {
+                OPENED.with(|opened| opened.borrow_mut().push(Access::FullDiskAccess));
+                true
+            };
+            app.devtools_helper =
+                Lane::windowed_with_fda_for_test(test_arms::opening(), fda, test_arms::showing());
+            app.access_steps.set_reach(StepsReach {
+                open_pane: |_, access| {
+                    OPENED.with(|opened| opened.borrow_mut().push(access));
+                    true
+                },
+                ..StepsReach::INERT
+            });
+            app.publish_system_state(reading(Some(access), false));
+            (app, wid, view)
+        }
+
+        fn published_open(
+            app: &mut App,
+            wid: WindowId,
+            view: ViewId,
+            access: Access,
+        ) -> ActionRequest {
+            use crate::native_ui::SemanticRole;
+            assert!(app.prepare_native_input_scratch(wid));
+            let key = app.windows[&wid].leaf_render_cache[&view]
+                .native
+                .as_ref()
+                .unwrap()
+                .compiled
+                .semantics
+                .iter()
+                .find(|node| {
+                    node.role == SemanticRole::Button
+                        && node.key.as_str().starts_with("system-state/headline/")
+                        && node.label.contains(access.name())
+                })
+                .expect("the headline names the permission this press opens")
+                .key
+                .clone();
+            publish_vault_action(app, wid, view, key.as_str(), None)
+        }
+
+        #[test]
+        fn queued_headline_open_cannot_change_which_permission_the_person_pressed() {
+            let (mut app, wid, view) = page(Access::FullDiskAccess);
+            let old = published_open(&mut app, wid, view, Access::FullDiskAccess);
+            let review = old.context;
+            // A background grant reading moves the headline to another row,
+            // but its new frame has not replaced the old platform action.
+            app.publish_system_state(reading(Some(Access::Accessibility), false));
+            app.on_native_accessibility_action(wid, old);
+            assert!(
+                OPENED.with(|opened| opened.borrow().is_empty()),
+                "an FDA press must not become an Accessibility press"
+            );
+
+            let current = published_open(&mut app, wid, view, Access::Accessibility);
+            assert_eq!(current.context, review, "the plan and review are unchanged");
+            app.on_native_accessibility_action(wid, current);
+            assert_eq!(
+                OPENED.with(|opened| opened.borrow().clone()),
+                [Access::Accessibility],
+                "a fresh press opens its own current target"
+            );
+        }
+
+        #[test]
+        fn queued_headline_open_does_nothing_once_the_grant_is_in_place() {
+            let (mut app, wid, view) = page(Access::FullDiskAccess);
+            let old = published_open(&mut app, wid, view, Access::FullDiskAccess);
+            app.publish_system_state(reading(None, false));
+            app.on_native_accessibility_action(wid, old);
+            assert!(OPENED.with(|opened| opened.borrow().is_empty()));
+        }
+
+        #[test]
+        fn queued_headline_open_keeps_its_current_permission_during_a_run() {
+            for busy in [false, true] {
+                for access in [Access::FullDiskAccess, Access::Accessibility] {
+                    let (mut app, wid, view) = page(access);
+                    let current = published_open(&mut app, wid, view, access);
+                    app.publish_system_state(reading(Some(access), busy));
+                    app.on_native_accessibility_action(wid, current);
+                    assert_eq!(
+                        OPENED.with(|opened| opened.borrow().clone()),
+                        [access],
+                        "the current permission can unblock a busy run"
+                    );
+                }
+            }
+        }
+    }
+
+    fn setup_start_reading(standing: aterm_types::macos_setup::Standing) -> crate::SetupStatus {
+        use aterm_types::macos_setup::{Setting, Standing, Subject};
+        let mut status = crate::system_state::fixture_status("set-up").unwrap();
+        let repositories = status
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Setting(Setting::Repositories))
+            .unwrap();
+        repositories.standing = standing;
+        match standing {
+            Standing::Differs | Standing::Failed => repositories.now = Some("3 of 12".into()),
+            Standing::Waiting => {
+                repositories.now = None;
+                repositories.note =
+                    Some("Waits for your GitHub token from the Secrets vault".into());
+            }
+            _ => {}
+        }
+        status
+    }
+
+    fn assert_deferred_setup_start(current: crate::SetupStatus, should_start: bool) {
+        use aterm_types::macos_setup::{Plan, Standing};
+        thread_local! {
+            static APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        APPLIED.with(|applied| applied.set(0));
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
+            apply: |plan, typed, password, receipt| {
+                assert_eq!(plan, Plan::default());
+                assert!(!typed);
+                assert!(password.is_none());
+                APPLIED.with(|applied| applied.set(applied.get() + 1));
+                receipt.accept();
+                true
+            },
+            ..crate::system_state_host::InitialSetupHandlers::inert_for_test()
+        });
+        app.publish_system_state(setup_start_reading(Standing::Differs));
+        let queued = publish_vault_action(&mut app, wid, view, "system-state/headline/start", None);
+        let review = app
+            .native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .review_revision;
+        let plan = current.plan.as_ref().unwrap();
+        assert_eq!(
+            crate::system_state::headline(
+                &current,
+                &crate::system_state::rows(&current, plan.selection),
+                Some(plan),
+            )
+            .start,
+            should_start
+        );
+        // The status reached the model, but its next native frame and AX
+        // tree have not replaced the enabled action already queued by macOS.
+        app.publish_system_state(current);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .review_revision,
+            review,
+            "a same-plan reading does not replace the review"
+        );
+        app.on_native_accessibility_action(wid, queued.clone());
+        assert_eq!(
+            APPLIED.with(std::cell::Cell::get),
+            usize::from(should_start)
+        );
+        app.on_native_accessibility_action(wid, queued);
+        assert_eq!(
+            APPLIED.with(std::cell::Cell::get),
+            usize::from(should_start),
+            "an eligible action starts exactly once"
+        );
+    }
+
+    #[test]
+    fn deferred_setup_start_does_not_run_after_same_plan_readings_settle() {
+        assert_deferred_setup_start(
+            setup_start_reading(aterm_types::macos_setup::Standing::InPlace),
+            false,
+        );
+    }
+
+    #[test]
+    fn deferred_setup_start_does_not_run_when_the_same_plan_only_waits() {
+        assert_deferred_setup_start(
+            setup_start_reading(aterm_types::macos_setup::Standing::Waiting),
+            false,
+        );
+    }
+
+    #[test]
+    fn deferred_setup_start_does_not_run_when_the_same_plan_needs_a_person() {
+        use aterm_types::macos_setup::{Setting, Standing, Subject};
+        let mut current = setup_start_reading(Standing::Waiting);
+        let vault = current
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Setting(Setting::Secrets))
+            .unwrap();
+        vault.standing = Standing::NeedsYou;
+        vault.now = Some("Awaiting code".into());
+        vault.note = Some("Approve on an admin Mac: INERT-CODE".into());
+        assert_deferred_setup_start(current, false);
+    }
+
+    #[test]
+    fn deferred_setup_start_runs_once_for_current_changes_and_retrying_failures() {
+        use aterm_types::macos_setup::Standing;
+        assert_deferred_setup_start(setup_start_reading(Standing::Differs), true);
+        assert_deferred_setup_start(
+            crate::SetupStatus {
+                retrying: true,
+                ..setup_start_reading(Standing::Failed)
+            },
+            true,
+        );
+    }
+
     #[test]
     fn deferred_vault_join_cannot_run_after_a_same_plan_busy_publication() {
         thread_local! {

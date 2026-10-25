@@ -385,11 +385,11 @@ fn walk(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
 fn tier1_the_real_decider_defends_every_claim_and_never_rests() {
     let m = supervisor_cruise_model();
     let base = Instant::now() + Duration::from_secs(3600);
-    let mut seen: BTreeSet<State> = BTreeSet::new();
+    let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), start(base))]);
     let mut verdicts = BTreeMap::<String, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
-        if !seen.insert(st.clone()) {
+        if !seen.insert(crate::common::key(&m, &st)) {
             continue;
         }
         for inv in &m.invariants {

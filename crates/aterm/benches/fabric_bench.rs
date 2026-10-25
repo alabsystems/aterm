@@ -30,7 +30,7 @@ mod spec;
 #[path = "../tests/fabric_bench/stats.rs"]
 mod stats;
 
-/// The measurement. See the module note.
+/// The measurement.
 #[cfg(unix)]
 fn main() -> Result<(), String> {
     let spec = spec::from_env()?;

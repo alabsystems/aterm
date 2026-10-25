@@ -1396,7 +1396,7 @@ const DEFAULT_SIGNALS: crate::TtySignals = crate::TtySignals {
 };
 
 /// Edit the termios of `slave`, this test's live pty slave, in place.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn edit_termios(slave: i32, edit: impl FnOnce(&mut libc::termios)) {
     // SAFETY: all-zeros is a valid termios, overwritten by `tcgetattr`.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
@@ -1409,7 +1409,7 @@ fn edit_termios(slave: i32, edit: impl FnOnce(&mut libc::termios)) {
 
 /// A pty pair whose slave the test itself makes raw (`cfmakeraw`, `VMIN = 1`,
 /// `VTIME = 0`): no child, no race.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn raw_pair() -> (i32, i32) {
     let (master, slave) = open_pty_pair().expect("pty pair");
     edit_termios(slave, |t| {
@@ -1422,7 +1422,7 @@ fn raw_pair() -> (i32, i32) {
 }
 
 /// Write `bytes` into the pty (the master end), all of it, as a key would.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn type_into(master: i32, bytes: &[u8]) {
     // SAFETY: a bounded write of a live slice to this test's live master.
     let wrote = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
@@ -1435,7 +1435,7 @@ fn type_into(master: i32, bytes: &[u8]) {
 
 /// Read exactly `n` bytes from `fd` (the program reading its input, or aterm
 /// reading the program's output), returning them.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_exactly(fd: i32, n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n];
     let mut got = 0;
@@ -1448,13 +1448,102 @@ fn read_exactly(fd: i32, n: usize) -> Vec<u8> {
     out
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn close_pair(master: i32, slave: i32) {
     // SAFETY: both fds are this test's and still open.
     unsafe {
         libc::close(slave);
         libc::close(master);
     }
+}
+
+/// The program's unread input, read through the master: every raw key until the program reads
+/// it, and in canonical mode whole lines only; what the program wrote for aterm to read never
+/// counts. On Linux the master's own `FIONREAD` is that output, so the count comes through a
+/// descriptor of the slave opened for the read.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unread_input_len_counts_the_keys_the_program_has_not_read() {
+    let (master, slave) = raw_pair();
+    assert_eq!(unread_input_len(master), Some(0), "nothing typed");
+    type_into(slave, b"drawn");
+    assert!(readable(master), "the program's output reached aterm's end");
+    assert_eq!(unread_input_len(master), Some(0), "output is not input");
+    type_into(master, b"ab");
+    // Linux hands a write to the slave from a work queue: a hang detector, not a budget.
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(5),
+        || (unread_input_len(master) == Some(2)).then_some(()),
+    )
+    .expect("two keys unread");
+    assert_eq!(read_exactly(slave, 1), b"a");
+    assert_eq!(
+        unread_input_len(master),
+        Some(1),
+        "it falls as the program reads"
+    );
+    assert_eq!(read_exactly(slave, 1), b"b");
+    assert_eq!(unread_input_len(master), Some(0));
+    edit_termios(slave, |t| t.c_lflag |= libc::ICANON);
+    type_into(master, b"line\npar");
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(5),
+        || (unread_input_len(master) == Some(5)).then_some(()),
+    )
+    .expect("the whole line unread");
+    assert_eq!(
+        read_exactly(master, 5),
+        b"drawn",
+        "the output stayed aterm's to read"
+    );
+    assert_eq!(
+        unread_input_len(master),
+        Some(5),
+        "canonical: the partial line written with it is not counted"
+    );
+    let (r, w) = std::io::pipe().expect("pipe");
+    assert_eq!(
+        unread_input_len(std::os::fd::AsRawFd::as_raw_fd(&r)),
+        None,
+        "not a terminal"
+    );
+    drop((r, w));
+    assert_eq!(unread_input_len(-1), None);
+    close_pair(master, slave);
+}
+
+/// Whether `fd` has something to read (or its end), within a one-minute hang detector: Linux hands
+/// a pty write to the other end from a work queue.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn readable(fd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live `pollfd` for this test's own descriptor.
+    let ready = unsafe { libc::poll(&raw mut pfd, 1, 60_000) };
+    ready == 1
+}
+
+/// The read through a slave descriptor opened for it leaves the master's end of a session that
+/// ended as it was: once the program closed its side, the master still reads that end.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unread_input_len_leaves_an_ended_session_ended() {
+    let (master, slave) = raw_pair();
+    // SAFETY: closing this test's own slave, the program's side, which ends the session.
+    unsafe { libc::close(slave) };
+    let _ = unread_input_len(master);
+    assert!(readable(master), "the master hears the end");
+    let mut byte = [0u8; 1];
+    // SAFETY: a one-byte read into a local buffer from this test's master.
+    let n = unsafe { libc::read(master, byte.as_mut_ptr().cast(), 1) };
+    assert!(n <= 0, "the master reads the end, not a byte: {n}");
+    // SAFETY: this test's own master, still open.
+    unsafe { libc::close(master) };
 }
 
 #[test]

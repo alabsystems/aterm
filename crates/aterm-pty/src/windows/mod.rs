@@ -1109,6 +1109,12 @@ pub fn input_queue_len(_master: i32) -> Option<usize> {
     None
 }
 
+/// Windows twin of the Unix [`unread_input_len`]: a ConPTY reports no unread input.
+#[must_use]
+pub fn unread_input_len(_master: i32) -> Option<usize> {
+    None
+}
+
 /// Windows twin of the Unix [`output_queue_len`].
 #[must_use]
 pub fn output_queue_len(_master: i32) -> Option<usize> {

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Base64, hex, percent, JSON, terminal-safe text, field-sink, CRC-32, and DEFLATE codecs.
+//! Base64, hex, percent, JSON, XML text, terminal-safe text, field-sink, CRC-32, and DEFLATE codecs.
 //!
 //! # Examples
 //!
@@ -25,6 +25,7 @@ pub mod inflate;
 pub mod json;
 pub mod pct;
 pub mod tty;
+pub mod xml;
 
 use std::fmt;
 

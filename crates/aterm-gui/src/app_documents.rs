@@ -8441,7 +8441,7 @@ mod tests {
         let (dir, mut app, _, (late_document, late_view), late, generation) =
             late_document("aterm-quit-replay-late", |app, document, view| {
                 let crate::menu::NativeTerminateDecision::Dispatch(generation) =
-                    crate::menu::admit_native_terminate(false)
+                    crate::menu::admit_native_terminate(crate::system_quit::Asker::Person)
                 else {
                     panic!("a first request dispatches");
                 };

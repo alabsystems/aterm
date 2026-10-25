@@ -3,6 +3,13 @@
 
 # aterm-effects: spec recovery from its 3027 unit tests
 
+> 2026-10-24: `wd-kitty-cursor-emission` (§1) now also says the flying head never starts above the grid
+> top (row 0 and the row-1 sky seat used to put a fifth of it above the first row, where a top pane's open
+> edge let it reach the pad or the tab strip and a lower pane's divider cut it), and `wd-pet-sprite-in-grid`
+> holds both companions whole in a top pane and a lower pane on the first two rows; one new §2 test each.
+> `custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges` now requires row-zero custom art
+> to land whole beside its row; it pinned the old partial clip.
+
 > 2026-10-24: §8 adds the seven specs of Aos M5a's aterm-effects half (`int_bag_mlp`, `tone_int`)
 > with their 50 tests. `tone-asset-decoder-fail-closed` (§1) now also names `tone::raw`, the verified
 > raw view `ToneModel::from_bytes` is rebuilt on. §3's counts were taken before §7 and §8.
@@ -882,10 +889,10 @@ wd-freeze	contract	WordDecorations::{freeze,thaw,rescan,tick}; trick_flash	While
 wd-pane-scoping	invariant	WordDecorations::{bind_pane,set_scan_session,retain_panes,needs_rescan,rescan}	Per-scope state is parked per pane and session, so identical words in two panes or tabs are independent episodes; retain_panes drops departed panes; the limiter, mutex and bake budget stay window-wide.	0,1,2,7	5
 wd-resize-settle	contract	WordDecorations::rescan (settle_until)	After a width change of a scope, births until RESIZE_SETTLE_MS of stable width are born settled and unmarked; widths are per scope.	0,1,2	2
 fp-field-coverage	contract	word_decorations::{fold_free,fnv_mix_u64}; PetFrame::fp	Folding a sprite into the fingerprint distinguishes sprites differing in any single field; PetFrame::fp distinguishes under_ink.	0,1,3,7	2
-wd-kitty-cursor-emission	contract	WordDecorations::{kitty_cursor,kitty_cursor_footprint,set_kitty_sprite_source}	The flying kitty draws one body sprite at its footprint (clamped after scale and lead, rising at the right edge, raised by the seat's whole rows of lift, which the settled follower glides while it excludes only the hover bob), sized within its slot for every age, from a user sprite when set and nothing when that source is invalid; song notes precede it scaled by the sing drive.	0,1,2,3,4	8
+wd-kitty-cursor-emission	contract	WordDecorations::{kitty_cursor,kitty_cursor_footprint,set_kitty_sprite_source}	The flying kitty draws one body sprite at its footprint (clamped after scale and lead, rising at the right edge, raised by the seat's whole rows of lift, which the settled follower glides while it excludes only the hover bob), sized within its slot for every age, from a user sprite when set and nothing when that source is invalid; song notes precede it scaled by the sing drive. Nothing it emits starts above the grid top: on row 0 and the row-1 sky seat the seat stops at the grid top less the hover bob's reach (BOB_AMP of a row), and no stretch, fold arc or note rises past it.	0,1,2,3,4	9
 wd-cursor-placement	refinement	WordDecorations::{resolve_kitty_cursor_placement,kitty_cursor_at_placement,rebase_kitty_cursor_placement,kitty_cursor}; KittyCursorPlacementState	The placement ledger refines cursor_cat_fold_model: folds start continuous, change side only off glass, glide at most 4 px per frame onto the footprint, and coordinate or source changes retire them; the compat path draws the raw footprint.	0,1,2,3,5,10	7
 wd-held-tiles	contract	WordDecorations::{pet_cursor,dog_cameo,drop_holds_if_metric_moved}	A held tile is re-emitted only for the same look; a metric change drops every held tile.	0,1,2	3
-wd-pet-sprite-in-grid	contract	WordDecorations::pet_cursor; PetFrame::body_px	Every pet sprite lies inside the grid and the body equals the clamped body_px.	0,1,3,7	2
+wd-pet-sprite-in-grid	contract	WordDecorations::pet_cursor; PetFrame::body_px; pane::translate_free_into_pane	Every pet sprite lies inside the grid and the body equals the clamped body_px. With the caret on row 0 or 1, the pet's and the flying head's sprites land whole in a pane at the window top (whose open top edge would let an overhang into the pad or, after the splice, the tab strip) and in a pane below a divider.	0,1,3,7	3
 wd-dog-cameo	contract	WordDecorations::dog_cameo	Once baked, the cameo is one sprite at the frame's alpha trailing behind the caret.	0,1,2,3	1
 wd-trick-flash	contract	WordDecorations::{note_trick_typed,tick,trick_flash_phase}	A live flash on a wordless screen emits exactly its cells and its own deadline; beside other ink it only extends the deadline; a pending flash changes nothing.	0,1,2	5
 art-asset-quality	table-property	art/glyphs and art/animal TOML; cat_glyphs_gen::GLYPHS; aterm_scene::{fill_path,parse_path}	Every roster asset is semantic and bounded (layers, commands, one dark outline first, roles, anchors and aspect in band), survives a 16 px bake per role, and is distinct within its class; the maneki's paw keeps its keyline.	0,1,3,7,8	11
@@ -2601,6 +2608,7 @@ src/word_decorations.rs	an_unbound_scans_pending_ignition_is_not_session_zeros_t
 src/word_decorations.rs	an_unrelated_edit_does_not_license_a_repaint_replay	wd-typed-rearm	
 src/word_decorations.rs	animal_words_peek_their_species_heads	wd-scan-classification	
 src/word_decorations.rs	beside_other_ink_the_flash_extends_the_deadline_and_never_shortens_it	wd-trick-flash	
+src/word_decorations.rs	both_companions_on_the_top_rows_land_whole_in_a_top_pane_and_a_lower_pane	wd-pet-sprite-in-grid	wd-kitty-cursor-emission
 src/word_decorations.rs	bottom_rows_keep_occurrence_slots_on_a_match_saturated_screen	wd-occurrence-cap	
 src/word_decorations.rs	bound_panes_keep_independent_damage_epochs	wd-pane-scoping	
 src/word_decorations.rs	bow_cat_sighting_carries_trait_bow	wd-kitty-sighting	
@@ -2706,6 +2714,7 @@ src/word_decorations.rs	supernova_detonation_cues_at_the_grant_edge_once	wd-curs
 src/word_decorations.rs	supernova_roll_decorrelates_and_transfers_across_alignment	wd-burst-roll	
 src/word_decorations.rs	supernova_suppressed_under_reduced_motion	wd-reduced-motion-static	
 src/word_decorations.rs	supernova_wash_splits_around_selection	wd-selection-safety	
+src/word_decorations.rs	the_flying_head_on_the_top_rows_stays_inside_the_grid	wd-kitty-cursor-emission	
 src/word_decorations.rs	the_summoning_word_is_claimed_even_after_the_caret_moved_on	wd-companion-claim	
 src/word_decorations.rs	transfer_then_expire_writes_mark_under_departure_ident	wd-done-marks	
 src/word_decorations.rs	tui_prompt_box_frame_still_summons_a_cat	wd-peek-plan	

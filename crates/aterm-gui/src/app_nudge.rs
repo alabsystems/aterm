@@ -56,7 +56,7 @@ pub(crate) struct WorldFacts {
     pub(crate) cell_px: Option<(u16, u16)>,
 }
 
-/// A PTY held one row short, released on drop (see the module note).
+/// A PTY held one row short, released on drop.
 pub(crate) struct PtyGuard {
     restore: Option<Box<dyn FnOnce()>>,
 }
@@ -836,7 +836,7 @@ impl crate::App {
         }
     }
 
-    /// Run the repaint nudge one step (see the module note).
+    /// Run the repaint nudge one step.
     pub(crate) fn tick_nudges(&mut self) {
         if repaint_adoptions_pending() {
             for session in take_repaint_adoptions() {

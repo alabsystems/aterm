@@ -74,34 +74,44 @@ pub const PAPER_GREY: Look = Look {
     cursor: 0x0009_69DA,
 };
 
-/// Each channel's median (the upper one of an even count).
+/// Each channel's median (the upper one of an even count): a channel is a byte, so it is the
+/// first value whose running count passes half the pixels, with no sort of every ring.
 fn median(px: &[u32]) -> u32 {
     let mid = px.len() / 2;
     let mut out = 0;
-    let mut ch = Vec::with_capacity(px.len());
     for sh in [16, 8, 0] {
-        ch.clear();
-        ch.extend(px.iter().map(|p| (p >> sh) & 0xff));
-        ch.sort_unstable();
-        out |= ch[mid] << sh;
+        let mut count = [0u32; 256];
+        for p in px {
+            count[((p >> sh) & 0xff) as usize] += 1;
+        }
+        let mut seen = 0;
+        for (v, &n) in (0u32..).zip(&count) {
+            seen += n as usize;
+            if seen > mid {
+                out |= v << sh;
+                break;
+            }
+        }
     }
     out
 }
 
+/// The commonest colour, the lowest of a tie; a cell holds a few dozen colours, so each is
+/// counted in a short list rather than sorting every pixel.
 fn mode(px: &[u32]) -> u32 {
-    let mut v: Vec<u32> = px.iter().map(|p| p & 0x00FF_FFFF).collect();
-    v.sort_unstable();
-    let (mut best, mut best_n, mut i) = (v[0], 0, 0);
-    while i < v.len() {
-        let mut j = i;
-        while j < v.len() && v[j] == v[i] {
-            j += 1;
+    let mut seen: Vec<(u32, usize)> = Vec::new();
+    for p in px {
+        let p = p & 0x00FF_FFFF;
+        match seen.iter_mut().find(|(c, _)| *c == p) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((p, 1)),
         }
-        if j - i > best_n {
-            best_n = j - i;
-            best = v[i];
+    }
+    let (mut best, mut best_n) = (0, 0);
+    for (c, n) in seen {
+        if n > best_n || (n == best_n && c < best) {
+            (best, best_n) = (c, n);
         }
-        i = j;
     }
     best
 }
@@ -823,5 +833,46 @@ fn survey_every_style_s_worst_letter() {
     });
     for v in verdicts {
         println!("{v}");
+    }
+}
+
+/// [`median`] is each channel's sorted middle (`sorted[len / 2]`) and [`mode`] the first longest
+/// run of the sorted colours, for odd and even counts, repeated values, ties and channels that
+/// differ in order. NEGATIVE CONTROLS: `seen >= mid` takes the value below the middle of an even
+/// count, and `c > best` takes a tie's highest colour; each fails.
+#[test]
+fn median_and_mode_are_the_sorted_readings() {
+    let sorted_middle = |px: &[u32]| {
+        [16, 8, 0].into_iter().fold(0, |out, sh| {
+            let mut ch: Vec<u32> = px.iter().map(|p| (p >> sh) & 0xff).collect();
+            ch.sort_unstable();
+            out | ch[ch.len() / 2] << sh
+        })
+    };
+    let sorted_mode = |px: &[u32]| {
+        let mut v: Vec<u32> = px.iter().map(|p| p & 0x00FF_FFFF).collect();
+        v.sort_unstable();
+        let runs = v.chunk_by(|a, b| a == b);
+        let longest = runs.clone().map(<[u32]>::len).max().unwrap_or(0);
+        runs.into_iter()
+            .find(|r| r.len() == longest)
+            .map_or(0, |r| r[0])
+    };
+    let mut px = Vec::new();
+    let mut x: u32 = 0x9E37_79B9;
+    for len in 1..=40 {
+        px.clear();
+        for _ in 0..len {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            px.push(match x % 6 {
+                0 | 1 => 0x00FF_00FF,
+                2 | 3 => 0xAA11_2233,
+                _ => x & 0x00FF_FFFF,
+            });
+        }
+        assert_eq!(median(&px), sorted_middle(&px), "{px:08x?}");
+        assert_eq!(mode(&px), sorted_mode(&px), "{px:08x?}");
     }
 }

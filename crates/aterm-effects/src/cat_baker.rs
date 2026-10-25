@@ -48,7 +48,6 @@ enum SlotKey {
 /// Host-side LRU bake cache of interned [`FxArt`]s (§5.5): what to keep baked, never where it
 /// lives on a GPU (`aterm-gpu`'s fx atlas keeps its own residency, uploading an art's region only
 /// when it is first drawn).
-#[derive(Default)]
 pub struct CatBaker {
     cell_w: u16,
     cell_h: u16,
@@ -67,7 +66,31 @@ pub struct CatBaker {
     bakes_left: u32,
 }
 
+impl Default for CatBaker {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CatBaker {
+    /// Construct an uninitialized cat-tile baker with no allocated slots or scratch buffers.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cell_w: 0,
+            cell_h: 0,
+            slot_w: 0,
+            slots: Vec::new(),
+            version: 0,
+            scratch: None,
+            eye_mask_scratch: None,
+            clock: 0,
+            bakes_left: 0,
+        }
+    }
+
     /// Structural slot count for a cell height.
     #[inline]
     #[must_use]
@@ -410,7 +433,7 @@ pub(crate) fn paint_dark_masked_disc(
                 && tile
                     .pixels()
                     .get(i..i + 4)
-                    .is_some_and(|p| p[3] == 255 && p[..3].iter().all(|&c| c < 96));
+                    .is_some_and(|p| p[3] == 255 && p[0] < 96 && p[1] < 96 && p[2] < 96);
             if !dark_eye {
                 continue;
             }
@@ -476,14 +499,17 @@ const BG_BAND_MID_MAX: f32 = 0.58;
 impl Default for CatColorKey {
     #[inline]
     fn default() -> Self {
-        Self {
-            accent: 12,
-            background: 0,
-        }
+        Self::DEFAULT
     }
 }
 
 impl CatColorKey {
+    /// Default dark neutral palette key.
+    pub const DEFAULT: Self = Self {
+        accent: 12,
+        background: 0,
+    };
+
     /// Resolve matched-word, neighboring-text, and local-background colors on the cold rescan path.
     #[inline]
     #[must_use]
@@ -592,15 +618,28 @@ const OUTLINE_BASES: [u32; 5] = [
 ];
 
 struct FillsLut {
-    coat_eye: [[[CoatEyePair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()],
     iris: [[(f32, f32, f32); CONTEXT_ACCENTS.len()]; EYE_RAMP.len()],
     outline: [[(f32, f32, f32); CONTEXT_ACCENTS.len()]; OUTLINE_BASES.len()],
     underlay: [(f32, f32, f32); CONTEXT_ACCENTS.len()],
+    coat_eye: [[[CoatEyePair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()],
 }
 
 fn fills_lut() -> &'static FillsLut {
     static LUT: std::sync::OnceLock<FillsLut> = std::sync::OnceLock::new();
     LUT.get_or_init(|| FillsLut {
+        iris: std::array::from_fn(|iris_idx| {
+            let iris = EYE_RAMP[iris_idx];
+            std::array::from_fn(|accent_idx| rgb(mix_rgb(iris, CONTEXT_ACCENTS[accent_idx], 0.28)))
+        }),
+        outline: std::array::from_fn(|bg_idx| {
+            let outline_base = OUTLINE_BASES[bg_idx];
+            std::array::from_fn(|accent_idx| {
+                rgb(mix_rgb(outline_base, CONTEXT_ACCENTS[accent_idx], 0.10))
+            })
+        }),
+        underlay: std::array::from_fn(|accent_idx| {
+            rgb(mix_rgb(EYE_INK_PALE, CONTEXT_ACCENTS[accent_idx], 0.10))
+        }),
         coat_eye: std::array::from_fn(|coat_idx| {
             let coat_stop = COAT_RAMP[coat_idx];
             std::array::from_fn(|accent_idx| {
@@ -623,19 +662,6 @@ fn fills_lut() -> &'static FillsLut {
                     CoatEyePair { coat, eye_ink }
                 })
             })
-        }),
-        iris: std::array::from_fn(|iris_idx| {
-            let iris = EYE_RAMP[iris_idx];
-            std::array::from_fn(|accent_idx| rgb(mix_rgb(iris, CONTEXT_ACCENTS[accent_idx], 0.28)))
-        }),
-        outline: std::array::from_fn(|bg_idx| {
-            let outline_base = OUTLINE_BASES[bg_idx];
-            std::array::from_fn(|accent_idx| {
-                rgb(mix_rgb(outline_base, CONTEXT_ACCENTS[accent_idx], 0.10))
-            })
-        }),
-        underlay: std::array::from_fn(|accent_idx| {
-            rgb(mix_rgb(EYE_INK_PALE, CONTEXT_ACCENTS[accent_idx], 0.10))
         }),
     })
 }
@@ -680,8 +706,11 @@ impl ResolvedFills {
 }
 
 #[inline]
-fn packed_rgb((r, g, b): (f32, f32, f32)) -> u32 {
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+const fn packed_rgb((r, g, b): (f32, f32, f32)) -> u32 {
+    #[inline]
+    const fn channel(value: f32) -> u32 {
+        (value.clamp(0.0, 1.0) * 255.0).round() as u32
+    }
     (channel(r) << 16) | (channel(g) << 8) | channel(b)
 }
 
@@ -821,11 +850,11 @@ pub const fn accessory_attach(acc: CatGlyphId) -> (f32, f32, f32) {
 /// Fit an accessory into its attachment box, keeping the authored viewbox
 /// aspect: a wide bow gets shorter, a tall bell narrower.
 #[inline]
-fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
+const fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
     let (cx, cy, s) = accessory_attach(acc);
     let max_w = s * w as f32;
     let max_h = s * h as f32;
-    let aspect = (f32::from(GLYPHS[acc as usize].aspect_x1000) / 1000.0).max(0.001);
+    let aspect = (GLYPHS[acc as usize].aspect_x1000 as f32 / 1000.0).max(0.001);
     let (bw, bh) = if max_w / max_h > aspect {
         (max_h * aspect, max_h)
     } else {
@@ -1118,7 +1147,7 @@ static GLYPH_META: [GlyphMeta; GLYPHS.len()] = {
     meta
 };
 
-fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransform) -> bool {
+const fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransform) -> bool {
     let (ex0, ey0, ex1, ey1) = bounds;
     let eye_w = (ex1 - ex0) * xform.scale_x;
     let eye_h = (ey1 - ey0) * xform.scale_y;

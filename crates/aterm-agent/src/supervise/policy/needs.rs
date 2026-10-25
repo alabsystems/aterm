@@ -11,20 +11,30 @@ pub const NEEDS_YOU: &str = "NEEDS YOU:";
 /// The head of the worker's defense that nothing is left to do.
 pub const NOTHING_LEFT: &str = "Nothing left:";
 
+/// The restart instruction shared by the continuations and needs acknowledgements.
+macro_rules! restart_hint {
+    () => {
+        "Handle agent restarts yourself: save a handoff; `aterm ctl help restart`."
+    };
+}
+pub(crate) use restart_hint;
+
 /// [`NEEDS_HINT`] as a literal, for the texts `concat!` builds on it.
 macro_rules! needs_hint {
     () => {
-        "Put what only a person can give on a line starting NEEDS YOU: and carry on."
+        concat!(
+            "Put what only a person can give on a line starting NEEDS YOU: and carry on. ",
+            $crate::supervise::policy::needs::restart_hint!(),
+        )
     };
 }
 pub(crate) use needs_hint;
 
-/// Appended after the answers aterm types to a question (`super::turn_end::prose_answer`, `super::turn_end::reversible_answer`), and the last sentence of a restart's carry-on.
+/// Appended after the answers aterm types to a question (`super::turn_end::prose_answer`, `super::turn_end::reversible_answer`), and to a restart's carry-on.
 pub const NEEDS_HINT: &str = needs_hint!();
 
 /// Appended to the act a point types when a NEW set of needs stands, once a set.
-pub const NEEDS_ACK: &str = "Your NEEDS YOU line is on the person's screen now. Do not wait for \
-                             it: carry on with everything else.";
+pub const NEEDS_ACK: &str = concat!("Needs on screen; carry on. ", restart_hint!(),);
 
 /// THE NEED A BARE HEAD NAMES WITH NO WORDS UNDER IT.
 pub const UNREAD_NEED: &str = "see the NEEDS YOU line in its report";

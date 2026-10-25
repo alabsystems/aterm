@@ -9,14 +9,15 @@ use aterm_session::SessionId;
 
 #[cfg(a11y_tree)]
 use crate::palette::{a11y_epoch_from, a11y_slot_for, list_overlay_a11y};
-use crate::palette::{finish_overlay_card, overlay_card_frame, row_text_writer};
+use crate::palette::{finish_overlay_card, overlay_card_frame, overlay_card_span, row_text_writer};
 use crate::settings::{Roles, SettingsGeom};
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TrayInput, rgba};
 
 const MAX_BODY_LINES: usize = 16;
 const CHROME_ROWS: usize = 2;
-const MAX_CARD_WIDTH: f32 = 760.0;
+/// The card's widest, in points ([`crate::palette::overlay_card_span`]).
+const MAX_CARD_WIDTH_PT: f32 = 760.0;
 
 /// What a chip's leading mark says, most pressing first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -994,21 +995,12 @@ impl OverviewState {
 }
 
 fn overview_layout(state: &OverviewState, g: &SettingsGeom) -> OverviewLayout {
-    let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
-    let desired_margin = (g.cw * 2.0).max(16.0);
-    let max_margin = (tray_w * 0.5 - g.cw.max(0.0)).max(0.0);
-    let margin = desired_margin.min(max_margin);
-    let card_w = (tray_w - margin * 2.0).clamp(0.0, MAX_CARD_WIDTH);
+    let (card_x, card_w) = overlay_card_span(g, MAX_CARD_WIDTH_PT);
     let card_rows = state.wanted_rows().min(g.panel_rows);
     let card_h = (card_rows as f32 * g.ch).clamp(0.0, tray_h);
     OverviewLayout {
-        card: (
-            ((tray_w - card_w) * 0.5).max(0.0),
-            ((tray_h - card_h) * 0.5).max(0.0),
-            card_w,
-            card_h,
-        ),
+        card: (card_x, ((tray_h - card_h) * 0.5).max(0.0), card_w, card_h),
         card_rows,
         body_rows: state
             .lines()
@@ -1033,6 +1025,16 @@ fn overview_row_rect_in(
         (card_w - g.cw * 2.0).max(0.0),
         (g.ch - 2.0).max(0.0),
     ))
+}
+
+/// Painted hover/hit rectangle for visible slot `slot`, card-tray local.
+#[cfg(test)]
+pub(crate) fn overview_row_rect(
+    state: &OverviewState,
+    g: &SettingsGeom,
+    slot: usize,
+) -> Option<(f32, f32, f32, f32)> {
+    overview_row_rect_in(&overview_layout(state, g), g, slot)
 }
 
 /// Item index under a card-local point `(px, py)`.
@@ -1191,6 +1193,60 @@ pub(crate) fn fabric_hint_of(node: &str) -> String {
     format!("\u{2191}\u{2193} move   on {node}, answered there   esc close")
 }
 
+/// v5's closing scene (the paired perf's and the captures'): a Cruise session naming two needs and
+/// a held Land session with its held line.
+#[cfg(any(test, feature = "bench-support"))]
+pub(crate) fn closing_scene() -> OverviewState {
+    let chip = |sid: &str, local_id: u64, label: &str, doing: &str, driver: &str| OverviewChip {
+        sid: SessionId::new(sid),
+        local_id,
+        label: label.to_string(),
+        mark: ChipMark::Decide,
+        need: Some("ask"),
+        doing: doing.to_string(),
+        task: None,
+        task_words: None,
+        driver: Some(Driver::Aterm(driver.to_string())),
+        held: None,
+        typed: None,
+        worker_of: false,
+        held_by_person: false,
+        has_result: false,
+        stoppable: false,
+    };
+    let cruise = chip(
+        "n",
+        1,
+        "cruise-needs",
+        "needs you: grant Screen Recording to com.aterm.aterm in System Settings \u{25b8} Privacy & \
+         Security \u{25b8} Screen Recording, so the windowed check can capture the menu (+1 more)",
+        "cruise",
+    );
+    let land = OverviewChip {
+        typed: Some(("aterm".to_string(), "just now".to_string())),
+        held: Some(
+            "not landed yet: needs you; open work in its report: local, unchecked box, a part, \
+             still open"
+                .to_string(),
+        ),
+        ..chip(
+            "l",
+            2,
+            "land-held",
+            "needs you: rotate the deploy key",
+            "land",
+        )
+    };
+    OverviewState::new(
+        crate::WindowId(0),
+        vec![OverviewGroup {
+            label: "Window 1 \u{2014} aterm".to_string(),
+            chips: vec![cruise, land],
+        }],
+        Vec::new(),
+    )
+}
+
 /// Build the Overview card's accessibility tree.
 #[cfg(a11y_tree)]
 pub(crate) fn overview_a11y(state: &OverviewState) -> aterm_a11y::model::TreeUpdate {
@@ -1266,6 +1322,7 @@ mod tests {
             font_px: 13.0,
             cols: 160,
             panel_rows: 48,
+            px_per_pt: 1.0,
         }
     }
 
@@ -1485,7 +1542,7 @@ mod tests {
         );
         let g = geom();
         let layout = overview_layout(&s, &g);
-        assert_eq!(layout.card.2, MAX_CARD_WIDTH, "the card at its widest");
+        assert_eq!(layout.card.2, MAX_CARD_WIDTH_PT, "the card at its widest");
         assert_eq!(s.lines().len(), 5);
         assert_eq!(s.wanted_rows(), CHROME_ROWS + 5);
         let texts = |s: &OverviewState| -> Vec<(f32, String)> {
@@ -1590,5 +1647,114 @@ mod tests {
         groups[0].chips[1].doing = "busy 4m".to_string();
         assert!(s.retarget(groups, state().manages));
         assert_ne!(s.fingerprint(), before);
+    }
+
+    /// The same window at backing scale `k`: its cells, type and width cap scaled together.
+    fn geom_at(k: f32) -> SettingsGeom {
+        SettingsGeom {
+            cw: 8.0 * k,
+            ch: 16.0 * k,
+            font_px: 13.0 * k,
+            cols: 144,
+            panel_rows: 40,
+            px_per_pt: k,
+        }
+    }
+
+    /// Every Text prim of a tray as `(x, baseline, string)`.
+    fn painted_texts(tray: &TrayInput) -> Vec<(f32, f32, String)> {
+        tray.prims
+            .iter()
+            .filter_map(|p| match p {
+                DrawPrim::Text { x, baseline, s, .. } => Some((*x, *baseline, s.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A window too narrow for the cap at backing scale `k`, whose cell (7 points) makes two cells
+    /// less than the margin's 16-point floor, so the floor decides the card's width.
+    fn narrow_at(k: f32) -> SettingsGeom {
+        SettingsGeom {
+            cw: 7.0 * k,
+            cols: 60,
+            ..geom_at(k)
+        }
+    }
+
+    #[test]
+    fn the_card_is_one_width_in_points_at_1x_and_2x_and_says_the_same() {
+        let s = closing_scene();
+        for at in [geom_at, narrow_at] {
+            let (g1, g2) = (at(1.0), at(2.0));
+            let (c1, c2) = (overview_layout(&s, &g1).card, overview_layout(&s, &g2).card);
+            for (one, two) in [(c1.0, c2.0), (c1.1, c2.1), (c1.2, c2.2), (c1.3, c2.3)] {
+                assert!(
+                    (two / g2.px_per_pt - one).abs() < 0.01,
+                    "the 2x card {c2:?} is the 1x card {c1:?} in points"
+                );
+            }
+            let (t1, t2) = (
+                overview_tray(&s, &g1, Theme::default()),
+                overview_tray(&s, &g2, Theme::default()),
+            );
+            let words = |t: &TrayInput| -> Vec<String> {
+                painted_texts(t).into_iter().map(|(_, _, s)| s).collect()
+            };
+            assert_eq!(
+                words(&t2),
+                words(&t1),
+                "the 2x card cuts its rows where the 1x card does"
+            );
+            // within a point: a centred run moves by half of what its measure's per-glyph rounding adds
+            let x_at = |t: &TrayInput| -> Vec<f32> {
+                painted_texts(t).into_iter().map(|(x, ..)| x).collect()
+            };
+            for (one, two) in x_at(&t1).into_iter().zip(x_at(&t2)) {
+                assert!(
+                    (two / g2.px_per_pt - one).abs() < 1.0,
+                    "each run starts where the 1x card starts it: {one} vs {two}"
+                );
+            }
+        }
+        let card_w = |g: SettingsGeom| overview_layout(&s, &g).card.2;
+        assert_eq!(
+            card_w(geom_at(1.0)),
+            MAX_CARD_WIDTH_PT,
+            "the wide card at its widest"
+        );
+        let narrow = narrow_at(1.0);
+        assert_eq!(
+            card_w(narrow),
+            narrow.cols as f32 * narrow.cw - 2.0 * 16.0,
+            "the narrow card: the tray less a 16-point margin on each side"
+        );
+    }
+
+    #[test]
+    fn the_key_hints_fit_whole_on_a_2x_card() {
+        let s = closing_scene();
+        let g = geom_at(2.0);
+        let layout = overview_layout(&s, &g);
+        let (card_x, card_y, card_w, _) = layout.card;
+        let last_row = card_y + layout.card_rows.saturating_sub(1) as f32 * g.ch;
+        let hints: Vec<(f32, String)> = painted_texts(&overview_tray(&s, &g, Theme::default()))
+            .into_iter()
+            .filter(|(_, baseline, _)| *baseline > last_row)
+            .map(|(x, _, s)| (x, s))
+            .collect();
+        assert_eq!(
+            hints.len(),
+            1,
+            "one run of key hints on the card's last row: {hints:?}"
+        );
+        let (x, hint) = &hints[0];
+        let right = x + crate::settings::text_w(hint, TypeStep::Caption.px(g.font_px).get());
+        assert!(
+            *x >= card_x + g.cw - 0.01 && right <= card_x + card_w - g.cw + 0.01,
+            "{hint:?} spans {x}..{right}, past the card's {}..{}",
+            card_x + g.cw,
+            card_x + card_w - g.cw
+        );
     }
 }

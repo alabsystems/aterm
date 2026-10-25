@@ -14,7 +14,8 @@ pub struct Connector {
     pub home: Home,
     /// Files under the home whose existence indicates a stored login (`stat`ed, never opened).
     pub stores: &'static [&'static str],
-    /// Environment variables the CLI reads ahead of its stored login.
+    /// Credential variables the CLI reads in place of or beside its stored login;
+    /// [`crate::harness::relaunch::ahead_env`] names those a pooled launch removes.
     pub credential_env: &'static [&'static str],
     /// The sign-in flow.
     pub login: Login,
@@ -246,7 +247,7 @@ pub struct Accounts {
     /// Whether a lab pass measured [`Accounts::seam`] (and its shared set) against a real
     /// install; until one has, moves between its logins are not advised.
     pub measured: bool,
-    /// The build the lab measured the seam on, where it did.
+    /// The builds the lab measured the seam on, where it did.
     pub measured_on: Option<&'static str>,
     /// What the lab measured the CLI's walls on (the limit and login-ended rows a running
     /// session ends a turn on, or the records its limits are read from), where it did. Until it
@@ -310,6 +311,12 @@ pub enum Seam {
         var: &'static str,
         /// The entries every overlay home links to the default home.
         shared: &'static [Shared],
+        /// The empty files every overlay home is given of its own where it has none: the CLI's
+        /// "never ask" marker for a first-start offer whose answer is the default home's, since
+        /// the overlay's sessions and setup are the default home's (kimi 2.3.1 offers to move
+        /// the older kimi-cli's data into each home holding no `.skip-migration-from-kimi-cli`,
+        /// however the default home answered).
+        markers: &'static [&'static str],
     },
 }
 
@@ -328,8 +335,19 @@ impl Seam {
 pub enum Shared {
     /// A directory: made in the default home where it is missing, so the link never dangles.
     Dir(&'static str),
-    /// A file: linked whether or not it exists yet, since the CLI's create follows the link.
+    /// A file: linked whether or not it exists yet, since the CLI's create follows the link. A
+    /// file the CLI rewrites by renaming a new copy over it is one only knowingly, since the
+    /// rename replaces the link and the overlay's next launch is refused as drift: kimi 2.3.1's
+    /// `workspaces.json` is not one, its `mcp.json` is (an MCP server added, changed or removed
+    /// in an overlay replaces that link), so the person's MCP setup follows every login. A CLI
+    /// that resolves the link before its rename keeps the link: both Codex 0.164.0 builds
+    /// rename a new `config.toml` over the default home's file.
     File(&'static str),
+    /// A file the person writes and the CLI only reads: linked once the default home has it,
+    /// since the CLI warns of a link that leads nowhere (kimi 2.3.1 names a dangling
+    /// `AGENTS.md` "not a readable regular file" at every start); while the default home has
+    /// none, an overlay's link to it is removed.
+    Present(&'static str),
     /// Every file at the default home's root whose name ends so (a database: `-wal` and `-shm`
     /// are made beside the file a link resolves to, so they are never linked themselves).
     Suffix(&'static str),
@@ -759,6 +777,30 @@ const CODEX_LIMIT_WORDS: &[&str] = &[
 /// with everything but the login linked to `~/.codex` (lab gate (a), codex-old 0.164.0: its
 /// databases keep their `-wal` beside the linked file, a rollout lands in the linked
 /// `sessions`, and `exec resume <id>` in an overlay finds a rollout the default home wrote).
+/// Neither codex-old 0.164.0 nor codex-alab 0.164.0-dev replaces one of these links
+/// (`docs/measured/codex-overlay-writes-2026-10-24.md`, `exec` and TUI turns, resumes,
+/// `/rename`, a history trim, `mcp`, `features`, `archive`, `plugin` (codex-old) and a saved
+/// approval rule in an overlay). `config.toml`, the one shared file either rewrites by renaming
+/// a new copy over it, gets that copy at the default home's path, so its link stays. The rest
+/// is created through its link (`.sqlite-maintenance.lock` by codex-old), appended or written
+/// in place, or written inside a linked directory. `AGENTS.override.md` and `AGENTS.md`, the
+/// global instructions both builds read from the Codex home (the override first), are linked
+/// whether or not the default home has them: neither build warns of a link that leads nowhere,
+/// and each reads the file through it once the default home has it (the record's §7, §11).
+///
+/// An overlay that runs a session before the default home has made its databases makes six of
+/// its own, which `ensure` reports as drift once the default home makes them (the record's
+/// §8). The pool reads the default home's usage before it links or reads an overlay
+/// (`accounts_pool::record_usage`), a sign-in's staging home keeps no database of its own (one
+/// the default home lacks is moved there), and `launch_env` and `session_move` pass over a
+/// drifted row unless it is the pinned one. Left open: a launch under `accounts = "off"`
+/// (straight to the pin, no usage read), a roster with no default row, and a person's own
+/// `CODEX_HOME=<overlay>` run.
+///
+/// Each build records a thread's rollout under the path of the home that wrote it (the shared
+/// `state_5.sqlite`), and an `exec resume <id>` from the default home fails (`no rollout
+/// found`) once that path no longer resolves (the record's §12). So an overlay directory is
+/// never removed or renamed while a session it wrote may be resumed or moved.
 pub const CODEX_ACCOUNTS: Accounts = Accounts {
     seam: Seam::Overlay {
         var: "CODEX_HOME",
@@ -768,6 +810,7 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
             Shared::File("session_index.jsonl"),
             Shared::File("history.jsonl"),
             Shared::File("config.toml"),
+            Shared::File("AGENTS.override.md"),
             Shared::File("AGENTS.md"),
             Shared::Dir("prompts"),
             Shared::Dir("rules"),
@@ -779,6 +822,7 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
             Shared::File(".sqlite-maintenance.lock"),
             Shared::Suffix(".sqlite"),
         ],
+        markers: &[],
     },
     roster_file: "accounts-codex.toml",
     default_home: ".codex",
@@ -794,23 +838,106 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
     sign_in_page: SignInPage::Fixed("https://auth.openai.com/log-in"),
     web_session_key: None,
     measured: true,
-    measured_on: Some("codex-old 0.164.0"),
+    measured_on: Some("codex-old 0.164.0 and codex-alab 0.164.0-dev"),
     walls_measured_on: Some("codex rollouts' rate_limits"),
     signin: Some(CODEX_SIGNIN),
 };
 
+/// Grok Build's texts for a login of its own (the one `grok login` writes to the auth file a
+/// row's `GROK_AUTH_PATH` names) that is missing, expired, rejected or could not be renewed, as
+/// grok 1.0.70's binary spells them (a sweep of its strings; none was seen on a screen): ``Not
+/// logged in. Run `grok login`.``, ``Token expired. Run `grok login` to re-authenticate.``,
+/// ``Your auth token is invalid or expired. Run `grok login` to re-authenticate.``,
+/// ``Authentication rejected by server. …``, ``Auth recovery exhausted; re-authentication
+/// required. …`` and `Session expired, re-authentication required`, ``Session expired. Run
+/// `grok login` to re-authenticate.``, ``Your session has expired. …``, `Authentication
+/// required: your session has expired or your credentials were rejected. …`, ``Authentication
+/// required. Run `grok login` to re-authenticate.``, `Your session expired and … could not
+/// renew it in the background. …`, ``Authentication could not be refreshed. …``, ``Your team
+/// sign-in was rejected. It may have expired or lack access. Run `grok login` to sign in
+/// again.``, the not-signed-in texts (``Not signed in. Run `grok login` …``, `Not signed in. To
+/// authenticate without a browser, …`, ``not signed in — run `grok login`, …``, `You are not
+/// authenticated.`, `No cached auth token found`, ``Authentication failed. Run `grok login`, set
+/// XAI_API_KEY, or add api_key to ~/.grok/config.toml.``, ``No cached credentials found. …``,
+/// `Headless mode requires a grok.com session. …`, ``preferred_method=oidc but no session is
+/// available. …`` and `Signed out: /feedback works, and /login signs in.`), and a compaction's
+/// 401 (`… compaction failed — re-authenticate with /login and retry.`, `authentication problem
+/// — re-authenticate using /login and retry.`). Each phrase stands in one of aterm-phase's
+/// `grok.auth.*` texts, which its `vendor_drift` bench holds to the installed binary
+/// (`connector_tests::every_grok_auth_word_is_one_of_the_builds_login_ended_texts`). The agent
+/// proxy's status `Not authenticated.` says no login is stored too, but its two words are no
+/// phrase: the build's own log lines end on them (`announcements refresh skipped: not
+/// authenticated`), and so does much other prose. Nothing reads these words yet: no running path
+/// asks a pool's [`Walls::ended_in`], and Grok Build's row is not in [`ROWS`], so no review runs
+/// it.
+///
+/// None is bare `token expired`, `re-authenticate`, ``run `grok login` `` or `sign in again`, which
+/// the build also prints where no login of the row's ended: a passing failure (``Authentication
+/// is temporarily unavailable. Run `grok login` if this persists.``, `Token refresh failed
+/// transiently (network); …`, `Re-authenticated after 401; retrying request`), an MCP server's
+/// own OAuth (`Access token expired or nearly expired, refreshing.`, `Invalid token type: Token
+/// expired`), Grove's Git credentials (`token expired and refresh is off; …`), the sign-in flow's
+/// own ending (`Device code expired. …`), a feature that wants a grok.com login an API-key
+/// session lacks (``Billing data requires auth with grok.com. Run `grok login` …``) and the
+/// `/login` command's menu row. Nor are the texts of a credential no row holds: a team's
+/// deployment key (`Your GROK_DEPLOYMENT_KEY is invalid or expired. Please contact a team
+/// admin.`, `The deployment key was rejected. …`), which `grok setup` installs managed
+/// configuration with, an admin's API-key policy (``API-key auth is disabled by your
+/// administrator. …``), a configuration that offers no sign-in (`No login method available`), a
+/// model endpoint's own key (`Authentication failed: the model endpoint rejected this build's
+/// credential. …`), and a 401 that outlasts a login just renewed (`Auth recovery succeeded but …
+/// still rejected (401); …`). A renewal (`accounts renew`, a fresh `grok login`) changes none of
+/// those. Whether a set `GROK_DEPLOYMENT_KEY` also signs a session in ahead of the row's login
+/// (the build's status texts list `You are authenticated via deployment key.` beside `You are
+/// logged in with …`) is unmeasured, so a pooled line leaves it set.
 const GROK_AUTH_WORDS: &[&str] = &[
     "not logged in. run `grok login`",
-    "you are not authenticated",
-    "no cached credentials found",
-    "token expired",
+    "token expired. run `grok login`",
+    "auth token is invalid or expired",
+    "authentication rejected by server",
+    "re-authentication required",
+    "session expired. run `grok login`",
     "your session has expired",
+    "authentication required. run `grok login`",
+    "could not renew it in the background",
     "authentication could not be refreshed",
+    "your team sign-in was rejected",
+    "not signed in. run `grok login`",
+    "not signed in. to authenticate without a browser",
+    "not signed in \u{2014} run `grok login`",
+    "you are not authenticated",
+    "no cached auth token found",
+    "authentication failed. run `grok login`",
+    "no cached credentials found",
+    "headless mode requires a grok.com session",
+    "no session is available. run `grok login`",
+    "signed out: /feedback works, and /login signs in",
+    "compaction failed \u{2014} re-authenticate with /login",
+    "authentication problem \u{2014} re-authenticate using /login",
 ];
 
+/// Grok Build's usage walls and credit-exhaustion words from its 1.0.67 and 1.0.70 binaries.
+/// The team's API rate limit keeps its full wording with either apostrophe. The bare strings
+/// `spending-limit` and `spending limit` sit beside the compaction failure, but their error
+/// grammar is unmeasured: a failed review can quote them without exhausting its account. They
+/// alone therefore justify no cooldown. The complete compaction failure still matches its
+/// `out of credits` words, alongside the upsells, exhaustion messages and error codes below.
 const GROK_LIMIT_WORDS: &[&str] = &[
     "hit the rate limit for your plan",
+    "hit your team's api rate limit",
+    "hit your team\u{2019}s api rate limit",
+    "ask a team admin to purchase more credits",
     "free grok build usage limit",
+    "hit your free usage limit",
+    "hit your weekly limit",
+    "hit the credit limit for your plan",
+    "hit your spending cap",
+    "resubmit the last prompt once you have usage again",
+    "out of credits",
+    "usage balance exhausted",
+    "usage limit reached",
+    "free-usage-exhausted",
+    "insufficient_quota",
 ];
 
 /// Grok Build's pool: `GROK_AUTH_PATH` names the account's `auth.json` and `GROK_HOME`
@@ -839,11 +966,18 @@ pub const GROK_ACCOUNTS: Accounts = Accounts {
     signin: Some(GROK_SIGNIN),
 };
 
+/// Kimi Code's texts for an ended login. `provider managed:kimi-code has no credential configured`
+/// is what kimi 2.3.1's `-p` fails with where the home's `config.toml` names the managed login and
+/// its token is gone (`docs/measured/kimi-credentials-2026-10-24.md` §5): the managed provider is
+/// the one `kimi login` writes, so its missing token is the row's login ended. The same sentence
+/// for another provider (`provider __kimi_env__ …`, an environment model with no key, or a
+/// hand-written provider with none) is no login of the row's.
 const KIMI_AUTH_WORDS: &[&str] = &[
     "re-login required",
     "no token for \"kimi-code\"",
     "run /login",
     "use /login to sign in",
+    "provider managed:kimi-code has no credential configured",
 ];
 
 const KIMI_LIMIT_WORDS: &[&str] = &[
@@ -858,24 +992,36 @@ const KIMI_LIMIT_WORDS: &[&str] = &[
 ];
 
 /// Kimi Code's pool: a whole `KIMI_CODE_HOME` per account (one home holds one login per OAuth
-/// host), its sessions, input history and the user's own setup linked to the default home. Its
-/// home root was read in the lab (kimi 2.3.1 makes `device_id`, `cache`, `workspaces.json`,
-/// `sessions` and `logs`; `config.toml`, `credentials` and the region marker are the login's),
-/// but resume across two homes needs a signed-in account, so it is not measured yet.
+/// host), its sessions, their locks, input history, folder trust and the user's own setup linked
+/// to the default home; `config.toml`, `credentials`, the region marker, `device_id`, `logs`,
+/// `cache`, `bin`, `session_index.jsonl` and `workspaces.json` stay each login's. Measured on
+/// kimi 2.3.1 (`docs/measured/kimi-resume-2026-10-24.md`, no account signed in, a local stand-in
+/// model): an overlay lists, opens, replays and continues a session the default home wrote, and
+/// the default home sees the overlay's turns and sessions; a turn in one home refuses a second
+/// open in the other only once `locks` is shared; a folder trusted in one is trusted in the other
+/// only once `workspace-trust` is. `workspaces.json` is not linked: kimi replaces it (a write to
+/// a temporary file renamed over it) at its first write in an overlay, and resume never needed
+/// it, since each session's folder is named under `sessions`. `mcp.json` is linked though kimi
+/// writes it the same way, at an MCP change made in an overlay ([`Shared::File`]). Each overlay
+/// holds its own `.skip-migration-from-kimi-cli`: where `~/.kimi` holds the older kimi-cli's
+/// data, kimi otherwise offers to move it into the overlay before its first screen, which no
+/// unattended start answers (the lab record's migration section).
 pub const KIMI_ACCOUNTS: Accounts = Accounts {
     seam: Seam::Overlay {
         var: "KIMI_CODE_HOME",
         shared: &[
             Shared::Dir("sessions"),
+            Shared::Dir("locks"),
             Shared::Dir("user-history"),
-            Shared::File("workspaces.json"),
+            Shared::Dir("workspace-trust"),
             Shared::Dir("skills"),
             Shared::Dir("agents"),
             Shared::Dir("plugins"),
             Shared::File("mcp.json"),
             Shared::File("tui.toml"),
-            Shared::File("AGENTS.md"),
+            Shared::Present("AGENTS.md"),
         ],
+        markers: &[".skip-migration-from-kimi-cli"],
     },
     roster_file: "accounts-kimi.toml",
     // `.kimi-code` is the home name kimi 2.3.1's binary spells; the lab ran it under a scratch
@@ -896,8 +1042,9 @@ pub const KIMI_ACCOUNTS: Accounts = Accounts {
     // Both sites' script bundles keep `access_token` and `refresh_token` in `localStorage`
     // (design §5 (f)).
     web_session_key: Some("access_token"),
-    measured: false,
-    measured_on: None,
+    measured: true,
+    measured_on: Some("kimi 2.3.1"),
+    // No signed-in session reached a wall, so a running session is not moved yet.
     walls_measured_on: None,
     signin: Some(KIMI_SIGNIN),
 };
@@ -1129,7 +1276,23 @@ pub const KIMI: Connector = Connector {
         default: ".kimi-code",
     },
     stores: &["credentials/kimi-code.json"],
-    credential_env: &[],
+    // Measured on kimi 2.3.1 with `-p` (`docs/measured/kimi-credentials-2026-10-24.md`; no
+    // account signed in, two loopback stand-ins): `KIMI_MODEL_NAME` with `KIMI_MODEL_API_KEY`
+    // replaces the home's default model and its provider with an environment model of their
+    // own, and with no key the run fails (`provider __kimi_env__ has no credential
+    // configured`); a key without the name is never read. An `Authorization` line in
+    // `KIMI_CODE_CUSTOM_HEADERS` replaces the provider's own bearer on every chat request.
+    // `KIMI_API_KEY` is no variable kimi reads from its environment: it is a key of a provider's
+    // `env` table in `config.toml`, and with it exported a provider with no key of its own still
+    // has none; `KIMI_BASE_URL` is only an environment model's base. `KIMI_CODE_BASE_URL`,
+    // `KIMI_CODE_OAUTH_HOST` and `KIMI_OAUTH_HOST` move the managed login's endpoints and, by
+    // the binary (`resolveKimiCodeRuntimeAuth`; no OAuth login was measured), the credential
+    // slot its token is read from; they carry no credential and are not listed.
+    credential_env: &[
+        "KIMI_MODEL_NAME",
+        "KIMI_MODEL_API_KEY",
+        "KIMI_CODE_CUSTOM_HEADERS",
+    ],
     login: Login::Run {
         args: &["login"],
         remote: None,

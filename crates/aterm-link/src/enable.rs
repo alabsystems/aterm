@@ -354,7 +354,7 @@ impl Paths {
         let flat = collapse_between_tags(text);
         let label = format!(
             "<key>Label</key><string>{}</string>",
-            xml_escape(&self.label())
+            aterm_codec::xml::escape(&self.label())
         );
         if !flat.contains(&label) || !flat.contains("<key>KeepAlive</key><true/>") {
             return false;
@@ -373,11 +373,11 @@ impl Paths {
     /// Render the launchd plist (`ProgramArguments` as XML-escaped words, no `/bin/sh -c`).
     #[must_use]
     pub fn plist_text(&self) -> String {
-        let root = xml_escape(&self.root.to_string_lossy());
+        let root = aterm_codec::xml::escape(&self.root.to_string_lossy());
         let args: String = self
             .broker_argv()
             .iter()
-            .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
+            .map(|a| format!("    <string>{}</string>\n", aterm_codec::xml::escape(a)))
             .collect();
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -397,7 +397,7 @@ impl Paths {
              \x20 <key>StandardErrorPath</key><string>{root}/broker.err</string>\n\
              </dict>\n\
              </plist>\n",
-            label = xml_escape(&self.label()),
+            label = aterm_codec::xml::escape(&self.label()),
         )
     }
 
@@ -432,12 +432,6 @@ pub(crate) fn default_root(home: &Path) -> PathBuf {
 pub(crate) fn root_of(broker: &str) -> Option<PathBuf> {
     let root = Path::new(broker).parent()?.to_path_buf();
     root.is_absolute().then_some(root)
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn xml_unescape(s: &str) -> String {
@@ -6072,7 +6066,7 @@ mod tests {
                  \t\t<string>{script}</string>\n\t</array>\n\
                  \t<key>KeepAlive</key>\n\t<true/>\n</dict>\n</plist>\n",
                 label = p.label(),
-                script = xml_escape(script),
+                script = aterm_codec::xml::escape(script),
             )
         };
         let install = |text: &str| std::fs::write(p.plist(), text).expect("plist");

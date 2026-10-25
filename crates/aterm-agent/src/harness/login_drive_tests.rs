@@ -227,6 +227,11 @@ fn signin_stand_in() {
     let first = words.next();
     let transcript = match first {
         Some("kimi" | "hold") => KIMI.to_owned(),
+        Some("kimi-unfinished") => KIMI
+            .lines()
+            .filter(|line| !line.contains("Logged in"))
+            .collect::<Vec<_>>()
+            .join("\n"),
         Some("off-pin") => KIMI.replace("www.kimi.ai", "www.kimi.ai.example.com"),
         _ => String::new(),
     };
@@ -922,5 +927,35 @@ fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk
     assert!(
         !calls_back_here(kimi_route),
         "CONTROL: kimi's page calls nothing back"
+    );
+}
+
+#[test]
+fn slow_approver_past_output_grace_still_drains_buffered_signed_in_line() {
+    struct SlowApprover;
+    impl Approver for SlowApprover {
+        fn approve(&mut self, _handoff: &Handoff<'_>) -> Approval {
+            std::thread::sleep(OUTPUT_GRACE + Duration::from_millis(150));
+            Approval::Approved { page: true }
+        }
+    }
+
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let drove = stand_in_drive_in(tmp.path(), "kimi 0", &mut SlowApprover);
+    assert_eq!(
+        drove.outcome,
+        Outcome::SignedIn {
+            email: None,
+            page: true,
+        },
+        "buffered `Signed in` line must still be drained when approver exceeds OUTPUT_GRACE"
+    );
+
+    let tmp_ctrl = aterm_tempfile::tempdir().expect("tmp_ctrl");
+    let control = stand_in_drive_in(tmp_ctrl.path(), "kimi-unfinished 0", &mut SlowApprover);
+    assert_eq!(
+        control.outcome,
+        Outcome::Exited(Some(0)),
+        "CONTROL: exit 0 without a completion phrase stays Exited(Some(0))"
     );
 }

@@ -158,6 +158,7 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
     note_login_notice(&mut logins, "main", 2, NOW - HOUR);
     note_served_login(&mut logins, "main", NOW - HOUR);
     note_wrong_account(&mut logins, "work-2", NOW);
+    note_sign_in_task(&mut logins, "main", SignInAction::Browser, NOW);
     let text = logins.to_json();
     assert_eq!(Logins::from_json(&text, NOW), Ok(logins.clone()));
     assert!(text.starts_with("{\"labels\":"), "keys sorted: {text}");
@@ -238,6 +239,38 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
         std::fs::read_to_string(store.logins_file()).expect("kept"),
         "{\"schema\":7}"
     );
+}
+
+#[test]
+fn a_sign_in_task_survives_restart_and_old_login_use_until_a_new_login_is_bound() {
+    let tmp = tmp("sign-in-task");
+    let store = Store::at_for(tmp.path(), Cli::Kimi, tmp.path());
+    let (mut state, mut logins) = renewed(NOW - DAY);
+    let dir = logins.labels["main"].dir.clone();
+    note_sign_in_task(&mut logins, "main", SignInAction::Browser, NOW - HOUR);
+    store.save_logins(&logins).expect("save");
+    let reopened = Store::at_for(tmp.path(), Cli::Kimi, tmp.path());
+    let (mut logins, _) = reopened.load_logins(NOW).expect("reload");
+    assert_eq!(
+        sign_in_tasks(&roster(), &logins),
+        [("main".into(), SignInAction::Browser)]
+    );
+    assert_eq!(logins.labels["main"].dir, dir);
+    note_served_login(&mut logins, "main", NOW);
+    assert!(logins.labels["main"].sign_in_task.is_some());
+    note_renewed(
+        &mut state,
+        &mut logins,
+        "main",
+        None,
+        &abs("/s/main.2"),
+        None,
+        NOW,
+    );
+    assert!(sign_in_tasks(&roster(), &logins).is_empty());
+    note_sign_in_task(&mut logins, "main", SignInAction::Login, NOW);
+    note_wrong_account(&mut logins, "main", NOW);
+    assert!(sign_in_tasks(&roster(), &logins).is_empty());
 }
 
 #[test]

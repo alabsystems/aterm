@@ -1153,3 +1153,30 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         );
     }
 }
+
+/// THE ACCOUNT MENU'S WHY NEVER ASKS THE PERSON FOR THE WEEK (owner ruling R-12): no line under
+/// the footer's reason names `/usage` or a command for the person to type; it says why the
+/// harness has no figure.
+#[test]
+fn no_weekly_why_tells_the_person_to_open_usage() {
+    use aterm_agent::harness::profile::WeeklyGap;
+    use aterm_agent::harness::tap::Refusal;
+    for gap in [
+        WeeklyGap::TapOff,
+        WeeklyGap::Unoffered(Refusal::Exe),
+        WeeklyGap::Unoffered(Refusal::Home),
+        WeeklyGap::Unoffered(Refusal::Login),
+        WeeklyGap::Unoffered(Refusal::Line),
+        WeeklyGap::Unoffered(Refusal::Argv),
+        WeeklyGap::Unoffered(Refusal::Settings),
+        WeeklyGap::Untapped,
+        WeeklyGap::Unrestarted,
+        WeeklyGap::NoReply,
+        WeeklyGap::Stale,
+    ] {
+        let whole = weekly_gap_why(gap).join(" ");
+        for asks in ["/usage", "open ", "aterm ctl"] {
+            assert!(!whole.contains(asks), "{gap:?}: {whole:?} asks {asks:?}");
+        }
+    }
+}

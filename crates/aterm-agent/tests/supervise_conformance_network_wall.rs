@@ -284,12 +284,12 @@ fn walk(m: &Model, strict: bool) -> (BTreeMap<&'static str, usize>, Vec<State>) 
         now: base,
         measured: base,
     };
-    let mut seen: BTreeSet<State> = BTreeSet::new();
+    let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
     let mut words = BTreeMap::<&str, usize>::new();
     let mut disagree = Vec::new();
     while let Some((st, real)) = queue.pop_front() {
-        if !seen.insert(st.clone()) {
+        if !seen.insert(crate::common::key(m, &st)) {
             continue;
         }
         if strict {

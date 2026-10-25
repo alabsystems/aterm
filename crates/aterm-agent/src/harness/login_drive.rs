@@ -607,7 +607,7 @@ pub struct Spec<'a> {
     pub hang: Duration,
 }
 
-fn end(child: &mut aterm_uds::spawnfd::Child) {
+pub(super) fn end(child: &mut aterm_uds::spawnfd::Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id())
         && pid > 0
@@ -727,7 +727,12 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                 deadline,
             };
             match approver.approve(&handoff) {
-                Approval::Approved { page: shown } => page = shown,
+                Approval::Approved { page: shown } => {
+                    page = shown;
+                    if status.is_some() {
+                        exited_at = Some(Instant::now());
+                    }
+                }
                 Approval::NeedsYou(why) => {
                     end(&mut child);
                     return Drove {
@@ -772,6 +777,11 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         }
         if exited_at.is_some_and(|at| at.elapsed() >= OUTPUT_GRACE) {
             break;
+        }
+    }
+    while let Ok(msg) = rx.try_recv() {
+        if let Some(line) = msg {
+            scan.feed(spec.grammar, &line);
         }
     }
     let code = status.and_then(|s| s.code());
@@ -1130,9 +1140,12 @@ pub fn login_command(
     let env = signin
         .map(|signin| child_env(req.cli, signin, req.staging, &path, var))
         .unwrap_or_default();
-    let mut args = match route.drive {
-        Drive::AppServer => vec!["login".to_owned()],
-        Drive::Lines { .. } => child_args(route, req.row.vendor.region),
+    let mut args: Vec<OsString> = match route.drive {
+        Drive::AppServer => vec![OsString::from("login")],
+        Drive::Lines { .. } => child_args(route, req.row.vendor.region)
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
     };
     let mut program = program;
     if over_ssh && signin.is_some_and(|s| s.no_desk.contains(&std::env::consts::OS)) {
@@ -1152,10 +1165,7 @@ pub fn login_command(
         }
         let parent = var("PATH").unwrap_or_default();
         let resolved = on_path(&program, &parent).unwrap_or(program);
-        let mut wrapped: Vec<String> = no_desk_argv(&resolved, &[])
-            .into_iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let mut wrapped = no_desk_argv(&resolved, &[]);
         wrapped.append(&mut args);
         args = wrapped;
         program = sandbox.to_path_buf();

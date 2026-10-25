@@ -1878,6 +1878,7 @@ pub(crate) struct MachineConfig {
 pub(crate) struct SysConfig {
     pub(crate) stats_bars: Option<String>,
     pub(crate) stats_deck_size: Option<String>,
+    pub(crate) stats_deck_style: Option<String>,
     pub(crate) disk_roots: Option<Vec<String>>,
 }
 
@@ -3799,6 +3800,15 @@ impl Config {
             self.sys
                 .as_ref()
                 .and_then(|sys| sys.stats_deck_size.as_deref()),
+        )
+    }
+
+    /// Which painter draws the Deck (`[sys] stats_deck_style`).
+    pub(crate) fn stats_deck_style_or_default(&self) -> crate::stats_deck::DeckStyle {
+        crate::stats_deck::DeckStyle::parse(
+            self.sys
+                .as_ref()
+                .and_then(|sys| sys.stats_deck_style.as_deref()),
         )
     }
 
@@ -6348,17 +6358,22 @@ impl App {
 
     /// The `(rows, cols)` window `wid` gets for raw `size`.
     pub(crate) fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        let cols = aterm_render::pad_split(size.width as usize, pad, cw).cells as u16;
+        let (cw, _) = self.win_cell_size(wid);
+        let cols = aterm_render::pad_split(size.width as usize, self.win_pad(wid), cw).cells as u16;
+        let rows = self.grid_rows_under(wid, size.height as usize, self.win_head(wid));
+        (rows, cols)
+    }
+
+    /// The rows window `wid`'s grid gets in a frame `frame_h` px tall under a `head` px head.
+    pub(crate) fn grid_rows_under(&self, wid: WindowId, frame_h: usize, head: usize) -> u16 {
+        let (_, ch) = self.win_cell_size(wid);
         let win_rows = crate::asymmetric_pad_cells(
-            (size.height as usize).saturating_sub(self.win_head(wid)),
+            frame_h.saturating_sub(head),
             self.win_pad_top(wid),
-            pad,
+            self.win_pad(wid),
             ch,
         ) as u16;
-        let rows = win_rows.saturating_sub(self.chrome_rows(wid)).max(1);
-        (rows, cols)
+        win_rows.saturating_sub(self.chrome_rows(wid)).max(1)
     }
 
     /// Minimum inner size that aligns the resize-increment lattice with the whole-cell frame lattice for window `wid`.
@@ -7255,6 +7270,7 @@ impl App {
         );
         let old_stats_bars = self.config.stats_bars_or_default();
         let old_deck_size = self.config.stats_deck_size_or_default();
+        let old_deck_style = self.config.stats_deck_style_or_default();
 
         let sparkle_feed_changed = deco_feed_changed(
             &self.config,
@@ -7584,11 +7600,13 @@ impl App {
         );
         let new_stats_bars = config.stats_bars_or_default();
         let new_deck_size = config.stats_deck_size_or_default();
-        let stats_bars_changed = old_stats_bars.takes_room() != new_stats_bars.takes_room()
-            || (new_stats_bars.takes_room() && old_deck_size != new_deck_size);
+        let new_deck_style = config.stats_deck_style_or_default();
+        let deck_moved = old_stats_bars.takes_room() != new_stats_bars.takes_room()
+            || (new_stats_bars.takes_room()
+                && (old_deck_size != new_deck_size || old_deck_style != new_deck_style));
         crate::menu::set_stats_bars_form(new_stats_bars);
         crate::menu::set_deck_size_pref(new_deck_size);
-        if old_stats_bars != new_stats_bars {
+        if old_stats_bars != new_stats_bars || old_deck_style != new_deck_style {
             for ws in self.windows.values_mut() {
                 ws.stats_lens = crate::stats_lens::LensSlot::default();
                 if let Some(w) = ws.os_window.as_ref() {
@@ -7596,7 +7614,9 @@ impl App {
                 }
             }
         }
-        if !backend_rebuild_needed && (old_padding != new_padding || stats_bars_changed) {
+        if !backend_rebuild_needed && (old_padding != new_padding || deck_moved) {
+            let _site = deck_moved
+                .then(|| crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Deck));
             let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
                 .windows
                 .iter()

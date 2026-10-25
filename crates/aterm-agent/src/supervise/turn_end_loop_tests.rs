@@ -32,6 +32,9 @@ mod tap_clock_loop;
 #[path = "log_wake_loop_tests.rs"]
 mod log_wake_loop;
 
+#[path = "woken_turn_loop_tests.rs"]
+mod woken_turn_loop;
+
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
@@ -457,6 +460,62 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
     );
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert!(m.requests.contains(&continue_request("keep going")));
+}
+
+/// Claude Code 2.1.310 draws its grey suggestion's first glyph inverse, under the caret it draws
+/// itself, and the rest dim (the cells read in the real-Claude lab, 2026-10-24): the loop reads the
+/// glyph after the caret and accepts the suggestion, where it read the caret's cell as a person's
+/// draft and pressed Enter, which sends nothing. NEGATIVE CONTROL: the same caret over plain text
+/// is a draft, and nothing accepts it.
+#[test]
+fn a_suggestion_under_claude_codes_drawn_caret_is_accepted() {
+    let caret = suggesting("Stage 1 is in.")
+        .iter()
+        .position(|row| row == "❯ keep going")
+        .expect("caret row");
+    for (after, accepted) in [
+        ("OK e 999999 111318 dim", true),
+        ("OK e d0d0d0 111318 none", false),
+    ] {
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            suggesting("Stage 1 is in."),
+            suggesting("Stage 1 is in."),
+            busy_screen(),
+            ended(STOP),
+        ]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+        m.screen_cols.insert(2, 12);
+        m.vanish_after = Some(2);
+        m.cells = [
+            ((caret, 2), "OK k 111318 d0d0d0 inverse".to_string()),
+            ((caret, 3), after.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (lines, _) = watch_lines(&mut m, &hosted(30));
+        assert!(
+            m.requests.contains(&format!("cell {caret} 3")),
+            "{after}: the glyph after the caret is read: {:#?}",
+            m.requests
+        );
+        assert_eq!(
+            lines.contains(&format!(
+                "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
+            )),
+            accepted,
+            "{after}: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            m.presses().iter().any(|p| p.ends_with(" right")),
+            accepted,
+            "{after}: {:#?}",
+            m.requests
+        );
+    }
 }
 
 #[test]
@@ -16920,6 +16979,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
                     short: s.turn_end.short_streak(),
                     retry: None,
                     said: s.turn_end.replies(),
+                    said_reset_ms: s.carried().said_reset_ms,
                 },
                 s.turn_end.limit_try()
             )),

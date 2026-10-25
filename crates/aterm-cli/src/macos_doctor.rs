@@ -7,23 +7,27 @@ use aterm_json::{Value, json};
 use aterm_machines::init::{Hold, Workstation, WorkstationGroup};
 use aterm_machines::port::{Cmd, System};
 use aterm_machines::{model::PValue, plist};
-use aterm_types::macos_setup::{Selection, Setting};
+use aterm_types::macos_setup::{
+    PassOutcome, PutBack, RestoreOutcome, Selection, Setting, Unfinished,
+};
 
 mod initial;
 pub use initial::{
     InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
-    InitialSetupSnapshotError, SetupHooks, SetupNext, StageEvent, alab_mac, apply_initial_setup,
-    apply_initial_setup_observed, authorize_initial_setup, authorize_initial_setup_observed,
-    automatic_plan, check_initial_setup, check_initial_setup_observed,
-    initial_setup_access_revision, initial_setup_admission, initial_setup_finished,
-    initial_setup_observation, initial_setup_park_mark, initial_setup_revision,
-    initial_setup_snapshot, initial_setup_status, observe_initial_setup,
-    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
-    run_initial_setup_pass, upgrade_provisional_setup, validate_initial_setup_plan,
+    InitialSetupSnapshotError, InitialSetupUpgrade, SetupHooks, SetupNext, SetupUpgrade,
+    StageEvent, alab_mac, apply_initial_setup, apply_initial_setup_observed, automatic_plan,
+    check_initial_setup, check_initial_setup_observed, initial_setup_access_revision,
+    initial_setup_admission, initial_setup_finished, initial_setup_observation,
+    initial_setup_park_mark, initial_setup_revision, initial_setup_snapshot, initial_setup_status,
+    observe_initial_setup, provisional_setup_widens, request_initial_setup_stop,
+    restart_initial_setup, restart_initial_setup_observed, run_initial_setup_pass,
+    upgrade_provisional_setup, validate_initial_setup_plan,
 };
 #[cfg(any(test, debug_assertions))]
-pub use initial::{initial_setup_observation_at, initial_setup_snapshot_at};
+pub use initial::{
+    ProvisionalSetupWatchTest, initial_setup_observation_at, initial_setup_snapshot_at,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -55,7 +59,7 @@ impl Action {
 pub const LOGIN: &str = "login";
 
 /// One preference's observed outcome.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Row {
     /// Human-readable setting name.
     pub name: String,
@@ -78,6 +82,40 @@ pub struct Report {
     pub manual_steps: Vec<String>,
     /// Original per-key values retained for `--restore`.
     pub backup: PathBuf,
+    /// A Restore's outcome by System State row, for the page, whose notes name rows where
+    /// `rows` names each key; `None` for any other action.
+    pub restore: Option<RestoreRows>,
+    /// A pass's rows for the page (design §3.4, §3.6): what it did to the Mac settings in
+    /// System State's row names, where `rows` names each preference key, keyboard and process
+    /// for `aterm doctor`; `None` where `rows` are in the page's terms already.
+    pub page: Option<PassPage>,
+}
+
+/// What a Restore did, for System State (design §3.4).
+#[derive(Clone, Debug, Default)]
+pub struct RestoreRows {
+    /// How each row's saved preferences came out. A relaunch that failed after they were
+    /// written leaves the rows its process reads to the next login, never a row of its own:
+    /// the page names no process.
+    pub outcome: aterm_types::macos_setup::RestoreOutcome,
+}
+
+/// A pass's rows for System State (design §3.4, §3.6).
+#[derive(Clone, Debug, Default)]
+pub struct PassPage {
+    /// What the pass did to the Mac settings that the page says in its own words: a change
+    /// that failed or could not be confirmed, by row, and what its rollback put back.
+    pub outcome: PassOutcome,
+    /// The pass's other rows, about no one setting's keys, which the page shows as they are.
+    pub rows: Vec<Row>,
+}
+
+impl PassPage {
+    /// Add a later part of the same pass (a follow-up, a later stage's report).
+    pub fn merge(&mut self, later: Self) {
+        self.outcome.merge(later.outcome);
+        self.rows.extend(later.rows);
+    }
 }
 
 impl Report {
@@ -87,7 +125,7 @@ impl Report {
         self.rows.iter().any(|r| {
             matches!(
                 r.status.as_str(),
-                "drift" | "error" | "blocked" | "waiting" | "unverified"
+                "drift" | "error" | "blocked" | "waiting" | "unreached" | "unverified"
             )
         })
     }
@@ -399,6 +437,8 @@ fn apply_part_with(
                         }],
                         manual_steps: Vec::new(),
                         backup: root.join("original-preferences.json"),
+                        restore: None,
+                        page: None,
                     }));
                 }
                 return Ok(None);
@@ -420,6 +460,8 @@ fn apply_part_with(
             }],
             manual_steps: Vec::new(),
             backup: root.join("original-preferences.json"),
+            restore: None,
+            page: None,
         }));
     }
     let accounts_selected =
@@ -471,11 +513,14 @@ fn apply_part_with(
     if report.needs_attention()
         && let Some(detail) = request_failure
     {
-        report.rows.push(Row {
-            name: "Native account permission request".into(),
-            status: "blocked".into(),
-            detail,
-        });
+        as_is(
+            &mut report,
+            Row {
+                name: "Native account permission request".into(),
+                status: "blocked".into(),
+                detail,
+            },
+        );
     }
     Ok(Some(report))
 }
@@ -1077,12 +1122,27 @@ trait Host {
     /// Relaunch `name`, and return once it runs again and what it reads of `reads` has
     /// settled, so a read-back after it reads what the relaunched process kept.
     fn restart(&mut self, name: &str, reads: &[&Target]) -> Result<(), String>;
-    fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String>;
-    /// Put the live settings `saved` holds back as well as the saved preferences. A setting
-    /// whose saved preference is back but loads only at the next login is [`LOGIN`], named as
-    /// its System State row is, with a note to log out: `blocked` means Restore could not put
-    /// a preference back.
-    fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row>;
+    /// Run `group`'s items, applying them when `apply`: each row with the System State row its
+    /// item was built for, which the page names in place of the item's own title.
+    fn workstation(
+        &mut self,
+        group: WorkstationGroup,
+        apply: bool,
+    ) -> Result<Vec<(Option<Setting>, Row)>, String>;
+    /// Put the live settings `saved` holds back as well as the saved preferences: `saved` is
+    /// only what was put back and kept. A setting whose saved preference is back but loads only
+    /// at the next login is [`LOGIN`], named as its System State row is, with a note to log
+    /// out: `blocked` means Restore could not put a preference back.
+    fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<RuntimeRow>;
+}
+
+/// One row [`Host::restore_runtime`] gives, and how it says the System State row it is about
+/// came out.
+struct RuntimeRow {
+    row: Row,
+    /// The row and how it came out; `None` for the one row about none, the change journal's
+    /// refusal of a record ([`journal_refused`]).
+    put_back: Option<(Setting, PutBack)>,
 }
 
 /// One item whose change an apply pass reached.
@@ -1304,7 +1364,11 @@ impl Host for NativeHost {
         answer.map_err(|why| format!("restart {name}: {why}"))
     }
 
-    fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String> {
+    fn workstation(
+        &mut self,
+        group: WorkstationGroup,
+        apply: bool,
+    ) -> Result<Vec<(Option<Setting>, Row)>, String> {
         use aterm_machines::model::{Mode, Outcome};
         let mode = if apply { Mode::Apply } else { Mode::Plan };
         let prepared = match self.prepared.take() {
@@ -1312,10 +1376,15 @@ impl Host for NativeHost {
             _ => self.prepare(group)?,
         };
         self.domains.clear();
+        let result = prepared.run_recording(self.sys.as_ref(), mode)?;
+        let settings: Vec<(String, Setting)> = result
+            .tagged()
+            .into_iter()
+            .map(|(setting, row)| (row.id.clone(), setting))
+            .collect();
         let rows = if apply {
             use aterm_machines::items::defaults::Scope;
             use aterm_machines::model::Read;
-            let result = prepared.run_recording(self.sys.as_ref(), mode)?;
             if let Ok(root) = state_root() {
                 initial::note_at_login(&root, initial::changed_at_login(result.tagged()));
             }
@@ -1367,14 +1436,18 @@ impl Host for NativeHost {
             self.withheld.extend(result.withheld);
             result.rows
         } else {
-            prepared.run(self.sys.as_ref(), mode)?
+            result.rows
         };
         self.domains.clear();
         Ok({
             rows.into_iter()
                 .map(|row| {
+                    let setting = settings
+                        .iter()
+                        .find(|(id, _)| *id == row.id)
+                        .map(|(_, setting)| *setting);
                     let status = initial::row_status(&row);
-                    Row {
+                    let row = Row {
                         name: row.title,
                         status: status.into(),
                         detail: row
@@ -1386,13 +1459,14 @@ impl Host for NativeHost {
                                 (None, None) => None,
                             })
                             .unwrap_or_else(|| "workstation item completed".into()),
-                    }
+                    };
+                    (setting, row)
                 })
                 .collect()
         })
     }
 
-    fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row> {
+    fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<RuntimeRow> {
         let mut rows = Vec::new();
         if let Some(original) = saved.iter().find(|s| {
             !s.target.host
@@ -1420,7 +1494,10 @@ impl Host for NativeHost {
                     &format!("{}, as before this setup", shown(value)),
                     None,
                 ) {
-                    rows.push(journal_refused(&[format!("{id}: {why}")]));
+                    rows.push(RuntimeRow {
+                        row: journal_refused(&[format!("{id}: {why}")]),
+                        put_back: None,
+                    });
                 }
                 let result = self.sys.set_natural_scrolling(value).and_then(|()| {
                     if self.sys.natural_scrolling()? == value {
@@ -1430,22 +1507,32 @@ impl Host for NativeHost {
                     }
                 });
                 rows.push(match result {
-                    Ok(()) => Row {
-                        name: "Original scroll direction".into(),
-                        status: "restored".into(),
-                        detail: "saved and active scroll direction restored".into(),
+                    Ok(()) => RuntimeRow {
+                        row: Row {
+                            name: "Original scroll direction".into(),
+                            status: "restored".into(),
+                            detail: "saved and active scroll direction restored".into(),
+                        },
+                        put_back: Some((Setting::NaturalScrolling, PutBack::Back)),
                     },
-                    Err(detail) => Row {
-                        name: "Original scroll direction".into(),
-                        status: "error".into(),
-                        detail,
+                    // The saved direction is back, and macOS loads it at the next login.
+                    Err(detail) => RuntimeRow {
+                        row: Row {
+                            name: "Original scroll direction".into(),
+                            status: "error".into(),
+                            detail,
+                        },
+                        put_back: Some((Setting::NaturalScrolling, PutBack::AtLogin)),
                     },
                 });
             } else {
-                rows.push(Row {
-                    name: Setting::NaturalScrolling.name().into(),
-                    status: LOGIN.into(),
-                    detail: "Log out and back in to use the restored scroll direction.".into(),
+                rows.push(RuntimeRow {
+                    row: Row {
+                        name: Setting::NaturalScrolling.name().into(),
+                        status: LOGIN.into(),
+                        detail: "Log out and back in to use the restored scroll direction.".into(),
+                    },
+                    put_back: Some((Setting::NaturalScrolling, PutBack::AtLogin)),
                 });
             }
         }
@@ -1455,19 +1542,41 @@ impl Host for NativeHost {
                     .key
                     .starts_with("com.apple.keyboard.modifiermapping.")
         }) {
-            rows.push(Row {
-                name: Setting::CapsLock.name().into(),
-                status: LOGIN.into(),
-                detail: "Log out and back in to use the restored keyboard settings.".into(),
+            rows.push(RuntimeRow {
+                row: Row {
+                    name: Setting::CapsLock.name().into(),
+                    status: LOGIN.into(),
+                    detail: "Log out and back in to use the restored keyboard settings.".into(),
+                },
+                put_back: Some((Setting::CapsLock, PutBack::AtLogin)),
+            });
+        }
+        // Trackpad scrolling's keys are saved preferences macOS loads only at the next login
+        // (their items' effect), and nothing here relaunches a reader of them: back as saved,
+        // and in use from that login.
+        if saved.iter().any(|s| {
+            aterm_machines::init_preferences::setting_of_preference(&s.target.domain, &s.target.key)
+                == Some(Setting::TrackpadScrolling)
+        }) {
+            rows.push(RuntimeRow {
+                row: Row {
+                    name: Setting::TrackpadScrolling.name().into(),
+                    status: LOGIN.into(),
+                    detail: "Log out and back in to use the restored trackpad settings.".into(),
+                },
+                put_back: Some((Setting::TrackpadScrolling, PutBack::AtLogin)),
             });
         }
         rows
     }
 }
 
+/// The name of the row that says the change journal refused records ([`journal_refused`]).
+const JOURNAL_ROW: &str = "Change journal";
+
 fn journal_refused(refused: &[String]) -> Row {
     Row {
-        name: "Change journal".into(),
+        name: JOURNAL_ROW.into(),
         status: "error".into(),
         detail: format!(
             "the change journal refused these records; the changes went ahead anyway: {}",
@@ -1635,18 +1744,54 @@ fn append_workstation(
         WorkstationGroup::Withheld => "Settings waiting for Full Disk Access",
     };
     match host.workstation(group, apply) {
-        Ok(rows) if rows.is_empty() => report.rows.push(Row {
-            name: name.into(),
-            status: "unverified".into(),
-            detail: "setup returned no settings to verify".into(),
-        }),
-        Ok(rows) => report.rows.extend(rows),
-        Err(detail) => report.rows.push(Row {
-            name: name.into(),
-            status: "unverified".into(),
-            detail,
-        }),
+        Ok(rows) if rows.is_empty() => as_is(
+            report,
+            Row {
+                name: name.into(),
+                status: "unverified".into(),
+                detail: "setup returned no settings to verify".into(),
+            },
+        ),
+        Ok(rows) => {
+            for (setting, row) in rows {
+                // An item's line names its keys or keyboard: the page names its row, and says a
+                // change that failed or could not be read back in its own words (design §3.6).
+                match setting {
+                    Some(setting) => {
+                        let how = match row.status.as_str() {
+                            "error" => Some(Unfinished::Failed),
+                            "unverified" => Some(Unfinished::Unconfirmed),
+                            _ => None,
+                        };
+                        if let Some(how) = how {
+                            page(report).outcome.unfinished(setting, how);
+                        }
+                        report.rows.push(row);
+                    }
+                    None => as_is(report, row),
+                }
+            }
+        }
+        Err(detail) => as_is(
+            report,
+            Row {
+                name: name.into(),
+                status: "unverified".into(),
+                detail,
+            },
+        ),
     }
+}
+
+/// `report`'s rows for System State's page ([`Report::page`]), begun where none were.
+fn page(report: &mut Report) -> &mut PassPage {
+    report.page.get_or_insert_with(PassPage::default)
+}
+
+/// Add `row`, which is about no one setting's keys, to `report` and to its page as it is.
+fn as_is(report: &mut Report, row: Row) {
+    page(report).rows.push(row.clone());
+    report.rows.push(row);
 }
 
 fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
@@ -1689,6 +1834,8 @@ fn execute_pass(
         rows: Vec::new(),
         manual_steps: Vec::new(),
         backup,
+        restore: None,
+        page: None,
     };
     if action == Action::Restore {
         return restore(host, root, report).map(Pass::from);
@@ -1697,11 +1844,14 @@ fn execute_pass(
         if action == Action::Apply {
             initial::record_applied(root, host.selection())?;
         }
-        report.rows.push(Row {
-            name: "Selected Mac settings".into(),
-            status: "ok".into(),
-            detail: "no settings selected; macOS was left unchanged".into(),
-        });
+        as_is(
+            &mut report,
+            Row {
+                name: "Selected Mac settings".into(),
+                status: "ok".into(),
+                detail: "no settings selected; macOS was left unchanged".into(),
+            },
+        );
         return Ok(report.into());
     }
     // The sign-outs are their own stage: a pass of every preference is the full profile's, with
@@ -1824,6 +1974,9 @@ fn apply_preferences(
         .filter(|target| !activated.contains(target))
         .collect();
     let mut put_back = Vec::new();
+    // How the rollback left each key's System State row, for the page (`PassPage`).
+    let mut rolled: Vec<(Option<Setting>, PutBack)> = Vec::new();
+    let mut journal = false;
     // The rollback's `restored` row, by its place in the report, and the keys it names.
     let mut restored_row: Option<(usize, Vec<String>)> = None;
     if !rollback.is_empty() {
@@ -1847,6 +2000,7 @@ fn apply_preferences(
                 withheld(host, &previous.target).or_else(|| unknown_original(previous))
             {
                 left.push(why);
+                rolled.push((row_of(&previous.target), PutBack::Unknown));
                 continue;
             }
             let wrote = match restore_one(
@@ -1855,15 +2009,18 @@ fn apply_preferences(
                 previous.value.as_ref(),
                 &mut refused,
             ) {
+                // A key whose saved value already reads the original (its reader wrote it back
+                // over the change) is back as much as one the rollback wrote, as Restore counts
+                // it, and its live value is put back the same way; only a write relaunches its
+                // reader.
                 Ok(wrote) => {
-                    if wrote {
-                        restored.push(previous.target.describe());
-                        put_back.push((previous.target.clone(), previous.value.clone()));
-                    }
+                    restored.push(previous.target.describe());
+                    put_back.push((previous.target.clone(), previous.value.clone()));
                     wrote
                 }
                 Err((wrote, error)) => {
                     errors.push(format!("rollback {}: {error}", previous.target.describe()));
+                    rolled.push((row_of(&previous.target), PutBack::Failed));
                     wrote
                 }
             };
@@ -1888,9 +2045,9 @@ fn apply_preferences(
             });
         }
         if !refused.is_empty() {
+            journal = true;
             report.rows.push(journal_refused(&refused));
         }
-        report.rows.extend(host.restore_runtime(&rollback));
         if !errors.is_empty() {
             report.rows.push(Row {
                 name: "Preference rollback".into(),
@@ -1899,7 +2056,12 @@ fn apply_preferences(
             });
         }
     }
-    if refresh(host, &reload.iter().collect::<Vec<_>>(), report) && full_profile {
+    let relaunched = report.rows.len();
+    let unread = refresh(host, &reload.iter().collect::<Vec<_>>(), report);
+    journal |= report.rows[relaunched..]
+        .iter()
+        .any(|row| row.name == JOURNAL_ROW);
+    if unread.is_empty() && full_profile {
         settle_pending_refresh(host, root)?;
     }
     // A key whose relaunched reader did not keep the rollback is named as lost alone, not also
@@ -1923,14 +2085,69 @@ fn apply_preferences(
             detail: format!("{NOT_RETAINED}: {}", lost.join(", ")),
         });
     }
-    if let Err(detail) = record_withheld(root, &left_alone, &reached, &unverified, turn) {
-        report.rows.push(Row {
-            name: "Settings waiting for Full Disk Access".into(),
-            status: "error".into(),
-            detail,
+    if !rollback.is_empty() {
+        for (target, _) in &put_back {
+            rolled.push((row_of(target), put_back_as(target, &lost, &unread)));
+        }
+        // Only what the rollback put back, and its reader kept, has a live value to put back
+        // or loads at the next login.
+        let kept: Vec<Saved> = rollback
+            .iter()
+            .filter(|item| {
+                put_back.iter().any(|(target, _)| *target == item.target)
+                    && !lost.contains(&item.target.describe())
+            })
+            .cloned()
+            .collect();
+        for runtime in host.restore_runtime(&kept) {
+            match runtime.put_back {
+                Some((setting, put)) => rolled.push((Some(setting), put)),
+                None => journal = true,
+            }
+            report.rows.push(runtime.row);
+        }
+        // The page says what the rollback did in one line, in its row names, never a key, a
+        // keyboard or a process (`rows` keeps each for `aterm doctor`).
+        let mut outcome = RestoreOutcome::of(rolled);
+        outcome.journal_refused = journal;
+        page(report).outcome.merge(PassOutcome {
+            rolled_back: Some(outcome),
+            unfinished: Vec::new(),
         });
     }
+    if let Err(detail) = record_withheld(root, &left_alone, &reached, &unverified, turn) {
+        as_is(
+            report,
+            Row {
+                name: "Settings waiting for Full Disk Access".into(),
+                status: "error".into(),
+                detail,
+            },
+        );
+    }
     Ok((unverified, settled))
+}
+
+/// The System State row whose items write `target` (`None` for a key no item of this build
+/// writes, such as one an older aterm backed up).
+fn row_of(target: &Target) -> Option<Setting> {
+    aterm_machines::init_preferences::setting_of_preference(&target.domain, &target.key)
+}
+
+/// How a key put back and verified came out once its readers were relaunched: back, or, where
+/// a reader of it did not relaunch (`unread`, [`refresh`]), back as saved and in use from the
+/// next login; failed where its reader, once relaunched, no longer read it (`lost`).
+fn put_back_as(target: &Target, lost: &[String], unread: &[&str]) -> PutBack {
+    if lost.contains(&target.describe()) {
+        PutBack::Failed
+    } else if aterm_machines::init_activation::readers(&target.domain)
+        .iter()
+        .any(|process| unread.contains(process))
+    {
+        PutBack::AtLogin
+    } else {
+        PutBack::Back
+    }
 }
 
 const WITHHELD_RECORD: &str = "withheld-preferences.json";
@@ -2023,7 +2240,66 @@ fn record_withheld(
     save_withheld(root, &record)
 }
 
+/// Whether a follow-up with Full Disk Access has anything to do: a Restore's put-back that
+/// waits for the grant, or a change setup left for want of it while no Stop holds the run.
+fn follow_up_owed(root: &Path) -> Result<bool, String> {
+    Ok(!restore_waiting(root)?.is_empty()
+        || (!load_withheld(root)?.items.is_empty() && !initial::stopped(root)?))
+}
+
+/// The settings a follow-up ([`follow_up_at`]) would change now: what a Restore or setup left
+/// in another app's container for want of Full Disk Access, once aterm has it (`granted`,
+/// asked only when something is owed); none without the grant. A setup pass marks them busy
+/// while its follow-up runs, as it marks a stage's (`initial::InitialHost::withheld_owed`).
+pub(super) fn owed_with_full_disk_access(
+    root: &Path,
+    granted: impl FnOnce() -> Option<bool>,
+) -> Vec<Setting> {
+    let mut owed = Selection::none();
+    for item in load_withheld(root)
+        .map(|record| record.items)
+        .unwrap_or_default()
+    {
+        if let Some(setting) = aterm_machines::init_preferences::setting_of(&item) {
+            owed.set(setting, true);
+        }
+    }
+    for target in restore_waiting(root).unwrap_or_default() {
+        if let Some(setting) =
+            aterm_machines::init_preferences::setting_of_preference(&target.domain, &target.key)
+        {
+            owed.set(setting, true);
+        }
+    }
+    if owed.is_empty() || granted() != Some(true) {
+        return Vec::new();
+    }
+    Setting::ALL
+        .into_iter()
+        .filter(|setting| owed.contains(*setting))
+        .collect()
+}
+
+/// A follow-up once aterm has Full Disk Access: a Restore's put-back that waited for it
+/// ([`finish_waiting_restore`]), then what setup left for want of it ([`follow_up_setup_at`]).
 fn follow_up_at(
+    root: &Path,
+    host: &mut dyn Host,
+    build: &str,
+    now: std::time::SystemTime,
+) -> Result<Option<Report>, String> {
+    let restored = finish_waiting_restore(root, host)?;
+    let set = follow_up_setup_at(root, host, build, now)?;
+    Ok(match (restored, set) {
+        (Some(mut restored), Some(set)) => {
+            restored.rows.extend(set.rows);
+            Some(restored)
+        }
+        (restored, set) => restored.or(set),
+    })
+}
+
+fn follow_up_setup_at(
     root: &Path,
     host: &mut dyn Host,
     build: &str,
@@ -2036,11 +2312,13 @@ fn follow_up_at(
     if host.full_disk_access() != Some(true) {
         return Ok(None);
     }
-    let chosen = authorized_selection(root)?;
+    let Some(chosen) = initial::withheld_selection(root)? else {
+        return Ok(None);
+    };
     let mut selected = Selection::none();
     for item in &record.items {
         if let Some(setting) = aterm_machines::init_preferences::setting_of(item)
-            && chosen.is_none_or(|chosen| chosen.contains(setting))
+            && chosen.contains(setting)
         {
             selected.set(setting, true);
         }
@@ -2054,6 +2332,8 @@ fn follow_up_at(
         rows: Vec::new(),
         manual_steps: Vec::new(),
         backup: root.join("original-preferences.json"),
+        restore: None,
+        page: None,
     };
     let now = epoch_secs(now);
     let selection = host.selection();
@@ -2074,7 +2354,8 @@ fn follow_up_at(
     Ok(Some(report))
 }
 
-/// Apply any container preferences withheld from earlier passes once Full Disk Access is granted.
+/// Once Full Disk Access is granted, put back what a Restore could not for want of it, and apply
+/// any container preferences withheld from earlier passes.
 pub fn finish_withheld_preferences<S>(
     reserve: impl FnOnce() -> S,
 ) -> Result<Option<Report>, String> {
@@ -2100,7 +2381,7 @@ fn follow_up_finished_at<S, H: Host>(
     build: &str,
     now: std::time::SystemTime,
 ) -> Result<Option<Report>, String> {
-    if load_withheld(root)?.items.is_empty() || initial::stopped(root)? {
+    if !follow_up_owed(root)? {
         return Ok(None);
     }
     let mut host = host()?;
@@ -2115,7 +2396,7 @@ fn follow_up_finished_at<S, H: Host>(
 }
 
 fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
-    if load_withheld(root)?.items.is_empty() {
+    if load_withheld(root)?.items.is_empty() && restore_waiting(root)?.is_empty() {
         return Ok(None);
     }
     follow_up_at(
@@ -2254,6 +2535,14 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     initial::save_restore(root)?;
     save_withheld(root, &Withheld::default())?;
     let saved = load_backup(&report.backup)?;
+    // What this Restore cannot put back until aterm has Full Disk Access, which a follow-up
+    // then puts back by itself ([`finish_waiting_restore`]); none clears an older Restore's.
+    let waiting: Vec<Target> = saved
+        .iter()
+        .filter(|item| unknown_original(item).is_none() && withheld(host, &item.target).is_some())
+        .map(|item| item.target.clone())
+        .collect();
+    save_restore_waiting(root, &waiting)?;
     let mut activation = pending_refresh(root)?;
     for saved in &saved {
         if withheld(host, &saved.target).is_some() || unknown_original(saved).is_some() {
@@ -2271,12 +2560,18 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
             detail: "no changed preferences were backed up".into(),
         });
     }
+    // Each key's System State row, and how it came out, for the page (`RestoreRows`).
+    let mut outcomes: Vec<(Option<Setting>, PutBack)> = Vec::new();
     let mut refused = Vec::new();
     let mut put_back = Vec::new();
     for item in saved.iter().rev() {
         let why = unknown_original(item)
-            .or_else(|| withheld(host, &item.target).map(|_| restore_waits(&item.target)));
-        if let Some(why) = why {
+            .map(|why| (why, PutBack::Unknown))
+            .or_else(|| {
+                withheld(host, &item.target).map(|_| (restore_waits(&item.target), PutBack::Waits))
+            });
+        if let Some((why, left)) = why {
+            outcomes.push((row_of(&item.target), left));
             report.rows.push(Row {
                 name: item.target.describe(),
                 status: "blocked".into(),
@@ -2295,79 +2590,246 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
                     detail: "original value restored".into(),
                 });
             }
-            Err((_, detail)) => report.rows.push(Row {
-                name: item.target.describe(),
-                status: "error".into(),
-                detail,
-            }),
+            Err((_, detail)) => {
+                outcomes.push((row_of(&item.target), PutBack::Failed));
+                report.rows.push(Row {
+                    name: item.target.describe(),
+                    status: "error".into(),
+                    detail,
+                });
+            }
         }
     }
-    if !refused.is_empty() {
+    let mut journal = !refused.is_empty();
+    if journal {
         report.rows.push(journal_refused(&refused));
     }
-    if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) {
+    let relaunched = report.rows.len();
+    let unread = refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report);
+    if unread.is_empty() {
         settle_pending_refresh(host, root)?;
     }
-    for name in not_retained(host, &put_back) {
+    journal |= report.rows[relaunched..]
+        .iter()
+        .any(|row| row.name == JOURNAL_ROW);
+    let lost = not_retained(host, &put_back);
+    for name in &lost {
         if let Some(row) = report
             .rows
             .iter_mut()
-            .find(|row| row.name == name && row.status == "restored")
+            .find(|row| row.name == *name && row.status == "restored")
         {
             row.status = "error".into();
             row.detail = NOT_RETAINED.into();
         }
     }
-    report.rows.extend(host.restore_runtime(&saved));
+    // A relaunch that failed after the preferences were written leaves what its process reads
+    // to the next login: back as saved, in use from then, which the page says in its login
+    // sentence, never as the process (`aterm doctor --restore` keeps its line).
+    for (target, _) in &put_back {
+        outcomes.push((row_of(target), put_back_as(target, &lost, &unread)));
+    }
+    // Only what is back, and stayed back, has a live value to put back or loads at the next
+    // login: a key Restore could not write, or that its reader wrote over, does neither.
+    let kept: Vec<Saved> = saved
+        .iter()
+        .filter(|item| {
+            put_back.iter().any(|(target, _)| *target == item.target)
+                && !lost.contains(&item.target.describe())
+        })
+        .cloned()
+        .collect();
+    for runtime in host.restore_runtime(&kept) {
+        match runtime.put_back {
+            Some((setting, put)) => outcomes.push((Some(setting), put)),
+            None => journal = true,
+        }
+        report.rows.push(runtime.row);
+    }
+    // The groups Restore put back are left as is from now on (design §3.4).
+    initial::leave_restored_as_is(root)?;
+    let mut outcome = RestoreOutcome::of(outcomes);
+    outcome.journal_refused = journal;
+    report.restore = Some(RestoreRows { outcome });
     Ok(report)
 }
 
 fn pending_refresh(root: &Path) -> Result<Vec<Target>, String> {
-    let path = root.join("pending-refresh.json");
+    targets_record(root, "pending-refresh.json", "pending activation")
+}
+
+/// The keys a record of `name` lists, `what` naming it in an error; none when it is absent.
+fn targets_record(root: &Path, name: &str, what: &str) -> Result<Vec<Target>, String> {
+    let path = root.join(name);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let value: Value =
-        aterm_json::from_slice(&bytes).map_err(|e| format!("pending activation: {e}"))?;
+    let value: Value = aterm_json::from_slice(&bytes).map_err(|e| format!("{what}: {e}"))?;
     if value["profile"].as_str() != Some(PROFILE) {
-        return Err("unrecognized pending activation profile".into());
+        return Err(format!("unrecognized {what} profile"));
     }
     value["targets"]
         .as_array()
-        .ok_or("pending activation has no targets")?
+        .ok_or_else(|| format!("{what} has no targets"))?
         .iter()
         .map(|entry| {
             Ok(Target {
                 domain: entry["domain"]
                     .as_str()
-                    .ok_or("pending activation domain is missing")?
+                    .ok_or_else(|| format!("{what} domain is missing"))?
                     .into(),
                 key: entry["key"]
                     .as_str()
-                    .ok_or("pending activation key is missing")?
+                    .ok_or_else(|| format!("{what} key is missing"))?
                     .into(),
                 host: entry["host"]
                     .as_bool()
-                    .ok_or("pending activation scope is missing")?,
+                    .ok_or_else(|| format!("{what} scope is missing"))?,
             })
         })
         .collect()
+}
+
+fn save_targets_record(root: &Path, name: &str, targets: &[Target]) -> Result<(), String> {
+    let targets: Vec<Value> = targets
+        .iter()
+        .map(|t| json!({ "domain": t.domain, "key": t.key, "host": t.host }))
+        .collect();
+    write_json(
+        &root.join(name),
+        &json!({ "profile": PROFILE, "targets": targets }),
+    )
 }
 
 fn save_pending_refresh(root: &Path, targets: &[Target]) -> Result<(), String> {
     if targets.is_empty() {
         return Ok(());
     }
-    let targets: Vec<Value> = targets
-        .iter()
-        .map(|t| json!({ "domain": t.domain, "key": t.key, "host": t.host }))
-        .collect();
-    write_json(
-        &root.join("pending-refresh.json"),
-        &json!({ "profile": PROFILE, "targets": targets }),
-    )
+    save_targets_record(root, "pending-refresh.json", targets)
+}
+
+/// The record of the keys a Restore could not put back for want of Full Disk Access
+/// (`PutBack::Waits`): their saved values are in another app's container.
+const RESTORE_WAITING: &str = "restore-waiting.json";
+
+fn restore_waiting(root: &Path) -> Result<Vec<Target>, String> {
+    targets_record(root, RESTORE_WAITING, "waiting restore")
+}
+
+/// Record `targets` as what a Restore still owes once aterm has Full Disk Access; none
+/// removes the record.
+fn save_restore_waiting(root: &Path, targets: &[Target]) -> Result<(), String> {
+    if !targets.is_empty() {
+        return save_targets_record(root, RESTORE_WAITING, targets);
+    }
+    match std::fs::remove_file(root.join(RESTORE_WAITING)) {
+        Ok(()) => durable_directory(root).map_err(|e| format!("{}: {e}", root.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("clear the waiting restore: {e}")),
+    }
+}
+
+/// Put back what a Restore left for want of Full Disk Access, once aterm has it (System State
+/// design §3.4), with no press: each key whose row still stands restored
+/// ([`initial::restore_owed`]), its readers relaunched as a Restore relaunches them. A key a
+/// choice since queued to set again waits for that pass; one a pass set since, or whose
+/// Restore a run replaced, is let go. `None` when nothing waits or aterm still lacks the grant.
+fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Report>, String> {
+    let waiting = restore_waiting(root)?;
+    if waiting.is_empty() || host.full_disk_access() != Some(true) {
+        return Ok(None);
+    }
+    let backup = root.join("original-preferences.json");
+    let saved = load_backup(&backup)?;
+    let mut report = Report {
+        action: Action::Restore,
+        rows: Vec::new(),
+        manual_steps: Vec::new(),
+        backup,
+        restore: None,
+        page: None,
+    };
+    let (mut still, mut put_back, mut outcomes, mut refused) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for target in &waiting {
+        match initial::restore_owed(root, row_of(target)) {
+            initial::RestoreOwed::Wait => {
+                still.push(target.clone());
+                continue;
+            }
+            initial::RestoreOwed::LetGo => continue,
+            initial::RestoreOwed::PutBack => {}
+        }
+        let Some(item) = saved
+            .iter()
+            .find(|item| item.target == *target && unknown_original(item).is_none())
+        else {
+            continue;
+        };
+        if withheld(host, target).is_some() {
+            still.push(target.clone());
+            continue;
+        }
+        match restore_one(host, target, item.value.as_ref(), &mut refused) {
+            Ok(_) => {
+                put_back.push((target.clone(), item.value.clone()));
+                report.rows.push(Row {
+                    name: target.describe(),
+                    status: "restored".into(),
+                    detail: "original value restored".into(),
+                });
+            }
+            Err((_, detail)) => {
+                outcomes.push((row_of(target), PutBack::Failed));
+                report.rows.push(Row {
+                    name: target.describe(),
+                    status: "error".into(),
+                    detail,
+                });
+            }
+        }
+    }
+    if !refused.is_empty() {
+        report.rows.push(journal_refused(&refused));
+    }
+    let relaunched = report.rows.len();
+    let unread = refresh(
+        host,
+        &put_back
+            .iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>(),
+        &mut report,
+    );
+    let journal = !refused.is_empty()
+        || report.rows[relaunched..]
+            .iter()
+            .any(|row| row.name == JOURNAL_ROW);
+    let lost = not_retained(host, &put_back);
+    // A reader that did not relaunch leaves its rows to the next login, as a Restore does: the
+    // page names no process.
+    for (target, _) in &put_back {
+        if lost.contains(&target.describe())
+            && let Some(row) = report
+                .rows
+                .iter_mut()
+                .find(|row| row.name == target.describe() && row.status == "restored")
+        {
+            row.status = "error".into();
+            row.detail = NOT_RETAINED.into();
+        }
+        outcomes.push((row_of(target), put_back_as(target, &lost, &unread)));
+    }
+    save_restore_waiting(root, &still)?;
+    if outcomes.is_empty() && !journal {
+        return Ok(None);
+    }
+    let mut outcome = RestoreOutcome::of(outcomes);
+    outcome.journal_refused = journal;
+    report.restore = Some(RestoreRows { outcome });
+    Ok(Some(report))
 }
 
 fn clear_pending_refresh(root: &Path) -> Result<(), String> {
@@ -2419,13 +2881,16 @@ fn rolled_back(restored: &[String]) -> String {
 const NOT_RETAINED: &str =
     "written back, but its reader, once relaunched, no longer reads the original value";
 
-fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> bool {
+/// Relaunch the readers of `targets`, each once, so they read what was written: the
+/// processes whose relaunch failed, which still run with what they read before (none: every
+/// reader relaunched).
+fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> Vec<&'static str> {
     let targets: Vec<&Target> = targets
         .iter()
         .copied()
         .filter(|target| withheld(&*host, target).is_none())
         .collect();
-    let mut refreshed = true;
+    let mut unread = Vec::new();
     let mut refused = Vec::new();
     for process in aterm_machines::init_activation::RELAUNCHED {
         let reads: Vec<&Target> = targets
@@ -2446,7 +2911,7 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
             refused.push(format!("{id}: {why}"));
         }
         if let Err(detail) = host.restart(process, &reads) {
-            refreshed = false;
+            unread.push(process);
             report.rows.push(Row {
                 name: format!("Reload {process}"),
                 status: "error".into(),
@@ -2463,7 +2928,7 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
     if !refused.is_empty() {
         report.rows.push(journal_refused(&refused));
     }
-    refreshed
+    unread
 }
 
 #[cfg(test)]
@@ -2517,6 +2982,10 @@ mod tests {
         /// whichever pass makes them.
         bundles: bool,
         withheld: Vec<String>,
+        /// The doctor's own writes of these keys (a rollback, a Restore) fail.
+        refuses: Vec<Target>,
+        /// Every key whose live value `restore_runtime` was handed, in order.
+        runtime_given: Vec<Target>,
     }
 
     impl Fake {
@@ -2723,6 +3192,19 @@ mod tests {
             follow_up_at(root, &mut self.host, self.build, self.now)
         }
 
+        /// What a follow-up would change now ([`owed_with_full_disk_access`]).
+        pub(super) fn owed(&self, root: &Path) -> Vec<Setting> {
+            owed_with_full_disk_access(root, || self.host.full_disk_access)
+        }
+
+        pub(super) fn restore(&mut self, root: &Path) -> Result<Report, String> {
+            execute(&mut self.host, root, Action::Restore)
+        }
+
+        pub(super) fn explicit_apply(&mut self, root: &Path) -> Result<Report, String> {
+            run_mutation(&mut self.host, root, Action::Apply)
+        }
+
         fn wait(&mut self, by: std::time::Duration) {
             self.now += by;
         }
@@ -2735,6 +3217,11 @@ mod tests {
         /// macOS gives aterm Full Disk Access.
         pub(super) fn grant(&mut self) {
             self.host.full_disk_access = Some(true);
+        }
+
+        /// aterm's Full Disk Access reads off again (an update, say).
+        pub(super) fn revoke(&mut self) {
+            self.host.full_disk_access = Some(false);
         }
 
         /// Notification Center never keeps a clear of its widget list (it is not up again in time).
@@ -2998,13 +3485,34 @@ mod tests {
                 value: None,
                 granted: true,
             },
+            Saved {
+                target: Target::new("com.apple.AppleMultitouchTrackpad", "TrackpadScroll"),
+                value: None,
+                granted: true,
+            },
         ];
         let (mut host, calls) = inert_host(Some(true), Vec::new);
-        let rows = host.restore_runtime(&saved);
+        let runtime = host.restore_runtime(&saved);
+        assert_eq!(
+            runtime
+                .iter()
+                .map(|runtime| runtime.put_back)
+                .collect::<Vec<_>>(),
+            [
+                Some((Setting::NaturalScrolling, PutBack::AtLogin)),
+                Some((Setting::CapsLock, PutBack::AtLogin)),
+                Some((Setting::TrackpadScrolling, PutBack::AtLogin)),
+            ]
+        );
+        let rows: Vec<Row> = runtime.into_iter().map(|runtime| runtime.row).collect();
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(
             names,
-            [Setting::NaturalScrolling.name(), Setting::CapsLock.name()]
+            [
+                Setting::NaturalScrolling.name(),
+                Setting::CapsLock.name(),
+                Setting::TrackpadScrolling.name()
+            ]
         );
         for row in &rows {
             assert_eq!(row.status, "login", "{}: {}", row.name, row.detail);
@@ -3021,6 +3529,8 @@ mod tests {
             rows,
             manual_steps: Vec::new(),
             backup: PathBuf::from("original-preferences.json"),
+            restore: None,
+            page: None,
         };
         assert!(!report.needs_attention(), "{}", report.to_text());
         assert!(calls.lock().unwrap().is_empty(), "no runtime value was set");
@@ -3031,6 +3541,210 @@ mod tests {
                 "the terminal still says to log out: {text}"
             );
         }
+    }
+
+    /// Only a key Restore put back, and that stayed back, has a live value to put back or loads
+    /// at the next login. A Restore whose reads and writes of the Caps Lock mapping and of a
+    /// scroll direction the Mac had never set do not land (the inert system runs nothing) says
+    /// each of them failed, and nothing of the next login. Its positive control is
+    /// `a_setting_that_loads_at_the_next_login_is_restored_not_blocked`, where the same two keys
+    /// reach the login rows.
+    #[test]
+    fn a_key_restore_could_not_put_back_has_no_login_row() {
+        let saved = [
+            Saved {
+                target: Target {
+                    domain: "-g".into(),
+                    key: "com.apple.keyboard.modifiermapping.1452-610-0".into(),
+                    host: true,
+                },
+                value: None,
+                granted: true,
+            },
+            Saved {
+                target: Target::new("-g", "com.apple.swipescrolldirection"),
+                value: None,
+                granted: true,
+            },
+        ];
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        save_backup(&root.path().join("original-preferences.json"), &saved).unwrap();
+        let (mut host, _) = inert_host(Some(true), Vec::new);
+        let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+        assert!(
+            report.rows.iter().all(|row| row.status != LOGIN),
+            "{}",
+            report.to_text()
+        );
+        let restore = report
+            .restore
+            .expect("a Restore says what it did to each row");
+        assert_eq!(
+            restore.outcome.rows,
+            [
+                (Some(Setting::CapsLock), PutBack::Failed),
+                (Some(Setting::NaturalScrolling), PutBack::Failed)
+            ]
+        );
+    }
+
+    /// A rollback hands the live values only of what it put back and its reader kept: a key whose
+    /// rollback write fails has no live value put back and no login row. Positive control: the
+    /// same pass with the write allowed hands it over.
+    #[test]
+    fn a_rollback_hands_over_only_what_it_put_back() {
+        let dock = wanted()[0].0.clone();
+        for refused in [false, true] {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            let mut host = Fake {
+                fail_once: true,
+                refuses: if refused {
+                    vec![dock.clone()]
+                } else {
+                    Vec::new()
+                },
+                ..Fake::default()
+            };
+            let report = execute(&mut host, root.path(), Action::Apply).expect("report");
+            assert!(report.needs_attention());
+            let expected = if refused {
+                Vec::new()
+            } else {
+                vec![dock.clone()]
+            };
+            assert_eq!(host.runtime_given, expected, "{}", report.to_text());
+        }
+    }
+
+    /// A rollback key whose saved value already reads the original (its reader wrote the change
+    /// back over) is put back as much as one the rollback wrote, as Restore counts it: its live
+    /// value is handed to `restore_runtime` too, so a live value the failed step changed is put
+    /// back. Its pair is `a_rollback_with_nothing_to_put_back_relaunches_nothing`: no write, no
+    /// relaunch.
+    #[test]
+    fn a_rollback_hands_over_a_key_already_back_as_restore_does() {
+        let dock = wanted()[0].0.clone();
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            written_back: vec![dock.clone()],
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).expect("report");
+        assert!(report.needs_attention(), "{}", report.to_text());
+        assert_eq!(host.runtime_given, vec![dock], "{}", report.to_text());
+    }
+
+    /// A pass whose change failed reaches System State by row: the change that did not take,
+    /// and what its rollback put back, in the page's row names, where `aterm doctor`'s rows name
+    /// each key (design §3.4, §3.6). The page's own rows name no key.
+    #[test]
+    fn a_failed_change_and_its_rollback_reach_the_page_by_row() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            fail_once: true,
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).expect("report");
+        assert!(report.needs_attention(), "{}", report.to_text());
+        assert!(
+            report.to_text().contains("com.apple.dock"),
+            "the terminal keeps each key: {}",
+            report.to_text()
+        );
+        let page = report
+            .page
+            .as_ref()
+            .expect("a pass says what it did, by row");
+        assert_eq!(
+            page.outcome,
+            PassOutcome {
+                rolled_back: Some(RestoreOutcome {
+                    rows: vec![(Some(Setting::Dock), PutBack::Back)],
+                    journal_refused: false,
+                }),
+                unfinished: vec![(Setting::Dock, Unfinished::Failed)],
+            },
+            "{}",
+            report.to_text()
+        );
+        for row in &page.rows {
+            assert!(
+                !row.name.contains("com.apple") && !row.detail.contains("com.apple"),
+                "{row:?}"
+            );
+        }
+    }
+
+    /// A Restore of what an Apply set reports each System State row it put back, never a key
+    /// (`aterm doctor`'s text keeps those), and leaves those groups at Leave as is in the saved
+    /// plan (design §3.4).
+    #[test]
+    fn a_restore_reports_each_row_it_put_back_and_leaves_their_groups_as_is() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        let mut host = Fake::default();
+        execute(&mut host, root.path(), Action::Apply).expect("apply");
+        let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        let restore = report.restore.as_ref().expect("a Restore says what it did");
+        assert_eq!(
+            restore.outcome,
+            RestoreOutcome {
+                rows: vec![
+                    (Some(Setting::Widgets), PutBack::Back),
+                    (Some(Setting::Dock), PutBack::Back),
+                ],
+                journal_refused: false,
+            }
+        );
+        assert!(
+            report.to_text().contains("com.apple.dock show-recents"),
+            "{}",
+            report.to_text()
+        );
+        let plan = initial::initial_setup_snapshot_at(
+            root.path(),
+            aterm_types::macos_setup::Plan::default(),
+        )
+        .unwrap()
+        .plan;
+        let restored = initial::preferences(Selection::all());
+        for setting in Setting::ALL {
+            assert_eq!(
+                plan.selection.contains(setting),
+                !restored.contains(setting),
+                "{setting:?}"
+            );
+        }
+    }
+
+    /// A Restore whose relaunch fails after the preferences were written leaves the rows that
+    /// process reads to the next login: back as saved, in use from then, never failed, and the
+    /// page's outcome names no process (`aterm doctor --restore` keeps its `Reload` line).
+    #[test]
+    fn a_restore_whose_relaunch_fails_brings_its_rows_back_at_the_next_login() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        let mut host = Fake::default();
+        execute(&mut host, root.path(), Action::Apply).expect("apply");
+        host.fail_restart_once = true;
+        let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+        let restore = report.restore.as_ref().expect("a Restore says what it did");
+        assert_eq!(
+            restore.outcome,
+            RestoreOutcome {
+                rows: vec![
+                    (Some(Setting::Widgets), PutBack::AtLogin),
+                    (Some(Setting::Dock), PutBack::AtLogin),
+                ],
+                journal_refused: false,
+            }
+        );
+        assert!(
+            report.rows.iter().any(|row| row.name == "Reload Dock"),
+            "{}",
+            report.to_text()
+        );
     }
 
     #[test]
@@ -4898,8 +5612,10 @@ mod tests {
                 .push((id.into(), from.into(), to.into(), revert.map(str::to_owned)));
             Ok(())
         }
-        fn restore_runtime(&mut self, _saved: &[Saved]) -> Vec<Row> {
+        fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<RuntimeRow> {
             self.runtime_changed = false;
+            self.runtime_given
+                .extend(saved.iter().map(|saved| saved.target.clone()));
             Vec::new()
         }
         fn read(&mut self, target: &Target) -> Result<Option<PValue>, String> {
@@ -4910,6 +5626,9 @@ mod tests {
                 !self.dies_in_doctor_writes,
                 "the process ends among the doctor's own writes"
             );
+            if self.refuses.contains(target) {
+                return Err("injected write refusal".into());
+            }
             self.put(target, value)
         }
         fn preference_changes(&mut self, group: WorkstationGroup) -> Result<Vec<Saved>, String> {
@@ -4945,7 +5664,7 @@ mod tests {
             &mut self,
             group: WorkstationGroup,
             apply: bool,
-        ) -> Result<Vec<Row>, String> {
+        ) -> Result<Vec<(Option<Setting>, Row)>, String> {
             let mut rows = Vec::new();
             assert!(
                 !(apply && group == WorkstationGroup::Preferences && self.dies_in_preferences),
@@ -4960,9 +5679,10 @@ mod tests {
                                 && (group != WorkstationGroup::Withheld || contained(target))
                         })
                         .collect();
-                    if keys.is_empty() {
+                    let Some(setting) = keys.first().map(|(target, _)| Self::setting(target))
+                    else {
                         continue;
-                    }
+                    };
                     let left_alone = keys.iter().any(|(target, _)| !self.reaches(target));
                     if apply && left_alone {
                         self.withheld.push(item.clone());
@@ -5044,11 +5764,14 @@ mod tests {
                     if apply && matches!(status, "ok" | "applied") {
                         self.settled.push(item.clone());
                     }
-                    rows.push(Row {
-                        name: item,
-                        status: status.into(),
-                        detail,
-                    });
+                    rows.push((
+                        Some(setting),
+                        Row {
+                            name: item,
+                            status: status.into(),
+                            detail,
+                        },
+                    ));
                 }
                 assert!(
                     !(apply
@@ -5095,11 +5818,14 @@ mod tests {
                 if apply && status == "ok" {
                     self.settled.push(item.clone());
                 }
-                rows.push(Row {
-                    name: item,
-                    status: status.into(),
-                    detail,
-                });
+                rows.push((
+                    Some(Setting::Messages),
+                    Row {
+                        name: item,
+                        status: status.into(),
+                        detail,
+                    },
+                ));
             }
             Ok(rows)
         }
@@ -5373,12 +6099,28 @@ mod tests {
                 if !report.needs_attention() {
                     initial::complete_explicit_workstation_plan(root.path()).unwrap();
                 }
-                assert_eq!(initial::finished_at(root.path()).unwrap(), !blocked);
+                // A Restore withdrew no permission, so the explicit plan keeps aterm's
+                // permissions, and their stage is the run's one step left; a Cancel's plan
+                // has none.
+                let finished = !blocked && stopped == "cancelled";
+                assert_eq!(initial::finished_at(root.path()).unwrap(), finished);
                 assert_eq!(initial::revision_at(root.path()).unwrap(), revision);
                 assert_eq!(
                     claim_automatic_setup_at(root.path()).unwrap().is_none(),
-                    !blocked
+                    finished
                 );
+                if !blocked && stopped == "restored" {
+                    let snapshot =
+                        initial::initial_setup_snapshot_at(root.path(), Default::default())
+                            .unwrap();
+                    let left: Vec<&str> = snapshot
+                        .rows
+                        .iter()
+                        .filter(|row| row.status != "applied")
+                        .map(|row| row.name.as_str())
+                        .collect();
+                    assert_eq!(left, ["aterm permissions"]);
+                }
             }
         }
     }
@@ -5608,6 +6350,8 @@ mod tests {
                 rows: Vec::new(),
                 manual_steps: Vec::new(),
                 backup: PathBuf::new(),
+                restore: None,
+                page: None,
             },
             unverified: vec!["dock".to_owned()],
             settled: Vec::new(),
@@ -6229,5 +6973,91 @@ mod tests {
             assert!(matches!(scope, PersonScope::Unresolved(_)), "{scope:?}");
             assert_eq!(scope.lasting(), None);
         }
+    }
+
+    /// A Restore that could not put Notification Center's widget list back for want of Full
+    /// Disk Access puts it back by itself once aterm has the grant (design §3.4), with no
+    /// press: nothing before the grant, once after it, its reader relaunched, and a calm
+    /// outcome for the page.
+    #[test]
+    fn a_restore_waiting_for_full_disk_access_puts_back_once_granted() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut host = Fake {
+            selected: Some(widgets),
+            notification_center: true,
+            full_disk_access: Some(true),
+            values: BTreeMap::from([(nc_widgets(), populated())]),
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        let shows = |host: &Fake, value: &PValue| {
+            host.values
+                .get(&nc_widgets())
+                .is_some_and(|now| now.same(value))
+        };
+        assert!(shows(&host, &cleared()));
+        host.full_disk_access = Some(false);
+        let report = execute(&mut host, root.path(), Action::Restore).unwrap();
+        assert!(
+            report
+                .restore
+                .as_ref()
+                .unwrap()
+                .outcome
+                .rows
+                .contains(&(Some(Setting::Widgets), PutBack::Waits)),
+            "{}",
+            report.to_text()
+        );
+        assert_eq!(restore_waiting(root.path()).unwrap(), [nc_widgets()]);
+        assert!(shows(&host, &cleared()));
+        let now = std::time::SystemTime::now();
+        let writes = host.writes.len();
+        assert!(owed_with_full_disk_access(root.path(), || Some(false)).is_empty());
+        assert!(
+            follow_up_at(root.path(), &mut host, "1.0.0+gtest", now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.writes.len(), writes, "nothing before the grant");
+        host.full_disk_access = Some(true);
+        assert_eq!(
+            owed_with_full_disk_access(root.path(), || Some(true)),
+            [Setting::Widgets]
+        );
+        let relaunches = host.relaunches("NotificationCenter")
+            + host
+                .restarts
+                .iter()
+                .filter(|p| *p == "NotificationCenter")
+                .count();
+        let report = follow_up_at(root.path(), &mut host, "1.0.0+gtest", now)
+            .unwrap()
+            .expect("the waiting put-back runs once granted");
+        assert_eq!(
+            report.restore.unwrap().outcome.rows,
+            [(Some(Setting::Widgets), PutBack::Back)]
+        );
+        assert!(shows(&host, &populated()));
+        assert_eq!(
+            host.relaunches("NotificationCenter")
+                + host
+                    .restarts
+                    .iter()
+                    .filter(|p| *p == "NotificationCenter")
+                    .count(),
+            relaunches + 1
+        );
+        assert!(restore_waiting(root.path()).unwrap().is_empty());
+        let writes = host.writes.len();
+        assert!(
+            follow_up_at(root.path(), &mut host, "1.0.0+gtest", now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.writes.len(), writes, "once");
     }
 }

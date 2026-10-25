@@ -19,7 +19,8 @@ pub const CONTINUE_TEXT: &str = concat!(
     " Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then \
      keep hunting for what would make the work more complete and more correct. Never stop to \
      ask: put what only a person can give on a line starting NEEDS YOU: and carry on with \
-     everything else."
+     everything else. ",
+    super::policy::needs::restart_hint!(),
 );
 
 /// Every `[harness]` key, in the order the help and Settings list them.
@@ -335,6 +336,8 @@ pub struct SupervisorConfig {
     /// The live upgrade asks first.
     pub upgrade_ask: bool,
     /// Seconds the supervisor keeps its hands off a session after a person's keystroke into it.
+    /// A question dialog waits the shorter of this and `approval_loop::QUESTION_PERSON_GRACE`
+    /// (15 s): a question nobody is answering is answered, never held for the whole grace.
     pub human_grace_s: u32,
     /// What the harness does with a session's measured wait ([`Occupancy`]).
     pub occupancy: Occupancy,

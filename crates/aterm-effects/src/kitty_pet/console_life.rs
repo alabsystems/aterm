@@ -65,18 +65,20 @@ struct VisibilityHold {
 impl Default for VisibilityHold {
     #[inline]
     fn default() -> Self {
-        Self {
-            shown: true,
-            contrary_since: None,
-            blind_since: None,
-            cover: 1.0,
-            at: None,
-            by_fiat: false,
-        }
+        Self::DEFAULT
     }
 }
 
 impl VisibilityHold {
+    const DEFAULT: Self = Self {
+        shown: true,
+        contrary_since: None,
+        blind_since: None,
+        cover: 1.0,
+        at: None,
+        by_fiat: false,
+    };
+
     fn update(&mut self, now: Instant, verdict: Option<bool>) -> f32 {
         let dt = self.advance(now);
         if self.by_fiat {
@@ -163,13 +165,25 @@ impl VisibilityHold {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct ZHold {
     under: bool,
     clear_since: Option<Instant>,
 }
 
+impl Default for ZHold {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl ZHold {
+    const EMPTY: Self = Self {
+        under: false,
+        clear_since: None,
+    };
+
     #[inline]
     fn update(&mut self, now: Instant, ink: bool) -> bool {
         if ink {
@@ -178,7 +192,7 @@ impl ZHold {
         } else if self.under {
             let since = *self.clear_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= Duration::from_secs_f32(Z_DWELL) {
-                *self = Self::default();
+                *self = Self::EMPTY;
             }
         }
         self.under
@@ -197,11 +211,12 @@ const fn passing(frame: &PetFrame) -> bool {
 }
 
 #[inline]
-fn cover_alpha(alpha: u8, cover: f32) -> u8 {
+const fn cover_alpha(alpha: u8, cover: f32) -> u8 {
     if alpha == 0 || cover <= 0.0 {
         return 0;
     }
-    ((f32::from(alpha) * cover.min(1.0)).round() as u8).max(1)
+    let scaled = ((alpha as f32) * cover.min(1.0)).round() as u8;
+    if scaled > 1 { scaled } else { 1 }
 }
 
 /// An admitted user-input intent, never a claim that the PTY displayed it.
@@ -221,15 +236,15 @@ pub enum PetInputKind {
 impl PetInputKind {
     #[inline]
     #[must_use]
-    pub fn parse(kind: &str) -> Option<Self> {
-        match kind {
-            "text" => Some(Self::Text),
-            "delete" => Some(Self::Delete),
-            "navigate" => Some(Self::Navigate),
-            "submit" => Some(Self::Submit),
-            "paste" => Some(Self::Paste),
-            "kill" => Some(Self::Kill),
-            "kill-forward" => Some(Self::KillForward),
+    pub const fn parse(kind: &str) -> Option<Self> {
+        match kind.as_bytes() {
+            b"text" => Some(Self::Text),
+            b"delete" => Some(Self::Delete),
+            b"navigate" => Some(Self::Navigate),
+            b"submit" => Some(Self::Submit),
+            b"paste" => Some(Self::Paste),
+            b"kill" => Some(Self::Kill),
+            b"kill-forward" => Some(Self::KillForward),
             _ => None,
         }
     }
@@ -287,7 +302,6 @@ pub(super) struct PerchTrip {
     pub(super) hop: bool,
 }
 
-#[derive(Default)]
 pub(super) struct ConsoleLife {
     pub(super) world: Option<Box<PetWorld>>,
     pub(super) spare_world: Option<Box<PetWorld>>,
@@ -342,6 +356,13 @@ pub(super) struct ConsoleLife {
     row_sig_prev: Vec<u64>,
 }
 
+impl Default for ConsoleLife {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[inline]
 const fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
     let mut blank = true;
@@ -363,6 +384,64 @@ const fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
 }
 
 impl ConsoleLife {
+    #[inline]
+    #[must_use]
+    pub(super) const fn new() -> Self {
+        Self {
+            world: None,
+            spare_world: None,
+            presentable: false,
+            seq: 0,
+            input: None,
+            typed_at: None,
+            typed_kind: None,
+            consumed: 0,
+            attention: PetAttention::Rest,
+            reason: "",
+            anchor: None,
+            target: None,
+            gaze: None,
+            resident: false,
+            resident_handoff: false,
+            moving: false,
+            clipped: false,
+            contact_at: None,
+            contact_armed: false,
+            completion: None,
+            result_at: None,
+            pose: None,
+            still: false,
+            hidden_hold: 0.0,
+            caret_held: false,
+            tick_stamp: None,
+            repair_until: None,
+            repair_target: None,
+            progress_key: None,
+            progress: None,
+            progress_at: None,
+            trip: None,
+            lift: 0.0,
+            source_seq: 0,
+            completion_seq: 0,
+            failure_quiet_until: None,
+            last_body: None,
+            last_seat: None,
+            on_glass: false,
+            hold: VisibilityHold::DEFAULT,
+            z: ZHold::EMPTY,
+            cursor_home: None,
+            contact_changed: false,
+            observed_seq: 0,
+            progress_seq: 0,
+            perched_since: None,
+            faux_caret: None,
+            rest_seat: std::cell::Cell::new(None),
+            rest_seated: std::cell::Cell::new(false),
+            row_sig: Vec::new(),
+            row_sig_prev: Vec::new(),
+        }
+    }
+
     /// A fresh console life for a retired coordinate space.
     pub(super) fn retired(&mut self) -> Self {
         let spare_world = self
@@ -698,14 +777,21 @@ impl PetBrain {
 
     /// Whether the console's last observation holds a command still running
     /// (shell integration's executing block).
-    pub(super) fn console_executing(&self) -> bool {
-        self.console.world.as_ref().is_some_and(|world| {
-            world
-                .anchors()
-                .iter()
-                .flatten()
-                .any(|a| a.state == BlockState::Executing)
-        })
+    pub(super) const fn console_executing(&self) -> bool {
+        let Some(world) = self.console.world.as_ref() else {
+            return false;
+        };
+        let anchors = world.anchors();
+        let mut i = 0;
+        while i < anchors.len() {
+            if let Some(a) = &anchors[i]
+                && matches!(a.state, BlockState::Executing)
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// The last observed letterform ([`crate::pet_world::PetWorld::letter_at`])
@@ -713,7 +799,12 @@ impl PetBrain {
     /// the map certifies none, and `None` where it covers none of them. An
     /// unobserved cell inside a covered run reads as no letter: the law that
     /// asks keeps its body off what it saw, never off what it guessed.
-    pub(super) fn observed_last_letter(&self, row: f32, a: f32, b: f32) -> Option<Option<usize>> {
+    pub(super) const fn observed_last_letter(
+        &self,
+        row: f32,
+        a: f32,
+        b: f32,
+    ) -> Option<Option<usize>> {
         if !self.console.presentable
             || !row.is_finite()
             || row < 0.0
@@ -727,7 +818,9 @@ impl PetBrain {
         if self.letters_unseen {
             return None;
         }
-        let world = self.console.world.as_ref()?;
+        let Some(world) = self.console.world.as_ref() else {
+            return None;
+        };
         let (first, end) = (a.max(0.0).floor() as usize, b.ceil() as usize);
         if end <= first || end - first > crate::pet_world::MAX_WORLD_COLS {
             return None;
@@ -737,7 +830,12 @@ impl PetBrain {
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.
-    pub(super) fn observed_ink_overlaps(&self, col: f32, row: f32, width: f32) -> Option<bool> {
+    pub(super) const fn observed_ink_overlaps(
+        &self,
+        col: f32,
+        row: f32,
+        width: f32,
+    ) -> Option<bool> {
         let (a, b) = (col + INK_PAD, col + width - INK_PAD);
         if self.console.presentable
             && let Some(world) = self.console.world.as_ref()
@@ -784,7 +882,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn console_body(&self, sense: PetSense) -> PetRect {
+    const fn console_body(&self, sense: PetSense) -> PetRect {
         still_body_rect(
             (self.col, self.row),
             Stance::NEUTRAL,
@@ -948,21 +1046,27 @@ impl PetBrain {
 
     /// Whether the re-sighting ghost may stay on its own glass, judged at the boundary ([`PetBrain::resight_coordinate_space`]) before the old map is retired: the body standing still at its seat in `last_stance` is admitted only where the map certifies nothing protected under it.
     #[inline]
-    pub(super) fn console_still_body_clear(&self) -> bool {
-        self.console_still_rect_verdict(self.col, self.row, self.last_stance) == Some(true)
+    pub(super) const fn console_still_body_clear(&self) -> bool {
+        matches!(
+            self.console_still_rect_verdict(self.col, self.row, self.last_stance),
+            Some(true)
+        )
     }
 
     /// [`Self::console_still_body_clear`]'s verdict for a still body at `(col, row)` in `stance` (a ghost still on glass at the boundary, `Departure::own_clear`), over what the map sees of it (`PetWorld::seen_under_text_clearance_past_caret`): `None` where the covered part is clear and the rest unseen, `Some(false)` over a protected cell or with no certified map.
     #[inline]
-    pub(super) fn console_still_rect_verdict(
+    pub(super) const fn console_still_rect_verdict(
         &self,
         col: f32,
         row: f32,
         stance: Stance,
     ) -> Option<bool> {
-        let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
+        let Some(world) = self.console.world.as_ref() else {
             return Some(false);
         };
+        if world.stamp().is_none() {
+            return Some(false);
+        }
         let rect = still_body_rect(
             (col, row),
             stance,
@@ -974,13 +1078,13 @@ impl PetBrain {
 
     /// WHERE A SLEEPER MAY STRETCH: the body where the cat lies covers no ink and nothing protected the map sees ([`PetWorld::ink_clearance`], which counts as ink every cell anything protects: the host's chrome, an image, a selection, an overlay, a row it cannot see), so the stretch is drawn in front of blank ground and never under a word.
     #[inline]
-    pub(super) fn console_stretch_on_blank(&self) -> bool {
+    pub(super) const fn console_stretch_on_blank(&self) -> bool {
         self.console_stretch_on_blank_at((self.col, self.row))
     }
 
     /// [`Self::console_stretch_on_blank`] for a body at `at` (cells): the sleeper's fall judges where it falls from and where it lands.
     #[inline]
-    pub(super) fn console_stretch_on_blank_at(&self, at: (f32, f32)) -> bool {
+    pub(super) const fn console_stretch_on_blank_at(&self, at: (f32, f32)) -> bool {
         if !self.console.presentable {
             return true;
         }
@@ -993,7 +1097,7 @@ impl PetBrain {
             (self.last_cell_w, self.last_cell_h),
             self.last_grid,
         );
-        world.ink_clearance(rect, 0.0) == Some(true)
+        matches!(world.ink_clearance(rect, 0.0), Some(true))
     }
 
     /// An examined obstruction under the pet's natural body.
@@ -1990,11 +2094,29 @@ impl PetBrain {
                         if let Some((lx, ly)) = self.last_pointer
                             && dt > 1e-4
                         {
-                            let k = 1.0 - (-dt / DASH_WINDOW).exp();
-                            self.pointer_vx += ((px - lx) / dt - self.pointer_vx) * k;
-                            self.pointer_vy += ((py - ly) / dt - self.pointer_vy) * k;
-                            let inst = ((px - lx) / dt).hypot((py - ly) / dt);
-                            self.pointer_speed += (inst - self.pointer_speed) * k;
+                            let stationary = px == lx && py == ly;
+                            if !stationary
+                                || self.pointer_vx != 0.0
+                                || self.pointer_vy != 0.0
+                                || self.pointer_speed != 0.0
+                            {
+                                let k = 1.0 - (-dt / DASH_WINDOW).exp();
+                                let (vx_inst, vy_inst, inst) = if stationary {
+                                    (0.0, 0.0, 0.0)
+                                } else {
+                                    let vx = (px - lx) / dt;
+                                    let vy = (py - ly) / dt;
+                                    (vx, vy, vx.hypot(vy))
+                                };
+                                self.pointer_vx += (vx_inst - self.pointer_vx) * k;
+                                self.pointer_vy += (vy_inst - self.pointer_vy) * k;
+                                self.pointer_speed += (inst - self.pointer_speed) * k;
+                                if stationary && self.pointer_speed < 1e-5 {
+                                    self.pointer_vx = 0.0;
+                                    self.pointer_vy = 0.0;
+                                    self.pointer_speed = 0.0;
+                                }
+                            }
                         }
                         self.last_pointer = Some((px, py));
                         self.pointer_heat =
@@ -2077,8 +2199,16 @@ impl PetBrain {
     }
 
     #[inline]
-    fn console_may_stand(world: &PetWorld, rect: PetRect, margin: f32, passing: bool) -> bool {
-        Self::ground_clearance(world, rect, margin, passing) == Some(true)
+    const fn console_may_stand(
+        world: &PetWorld,
+        rect: PetRect,
+        margin: f32,
+        passing: bool,
+    ) -> bool {
+        matches!(
+            Self::ground_clearance(world, rect, margin, passing),
+            Some(true)
+        )
     }
 
     /// THE ESCORT PASSES UNDER THE HOST'S LABELS.
@@ -2106,8 +2236,12 @@ impl PetBrain {
 
     /// The sequence number of the last key the app noted ([`Self::note_console_input`]), when it was an Enter: one Enter, told from the next.
     #[inline]
-    pub(super) fn last_submit_seq(&self) -> Option<u64> {
-        (self.console.typed_kind == Some(PetInputKind::Submit)).then_some(self.console.seq)
+    pub(super) const fn last_submit_seq(&self) -> Option<u64> {
+        if matches!(self.console.typed_kind, Some(PetInputKind::Submit)) {
+            Some(self.console.seq)
+        } else {
+            None
+        }
     }
 
     /// The kind of the last key the app noted ([`Self::note_console_input`]), when it was pressed within `secs`: a letter typed is writing that goes forward before its echo has moved the caret.
@@ -2126,7 +2260,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn ground_clearance(
+    const fn ground_clearance(
         world: &PetWorld,
         rect: PetRect,
         margin: f32,
@@ -2150,7 +2284,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn stand_clearance(world: &PetWorld, body: PetRect, passing: bool) -> Option<bool> {
+    const fn stand_clearance(world: &PetWorld, body: PetRect, passing: bool) -> Option<bool> {
         let (feet, margin) = Self::stand_rect(world, body);
         Self::ground_clearance(world, feet, margin, passing)
     }
@@ -2162,8 +2296,11 @@ impl PetBrain {
     }
 
     #[inline]
-    fn console_must_yield(world: &PetWorld, rect: PetRect, passing: bool) -> bool {
-        Self::ground_clearance(world, rect, 0.0, passing) == Some(false)
+    const fn console_must_yield(world: &PetWorld, rect: PetRect, passing: bool) -> bool {
+        matches!(
+            Self::ground_clearance(world, rect, 0.0, passing),
+            Some(false)
+        )
     }
 
     /// The escort's own station, corrected only where the ladder is blind.
@@ -2355,7 +2492,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn console_walled(world: &PetWorld, from: PetRect, to: PetRect, passing: bool) -> bool {
+    const fn console_walled(world: &PetWorld, from: PetRect, to: PetRect, passing: bool) -> bool {
         if passing {
             // The way the feet go: chrome over the ground is walked under
             // ([`Self::console_escorting`]), chrome on it or across it is a
@@ -2926,15 +3063,16 @@ impl PetBrain {
 }
 
 #[inline]
-fn still_body_rect(
+const fn still_body_rect(
     seat: (f32, f32),
     stance: Stance,
     cell: (u16, u16),
     grid: (u16, u16),
 ) -> PetRect {
-    let (cw, ch) = (cell.0.max(1), cell.1.max(1));
+    let cw = if cell.0 > 1 { cell.0 } else { 1 };
+    let ch = if cell.1 > 1 { cell.1 } else { 1 };
     let (x0, x1, y0, y1) = drawn_body_px(seat, stance, (cw, ch), grid);
-    let (cw, ch) = (f32::from(cw), f32::from(ch));
+    let (cw, ch) = (cw as f32, ch as f32);
     PetRect::new(
         y0 as f32 / ch,
         x0 as f32 / cw,
@@ -2944,19 +3082,19 @@ fn still_body_rect(
 }
 
 #[inline]
-fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
-    frame
-        .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-        .map(|(x0, x1, y0, y1)| {
-            let cw = f32::from(sense.cell_w.max(1));
-            let ch = f32::from(sense.cell_h.max(1));
-            PetRect::new(
-                y0 as f32 / ch,
-                x0 as f32 / cw,
-                (y1 - y0) as f32 / ch,
-                (x1 - x0) as f32 / cw,
-            )
-        })
+const fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
+    let Some((x0, x1, y0, y1)) = frame.body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+    else {
+        return None;
+    };
+    let cw = (if sense.cell_w > 1 { sense.cell_w } else { 1 }) as f32;
+    let ch = (if sense.cell_h > 1 { sense.cell_h } else { 1 }) as f32;
+    Some(PetRect::new(
+        y0 as f32 / ch,
+        x0 as f32 / cw,
+        (y1 - y0) as f32 / ch,
+        (x1 - x0) as f32 / cw,
+    ))
 }
 
 #[inline]
@@ -2994,12 +3132,14 @@ const fn typed_run(
 }
 
 #[inline]
-fn local_ink(
+const fn local_ink(
     world: &PetWorld,
     body: PetRect,
     typed: Option<(usize, usize, usize)>,
 ) -> Option<[u64; 8]> {
-    world.stamp()?;
+    if world.stamp().is_none() {
+        return None;
+    }
     let r0 = (body.row - CONTACT_MARGIN).floor().max(0.0) as usize;
     let c0 = (body.col - CONTACT_MARGIN).floor().max(0.0) as usize;
     let r1 = (body.row + body.rows + CONTACT_MARGIN).ceil() as usize;
@@ -3008,44 +3148,60 @@ fn local_ink(
         return None;
     }
     let mut bits = [0; 8];
-    for r in r0..r1 {
+    let mut r = r0;
+    while r < r1 {
         let dr = r - r0;
-        let mut row_bits = u64::from(world.ink_row_bits(r, c0, c1)?);
+        let Some(raw_bits) = world.ink_row_bits(r, c0, c1) else {
+            return None;
+        };
+        let mut row_bits = raw_bits as u64;
         if let Some((row, first, end)) = typed
             && row == r
         {
-            let t0 = first.max(c0);
-            let t1 = end.min(c1);
+            let t0 = if first > c0 { first } else { c0 };
+            let t1 = if end < c1 { end } else { c1 };
             if t1 > t0 {
                 row_bits &= !(((1u64 << (t1 - t0)) - 1) << (t0 - c0));
             }
         }
         bits[dr >> 1] |= row_bits << ((dr & 1) << 5);
+        r += 1;
     }
     Some(bits)
 }
 
-fn detect_faux_composer_caret(
+#[inline]
+const fn bg_eq(a: [u8; 3], b: [u8; 3]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+const fn detect_faux_composer_caret(
     input: &aterm_core::render::RenderInput,
     pane: PetPane,
 ) -> Option<(u16, u16)> {
     let start_r = pane.rows / 2;
-    let end_r = input
-        .cursor_row
-        .saturating_sub(pane.row)
-        .min(pane.rows.saturating_sub(1));
-    for local_r in (start_r..end_r).rev() {
+    let max_end_r = pane.rows.saturating_sub(1);
+    let sub_r = input.cursor_row.saturating_sub(pane.row);
+    let end_r = if sub_r < max_end_r { sub_r } else { max_end_r };
+    let cells = input.cells.as_slice();
+    let mut local_r = end_r;
+    while local_r > start_r {
+        local_r -= 1;
         let frame_r = pane.row + local_r;
-        let Some(row) = input.cells.get(frame_r) else {
+        if frame_r >= cells.len() {
             continue;
-        };
+        }
+        let row = cells[frame_r].as_slice();
         let mut prompt_c = None;
         let mut boxed = false;
-        for local_c in 0..6.min(pane.cols) {
-            let Some(cell) = row.get(pane.col + local_c) else {
+        let scan_cols = if pane.cols < 6 { pane.cols } else { 6 };
+        let mut local_c = 0;
+        while local_c < scan_cols {
+            let idx = pane.col + local_c;
+            if idx >= row.len() {
                 break;
-            };
-            match cell.ch {
+            }
+            match row[idx].ch {
                 '│' | '┃' | '║' | '|' if local_c == 0 => boxed = true,
                 ' ' => {}
                 '>' | '❯' | '›' => {
@@ -3054,19 +3210,29 @@ fn detect_faux_composer_caret(
                 }
                 _ => break,
             }
+            local_c += 1;
         }
         let Some(prompt_c) = prompt_c else {
             continue;
         };
-        let base_bg = row.get(pane.col + prompt_c).map(|c| c.bg);
+        let prompt_idx = pane.col + prompt_c;
+        let base_bg = if prompt_idx < row.len() {
+            Some(row[prompt_idx].bg)
+        } else {
+            None
+        };
         let mut last_text: Option<(usize, usize, usize)> = None;
-        for comp_r in local_r..end_r {
-            let Some(comp_row) = input.cells.get(pane.row + comp_r) else {
+        let mut comp_r = local_r;
+        while comp_r < end_r {
+            let comp_frame_r = pane.row + comp_r;
+            if comp_frame_r >= cells.len() {
                 break;
-            };
-            let Some(first_cell) = comp_row.get(pane.col) else {
+            }
+            let comp_row = cells[comp_frame_r].as_slice();
+            if pane.col >= comp_row.len() {
                 break;
-            };
+            }
+            let first_cell = &comp_row[pane.col];
             if matches!(first_cell.ch, '╰' | '└' | '╭' | '┌' | '─' | '━' | '═' | '+')
             {
                 break;
@@ -3077,11 +3243,16 @@ fn detect_faux_composer_caret(
                         break;
                     }
                 } else {
-                    let indented = (0..=prompt_c).all(|c| {
-                        comp_row
-                            .get(pane.col + c)
-                            .is_some_and(|cell| cell.ch == ' ')
-                    });
+                    let mut indented = true;
+                    let mut c = 0;
+                    while c <= prompt_c {
+                        let idx = pane.col + c;
+                        if idx >= comp_row.len() || comp_row[idx].ch != ' ' {
+                            indented = false;
+                            break;
+                        }
+                        c += 1;
+                    }
                     if !indented {
                         break;
                     }
@@ -3089,14 +3260,18 @@ fn detect_faux_composer_caret(
             }
             let mut right_limit = pane.cols.saturating_sub(1);
             if boxed {
-                for c in ((prompt_c + 1)..pane.cols).rev() {
-                    let Some(cell) = comp_row.get(pane.col + c) else {
-                        continue;
-                    };
-                    if cell.ch == ' ' {
+                let mut c = pane.cols;
+                while c > prompt_c + 1 {
+                    c -= 1;
+                    let idx = pane.col + c;
+                    if idx >= comp_row.len() {
                         continue;
                     }
-                    if matches!(cell.ch, '│' | '┃' | '║' | '|') {
+                    let ch = comp_row[idx].ch;
+                    if ch == ' ' {
+                        continue;
+                    }
+                    if matches!(ch, '│' | '┃' | '║' | '|') {
                         right_limit = c;
                     }
                     break;
@@ -3104,35 +3279,44 @@ fn detect_faux_composer_caret(
             }
             let start_c = prompt_c + 1;
             let mut row_has_ink = false;
-            for local_c in start_c..right_limit {
-                let Some(cell) = comp_row.get(pane.col + local_c) else {
+            let mut scan_c = start_c;
+            while scan_c < right_limit {
+                let idx = pane.col + scan_c;
+                if idx >= comp_row.len() {
                     break;
+                }
+                let cell = &comp_row[idx];
+                let diff_base = match base_bg {
+                    Some(bg) => !bg_eq(cell.bg, bg),
+                    None => false,
                 };
-                let inverse_caret = base_bg.is_some_and(|bg| cell.bg != bg)
-                    && comp_row
-                        .get(pane.col + local_c - 1)
-                        .is_none_or(|prev| prev.bg != cell.bg)
-                    && comp_row
-                        .get(pane.col + local_c + 1)
-                        .is_none_or(|next| next.bg != cell.bg);
+                let diff_prev = idx == 0 || !bg_eq(comp_row[idx - 1].bg, cell.bg);
+                let diff_next = idx + 1 >= comp_row.len() || !bg_eq(comp_row[idx + 1].bg, cell.bg);
+                let inverse_caret = diff_base && diff_prev && diff_next;
                 if cell.ch == '█' || inverse_caret {
-                    return Some((comp_r as u16, local_c as u16));
+                    return Some((comp_r as u16, scan_c as u16));
                 }
                 if cell.ch != ' ' && cell.ch != '\0' {
                     row_has_ink = true;
-                    last_text = Some((comp_r, local_c, right_limit));
+                    last_text = Some((comp_r, scan_c, right_limit));
                 }
+                scan_c += 1;
             }
             if !boxed && !row_has_ink {
                 break;
             }
+            comp_r += 1;
         }
         if boxed {
             if let Some((tr, tc, right_limit)) = last_text {
-                let col = (tc + 1).min(right_limit.saturating_sub(1));
+                let limit_m1 = right_limit.saturating_sub(1);
+                let next_c = tc + 1;
+                let col = if next_c < limit_m1 { next_c } else { limit_m1 };
                 return Some((tr as u16, col as u16));
             }
-            let col = (prompt_c + 2).min(pane.cols.saturating_sub(1));
+            let limit_m1 = pane.cols.saturating_sub(1);
+            let next_c = prompt_c + 2;
+            let col = if next_c < limit_m1 { next_c } else { limit_m1 };
             return Some((local_r as u16, col as u16));
         }
     }

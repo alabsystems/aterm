@@ -13,7 +13,7 @@ use crate::kitty_summon::{TypedHit, TypedKittySummon};
 use crate::tone_infer::ToneTracker;
 
 /// Classified key press from the committed key path.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct TypedPress<'ev> {
     /// Key that edits or moves beyond one glyph, resetting detector windows.
     pub brk: bool,
@@ -25,7 +25,22 @@ pub struct TypedPress<'ev> {
     pub ime: Option<&'ev str>,
 }
 
+impl Default for TypedPress<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 impl<'ev> TypedPress<'ev> {
+    /// An empty key press with no break, backspace, bare glyph, or IME commit.
+    pub const NONE: Self = Self {
+        brk: false,
+        backspace: false,
+        typed: None,
+        ime: None,
+    };
+
     /// Apply the `brk` -> `backspace` -> `chars` cascade to `target`.
     #[inline]
     pub fn feed<T>(
@@ -40,8 +55,13 @@ impl<'ev> TypedPress<'ev> {
         } else if self.backspace {
             on_backspace(target);
         } else {
-            for c in self.chars() {
+            if let Some(c) = self.typed {
                 on_char(target, c);
+            }
+            if let Some(ime) = self.ime {
+                for c in ime.chars() {
+                    on_char(target, c);
+                }
             }
         }
     }
@@ -70,7 +90,6 @@ pub struct PressFeed<'a> {
 }
 
 /// Per-window companion detectors and cameo state.
-#[derive(Default)]
 pub struct Companions {
     /// The earned cursor cat's decision layer ([`crate::kitty_cursor`]).
     pub cursor_cat: CursorCat,
@@ -91,7 +110,30 @@ pub struct Companions {
     pub dog_cameo_session: Option<u64>,
 }
 
+impl Default for Companions {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Companions {
+    /// Construct a fresh per-window companion state with all detectors at rest.
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cursor_cat: CursorCat::new(),
+            kitty_summon: TypedKittySummon::new(),
+            tone_tracker: ToneTracker::new(),
+            kitty_sing: KittySing::new(),
+            music_notes: MusicNotes::new(),
+            sing_riff_bar: None,
+            dog_cameo: DogCameo::new(),
+            dog_cameo_session: None,
+        }
+    }
+
     /// Feed a classified key press to the tone, sing-along, and summon detectors.
     pub fn note_typed_press(&mut self, press: TypedPress<'_>, feed: PressFeed<'_>) -> TypedHit {
         let PressFeed {
@@ -116,24 +158,25 @@ impl Companions {
         if keyed_enter {
             self.kitty_sing.note_keyed_enter(now, session);
         }
-        let mut fired = TypedHit::default();
-        if press.brk {
-            self.kitty_summon.note_break();
-        } else if press.backspace {
-            self.kitty_summon.note_backspace(session);
-        } else if let Some((lexicon, opts)) = words {
-            for c in press.chars() {
-                fired = fired.merge(self.kitty_summon.note_char(now, session, c, lexicon, opts));
-            }
-        }
+        let mut fired = TypedHit::NONE;
+        press.feed(
+            &mut self.kitty_summon,
+            |summon| summon.note_break(),
+            |summon| summon.note_backspace(session),
+            |summon, c| {
+                if let Some((lexicon, opts)) = words {
+                    fired = fired.merge(summon.note_char(now, session, c, lexicon, opts));
+                }
+            },
+        );
         fired
     }
 
     /// Reset transient companion state for Serious Mode.
     #[inline]
     pub fn drain_serious(&mut self) {
-        self.cursor_cat = CursorCat::default();
-        self.dog_cameo = DogCameo::default();
+        self.cursor_cat = CursorCat::new();
+        self.dog_cameo = DogCameo::new();
         self.dog_cameo_session = None;
         self.kitty_sing.drain_serious();
         self.music_notes.clear();
@@ -164,7 +207,7 @@ mod tests {
         words: Option<(&Lexicon, &ScanOptions<'_>)>,
         now: Instant,
     ) -> TypedHit {
-        line.chars().fold(TypedHit::default(), |hit, ch| {
+        line.chars().fold(TypedHit::NONE, |hit, ch| {
             hit.merge(c.note_typed_press(
                 glyph(ch),
                 PressFeed {

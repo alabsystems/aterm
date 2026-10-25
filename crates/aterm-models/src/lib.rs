@@ -10,8 +10,9 @@ use aterm_spec::derive::Model;
 type Domain = (&'static str, fn() -> Model);
 
 /// One model of each domain crate.
-const DOMAINS: [Domain; 13] = [
+const DOMAINS: [Domain; 14] = [
     ("aterm-models-agh", aterm_models_agh::agh_route_wall_model),
+    ("aterm-models-db", aterm_models_db::offline_rights_model),
     (
         "aterm-models-aos",
         aterm_models_aos::aos_boundary_publication_model,

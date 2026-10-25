@@ -1,0 +1,15 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-24: the upsell's words are the binary's strings (its title `You hit your weekly limit.`, the `Upgrade tier` option and `Upgrade to a higher tier for more usage`, and the `Try Again` option and `Resubmit the last prompt once you have usage again`); the rows around them, the options' marks and each label sharing its row with its line are assembled, not captured — no signed-in account has drawn a Grok Build wall yet, so where its upsell sits and how it lays out its options are unmeasured
+  ~/proj
+
+  › summarize the failing test
+
+  The failing test is `wall::reads_a_grok_limit`; it expects one wall row.
+
+  You hit your weekly limit.
+
+  › Upgrade tier   Upgrade to a higher tier for more usage
+    Try Again      Resubmit the last prompt once you have usage again
+
+
+
+                                                 ctrl+q  quit

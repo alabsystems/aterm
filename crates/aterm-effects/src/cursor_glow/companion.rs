@@ -89,7 +89,7 @@ impl CursorGlow {
         if self.v2.engaged() {
             self.v2.pet_offer(geom, pet)
         } else {
-            rk::companion::PetOffer::default()
+            rk::companion::PetOffer::EMPTY
         }
     }
 
@@ -254,7 +254,7 @@ impl CursorGlow {
 
     /// Return `true` once per flow entry into [`rk::Flow::open`] for [`crate::kitty_pet::PetBrain::note_flow`].
     #[inline]
-    pub fn take_flow_entry(&mut self) -> bool {
+    pub const fn take_flow_entry(&mut self) -> bool {
         let open = self.flow_status().open();
         let entered = open && !self.flow_open;
         self.flow_open = open;

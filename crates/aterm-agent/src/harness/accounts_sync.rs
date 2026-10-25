@@ -2706,13 +2706,13 @@ pub const OTHER_CLIS: [Cli; 3] = [Cli::Codex, Cli::Grok, Cli::Kimi];
 
 /// The fleet file of `cli`'s pool in `~/.secrets` (`ai-accounts-codex.toml`,
 /// `ai-accounts-grok.toml`, `ai-accounts-kimi.toml`): the vault's subscriber writes it, and
-/// aterm only reads it ([`sync_cli_accounts`]).
+/// aterm only reads it ([`sync_cli_with`]).
 #[must_use]
 pub fn cli_fleet_file(cli: Cli) -> String {
     format!("ai-accounts-{}.toml", cli.id())
 }
 
-/// What a sync of another CLI's pool did ([`sync_cli_accounts`]).
+/// What a sync of another CLI's pool did ([`sync_cli_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliSync {
     /// Nothing: this machine keeps no roster of the CLI's and no source was named, so nothing
@@ -3269,7 +3269,12 @@ fn renew_pool_due(
                 .is_some_and(|a| a.limited_until(now).is_some())
         })
         .collect();
-    due_labels.sort_by_key(|label| logins.get(label).and_then(|b| b.wrong_at));
+    due_labels.sort_by_key(|label| {
+        (
+            unaddressed_sign_in_task_at(&store, &logins, label),
+            logins.get(label).and_then(|b| b.wrong_at),
+        )
+    });
     for label in due_labels {
         let Some(row) = file_roster.row(&label).cloned() else {
             continue;
@@ -3303,12 +3308,97 @@ struct AutoRenewGuard {
     /// ([`super::cli::Renewal::NeedsPerson`]), and since when: none is tried again in the
     /// background before [`PERSON_BACKOFF`] has passed.
     parked: BTreeMap<String, Instant>,
+    /// The newest `(at, same_second_count)` signed-in `accounts browser` window event already used
+    /// to lift a row's background hold once.
+    browser_unparked: BTreeMap<String, (i64, usize)>,
 }
 
 /// How long a row whose background renewal stopped for a person is left alone by the
 /// background before it is tried again: a renewal that stops so (accounts.x.ai's block page,
 /// a page that waits on a person) starts a live device sign-in every time it runs.
 const PERSON_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
+const PERSON_BACKOFF_SECS: i64 = 6 * 60 * 60;
+
+fn is_signed_in_browser_window_why(why: &str) -> bool {
+    let Some((_, tail)) = why.split_once(" window ") else {
+        return false;
+    };
+    let Some((end, state)) = tail.split_once(' ') else {
+        return false;
+    };
+    state == "session-kept" || (state == "session-unknown" && matches!(end, "done" | "quit"))
+}
+
+fn is_person_stop_why(why: &str) -> bool {
+    why.ends_with(" needs-sign-in") || why.ends_with(" needs-you") || why.ends_with(" hung")
+}
+
+fn browser_window_signed_in_token(
+    store: &accounts::Store,
+    label: &str,
+    since_at: i64,
+) -> Option<(i64, usize)> {
+    let events = store.tail(accounts::LEDGER_KEEP_ROWS).ok()?;
+    let mut last_at: Option<i64> = None;
+    let mut same_at_count = 0usize;
+    let mut satisfied: Option<(i64, usize)> = None;
+    for event in events {
+        if event.kind != accounts::Kind::SignIn || event.account != label {
+            continue;
+        }
+        let why = event.why.as_str();
+        if is_signed_in_browser_window_why(why) {
+            if last_at == Some(event.t) {
+                same_at_count += 1;
+            } else {
+                last_at = Some(event.t);
+                same_at_count = 1;
+            }
+            if event.t >= since_at {
+                satisfied = Some((event.t, same_at_count));
+            }
+        } else if why.contains(" window ") {
+            if event.t >= since_at {
+                satisfied = None;
+            }
+        } else if is_person_stop_why(why) {
+            satisfied = None;
+        }
+    }
+    satisfied
+}
+
+pub(super) fn unaddressed_sign_in_task_at(
+    store: &accounts::Store,
+    logins: &accounts::Logins,
+    label: &str,
+) -> Option<i64> {
+    let task = logins.get(label).and_then(|b| b.sign_in_task)?;
+    if task.action == accounts::SignInAction::Browser
+        && browser_window_signed_in_token(store, label, task.at).is_some()
+    {
+        return None;
+    }
+    Some(task.at)
+}
+
+fn reconcile_browser_window_unpark(
+    state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    key: &str,
+    token: Option<(i64, usize)>,
+) {
+    let Some(token) = token else {
+        return;
+    };
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.browser_unparked.get(key).copied() != Some(token) {
+        guard.browser_unparked.insert(key.to_owned(), token);
+        guard.parked.remove(key);
+        guard.last_attempt.remove(key);
+    }
+}
 
 /// Notes how a background renewal of `label` ended: one that stopped for a person
 /// ([`super::cli::Renewal::NeedsPerson`]) parks the row until [`PERSON_BACKOFF`] has passed
@@ -3599,7 +3689,7 @@ pub(super) fn auto_renew_candidates(
             .sessions
             .values()
             .any(|s| is_walled_or_low(&s.account));
-    let mut out = Vec::new();
+    let mut tiered: Vec<(u8, accounts::Row)> = Vec::new();
     let mut seen = BTreeSet::new();
     if any_walled {
         let wall_point = accounts::Point::Wall {
@@ -3629,7 +3719,7 @@ pub(super) fn auto_renew_candidates(
                 })
             {
                 if seen.insert(next_row.label.clone()) {
-                    out.push(next_row.clone());
+                    tiered.push((0, next_row.clone()));
                 }
             }
             if let Some(me_label) = me
@@ -3640,7 +3730,7 @@ pub(super) fn auto_renew_candidates(
                 && me_row.email.is_some()
                 && seen.insert(me_row.label.clone())
             {
-                out.push(me_row);
+                tiered.push((0, me_row));
             }
         }
     }
@@ -3656,11 +3746,11 @@ pub(super) fn auto_renew_candidates(
             && row.email.is_some()
             && seen.insert(row.label.clone())
         {
-            out.push(row.clone());
+            tiered.push((1, row.clone()));
         }
     }
-    out.sort_by_key(|row| logins.get(&row.label).and_then(|b| b.wrong_at));
-    out
+    tiered.sort_by_key(|(tier, row)| (*tier, logins.get(&row.label).and_then(|b| b.wrong_at)));
+    tiered.into_iter().map(|(_, row)| row).collect()
 }
 
 #[cfg(test)]
@@ -4350,6 +4440,11 @@ fn spawn_row_renewal(
         Ok(None) => return RenewalDispatch::Held,
         Err(_) => return RenewalDispatch::Failed,
     };
+    reconcile_browser_window_unpark(
+        renew_guard,
+        &next_label,
+        browser_window_signed_in_token(&store, &next_label, 0),
+    );
     let Some(mut permit) = AutoRenewPermit::claim_with_mailbox(
         renew_guard,
         &next_label,
@@ -4555,12 +4650,49 @@ fn spawn_vendor_renewal(
         }
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
+    let existing_binding = logins.get(&next_row.label);
+    let browser_token = match existing_binding.and_then(|b| b.sign_in_task) {
+        Some(task) => {
+            let token = (task.action == accounts::SignInAction::Browser)
+                .then(|| browser_window_signed_in_token(&store, &next_row.label, task.at))
+                .flatten();
+            if token.is_none() && now.saturating_sub(task.at) < PERSON_BACKOFF_SECS {
+                return RenewalDispatch::Held;
+            }
+            token
+        }
+        None => browser_window_signed_in_token(&store, &next_row.label, 0),
+    };
     match store.signin_now() {
         Ok(Some(probe)) => drop(probe),
         Ok(None) => return RenewalDispatch::Held,
         Err(_) => return RenewalDispatch::Failed,
     }
     let key = format!("{}:{}", cli.id(), next_row.label);
+    if let Some(binding) = existing_binding {
+        if let Some(task) = binding.sign_in_task {
+            if browser_token.is_some() {
+                reconcile_browser_window_unpark(renew_guard, &key, browser_token);
+            } else if now.saturating_sub(task.at) >= PERSON_BACKOFF_SECS {
+                renew_guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .parked
+                    .remove(&key);
+            }
+        } else {
+            let mut guard = renew_guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.parked.remove(&key).is_some() {
+                guard.last_attempt.remove(&key);
+            }
+            drop(guard);
+            reconcile_browser_window_unpark(renew_guard, &key, browser_token);
+        }
+    } else {
+        reconcile_browser_window_unpark(renew_guard, &key, browser_token);
+    }
     let Some(permit) = AutoRenewPermit::claim_with_mailbox(
         renew_guard,
         &key,
@@ -9187,6 +9319,91 @@ totp = "JBSWY3DPEHPK3PXP"
             &single_w.roster(),
             UPKEEP_NOW + 60,
         ));
+    }
+
+    #[test]
+    fn auto_renew_candidates_keeps_wall_recovery_ahead_of_due_rows_even_after_historical_wrong_at()
+    {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let m27_2_dir = dir.path().join("m27-2-empty");
+        let m27_3_dir = dir.path().join("m27-3-empty");
+        fs::create_dir_all(&m27_2_dir).unwrap();
+        fs::create_dir_all(&m27_3_dir).unwrap();
+        let roster = Roster {
+            rows: vec![
+                accounts::Row {
+                    label: "m27".to_owned(),
+                    email: Some("m27@example.test".to_owned()),
+                    class: Class::Dedicated,
+                    ..accounts::Row::default()
+                },
+                accounts::Row {
+                    label: "m27-2".to_owned(),
+                    dir: Some(m27_2_dir.display().to_string()),
+                    email: Some("m27-2@example.test".to_owned()),
+                    class: Class::Dedicated,
+                    ..accounts::Row::default()
+                },
+                accounts::Row {
+                    label: "m27-3".to_owned(),
+                    dir: Some(m27_3_dir.display().to_string()),
+                    email: Some("m27-3@example.test".to_owned()),
+                    class: Class::Dedicated,
+                    ..accounts::Row::default()
+                },
+            ],
+        };
+        let now = UPKEEP_NOW;
+        let mut state = accounts::State {
+            active: Some("m27".to_owned()),
+            proven: true,
+            ..accounts::State::default()
+        };
+        let _ = accounts::note_sample(
+            &mut state,
+            "m27",
+            accounts::Sample {
+                week_pct: Some(accounts::LOW_WEEK_PCT),
+                week_reset: Some(now + 3 * 86_400),
+                at: now - 30,
+                ..accounts::Sample::default()
+            },
+            now,
+        );
+        let mut logins = accounts::Logins::default();
+        logins.labels.insert(
+            "m27".to_owned(),
+            accounts::Binding {
+                renewed_at: Some(now - 360 * 86_400),
+                ..accounts::Binding::default()
+            },
+        );
+        logins.labels.insert(
+            "m27-2".to_owned(),
+            accounts::Binding {
+                wrong_at: Some(now - 86_400),
+                ..accounts::Binding::default()
+            },
+        );
+
+        let labels: Vec<String> = auto_renew_candidates(&roster, &state, &logins, now)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["m27-3".to_owned(), "m27-2".to_owned(), "m27".to_owned(),],
+            "wall-recovery rows (clean m27-3 first, then m27-2 with old wrong_at) stay ahead of background due row m27"
+        );
+
+        // Negative: when m27 is healthy (not low or walled), only due row m27 is returned.
+        let mut healthy = state.clone();
+        healthy.accounts.clear();
+        let due_only: Vec<String> = auto_renew_candidates(&roster, &healthy, &logins, now)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(due_only, vec!["m27".to_owned()]);
     }
 }
 

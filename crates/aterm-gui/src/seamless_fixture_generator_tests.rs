@@ -3292,6 +3292,11 @@ fn fx_mailbox() -> FxMailbox {
         assert_eq!(ask(10, "green?"), "OK 1\n");
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert!(link("bb".repeat(16)).starts_with("OK"));
+        assert_eq!(
+            cmd_link_after_log_switch(&store, "gap from=4 to=9 records=2", Some(generation), || {}),
+            "OK\n",
+            "the broker gave up two unread mails below the next one"
+        );
         assert_eq!(ask(10, "tag?"), "OK 2\n");
         assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
         assert_eq!(
@@ -3370,6 +3375,14 @@ fn fx_mailbox() -> FxMailbox {
         assert!(
             fabric.dropped > 0 && fabric.broadcasts_uncarried > 0 && fabric.broadcasts_refilled > 0,
             "{fabric:?}"
+        );
+        assert_eq!(
+            fabric.given_up,
+            Some(crate::fabric::GivenUp {
+                from: 4,
+                to: 9,
+                records: Some(2)
+            })
         );
         let topics = render_topics(&ctx.fabric.topics());
         let guard = store.read().unwrap();

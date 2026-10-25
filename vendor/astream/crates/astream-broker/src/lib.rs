@@ -197,9 +197,9 @@ pub use storage::{storage_len_advance, storage_truncate_within_len};
 pub use store::RetentionTick;
 pub use store::{
     incarnation_base, incarnation_of, is_hidden_record, on_boot_volume,
-    store_ack_seq_in_reserved_half, store_head_advance, will_seq, Boot, BrokerLog, Durability,
-    FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared, Volume, INC_MAX, ORDERED_HORIZON,
-    RETIRE_SUBJECT, WILL_SEQ_LOW,
+    store_ack_seq_in_reserved_half, store_head_advance, will_seq, Boot, BrokerLog,
+    CheckedPublishError, Durability, FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared,
+    Volume, INC_MAX, ORDERED_HORIZON, RETIRE_SUBJECT, WILL_SEQ_LOW,
 };
 
 #[cfg(test)]

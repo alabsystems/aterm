@@ -900,7 +900,7 @@ impl PaneTextCache {
                 cached.key.session,
                 "Claude Code context indicator",
                 &cached.rows,
-                || aterm_phase::phase::context_left_shown(&cached.rows),
+                || aterm_phase::phase::context_left(&cached.rows),
             )
             .flatten()
         })

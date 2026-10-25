@@ -162,9 +162,9 @@ print $? & 127 ? "signal " . ($? & 127) : "exit " . ($? >> 8);
 "#;
 
 /// A Ctrl-C that cuts a `curl | bash` download short ends bash by the signal,
-/// so a script around it stops too. The prefix runs to the end of the test
-/// seam, past every top-level line before main, and its last line says bash ran
-/// them all. Before, the run's INT trap was set at the top level: bash only
+/// so a script around it stops too. The prefix is every line before the final
+/// `main "$@"`, so it runs every top-level line, and its last line says bash
+/// ran them all. Before, the run's INT trap was set at the top level: bash only
 /// marked it pending, and the cut script ended with status 0, or mid-function
 /// with a syntax error.
 #[test]
@@ -172,17 +172,12 @@ fn a_ctrl_c_while_the_script_arrives_ends_it_by_the_signal() {
     let scratch = Scratch::new();
     let text = std::fs::read_to_string(install_sh()).expect("install.sh");
     let lines: Vec<&str> = text.lines().collect();
-    let seam = lines
+    let last = lines
         .iter()
-        .position(|l| *l == "if [[ \"${ATERM_INSTALL_LIBRARY_ONLY:-0}\" == 1 ]]; then")
-        .expect("install.sh has its test seam");
-    let end = seam
-        + lines[seam..]
-            .iter()
-            .position(|l| *l == "fi")
-            .expect("the seam's fi");
+        .rposition(|l| *l == "main \"$@\"")
+        .expect("install.sh ends by calling main");
     let mark = scratch.join("ran");
-    let mut prefix = lines[..=end].join("\n");
+    let mut prefix = lines[..last].join("\n");
     prefix.push_str(&format!("\n: >{}\n", q(s(&mark))));
     let prefix = scratch.write("prefix.sh", prefix);
     let feed = scratch.write("feed.pl", FEED);

@@ -89,6 +89,31 @@ impl AuthorizationWrite {
 }
 
 impl AuthorizationCommit {
+    fn same_records(&self, current: &Records, expected: &Records) -> bool {
+        if !matches!(
+            self.writes.first(),
+            Some(AuthorizationWrite::UpgradePlan(..))
+        ) {
+            return current == expected;
+        }
+        let without_spent_stop = |records: &Records| {
+            let mut records = records.clone();
+            // An unfinished predecessor's Stop also holds its immediate upgrade.
+            // Other older numeric Stops cannot revoke this owned retry. Keep the
+            // request itself and every other record/publication check unchanged.
+            if let Some(request @ StopRequest::Revision(revision)) = records.stop_request
+                && revision < self.revision
+                && !self.prefixes[0]
+                    .progress
+                    .is_some_and(|prior| prior.stopped_by(Some(request)))
+            {
+                records.stop_request = None;
+            }
+            records
+        };
+        without_spent_stop(current) == without_spent_stop(expected)
+    }
+
     fn new(
         baseline: InitialSetupObservation,
         plan: &Plan,
@@ -206,9 +231,15 @@ impl InitialSetupAuthorization {
         root: &Path,
         read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
     ) -> Result<Plan, String> {
-        let configured = read();
-        let plan = offered_plan(saved_plan_record(root)?, configured.clone())?;
-        self.vault = AdmittedVault::of(configured);
+        // A read-only snapshot can still show a saved plan after a read error;
+        // an offer must know the vault its eventual Secrets choice may replace.
+        // Fail before presenting it so startup can retry and offer the current vault.
+        let configured = read()?;
+        let records = observation_at(root)
+            .map_err(|error| error.to_string())?
+            .records;
+        let plan = offered_plan(records.presented_plan_record(), Ok(configured.clone()))?;
+        self.vault = AdmittedVault::of(Ok(configured));
         Ok(plan)
     }
 
@@ -373,6 +404,43 @@ impl InitialSetupAuthorization {
         self.persist_with_vault(root, plan, admission, Ok, write, observe)
     }
 
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn persist_for_watch_test(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        upgrade: bool,
+        fault: Option<(usize, bool)>,
+    ) -> Result<Option<u64>, String> {
+        let mut index = 0;
+        observe_mutation_at(root, None, Err("busy".into()), |root| {
+            self.persist_with(
+                root,
+                plan,
+                if upgrade {
+                    Admission::Upgrade
+                } else {
+                    Admission::Automatic
+                },
+                |step, root| {
+                    let current = index;
+                    index += 1;
+                    if let Some((at, published)) = fault
+                        && current == at
+                    {
+                        if published {
+                            step.persist(root)?;
+                        }
+                        return Err("injected upgrade publication failure".into());
+                    }
+                    step.persist(root)
+                },
+                |root| observation_at(root).map_err(|error| error.to_string()),
+            )
+        })
+        .result
+    }
+
     fn persist_with_vault(
         &mut self,
         root: &Path,
@@ -412,12 +480,19 @@ impl InitialSetupAuthorization {
             AuthorizationState::Writing(commit) => {
                 if current.publications() != commit.publications
                     || commit.plan != *plan
-                    || !commit.prefixes.contains(&current.records)
+                    || !commit
+                        .prefixes
+                        .iter()
+                        .any(|expected| commit.same_records(&current.records, expected))
                 {
                     self.state = AuthorizationState::Ended;
                     return Ok(None);
                 }
-                if commit.prefixes.last() == Some(&current.records) {
+                if commit
+                    .prefixes
+                    .last()
+                    .is_some_and(|expected| commit.same_records(&current.records, expected))
+                {
                     let revision = commit.revision;
                     self.state = AuthorizationState::Ended;
                     return Ok(Some(revision));
@@ -1371,21 +1446,15 @@ mod tests {
         request_stop_at(root.path(), first).unwrap();
         assert!(!finished_at(root.path()).unwrap());
         assert!(!progress(root.path()).unwrap().unwrap().stopped);
-        // The changed request still retires this process-local ticket; a new
-        // launch can review the readable pending target instead.
         assert_eq!(
             owner
                 .upgrade_at(root.path(), &Plan::default())
                 .result
                 .unwrap(),
-            None
+            Some(first + 1),
+            "a completed predecessor's delayed Stop must not strand its owned upgrade"
         );
-        let mut fresh = InitialSetupAuthorization::capture_at(root.path()).unwrap();
-        fresh
-            .persist_at_as(root.path(), &Plan::default(), Admission::Automatic)
-            .result
-            .unwrap()
-            .unwrap();
+        restart_at(root.path(), &Plan::default()).unwrap();
         let next = progress(root.path()).unwrap().unwrap();
         assert!(next.admitted && !next.stopped);
         request_stop_at(root.path(), first + 1).unwrap();
@@ -1394,6 +1463,88 @@ mod tests {
             next,
             "a newer deliberate revision is not stopped by the upgrade marker"
         );
+    }
+
+    #[test]
+    fn irrelevant_stops_keep_the_owned_upgrade_across_every_publication_boundary() {
+        for completed in [false, true] {
+            for predecessor in [false, true] {
+                if predecessor && !completed {
+                    continue;
+                }
+                for fault in 0..4 {
+                    for published in [false, true] {
+                        let root = aterm_tempfile::tempdir().unwrap();
+                        provisional_permissions(root.path(), completed);
+                        let mut prior = progress(root.path()).unwrap().unwrap();
+                        prior.revision = 7;
+                        save_progress(root.path(), prior).unwrap();
+                        let stopped = prior.revision - u64::from(!predecessor);
+                        let mut owner = interrupt_upgrade(root.path(), fault, published);
+                        request_stop_at(root.path(), stopped).unwrap();
+                        let request = std::fs::read(root.path().join(STOP_REQUEST)).unwrap();
+                        assert_eq!(
+                            owner
+                                .upgrade_at(root.path(), &Plan::default())
+                                .result
+                                .unwrap(),
+                            Some(prior.revision + 1),
+                            "completed={completed}, predecessor={predecessor}, fault={fault}, published={published}"
+                        );
+                        let recovered = progress(root.path()).unwrap().unwrap();
+                        assert!(recovered.admitted && !recovered.stopped && !recovered.completed);
+                        assert_eq!(recovered.revision, prior.revision + 1);
+                        assert_eq!(recovered.done, prior.done);
+                        assert_eq!(recovered.access_revision(), prior.access_revision());
+                        assert_eq!(
+                            std::fs::read(root.path().join(STOP_REQUEST)).unwrap(),
+                            request
+                        );
+                        observe_mutation_at(
+                            root.path(),
+                            None,
+                            Err("busy".into()),
+                            fold_stop_request,
+                        )
+                        .result
+                        .unwrap();
+                        assert_eq!(stop_request_at(root.path()), None);
+                        assert!(!progress(root.path()).unwrap().unwrap().stopped);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_future_and_unreadable_stops_still_retire_upgrade_recovery() {
+        for fault in 0..4 {
+            for published in [false, true] {
+                for offset in [Some(1), Some(2), None] {
+                    let root = aterm_tempfile::tempdir().unwrap();
+                    let first = provisional_permissions(root.path(), true);
+                    let mut owner = interrupt_upgrade(root.path(), fault, published);
+                    if let Some(offset) = offset {
+                        request_stop_at(root.path(), first + offset).unwrap();
+                    } else {
+                        std::fs::write(root.path().join(STOP_REQUEST), b"unreadable").unwrap();
+                    }
+                    let request = std::fs::read(root.path().join(STOP_REQUEST)).unwrap();
+                    assert_eq!(
+                        owner
+                            .upgrade_at(root.path(), &Plan::default())
+                            .result
+                            .unwrap(),
+                        None,
+                    );
+                    assert!(!owner.pending());
+                    assert_eq!(
+                        std::fs::read(root.path().join(STOP_REQUEST)).unwrap(),
+                        request
+                    );
+                }
+            }
+        }
     }
 
     #[test]

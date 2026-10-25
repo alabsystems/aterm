@@ -2371,7 +2371,8 @@ fn handoff_refusal(release: &str, missing: &str) -> Error {
     ))
 }
 
-/// The release token must be present and GitHub must take it (`GET /user` names its login), before the build.
+/// The release token must be present and GitHub must take it (`GET /user` names its login),
+/// before the build; an offline run checks nothing.
 ///
 /// # Errors
 /// No token in its file, a token GitHub refuses, or no answer from GitHub.

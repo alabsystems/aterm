@@ -99,13 +99,19 @@ impl Seen {
 }
 
 /// A state key's hash: a multiply-rotate mix of each value (the `FxHash`
-/// construction).
+/// construction). The rotate is spelled as two shifts: a dev build of this crate
+/// (opt-level 1, which shares generics) otherwise calls an opt-level-0 crate's
+/// out-of-line copy of the rotate intrinsic for every value of every state.
 #[inline]
+#[expect(
+    clippy::manual_rotate,
+    reason = "`rotate_left` is an out-of-line opt-level-0 call in this crate's dev build"
+)]
 const fn key_hash(key: &[i64]) -> u64 {
     let mut h = key.len() as u64;
     let mut i = 0;
     while i < key.len() {
-        h = (h.rotate_left(5) ^ key[i] as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        h = (((h << 5) | (h >> 59)) ^ key[i] as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
         i += 1;
     }
     h
@@ -605,6 +611,10 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
             .collect()
     };
     let mut open = watched.len();
+    // Whether each action is watched: asked of every action of every lawful state.
+    let watches: Vec<bool> = upto(m.actions.len())
+        .map(|a| watched.contains(&a))
+        .collect();
     let mut walk = Walk::new(w);
     while walk.pop(w) {
         assert!(
@@ -616,7 +626,7 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
         let env = w.env(st);
         let from_lawful = lawful(&env, st);
         for a in upto(m.actions.len()) {
-            let watching = from_lawful && watched.contains(&a);
+            let watching = from_lawful && watches[a];
             let made = w.successors(&env, st, a, &mut walk.next);
             for j in upto(made) {
                 let ns = w.nth(&walk.next, j);
@@ -1278,6 +1288,39 @@ pub fn pick(m: &Model, state: &State, action: &str, var: &str, value: i64) -> Op
 mod tests {
     use super::*;
     use crate::test_models::{config_catalog_snapshot_model, ring_model, subscribe_model};
+
+    /// [`key_hash`]'s two shifts are the rotate by 5 of the `FxHash` mix, for keys of every
+    /// length to 4 over values with every high and low bit pattern a rotate carries. NEGATIVE
+    /// CONTROL: shifting right by 58 instead of 59 gives another hash.
+    #[test]
+    fn key_hash_is_the_rotate_mix() {
+        let rotated = |key: &[i64]| {
+            key.iter().fold(key.len() as u64, |h, &v| {
+                (h.rotate_left(5) ^ v as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95)
+            })
+        };
+        let values = [
+            0,
+            1,
+            -1,
+            i64::MIN,
+            i64::MAX,
+            0x0f0f_0f0f_0f0f_0f0f,
+            -0x1234_5678_9abc,
+        ];
+        for len in 0..=4 {
+            for start in 0..values.len() {
+                let key: Vec<i64> = values
+                    .iter()
+                    .cycle()
+                    .skip(start)
+                    .take(len)
+                    .copied()
+                    .collect();
+                assert_eq!(key_hash(&key), rotated(&key), "{key:?}");
+            }
+        }
+    }
 
     fn assert_lasso(m: &Model, cycle: &NonProgressCycle, goal: impl Fn(&State) -> bool) {
         assert_eq!(

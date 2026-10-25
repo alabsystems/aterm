@@ -569,11 +569,11 @@ fn walk_all(
     hold_teller: HoldTeller,
 ) -> Result<BTreeMap<String, usize>, String> {
     let base = Instant::now() + Duration::from_secs(3600);
-    let mut seen: BTreeSet<State> = BTreeSet::new();
+    let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), start(base, teller, hold_teller))]);
     let mut verdicts = BTreeMap::<String, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
-        if !seen.insert(st.clone()) {
+        if !seen.insert(crate::common::key(m, &st)) {
             continue;
         }
         for inv in &m.invariants {

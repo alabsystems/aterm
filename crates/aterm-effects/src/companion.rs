@@ -102,26 +102,21 @@ pub fn cursor_cat_color_key(
     ];
     let pack =
         |rgb: [u8; 3]| (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
-    let mut last_bg_rgb = fallback_bg_rgb;
-    let mut last_band = CatColorKey::background_band(fallback_bg);
+    let mut last_bg_rgb = [0u8; 3];
     'rows: for row in r0..=r1 {
         let line = cells.get(row).map_or(&[][..], Vec::as_slice);
         for col in c0..=c1 {
             let cell = line.get(col);
             let background_rgb = cell.map_or(fallback_bg_rgb, |cell| cell.bg);
-            let band = if background_rgb == last_bg_rgb {
-                last_band
-            } else {
-                let b = CatColorKey::background_band(pack(background_rgb));
+            if sampled == 0 || background_rgb != last_bg_rgb {
+                let band = CatColorKey::background_band(pack(background_rgb));
                 last_bg_rgb = background_rgb;
-                last_band = b;
-                b
-            };
-            min_background_band = min_background_band.min(band);
-            max_background_band = max_background_band.max(band);
-            for (dst, src) in bg_sum.iter_mut().zip(background_rgb) {
-                *dst += u32::from(src);
+                min_background_band = min_background_band.min(band);
+                max_background_band = max_background_band.max(band);
             }
+            bg_sum[0] += u32::from(background_rgb[0]);
+            bg_sum[1] += u32::from(background_rgb[1]);
+            bg_sum[2] += u32::from(background_rgb[2]);
             sampled += 1;
             if let Some(cell) = cell
                 && !cell.wide
@@ -134,9 +129,9 @@ pub fn cursor_cat_color_key(
                 }
             {
                 principal_fg.get_or_insert(cell.fg);
-                for (dst, src) in fg_sum.iter_mut().zip(cell.fg) {
-                    *dst += u32::from(src);
-                }
+                fg_sum[0] += u32::from(cell.fg[0]);
+                fg_sum[1] += u32::from(cell.fg[1]);
+                fg_sum[2] += u32::from(cell.fg[2]);
                 visible += 1;
             }
             if sampled == MAX_SAMPLES {
@@ -356,13 +351,13 @@ pub const fn shed_companion_presentable(base_presentable: bool, envelope: f32) -
 /// Attenuate a companion's alpha by the load-shed envelope at the final presentation seam; the brains keep their unscaled state.
 #[inline]
 #[must_use]
-pub fn shed_companion_alpha(alpha: u8, envelope: f32) -> u8 {
+pub const fn shed_companion_alpha(alpha: u8, envelope: f32) -> u8 {
     let envelope = if envelope.is_finite() {
         envelope.clamp(0.0, 1.0)
     } else {
         0.0
     };
-    (f32::from(alpha) * envelope).round() as u8
+    (alpha as f32 * envelope).round() as u8
 }
 
 /// Whether the soft-shed envelope still owes another presentation: fade-out stops at zero; fade-in starts from that exact zero and stops only at full amplitude.
@@ -399,15 +394,31 @@ pub struct ContrastFallback {
 }
 
 /// The trail owner's verdict as the host resolved it: trail master on, parsed style, and whether the resolved trail is in pet mode (native: from the trail presentation; web: `GlowSpelling::pet_of` over the page's spelling, since the parsed enum cannot tell `rainbow kitty pet` from `rainbow kitty flying`).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct GlowOwnership {
     pub enabled: bool,
     pub style: GlowStyle,
     pub style_raw_names_pet: bool,
 }
 
+impl GlowOwnership {
+    /// Disabled trail ownership on the default style.
+    pub const NONE: Self = Self {
+        enabled: false,
+        style: GlowStyle::Lumen,
+        style_raw_names_pet: false,
+    };
+}
+
+impl Default for GlowOwnership {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 /// What the resident is told about its session, restated by the host each frame (the brain diffs each fact).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RoomFacts {
     /// The session's status phase is `Quiet`: a foreground job, nothing printing recently.
     pub quiet: bool,
@@ -417,8 +428,24 @@ pub struct RoomFacts {
     pub session: Option<SessionRoom>,
 }
 
+impl RoomFacts {
+    /// Empty room facts with no active session or sibling pane.
+    pub const EMPTY: Self = Self {
+        quiet: false,
+        sibling: None,
+        session: None,
+    };
+}
+
+impl Default for RoomFacts {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// The facts only a live session has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionRoom {
     /// A turn lease is live: an agent is driving this session.
     pub lease: bool,
@@ -428,6 +455,23 @@ pub struct SessionRoom {
     pub inbox: RoomInbox,
     /// The serial of the session's task end (§11.2's end: Land's landing) that no pet has cheered yet; `None` when none stands or it was cheered (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3).
     pub landed: Option<u32>,
+}
+
+impl SessionRoom {
+    /// Empty session facts with no lease, turn, inbox items, or uncheered landing.
+    pub const EMPTY: Self = Self {
+        lease: false,
+        turn: (0, false),
+        inbox: RoomInbox::EMPTY,
+        landed: None,
+    };
+}
+
+impl Default for SessionRoom {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// One frame's inputs to [`CompanionOwner::prepare`].
@@ -520,7 +564,7 @@ pub struct PetGlass {
 
 /// The pet's per-session latches. Every key carries the session, so a tab or
 /// pane switch re-baselines silently.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Latches {
     /// `(session, completed_command_seq)`: the once-per-completion latch.
     cmd_seq: Option<(u64, u64)>,
@@ -539,6 +583,24 @@ struct Latches {
     brackets: Option<((u64, bool), u64)>,
     /// A hidden cursor's move, not yet taken ([`HIDDEN_REST`]).
     hidden_rest: Option<HiddenRest>,
+}
+
+impl Latches {
+    const EMPTY: Self = Self {
+        cmd_seq: None,
+        content_seq: None,
+        wrap_serial: None,
+        finished_caret: None,
+        brackets: None,
+        hidden_rest: None,
+    };
+}
+
+impl Default for Latches {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// [`Latches::finished_caret`]: the caret reading of the last finished present
@@ -640,22 +702,31 @@ struct PixelFrame {
 impl Default for CompanionOwner {
     #[inline]
     fn default() -> Self {
-        let base = KittyLook::default();
+        Self::new()
+    }
+}
+
+impl CompanionOwner {
+    /// Construct a fresh pet driver in its disabled, byte-identical-off posture.
+    #[must_use]
+    #[inline]
+    pub const fn new() -> Self {
+        let base = KittyLook::DEFAULT;
         Self {
-            pet: PetBrain::default(),
+            pet: PetBrain::new(),
             species: PetSpecies::Cat,
             enabled: false,
             pair: (base.coat, base.iris),
             arrival: PetArrival::Quiet,
             rung: CompanionRung::Launch,
-            latches: Latches::default(),
+            latches: Latches::EMPTY,
             pointer_px: None,
             hit_rect: None,
             last_alpha: 0,
             last_visible: false,
             last_static: false,
             last_shed_tick: None,
-            geom: EffectGeom::default(),
+            geom: EffectGeom::EMPTY,
             last_sync: None,
             drawn_frame: None,
             resight_frame: None,
@@ -665,17 +736,14 @@ impl Default for CompanionOwner {
             landed_taken: None,
         }
     }
-}
 
-impl CompanionOwner {
     /// An owner the host dresses every frame through [`Self::set_look`] rather than the seed.
     #[must_use]
     #[inline]
-    pub fn dressed_by_host() -> Self {
-        Self {
-            enabled: true,
-            ..Self::default()
-        }
+    pub const fn dressed_by_host() -> Self {
+        let mut owner = Self::new();
+        owner.enabled = true;
+        owner
     }
 
     /// Dress the pet in `KittyLook::for_launch(seed)` (rung `Launch`, quiet); `enabled = false` retires it outright, so off costs and draws nothing.
@@ -1505,7 +1573,7 @@ impl CompanionOwner {
     /// ([`PetBrain::set_letter_arrival_dwells`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_pet_letter_arrival_dwells(&mut self, dwells: bool) {
+    pub const fn set_pet_letter_arrival_dwells(&mut self, dwells: bool) {
         self.pet.set_letter_arrival_dwells(dwells);
     }
 
@@ -1513,7 +1581,7 @@ impl CompanionOwner {
     /// last key was an Enter ([`PetBrain::set_letter_step_rearms`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_pet_letter_step_rearms(&mut self, rearms: bool) {
+    pub const fn set_pet_letter_step_rearms(&mut self, rearms: bool) {
         self.pet.set_letter_step_rearms(rearms);
     }
 

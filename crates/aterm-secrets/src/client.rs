@@ -1029,6 +1029,86 @@ fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Optio
     Ok(Some(everyone.into_values().collect()))
 }
 
+/// The offline Commons reader, kept beside the vault's lock, pin and version
+/// checks so it cannot accidentally bypass the locally applied source binding.
+pub(crate) fn cached_commons(paths: &Paths) -> crate::Result<Option<crate::commons::Snapshot>> {
+    let Some(_observation) = StateLock::observe(paths)? else {
+        return Ok(None);
+    };
+    let Some(config) = config(paths)? else {
+        return Ok(None);
+    };
+    let Some(pin) = config.signer else {
+        return Ok(None);
+    };
+    let state = load_state(paths)?;
+    if state.membership != Stored::In
+        || state.failed
+        || !state.pending.is_empty()
+        || !source_bound(&config, &state)
+        || !pin_admitted(&config, None)
+    {
+        return Ok(None);
+    }
+    let (Some(digest), Some(identity)) = (state.digest, read_identity(paths)?) else {
+        return Ok(None);
+    };
+    let Some(bytes) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
+        return Ok(None);
+    };
+    let (envelope, pinned, verdict) = envelope::verify_for_reader(
+        bytes.as_slice(),
+        &config.name,
+        &pin,
+        &config.followed,
+        Some(&Floor::version(state.seq, digest)),
+    )?;
+    if verdict != Verdict::Unchanged || !matches!(pinned, Pin::Same) {
+        return Ok(None);
+    }
+    let mut control = None;
+    for locker in envelope
+        .lockers
+        .iter()
+        .filter(|locker| locker.label != "admin")
+    {
+        let plain = match age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) {
+            Ok(plain) => plain,
+            Err(age::AgeError::NoMatch) => continue,
+            Err(error) => return Err(Error::new(format!("Commons locker: {error}"))),
+        };
+        let entries = text::parse_locker(plain.as_slice())
+            .map_err(|error| Error::new(format!("Commons locker: {error}")))?;
+        for entry in entries
+            .into_iter()
+            .filter(|entry| entry.name == crate::commons::ENTRY)
+        {
+            // Host labels can be renamed while a device is offline. The vault
+            // signer addressed this ciphertext to the proven age recipient;
+            // its consumer must check stable member identities, not labels.
+            if !matches!(&entry.audience, Audience::Hosts(_))
+                || entry.if_absent
+                || entry.anchor.is_some()
+                || control.is_some()
+            {
+                return Err(Error::new(
+                    "Commons control audience is not an unambiguous explicit recipient grant",
+                ));
+            }
+            control = Some(entry.value);
+        }
+    }
+    Ok(control.map(|control| {
+        crate::commons::Snapshot::verified(
+            config.name,
+            &envelope,
+            config.followed,
+            identity.recipient(),
+            control,
+        )
+    }))
+}
+
 fn plain_entries(config: &Config, path: &Path) -> crate::Result<Vec<Entry>> {
     let bytes = fsx::read_private(path, text::MAX_TEXT)?
         .ok_or_else(|| Error::new(format!("{}: no such file", path.display())))?;
@@ -1049,8 +1129,9 @@ pub enum Look {
     /// Transient transport failure or unreached source.
     Unreached(String),
     /// Unreached, the last failure [`transport::Unheard::held`], as macOS fails this app's LAN
-    /// traffic while its Local Network question is unanswered or denied. A host that is off or a
-    /// server that stalls fails alike, so this is a hint to name the setting, never a finding.
+    /// traffic while its Local Network question is unanswered or denied (aterm-http names a
+    /// `.local` lookup mDNSResponder refuses as no route). A host that is off or a server that
+    /// stalls fails alike, so this is a hint to name the setting, never a finding.
     Held(String),
     /// The endpoint or path holds no vault.
     NoVault(String),
@@ -1282,6 +1363,7 @@ fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
 fn files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
+        && cache_intact(paths, state)
         && state.manifest.files.iter().all(|(name, digest)| {
             materialize::behind_a_link(&paths.home, name)
                 || materialize::target_path(&paths.home, name)
@@ -1289,6 +1371,13 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
                     .and_then(|path| fsx::read_private(&path, text::MAX_VALUE).ok().flatten())
                     .is_some_and(|bytes| materialize::digest_hex(bytes.as_slice()) == *digest)
         })
+}
+
+fn cache_intact(paths: &Paths, state: &State) -> bool {
+    config(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|config| config.signer.is_none() || held_copy(paths, &config, state).is_some())
 }
 
 fn place(source: &Source) -> String {
@@ -1622,8 +1711,8 @@ fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
     let due = state.membership == Stored::In
         && !state.failed
         && state.pending.is_empty()
-        && *repaired != Some(version)
-        && !files_intact(paths, &state);
+        && (!cache_intact(paths, &state)
+            || (*repaired != Some(version) && !files_intact(paths, &state)));
     if due {
         *repaired = Some(version);
     }
@@ -2460,6 +2549,7 @@ pub struct Admin {
     pub doc: Document,
     /// The source config.
     pub config: Config,
+    commons_eligibility: crate::commons::membership::Eligibility,
     seed: [u8; 32],
     seq: u64,
     /// The handoff chain from the vault's first key to the current one, carried whole on
@@ -2484,6 +2574,105 @@ impl std::fmt::Debug for Admin {
 }
 
 impl Admin {
+    /// Prepare an initial typed Commons roster from consumed joint-possession
+    /// proofs and the authenticated eligibility snapshot captured on open.
+    /// Use only for a new network and durably publish its returned genesis as
+    /// the authenticated trust anchor; an unavailable anchor is not a new lab.
+    /// Retain and ingest the exact returned bytes before publishing them.
+    pub fn prepare_commons_genesis(
+        &self,
+        network: [u8; 16],
+        members: Vec<crate::commons::roster::Enrollment>,
+    ) -> crate::Result<crate::commons::node::Node> {
+        crate::commons::roster::create(&self.seed, &self.commons_eligibility, network, members)
+    }
+
+    /// Prepare a fresh key epoch and typed roster extending the exact current
+    /// control head. An omitted device is absent from this roster; permanent
+    /// retirement is a separate retained control fact. Persist and retry the
+    /// exact returned bytes rather than preparing another random epoch.
+    pub fn prepare_commons_rotation(
+        &self,
+        journal: &crate::commons::journal::Journal,
+        members: Vec<crate::commons::roster::Grant>,
+    ) -> crate::Result<crate::commons::node::Node> {
+        crate::commons::roster::rotate(&self.seed, &self.commons_eligibility, journal, members)
+    }
+
+    /// Prepare one atomic retirement and fresh-key roster update. Retired actors
+    /// must have retained bindings and must be absent from the resulting roster.
+    pub fn prepare_commons_retirement(
+        &self,
+        journal: &crate::commons::journal::Journal,
+        members: Vec<crate::commons::roster::Grant>,
+        retirements: &[[u8; 48]],
+    ) -> crate::Result<crate::commons::node::Node> {
+        crate::commons::roster::rotate_retiring(
+            &self.seed,
+            &self.commons_eligibility,
+            journal,
+            members,
+            retirements,
+        )
+    }
+
+    /// Explicitly approve a jointly proven Commons device binding. This is an
+    /// authority decision, not automatic eligibility from the vault machine list.
+    /// The host must already belong to the explicit Commons control audience.
+    /// Eligibility is the authenticated snapshot captured on open; reopen after
+    /// publishing edits. Unpublished changes to `doc` cannot approve a member.
+    /// The certificate is inactive until a validated current roster includes it.
+    pub fn approve_commons_member(
+        &self,
+        journal: &crate::commons::journal::Journal,
+        host: &str,
+        possession: crate::commons::binding::Possession,
+    ) -> crate::Result<crate::commons::membership::Certificate> {
+        crate::commons::membership::approve(
+            &self.seed,
+            journal,
+            &self.commons_eligibility,
+            host,
+            possession,
+        )
+    }
+
+    /// Prepare a domain-separated control node without exporting the vault key.
+    /// Persist and retry its exact bytes: a freshly encrypted draft is a distinct
+    /// event. Named recipients must already be in this admin's document; callers
+    /// still decide which machines qualify for Commons membership.
+    pub fn seal_commons(
+        &self,
+        network: [u8; 16],
+        edit: crate::commons::node::Edit<'_>,
+    ) -> crate::Result<crate::commons::node::Node> {
+        self.seal_commons_restricted(network, edit, &[])
+    }
+
+    /// Seal a control snapshot with permanent, independently readable restrictions.
+    /// Recovery cannot add facts; all prior facts survive its payload selection.
+    pub fn seal_commons_restricted(
+        &self,
+        network: [u8; 16],
+        edit: crate::commons::node::Edit<'_>,
+        facts: &[crate::commons::constraints::Fact],
+    ) -> crate::Result<crate::commons::node::Node> {
+        use crate::commons::node::{Edit, Node};
+        let recipients = match &edit {
+            Edit::Create { hosts, .. } | Edit::Update { hosts, .. } => {
+                recipients_of(hosts, &self.doc)?
+            }
+            Edit::Recover { .. } => Vec::new(),
+        };
+        let authored_ms = aterm_time::unix_millis()
+            .ok_or_else(|| Error::new("system clock cannot represent an author timestamp"))?;
+        if facts.is_empty() {
+            Node::seal(&self.seed, network, edit, &recipients, authored_ms)
+        } else {
+            Node::seal_restricted(&self.seed, network, edit, &recipients, authored_ms, facts)
+        }
+    }
+
     /// The version this was opened at.
     pub const fn seq(&self) -> u64 {
         self.seq
@@ -2618,6 +2807,7 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
         }
     }
     Ok(Admin {
+        commons_eligibility: crate::commons::membership::Eligibility::from_document(&opened.doc),
         doc: opened.doc.clone(),
         config,
         seed: opened.seed,
@@ -6462,8 +6652,16 @@ mod tests {
             ("a cache that does not verify", &forged),
         ] {
             fsx::write_atomic(&member.cache_file(), cached, 0o600).expect("cache");
-            let (_, outcome) = subscriber_pass(&member, &mut None).expect(what);
-            assert_eq!(outcome, SyncOutcome::Unchanged { seq: 3 }, "{what}");
+            assert!(
+                subscriber_pass(&member, &mut None).is_err(),
+                "{what}: a missing valid local copy cannot make the older served version healthy"
+            );
+            assert_eq!(
+                load_state(&member).unwrap().seq,
+                3,
+                "the rollback floor remains intact"
+            );
+            assert_eq!(std::fs::read(member.cache_file()).unwrap(), *cached);
             assert!(served() == stale, "{what}: nothing published");
         }
         fsx::write_atomic(&member.cache_file(), &newest, 0o600).expect("cache");
@@ -6477,6 +6675,529 @@ mod tests {
         );
         assert!(served() == newest, "the newest copy is served");
         server.stop();
+    }
+}
+
+#[cfg(test)]
+mod commons_tests {
+    use super::*;
+    use crate::commons::{self, ENTRY};
+
+    fn fixture() -> (aterm_tempfile::TempDir, Paths, PathBuf) {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.vault");
+        let paths = Paths::for_home(&root.path().join("admin"));
+        create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+        let admin = admin_open(&paths).unwrap();
+        let mut document = admin.doc.clone();
+        document
+            .set_entry(
+                &Audience::Hosts(vec!["m1".into()]),
+                ENTRY,
+                b"inert-commons-key-material",
+            )
+            .unwrap();
+        document
+            .set_entry(&Audience::Everyone, "ordinary", b"ordinary value")
+            .unwrap();
+        admin_publish(&paths, &admin, &document).unwrap();
+        (root, paths, source)
+    }
+
+    #[test]
+    fn member_certification_uses_opened_eligibility_not_unpublished_edits() {
+        use crate::commons::{
+            binding::{Pending, Request},
+            journal::{Journal, Trust},
+            node::Edit,
+        };
+        let (root, paths, _source) = fixture();
+        let mut admin = admin_open(&paths).unwrap();
+        let network = [33; 16];
+        let genesis = admin
+            .seal_commons(
+                network,
+                Edit::Create {
+                    hosts: &["m1".into()],
+                    payload: b"initial control",
+                },
+            )
+            .unwrap();
+        let mut journal = Journal::open(
+            &root.path().join("member-control"),
+            Trust {
+                network,
+                authority: genesis.authority(),
+                genesis: genesis.id(),
+            },
+        )
+        .unwrap();
+        journal.ingest(genesis.bytes()).unwrap();
+        let member = Identity::from_secret_bytes([41; 32]);
+        let seed = [43; 32];
+        let request = Request::create(
+            network,
+            genesis.authority(),
+            [47; 16],
+            [53; 16],
+            &member,
+            &seed,
+        )
+        .unwrap();
+        let proof = || {
+            let (mut pending, challenge) =
+                Pending::issue(&request, network, genesis.authority()).unwrap();
+            pending
+                .verify(&request.answer(&member, &seed, &challenge).unwrap())
+                .unwrap()
+        };
+        admin
+            .doc
+            .add_machine("m2", &member.recipient().to_bech32())
+            .unwrap();
+        admin
+            .doc
+            .set_entry(
+                &Audience::Hosts(vec!["m1".into(), "m2".into()]),
+                ENTRY,
+                b"inert-control",
+            )
+            .unwrap();
+        assert!(
+            admin
+                .approve_commons_member(&journal, "m2", proof())
+                .is_err()
+        );
+        use crate::commons::roster::{self, Enrollment, Grant, Role};
+        assert!(
+            admin
+                .prepare_commons_genesis(
+                    network,
+                    vec![Enrollment::new("m2", proof(), Role::Writer)]
+                )
+                .is_err()
+        );
+        admin_publish(&paths, &admin, &admin.doc).unwrap();
+        assert!(
+            admin
+                .approve_commons_member(&journal, "m2", proof())
+                .is_err(),
+            "reopen after publishing"
+        );
+        let mut reopened = admin_open(&paths).unwrap();
+        assert!(
+            reopened
+                .approve_commons_member(&journal, "m2", proof())
+                .is_ok()
+        );
+        let initial = reopened
+            .prepare_commons_genesis(network, vec![Enrollment::new("m2", proof(), Role::Writer)])
+            .unwrap();
+        let mut active = Journal::open(
+            &root.path().join("typed-member-control"),
+            Trust {
+                network,
+                authority: initial.authority(),
+                genesis: initial.id(),
+            },
+        )
+        .unwrap();
+        active.ingest(initial.bytes()).unwrap();
+        assert_eq!(
+            roster::current(&active, &member)
+                .unwrap()
+                .unwrap()
+                .local()
+                .role(),
+            Role::Writer
+        );
+        let next = reopened
+            .prepare_commons_rotation(
+                &active,
+                vec![Grant::recorded(
+                    "m2",
+                    request.binding().clone(),
+                    Role::Reader,
+                )],
+            )
+            .unwrap();
+        active.ingest(next.bytes()).unwrap();
+        assert_eq!(
+            roster::current(&active, &member)
+                .unwrap()
+                .unwrap()
+                .local()
+                .role(),
+            Role::Reader
+        );
+        reopened
+            .doc
+            .unset_entry(&Audience::Hosts(vec!["m1".into(), "m2".into()]), ENTRY)
+            .unwrap();
+        assert!(
+            reopened
+                .approve_commons_member(&journal, "m2", proof())
+                .is_ok(),
+            "a draft removal is not a published revocation"
+        );
+        admin_publish(&paths, &reopened, &reopened.doc).unwrap();
+        assert!(
+            admin_open(&paths)
+                .unwrap()
+                .approve_commons_member(&journal, "m2", proof())
+                .is_err()
+        );
+        assert!(
+            admin_open(&paths)
+                .unwrap()
+                .prepare_commons_rotation(
+                    &active,
+                    vec![Grant::recorded(
+                        "m2",
+                        request.binding().clone(),
+                        Role::Writer
+                    )]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn control_journal_uses_the_admin_signer_without_ordinary_materialization() {
+        use crate::commons::{
+            journal::{Journal, State, Trust},
+            node::Edit,
+        };
+        let (root, paths, _source) = fixture();
+        let admin = admin_open(&paths).unwrap();
+        let hosts = ["m1".to_string()];
+        let network = [33; 16];
+        let node = admin
+            .seal_commons(
+                network,
+                Edit::Create {
+                    hosts: &hosts,
+                    payload: b"encrypted journal control",
+                },
+            )
+            .unwrap();
+        assert_eq!(Some(node.authority()), admin.config.signer);
+        assert!(
+            admin
+                .seal_commons(
+                    network,
+                    Edit::Create {
+                        hosts: &["unknown-host".into()],
+                        payload: b"secret"
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            admin
+                .seal_commons(
+                    network,
+                    Edit::Create {
+                        hosts: &[],
+                        payload: b"secret"
+                    }
+                )
+                .is_err()
+        );
+        let ordinary = paths.home.join(".secrets/ordinary");
+        std::fs::remove_file(&ordinary).unwrap();
+        std::fs::create_dir(&ordinary).unwrap();
+        assert!(!materialization_ready(&paths).unwrap());
+        let mut journal = Journal::open(
+            &root.path().join("control"),
+            Trust {
+                network,
+                authority: node.authority(),
+                genesis: node.id(),
+            },
+        )
+        .unwrap();
+        journal.ingest(node.bytes()).unwrap();
+        assert_eq!(
+            journal.state(),
+            State::Ready {
+                head: node.id(),
+                basis: node.id()
+            }
+        );
+        let identity = read_identity(&paths).unwrap().unwrap();
+        assert_eq!(
+            journal
+                .current(&identity)
+                .unwrap()
+                .unwrap()
+                .payload
+                .as_slice(),
+            b"encrypted journal control"
+        );
+        assert!(
+            !materialization_ready(&paths).unwrap(),
+            "control repair never marks ordinary files applied"
+        );
+    }
+
+    #[test]
+    fn commons_cache_is_authenticated_offline_and_never_a_plaintext_file() {
+        let (_root, paths, source) = fixture();
+        let state = load_state(&paths).unwrap();
+        let config = config(&paths).unwrap().unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let snapshot = commons::cached(&paths).unwrap().unwrap();
+        assert_eq!(snapshot.control(), b"inert-commons-key-material");
+        assert_eq!(snapshot.sequence(), state.seq);
+        assert_eq!(Some(*snapshot.digest()), state.digest);
+        assert_eq!(Some(*snapshot.signer()), config.signer);
+        assert_eq!(snapshot.vault(), config.name);
+        assert_eq!(
+            snapshot.recipient(),
+            read_identity(&paths).unwrap().unwrap().recipient()
+        );
+        assert!(!format!("{snapshot:?}").contains("inert-commons-key-material"));
+        assert!(!state.manifest.files.contains_key(ENTRY));
+        assert!(!paths.home.join(".secrets").join(ENTRY).exists());
+        assert_eq!(
+            std::fs::read(paths.home.join(".secrets/ordinary")).unwrap(),
+            b"ordinary value"
+        );
+        let lock = StateLock::take(&paths).unwrap();
+        assert!(commons::cached(&paths).unwrap().is_none());
+        drop(lock);
+        assert!(commons::cached(&paths).unwrap().is_some());
+    }
+
+    #[test]
+    fn commons_cache_refuses_unbound_revoked_pending_and_changed_state() {
+        let (_root, paths, _source) = fixture();
+        let original = load_state(&paths).unwrap();
+        for variant in 0..6 {
+            let mut state = original.clone();
+            match variant {
+                0 => state.source_identity = None,
+                1 => state.digest = None,
+                2 => state.membership = Stored::Revoked,
+                3 => state.membership = Stored::Pending,
+                4 => state.failed = true,
+                _ => {
+                    state.pending.insert("ordinary".into(), "incomplete".into());
+                }
+            }
+            save_state(&paths, &state).unwrap();
+            assert!(
+                commons::cached(&paths).unwrap().is_none(),
+                "variant {variant}"
+            );
+        }
+        save_state(&paths, &original).unwrap();
+        let bytes = std::fs::read(paths.cache_file()).unwrap();
+        let mut state = original.clone();
+        state.seq += 1;
+        save_state(&paths, &state).unwrap();
+        assert!(
+            commons::cached(&paths).is_err(),
+            "rollback below the applied version"
+        );
+        state = original.clone();
+        state.digest = Some([42; 32]);
+        save_state(&paths, &state).unwrap();
+        assert!(
+            commons::cached(&paths).is_err(),
+            "different hash at the applied version"
+        );
+        save_state(&paths, &original).unwrap();
+        let mut corrupt = bytes.clone();
+        let prefix = b"signature: ";
+        let signature = corrupt
+            .windows(prefix.len())
+            .position(|part| part == prefix)
+            .unwrap()
+            + prefix.len();
+        corrupt[signature] = if corrupt[signature] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        fsx::write_atomic(&paths.cache_file(), &corrupt, 0o600).unwrap();
+        assert!(commons::cached(&paths).is_err(), "corrupt signature");
+        fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+        let (_other_root, other, _) = fixture();
+        let foreign = std::fs::read(other.cache_file()).unwrap();
+        fsx::write_atomic(&paths.cache_file(), &foreign, 0o600).unwrap();
+        assert!(
+            commons::cached(&paths).is_err(),
+            "a valid envelope from another authority cannot replace this vault"
+        );
+        fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+        let config = config(&paths).unwrap().unwrap();
+        let mut unrelated = config.clone();
+        unrelated.source = Source::Path(paths.home.join("a-different-source"));
+        save_config(&paths, &unrelated).unwrap();
+        assert!(commons::cached(&paths).unwrap().is_none());
+        save_config(&paths, &config).unwrap();
+        let key = std::fs::read(paths.identity_file()).unwrap();
+        let other = Identity::generate().unwrap().to_bech32();
+        fsx::write_atomic(&paths.identity_file(), other.as_slice(), 0o600).unwrap();
+        assert!(
+            commons::cached(&paths).unwrap().is_none(),
+            "another recipient cannot open the grant"
+        );
+        fsx::write_atomic(&paths.identity_file(), &key, 0o600).unwrap();
+        assert!(commons::cached(&paths).unwrap().is_some());
+    }
+
+    fn signed_lockers(paths: &Paths, plaintexts: &[String], future: bool) {
+        let admin = admin_open(paths).unwrap();
+        let identity = read_identity(paths).unwrap().unwrap();
+        let old = load_state(paths).unwrap();
+        let lockers = plaintexts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Locker {
+                label: (i + 1).to_string(),
+                armored: age::armor(
+                    &age::encrypt(&[identity.recipient()], text.as_bytes()).unwrap(),
+                ),
+            })
+            .collect();
+        let bytes = envelope::sign(
+            &Unsigned {
+                name: admin.config.name.clone(),
+                seq: old.seq + u64::from(future),
+                time: 1,
+                handoff: admin.handoff.clone(),
+                lockers,
+            },
+            &admin.seed,
+        )
+        .unwrap();
+        fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+        if !future {
+            let mut state = old;
+            state.digest = Some(envelope::parse(&bytes).unwrap().digest());
+            save_state(paths, &state).unwrap();
+        }
+    }
+
+    #[test]
+    fn commons_cache_requires_applied_explicit_nonduplicated_recipient_grants() {
+        let (_root, paths, _source) = fixture();
+        let grant = format!("[m1]\n{ENTRY}=inert-control\n");
+        signed_lockers(&paths, std::slice::from_ref(&grant), true);
+        assert!(
+            commons::cached(&paths).unwrap().is_none(),
+            "a future cache is not the applied version"
+        );
+        let (_root, paths, _source) = fixture();
+        signed_lockers(&paths, &[grant.clone(), grant], false);
+        assert!(
+            commons::cached(&paths).is_err(),
+            "two opened lockers cannot each grant Commons"
+        );
+        let (_root, paths, _source) = fixture();
+        signed_lockers(
+            &paths,
+            &[format!("[other]\n{ENTRY}=inert-control\n")],
+            false,
+        );
+        assert!(
+            commons::cached(&paths).unwrap().is_some(),
+            "an authority-encrypted recipient grant survives a host-label change"
+        );
+        let (_root, paths, _source) = fixture();
+        signed_lockers(
+            &paths,
+            &[format!("[everyone]\n{ENTRY}=inert-control\n")],
+            false,
+        );
+        assert!(
+            commons::cached(&paths).is_err(),
+            "an everyone locker cannot grant Commons"
+        );
+    }
+
+    #[test]
+    fn unconfigured_and_plain_vaults_do_not_create_commons_keys() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("fresh"));
+        assert!(commons::cached(&paths).unwrap().is_none());
+        assert!(!paths.home.exists());
+        let source = root.path().join("plain.secrets");
+        fsx::write_atomic(&source, b"ordinary=inert\n", 0o600).unwrap();
+        let paths = Paths::for_home(&root.path().join("plain"));
+        join(
+            &paths,
+            &JoinOptions {
+                source: source.to_str().unwrap().into(),
+                host: Some("m1".into()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: &|| None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        assert!(commons::cached(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn commons_cache_follows_authority_rotation_and_drops_a_removed_grant() {
+        let (_root, paths, _source) = fixture();
+        let old_config = config(&paths).unwrap().unwrap();
+        let old = *commons::cached(&paths).unwrap().unwrap().signer();
+        let admin = admin_open(&paths).unwrap();
+        admin_rotate(&paths, &admin, &admin.doc).unwrap();
+        let rotated = commons::cached(&paths).unwrap().unwrap();
+        assert_ne!(*rotated.signer(), old);
+        assert!(rotated.followed().contains(&old));
+        let current_config = config(&paths).unwrap().unwrap();
+        let current_state = load_state(&paths).unwrap();
+        let mut stale = current_state.clone();
+        stale.source_identity = Some(source_identity(&old_config));
+        save_config(&paths, &old_config).unwrap();
+        save_state(&paths, &stale).unwrap();
+        assert!(
+            commons::cached(&paths).unwrap().is_none(),
+            "a signer handoff must be applied before its control is exposed"
+        );
+        save_config(&paths, &current_config).unwrap();
+        save_state(&paths, &current_state).unwrap();
+        let admin = admin_open(&paths).unwrap();
+        let mut document = admin.doc.clone();
+        document
+            .unset_entry(&Audience::Hosts(vec!["m1".into()]), ENTRY)
+            .unwrap();
+        admin_publish(&paths, &admin, &document).unwrap();
+        assert!(commons::cached(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_or_damaged_commons_cache_is_repaired_without_a_new_vault_version() {
+        let (_root, paths, _source) = fixture();
+        let before = load_state(&paths).unwrap();
+        let mut repaired = None;
+        for missing in [true, false, true] {
+            if missing {
+                std::fs::remove_file(paths.cache_file()).unwrap();
+            } else {
+                fsx::write_atomic(&paths.cache_file(), b"damaged cache", 0o600).unwrap();
+            }
+            assert!(!materialization_ready(&paths).unwrap());
+            assert!(
+                repair_due(&paths, &mut repaired),
+                "a lost internal cache is repairable more than once at the same version"
+            );
+            sync(&paths, None).unwrap();
+            let snapshot = commons::cached(&paths).unwrap().unwrap();
+            assert_eq!(snapshot.sequence(), before.seq);
+            assert_eq!(Some(*snapshot.digest()), before.digest);
+            assert!(materialization_ready(&paths).unwrap());
+        }
     }
 }
 

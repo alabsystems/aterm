@@ -1242,3 +1242,228 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
         "CONTROL"
     );
 }
+
+#[test]
+fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discarded() {
+    let (tmp, env) = kimi_env("background-sign-in-task");
+    let home = tmp.path().join("home");
+    let store = env.accounts_store_for(Cli::Kimi).expect("store");
+    let roster =
+        accounts::Roster::parse_for(Cli::Kimi, &read(&tmp.path().join("accounts-kimi.toml")))
+            .expect("roster");
+    let row = roster.row("kimi-one").expect("row");
+    let host = SignInHost::new(
+        Script::Ends(login_drive::Outcome::NeedsSignIn(
+            "private vendor text".into(),
+        )),
+        &home,
+    );
+    assert_eq!(
+        renew_one_for(
+            Cli::Kimi,
+            0,
+            &host,
+            &store,
+            row,
+            None,
+            &mut io::sink(),
+            &mut io::sink()
+        ),
+        Renewal::NeedsPerson
+    );
+    let (logins, _) = env
+        .accounts_store_for(Cli::Kimi)
+        .expect("reopen")
+        .load_logins(env.now)
+        .expect("reload");
+    assert_eq!(
+        accounts::sign_in_tasks(&roster, &logins),
+        [("kimi-one".into(), accounts::SignInAction::Browser)]
+    );
+    let (_, text, _) = run_line("accounts --cli kimi", &env);
+    assert!(
+        text.contains("accounts browser kimi-one --cli kimi"),
+        "{text}"
+    );
+    let (_, json, _) = run_line("accounts --cli kimi --json", &env);
+    assert!(
+        json.contains("sign_in_task") && json.contains("browser"),
+        "{json}"
+    );
+    assert!(!read(&store.logins_file()).contains("private vendor text"));
+    let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
+    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let (logins, _) = store.load_logins(env.now).expect("read success");
+    assert!(accounts::sign_in_tasks(&roster, &logins).is_empty());
+}
+
+#[test]
+fn codex_signin_staging_adopts_startup_sqlite_and_due_renewals_order_ready_rows_first() {
+    struct StartupSqliteHost {
+        home: PathBuf,
+        db_bytes: &'static str,
+        order: std::cell::RefCell<Vec<String>>,
+    }
+    impl AccountsHost for StartupSqliteHost {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            Err("unused".to_owned())
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            Err("unused".to_owned())
+        }
+        fn now(&self) -> i64 {
+            1_758_412_900
+        }
+        fn vendor_sign_in(&self, req: &Request<'_>) -> Drove {
+            self.order.borrow_mut().push(req.row.label.clone());
+            if req.cli == Cli::Codex {
+                std::fs::write(req.staging.join("auth.json"), "{}").expect("auth.json");
+                let db = req.staging.join("state_5.sqlite");
+                if std::fs::symlink_metadata(&db).is_err() {
+                    std::fs::write(&db, self.db_bytes).expect("startup sqlite");
+                    std::fs::write(req.staging.join("state_5.sqlite-wal"), "wal").expect("wal");
+                }
+                let _ = &self.home;
+                Drove {
+                    outcome: login_drive::Outcome::SignedIn {
+                        email: req.row.email.clone(),
+                        page: true,
+                    },
+                    host: Some("auth.openai.com".to_owned()),
+                }
+            } else {
+                let cred = req.staging.join("credentials/kimi-code.json");
+                std::fs::create_dir_all(cred.parent().expect("parent")).expect("cred dir");
+                std::fs::write(cred, "{}").expect("kimi cred");
+                Drove {
+                    outcome: login_drive::Outcome::SignedIn {
+                        email: None,
+                        page: true,
+                    },
+                    host: Some("www.kimi.ai".to_owned()),
+                }
+            }
+        }
+    }
+
+    let tmp = tmp_dir("signin-codex-startup-sqlite");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let home = tmp.path().join("home");
+    for line in [
+        "accounts add codex-one --cli codex --email codex-one@example.com",
+        "accounts add codex-two --cli codex --email codex-two@example.com",
+    ] {
+        let (code, _, err) = run_line(line, &env);
+        assert_eq!(code, exit(0), "{err}");
+    }
+    let host = StartupSqliteHost {
+        home: home.clone(),
+        db_bytes: "initial-db",
+        order: std::cell::RefCell::new(Vec::new()),
+    };
+    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let default_db = home.join(".codex/state_5.sqlite");
+    assert_eq!(read(&default_db), "initial-db");
+    assert_eq!(read(&home.join(".codex/state_5.sqlite-wal")), "wal");
+    let staging_one = home.join(".aterm/logins/codex/codex-one+1");
+    assert!(staging_one.join("state_5.sqlite").is_symlink());
+    assert!(!staging_one.join("state_5.sqlite-wal").exists());
+
+    let store = env.accounts_store_for(Cli::Codex).expect("codex store");
+    let (logins, _) = store.load_logins(env.now).expect("logins");
+    let file_roster =
+        accounts::Roster::parse_for(Cli::Codex, &read(&tmp.path().join("accounts-codex.toml")))
+            .expect("roster");
+    let bound = accounts::bound(&file_roster, &logins);
+    let row_one = bound.row("codex-one").expect("codex-one");
+    let env_one = crate::harness::accounts_pool::login_env(Cli::Codex, row_one, &home)
+        .expect("codex-one overlay starts cleanly without drift");
+    assert_eq!(env_one.value, Some(staging_one.display().to_string()));
+
+    // Negative: an existing default-home sqlite file is never overwritten by a later staging file.
+    std::fs::write(home.join(".codex/state_6.sqlite"), "owner-state-6").expect("existing db");
+    let staging_manual = home.join(".aterm/logins/codex/manual");
+    std::fs::create_dir_all(&staging_manual).expect("manual staging");
+    std::fs::write(staging_manual.join("auth.json"), "{}").expect("auth");
+    std::fs::write(staging_manual.join("state_6.sqlite"), "transient").expect("transient");
+    reconcile_staging_overlay_suffixes(
+        Cli::Codex.accounts().seam,
+        Cli::Codex.connector().stores,
+        &staging_manual,
+        &home.join(".codex"),
+    )
+    .expect("reconcile existing");
+    assert_eq!(read(&home.join(".codex/state_6.sqlite")), "owner-state-6");
+    assert!(staging_manual.join("state_6.sqlite").is_symlink());
+
+    // Due renewals order ready rows ahead of rows holding an unaddressed sign_in_task.
+    let (kimi_tmp, mut kimi_env) = kimi_env("due-order-sign-in-task");
+    let kimi_home = kimi_tmp.path().join("home");
+    let (code, _, err) = run_line(
+        "accounts add kimi-two --cli kimi --email kimi-two@example.com --region global",
+        &kimi_env,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    let seed = StartupSqliteHost {
+        home: kimi_home.clone(),
+        db_bytes: "",
+        order: std::cell::RefCell::new(Vec::new()),
+    };
+    for label in ["kimi-one", "kimi-two"] {
+        let (code, out, err) = renew(
+            &format!("accounts renew {label} --cli kimi"),
+            &kimi_env,
+            &seed,
+        );
+        assert_eq!(code, exit(0), "{out}{err}");
+    }
+    kimi_env.now += 40 * 86_400;
+    let kimi_store = kimi_env.accounts_store_for(Cli::Kimi).expect("kimi store");
+    let mut note = None;
+    kimi_store
+        .transact_logins(kimi_env.now, &mut note, |_, logins| {
+            accounts::note_sign_in_task(
+                logins,
+                "kimi-one",
+                accounts::SignInAction::Browser,
+                kimi_env.now - 60,
+            );
+            Ok(Vec::new())
+        })
+        .expect("record sign_in_task on kimi-one");
+    let due_host = StartupSqliteHost {
+        home: kimi_home.clone(),
+        db_bytes: "",
+        order: std::cell::RefCell::new(Vec::new()),
+    };
+    let (code, out, err) = renew("accounts renew --cli kimi --due", &kimi_env, &due_host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(
+        *due_host.order.borrow(),
+        vec!["kimi-two".to_owned(), "kimi-one".to_owned()],
+        "ready kimi-two runs ahead of kimi-one with an unaddressed sign_in_task"
+    );
+
+    // Negative: once neither row has a sign_in_task, --due runs in roster order.
+    kimi_env.now += 40 * 86_400;
+    let plain_host = StartupSqliteHost {
+        home: kimi_home,
+        db_bytes: "",
+        order: std::cell::RefCell::new(Vec::new()),
+    };
+    let (code, out, err) = renew("accounts renew --cli kimi --due", &kimi_env, &plain_host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(
+        *plain_host.order.borrow(),
+        vec!["kimi-one".to_owned(), "kimi-two".to_owned()]
+    );
+}

@@ -71,17 +71,88 @@ fn command_spelling(exe: &Path) -> Option<String> {
 /// The `--settings` value for `exe`.
 #[must_use]
 pub fn settings_value(exe: &Path) -> Option<String> {
-    command_spelling(exe).map(|exe| format!("{VALUE_HEAD}{exe}{COMMAND_TAIL}{VALUE_TAIL}"))
+    settings_value_chained(exe, None)
 }
 
-/// Whether a `--settings` value is exactly aterm's tap.
+/// The flag that names the owner's own statusLine command the tap runs after its write
+/// ([`settings_value_chained`]), hex-encoded so the command line stays inert to a shell.
+pub const CHAIN_FLAG: &str = "--then";
+
+/// The longest owner's statusLine command the tap carries, in bytes ([`settings_line`]).
+pub const CHAIN_MAX: usize = 4096;
+
+/// THE `--settings` VALUE FOR `exe` THAT CARRIES THE OWNER'S OWN STATUSLINE `chain`
+/// (owner ruling R-12): `<exe> harness tap --then <hex of chain>`, so the tap writes its
+/// reading and then runs the owner's command on the same payload, whose row is the one shown;
+/// [`settings_value`]'s with no chain. `None` where `exe` cannot be named, or `chain` is empty,
+/// longer than [`CHAIN_MAX`] or holds a NUL.
+#[must_use]
+pub fn settings_value_chained(exe: &Path, chain: Option<&str>) -> Option<String> {
+    let exe = command_spelling(exe)?;
+    let tail = match chain {
+        None => String::new(),
+        Some(cmd) if cmd.is_empty() || cmd.len() > CHAIN_MAX || cmd.contains('\0') => {
+            return None;
+        }
+        Some(cmd) => format!(" {CHAIN_FLAG} {}", hex_of(cmd.as_bytes())),
+    };
+    Some(format!("{VALUE_HEAD}{exe}{COMMAND_TAIL}{tail}{VALUE_TAIL}"))
+}
+
+/// Lowercase hex of `bytes`.
+fn hex_of(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0xf)]));
+    }
+    out
+}
+
+/// The UTF-8 text lowercase hex `hex` spells; `None` for anything else (odd length, another
+/// digit, an uppercase one, bytes that are not UTF-8).
+#[must_use]
+pub fn text_of_hex(hex: &str) -> Option<String> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let decoded = pairs
+        .iter()
+        .map(|&[hi, lo]| Some((digit(hi)? << 4) | digit(lo)?))
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(decoded).ok()
+}
+
+/// The owner's statusLine command an exact tap value carries (`Some(None)`: the plain tap), or
+/// `None` where `value` is not exactly aterm's tap ([`is_ours`]).
+#[must_use]
+pub fn chained_of(value: &str) -> Option<Option<String>> {
+    let command = value
+        .strip_prefix(VALUE_HEAD)
+        .and_then(|rest| rest.strip_suffix(VALUE_TAIL))?;
+    let (exe, chain) = match command.strip_suffix(COMMAND_TAIL) {
+        Some(exe) => (exe, None),
+        None => {
+            let (head, hex) = command.rsplit_once(&format!(" {CHAIN_FLAG} "))?;
+            (head.strip_suffix(COMMAND_TAIL)?, Some(text_of_hex(hex)?))
+        }
+    };
+    (settings_value_chained(Path::new(exe), chain.as_deref()).as_deref() == Some(value))
+        .then_some(chain)
+}
+
+/// Whether a `--settings` value is exactly aterm's tap, plain or carrying the owner's own
+/// statusLine ([`settings_value_chained`]).
 #[must_use]
 pub fn is_ours(value: &str) -> bool {
-    value
-        .strip_prefix(VALUE_HEAD)
-        .and_then(|rest| rest.strip_suffix(VALUE_TAIL))
-        .and_then(|command| command.strip_suffix(COMMAND_TAIL))
-        .is_some_and(|exe| settings_value(Path::new(exe)).as_deref() == Some(value))
+    chained_of(value).is_some()
 }
 
 /// Whether `argv` (`argv[0]` first) carries aterm's tap.
@@ -543,9 +614,9 @@ fn first_reported(path: &Path, reading: &Reading) -> i64 {
         .map_or(reading.at, |held| held.at.min(reading.at))
 }
 
-/// Read stdin as the verb takes it: at most [`STDIN_MAX`] bytes of UTF-8,
-/// the rest drained.
-fn read_payload(stdin: &mut dyn Read) -> Option<String> {
+/// Read stdin as the verb takes it: at most [`STDIN_MAX`] bytes, the rest
+/// drained (`None` past it, or where it could not be read).
+fn read_bytes(stdin: &mut dyn Read) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let read = stdin
         .take(STDIN_MAX as u64 + 1)
@@ -556,7 +627,30 @@ fn read_payload(stdin: &mut dyn Read) -> Option<String> {
         return None;
     }
     read?;
-    String::from_utf8(bytes).ok()
+    Some(bytes)
+}
+
+/// Write the reading the payload `payload` gives for the tab and process `vars` name into
+/// `dir` ([`first_reported`]'s stamp), and return it.
+fn record(
+    payload: Option<&str>,
+    vars: &TapVars,
+    dir: Option<&Path>,
+    now: i64,
+    started: std::time::Instant,
+) -> Option<Reading> {
+    let reading = Reading::of_stdin(payload.unwrap_or(""), vars, now);
+    if let (Some(reading), Some(dir)) = (&reading, dir)
+        && let Some(name) = file_name(&reading.sid, reading.pid)
+    {
+        let reading = Reading {
+            at: first_reported(&dir.join(&name), reading),
+            dur_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            ..reading.clone()
+        };
+        let _ = write_reading(dir, &name, &reading.to_json());
+    }
+    reading
 }
 
 /// `aterm harness tap`, Claude Code's status-line command.
@@ -572,25 +666,68 @@ pub fn run(
     let payload = if stdin_is_tty {
         None
     } else {
-        read_payload(stdin)
+        read_bytes(stdin).and_then(|bytes| String::from_utf8(bytes).ok())
     };
-    let reading = Reading::of_stdin(payload.as_deref().unwrap_or(""), vars, now);
-    if let (Some(reading), Some(dir)) = (&reading, dir)
-        && let Some(name) = file_name(&reading.sid, reading.pid)
-    {
-        let reading = Reading {
-            at: first_reported(&dir.join(&name), reading),
-            dur_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            ..reading.clone()
-        };
-        let _ = write_reading(dir, &name, &reading.to_json());
-    }
+    let reading = record(payload.as_deref(), vars, dir, now, started);
     let line = reading
         .as_ref()
         .map_or_else(|| NO_FIGURES.to_owned(), Reading::line);
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
     std::process::ExitCode::SUCCESS
+}
+
+/// `aterm harness tap --then <hex>`, the tap that carries the owner's own statusLine
+/// ([`settings_value_chained`]): it writes the reading as [`run`] does and prints nothing, and
+/// returns the payload, byte for byte, for the owner's command ([`chain_command`]), whose row is
+/// the one Claude Code shows. `None` where there is nothing to hand on (a payload over
+/// [`STDIN_MAX`], or one that could not be read): that run shows no row, as a command that
+/// printed nothing.
+pub fn run_chained(
+    stdin: &mut dyn Read,
+    stdin_is_tty: bool,
+    vars: &TapVars,
+    dir: Option<&Path>,
+    now: i64,
+) -> Option<Vec<u8>> {
+    let started = std::time::Instant::now();
+    let bytes = if stdin_is_tty {
+        Vec::new()
+    } else {
+        read_bytes(stdin)?
+    };
+    let _ = record(std::str::from_utf8(&bytes).ok(), vars, dir, now, started);
+    Some(bytes)
+}
+
+/// THE OWNER'S OWN STATUSLINE COMMAND `cmd`, as Claude Code runs one (`/bin/sh -c`, in this
+/// process's working directory and environment, which are the ones Claude Code gave the tap),
+/// with `payload` on its stdin: an unlinked 0600 file in the temporary directory, so a payload
+/// of any size is there before the command starts. Its stdout and stderr are this process's, so
+/// an exec of it ([`aterm_uds::spawnfd::Command::exec`]) leaves Claude Code its row and its exit
+/// status, as if aterm were not there.
+#[cfg(unix)]
+pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd::Command> {
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path =
+        std::env::temp_dir().join(format!(".aterm-tap-stdin-{}-{stamp}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    file.write_all(payload)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    command.arg("-c").arg(cmd).stdin(file);
+    Ok(command)
 }
 
 /// Remove from `dir` every reading whose process is gone (`alive` answers for a pid).
@@ -708,21 +845,27 @@ pub struct GateFacts<'a> {
     pub argv: &'a [String],
     /// Every document of the settings chain Claude Code reads for it.
     pub settings: &'a [(String, Source)],
+    /// Which of [`Self::settings`] is the user's own `settings.json`, the one document whose
+    /// statusLine the tap carries ([`settings_line`]).
+    pub user_settings: Option<&'a str>,
     /// The vendor's profile store holds a config ([`accounts::profile_configured`]).
     pub profile_store: bool,
 }
 
-/// The `--settings` value a relaunch line carries, or `None`.
+/// The `--settings` value a relaunch line carries, or `None`: the plain tap, or the tap that
+/// carries the owner's own statusLine ([`settings_line`], [`settings_value_chained`]).
 #[must_use]
 pub fn gate(f: &GateFacts<'_>) -> Option<String> {
-    let value = settings_value(f.exe?)?;
+    let exe = f.exe?;
+    settings_value(exe)?;
     if !(f.stored_login && own_login(f.login, f.home, f.lone_login)) || f.profile_store {
         return None;
     }
     if !line_admits(f.argv) {
         return None;
     }
-    settings_admit(f.settings).then_some(value)
+    let chain = settings_line(f.settings, f.user_settings)?;
+    settings_value_chained(exe, chain.as_deref())
 }
 
 /// [`gate`]'s argv half: the line (`argv[0]` first) parses, and carries no `--settings` or
@@ -747,29 +890,63 @@ pub fn line_refusal(argv: &[String]) -> Option<Refusal> {
 }
 
 /// [`gate`]'s SETTINGS HALF, the one judgment the relaunch's gate and the Claude Code footer's
-/// reason for a missing week share (`upgrade_drive::tap_settings_admit`): the chain is quiet
-/// ([`settings_quiet`]), and no document of it moves the line off its stored login (an
+/// reason for a missing week share (`upgrade_drive::tap_settings_admit`): [`settings_line`]
+/// admits the chain, and no document of it moves the line off its stored login (an
 /// `apiKeyHelper`, or a credential, login or home variable in an `env` block:
-/// [`accounts::ProcessLogin::with_settings`]).
+/// [`accounts::ProcessLogin::with_settings`]). `user` names the user's own `settings.json`
+/// among the documents.
 #[must_use]
-pub fn settings_admit(settings: &[(String, Source)]) -> bool {
-    accounts::ProcessLogin::of_env([])
-        .with_settings(settings)
-        .stored_login
-        && settings_quiet(settings)
+pub fn settings_admit(settings: &[(String, Source)], user: Option<&str>) -> bool {
+    settings_line(settings, user).is_some()
 }
 
-/// [`settings_admit`]'s quiet half: every document of the chain read, and none sets a
-/// statusLine of its own or turns hooks off.
+/// WHAT THE SETTINGS CHAIN LEAVES THE TAP (owner ruling R-12): `Some(None)` where every
+/// document was read and none sets a statusLine (the plain tap), `Some(Some(cmd))` where the
+/// one statusLine the chain sets is the owner's own in the user's `settings.json` (`user`), a
+/// plain command line ([`netwatch::Settings::status_command`]), so the tap carries it
+/// ([`settings_value_chained`]) and the owner's row still shows; `None` (no tap) where a
+/// document cannot be read or parsed, one turns hooks off, a statusLine is set anywhere else (a
+/// project's or a local one, a managed one, a `--settings` value's, `cowork_settings.json`'s:
+/// carrying those would mean re-deciding Claude Code's merge and trust), two documents set one,
+/// the owner's is of another shape or longer than [`CHAIN_MAX`], or the platform is not Unix
+/// (the carried command runs under `/bin/sh`); and wherever a document moves the line off its
+/// stored login ([`accounts::ProcessLogin::with_settings`]).
 #[must_use]
-pub fn settings_quiet(settings: &[(String, Source)]) -> bool {
-    settings.iter().all(|(_, source)| match source {
-        Source::Missing => true,
-        Source::Unreadable => false,
-        Source::Text(text) => {
-            netwatch::settings_of(text).is_some_and(|read| !read.status_line && !read.hooks_off)
+pub fn settings_line(settings: &[(String, Source)], user: Option<&str>) -> Option<Option<String>> {
+    if !accounts::ProcessLogin::of_env([])
+        .with_settings(settings)
+        .stored_login
+    {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for (name, source) in settings {
+        match source {
+            Source::Missing => {}
+            Source::Unreadable => return None,
+            Source::Text(text) => {
+                let read = netwatch::settings_of(text)?;
+                if read.hooks_off {
+                    return None;
+                }
+                if read.status_line {
+                    lines.push((name.as_str(), read.status_command));
+                }
+            }
         }
-    })
+    }
+    match lines.as_slice() {
+        [] => Some(None),
+        [(name, Some(cmd))]
+            if cfg!(unix)
+                && user == Some(*name)
+                && cmd.len() <= CHAIN_MAX
+                && !cmd.contains('\0') =>
+        {
+            Some(Some(cmd.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a process whose records are in `dir` runs under the `HOME` of the user whose home

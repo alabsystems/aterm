@@ -49,14 +49,32 @@ pub(crate) fn plan_for(sid: &str) -> LedgerPlan {
     }
 }
 
-/// Resolve the `aterm` CLI executable path.
-pub(crate) fn aterm_cli() -> PathBuf {
+/// The front door, `aterm` (`aterm.exe` on Windows), beside `exe`, when `is_file` finds it there:
+/// the name the router answers with the front door's verbs. A window started under its alias
+/// (`aterm-gui`, which the Windows Start Menu and jump list launch) has the alias as its own path,
+/// and the router hands a window alias's arguments to a window, which refuses `pkg`, `ai` and the
+/// rest.
+fn front_door_beside(exe: &Path, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let name = format!("aterm{}", std::env::consts::EXE_SUFFIX);
+    exe.parent()
+        .map(|dir| dir.join(name))
+        .filter(|path| is_file(path))
+}
+
+/// Resolve the `aterm` CLI executable path: [`front_door_beside`] this process's own, else the
+/// bare name for the shell's `PATH`.
+pub(crate) fn aterm_cli() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(&name)))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| PathBuf::from(name))
+        .and_then(|exe| front_door_beside(&exe, Path::is_file))
+        .unwrap_or_else(|| PathBuf::from(format!("aterm{}", std::env::consts::EXE_SUFFIX)))
+}
+
+/// This process's front door by its full path: [`front_door_beside`] its own path, else that
+/// path itself (a build with no `aterm` beside it).
+pub(crate) fn own_front_door() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(front_door_beside(&exe, Path::is_file).unwrap_or(exe))
 }
 
 /// Prepend `--socket <sock>` after `drive` when `sock` is present.
@@ -172,5 +190,24 @@ mod tests {
         );
         assert_eq!(with_socket(&plan.argv, None), plan.argv);
         assert!(!aterm_cli().to_string_lossy().contains("aterm-gui"));
+    }
+
+    #[test]
+    fn a_window_alias_finds_the_front_door_beside_it() {
+        let dir = Path::new(if cfg!(windows) {
+            r"C:\Program Files\aterm"
+        } else {
+            "/Applications/aterm.app/Contents/MacOS"
+        });
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let door = dir.join(format!("aterm{suffix}"));
+        let alias = dir.join(format!("aterm-gui{suffix}"));
+        assert_eq!(front_door_beside(&alias, |_| true), Some(door.clone()));
+        assert_eq!(
+            front_door_beside(&alias, |path| path == door),
+            Some(door.clone())
+        );
+        assert_eq!(front_door_beside(&alias, |_| false), None);
+        assert_eq!(front_door_beside(&door, |_| true), Some(door.clone()));
     }
 }

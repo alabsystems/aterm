@@ -106,16 +106,21 @@ fn read_error(e: ProtoError, what: &str, span: Duration) -> ClientError {
                 span.as_secs_f64()
             ))
         }
-        ProtoError::Io(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-            ) =>
-        {
-            ClientError::Closed
-        }
+        ProtoError::Io(io) if helper_gone(&io) => ClientError::Closed,
         other => ClientError::Io(other.to_string()),
     }
+}
+
+/// Whether a send or read failed because the helper's side of the socket is gone: a closed
+/// pipe, a reset, or a socket no longer connected (`down` racing a helper that had just found
+/// no session left read ENOTCONN).
+fn helper_gone(io: &std::io::Error) -> bool {
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 /// A fresh control connection's refused read span. A helper that closed the connection
@@ -240,14 +245,7 @@ impl Session {
 
     fn send(&self, request: &Request) -> Result<(), ClientError> {
         self.chan.send_request(request).map_err(|e| match e {
-            ProtoError::Io(io)
-                if matches!(
-                    io.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                ClientError::Closed
-            }
+            ProtoError::Io(io) if helper_gone(&io) => ClientError::Closed,
             other => ClientError::Io(other.to_string()),
         })
     }

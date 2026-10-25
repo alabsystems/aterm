@@ -127,6 +127,9 @@ fn lift_stars(
     (ox, oy): (i32, i32),
     (over, under, halos): (&mut Vec<GlowQuad>, &mut Vec<GlowQuad>, &mut Vec<RainHalo>),
 ) -> bool {
+    if marks.is_empty() || icons.is_empty() {
+        return false;
+    }
     let mut lifted = false;
     for mark in marks {
         let r = mark.reach / 2;
@@ -140,30 +143,40 @@ fn lift_stars(
         let own = keys
             .get(mark.lights.0 as usize..mark.lights.1 as usize)
             .unwrap_or_default();
+        if own.is_empty() {
+            continue;
+        }
         let inside = |b: PxBox| {
             b.0 >= mark.rect.0 && b.1 <= mark.rect.1 && b.2 >= mark.rect.2 && b.3 <= mark.rect.3
         };
         let star_quad =
             |q: &GlowQuad| inside(quad_box(q)) && own.contains(&rk::stardust::sky_quad_key(q));
         let (nq, nu, nh) = (over.len(), under.len(), halos.len());
-        over.retain(|q| !star_quad(q));
-        under.retain(|q| !star_quad(q));
-        halos.retain(|h| !(inside(halo_box(h)) && own.contains(&rk::stardust::sky_halo_key(h))));
+        if nq > 0 {
+            over.retain(|q| !star_quad(q));
+        }
+        if nu > 0 {
+            under.retain(|q| !star_quad(q));
+        }
+        if nh > 0 {
+            halos
+                .retain(|h| !(inside(halo_box(h)) && own.contains(&rk::stardust::sky_halo_key(h))));
+        }
         lifted |= over.len() != nq || under.len() != nu || halos.len() != nh;
     }
     lifted
 }
 
 #[inline]
-fn quad_box(q: &GlowQuad) -> PxBox {
-    let (x, y) = (i32::from(q.x), i32::from(q.y));
-    (x, x + i32::from(q.w), y, y + i32::from(q.h))
+const fn quad_box(q: &GlowQuad) -> PxBox {
+    let (x, y) = (q.x as i32, q.y as i32);
+    (x, x + q.w as i32, y, y + q.h as i32)
 }
 
 #[inline]
-fn halo_box(h: &RainHalo) -> PxBox {
-    let (x, y) = (i32::from(h.x), i32::from(h.y));
-    (x, x + i32::from(h.w), y, y + i32::from(h.h))
+const fn halo_box(h: &RainHalo) -> PxBox {
+    let (x, y) = (h.x as i32, h.y as i32);
+    (x, x + h.w as i32, y, y + h.h as i32)
 }
 
 /// The icon's drawn rows as bands `(x0, x1, y0, y1)` in window pixels, top
@@ -195,8 +208,12 @@ fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, (ox, oy): (i32, i32), out: &mu
         FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => v >> 24 >= u32::from(ICON_ALPHA_EDGE),
     };
     let (lo, hi) = (icon.0.max(bx0), icon.1.min(bx0 + w));
+    let (y_lo, y_hi) = (icon.2.max(by0), icon.3.min(by0 + h));
+    if lo >= hi || y_lo >= y_hi {
+        return;
+    }
     let mut prev_sy: Option<(usize, Option<(i32, i32)>)> = None;
-    for y in icon.2.max(by0)..icon.3.min(by0 + h) {
+    for y in y_lo..y_hi {
         let dy = y - by0;
         let sy = ((2 * dy + 1) * ah / two_h).min(ah_max) as usize;
         let span = match prev_sy {
@@ -280,22 +297,36 @@ fn cut_rect(rect: PxBox, bands: &[PxBox], out: &mut Vec<PxBox>) -> bool {
 /// channel (the gradient a sub-quad starting there continues exactly).
 #[cfg(test)]
 #[inline]
-fn lerp_rgb(a: u32, b: u32, k: i32, w: i32) -> u32 {
-    let w = w.max(1);
-    let ch = |sh: u32| {
+const fn lerp_rgb(a: u32, b: u32, k: i32, w: i32) -> u32 {
+    const fn ch(a: u32, b: u32, sh: u32, k: i32, w: i32) -> u32 {
         let (ca, cb) = (((a >> sh) & 0xff) as i32, ((b >> sh) & 0xff) as i32);
-        ((ca * (w - k) + cb * k + w / 2) / w).clamp(0, 255) as u32
-    };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        let v = (ca * (w - k) + cb * k + w / 2) / w;
+        if v < 0 {
+            0
+        } else if v > 255 {
+            255
+        } else {
+            v as u32
+        }
+    }
+    let w = if w > 1 { w } else { 1 };
+    (ch(a, b, 16, k, w) << 16) | (ch(a, b, 8, k, w) << 8) | ch(a, b, 0, k, w)
 }
 
 /// Bounding box `(x0, x1, y0, y1)` of a non-empty sorted `bands` slice.
 #[inline]
-fn bands_bounds(bands: &[PxBox]) -> PxBox {
+const fn bands_bounds(bands: &[PxBox]) -> PxBox {
     let (mut x0, mut x1) = (i32::MAX, i32::MIN);
-    for b in bands {
-        x0 = x0.min(b.0);
-        x1 = x1.max(b.1);
+    let mut i = 0;
+    while i < bands.len() {
+        let b = bands[i];
+        if b.0 < x0 {
+            x0 = b.0;
+        }
+        if b.1 > x1 {
+            x1 = b.1;
+        }
+        i += 1;
     }
     (x0, x1, bands[0].2, bands[bands.len() - 1].3)
 }

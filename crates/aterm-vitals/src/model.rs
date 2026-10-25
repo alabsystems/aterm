@@ -1025,6 +1025,8 @@ pub struct Split {
 pub struct TabView {
     /// The host's key for it.
     pub key: u64,
+    /// The key of the tab it is a pane of ([`TabRoot::tab`], [`ProcScope::Tab`]).
+    pub tab: u64,
     /// `Tab 2`.
     pub label: String,
     /// The program in front.
@@ -2705,6 +2707,7 @@ impl Vitals {
                 let state = self.tabs.entry(root.key).or_default();
                 TabView {
                     key: root.key,
+                    tab: root.tab,
                     label: root.label.clone(),
                     shell_pid: root.shell_pid,
                     program: if root.program.is_empty() {
@@ -5314,6 +5317,11 @@ mod tests {
         let net = s.resource(Network, &[7, 8]).tab;
         assert_eq!(net.missing, Some(NoFigure::NotPerApp));
 
+        assert_eq!(
+            [s.tab(7), s.tab(8)].map(|t| t.map(|t| t.tab)),
+            [Some(7), Some(7)],
+            "each pane carries its tab's key"
+        );
         let t = s.tab_of(&[7, 8]).expect("the tab");
         assert_eq!((t.key, t.label.as_str()), (7, "Tab 1"));
         assert_eq!(t.scope.procs, 4);

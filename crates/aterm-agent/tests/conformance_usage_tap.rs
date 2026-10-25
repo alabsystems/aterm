@@ -19,17 +19,28 @@ const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 const RESET: i64 = 1_792_062_396;
 const NOW: i64 = 1_792_050_000;
 
-const DECIDED: [&str; 9] = [
-    "tapped", "noted", "epoch", "lpid", "lapi", "lfigs", "strike", "silent", "said",
+const DECIDED: [&str; 10] = [
+    "tapped",
+    "displaced",
+    "noted",
+    "epoch",
+    "lpid",
+    "lapi",
+    "lfigs",
+    "strike",
+    "silent",
+    "said",
 ];
+
+/// The owner's own statusLine command in the user's `settings.json` when `userline` is 1.
+const OWNER_LINE: &str = "echo mine";
 
 fn reachable(m: &Model) -> Vec<S> {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::from([m.init_state()]);
     let mut out = Vec::new();
     while let Some(s) = queue.pop_front() {
-        // Every state binds every variable, so its values in name order are its identity.
-        if !seen.insert(s.values().copied().collect::<Vec<i64>>()) {
+        if !seen.insert(crate::common::key(m, &s)) {
             continue;
         }
         for a in &m.actions {
@@ -72,18 +83,19 @@ fn reading(pid: i64, api: i64, figs: i64) -> Reading {
 
 const RENEWED: &str = "/Users//example/.aterm/logins/main.1";
 
-fn gate_taps(s: &S) -> bool {
+/// The value the real gate puts on a launch in state `s`.
+fn real_gate(s: &S) -> Option<String> {
     let argv = vec!["claude".to_string(), "--verbose".to_string()];
     let user = if s["userline"] == 1 {
-        r#"{"statusLine":{"type":"command","command":"echo mine"}}"#
+        format!(r#"{{"statusLine":{{"type":"command","command":"{OWNER_LINE}"}}}}"#)
     } else {
-        r#"{"permissions":{"allow":["Bash(ls)"]}}"#
+        r#"{"permissions":{"allow":["Bash(ls)"]}}"#.to_string()
     };
     let settings = vec![
         ("managed".to_string(), Source::Missing),
-        ("user".to_string(), Source::Text(user.to_string())),
+        ("user".to_string(), Source::Text(user)),
     ];
-    let taps = [None, Some(RENEWED)].map(|login| {
+    let values = [None, Some(RENEWED)].map(|login| {
         tap::gate(&tap::GateFacts {
             exe: (s["armed"] == 1).then(|| Path::new(EXE)),
             stored_login: s["cred"] == 1,
@@ -92,12 +104,25 @@ fn gate_taps(s: &S) -> bool {
             home: None,
             argv: &argv,
             settings: &settings,
+            user_settings: Some("user"),
             profile_store: false,
         })
-        .is_some()
     });
-    assert_eq!(taps[0], taps[1], "both forms of the own login: {s:?}");
-    taps[0]
+    assert_eq!(values[0], values[1], "both forms of the own login: {s:?}");
+    values[0].clone()
+}
+
+type Gate = dyn Fn(&S) -> Option<String>;
+
+/// What a launch's value does in state `s`: whether it taps, and whether it put the plain tap
+/// over the owner's own statusLine instead of carrying it (`tap::chained_of`).
+fn gate_taps(s: &S, gate: &Gate) -> (bool, bool) {
+    let value = gate(s);
+    let displaced = s["userline"] == 1
+        && value
+            .as_deref()
+            .is_some_and(|value| tap::chained_of(value) != Some(Some(OWNER_LINE.to_string())));
+    (value.is_some(), displaced)
 }
 
 type BesideBy = dyn Fn(&Fresh, &Reading) -> Beside;
@@ -198,10 +223,11 @@ fn first_point(silence: &mut Silence, at: i64, pid: u32, tapped: bool) -> Heard 
     }
 }
 
-fn launch_by(s: &S, first: &First) -> S {
+fn launch_by(s: &S, first: &First, gate: &Gate) -> S {
     let mut out = s.clone();
-    let tapped = gate_taps(s);
+    let (tapped, displaced) = gate_taps(s, gate);
     out.insert("tapped", i64::from(tapped));
+    out.insert("displaced", i64::from(displaced || s["displaced"] == 1));
     let (mut silence, at) = silence_of(s);
     let pid = u32::try_from(1000 + s["pid"] + 1).expect("a pid");
     let heard = first(&mut silence, at, pid, tapped);
@@ -215,6 +241,7 @@ fn disagreements(
     admit: &dyn Fn(&mut Fresh, &Reading) -> bool,
     beside: &BesideBy,
     first: &First,
+    gate: &Gate,
 ) -> Vec<(&'static str, S, S, S)> {
     let mut out = Vec::new();
     for s in states {
@@ -224,7 +251,7 @@ fn disagreements(
                 continue;
             }
             let real = match action {
-                "Launch" => launch_by(s, first),
+                "Launch" => launch_by(s, first, gate),
                 "Read" => read_by(s, admit, beside),
                 _ => tick_by(s),
             };
@@ -247,7 +274,7 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
     );
     let real = |f: &mut Fresh, r: &Reading| f.admit(r);
     let beside = |f: &Fresh, r: &Reading| f.beside(r);
-    let wrong = disagreements(&m, &states, &real, &beside, &first_point);
+    let wrong = disagreements(&m, &states, &real, &beside, &first_point, &real_gate);
     assert!(wrong.is_empty(), "{:?}", wrong.first());
     let reads = |m: &Model, pick: &dyn Fn(&S, &S) -> bool| {
         states.iter().any(|s| {
@@ -281,13 +308,13 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
         "a told mark ended by a relaunch, both ways"
     );
     let always = |_: &mut Fresh, _: &Reading| true;
-    let caught = disagreements(&m, &states, &always, &beside, &first_point);
+    let caught = disagreements(&m, &states, &always, &beside, &first_point, &real_gate);
     assert!(
         caught.iter().any(|(action, ..)| *action == "Read"),
         "the always-fresh admit must disagree with the model"
     );
     let blind = |_: &Fresh, _: &Reading| Beside::default();
-    let caught = disagreements(&m, &states, &real, &blind, &first_point);
+    let caught = disagreements(&m, &states, &real, &blind, &first_point, &real_gate);
     assert!(
         caught
             .iter()
@@ -298,11 +325,29 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
         *silence = Silence::default();
         Heard::Same
     };
-    let caught = disagreements(&m, &states, &real, &beside, &unsaid);
+    let caught = disagreements(&m, &states, &real, &beside, &unsaid, &real_gate);
     assert!(
         caught
             .iter()
             .any(|(action, s, real, _)| *action == "Launch" && s["said"] == 1 && real["said"] == 1),
         "a first point that ends the mark without a word must disagree with the model"
+    );
+    assert!(
+        states
+            .iter()
+            .any(|s| s["userline"] == 1 && s["tapped"] == 1),
+        "a line tapped beside the owner's own statusLine (R-12)"
+    );
+    let blind_to_chain = |s: &S| {
+        (s["armed"] == 1 && s["cred"] == 1)
+            .then(|| tap::settings_value(Path::new(EXE)))
+            .flatten()
+    };
+    let caught = disagreements(&m, &states, &real, &beside, &first_point, &blind_to_chain);
+    assert!(
+        caught.iter().any(|(action, s, real, _)| *action == "Launch"
+            && s["userline"] == 1
+            && real["displaced"] == 1),
+        "a gate that puts the plain tap over the owner's statusLine must disagree with the model"
     );
 }

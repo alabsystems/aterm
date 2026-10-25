@@ -361,12 +361,15 @@ fn timing() -> TurnEndTiming {
 /// Mirror one model action on the real side (the model has fired it);
 /// `variant`: an unseen reply is the act's `❯` row left unanswered.
 fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i64, variant: bool) {
-    // The worker answered: no row of the act's stands unanswered.
+    // A turn ended under the act's row: no row of the act's stands unanswered.
     if matches!(
         action,
         "WorkedShort"
+            | "WorkedShortSame"
             | "WorkedHitsTheWall"
             | "WorkedLong"
+            | "WorkedLongQuiet"
+            | "WorkedLongQuietSame"
             | "WorkedClaimsDone"
             | "WorkedNeeds"
             | "RetryTaken"
@@ -374,6 +377,10 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             | "HumanWork"
             | "HarnessTurn"
             | "HarnessTurnLong"
+            | "WallAppears"
+            | "ProgramTurn"
+            | "ProgramTurnUnseen"
+            | "ProgramTurnSame"
     ) {
         real.unanswered = false;
     }
@@ -386,6 +393,7 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
         "WorkedShort"
             | "WorkedHitsTheWall"
             | "WorkedLong"
+            | "WorkedLongQuiet"
             | "WorkedClaimsDone"
             | "WorkedNeeds"
             | "RetryTaken"
@@ -394,6 +402,8 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             | "HarnessTurn"
             | "HarnessTurnLong"
             | "WallAppears"
+            | "ProgramTurn"
+            | "ProgramTurnUnseen"
     ) {
         real.earlier += 1;
     }
@@ -451,11 +461,21 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             let a = decide_turn_end(&real.st, &r, &cfg, real.now);
             real.st.acted(&a, &r, real.now);
         }
-        "WorkedShort" | "WorkedShortSame" | "WorkedHitsTheWall" | "RetryHitsTheWall" => {
+        // The program's own turn is a short one no act awaited.
+        "WorkedShort" | "WorkedShortSame" | "WorkedHitsTheWall" | "RetryHitsTheWall"
+        | "ProgramTurn" | "ProgramTurnSame" => {
             real.st.observe(&seen(after, Some(SHORT)), real.now);
         }
         "WorkedLong" | "WorkedClaimsDone" | "RetryTaken" => {
             real.st.observe(&seen(after, Some(LONG)), real.now);
+        }
+        // Busy past min_work with no tool row: kept, so said again it is no work.
+        "WorkedLongQuiet" | "WorkedLongQuietSame" => {
+            let r = TurnEndReading {
+                ran_tools: false,
+                ..seen(after, Some(LONG))
+            };
+            real.st.observe(&r, real.now);
         }
         "WorkedNeeds" => {
             let r = TurnEndReading {
@@ -464,7 +484,8 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             };
             real.st.observe(&r, real.now);
         }
-        "ReplyUnseen" | "DeadlineUnseen" => {
+        // The program's own turn no point saw busy: its new words alone show it ran.
+        "ReplyUnseen" | "DeadlineUnseen" | "ProgramTurnUnseen" => {
             real.st.observe(&seen(after, None), real.now);
         }
         "TimePassesUnseen" => {
@@ -532,13 +553,13 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
     let take = cnst(m, "Take");
 
     // A state is walked again where the real streak or replies reached it otherwise.
-    let mut seen: BTreeSet<(State, i64, i64, i64, i64)> = BTreeSet::new();
+    let mut seen: BTreeSet<(Vec<i64>, i64, i64, i64, i64)> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), start(m, base))]);
     let mut acts = BTreeMap::<&str, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
         let short = i64::from(real.st.short_streak()).min(streak);
         let key = (
-            st.clone(),
+            crate::common::key(m, &st),
             short,
             crate::common::same(&real.st),
             tries(&real.st),
@@ -907,5 +928,97 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         verdict(&decided(&real, &st, &policy()), &st),
         Verdict::Continue,
         "the control: an answer short of the run goes"
+    );
+
+    // The program's own no-work turn counts as an act's answer: said again it holds, and it counts into the run.
+    let own = [
+        "HumanWork",
+        "Continue",
+        "WorkedShort",
+        "BackoffDue",
+        "ProgramTurnSame",
+    ];
+    let (st, real) = replay(&m, &own, base);
+    assert!(!m.action_enabled("Continue", &st), "{st:?}");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing
+    );
+    let mut lifting = vec!["HumanWork", "Continue", "WorkedShort", "BackoffDue"];
+    for _ in 0..NO_WORK_ACTS {
+        lifting.extend(["ProgramTurnSame", "BackoffDue"]);
+    }
+    let lifted = aterm_spec::interp::with_buggy(&m, 8);
+    let mut b = lifted.init_state();
+    for action in &lifting {
+        assert!(lifted.fire(action, &mut b), "{action} at {b:?}");
+    }
+    assert!(lifted.fire("Continue", &mut b), "{b:?}");
+    assert!(
+        !lifted.check_invariant("ANoWorkRunGetsNoMoreActs", &b),
+        "{b:?}"
+    );
+    let (st, real) = replay(&m, &lifting, base);
+    assert!(!m.action_enabled("Continue", &st), "{st:?}");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing,
+        "the real decider holds where the lifting model types"
+    );
+    // Its own turns no point saw busy, each in new words, count all the same: the run holds them.
+    let mut unseen = vec!["HumanWork", "Continue", "WorkedShort", "BackoffDue"];
+    unseen.extend(vec!["ProgramTurnUnseen"; NO_WORK_ACTS - 1]);
+    let lifted = aterm_spec::interp::with_buggy(&m, 8);
+    let mut b = lifted.init_state();
+    for action in &unseen {
+        assert!(lifted.fire(action, &mut b), "{action} at {b:?}");
+    }
+    assert!(lifted.fire("Continue", &mut b), "{b:?}");
+    assert!(
+        !lifted.check_invariant("ANoWorkRunGetsNoMoreActs", &b),
+        "{b:?}"
+    );
+    let (st, real) = replay(&m, &unseen, base);
+    assert!(!m.action_enabled("Continue", &st), "{st:?}");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing,
+        "the real decider holds the unseen turns' run"
+    );
+    unseen.pop();
+    let (st, real) = replay(&m, &unseen, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Continue,
+        "the control: one unseen turn short of the run, the act goes"
+    );
+    let mut new_words = own;
+    new_words[4] = "ProgramTurn";
+    let (st, real) = replay(&m, &new_words, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Wait,
+        "the control: new words lift the same-reply hold, the back-off paces the act"
+    );
+
+    // A long answer that ran no tool, in new words, is kept and the next act goes at once; said again, it is no work and holds.
+    let quiet = ["HumanWork", "Continue", "WorkedLongQuiet"];
+    let (st, real) = replay(&m, &quiet, base);
+    assert_eq!(crate::common::same(&real.st), 1, "kept");
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Continue
+    );
+    let again = [
+        "HumanWork",
+        "Continue",
+        "WorkedLongQuiet",
+        "Continue",
+        "WorkedLongQuietSame",
+    ];
+    let (st, real) = replay(&m, &again, base);
+    assert_eq!(
+        verdict(&decided(&real, &st, &policy()), &st),
+        Verdict::Nothing
     );
 }

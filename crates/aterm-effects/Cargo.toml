@@ -7,11 +7,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm visual-effects engines: the host-agnostic cursor aurora/comet-trail and sparkle-words (animated ink, peeking cat, supernova) state machines that the native GUI and the web embedders share."
-# The integration tests are ONE suite binary, declared as the `[[test]]` target
-# at the end of this file. The two trick conformances are unit modules mounted
-# by src/lib.rs so they share the cfg(test) build that emits the
-# implementation's model anchors. With autotests off, every other `tests/*.rs`
-# that is not a `mod` of tests/effects_suite.rs is silently never compiled.
+# The integration tests are one suite binary and one binary of their own (Aos
+# M6's held-out counter), each declared as a `[[test]]` target at the end of
+# this file. The two trick conformances are unit modules mounted by src/lib.rs
+# so they share the cfg(test) build that emits the implementation's model
+# anchors. With autotests off, every other `tests/*.rs` that is neither a `mod`
+# of tests/effects_suite.rs nor a `[[test]]` target is silently never compiled.
 autotests = false
 
 [dependencies]
@@ -88,14 +89,21 @@ workspace = true
 
 # ---- integration tests (autotests = false above) ----------------------------
 
-# Apart from the unit-mounted trick conformances, every tests/*.rs is a `mod`
-# of this suite: one link and one process instead of one per file, the files
-# unchanged at their paths. The exact-allocation pins share it through the
-# suite's per-thread counting allocator (tests/alloc_count), so none needs a
-# binary of its own.
+# Apart from the unit-mounted trick conformances and the one exception below,
+# every tests/*.rs is a `mod` of this suite: one link and one process instead
+# of one per file, the files unchanged at their paths. The exact-allocation
+# pins share it through the suite's per-thread counting allocator
+# (tests/alloc_count), so none needs a binary of its own.
 [[test]]
 name = "effects_suite"
 path = "tests/effects_suite.rs"
+
+# The one exception: Aos M6's process-global held-out counter (design §13.3)
+# is read by a test of its own binary, since the suite and the unit tests judge
+# held-out items on parallel threads of one process.
+[[test]]
+name = "m6_held_out_counter"
+path = "tests/m6_held_out_counter.rs"
 
 # ---- release perf gates: `targo --unverified bench -p aterm-effects` ----------
 # Wall-clock budgets in the bench profile; the tests above hold their

@@ -1966,7 +1966,7 @@ pub const VERBS: &[VerbSpec] = &[
          nudge=<idle|armed|short|restoring> nudged=<N>`, then `resize`, `run` and open/owed \
          `epoch` rows. `resize <id> t=<ms> run=<r> ord=<n> from=<CxR> to=<CxR> alt=<0|1> \
          sync=<0|1> trimmed=<k> demoted=<k> pushed=<k> revealed=<k> appended=<k> restored=<k> \
-         shift=<+-k> cut=<k> site=<input|window|chrome|term|pass|redraw|ctl-cross|-> at=<pct \
+         shift=<+-k> cut=<k> site=<input|window|chrome|deck|term|pass|redraw|ctl-cross|-> at=<pct \
          file:line|-> win=<CxR|-> chrome=<k|->`. `run <r> t=<ms> n=<k> alt=<0|1> \
          geom=<CxR>><CxR>>... net=<zero|changed> displaced=<+-k> \
          verdict=<none|silent|desync-risk|unverified|healed|reflow> first_out_ms=<ms|-> \
@@ -2975,15 +2975,19 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "inbox [<n>] [since=<id>] [--peek] [--meta]: this session's message rows",
         "— header: `OK <n> hold=<0|1> holder=<turn-id|lease:<holder>|-> seen=<id> \
-         bus_head=<off> oldest_on_bus=<@off|-> dropped=<n> pending=<n>`, then `msg <id> \
+         bus_head=<off> oldest_on_bus=<@off|-> dropped=<n> pending=<n> \
+         [given_up=@<a>..@<b> [given_up_count=<n>]]`, then `msg <id> \
          off=<n> t=<ms> from=<p> kind=<k> trust=<human|agent|relayed|screen> [re=<n> [re-id=<id>]] \
          [verdict=<handled|refused|deferred>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
          [topic=<t>] len=<n> [more=1] [truncated=1] text=<pct>` (text preview capped at 512 B; \
          use `inbox get <id>` or `inbox get @<off>` for full bodies; lost bus records below \
          retention return `ERR retained-from=<floor>` or `ERR no such record`) and queued \
-         outbound `post <id> to=<> kind=<> off=- len=<n> [key=<token>]` rows. `<n>` selects the \
-         newest `n` `msg` rows above `since=`; `--peek` leaves rows unlisted and `--meta` omits \
-         `text=`.",
+         outbound `post <id> to=<> kind=<> off=- len=<n> [key=<token>]` rows. `given_up=` names \
+         the newest range of this node's unread mail the broker's retention gave up before the \
+         bridge read it (broker offsets `a..b`; whose it was went with it, so every session of \
+         the node names it), and `given_up_count=` how many where the broker counted; the log \
+         marks each once (`mail-gap`). `<n>` selects the newest `n` `msg` rows above `since=`; \
+         `--peek` leaves rows unlisted and `--meta` omits `text=`.",
     ),
     v(
         "inbox get",
@@ -3071,8 +3075,11 @@ pub const VERBS: &[VerbSpec] = &[
          sets `fabric=stalled` and wakes `post --wait` with `ERR fabric stalled id=<n> \
          queued=1`; `log <identity> [continues=<off> was=<id>]` binds the broker log generation; \
          `mirror …`, `set-aside files=<n>` and `quarantine torn=<k>` report the bus mirror and \
-         quarantined state files; `bye <quit|handoff>` acknowledges `EVENT * bye`. Replies `OK` \
-         (`OK stale=1` to a superseded bridge lane).",
+         quarantined state files; `gap from=<a> to=<b> [records=<n>]` says the broker's \
+         retention gave up this node's unread mail at offsets `a..b` (`n` of it where the broker \
+         counted), which every session's `inbox` then names (`given_up=`) and its log marks \
+         (`mail-gap`); `bye <quit|handoff>` acknowledges `EVENT * bye`. Replies `OK` (`OK \
+         stale=1` to a superseded bridge lane).",
     )
     .input(Input::NONE),
     va(
@@ -3102,8 +3109,10 @@ pub const VERBS: &[VerbSpec] = &[
              `origin=local` (Owner sets and lifts it), `origin=fleet` (the fabric bridge does; \
              from Owner it is `ERR denied`), `origin=person` (`reason=taken-over`, only the \
              person's Take Over / Hand Back in the window; `invoke TakeOver|HandBack` is `ERR \
-             denied`), and `origin=remote` (a fleet drive's). While any slot stands, every \
-             PTY-reaching verb that resolves to the session answers `ERR halted reason=<r> \
+             denied`), and `origin=remote` (a fleet drive's: that node's own `off`, the \
+             person's Take Over, or the end of its grant lifts it; a local `off` lifts the local \
+             slot alone). While any slot stands, every PTY-reaching verb that resolves to the \
+             session answers `ERR halted reason=<r> \
              origin=<person|remote|fleet|local>` from ANY scope — `send key ctrl feed feed-bin \
              paste paste-bin mouse pointer resize focus signal restart reset turn close invoke \
              hwkey pane tab confirm askpass` — and while any session is held the \
@@ -3245,6 +3254,11 @@ pub const VERBS: &[VerbSpec] = &[
          `by=harness` turns are skipped in `prompt=`): `user_title= title= cwd= branch= prompt= \
          said= cmd= rows=` (<= 400 B per excerpt, credentials/fleet codes redacted, fleet \
          replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, never waited for). \
+         A codex-alab row, whose screen names no state, takes `agent=` from what codex-alab says of \
+         itself in OSC 7501 (`working` is `busy`; `blocked` is `prompt`, `question` or \
+         `wall:auth`; at rest, `idle`; nothing said, `unknown`) and, while its proven claim stands \
+         (`supervisor=codex-alab@<pid>`), `model= effort= ctx_left_pct= doing= cwd= branch= \
+         prompt= said=` from its rollout. \
          `aterm ctl survey [--fleet] [--budget <chars>]`, `survey [--json] [--sid <s>] [--fleet \
          | --host <h>]` (`--timeout <s>` with `--fleet` or `--host`) and `survey --brief \
          [--budget <chars>]` (`log n` + `brief all`) format multi-instance and fleet digests and \
@@ -3479,10 +3493,15 @@ pub fn is_any_scope_meta(verb: &str) -> bool {
 }
 
 /// The bridge lane's grammar generation, which the bridge and the instance serving it each state in `hello` (`lane=`) so either can tell which side reads less of the lane.
-pub const BRIDGE_LANE: u32 = 6;
+pub const BRIDGE_LANE: u32 = 7;
 
 /// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both sides.
 pub const LINK_QUARANTINE_LANE: u32 = 5;
+
+/// The lane that added `link gap from=<a> to=<b> [records=<n>]` (7 in [`BRIDGE_LANE`]'s list),
+/// for both sides: the broker's retention gave up the node's unread mail at `a..b` (astream R4's
+/// addendum A9), `n` of it where the broker counted.
+pub const LINK_GAP_LANE: u32 = 7;
 
 /// Whether `verb` is bridge-only per the table: no token unlocks it, Owner included.
 #[inline]

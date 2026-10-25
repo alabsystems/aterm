@@ -3044,10 +3044,35 @@ impl Broker {
     /// begin between batches, copy with no lock held, finish between batches.
     #[cfg(feature = "retention")]
     fn compact(&self, min_offset: u64, carry_state: bool) -> io::Result<u64> {
-        let _one = lock_compaction(&self.shared);
+        // Count a wait, but recover a poisoned compaction gate: it guards no data.
+        let _one = match self.shared.compaction.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.shared.compaction_waits.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .compaction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+        };
         let mut waited = false;
         let begun = {
-            let _batch = self.batch_settled(&mut waited);
+            // A poisoned try-lock already owns its guard. Panic with that guard;
+            // taking the lock again here would wait on this same thread forever.
+            let _batch = match self.shared.batch.try_lock() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    record_retention_wait(&self.shared, &mut waited);
+                    self.shared
+                        .batch
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("retention: the writer panicked inside a batch ({poisoned})")
+                }
+            };
             let mut log = self
                 .shared
                 .log
@@ -3071,7 +3096,19 @@ impl Broker {
                 .compact_abandon(c);
             return Err(e);
         }
-        let _batch = self.batch_settled(&mut waited);
+        let _batch = match self.shared.batch.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                record_retention_wait(&self.shared, &mut waited);
+                self.shared
+                    .batch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("retention: the writer panicked inside a batch ({poisoned})")
+            }
+        };
         let mut log = self
             .shared
             .log
@@ -3080,24 +3117,6 @@ impl Broker {
         let dropped = log.compact_finish(c);
         publish_retention(&self.shared, &log);
         dropped
-    }
-
-    /// Take the writer's batch lock (`Shared::batch`) for a retention call: at once
-    /// between batches, or — counted in [`BrokerStats::retention_waits`], once per call
-    /// (`waited`) — once the batch the writer is in has committed or rolled back. Held
-    /// across a compaction's begin and again across its finish, so no batch begins under
-    /// either. A writer that panicked holding it poisons it, and this panics, as the log
-    /// lock's poisoning did when the writer held that instead.
-    ///
-    /// THE POISONED ARM PANICS WITH THE GUARD IT WAS HANDED, and never locks again. A
-    /// poisoned `try_lock` still TAKES the mutex: its error carries the guard, and the
-    /// match's scrutinee keeps it alive through the arm, so a `lock()` there is this
-    /// thread waiting on itself — every retention call after a writer panic would hang
-    /// its caller instead of failing (`retention_after_a_writer_panic_fails_and_never_hangs`).
-    /// Bound here, the guard is dropped as the panic unwinds.
-    #[cfg(feature = "retention")]
-    fn batch_settled(&self, waited: &mut bool) -> std::sync::MutexGuard<'_, ()> {
-        batch_settled(&self.shared, waited)
     }
 
     /// The guard both retention calls take, with the log lock held (the visible head is
@@ -3209,7 +3228,17 @@ impl Broker {
             // Lock order: compaction → log. A job begun under the old rules appends its
             // held frames where the store ended at its begin; the rules frame set here
             // goes after them, and its cut is the base the new rules hold from.
-            let _one = lock_compaction(&self.shared);
+            let _one = match self.shared.compaction.try_lock() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.shared.compaction_waits.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .compaction
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                }
+            };
             let mut log = self
                 .shared
                 .log
@@ -7550,25 +7579,13 @@ fn settle_full_flush(
     (outcome, dirty, wake)
 }
 
-/// [`Broker::batch_settled`], for whoever holds the shared state: a retention call, or the
-/// retention tick.
+/// Count a retention call's first wait for the writer's current batch to settle.
+/// The lock acquisition stays at each call site so its guard lifetime is explicit.
 #[cfg(feature = "retention")]
-fn batch_settled<'a>(shared: &'a Shared, waited: &mut bool) -> std::sync::MutexGuard<'a, ()> {
-    match shared.batch.try_lock() {
-        Ok(held) => held,
-        Err(std::sync::TryLockError::WouldBlock) => {
-            if !*waited {
-                *waited = true;
-                shared.retention_waits.fetch_add(1, Ordering::Relaxed);
-            }
-            shared
-                .batch
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            panic!("retention: the writer panicked inside a batch ({poisoned})")
-        }
+fn record_retention_wait(shared: &Shared, waited: &mut bool) {
+    if !*waited {
+        *waited = true;
+        shared.retention_waits.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -8159,24 +8176,6 @@ fn ask_retention_after_batch(shared: &Shared) {
     }
 }
 
-/// Take the one-compaction-at-a-time lock (`Shared::compaction`), waiting for a compaction
-/// under way to finish, and counting the wait (`Shared::compaction_waits`). A poisoned lock
-/// is taken all the same, as every retention call takes it: the guard protects no data.
-#[cfg(feature = "retention")]
-fn lock_compaction(shared: &Shared) -> std::sync::MutexGuard<'_, ()> {
-    match shared.compaction.try_lock() {
-        Ok(held) => held,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            shared.compaction_waits.fetch_add(1, Ordering::Relaxed);
-            shared
-                .compaction
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }
-    }
-}
-
 /// Ask the retention tick for a tick now (`TickState::due`).
 #[cfg(feature = "retention")]
 fn ask_tick(shared: &Shared) {
@@ -8237,7 +8236,17 @@ fn retention_tick(
     wait: bool,
 ) -> io::Result<Option<crate::RetentionTick>> {
     let one = if wait {
-        Some(lock_compaction(shared))
+        Some(match shared.compaction.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                shared.compaction_waits.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .compaction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+        })
     } else {
         match shared.compaction.try_lock() {
             Ok(held) => Some(held),
@@ -8280,7 +8289,19 @@ fn retention_tick_run(shared: &Shared, now_ms: u64) -> io::Result<crate::Retenti
     };
     let mut waited = false;
     let begun = {
-        let _batch = batch_settled(shared, &mut waited);
+        let _batch = match shared.batch.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                record_retention_wait(shared, &mut waited);
+                shared
+                    .batch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("retention: the writer panicked inside a batch ({poisoned})")
+            }
+        };
         let mut log = shared
             .log
             .lock()
@@ -8316,7 +8337,19 @@ fn retention_tick_run(shared: &Shared, now_ms: u64) -> io::Result<crate::Retenti
         publish_retention(shared, &log);
         return Err(e);
     }
-    let _batch = batch_settled(shared, &mut waited);
+    let _batch = match shared.batch.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            record_retention_wait(shared, &mut waited);
+            shared
+                .batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("retention: the writer panicked inside a batch ({poisoned})")
+        }
+    };
     let mut log = shared
         .log
         .lock()
@@ -9159,9 +9192,12 @@ fn queue_delivery_cached<S: Write>(
     rec: &BrokerRecord,
 ) -> io::Result<()> {
     let slot = crc_cache_slot(shared.delivery_crc_cache.as_ref(), rec.seq.0);
-    let cached = *slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cached = {
+        let held = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held
+    };
     let crc = match cached {
         Some(hit) if hit.offset == rec.seq.0 => hit.crc,
         _ => {

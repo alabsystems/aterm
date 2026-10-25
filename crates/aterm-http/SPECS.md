@@ -40,8 +40,17 @@
 > `methods::post_patch_and_put_carry_a_zero_length_when_empty` hold the rest of it. **42 specs**
 > cover **142 tests**.
 
+> Status 2026-10-23: `dns-local-refusal` joins. macOS refuses an app its person answered *Don't
+> Allow* every mDNS query (`kDNSServiceErr_PolicyDenied`), which `getaddrinfo` reports as a
+> definite "no such name" (measured from a denied app's own process on a macOS 27.0 VM), so
+> `TcpConnector::connect` asks mDNSResponder after a failed lookup of a `.local` name and names a
+> refusal `HostUnreachable`, the kind macOS gives the same app's refused connect. The query runs on
+> a helper thread, so the caller waits at most the time it gave. Its 6 tests (three in
+> `src/stream.rs`, three in the new `src/local_network.rs`) map to it: **43 specs** cover **148
+> tests**.
+
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 33 specs of that date
-> (42 now) is proved through Trust/Clean about the compiled Rust fn, and then the tests it
+> (43 now) is proved through Trust/Clean about the compiled Rust fn, and then the tests it
 > subsumes are deleted. The 4 tests §4 listed outside any spec are all deleted.
 
 Source: `crates/aterm-http` (read only). I read every `#[test]` (src/client.rs 28, src/pem.rs 11,
@@ -52,12 +61,12 @@ and 2 in a trust-config test file deleted 2026-10-16 = 106) and the code each on
 of the `#[test]` in its doc comment.
 Nothing was compiled or run. The claims below come from reading the code.
 
-Result: **42 specs** cover **142 tests**. 36 specs are the primary spec of at least one test. Four
+Result: **43 specs** cover **148 tests**. 37 specs are the primary spec of at least one test. Four
 are lemmas that the others need and are only secondary specs of tests: `uri-render`,
 `proxy-target-debug-redacts`, `http-number-grammar` and `response-accessors`.
 `client-config-roots-fail-closed` is now only a secondary spec too, and
 `provider-advertises-modern-schemes` has no test left.
-**No test outside a spec is left** (§4): every test the crate runs (2026-10-21: 89 unit tests and
+**No test outside a spec is left** (§4): every test the crate runs (2026-10-23: 95 unit tests and
 53 in the suite) has a row in §2.
 
 ## 0. Notation used in the statements
@@ -91,7 +100,7 @@ Function paths are relative to the crate (`uri::Uri::parse` means `aterm_http::u
 - `blocking_gaps` uses the numbers of the gap table in
   `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit)
   §7. Gap 0 (admitting a seal that publishes Clean rows to the machine's `trust` channel) is a
-  prerequisite for every row, so it is listed on all 42. 1 is non-scalar carriers, 2 is `&self`/`&mut`
+  prerequisite for every row, so it is listed on all 43. 1 is non-scalar carriers, 2 is `&self`/`&mut`
   views, 3 is E6 body widening, 4 is callee-ensures composition, 5 is quantified clauses, 7 is loops,
   8 is effects/FFI, 10 is model-to-code refinement, 11 is generics, 12 is cross-crate citation
   (`aterm_codec`, rustls, webpki, ring), and 13 is closures, threads and `OnceLock`.
@@ -144,20 +153,22 @@ streamed-body-framing	refinement	client::Framed::{read, read_chunked, count}, cl
 phase-classification	contract	client::RequestBuilder::exchange_with_env, client::{write_tracked, read_final_head, read_head_byte, read_uninterrupted, decide_framing}	∀ request: a SendError's phase is NotSent ⇔ Stream::write accepted no byte of the request head, which covers every builder, endpoint, body-on-GET, proxy, DNS, connect, proxy CONNECT (a refused tunnel is Protocol("proxy refused CONNECT with status " + code)) and TLS-handshake failure; it is Sent once a head byte was accepted and no final head has parsed, and EOF before a status line is then Io(UnexpectedEof, "connection closed before the response"), an UnexpectedEof read error (TLS without close_notify) counting as that EOF and an Interrupted read of the head retried, never returned; it is Answered once the final head parsed, a 101 head included, and so is a final head read after a refused write (send-pipeline-order's early answer). exchange returns Ok exactly when the final head parsed and decide_framing accepted its framing; a refused framing, an unrequested 101 among them, is Err(SendError { phase: Answered, error: Protocol(_) }), and a failure after Ok is a BodyReader read error.	streaming::a_refused_connect_was_not_sent, streaming::a_server_that_reads_the_request_and_closes_leaves_it_sent, streaming::a_server_that_closes_mid_body_had_answered, streaming::a_reader_shorter_than_its_length_fails_after_the_head_was_sent, streaming::a_head_whose_framing_is_refused_had_answered, streaming::an_unrequested_switch_of_protocols_had_answered, streaming::a_proxy_that_refuses_the_tunnel_is_a_protocol_error_unsent, an_unclean_tls_close_in_the_head_reads_as_the_plain_eof, an_interrupted_read_in_the_head_is_waited_out	a phase carried through a &mut out-parameter across a write loop, network effects	0,1,2,4,8
 idle-deadline	contract	stream::Deadline::{after, with_idle, idle, connect_phase, per_call, expired, as_timeout}, stream::later, stream::Bounded::{admit, admit_read, admit_write}, stream::TcpConnector::connect, connect::connect_timeout, client::RequestBuilder::{idle, backstop, connect_within}	∀ total T (backstop, else the client timeout), idle I, connect budget C: every socket call (connect, read, write, flush) runs under the timeout min(remaining, I); its expiry is TimedOut with "no bytes for " + dec(I.as_millis()) + "ms" when I was the smaller, else "request deadline exceeded"; until the stream is established (DNS, connect, proxy CONNECT, TLS handshake) remaining counts down to the sooner of start + C and start + T, whose expiry reads "connect deadline exceeded" when C was the sooner, and after it the request's own deadline holds. A T or C too long for an Instant (Duration::MAX) ends FAR_FUTURE from now and never panics. The connect itself is connect::connect_timeout(addr, t), TcpStream::connect_timeout's contract: t = 0 is InvalidInput, a port nothing listens on is ConnectionRefused (on Windows too, after one SYN retry rather than two), and the stream comes back blocking. Every bound here is enforced at a socket call (stream-admit-before-every-syscall), so the platform certificate check inside a TLS handshake, which is no socket call, keeps its own bound (EVALUATION_DEADLINE, 30 s, on Apple platforms; a 10 s URL-retrieval cap on Windows): a check that stalls ends only there, and C or T expiring meanwhile is reported at the next socket call.	streaming::a_silent_server_hits_the_idle_cap, streaming::a_trickling_server_hits_the_total_deadline, streaming::a_tls_handshake_that_never_answers_hits_the_connect_budget_unsent, streaming::the_request_deadline_takes_over_once_the_connect_budget_has_opened_the_stream, an_idle_cap_shorter_than_the_budget_bounds_each_call_and_names_itself, the_connect_phase_takes_the_sooner_end, a_budget_too_long_for_the_clock_is_far_off_rather_than_a_panic, connect::a_listening_port_connects_and_the_stream_blocks, connect::a_closed_port_is_refused, connect::a_zero_budget_is_invalid_input	Instant as a clock effect, Duration min, a per-call cap carried from admit to the error map, closures in map_err	0,1,2,8,13
 dns-bounded	contract	stream::resolve_within, stream::TcpConnector::connect	∀ host, port, within, resolver: resolve_within runs resolver(host, port) on a thread named "aterm-http-dns" and returns once it answers or the time within has passed: its addresses collected into a Vec, or Err(TimedOut, "dns: no answer within " + dec(within.as_millis()) + "ms") with the helper left to finish alone (its send fails quietly); a resolver error e becomes Err(e.kind(), "dns: " + host + ": " + e); when no thread can be spawned the resolver runs inline. Every resolution failure TcpConnector::connect reports starts "dns:", on every platform.	a_resolver_that_never_answers_is_a_dns_timeout, a_failed_lookup_keeps_its_kind_and_names_the_host, a_resolved_address_connects	a spawned thread, a sync_channel and recv_timeout, an Arc<Mutex<Option<F>>> hand-over, generics F and I	0,8,11,13
+dns-local-refusal	contract	stream::TcpConnector::connect, stream::connect_with, stream::denial_wait, stream::refused_local, local_network::{is_local_name, denied, asked_within}	∀ host, failed lookup e, deadline d, denied: w = denial_wait(d) is min(d's remaining, DENIAL_WAIT), zero once d has passed; refused_local(host, e, w, denied) is e unchanged, denied never asked, when e is TimedOut (a question still on screen holds a lookup unanswered), w is zero or host is not a local name; otherwise denied(host, w) is asked once, and when it says yes the error is Err(HostUnreachable, "dns: " + host + ": macOS does not let this app use the local network (Local Network privacy)"), else e. connect_with routes every resolve_within failure through it. A local name is one whose last label is `local` (ASCII case aside), with or without a trailing dot, and at least one label before it; no byte index splits a character. asked_within(host, w, ask) runs ask(host, w) on a thread named "aterm-http-mdns" and is its answer when it comes within w, else no (a late answer is dropped, a thread that cannot start is no), so a caller waits at most w. On macOS denied(host, w) is asked_within of an A query to mDNSResponder (DNSServiceQueryRecord) that is yes when the query is refused with kDNSServiceErr_PolicyDenied (-65570) at once or its first reply within w carries it; silence, an answer, a query dns_sd refuses otherwise and a name with a NUL are no; elsewhere denied is always no.	only_a_refused_local_name_is_named_as_the_local_network_refusal, the_wait_to_ask_is_capped_by_what_the_deadline_has_left, the_connector_names_a_refused_local_lookup, local_network::only_a_name_under_local_is_a_local_name, local_network::a_question_answered_late_or_never_is_no_refusal, local_network::silence_an_answer_and_a_query_not_made_are_no_refusal	FFI to libSystem's dns_sd and poll (the refusal arm is measured from a denied app's own process; mDNSResponder judges a test binary's query as the binary's own and never refuses it, measured even in a denied app's tab), a helper thread with recv_timeout, closures as injected effects, &str suffix slicing on a char boundary	0,8,11,13
 secret-header-scrub	invariant	client::RequestBuilder::{secret_header, exchange_with_env}, client::{render_head, is_reserved}, <client::RequestBuilder as Debug>::fmt, <client::Exchange as Debug>::fmt, aterm_uds::secret::{Secret, scrub}	∀ request with secret headers S: each (n, v) ∈ S is admitted only when n is a token, n is not reserved (is_reserved: ci host, content-length, transfer-encoding, connection, proxy-authorization), n is not ci accept (caller-accept) and every byte of v is vchar_ok (else Err(Invalid) naming n and never v, at NotSent before any connector.connect call); every admitted one is written after the caller's headers as n + ": " + v + "\r\n" into one buffer allocated at its final size (so no reallocation leaves a copy) and scrubbed after the write whatever the write's result; no Debug of RequestBuilder, SendError or Error and no error text contains v (as a contiguous byte string) from the request: the one way v can appear is a Protocol error quoting response bytes, when a peer echoes v into a malformed status line, version or header line. The Debug of a RequestBuilder lists header names, never values, and so does an Exchange's of its response headers, so an Exchange's Debug print carries no response header value (a signed Location); Response keeps its derived Debug, which prints its header values and body.	streaming::a_secret_header_is_on_the_wire_and_in_no_error_or_debug, streaming::a_secret_header_with_a_control_character_is_refused_without_its_value, streaming::a_secret_header_with_a_reserved_name_is_refused_before_any_connect, streaming::an_exchange_debug_names_its_headers_without_their_values	Vec capacity reasoning (no reallocation), volatile scrub writes (aterm_uds), Debug formatting, cross-crate Secret	0,1,2,3,4,8,12
 ```
 
 Unqualified test names in `subsumes` are in the file that holds the spec's functions (`src/uri.rs`,
 `src/pem.rs`, `src/proxy.rs`, `src/client.rs`, `src/stream.rs`, `src/tls.rs`). A `loopback::`,
 `tls_stream::`, `signature_methods::`, `golden_post::`, `methods::` or
-`streaming::` prefix is the file under `tests/`; `connect::` is `src/connect.rs`, and
+`streaming::` prefix is the file under `tests/`; `connect::` is `src/connect.rs`, `local_network::` is
+`src/local_network.rs`, and
 `verifier::tests::` and `verifier::unix::` are `src/verifier/tests.rs` and `src/verifier/unix.rs`.
 
-### Distribution by kind (42)
+### Distribution by kind (43)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 32 | uri-parse-accept-set, uri-parse-fields, uri-render, pem-lossy, proxy-resolve-selection, proxy-parse, proxy-refusal-names-variable-never-value, proxy-target-debug-redacts, no-proxy-match, header-validation-grammar, response-header-fields, http-number-grammar, status-line-grammar, read-head-skips-interim, response-accessors, render-request-exact, connect-tunnel-exchange, tls-config-lazy-and-shared, error-is-revoked, deadline-remaining, init-crypto-installs-provider, client-config-roots-fail-closed, verifier-accepts-only-through-arm, provider-advertises-modern-schemes, unix-store-fail-closed, unix-cert-path-selection, bodiless-no-content-length, caller-accept, header-iteration, phase-classification, idle-deadline, dns-bounded |
+| contract | 33 | uri-parse-accept-set, uri-parse-fields, uri-render, pem-lossy, proxy-resolve-selection, proxy-parse, proxy-refusal-names-variable-never-value, proxy-target-debug-redacts, no-proxy-match, header-validation-grammar, response-header-fields, http-number-grammar, status-line-grammar, read-head-skips-interim, response-accessors, render-request-exact, connect-tunnel-exchange, tls-config-lazy-and-shared, error-is-revoked, deadline-remaining, init-crypto-installs-provider, client-config-roots-fail-closed, verifier-accepts-only-through-arm, provider-advertises-modern-schemes, unix-store-fail-closed, unix-cert-path-selection, bodiless-no-content-length, caller-accept, header-iteration, phase-classification, idle-deadline, dns-bounded, dns-local-refusal |
 | equivalence | 1 | verifier-delegates-signatures |
 | refinement | 4 | response-body-framing, send-pipeline-order, platform-verifier-conformance, streamed-body-framing |
 | table-property | 2 | decide-framing-table, method-head-framing |
@@ -168,16 +179,17 @@ Unqualified test names in `subsumes` are in the file that holds the spec's funct
 
 | gap | specs | gap | specs |
 |---|---|---|---|
-| 0 seal admission | 42 | 7 loops | 18 |
-| 1 non-scalar carriers | 36 | 8 effects/FFI | 17 |
+| 0 seal admission | 43 | 7 loops | 18 |
+| 1 non-scalar carriers | 36 | 8 effects/FFI | 18 |
 | 2 `&self`/`&mut` views | 21 | 10 model→code refinement | 1 |
-| 3 E6 body widening | 17 | 11 generics | 8 |
+| 3 E6 body widening | 17 | 11 generics | 9 |
 | 4 callee-ensures composition | 12 | 12 cross-crate citation | 11 |
-| 5 quantified clauses | 17 | 13 closures/threads/`OnceLock` | 18 |
+| 5 quantified clauses | 17 | 13 closures/threads/`OnceLock` | 19 |
 
-No spec is blocked by gap 0 alone. Gap 1 is the crate's bottleneck: only 6 specs avoid it
+No spec is blocked by gap 0 alone. Gap 1 is the crate's bottleneck: only 7 specs avoid it
 (`tls-config-lazy-and-shared`, `stream-admit-before-every-syscall`, `deadline-remaining`,
-`init-crypto-installs-provider`, `verifier-delegates-signatures`, `dns-bounded`), and every one of
+`init-crypto-installs-provider`, `verifier-delegates-signatures`, `dns-bounded`,
+`dns-local-refusal`), and every one of
 those needs gap 8 or 12 instead.
 
 ### Proof dependency order
@@ -195,7 +207,7 @@ come last; the conformance spec needs the X.509 model `V`. The agh rows (2026-10
 `decide-framing-table` → `method-head-framing`; `response-body-framing` → `streamed-body-framing`;
 `render-request-exact` → `bodiless-no-content-length`, `caller-accept`; `response-accessors` →
 `header-iteration`; `deadline-remaining` → `idle-deadline` and `dns-bounded` →
-`phase-classification`; `header-validation-grammar` and aterm-uds's `Secret` →
+`phase-classification`; `dns-bounded` → `dns-local-refusal` (2026-10-23); `header-validation-grammar` and aterm-uds's `Secret` →
 `secret-header-scrub`.
 
 ## 2. Test → spec map (TSV)
@@ -239,6 +251,9 @@ src/client.rs	the_proxy_credential_rides_the_absolute_form_and_never_the_tunnel	
 src/connect.rs	a_closed_port_is_refused	idle-deadline	
 src/connect.rs	a_listening_port_connects_and_the_stream_blocks	idle-deadline	
 src/connect.rs	a_zero_budget_is_invalid_input	idle-deadline	
+src/local_network.rs	a_question_answered_late_or_never_is_no_refusal	dns-local-refusal	
+src/local_network.rs	only_a_name_under_local_is_a_local_name	dns-local-refusal	
+src/local_network.rs	silence_an_answer_and_a_query_not_made_are_no_refusal	dns-local-refusal	
 src/pem.rs	the_lossy_parser_drops_undecodable_blocks_and_keeps_going	pem-lossy	
 src/pem.rs	the_lossy_parser_skips_an_aux_info_block	pem-lossy	
 src/pem.rs	the_lossy_parser_terminates_on_every_malformed_input	pem-lossy	
@@ -267,7 +282,10 @@ src/stream.rs	an_answer_sent_before_a_reset_is_read_and_then_the_reset	stream-ad
 src/stream.rs	an_expired_deadline_is_a_timeout_not_a_hang	deadline-remaining	
 src/stream.rs	an_idle_cap_shorter_than_the_budget_bounds_each_call_and_names_itself	idle-deadline	deadline-remaining
 src/stream.rs	plaintext_io_sets_only_its_socket_timeout_direction	stream-admit-before-every-syscall	
+src/stream.rs	only_a_refused_local_name_is_named_as_the_local_network_refusal	dns-local-refusal	
 src/stream.rs	the_connect_phase_takes_the_sooner_end	idle-deadline	deadline-remaining
+src/stream.rs	the_connector_names_a_refused_local_lookup	dns-local-refusal	dns-bounded
+src/stream.rs	the_wait_to_ask_is_capped_by_what_the_deadline_has_left	dns-local-refusal	deadline-remaining
 src/tls.rs	init_crypto_is_idempotent	init-crypto-installs-provider	
 src/uri.rs	a_fragment_is_dropped_and_never_reaches_the_request_line	uri-parse-fields	
 src/uri.rs	control_characters_and_spaces_cannot_smuggle_a_header	uri-parse-accept-set	
@@ -357,7 +375,8 @@ tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-be
   `stream-admit-before-every-syscall` (2: the Apple-platform reset test in `src/stream.rs` and the
   TLS early answer in `tests/tls_stream.rs`), or to `send-pipeline-order` (1: the plain early
   answer), so with the five, 140 tests map to one of 42 specs. Main's merge (2026-10-21) adds
-  two: one to `send-pipeline-order`, one to `read-head-skips-interim`: 142.
+  two: one to `send-pipeline-order`, one to `read-head-skips-interim`: 142. `dns-local-refusal`
+  (2026-10-23) adds 6 and one spec: 148 tests map to one of 43 specs.
 - The biggest collapses: `streamed-body-framing` (10), `idle-deadline` (10, 3 of them
   `src/connect.rs`'s), `render-request-exact` (8 primary, 3 of them the golden and method tests),
   `stream-admit-before-every-syscall` (10, across three test files), `phase-classification` (9),

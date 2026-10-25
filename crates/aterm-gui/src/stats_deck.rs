@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use aterm_vitals::glance::needs::DeckNeed;
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{DiskLevel, HeatCell, Resource, ResourceView, ScopeFig, Snapshot, State};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform, ScopeForms};
@@ -92,11 +93,92 @@ impl StatsBars {
     }
 }
 
-/// The Deck's height in device pixels at `scale` in the window's form `deck`, or 0 when the
-/// Deck is not the stats bars' form.
-pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usize) -> usize {
+/// Which painter draws the Deck (`[sys] stats_deck_style`; config only, no menu item).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum DeckStyle {
+    /// Stats Deck v2's table (`DESIGN-stats-deck-v2-2026-10-20.md`), the default.
+    #[default]
+    V2,
+    /// The merged deck (`DESIGN-top-deck-merged-2026-10-21.md`): three terminal rows.
+    Merged,
+}
+
+impl DeckStyle {
+    /// Every style.
+    pub(crate) const ALL: [Self; 2] = [Self::V2, Self::Merged];
+
+    /// Parse the config value, ignoring case; a missing or unknown word is v2.
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        value.and_then(Self::from_word).unwrap_or_default()
+    }
+
+    /// The config word for this style.
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+            Self::Merged => "merged",
+        }
+    }
+
+    /// The style a config word names, or `None` for a word that is not one.
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        let word = word.trim();
+        Self::ALL
+            .into_iter()
+            .find(|s| s.word().eq_ignore_ascii_case(word))
+    }
+
+    /// The form a window with no form yet opens in: v2 its Folded deck, the merged deck its
+    /// three rows, under which the merged deck reads a window's room ([`deck_room`]), so its
+    /// first decision reads the grid it was opened for.
+    pub(crate) const fn room_form(self) -> DeckForm {
+        match self {
+            Self::V2 => DeckForm::Folded,
+            Self::Merged => DeckForm::Full,
+        }
+    }
+}
+
+/// The merged deck's least height in points, whatever the cell.
+pub(crate) const MERGED_MIN_PT: f64 = 45.0;
+
+/// The merged deck's greatest height in points, whatever the cell.
+pub(crate) const MERGED_MAX_PT: f64 = 60.0;
+
+/// The merged deck's row A alone (its Folded form) is never under this, in points.
+pub(crate) const ROW_A_MIN_PT: f64 = 14.0;
+
+/// The Deck's height in device pixels at `scale` in `style` and the window's form `deck`, or
+/// 0 when the Deck is not the stats bars' form. The merged deck is three terminal rows of
+/// `cell_px`, held to [`MERGED_MIN_PT`]..=[`MERGED_MAX_PT`]; folded to row A alone it gives
+/// the grid two whole rows back, or one or none where that would leave row A under
+/// [`ROW_A_MIN_PT`], so row A is one cell wherever three cells fit the band's range.
+pub(crate) fn deck_px(
+    form: StatsBars,
+    style: DeckStyle,
+    deck: DeckForm,
+    scale: f64,
+    cell_px: usize,
+) -> usize {
     if !(form.takes_room() && scale.is_finite() && scale > 0.0) {
         return 0;
+    }
+    if style == DeckStyle::Merged {
+        let least = (MERGED_MIN_PT * scale).round() as usize;
+        let most = (MERGED_MAX_PT * scale).round() as usize;
+        let three = cell_px.saturating_mul(3).clamp(least, most);
+        return match deck {
+            DeckForm::Full => three,
+            DeckForm::Folded => {
+                let row_a = (ROW_A_MIN_PT * scale).round() as usize;
+                let back = three
+                    .saturating_sub(row_a)
+                    .checked_div(cell_px)
+                    .unwrap_or(0)
+                    .min(2);
+                three - back * cell_px
+            }
+        };
     }
     let folded = (FOLDED_PT * scale).round() as usize;
     match deck {
@@ -110,14 +192,87 @@ pub(crate) fn chrome_head_px(
     head_pts: f64,
     scale: f64,
     form: StatsBars,
+    style: DeckStyle,
     deck: DeckForm,
     cell_px: usize,
 ) -> usize {
-    band_px(head_pts, scale) + deck_px(form, deck, scale, cell_px)
+    band_px(head_pts, scale) + deck_px(form, style, deck, scale, cell_px)
+}
+
+/// The deck a carried window frame was sized under ([`carried_deck`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CarriedDeck {
+    pub(crate) style: DeckStyle,
+    pub(crate) form: DeckForm,
+    /// The head it gives the window, in device px.
+    pub(crate) head: usize,
+}
+
+impl CarriedDeck {
+    /// Whether a window keeps this carried frame, re-gridding to it once, though the `live`
+    /// style decided the form `deck` for it: the head moved under the frame for something other
+    /// than its rows, because the other style sized it, or because v2, whose form never follows
+    /// the window, sized it in the other form. Under merged, a frame the merged deck sized in
+    /// the other form follows its grid instead.
+    pub(crate) fn keeps_frame(self, live: DeckStyle, deck: DeckForm) -> bool {
+        self.style != live || (live == DeckStyle::V2 && self.form != deck)
+    }
+}
+
+/// What deck sized a carried frame `carried_h` px tall: the first head (`head_in`) under which
+/// the carried grid's frame (`frame_h`) sits less than a cell (`cell_h`) below `carried_h`,
+/// trying the `live` style's Full and then Folded form, and then the other style's Folded and
+/// then Full form. A style's two forms differ by whole cells ([`deck_px`]), so a frame matches
+/// one of them. `None` when no deck gives that frame.
+pub(crate) fn carried_deck(
+    carried_h: u32,
+    cell_h: usize,
+    live: DeckStyle,
+    head_in: impl Fn(DeckStyle, DeckForm) -> usize,
+    frame_h: impl Fn(usize) -> u32,
+) -> Option<CarriedDeck> {
+    let other = DeckStyle::ALL.into_iter().find(|s| *s != live)?;
+    [
+        (live, DeckForm::Full),
+        (live, DeckForm::Folded),
+        (other, DeckForm::Folded),
+        (other, DeckForm::Full),
+    ]
+    .into_iter()
+    .map(|(style, form)| CarriedDeck {
+        style,
+        form,
+        head: head_in(style, form),
+    })
+    .find(|c| {
+        carried_h
+            .checked_sub(frame_h(c.head))
+            .is_some_and(|extra| (extra as usize) < cell_h)
+    })
 }
 
 fn band_px(head_pts: f64, scale: f64) -> usize {
     (head_pts * scale).round().max(0.0) as usize
+}
+
+/// What a frame under a `band` px titlebar band has room for, as `style` reads it
+/// ([`plan::deck_form_for`]): v2 reads nothing, since its form never follows the window; the
+/// merged deck the rows the frame's grid would hold under its three rows (`rows_under` the
+/// head that gives), whichever form it has now.
+pub(crate) fn deck_room(
+    style: DeckStyle,
+    bars: StatsBars,
+    band: usize,
+    scale: f64,
+    cell_px: usize,
+    rows_under: impl FnOnce(usize) -> u16,
+) -> plan::DeckRoom {
+    match style {
+        DeckStyle::V2 => plan::DeckRoom::Unread,
+        DeckStyle::Merged => plan::DeckRoom::Rows(rows_under(
+            band + deck_px(bars, style, style.room_form(), scale, cell_px),
+        )),
+    }
 }
 
 /// Headless stats seam (development only, [`aterm_types::dev_seam!`]).
@@ -183,7 +338,38 @@ impl crate::App {
         self.config.stats_deck_size_or_default()
     }
 
-    /// Window `wid`'s chrome head in device pixels for a `head_pts` titlebar band at `scale`.
+    /// Which painter draws the Deck, from the live config (`[sys] stats_deck_style`).
+    pub(crate) fn deck_style(&self) -> DeckStyle {
+        self.config.stats_deck_style_or_default()
+    }
+
+    /// What deck sized window `wid`'s carried frame, `carried_h` px tall, for its carried
+    /// `rows`×`cols` grid under a `head_pts` titlebar band at `scale` ([`carried_deck`]).
+    pub(crate) fn carried_deck_of(
+        &self,
+        wid: crate::WindowId,
+        head_pts: f64,
+        scale: f64,
+        (rows, cols): (u16, u16),
+        carried_h: u32,
+    ) -> Option<CarriedDeck> {
+        let bars = self.stats_bars_form();
+        let (_, cell_h) = self.win_cell_size(wid);
+        let band = band_px(head_pts, scale);
+        let bare = u64::from(self.window_frame_px_for(wid, rows, cols).height)
+            .saturating_sub(self.backend.head() as u64);
+        carried_deck(
+            carried_h,
+            cell_h,
+            self.deck_style(),
+            |style, form| band + deck_px(bars, style, form, scale, cell_h),
+            |head| u32::try_from(bare.saturating_add(head as u64)).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Window `wid`'s chrome head in device pixels for a `head_pts` titlebar band at `scale`,
+    /// its deck's form first decided for a frame `frame_h_px` tall ([`deck_room`]; 0 keeps the
+    /// form), so a fold rides the resize that crossed it and re-grids nothing more.
     pub(crate) fn deck_head_px(
         &mut self,
         wid: crate::WindowId,
@@ -192,20 +378,25 @@ impl crate::App {
         frame_h_px: u32,
     ) -> usize {
         let form = self.stats_bars_form();
+        let style = self.deck_style();
         let pref = self.deck_size_pref();
         let (_, cell_px) = self.win_cell_size(wid);
+        let band = band_px(head_pts, scale);
+        let room = (frame_h_px > 0).then(|| {
+            deck_room(style, form, band, scale, cell_px, |head| {
+                self.grid_rows_under(wid, frame_h_px as usize, head)
+            })
+        });
         let deck = match self.windows.get_mut(&wid) {
             Some(ws) => {
-                if frame_h_px > 0 {
-                    let titlebar = band_px(head_pts, scale) as f64;
-                    let avail = crate::stats_plan::avail_pt(f64::from(frame_h_px), titlebar, scale);
-                    ws.deck_form = crate::stats_plan::deck_form_for(avail, ws.deck_form, pref);
+                if let Some(room) = room {
+                    ws.deck_form = plan::deck_form_for(room, ws.deck_form, pref);
                 }
                 ws.deck_form
             }
             None => DeckForm::Folded,
         };
-        chrome_head_px(head_pts, scale, form, deck, cell_px)
+        chrome_head_px(head_pts, scale, form, style, deck, cell_px)
     }
 
     /// The Deck's height in window `wid`'s head when it draws there, in the window's own form
@@ -219,7 +410,7 @@ impl crate::App {
             return 0;
         }
         let (_, ch) = self.win_cell_size(wid);
-        match deck_px(form, ws.deck_form, ws.scale, ch) {
+        match deck_px(form, self.deck_style(), ws.deck_form, ws.scale, ch) {
             deck if deck > 0 && ws.metrics.head >= deck => deck,
             _ => 0,
         }
@@ -292,6 +483,13 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) contrast: bool,
     /// Whose wording and which clock the words say times on.
     pub(crate) locale: Locale,
+    /// What needs the owner in the window's tabs, worst first ([`crate::App::deck_needs`]): the
+    /// merged deck's needs rail; empty for v2, the sill and the lens.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the needs rail (slice E2) draws them")
+    )]
+    pub(crate) needs: Vec<DeckNeed>,
 }
 
 const HEADER_BASE_FULL: f64 = 11.5;
@@ -1874,6 +2072,8 @@ pub(crate) fn prims_fp(prims: &[DrawPrim]) -> u64 {
 /// The stats card's inputs for a window, read off the App.
 pub(crate) struct DeckFrame {
     pub(crate) form: StatsBars,
+    /// Which painter draws the Deck ([`DeckStyle`]).
+    pub(crate) style: DeckStyle,
     /// The sill's plate alpha ([`DeckInput::plate`]).
     pub(crate) plate: Option<u8>,
     pub(crate) geom: DeckGeom,
@@ -1890,6 +2090,8 @@ pub(crate) struct DeckFrame {
     pub(crate) deck: DeckForm,
     /// Increase Contrast.
     pub(crate) contrast: bool,
+    /// [`DeckInput::needs`], read only where the merged deck draws them.
+    pub(crate) needs: Vec<DeckNeed>,
 }
 
 impl crate::App {
@@ -1941,13 +2143,19 @@ impl crate::App {
         let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
         let band = crate::chrome_band::band_colors(palette);
         let band_inks = cached_inks(band.bar_bg, band.value, band.accent);
+        let style = self.deck_style();
         match form {
             StatsBars::Off => None,
             StatsBars::Deck => {
                 let rows = self.deck_rows_px(wid)?;
                 let (dy, deck) = (rows.start, rows.len());
+                let needs = match style {
+                    DeckStyle::Merged => self.deck_needs(wid),
+                    DeckStyle::V2 => Vec::new(),
+                };
                 Some(DeckFrame {
                     form,
+                    style,
                     plate: None,
                     geom: DeckGeom {
                         w: w as f32,
@@ -1965,6 +2173,7 @@ impl crate::App {
                     dwc,
                     deck: ws.deck_form,
                     contrast,
+                    needs,
                 })
             }
             StatsBars::Sill => {
@@ -1983,6 +2192,7 @@ impl crate::App {
                 });
                 Some(DeckFrame {
                     form,
+                    style,
                     plate,
                     geom: DeckGeom {
                         w: w as f32,
@@ -2000,6 +2210,7 @@ impl crate::App {
                     dwc,
                     deck: ws.deck_form,
                     contrast,
+                    needs: Vec::new(),
                 })
             }
         }
@@ -2060,6 +2271,7 @@ impl crate::App {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.vitals.snapshot.as_ref().map(|s| s.seq).hash(&mut h);
         f.form.hash(&mut h);
+        f.style.hash(&mut h);
         for v in [f.geom.w, f.geom.h, f.geom.pad, f.geom.scale, f.geom.font_px] {
             v.to_bits().hash(&mut h);
         }
@@ -2072,6 +2284,7 @@ impl crate::App {
         f.deck.hash(&mut h);
         f.contrast.hash(&mut h);
         f.inks.hash(&mut h);
+        f.needs.hash(&mut h);
         Arc::as_ptr(&deck_metrics()).hash(&mut h);
         h.finish() | 1
     }
@@ -2092,9 +2305,11 @@ impl crate::App {
                 platform: Platform::host(),
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
             },
+            needs: f.needs.clone(),
         };
-        let (prims, hits) = match f.form {
-            StatsBars::Sill => crate::stats_sill::sill_paint(&f.geom, &input),
+        let (prims, hits) = match (f.form, f.style) {
+            (StatsBars::Sill, _) => crate::stats_sill::sill_paint(&f.geom, &input),
+            (_, DeckStyle::Merged) => crate::stats_merged::merged_paint(&f.geom, &input),
             _ => deck_paint(&f.geom, &input),
         };
         if let Some(ws) = self.windows.get(&wid) {
@@ -2257,7 +2472,7 @@ const A11Y_TITLE: &str = "Stats deck, last 10 minutes";
 /// prints it, never past 100 (the over mark and the words carry the
 /// excess); `None` when unknown.
 #[cfg(a11y_tree)]
-fn meter_pct(share: Option<f32>) -> Option<f32> {
+pub(crate) fn meter_pct(share: Option<f32>) -> Option<f32> {
     share.filter(|v| v.is_finite()).map(|v| {
         let pct = v * 100.0;
         if pct > 0.0 && pct < 0.5 {
@@ -2275,6 +2490,20 @@ pub(crate) fn stats_a11y_group(
     panes: &[u64],
     loc: &Locale,
 ) -> crate::a11y_tree::StatsGroup {
+    stats_group(A11Y_TITLE, None, DECK_RESOURCES, snap, panes, loc)
+}
+
+/// A deck's group named `name` as a reader meets it: what needs the owner, where the deck says
+/// (the merged deck's rail), then a meter for each of `resources` in their order, then the cores.
+#[cfg(a11y_tree)]
+pub(crate) fn stats_group(
+    name: &'static str,
+    needs: Option<crate::a11y_tree::StatsNeeds>,
+    resources: impl IntoIterator<Item = Resource>,
+    snap: Option<&Snapshot>,
+    panes: &[u64],
+    loc: &Locale,
+) -> crate::a11y_tree::StatsGroup {
     use crate::a11y_tree::{StatsGroup, StatsMeter};
     let empty;
     let snap = match snap {
@@ -2284,9 +2513,9 @@ pub(crate) fn stats_a11y_group(
             &empty
         }
     };
-    let meters = DECK_RESOURCES
-        .iter()
-        .map(|&res| StatsMeter {
+    let meters = resources
+        .into_iter()
+        .map(|res| StatsMeter {
             name: words::resource_name(res).into(),
             value: meter_pct(
                 (snap.seq > 0)
@@ -2316,7 +2545,8 @@ pub(crate) fn stats_a11y_group(
     });
     let n = cores.len();
     StatsGroup {
-        name: A11Y_TITLE,
+        name,
+        needs,
         meters,
         cores_name: format!("{n} CPU {}", if n == 1 { "core" } else { "cores" }),
         cores,
@@ -2357,8 +2587,15 @@ impl crate::App {
                     y1: oy as f64 + f64::from(lg.dy) + f64::from(lg.h),
                 }),
             });
+        let snap = self.vitals.snapshot.as_deref();
+        let group = match (f.form, f.style) {
+            (StatsBars::Deck, DeckStyle::Merged) => {
+                crate::stats_merged::merged_a11y_group(snap, &f.tab_panes, &loc)
+            }
+            _ => stats_a11y_group(snap, &f.tab_panes, &loc),
+        };
         Some(crate::a11y_tree::GridStats {
-            group: stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc),
+            group,
             bounds: Some(bounds),
             lens,
         })
@@ -2393,35 +2630,200 @@ pub(crate) mod tests {
     #[test]
     fn only_a_change_into_or_out_of_the_deck_moves_the_head() {
         const CELL: usize = 28;
-        let head = |bars, deck| chrome_head_px(28.0, 2.0, bars, deck, CELL);
-        for deck in [DeckForm::Folded, DeckForm::Full] {
-            for a in StatsBars::ALL {
-                for b in StatsBars::ALL {
-                    let moved = head(a, deck) != head(b, deck);
-                    assert_eq!(
-                        a.takes_room() != b.takes_room(),
-                        moved,
-                        "{a:?} to {b:?}, {deck:?}"
-                    );
+        let head = |bars, style, deck| chrome_head_px(28.0, 2.0, bars, style, deck, CELL);
+        for style in DeckStyle::ALL {
+            for deck in [DeckForm::Folded, DeckForm::Full] {
+                for a in StatsBars::ALL {
+                    for b in StatsBars::ALL {
+                        let moved = head(a, style, deck) != head(b, style, deck);
+                        assert_eq!(
+                            a.takes_room() != b.takes_room(),
+                            moved,
+                            "{a:?} to {b:?}, {style:?} {deck:?}"
+                        );
+                    }
+                }
+            }
+            for bars in StatsBars::ALL {
+                let unfold =
+                    head(bars, style, DeckForm::Full) - head(bars, style, DeckForm::Folded);
+                assert_eq!(
+                    unfold != 0,
+                    bars.takes_room(),
+                    "{bars:?} {style:?}: only the Deck's Full adds rows"
+                );
+                assert_eq!(unfold % CELL, 0, "{bars:?} {style:?}");
+            }
+            assert_eq!(
+                head(StatsBars::Sill, style, DeckForm::Folded),
+                head(StatsBars::Off, style, DeckForm::Full)
+            );
+        }
+        for bars in StatsBars::ALL {
+            for deck in [DeckForm::Folded, DeckForm::Full] {
+                let moved = head(bars, DeckStyle::V2, deck) != head(bars, DeckStyle::Merged, deck);
+                assert_eq!(
+                    moved,
+                    bars.takes_room(),
+                    "a style switch, {bars:?} {deck:?}"
+                );
+            }
+        }
+    }
+
+    /// The merged deck is three terminal rows, held to 45..=60 pt, at any scale; where three
+    /// cells fit that range the band costs the grid exactly three rows. Row A alone gives two
+    /// whole rows back, fewer only where row A would fall under 14 pt, so it is one cell
+    /// wherever three cells fit.
+    #[test]
+    fn merged_band_is_three_cells() {
+        let merged = |scale: f64, cell| {
+            let px = |deck| deck_px(StatsBars::Deck, DeckStyle::Merged, deck, scale, cell);
+            let (full, row_a) = (px(DeckForm::Full), px(DeckForm::Folded));
+            let at = format!("{cell} px cells at {scale}×");
+            let least = (ROW_A_MIN_PT * scale).round() as usize;
+            assert!(row_a >= least && row_a <= full, "{row_a} px row A, {at}");
+            assert_eq!(
+                (full - row_a) % cell,
+                0,
+                "row A gives whole rows back, {at}"
+            );
+            let back = (full - row_a) / cell;
+            assert!(back <= 2, "{at}");
+            if back < 2 {
+                assert!(
+                    row_a < least + cell,
+                    "two rows back would leave under 14 pt, {at}"
+                );
+            }
+            if (MERGED_MIN_PT * scale..=MERGED_MAX_PT * scale).contains(&(3.0 * cell as f64)) {
+                assert_eq!(row_a, cell, "one cell, {at}");
+            }
+            full
+        };
+        for (scale, cell, want) in [
+            (1.0, 17, 17),
+            (1.0, 14, 17),
+            (1.0, 8, 29),
+            (1.0, 40, 20),
+            (2.0, 34, 34),
+            (2.0, 28, 34),
+            (1.0, 50, 60),
+            (2.0, 64, 56),
+            (3.0, 12, 111),
+        ] {
+            let row_a = deck_px(
+                StatsBars::Deck,
+                DeckStyle::Merged,
+                DeckForm::Folded,
+                scale,
+                cell,
+            );
+            assert_eq!(row_a, want, "row A of {cell} px cells at {scale}×");
+        }
+        // The spec's 51 pt at a 17 pt cell; the mockups' 102 px at 2×; the clamps.
+        for (scale, cell, want) in [
+            (1.0, 17, 51),
+            (1.0, 15, 45),
+            (1.0, 20, 60),
+            (1.0, 8, 45),
+            (1.0, 40, 60),
+            (2.0, 34, 102),
+            (2.0, 28, 90),
+            (2.0, 30, 90),
+            (2.0, 40, 120),
+            (2.0, 64, 120),
+            (3.0, 51, 153),
+            (3.0, 12, 135),
+            (3.0, 90, 180),
+        ] {
+            assert_eq!(merged(scale, cell), want, "{cell} px cells at {scale}×");
+        }
+        for scale in [1.0, 2.0, 3.0] {
+            let (least, most) = ((45.0 * scale) as usize, (60.0 * scale) as usize);
+            let mut last = 0;
+            for cell in 1..=120 {
+                let px = merged(scale, cell);
+                assert!((least..=most).contains(&px), "{cell} px cells at {scale}×");
+                assert!(px >= last, "it never shrinks as the cell grows");
+                last = px;
+                if (least..=most).contains(&(3 * cell)) {
+                    assert_eq!(px, 3 * cell, "three rows of {cell} px at {scale}×");
                 }
             }
         }
-        for bars in StatsBars::ALL {
-            let unfold = head(bars, DeckForm::Full) - head(bars, DeckForm::Folded);
-            assert_eq!(unfold != 0, bars.takes_room(), "{bars:?}");
-            assert_eq!(unfold % CELL, 0, "{bars:?}");
+        for deck in [DeckForm::Full, DeckForm::Folded] {
+            for bars in [StatsBars::Sill, StatsBars::Off] {
+                assert_eq!(deck_px(bars, DeckStyle::Merged, deck, 2.0, 28), 0);
+            }
+            for scale in [0.0, -1.0, f64::NAN] {
+                assert_eq!(
+                    deck_px(StatsBars::Deck, DeckStyle::Merged, deck, scale, 28),
+                    0
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_style_parses() {
+        assert_eq!(DeckStyle::parse(None), DeckStyle::V2);
         assert_eq!(
-            head(StatsBars::Sill, DeckForm::Folded),
-            head(StatsBars::Off, DeckForm::Full)
+            DeckStyle::default(),
+            DeckStyle::V2,
+            "v2 until the merged deck is built"
         );
+        for (word, want) in [
+            ("v2", DeckStyle::V2),
+            ("V2", DeckStyle::V2),
+            ("merged", DeckStyle::Merged),
+            (" Merged ", DeckStyle::Merged),
+            ("MERGED", DeckStyle::Merged),
+            ("", DeckStyle::V2),
+            ("v3", DeckStyle::V2),
+            ("merge", DeckStyle::V2),
+        ] {
+            assert_eq!(DeckStyle::parse(Some(word)), want, "{word:?}");
+        }
+        for style in DeckStyle::ALL {
+            assert_eq!(DeckStyle::from_word(style.word()), Some(style));
+        }
+        assert_eq!(DeckStyle::from_word("v3"), None);
+        let mut config = crate::app_config::Config::default();
+        assert_eq!(config.stats_deck_style_or_default(), DeckStyle::V2);
+        config = aterm_toml::from_str("[sys]\nstats_deck_style = \"Merged\"\n").expect("toml");
+        assert_eq!(config.stats_deck_style_or_default(), DeckStyle::Merged);
+        config = aterm_toml::from_str("[sys]\nstats_deck_style = \"table\"\n").expect("toml");
+        assert_eq!(config.stats_deck_style_or_default(), DeckStyle::V2);
+    }
+
+    /// Sets the deck's style as the config file would (`[sys] stats_deck_style`).
+    pub(crate) fn set_style(app: &mut crate::App, style: DeckStyle) {
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_deck_style = Some(style.word().into());
+    }
+
+    fn set_size(app: &mut crate::App, pref: DeckSizePref) {
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_deck_size = Some(pref.word().into());
     }
 
     #[test]
     fn head_sites_agree() {
+        for style in DeckStyle::ALL {
+            head_sites_agree_in(style);
+        }
+    }
+
+    fn head_sites_agree_in(style: DeckStyle) {
         use aterm_window::dpi::PhysicalSize;
         let _attached = attach_stats();
         let mut app = crate::App::headless_for_test();
+        set_style(&mut app, style);
         let wid = crate::WindowId(0);
         let band_pts = 28.0;
         let mut cells = std::collections::BTreeSet::new();
@@ -2436,16 +2838,35 @@ pub(crate) mod tests {
                 }
                 let (_, ch) = app.win_cell_size(wid);
                 cells.insert(ch);
-                let at = format!("{ch} px cells at {scale}×");
+                let at = format!("{style:?}, {ch} px cells at {scale}×");
                 let mut heads = Vec::new();
-                for (avail, want) in [(700.0, DeckForm::Folded), (900.0, DeckForm::Full)] {
-                    let frame = band + (FOLDED_PT * scale) as usize + (avail * scale) as usize;
+                // v2 is Full only where chosen, whatever the window's height.
+                let frames = match style {
+                    DeckStyle::V2 => [
+                        (DeckSizePref::Auto, DeckForm::Folded),
+                        (DeckSizePref::Full, DeckForm::Full),
+                    ]
+                    .map(|(pref, want)| {
+                        (band + ((FOLDED_PT + 900.0) * scale) as usize, pref, want)
+                    }),
+                    DeckStyle::Merged => {
+                        [(6, DeckForm::Folded), (30, DeckForm::Full)].map(|(rows, want)| {
+                            let three = deck_px(StatsBars::Deck, style, DeckForm::Full, scale, ch);
+                            let pads = app.win_pad_top(wid) + app.win_pad(wid);
+                            let rows = rows + usize::from(app.chrome_rows(wid));
+                            (band + three + pads + rows * ch, DeckSizePref::Auto, want)
+                        })
+                    }
+                };
+                for (frame, pref, want) in frames {
+                    set_size(&mut app, pref);
                     let head = app.deck_head_px(wid, band_pts, scale, frame as u32);
                     let ws = app.windows.get_mut(&wid).expect("the window");
                     assert_eq!(ws.deck_form, want, "{at}");
                     ws.metrics.head = head;
                     app.backend.set_head(head);
                     let f = app.deck_frame(wid).expect("the Deck shows");
+                    assert_eq!(f.style, style, "{at}");
                     let (above, below) = if crate::tab_bar::STRIP_IS_CHROME_BAND {
                         (0, band)
                     } else {
@@ -2455,9 +2876,10 @@ pub(crate) mod tests {
                     assert_eq!(f.geom.h as usize + band, head, "{at}");
                     assert_eq!(
                         f.geom.h as usize,
-                        deck_px(StatsBars::Deck, want, scale, ch),
+                        deck_px(StatsBars::Deck, style, want, scale, ch),
                         "{at}"
                     );
+                    assert_eq!(app.deck_drawn_px(wid), f.geom.h as usize, "{at}");
                     assert_eq!(
                         f.dy as usize + f.geom.h as usize + below,
                         app.win_head(wid),
@@ -2501,37 +2923,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// `stats_deck_size` forces the form whatever the window's room (under merged, full keeps
+    /// the three rows and folded row A alone); auto keeps v2 Folded at every height and decides
+    /// the merged deck's form from the frame; a frame of 0 keeps the form either way.
     #[test]
     fn the_deck_size_setting_forces_the_form() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let form = |app: &crate::App| app.windows[&wid].deck_form;
-        let tall = 56 + 124 + 1800;
-        let short = 56 + 124 + 1400;
-        for (word, frame, want) in [
-            ("folded", tall, DeckForm::Folded),
-            ("full", short, DeckForm::Full),
-            ("auto", short, DeckForm::Folded),
-            ("auto", tall, DeckForm::Full),
-            ("auto", 0, DeckForm::Full),
-        ] {
-            app.config
-                .sys
-                .get_or_insert_with(Default::default)
-                .stats_deck_size = Some(word.into());
-            let head = app.deck_head_px(wid, 28.0, 2.0, frame);
-            assert_eq!(form(&app), want, "{word} at {frame} px");
+        for style in DeckStyle::ALL {
+            let mut app = crate::App::headless_for_test();
+            set_style(&mut app, style);
+            let wid = crate::WindowId(0);
+            let form = |app: &crate::App| app.windows[&wid].deck_form;
             let (_, ch) = app.win_cell_size(wid);
-            assert_eq!(
-                head,
-                56 + deck_px(StatsBars::Deck, want, 2.0, ch),
-                "{word} at {frame} px"
-            );
+            let (tall, short) = match style {
+                DeckStyle::V2 => (56 + 124 + 1800, 56 + 124 + 1400),
+                DeckStyle::Merged => {
+                    let three = deck_px(StatsBars::Deck, style, DeckForm::Full, 2.0, ch);
+                    let pads = app.win_pad_top(wid) + app.win_pad(wid);
+                    let chrome = usize::from(app.chrome_rows(wid));
+                    let rows = |rows: usize| (56 + three + pads + (rows + chrome) * ch) as u32;
+                    (rows(30), rows(6))
+                }
+            };
+            let tall_auto = match style {
+                DeckStyle::V2 => DeckForm::Folded,
+                DeckStyle::Merged => DeckForm::Full,
+            };
+            for (word, frame, want) in [
+                ("folded", tall, DeckForm::Folded),
+                ("full", short, DeckForm::Full),
+                ("auto", 0, DeckForm::Full),
+                ("auto", short, DeckForm::Folded),
+                ("full", tall, DeckForm::Full),
+                ("auto", tall, tall_auto),
+                ("auto", 0, tall_auto),
+                ("auto", short, DeckForm::Folded),
+            ] {
+                let at = format!("{style:?} {word} at {frame} px");
+                app.config
+                    .sys
+                    .get_or_insert_with(Default::default)
+                    .stats_deck_size = Some(word.into());
+                let head = app.deck_head_px(wid, 28.0, 2.0, frame);
+                assert_eq!(form(&app), want, "{at}");
+                assert_eq!(
+                    head,
+                    56 + deck_px(StatsBars::Deck, style, want, 2.0, ch),
+                    "{at}"
+                );
+            }
         }
     }
 
+    /// A window v2 sized (Folded at 62 pt, and Full), restored under either style, keeps its
+    /// frame. Under v2 it takes the form the setting gives, Folded unless full, whatever form
+    /// sized it, and its grid follows the frame: a window Full sized under the old Automatic
+    /// gets the rows Full took back. A window the merged style sized keeps its frame
+    /// under either. [`a_window_restored_under_merged_keeps_row_a_or_its_three_rows`] has row A.
     #[test]
-    fn a_restored_window_keeps_its_form_and_size() {
+    fn a_restored_window_keeps_its_size() {
+        for live in DeckStyle::ALL {
+            a_restored_window_keeps_its_size_in(live);
+        }
+    }
+
+    fn a_restored_window_keeps_its_size_in(live: DeckStyle) {
         use aterm_window::dpi::PhysicalSize;
         let _attached = attach_stats();
         let mut app = crate::App::headless_for_test();
@@ -2544,18 +2999,22 @@ pub(crate) mod tests {
         }
         let (_, cell) = app.win_cell_size(wid);
         let cols = 80;
+        let v2_px = |deck| deck_px(StatsBars::Deck, DeckStyle::V2, deck, scale, cell);
+        let full_rows = (v2_px(DeckForm::Full) - v2_px(DeckForm::Folded)) / cell;
+        assert!(full_rows > 0, "PRECONDITION: Full takes whole rows");
+        let rows_in = |form: DeckForm| match form {
+            DeckForm::Full => full_rows as i32,
+            DeckForm::Folded => 0,
+        };
         let form = |app: &crate::App| app.windows[&wid].deck_form;
-        let frame_in = |app: &mut crate::App, deck: DeckForm, rows: u16| {
+        let frame_in = |app: &mut crate::App, sized: DeckStyle, deck: DeckForm, rows: u16| {
+            set_style(app, sized);
             app.windows.get_mut(&wid).expect("the window").deck_form = deck;
             let head = app.deck_head_px(wid, band_pts, scale, 0);
             app.backend.set_head(head);
             let frame = app.window_frame_px_for(wid, rows, cols);
-            let avail = crate::stats_plan::avail_pt(
-                f64::from(frame.height),
-                band_px(band_pts, scale) as f64,
-                scale,
-            );
-            (frame, avail)
+            set_style(app, live);
+            frame
         };
         let attach = |app: &mut crate::App, rows: u16, carried: Option<PhysicalSize<u32>>| {
             app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
@@ -2563,34 +3022,462 @@ pub(crate) mod tests {
             app.windows.get_mut(&wid).expect("the window").metrics.head = head;
             app.attach_frame_px(wid, rows, cols, carried)
         };
-        let in_band = |avail: f64| (850.0..870.0).contains(&avail);
         let rem = (cell / 2) as u32;
-        let mut checked = [false; 2];
-        for rows in 20..240 {
-            for (i, deck) in [DeckForm::Full, DeckForm::Folded].into_iter().enumerate() {
-                let (frame, _) = frame_in(&mut app, deck, rows);
-                let carried = PhysicalSize::new(frame.width, frame.height + rem);
-                let avail = crate::stats_plan::avail_pt(
-                    f64::from(carried.height),
-                    band_px(band_pts, scale) as f64,
-                    scale,
+        for rows in [20, 57, 120] {
+            for pref in DeckSizePref::ALL {
+                set_size(&mut app, pref);
+                for deck in [DeckForm::Full, DeckForm::Folded] {
+                    let frame = frame_in(&mut app, DeckStyle::V2, deck, rows);
+                    let carried = PhysicalSize::new(frame.width, frame.height + rem);
+                    let at = format!("{live:?} {pref:?}: a v2 {deck:?} frame of {rows} rows");
+                    let size = attach(&mut app, rows, Some(carried));
+                    let want = match (live, pref) {
+                        (_, DeckSizePref::Full) => DeckForm::Full,
+                        (DeckStyle::V2, _) | (_, DeckSizePref::Folded) => DeckForm::Folded,
+                        // The merged deck's form is its rows', dozens here.
+                        (DeckStyle::Merged, DeckSizePref::Auto) => DeckForm::Full,
+                    };
+                    assert_eq!(form(&app), want, "{at}");
+                    assert_eq!(size, carried, "the window keeps its size, {at}");
+                    let held = app.grid_dims_for(wid, size);
+                    assert_eq!(held.1, cols, "{at}");
+                    if live == DeckStyle::V2 {
+                        let gained = rows_in(deck) - rows_in(want);
+                        assert_eq!(
+                            i32::from(held.0) - i32::from(rows),
+                            gained,
+                            "the grid takes back what Full took, {at}"
+                        );
+                    } else {
+                        assert!(held.0 > rows, "{held:?}: the grid grows, {at}");
+                    }
+                    let _ = attach(&mut app, rows, None);
+                    assert_eq!(form(&app), want, "a new window of that grid, {at}");
+                }
+            }
+            set_size(&mut app, DeckSizePref::Auto);
+            let frame = frame_in(&mut app, DeckStyle::Merged, DeckForm::Full, rows);
+            let carried = PhysicalSize::new(frame.width, frame.height + rem);
+            let size = attach(&mut app, rows, Some(carried));
+            assert_eq!(
+                size, carried,
+                "{live:?}: a merged window keeps its size, {rows} rows"
+            );
+            let held = app.grid_dims_for(wid, size);
+            if live == DeckStyle::Merged {
+                assert_eq!(held, (rows, cols), "{rows} rows");
+            } else {
+                assert!(
+                    held.0 < rows && held.1 == cols,
+                    "{held:?}: the grid shrinks, {rows} rows"
                 );
-                if !in_band(avail) {
+            }
+        }
+    }
+
+    /// Under merged, a restored window keeps the form its carried frame was sized in where its
+    /// rows leave the choice open (10 rows under the three rows), and its grid: a frame row A
+    /// sized for up to 12 rows stays row A and one the three rows sized for 10 or more stays
+    /// so, each at its carried size; past that the form follows the rows and the frame
+    /// follows the grid. A frame v2 sized keeps its size, takes the form its rows give and
+    /// re-grids to it.
+    #[test]
+    fn a_window_restored_under_merged_keeps_row_a_or_its_three_rows() {
+        use aterm_window::dpi::PhysicalSize;
+        let _attached = attach_stats();
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (band_pts, scale) = (28.0, 2.0);
+        {
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            ws.scale = scale;
+            ws.head_pts = band_pts;
+        }
+        let (_, cell) = app.win_cell_size(wid);
+        let (cols, rem) = (80, (cell / 2) as u32);
+        let three = band_px(band_pts, scale)
+            + deck_px(
+                StatsBars::Deck,
+                DeckStyle::Merged,
+                DeckForm::Full,
+                scale,
+                cell,
+            );
+        let back = three
+            - chrome_head_px(
+                band_pts,
+                scale,
+                StatsBars::Deck,
+                DeckStyle::Merged,
+                DeckForm::Folded,
+                cell,
+            );
+        assert_eq!(back, 2 * cell, "PRECONDITION: row A gives two rows back");
+        let sized = |app: &mut crate::App, style, deck, rows| {
+            set_style(app, style);
+            app.windows.get_mut(&wid).expect("the window").deck_form = deck;
+            let head = app.deck_head_px(wid, band_pts, scale, 0);
+            app.backend.set_head(head);
+            let frame = app.window_frame_px_for(wid, rows, cols);
+            set_style(app, DeckStyle::Merged);
+            PhysicalSize::new(frame.width, frame.height + rem)
+        };
+        let mut kept = [0; 2];
+        for rows in 3..=16u16 {
+            for (style, deck) in [
+                (DeckStyle::Merged, DeckForm::Folded),
+                (DeckStyle::Merged, DeckForm::Full),
+                (DeckStyle::V2, DeckForm::Folded),
+                (DeckStyle::V2, DeckForm::Full),
+            ] {
+                let at = format!("{style:?} {deck:?} frame of {rows} rows");
+                let carried = sized(&mut app, style, deck, rows);
+                let under_three = app.grid_rows_under(wid, carried.height as usize, three);
+                app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
+                let head = app.attach_deck_head(wid, band_pts, scale, (rows, cols), Some(carried));
+                app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+                let size = app.attach_frame_px(wid, rows, cols, Some(carried));
+                let want = match under_three {
+                    0..=9 => DeckForm::Folded,
+                    10 => deck,
+                    _ => DeckForm::Full,
+                };
+                assert_eq!(app.windows[&wid].deck_form, want, "{at}, {under_three}");
+                let held = app.grid_dims_for(wid, size);
+                if style == DeckStyle::V2 {
+                    assert_eq!(size, carried, "the window keeps its size, {at}");
+                    assert!(held.0 != rows && held.1 == cols, "{held:?}: re-grids, {at}");
                     continue;
                 }
-                checked[i] = true;
-                let size = attach(&mut app, rows, Some(carried));
-                assert_eq!(form(&app), deck, "{rows} rows at avail {avail}");
-                assert_eq!(size, carried, "{deck:?}: the window keeps its size");
-                if deck == DeckForm::Full {
-                    let (_, folded_avail) = frame_in(&mut app, DeckForm::Folded, rows);
-                    assert!(folded_avail < 850.0, "PRECONDITION: {folded_avail}");
-                    let _ = attach(&mut app, rows, None);
-                    assert_eq!(form(&app), DeckForm::Folded, "a new window of that grid");
+                assert_eq!(held, (rows, cols), "the grid holds, {at}");
+                assert_eq!(size == carried, want == deck, "{at}");
+                if want == deck && under_three == 10 {
+                    kept[usize::from(deck == DeckForm::Full)] += 1;
                 }
             }
         }
-        assert_eq!(checked, [true; 2], "CONTROL: both forms met the band");
+        assert!(
+            kept.iter().all(|k| *k > 0),
+            "CONTROL: both forms met 10 rows: {kept:?}"
+        );
+    }
+
+    /// A new window (nothing carried) opens in the form its own grid gives: under merged, row A
+    /// alone only when that grid is under 10 rows, so a 10- to 12-row window keeps the three
+    /// rows; v2's windows open Folded. Either way the window holds the grid it was opened for.
+    #[test]
+    fn a_new_window_opens_in_the_form_its_grid_gives() {
+        let _attached = attach_stats();
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (band_pts, scale, cols) = (28.0, 2.0, 80);
+        {
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            ws.scale = scale;
+            ws.head_pts = band_pts;
+        }
+        for style in DeckStyle::ALL {
+            set_style(&mut app, style);
+            for rows in 3..=16u16 {
+                let at = format!("{style:?}, a new window of {rows} rows");
+                app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
+                let head = app.attach_deck_head(wid, band_pts, scale, (rows, cols), None);
+                app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+                let want = match style {
+                    DeckStyle::Merged if rows >= 10 => DeckForm::Full,
+                    _ => DeckForm::Folded,
+                };
+                assert_eq!(app.windows[&wid].deck_form, want, "{at}");
+                let size = app.attach_frame_px(wid, rows, cols, None);
+                assert_eq!(app.grid_dims_for(wid, size), (rows, cols), "{at}");
+            }
+        }
+    }
+
+    /// A window v2 sized, attached under the merged style, keeps its frame, and every tab of it
+    /// re-grids once to what that frame holds under the merged deck, booked `site=deck`; so does
+    /// a window v2 sized Full, attached under v2's Automatic, which is Folded. A window the live
+    /// style sized in the form it takes re-grids nothing.
+    #[test]
+    fn a_frame_another_deck_sized_regrids_each_tab_once_at_its_attach() {
+        for (deck, sized, live) in [
+            (DeckForm::Folded, DeckStyle::V2, DeckStyle::Merged),
+            (DeckForm::Full, DeckStyle::V2, DeckStyle::Merged),
+            (DeckForm::Folded, DeckStyle::Merged, DeckStyle::V2),
+            (DeckForm::Full, DeckStyle::V2, DeckStyle::V2),
+            (DeckForm::Folded, DeckStyle::V2, DeckStyle::V2),
+            (DeckForm::Full, DeckStyle::Merged, DeckStyle::Merged),
+        ] {
+            let at = format!("{deck:?} {sized:?} frame attached under {live:?}");
+            let _attached = attach_stats();
+            let (mut app, wid, sessions) = three_panes();
+            let (band_pts, scale) = (28.0, 2.0);
+            {
+                let ws = app.windows.get_mut(&wid).expect("the window");
+                ws.scale = scale;
+                ws.head_pts = band_pts;
+            }
+            let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+            set_style(&mut app, sized);
+            app.windows.get_mut(&wid).expect("the window").deck_form = deck;
+            let head = app.deck_head_px(wid, band_pts, scale, 0);
+            app.backend.set_head(head);
+            let carried = app.window_frame_px_for(wid, rows, cols);
+            set_style(&mut app, live);
+            let before = sites_of(&app, &sessions);
+            let head = app.attach_deck_head(wid, band_pts, scale, (rows, cols), Some(carried));
+            app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+            let size = app.attach_frame_px(wid, rows, cols, Some(carried));
+            assert_eq!(size, carried, "the window keeps its frame, {at}");
+            let held = app.grid_dims_for(wid, size);
+            app.regrid_to_attach_frame(wid, size);
+            app.regrid_to_attach_frame(wid, size);
+            let ws = &app.windows[&wid];
+            assert_eq!((ws.rows, ws.cols), held, "{at}");
+            let booked = new_sites(&before, &sites_of(&app, &sessions));
+            // Under Automatic, v2 takes Folded and the merged deck, at these rows, its three.
+            let want = match live {
+                DeckStyle::V2 => DeckForm::Folded,
+                DeckStyle::Merged => DeckForm::Full,
+            };
+            assert_eq!(app.windows[&wid].deck_form, want, "{at}");
+            if sized == live && deck == want {
+                assert_eq!(held, (rows, cols), "{at}");
+                assert!(booked.iter().all(Vec::is_empty), "{booked:?}, {at}");
+            } else {
+                assert_ne!(held, (rows, cols), "PRECONDITION: the head moved, {at}");
+                assert!(
+                    booked.iter().all(|b| b == &["site=deck"]),
+                    "one re-grid each, booked deck: {booked:?}, {at}"
+                );
+            }
+        }
+    }
+
+    /// A window of two tabs, the second split: three panes, each its own session.
+    fn three_panes() -> (crate::App, crate::WindowId, Vec<u64>) {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let first = app
+            .focused_session_id(wid)
+            .expect("the first tab's session");
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        let split = app.split_active_stub_tab(wid);
+        let sessions = vec![first, second, split];
+        assert_eq!(app.windows[&wid].tab_set.tabs().len(), 2, "PRECONDITION");
+        (app, wid, sessions)
+    }
+
+    /// Each session's resize rows' `site=` words, oldest first.
+    fn sites_of(app: &crate::App, sessions: &[u64]) -> Vec<Vec<String>> {
+        sessions
+            .iter()
+            .map(|id| {
+                let reply = app
+                    .pool
+                    .get(*id)
+                    .expect("a live session")
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap()
+                    .resizes()
+                    .reply(0, None);
+                reply
+                    .lines()
+                    .filter(|l| l.starts_with("resize "))
+                    .filter_map(|l| l.split(' ').find(|w| w.starts_with("site=")))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// What each session booked since `before`.
+    fn new_sites(before: &[Vec<String>], after: &[Vec<String>]) -> Vec<Vec<String>> {
+        before
+            .iter()
+            .zip(after)
+            .map(|(b, a)| a[b.len()..].to_vec())
+            .collect()
+    }
+
+    /// A switch of the deck's style in the config re-grids every tab of the window once,
+    /// booked `site=deck`, and a reload that keeps the style re-grids none. A headless
+    /// window's head is the backend's, so the test moves it to the new style's deck as
+    /// `refresh_all_window_metrics` moves an attached window's during the reload.
+    #[test]
+    fn a_style_switch_regrids_each_tab_once_booked_deck() {
+        use aterm_window::dpi::PhysicalSize;
+        let _attached = attach_stats();
+        let (mut app, wid, sessions) = three_panes();
+        let scratch = aterm_tempfile::tempdir().expect("scratch dir");
+        let dir = scratch.path().to_path_buf();
+        let text = |style: DeckStyle, bars: &str| {
+            format!("[sys]\n{bars}stats_deck_style = \"{}\"\n", style.word())
+        };
+        let apply = |app: &mut crate::App, text: String| {
+            crate::app_colorscheme::install_resolved_colors::apply_config_text(app, &dir, &text);
+        };
+        let head_of = |app: &mut crate::App, style: DeckStyle| {
+            let (_, cell) = app.win_cell_size(wid);
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            let head = chrome_head_px(0.0, ws.scale, StatsBars::Deck, style, ws.deck_form, cell);
+            ws.metrics.head = head;
+            app.backend.set_head(head);
+        };
+        let size = PhysicalSize::new(1600, 1400);
+        app.windows.get_mut(&wid).expect("the window").win_px = Some(size);
+        apply(&mut app, text(DeckStyle::V2, ""));
+        head_of(&mut app, DeckStyle::V2);
+        app.on_resize(wid, size);
+        let v2_grid = app.grid_dims_for(wid, size);
+        assert_eq!((app.windows[&wid].rows, app.windows[&wid].cols), v2_grid);
+        let deck = "stats_bars = \"deck\"\n";
+        for (style, bars, regrids) in [
+            (DeckStyle::Merged, "", true),
+            (DeckStyle::Merged, deck, false),
+            (DeckStyle::V2, deck, true),
+            (DeckStyle::V2, "", false),
+        ] {
+            let at = format!("to {style:?} {bars:?}");
+            let before = sites_of(&app, &sessions);
+            let grid = (app.windows[&wid].rows, app.windows[&wid].cols);
+            head_of(&mut app, style);
+            apply(&mut app, text(style, bars));
+            assert_eq!(app.deck_style(), style, "{at}");
+            let booked = new_sites(&before, &sites_of(&app, &sessions));
+            let now = (app.windows[&wid].rows, app.windows[&wid].cols);
+            if regrids {
+                assert_eq!(now, app.grid_dims_for(wid, size), "{at}");
+                assert_ne!(now, grid, "PRECONDITION: the head moved the grid, {at}");
+                assert!(
+                    booked.iter().all(|b| b == &["site=deck"]),
+                    "one re-grid each, booked deck: {booked:?}, {at}"
+                );
+            } else {
+                assert_eq!(now, grid, "{at}");
+                assert!(booked.iter().all(Vec::is_empty), "{booked:?}, {at}");
+            }
+        }
+        assert_eq!(
+            (app.windows[&wid].rows, app.windows[&wid].cols),
+            v2_grid,
+            "back where it started"
+        );
+    }
+
+    /// Under merged, a frame swept down a pixel at a time through 10 rows and back up, and one
+    /// that steps back a row after each row it takes, folds the deck to row A once and unfolds
+    /// it once. Each switch rides the resize that crossed it: the head is decided from the
+    /// frame before the grid, as `on_resize` does on a window (a headless window's head is the
+    /// backend's, so the test sets it), and a second pass at the same frame moves nothing.
+    /// Every tab re-grids once for each frame that moves its grid, booked `site=window`; the
+    /// grid is what the frame holds under the three rows, plus the two rows row A gives back,
+    /// so between the switches it never moves against the frame.
+    #[test]
+    fn the_row_a_fold_never_flaps() {
+        use aterm_window::dpi::PhysicalSize;
+        let _attached = attach_stats();
+        let (mut app, wid, sessions) = three_panes();
+        set_style(&mut app, DeckStyle::Merged);
+        let (band_pts, scale) = (28.0, 2.0);
+        {
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            ws.scale = scale;
+            ws.head_pts = band_pts;
+        }
+        let (_, ch) = app.win_cell_size(wid);
+        let px = |deck| {
+            chrome_head_px(
+                band_pts,
+                scale,
+                StatsBars::Deck,
+                DeckStyle::Merged,
+                deck,
+                ch,
+            )
+        };
+        let (three, back) = (
+            px(DeckForm::Full),
+            px(DeckForm::Full) - px(DeckForm::Folded),
+        );
+        assert_eq!(back, 2 * ch, "PRECONDITION: row A gives two rows back");
+        let pads = app.win_pad_top(wid) + app.win_pad(wid);
+        let chrome = usize::from(app.chrome_rows(wid));
+        let frame_of = |rows: usize| three + pads + (rows + chrome) * ch;
+        let step = |app: &mut crate::App, h: usize| {
+            let size = PhysicalSize::new(1600, h as u32);
+            let before = sites_of(app, &sessions);
+            let grid = (app.windows[&wid].rows, app.windows[&wid].cols);
+            let head = app.deck_head_px(wid, band_pts, scale, size.height);
+            app.windows.get_mut(&wid).expect("the window").metrics.head = head;
+            app.backend.set_head(head);
+            app.on_resize(wid, size);
+            assert_eq!(
+                app.deck_head_px(wid, band_pts, scale, size.height),
+                head,
+                "a second pass at {h} px moves nothing"
+            );
+            let ws = &app.windows[&wid];
+            let now = (ws.rows, ws.cols);
+            assert_eq!(now, app.grid_dims_for(wid, size), "{h} px");
+            let booked = new_sites(&before, &sites_of(app, &sessions));
+            let want: &[&str] = if now == grid { &[] } else { &["site=window"] };
+            assert!(
+                booked.iter().all(|b| b == want),
+                "{h} px, {grid:?} to {now:?}: {booked:?}"
+            );
+            let under_three = app.grid_rows_under(wid, h, three);
+            let folded = ws.deck_form == DeckForm::Folded;
+            assert_eq!(
+                usize::from(ws.rows),
+                usize::from(under_three) + if folded { back / ch } else { 0 },
+                "{h} px"
+            );
+            (ws.deck_form, ws.rows, under_three)
+        };
+        let (top, low) = (frame_of(14) + ch - 1, frame_of(6));
+        let by_px: Vec<usize> = (low..=top).rev().chain(low..=top).collect();
+        let half = ch / 2;
+        let rows_down = [14, 15, 13, 14, 12, 13, 11, 12, 10, 11, 9, 10, 8, 9, 7, 8, 6];
+        let rows_up = [7, 6, 8, 7, 9, 8, 10, 9, 11, 10, 12, 11, 13, 12, 14];
+        let jittered: Vec<usize> = rows_down
+            .into_iter()
+            .chain(rows_up)
+            .map(|r| frame_of(r) + half)
+            .collect();
+        for (path, frames) in [("pixel by pixel", by_px), ("jittered", jittered)] {
+            let (mut form, mut rows, mut under) = step(&mut app, frames[0]);
+            assert_eq!((form, under), (DeckForm::Full, 14), "{path}: PRECONDITION");
+            let mut switches = Vec::new();
+            for (i, h) in frames.iter().copied().enumerate().skip(1) {
+                let (f, r, u) = step(&mut app, h);
+                let down = frames[i] < frames[i - 1];
+                if f != form {
+                    switches.push((form, f, u));
+                } else if path == "pixel by pixel" {
+                    assert!(
+                        if down { r <= rows } else { r >= rows },
+                        "{path}: the grid moved against the frame at {h} px: {rows} to {r}"
+                    );
+                }
+                assert!(
+                    if down { u <= under } else { u >= under },
+                    "{path}: CONTROL: rows under the three rows follow the frame"
+                );
+                (form, rows, under) = (f, r, u);
+            }
+            assert_eq!(
+                switches,
+                [
+                    (DeckForm::Full, DeckForm::Folded, 9),
+                    (DeckForm::Folded, DeckForm::Full, 11)
+                ],
+                "{path}: one fold under 10 rows and one unfold at 11"
+            );
+        }
     }
 
     /// A snapshot after three readings: ten cores in two clusters, memory, a
@@ -2984,6 +3871,7 @@ pub(crate) mod tests {
                 platform: Platform::MacOs,
                 utc_offset_s: 0,
             },
+            needs: Vec::new(),
         }
     }
 
@@ -3131,6 +4019,13 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn the_deck_takes_the_heads_foot_under_a_titlebar_and_its_top_over_a_band() {
+        for style in DeckStyle::ALL {
+            the_deck_takes_the_heads_foot_in(style);
+        }
+    }
+
+    #[cfg(unix)]
+    fn the_deck_takes_the_heads_foot_in(style: DeckStyle) {
         let _attached = attach_stats();
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -3138,8 +4033,10 @@ pub(crate) mod tests {
             .sys
             .get_or_insert_with(Default::default)
             .stats_bars = Some("deck".into());
+        set_style(&mut app, style);
         let deck = deck_px(
             StatsBars::Deck,
+            style,
             app.windows[&wid].deck_form,
             app.windows[&wid].scale,
             app.win_cell_size(wid).1,
@@ -3194,6 +4091,7 @@ pub(crate) mod tests {
             .stats_bars = Some("deck".into());
         let deck = deck_px(
             StatsBars::Deck,
+            DeckStyle::V2,
             app.windows[&wid].deck_form,
             app.windows[&wid].scale,
             app.win_cell_size(wid).1,

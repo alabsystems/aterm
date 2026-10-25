@@ -743,6 +743,15 @@ impl SinkWriter {
         }
     }
 
+    /// The bytes written to this PTY that the program at its slave has not read (canonical mode:
+    /// whole lines only), or `None` where that is unknown ([`aterm_pty::unread_input_len`]: on
+    /// macOS the master's own count, on Linux the slave's through a descriptor of it). Every reader
+    /// of the program's unread input reads it here, never as a guessed zero.
+    #[must_use]
+    pub fn unread_input(&self) -> Option<usize> {
+        aterm_pty::unread_input_len(self.master)
+    }
+
     /// How much input the program at this PTY has not read.
     #[must_use]
     pub fn input_backlog(&self) -> Option<InputBacklog> {
@@ -753,7 +762,7 @@ impl SinkWriter {
     #[must_use]
     pub fn input_backlog_at(&self, now: Instant) -> Option<InputBacklog> {
         let echo = self.tty_echo()?;
-        let queued = aterm_pty::input_queue_len(self.master)?;
+        let queued = self.unread_input()?;
         let oldest = self
             .shared
             .ledger

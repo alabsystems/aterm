@@ -70,8 +70,16 @@ impl Tone {
 
     /// Parse a corpus label.
     #[inline]
-    pub fn parse_label(s: &str) -> Option<Tone> {
-        Tone::ALL.iter().copied().find(|t| t.label() == s)
+    #[must_use]
+    pub const fn parse_label(s: &str) -> Option<Tone> {
+        match s.as_bytes() {
+            b"calm" => Some(Tone::Calm),
+            b"excited" => Some(Tone::Excited),
+            b"frustrated" => Some(Tone::Frustrated),
+            b"playful" => Some(Tone::Playful),
+            b"technical" => Some(Tone::Technical),
+            _ => None,
+        }
     }
 }
 
@@ -165,6 +173,15 @@ pub struct ToneScratch {
 impl Default for ToneScratch {
     #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToneScratch {
+    /// Construct a zeroed inference scratch buffer.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             sum: [0.0; EMBED],
             hid: [0.0; HIDDEN],

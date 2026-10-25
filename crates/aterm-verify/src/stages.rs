@@ -1740,6 +1740,8 @@ fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
     r.record_child(&out, outcome, label);
 }
 
+// The guest compiles on a stock toolchain (STOCK EXCEPTION: no Linux build of Trust exists).
+
 /// `targo --unverified build --profile test -q -p aterm-lab --bin aterm-lab` ([`MAIN_PROFILE`]).
 #[must_use]
 pub fn linux_lab_build_args() -> Vec<String> {
@@ -1888,6 +1890,9 @@ fn glue_row(
     }
 }
 
+/// The `cells` check ([`crate::cells`]): the forge cells no fleet machine
+/// hosts (or each `--cell`), each linted for its own triple on rustup's
+/// toolchain (a STOCK EXCEPTION), one row per cell.
 fn foreign_cells(ctx: &Ctx, r: &mut Report) {
     if in_checkout(ctx, r, "cells") {
         crate::cells::run(ctx, r);

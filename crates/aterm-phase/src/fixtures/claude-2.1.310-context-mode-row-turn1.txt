@@ -1,0 +1,40 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.133.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the context indicator at the mode row's end after turn 1 of long stub replies (CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=20), at rest
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn.
+
+✻ Baked for 0s · done 11:33 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts                                                            14% until auto-compact

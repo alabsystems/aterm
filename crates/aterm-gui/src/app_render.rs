@@ -7246,6 +7246,7 @@ impl App {
                     font_px: 13.0,
                     cols: window.cols as usize,
                     panel_rows,
+                    px_per_pt: 1.0,
                 },
                 scale,
                 origin_x: self.win_pad(wid) as f64,
@@ -7259,6 +7260,7 @@ impl App {
                     font_px: self.win_font_px(wid),
                     cols: window.cols as usize,
                     panel_rows,
+                    px_per_pt: window.scale.max(f64::EPSILON) as f32,
                 },
                 scale: 1.0,
                 origin_x: self.win_pad(wid) as f64,
@@ -16858,6 +16860,7 @@ impl App {
             return;
         };
         let fp = ws.overlay_fp();
+        let px_per_pt = ws.scale.max(f64::EPSILON) as f32;
         let geom_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -16867,6 +16870,7 @@ impl App {
             font_px.to_bits().hash(&mut h);
             cols.hash(&mut h);
             panel_rows.hash(&mut h);
+            px_per_pt.to_bits().hash(&mut h); // the card's width cap is points
             pad.hash(&mut h);
             pad_top.hash(&mut h);
             head.hash(&mut h); // the dy anchor moves with the chrome headroom
@@ -16884,38 +16888,26 @@ impl App {
                 font_px,
                 cols,
                 panel_rows,
+                px_per_pt,
             };
             let Some(overlay) = ws.overlay.as_ref() else {
                 return;
             };
-            let mut tray = overlay.model().tray(&geom, palette);
-            const PAINT_MARGIN: f32 = 12.0; // covers the 2-step drop shadow (≤ 8 px)
-            let tray_w = (cols * cw) as f32;
-            let tray_h = (panel_rows * ch) as f32;
-            let (card_x, card_y, card_w, card_h) = tray.card;
-            let x0 = (card_x - PAINT_MARGIN).max(0.0).floor();
-            let y0 = (card_y - PAINT_MARGIN).max(0.0).floor();
-            let x1 = (card_x + card_w + PAINT_MARGIN).min(tray_w).ceil();
-            let y1 = (card_y + card_h + PAINT_MARGIN).min(tray_h).ceil();
-            if x1 <= x0 || y1 <= y0 {
+            let Some(cut) = crate::overlay::card_raster(
+                overlay.model().tray(&geom, palette),
+                (cols * cw) as f32,
+                (panel_rows * ch) as f32,
+            ) else {
                 ws.settings_card = None;
                 return;
-            }
-            crate::widget::translate_prims(&mut tray.prims, -x0, -y0);
-            let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
-                &tray.prims,
-                (x1 - x0) as u32,
-                (y1 - y0) as u32,
-                1.0,
-                [0, 0, 0, 0],
-            );
+            };
             ws.settings_card = Some(crate::SettingsCard {
                 scrim: overlay.model().scrim(),
-                rgba,
-                pw,
-                ph,
-                dx: (pad as f32 + x0) as u32,
-                dy: ((pad_top + head) as f32 + y0) as u32,
+                rgba: cut.rgba,
+                pw: cut.pw,
+                ph: cut.ph,
+                dx: (pad as f32 + cut.x0) as u32,
+                dy: ((pad_top + head) as f32 + cut.y0) as u32,
                 fp,
                 geom: geom_key,
                 raster_fingerprint_once: std::sync::OnceLock::new(),
@@ -16994,6 +16986,7 @@ impl App {
                 font_px,
                 cols,
                 panel_rows: 0, // unused: the badge self-positions at the top-right
+                px_per_pt: ws.scale.max(f64::EPSILON) as f32,
             };
             let mut tray = crate::build_badge::badge_tray(&geom, palette);
             let tray_w = (cols * cw) as f32;
@@ -17611,7 +17604,8 @@ fn preview_damage_from_compiled(
     })
 }
 
-/// Per-step input-line budget for the native `aterm-reflow` worker's chunked rewrap ([`drive_reflow_job`]).
+/// Per-step input-line budget for the native `aterm-reflow` worker's chunked rewrap
+/// ([`drive_reflow_job_gauged`]).
 pub(crate) const REFLOW_WORKER_STEP_LINES: usize = 50_000;
 
 /// Live gauge of the off-thread scrollback rewrap.
@@ -18023,7 +18017,8 @@ pub(crate) fn drive_reflow_job(
     drive_reflow_job_gauged(job, cancel, step_budget, None)
 }
 
-/// [`drive_reflow_job`], storing the job's progress into `gauge` after each step (one relaxed store per step, read only while a person waits).
+/// `drive_reflow_job`, storing the job's progress into `gauge` after each step (one relaxed
+/// store per step, read only while a person waits).
 pub(crate) fn drive_reflow_job_gauged(
     mut job: aterm_core::grid::PendingScrollbackReflow,
     cancel: &std::sync::atomic::AtomicBool,

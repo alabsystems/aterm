@@ -272,12 +272,27 @@ pub const fn bonk_sound_gain(
 }
 
 /// What [`drain_curse_bonk_cues`] reports.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CurseDrain {
     /// Bonk events handed to the sink this drain (0 while muted).
     pub emitted: usize,
     /// Distinct profanity locations this tick, independent of sound policy.
     pub wince_hits: u8,
+}
+
+impl CurseDrain {
+    /// Empty drain report before any cues are processed.
+    pub const EMPTY: Self = Self {
+        emitted: 0,
+        wince_hits: 0,
+    };
+}
+
+impl Default for CurseDrain {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Drain every curse-bonk cue the word-decoration tick recorded and emit the

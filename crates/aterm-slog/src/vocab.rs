@@ -227,6 +227,7 @@ kinds! {
     MailFetch => "mail-fetch",
     Shown => "shown",
     Row => "row",
+    MailGap => "mail-gap",
 }
 
 impl Kind {
@@ -311,6 +312,7 @@ impl Kind {
                 | Kind::MailFetch
                 | Kind::Shown
                 | Kind::Row
+                | Kind::MailGap
         )
     }
 

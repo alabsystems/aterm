@@ -6,7 +6,7 @@
 //! ([`ConfirmArm`]).
 //!
 //! The compiler holds the yes to its doors. `OwnerYes` is a braced struct whose one field is
-//! private to this module and of a private type ([`YesSeal`]) that is neither `Clone`, `Copy` nor
+//! private to this module and of a private type (`YesSeal`) that is neither `Clone`, `Copy` nor
 //! `Default`. A private field is visible only in its module and that module's children, and this
 //! module has none, so nothing outside this file (`native_settings` and its other `#[path]`
 //! children included) can build or copy one in safe Rust. Being braced, it has no constructor

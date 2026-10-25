@@ -75,10 +75,10 @@ pub const SHELL_APP_ID: &str = "shell";
 /// The canonical app id for a basename: every shell is [`SHELL_APP_ID`]; anything else is its basename.
 #[inline]
 #[must_use]
-pub fn canonical_app_id(basename: &str) -> &str {
-    match basename {
-        "zsh" | "bash" | "fish" | "sh" | "pwsh" | "nu" => SHELL_APP_ID,
-        other => other,
+pub const fn canonical_app_id(basename: &str) -> &str {
+    match basename.as_bytes() {
+        b"zsh" | b"bash" | b"fish" | b"sh" | b"pwsh" | b"nu" => SHELL_APP_ID,
+        _ => basename,
     }
 }
 
@@ -86,11 +86,11 @@ pub fn canonical_app_id(basename: &str) -> &str {
 /// in distinct coat families (claude's coat 12 is the stop closest to
 /// terracotta).
 #[inline]
-fn flagship_look(app_id: &str) -> Option<KittyLook> {
-    let (variant, coat, iris, age) = match app_id {
-        "claude" => (CatGlyphId::S108, 12, 0, CatAge::Adult),
-        "codex" => (CatGlyphId::S117, 15, 7, CatAge::Adult),
-        "agy" => (CatGlyphId::S122, 3, 6, CatAge::Adolescent),
+const fn flagship_look(app_id: &str) -> Option<KittyLook> {
+    let (variant, coat, iris, age) = match app_id.as_bytes() {
+        b"claude" => (CatGlyphId::S108, 12, 0, CatAge::Adult),
+        b"codex" => (CatGlyphId::S117, 15, 7, CatAge::Adult),
+        b"agy" => (CatGlyphId::S122, 3, 6, CatAge::Adolescent),
         _ => return None,
     };
     Some(
@@ -298,14 +298,35 @@ pub const fn glyph_key(id: CatGlyphId) -> &'static str {
     GLYPHS[id as usize].id
 }
 
+#[inline]
+const fn str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Resolve a persisted semantic glyph key through the generated roster.
 #[inline]
 #[must_use]
-pub fn glyph_from_key(key: &str) -> Option<CatGlyphId> {
-    GLYPHS
-        .iter()
-        .zip(GLYPH_IDS.iter().copied())
-        .find_map(|(def, id)| (def.id == key).then_some(id))
+pub const fn glyph_from_key(key: &str) -> Option<CatGlyphId> {
+    let mut i = 0;
+    while i < GLYPHS.len() {
+        if str_eq(GLYPHS[i].id, key) {
+            return Some(GLYPH_IDS[i]);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Stable persistence key for an age band.
@@ -323,11 +344,11 @@ pub const fn age_key(age: CatAge) -> &'static str {
 /// Resolve an age key from a ledger; unknown/legacy values use Adult.
 #[inline]
 #[must_use]
-pub fn age_from_key(key: &str) -> CatAge {
-    match key {
-        "kitten" => CatAge::Kitten,
-        "adolescent" => CatAge::Adolescent,
-        "elder" => CatAge::Elder,
+pub const fn age_from_key(key: &str) -> CatAge {
+    match key.as_bytes() {
+        b"kitten" => CatAge::Kitten,
+        b"adolescent" => CatAge::Adolescent,
+        b"elder" => CatAge::Elder,
         _ => CatAge::Adult,
     }
 }

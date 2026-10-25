@@ -3,7 +3,7 @@
 
 //! Supervisor loop driving worker sessions over [`Ctl`] (`aterm-ctl` or relay).
 //!
-//! Waits for a worker's turn to end ([`Session::await_turn`]), evaluates approval
+//! Waits for a worker's turn to end ([`Session::await_turn_from`]), evaluates approval
 //! boxes via [`super::policy::approval::decide`], executes turn-end continuations
 //! and limit/login/error waits via [`super::policy::turn_end::decide_turn_end`],
 //! rides out transient server outages, and records decisions to the ledger and journal.
@@ -663,7 +663,7 @@ pub enum StallSeen {
     NoProgress { minutes: u64, pid: u32 },
 }
 
-/// Configuration options for [`Session::run_hosted`], [`Session::watch`], and [`Session::supervise`].
+/// Configuration options for [`Session::run_hosted`], `Session::watch`, and `Session::supervise`.
 #[derive(Debug, Clone, Default)]
 pub struct SuperviseOpts {
     /// Maximum wall-clock budget for the supervisor loop.
@@ -719,6 +719,24 @@ const STOPPED_WAIT: &str = "the supervisor was stopped: no wait begins after the
 /// Infinite duration budget (`--max-s 0`, [`SuperviseOpts::hosted`]).
 pub const UNBOUNDED: Duration = Duration::MAX;
 const DEFAULT_CONTEXT_WARN: u8 = 10;
+
+/// Whether `rows` say the context indicator `reader` reads ([`ScreenReader::context`]) has gone,
+/// as after `/compact`: Claude Code's footer rule ([`crate::harness::footer::context_gone`]), the
+/// one the window drops its context fact on. A screen without a reading is not enough: the `/` and
+/// `@` menus, the shortcuts and Claude Code's own notices stand in the indicator's place while
+/// they are open, and a box takes the composer away. No other program's reading is read as gone.
+fn indicator_gone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
+    match reader.program() {
+        Program::Claude => crate::harness::footer::context_gone(rows),
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Gemini
+        | Program::Generic => false,
+    }
+}
 const TAIL_ROWS: usize = 40;
 
 type ScreenKey = (u64, usize, Vec<String>);
@@ -1951,6 +1969,9 @@ pub struct Session<'a, C: Ctl> {
     sleep_unknown: Option<&'static str>,
     sleep_unsaid: Option<&'static str>,
     slept_at: Option<i64>,
+    /// The last sleep the loop measured while the worker's turn ran, until that turn's point
+    /// ([`woken_turn`]).
+    woken: Option<woken_turn::WokenTurn>,
     wake_settle: Option<(Due, bool)>,
     restart_waits: u32,
     restart_run: Option<(&'static str, i64)>,
@@ -2233,6 +2254,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             sleep_unknown: None,
             sleep_unsaid: None,
             slept_at: None,
+            woken: None,
             wake_settle: None,
             restart_waits: 0,
             restart_run: None,
@@ -3778,6 +3800,14 @@ impl<'a, C: Ctl> Session<'a, C> {
                     if !signing_in {
                         self.limit_on_busy(screen.seq, review)?;
                     }
+                    if !writing
+                        && !carried
+                        && !signing_in
+                        && !off
+                        && let Some(opts) = opts
+                    {
+                        self.unstick_woken_turn(&screen, reader, opts, review)?;
+                    }
                     if self.wall_memory.is_none() && !self.turn_end.compacting() && !signing_in {
                         self.exception_ended(screen.seq, Some("the agent working"), review);
                     }
@@ -3892,7 +3922,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             Context::Warned { last } => {
                 let compacted = match left {
                     Some(left) => left >= last.saturating_add(COMPACTED_RISE),
-                    None => reader.composer(rows).is_some() && reader.prompt(rows).is_none(),
+                    None => indicator_gone(reader, rows),
                 };
                 if compacted {
                     self.context = Context::Armed;
@@ -4106,6 +4136,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.turn_end.seed_short(seed.short);
             let ago = Duration::from_millis(u64::try_from(now_ms - seed.at_ms).unwrap_or(0));
             self.turn_end.seed_replies(seed.said, ago, self.fx.mono());
+            let reset = seed.said_reset_ms.map(|ms| self.instant_of_ms(ms));
+            self.turn_end.seed_replies_reset(reset);
             if seed.point && !seed.ran {
                 self.turn_end.seed_point(ago, self.fx.mono());
                 if seed.esc {
@@ -4640,6 +4672,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 return Ok(Some(End::Timeout(point)));
             }
             let busy_for = self.running.point(self.fx.mono());
+            self.woken = None;
             let turn_end = if review.unattended() {
                 let action = self.turn_end_at_point(&point, busy_for, opts)?;
                 let folded = self.task_edge_at_fold(&point.screen, opts, review);
@@ -5546,6 +5579,7 @@ impl<C: Ctl> Session<'_, C> {
                                     &seen,
                                     &mut seen_key,
                                     &mut verdict_seq,
+                                    review,
                                 )?
                             {
                                 return Ok(None);
@@ -5655,6 +5689,10 @@ impl<C: Ctl> Session<'_, C> {
         let woke_at = wall_now.div_euclid(1000);
         self.settle_wake(woke_at, mono_now);
         self.slept_at = Some(woke_at);
+        self.woken = self
+            .running
+            .runs()
+            .then(|| woken_turn::WokenTurn::measured(wall_then, wall_now, mono_now));
     }
 
     fn recount_sleep(&mut self) -> Option<Duration> {
@@ -5934,14 +5972,19 @@ impl<C: Ctl> Session<'_, C> {
         host.warn(&text);
     }
 
+    /// Whether the screen moved past the verdict's point while the loop waits at it. The screen it
+    /// reads is also the context watch's ([`Self::watch_context`]): at rest is where a person's
+    /// `/compact`, the `/` and `@` menus and the shortcuts show.
     fn moved_under_verdict(
         &mut self,
         seen: &Turn,
         seen_key: &mut Option<String>,
         seq: &mut u64,
+        review: &mut dyn Review,
     ) -> Result<bool, Fail> {
         if let Some(last) = self.last.clone().filter(|l| l.seq > *seq) {
             *seq = last.seq;
+            self.watch_context(&last, self.reader(&last.rows), &mut |line| review.say(line))?;
             let then = self.turn_of(last);
             let key = seen_key.get_or_insert_with(|| self.review_key(seen));
             if point_key(self.reader(&then.screen.rows), &then) != *key
@@ -5961,6 +6004,9 @@ impl<C: Ctl> Session<'_, C> {
         }
         let screen = self.screen()?;
         *seq = screen.seq;
+        self.watch_context(&screen, self.reader(&screen.rows), &mut |line| {
+            review.say(line)
+        })?;
         let now = self.turn_of(screen);
         let key = seen_key.get_or_insert_with(|| self.review_key(seen));
         Ok(point_key(self.reader(&now.screen.rows), &now) != *key
@@ -6985,6 +7031,8 @@ pub(crate) mod wall_confirm;
 pub(super) use wall_confirm::words_kind;
 #[path = "wall_memory.rs"]
 mod wall_memory;
+#[path = "woken_turn.rs"]
+mod woken_turn;
 pub use turn_end_loop::standing_rules;
 /// Re-exports composer cursor-row guard constructors.
 pub(crate) use turn_end_loop::{composer_guard, composer_guard_at};

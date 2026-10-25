@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::ai::connector::{AGY, CLAUDE, CODEX, MUSE};
+use crate::ai::connector::{AGY, CLAUDE, CODEX, GROK, MUSE};
 use crate::ai::facts::{ClaudeAccounts, Managed};
 use crate::ai::permission::Level;
 use crate::ai::state::{Mark, State};
@@ -112,6 +112,68 @@ fn only_a_failed_run_is_read_for_a_lost_login() {
     assert_eq!(
         verdict_of(&CODEX, &Err(RunFailed::Timeout), None, "n", "").0,
         Verdict::Timeout
+    );
+
+    // Synthetic failed runs: partial review text and argument errors are not quota evidence.
+    for (stdout, stderr) in [
+        ("", "error: unknown option '--spending-limit'"),
+        (
+            "Finding: the '--spending-limit' flag is not defined here.",
+            "API error (status 500): upstream request failed",
+        ),
+        (
+            "Finding: the 'spending limit' label is unclear.",
+            "API error (status 500): upstream request failed",
+        ),
+        (
+            "",
+            "error: cannot hit your team's API endpoint: connection refused",
+        ),
+        (
+            "",
+            "error: cannot hit your team\u{2019}s API endpoint: connection refused",
+        ),
+    ] {
+        assert_eq!(
+            verdict_of(
+                &GROK,
+                &Ok(ran(1, stdout, stderr)),
+                None,
+                "n",
+                "review the change"
+            )
+            .0,
+            Verdict::Failed,
+            "{stdout}\n{stderr}"
+        );
+    }
+    for wall in [
+        "API error (status 429): You've hit your team's API rate limit.",
+        "API error (status 429): You\u{2019}ve hit your team\u{2019}s API rate limit.",
+        "You hit your weekly limit.",
+        "out of credits or over your spending limit. Add credits and retry.",
+        "error: usage balance exhausted",
+        "error: usage limit reached",
+        "error_code: subscription:free-usage-exhausted",
+        "error_code: insufficient_quota",
+    ] {
+        assert_eq!(
+            verdict_of(&GROK, &Ok(ran(1, "", wall)), None, "n", "").0,
+            Verdict::Limit,
+            "{wall}"
+        );
+    }
+    let quoted_wall = "Finding: the string \"You hit your weekly limit.\" is quoted here.";
+    assert_eq!(
+        verdict_of(
+            &GROK,
+            &Ok(ran(0, quoted_wall, "")),
+            Some(quoted_wall),
+            "n",
+            ""
+        )
+        .0,
+        Verdict::Served
     );
 }
 

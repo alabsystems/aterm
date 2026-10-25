@@ -210,13 +210,21 @@ pub const TWIN_MIN: Duration = Duration::from_millis(40);
 pub(super) const FOLLOW_DRS: [i16; 4] = [-1, 1, -2, 2];
 
 #[inline]
-fn neighbours_of<'a>(rows: &[RowSample<'a>], row: u16) -> [Option<&'a [char]>; 4] {
+const fn neighbours_of<'a>(rows: &[RowSample<'a>], row: u16) -> [Option<&'a [char]>; 4] {
     let mut out = [None; 4];
-    for (slot, dr) in out.iter_mut().zip(FOLLOW_DRS) {
-        *slot = row
-            .checked_add_signed(dr)
-            .and_then(|r| rows.iter().find(|s| s.row == r))
-            .map(|s| s.cols);
+    let mut k = 0;
+    while k < FOLLOW_DRS.len() {
+        if let Some(r) = row.checked_add_signed(FOLLOW_DRS[k]) {
+            let mut j = 0;
+            while j < rows.len() {
+                if rows[j].row == r {
+                    out[k] = Some(rows[j].cols);
+                    break;
+                }
+                j += 1;
+            }
+        }
+        k += 1;
     }
     out
 }
@@ -722,7 +730,7 @@ impl Witness {
         (None, if evidence { gone } else { 0 })
     }
 
-    fn follow_verdict(
+    const fn follow_verdict(
         armed: &[(u16, Unit, bool, u8)],
         there: &[char],
         k: usize,
@@ -741,22 +749,34 @@ impl Witness {
         let mut after = false;
         let mut lead: Option<u16> = None;
         let mut ext_hi = 0u16;
-        for (i, &(col, unit, _, arrivals)) in armed.iter().enumerate() {
-            let here = unit_at(there, col) == unit;
+        let mut i = 0;
+        while i < armed.len() {
+            let (col, unit, _, arrivals) = armed[i];
+            let here_u = unit_at(there, col);
+            let here = here_u.ch == unit.ch && here_u.wide == unit.wide && here_u.cont == unit.cont;
             let twin = arrivals & bit == 0;
             if here && !twin {
                 v.found += 1;
                 if after {
                     v.block = false;
+                    i += 1;
                     continue;
                 }
-                v.lo = v.lo.min(lead.unwrap_or(col));
+                let candidate = match lead {
+                    Some(l) => l,
+                    None => col,
+                };
+                if candidate < v.lo {
+                    v.lo = candidate;
+                }
                 lead = None;
                 ext_hi = col;
             } else if here {
                 v.neutral += 1;
                 if v.found == 0 {
-                    lead.get_or_insert(col);
+                    if lead.is_none() {
+                        lead = Some(col);
+                    }
                 } else if !after {
                     ext_hi = col;
                 }
@@ -770,29 +790,49 @@ impl Witness {
                     lead = None;
                 }
             }
+            i += 1;
         }
         v.hi = ext_hi;
         v
     }
 
-    fn relaid_suffix(armed: &[(u16, Unit, bool, u8)], own: &[char]) -> usize {
-        let Some(first) = own
-            .iter()
-            .position(|&c| c != ' ' && c != '\0')
-            .and_then(|i| u16::try_from(i).ok())
-        else {
+    const fn relaid_suffix(armed: &[(u16, Unit, bool, u8)], own: &[char]) -> usize {
+        let mut first = None;
+        let mut idx = 0;
+        while idx < own.len() {
+            let c = own[idx];
+            if c != ' ' && c != '\0' {
+                if idx <= u16::MAX as usize {
+                    first = Some(idx as u16);
+                }
+                break;
+            }
+            idx += 1;
+        }
+        let Some(first) = first else {
             return 0;
         };
-        for (start, &(c0, ..)) in armed.iter().enumerate() {
-            let Some(shift) = c0.checked_sub(first).filter(|&s| s > 0) else {
-                continue;
-            };
-            if armed[start..]
-                .iter()
-                .all(|&(col, unit, ..)| unit_at(own, col - shift) == unit)
-            {
-                return armed.len() - start;
+        let mut start = 0;
+        while start < armed.len() {
+            let c0 = armed[start].0;
+            if c0 > first {
+                let shift = c0 - first;
+                let mut all_match = true;
+                let mut j = start;
+                while j < armed.len() {
+                    let (col, unit, ..) = armed[j];
+                    let u = unit_at(own, col - shift);
+                    if !(u.ch == unit.ch && u.wide == unit.wide && u.cont == unit.cont) {
+                        all_match = false;
+                        break;
+                    }
+                    j += 1;
+                }
+                if all_match {
+                    return armed.len() - start;
+                }
             }
+            start += 1;
         }
         0
     }
@@ -1370,11 +1410,16 @@ impl Witness {
         if !self.retired_runs.is_empty() || !self.released_runs.is_empty() {
             let mut sample_row: Option<(u16, Option<RowSample<'_>>)> = None;
             for cell in cells {
-                if cell.leaving() || self.find(cell.row, cell.col, cell.born).is_some() {
+                if cell.leaving() {
                     continue;
                 }
                 let run = (cell.row, cell.cohort);
-                if self.retired_runs.binary_search(&run).is_ok() {
+                let retired = self.retired_runs.binary_search(&run).is_ok();
+                let released = !retired && self.released_runs.binary_search(&run).is_ok();
+                if (!retired && !released) || self.find(cell.row, cell.col, cell.born).is_some() {
+                    continue;
+                }
+                if retired {
                     let still_blank = match sample_row {
                         Some((r, s)) if r == cell.row => s,
                         _ => {
@@ -1387,9 +1432,7 @@ impl Witness {
                     if !still_blank || self.standing_runs.binary_search(&run).is_err() {
                         retire.push((cell.row, cell.col, cell.born));
                     }
-                } else if self.released_runs.binary_search(&run).is_ok()
-                    && self.released_span_takes(cells, release, run, cell.col)
-                {
+                } else if self.released_span_takes(cells, release, run, cell.col) {
                     release.push((cell.row, cell.col, cell.born));
                     self.hold_released(cell);
                 }
@@ -1874,26 +1917,57 @@ impl Witness {
         }
     }
 
-    fn moved(run: &[Blanked], rows: &[RowSample<'_>]) -> bool {
-        if run.iter().filter(|b| !b.unit.cont).take(2).count() < 2 {
+    const fn moved(run: &[Blanked], rows: &[RowSample<'_>]) -> bool {
+        let mut lead_count = 0;
+        let mut i = 0;
+        while i < run.len() {
+            if !run[i].unit.cont {
+                lead_count += 1;
+                if lead_count >= 2 {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if lead_count < 2 {
             return false;
         }
-        let Some((first, last)) = run.first().zip(run.last()) else {
-            return false;
-        };
-        let (row, c0) = (first.row, usize::from(first.col));
-        let span = usize::from(last.col).saturating_sub(c0);
-        rows.iter().any(|s| {
-            (0..s.cols.len().saturating_sub(span)).any(|d| {
-                if s.row == row && d == c0 {
-                    return false;
+        let first = run[0];
+        let last = run[run.len() - 1];
+        let (row, c0) = (first.row, first.col as usize);
+        let span = (last.col as usize).saturating_sub(c0);
+        let mut r = 0;
+        while r < rows.len() {
+            let s = rows[r];
+            let max_d = s.cols.len().saturating_sub(span);
+            let mut d = 0;
+            while d < max_d {
+                if !(s.row == row && d == c0) {
+                    let mut all_match = true;
+                    let mut k = 0;
+                    while k < run.len() {
+                        let b = run[k];
+                        let at = b.col as usize - c0 + d;
+                        if at > u16::MAX as usize {
+                            all_match = false;
+                            break;
+                        }
+                        let u = unit_at(s.cols, at as u16);
+                        if !(u.ch == b.unit.ch && u.wide == b.unit.wide && u.cont == b.unit.cont) {
+                            all_match = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if all_match {
+                        return true;
+                    }
                 }
-                run.iter().all(|b| {
-                    let at = usize::from(b.col) - c0 + d;
-                    u16::try_from(at).is_ok_and(|col| unit_at(s.cols, col) == b.unit)
-                })
-            })
-        })
+                d += 1;
+            }
+            r += 1;
+        }
+        false
     }
 }
 

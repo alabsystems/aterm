@@ -4635,9 +4635,37 @@ pub(crate) fn accounts_wrong_entry_for(
     )))
 }
 
-/// The digest key of another CLI's pool notice for `cause` (`due`, `wrong-account`): the key
-/// [`accounts_due_entry_for`] and [`accounts_wrong_entry_for`] post under, which a pool that says
-/// nothing more clears.
+/// The remaining human step of a pool's background sign-in, without its URL or code.
+pub(crate) fn accounts_sign_in_entry_for(
+    cli: aterm_agent::harness::accounts::Cli,
+    tasks: &[(String, aterm_agent::harness::accounts::SignInAction)],
+) -> Option<Entry> {
+    let (first, action) = tasks.first()?;
+    let mut entry = Entry::new(
+        Family::Accounts,
+        cli.id(),
+        "sign-in",
+        &format!("{} sign-in needs you", title_word(cli)),
+        Why::OnlyYou(Reason::new(
+            "Its background sign-in stopped for a person before a new login could be bound",
+        )),
+        Then::step(action.next_step(cli, first)),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .restated_at_once();
+    for (label, action) in tasks.iter().take(aterm_messages::exceptions::MORE_LINES) {
+        entry = entry.more(format!("{label}: {}", action.next_step(cli, label)));
+    }
+    Some(entry.log_line(format!(
+        "accounts cli={} need=sign-in n={}",
+        cli.id(),
+        tasks.len()
+    )))
+}
+
+/// The digest key of another CLI's pool notice for `cause` (`due`, `wrong-account`,
+/// `sign-in`), which a pool that says nothing more clears.
 pub(crate) fn pool_notice_key(cli: aterm_agent::harness::accounts::Cli, cause: &str) -> String {
     aterm_messages::need::Fingerprint::new(Family::Accounts.stem(), cli.id(), cause)
         .as_str()

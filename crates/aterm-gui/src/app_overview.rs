@@ -1660,6 +1660,72 @@ mod tests {
         assert_eq!(doing(person), "sign the release notes");
     }
 
+    /// On a Retina window a pointer lands on an Overview item as far right as its row is painted:
+    /// past where a card capped at 760 device pixels would end, and not one pixel further.
+    #[test]
+    fn a_retina_pointer_lands_on_an_overview_row_past_a_device_pixel_cap() {
+        let (mut app, wid, _) = app_with_three();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cols = 400;
+            ws.scale = 2.0;
+            ws.input_scratch.cells = vec![Vec::new(); 50];
+        }
+        assert!(app.open_overview().is_ok());
+        let (cw, ch) = app.win_cell_size(wid);
+        let window = &app.windows[&wid];
+        let painted = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px: app.win_font_px(wid),
+            cols: usize::from(window.cols),
+            panel_rows: window.overlay_rows(),
+            px_per_pt: 2.0,
+        };
+        let t = app
+            .overlay_coordinate_transform(wid)
+            .expect("the open card's transform");
+        assert_eq!(t.scale, 1.0, "the terminal route: device-pixel geometry");
+        let (ox, oy) = app.frame_origin(wid);
+        let to_window = |x: f32, y: f32| {
+            (
+                ox as f64 + t.origin_x + f64::from(x),
+                oy as f64 + t.origin_y + f64::from(y),
+            )
+        };
+        let card = window.overview().expect("open");
+        let mut items = 0;
+        for slot in 0.. {
+            let Some((rx, ry, rw, rh)) = crate::overview::overview_row_rect(card, &painted, slot)
+            else {
+                break;
+            };
+            assert!(
+                rw > 760.0,
+                "the 2x row ({rw} px) reaches past a card capped at 760 px"
+            );
+            let (cx, cy) = (rx + rw - 0.5, ry + rh * 0.5);
+            let want = crate::overview::overview_item_hit(card, &painted, cx, cy);
+            let (x, y) = to_window(cx, cy);
+            assert_eq!(
+                app.overview_item_at_pointer(wid, x, y),
+                want,
+                "slot {slot}'s right end"
+            );
+            let (x, y) = to_window(rx + rw + 0.5, cy);
+            assert_eq!(
+                app.overview_item_at_pointer(wid, x, y),
+                None,
+                "slot {slot}: past its painted right end"
+            );
+            items += usize::from(want.is_some());
+        }
+        assert_eq!(
+            items, 3,
+            "each of the three tabs' chips is hit at its right end"
+        );
+    }
+
     #[test]
     fn ages_and_sizes_read_in_coarse_units() {
         assert_eq!(super::coarse_age(59_000), "just now");

@@ -3407,13 +3407,13 @@ fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
             .map(|s| s.text)
     };
     for (gap, words) in [
-        (WeeklyGap::TapOff, "weekly ? \u{b7} /usage"),
+        (WeeklyGap::TapOff, "weekly ? \u{b7} tap off"),
         (
             WeeklyGap::Unoffered(Refusal::Home),
-            "weekly ? \u{b7} /usage",
+            "weekly ? \u{b7} untapped",
         ),
-        (WeeklyGap::Untapped, "weekly ? \u{b7} restart tab"),
-        (WeeklyGap::Unrestarted, "weekly ? \u{b7} /usage"),
+        (WeeklyGap::Untapped, "weekly ? \u{b7} until relaunch"),
+        (WeeklyGap::Unrestarted, "weekly ? \u{b7} untapped"),
         (WeeklyGap::NoReply, "weekly ? \u{b7} no reply yet"),
         (WeeklyGap::Stale, "weekly ? \u{b7} no reply 1h"),
     ] {
@@ -3893,6 +3893,46 @@ fn the_context_indicator_has_gone_only_from_an_empty_slot() {
             "no composer",
             aterm_phase::prompt::fixtures::rows(&["⏺ Done.", "", rest]),
         ),
+    ] {
+        assert!(!context_gone(&rows), "{what}: no sign it has gone");
+    }
+}
+
+/// The gone rule on recorded screens of Claude Code 2.1.310 (`aterm_phase::phase::context_fixtures`):
+/// only an empty slot after `/compact` is the indicator gone, at 120 columns and at 44; the `/`
+/// and `@` menus, the shortcuts, the effort notice in the slot and shell mode never are, nor the
+/// indicator a narrow pane moves after one space or onto a row of its own. One screen is
+/// CONSTRUCTED, not recorded (no notice was seen there at 44 columns): the 44-column screen with
+/// the indicator's own row swapped for the effort notice, which is the slot taken.
+#[test]
+fn the_context_indicator_has_gone_on_recorded_screens() {
+    use aterm_phase::phase::context_fixtures as f;
+    let screen = aterm_phase::prompt::fixtures::screen;
+    for (what, text) in [
+        ("after /compact", f::COMPACTED),
+        ("after /compact at 44 columns", f::COMPACTED_44COL),
+    ] {
+        assert!(context_gone(&screen(text)), "{what}: gone");
+    }
+    let mut notice_under = screen(f::MODE_ROW_44COL);
+    let at = notice_under
+        .iter()
+        .rposition(|row| row.ends_with("7% until auto-compact"))
+        .expect("the indicator's own row");
+    notice_under[at] = format!("{:>42}", "◐ medium · /effort");
+    for (what, rows) in [
+        ("the indicator", screen(f::MODE_ROW_7)),
+        ("the indicator after one space", screen(f::MODE_ROW_60COL)),
+        (
+            "the indicator on a row of its own",
+            screen(f::MODE_ROW_44COL),
+        ),
+        ("the / menu", screen(f::SLASH_MENU)),
+        ("the @ menu", screen(f::AT_MENU)),
+        ("the shortcuts", screen(f::SHORTCUTS)),
+        ("the effort notice", screen(f::COMPACTED_EFFORT)),
+        ("shell mode", screen(f::SHELL_MODE)),
+        ("a notice on a row of its own (constructed)", notice_under),
     ] {
         assert!(!context_gone(&rows), "{what}: no sign it has gone");
     }

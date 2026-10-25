@@ -1895,3 +1895,33 @@ fn the_local_walk_dials_one_instance_at_a_time_in_order() {
         );
     }
 }
+
+#[test]
+fn a_peers_typist_reads_in_its_own_words() {
+    let typed = |by: &str| {
+        wire_row(&[
+            ("local", "1"),
+            ("sid", "s-00000000000000000001"),
+            ("program", "zsh"),
+            ("program_kind", "shell"),
+            ("agent", "-"),
+            ("typed_by", by),
+            ("typed_ms", "60000"),
+        ])
+    };
+    for remote in [false, true] {
+        for by in [
+            "127.0.0.1 (node bc104d9c) over the fleet",
+            "the message bus",
+            "lab-sweep",
+        ] {
+            let mut answer = reply(1, vec![typed(by)]);
+            answer.remote = remote;
+            let text = render_text(&[answer], DEFAULT_BUDGET, None);
+            assert!(
+                text.contains(&format!(" typed by {} 1m ago", shown(by, 24))),
+                "remote={remote} {by}: {text}"
+            );
+        }
+    }
+}

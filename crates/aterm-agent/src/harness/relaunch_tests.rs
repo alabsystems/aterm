@@ -3930,3 +3930,211 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
     let other = format!("{} Upgraded.", upgrade::HARNESS_MARK);
     assert_eq!(upgrade::checking(&other, false), other);
 }
+
+/// A row's leader socket is `leader-<label>-<8 hex>.sock` in the grok home, the hex its auth
+/// file's, while it and its daemon's `PATH.daemon` fit `sockaddr_un`; the FNV-1a/64 of label and
+/// file past that, and no socket at all where even that does not fit.
+#[test]
+fn a_grok_rows_leader_socket_fits_sun_path_or_is_refused() {
+    // The longest label a roster takes (`[a-z0-9][a-z0-9._-]{0,63}`).
+    let label = "a-very-long-account-label-for-the-grok-pool-on-this-machine-0042";
+    assert_eq!(label.len(), 64);
+    assert!(accounts::admissible_label(label));
+    let login = "/l/work/auth.json";
+    assert_eq!(aterm_hash::fnv1a_64(login.as_bytes()) >> 32, 0x9906_8163);
+    assert_eq!(
+        format!(
+            "{:016x}",
+            aterm_hash::fnv1a_64(format!("{label}\0{login}").as_bytes())
+        ),
+        "f01ad3cec3bf7236"
+    );
+    let named = |home: &str| format!("{home}/leader-{label}-99068163.sock");
+    let hashed = |home: &str| format!("{home}/leader-f01ad3cec3bf7236.sock");
+    let socket = |home: &str| {
+        grok_leader_socket(Path::new(home), label, login).map(|p| p.to_string_lossy().into_owned())
+    };
+    assert_eq!(
+        socket("/g"),
+        Ok(concat!(
+            "/g/leader-",
+            "a-very-long-account-label-for-the-grok-pool-on-this-machine-0042",
+            "-99068163.sock"
+        )
+        .to_string())
+    );
+    // Under a home as long as `/Users//u/.grok`, that name and its daemon's pass sun_path.
+    assert_eq!(socket("/Users//u/.grok"), Ok(hashed("/Users//u/.grok")));
+    // A renewal binds the row to a fresh auth file, and the same label then names a fresh leader.
+    assert_eq!(
+        grok_leader_socket(Path::new("/Users//u/.grok"), "work", login),
+        Ok(PathBuf::from("/Users//u/.grok/leader-work-99068163.sock"))
+    );
+    assert_eq!(
+        grok_leader_socket(Path::new("/Users//u/.grok"), "work", "/l/auth.json"),
+        Ok(PathBuf::from("/Users//u/.grok/leader-work-07d954d5.sock"))
+    );
+    // A home whose named socket and its daemon's fill sun_path to the byte keeps the name; one
+    // byte more takes the hashed name.
+    let home_of_len = |len: usize| format!("/{}", "h".repeat(len - 1));
+    let fills = MAX_SUN_PATH - named("").len() - LEADER_DAEMON_SUFFIX.len();
+    assert_eq!(
+        named(&home_of_len(fills)).len() + LEADER_DAEMON_SUFFIX.len(),
+        MAX_SUN_PATH
+    );
+    assert_eq!(socket(&home_of_len(fills)), Ok(named(&home_of_len(fills))));
+    assert_eq!(
+        socket(&home_of_len(fills + 1)),
+        Ok(hashed(&home_of_len(fills + 1)))
+    );
+    let last = MAX_SUN_PATH - hashed("").len() - LEADER_DAEMON_SUFFIX.len();
+    assert_eq!(socket(&home_of_len(last)), Ok(hashed(&home_of_len(last))));
+
+    // Negative: past the hashed name's room, and a relative home, name no socket.
+    assert!(socket(&home_of_len(last + 1)).is_err(), "too long");
+    assert!(socket(".grok").is_err(), "relative");
+}
+
+/// [`MAX_SUN_PATH`] is what the platform's own socket address takes: a path of that many bytes
+/// fits `sockaddr_un` with its NUL, and one byte more does not.
+#[cfg(unix)]
+#[test]
+fn max_sun_path_is_the_platforms_sockaddr_un() {
+    use std::os::unix::net::SocketAddr;
+    let path_of_len = |len: usize| format!("/{}", "s".repeat(len - 1));
+    assert!(SocketAddr::from_pathname(path_of_len(MAX_SUN_PATH)).is_ok());
+    assert!(SocketAddr::from_pathname(path_of_len(MAX_SUN_PATH + 1)).is_err());
+}
+
+/// [`pool_args`]: the credential variables each CLI carries in place of a stored login are
+/// removed, only a Grok Build row of its own adds a leader socket, and the default row drops a
+/// carried socket only where it names a row's.
+#[test]
+fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
+    use super::super::accounts_pool::LoginEnv;
+    let row = |var: &'static str, value: Option<&str>| LoginEnv {
+        label: "work".to_string(),
+        var,
+        value: value.map(str::to_string),
+    };
+    let flags = words(&["-m", "x"]);
+    let home = Some(Path::new("/Users//u/.grok"));
+    let grok = pool_args(
+        accounts::Cli::Grok,
+        &row("GROK_AUTH_PATH", Some("/l/auth.json")),
+        home,
+        &flags,
+    )
+    .expect("grok row");
+    assert_eq!(grok.unset, ["GROK_AUTH", "GROK_LEADER_SOCKET"]);
+    assert_eq!(
+        grok.flags,
+        words(&[
+            "-m",
+            "x",
+            "--leader-socket",
+            "/Users//u/.grok/leader-work-07d954d5.sock"
+        ])
+    );
+    let codex = pool_args(
+        accounts::Cli::Codex,
+        &row("CODEX_HOME", Some("/c")),
+        home,
+        &flags,
+    )
+    .expect("codex row");
+    assert_eq!(codex.unset, ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]);
+    assert_eq!(codex.flags, flags);
+    let kimi = pool_args(
+        accounts::Cli::Kimi,
+        &row("KIMI_CODE_HOME", Some("/k")),
+        None,
+        &flags,
+    )
+    .expect("kimi row");
+    assert_eq!(
+        kimi.unset,
+        [
+            "KIMI_MODEL_NAME",
+            "KIMI_MODEL_API_KEY",
+            "KIMI_CODE_CUSTOM_HEADERS"
+        ]
+    );
+    assert_eq!(kimi.flags, flags);
+    let kimi_default = pool_args(
+        accounts::Cli::Kimi,
+        &row("KIMI_CODE_HOME", None),
+        None,
+        &flags,
+    )
+    .expect("kimi default row");
+    assert_eq!(kimi_default.unset, kimi.unset, "the default row's line too");
+    assert_eq!(
+        ahead_env(accounts::Cli::Claude),
+        [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        ]
+    );
+
+    // The default row drops a row's socket (`leader-*.sock`, in the grok home where it was read)
+    // and keeps a person's own, grok's default name included, and `GROK_LEADER_SOCKET`.
+    let carried = words(&[
+        "--leader-socket",
+        "/Users//u/.grok/leader-old-0123abcd.sock",
+        "--leader-socket=/elsewhere/leader-x.sock",
+        "--leader-socket",
+        "/Users//u/.grok/leader.sock",
+    ]);
+    let main = row("GROK_AUTH_PATH", None);
+    let default = pool_args(accounts::Cli::Grok, &main, home, &carried).expect("default row");
+    assert_eq!(default.unset, ["GROK_AUTH"]);
+    assert_eq!(
+        default.flags,
+        words(&[
+            "--leader-socket=/elsewhere/leader-x.sock",
+            "--leader-socket",
+            "/Users//u/.grok/leader.sock"
+        ])
+    );
+    let unread = pool_args(accounts::Cli::Grok, &main, None, &carried).expect("no home");
+    assert_eq!(
+        unread.flags,
+        words(&["--leader-socket", "/Users//u/.grok/leader.sock"])
+    );
+
+    // Negative: the kept credentials stay, whatever the row, and so do Kimi Code's variables
+    // that carry no login of its own (kimi 2.3.1 reads no `KIMI_API_KEY` from its environment;
+    // the rest name endpoints); a row of its own drops every carried socket.
+    for cli in accounts::Cli::ALL {
+        let ahead = ahead_env(cli);
+        for kept in [
+            "OPENAI_API_KEY",
+            "XAI_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "KIMI_API_KEY",
+            "KIMI_BASE_URL",
+            "KIMI_MODEL_BASE_URL",
+            "KIMI_CODE_BASE_URL",
+            "KIMI_CODE_OAUTH_HOST",
+            "KIMI_OAUTH_HOST",
+        ] {
+            assert!(!ahead.contains(&kept), "{cli:?} removes {kept}");
+        }
+    }
+    let own = pool_args(
+        accounts::Cli::Grok,
+        &row("GROK_AUTH_PATH", Some("/l/auth.json")),
+        home,
+        &carried,
+    )
+    .expect("grok row");
+    assert_eq!(
+        own.flags,
+        words(&[
+            "--leader-socket",
+            "/Users//u/.grok/leader-work-07d954d5.sock"
+        ])
+    );
+}

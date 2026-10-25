@@ -1919,6 +1919,8 @@ pub struct StreakSeed {
     pub retry: Option<RetryMark>,
     /// The short streak's replies ([`Carried::said`]).
     pub said: Replies,
+    /// The reset the newest of them showed ([`Carried::said_reset_ms`]).
+    pub said_reset_ms: Option<i64>,
 }
 
 #[must_use]
@@ -1943,6 +1945,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         if rule == RULE_OFF_STOOD {
             if let Some(l) = last.as_mut() {
                 l.said = Replies::default();
+                l.said_reset_ms = None;
             }
             continue;
         }
@@ -1968,6 +1971,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
                             esc: false,
                             retry: None,
                             said: Replies::default(),
+                            said_reset_ms: None,
                         });
                     }
                 }
@@ -2003,6 +2007,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             .and_then(|n| n.parse().ok())
             .unwrap_or(0);
         let esc = point && text("reason").is_some_and(|r| r.contains(&format!("({PERSONS_ESC})")));
+        let (said, said_reset_ms) = text("reason").and_then(replies_note_of).unwrap_or_default();
         last = Some(StreakSeed {
             at_ms,
             short,
@@ -2013,7 +2018,8 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             ran_ms: None,
             esc,
             retry: text("reason").and_then(retry_mark_of),
-            said: text("reason").and_then(replies_note_of).unwrap_or_default(),
+            said,
+            said_reset_ms,
         });
     }
     last.map(|l| StreakSeed { recorded, ..l })
@@ -2074,7 +2080,7 @@ pub fn point_reason(after: Carried, esc: bool) -> String {
         "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}",
         after.short,
         retry_mark(after.retry),
-        replies_note(after.said),
+        replies_note(after.said, after.said_reset_ms),
         if esc {
             format!(" ({PERSONS_ESC})")
         } else {
@@ -2091,6 +2097,8 @@ pub struct Carried {
     pub retry: Option<RetryMark>,
     /// The short streak's replies ([`super::policy::turn_end::TurnEndState::replies`]).
     pub said: Replies,
+    /// The reset the newest of them showed, unix milliseconds ([`super::policy::turn_end::TurnEndState::replies_reset`]).
+    pub said_reset_ms: Option<i64>,
 }
 
 impl Carried {
@@ -2100,14 +2108,15 @@ impl Carried {
             short,
             retry: None,
             said: Replies::NONE,
+            said_reset_ms: None,
         }
     }
 }
 
 const SAME_REPLIES: &str = "the short streak's replies";
 
-/// The ledger's note of the short streak's replies: each mark, its answers, and `w` with the wall's tries where a wall said it; then the no-work answers in a row.
-fn replies_note(said: Replies) -> String {
+/// The ledger's note of the short streak's replies: each mark, its answers, and `w` with the wall's tries where a wall said it; then the no-work answers in a row and the reset the newest showed.
+fn replies_note(said: Replies, reset_ms: Option<i64>) -> String {
     let kept: Vec<String> = said
         .kept()
         .map(|k| {
@@ -2122,8 +2131,9 @@ fn replies_note(said: Replies) -> String {
     if kept.is_empty() {
         return String::new();
     }
+    let reset = reset_ms.map_or_else(String::new, |ms| format!("; {RESET_AT}{ms}"));
     format!(
-        " ({SAME_REPLIES}: {}; {}{IN_A_ROW})",
+        " ({SAME_REPLIES}: {}; {}{IN_A_ROW}{reset})",
         kept.join(" "),
         said.run
     )
@@ -2131,13 +2141,20 @@ fn replies_note(said: Replies) -> String {
 
 const IN_A_ROW: &str = " in a row";
 
-fn replies_note_of(reason: &str) -> Option<Replies> {
+const RESET_AT: &str = "reset at ";
+
+fn replies_note_of(reason: &str) -> Option<(Replies, Option<i64>)> {
     let (_, rest) = reason.split_once(&format!("({SAME_REPLIES}: "))?;
-    let note = rest.split(')').next()?;
-    let (note, run) = match note.split_once("; ") {
-        Some((kept, run)) => (kept, run.strip_suffix(IN_A_ROW)?.parse().ok()?),
-        None => (note, 0),
-    };
+    let mut parts = rest.split(')').next()?.split("; ");
+    let note = parts.next()?;
+    let (mut run, mut reset) = (0, None);
+    for part in parts {
+        match (part.strip_suffix(IN_A_ROW), part.strip_prefix(RESET_AT)) {
+            (Some(n), _) => run = n.parse().ok()?,
+            (_, Some(ms)) => reset = Some(ms.parse().ok()?),
+            _ => return None,
+        }
+    }
     let kept = note
         .split(' ')
         .map(|k| {
@@ -2154,10 +2171,13 @@ fn replies_note_of(reason: &str) -> Option<Replies> {
             })
         })
         .collect::<Option<Vec<Kept>>>()?;
-    Some(Replies {
-        run,
-        ..Replies::of(&kept)
-    })
+    Some((
+        Replies {
+            run,
+            ..Replies::of(&kept)
+        },
+        reset,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2267,7 +2287,7 @@ pub fn act_reason_after(after: Carried, limit: Option<LimitTry>) -> String {
     let mut reason = "the turn-end policy".to_string();
     reason.push_str(&short_mark(after.short));
     reason.push_str(&retry_mark(after.retry));
-    reason.push_str(&replies_note(after.said));
+    reason.push_str(&replies_note(after.said, after.said_reset_ms));
     if let Some(l) = limit {
         let head = if l.in_place {
             IN_LIMITS_PLACE
@@ -2892,7 +2912,7 @@ fn cut(s: &str, n: usize) -> String {
 mod tests {
 
     #[test]
-    fn the_replies_note_carries_the_run_and_an_older_note_reads_none_in_a_row() {
+    fn the_replies_note_carries_the_run_and_the_reset_and_an_older_note_reads_none() {
         use super::{Kept, Replies, replies_note, replies_note_of};
         let kept = Kept {
             mark: 0x432b_225c_f708_95ef,
@@ -2904,14 +2924,17 @@ mod tests {
             run: 4,
             ..Replies::of(&[kept])
         };
-        let note = replies_note(said);
+        let note = replies_note(said, Some(1_792_972_800_000));
         assert_eq!(
             replies_note_of(&format!("the turn-end policy{note}")),
-            Some(said)
+            Some((said, Some(1_792_972_800_000)))
         );
-        let older = note.replace("; 4 in a row", "");
+        let older = note.replace("; reset at 1792972800000", "");
         assert_ne!(older, note);
-        assert_eq!(replies_note_of(&older), Some(Replies::of(&[kept])));
+        assert_eq!(replies_note_of(&older), Some((said, None)));
+        let oldest = older.replace("; 4 in a row", "");
+        assert_ne!(oldest, older);
+        assert_eq!(replies_note_of(&oldest), Some((Replies::of(&[kept]), None)));
     }
 
     #[test]
@@ -4085,6 +4108,7 @@ mod tests {
                 short: 2,
                 retry: Some(mark),
                 said: Replies::default(),
+                said_reset_ms: None,
             };
             let reason = act_reason_after(carried, None);
             let path = seed_ledger(
@@ -4128,6 +4152,7 @@ mod tests {
                     since_ms: 7,
                 }),
                 said: Replies::default(),
+                said_reset_ms: None,
             },
             Some(limit),
         );
@@ -4349,6 +4374,7 @@ mod tests {
                         short: 1,
                         retry,
                         said: Replies::default(),
+                        said_reset_ms: None,
                     },
                     false,
                 ),
@@ -4365,6 +4391,7 @@ mod tests {
                         short: 1,
                         retry: Some(mark(1)),
                         said: Replies::default(),
+                        said_reset_ms: None,
                     },
                     None,
                 ),
@@ -4440,6 +4467,7 @@ mod tests {
                         short: 0,
                         retry,
                         said: Replies::default(),
+                        said_reset_ms: None,
                     },
                     false,
                 ),
@@ -4632,6 +4660,7 @@ mod tests {
                         short: 0,
                         retry,
                         said: Replies::default(),
+                        said_reset_ms: None,
                     },
                     false,
                 ),

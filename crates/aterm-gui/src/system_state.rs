@@ -14,7 +14,8 @@ use std::sync::Arc;
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{
-    Access, Group, Observation, Plan, Selection, Setting, Standing, Subject,
+    Access, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome, Selection, Setting,
+    Standing, Subject, Unfinished,
 };
 
 use crate::native_app::{
@@ -98,6 +99,15 @@ pub struct SetupStatusRow {
     pub detail: String,
 }
 
+/// A step the last run or Restore could not finish (§3.6): the page's row it
+/// names, if one, and whether it is a row Restore could not put back
+/// ([`restore_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub(crate) row: Option<Subject>,
+    pub(crate) restore: bool,
+}
+
 impl SetupStatus {
     /// A setup run is going: busy with neither a Check nor a Restore.
     pub(crate) fn running(&self) -> bool {
@@ -145,20 +155,30 @@ impl SetupStatus {
 
     /// Failed results applicable to this review, whether or not the worker
     /// still retries them. An unassigned result is about setup itself;
-    /// a named row counts only while this plan manages it.
-    fn result_failures<'a>(
-        &'a self,
-        plan: Option<&'a Plan>,
-    ) -> impl Iterator<Item = Option<Subject>> + 'a {
+    /// a named row counts only while this plan manages it, but a row Restore
+    /// could not put back counts whatever the plan: Restore leaves the groups
+    /// it put back as is.
+    fn result_failures<'a>(&'a self, plan: Option<&'a Plan>) -> impl Iterator<Item = Failure> + 'a {
         let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
         self.results(plan)
             .filter(|(row, _)| matches!(row.status.as_str(), "error" | "failed"))
-            .map(|(_, subject_name)| {
-                Subject::all()
-                    .into_iter()
-                    .find(|subject| subject.name() == subject_name)
+            .map(|(_, name)| {
+                let (restore, name) = name
+                    .strip_prefix(RESTORE_ROW)
+                    .map_or((false, name), |name| (true, name));
+                Failure {
+                    row: Subject::all()
+                        .into_iter()
+                        .find(|subject| subject.name() == name),
+                    restore,
+                }
             })
-            .filter(move |row| row.is_none_or(|subject| manages(selection, subject)))
+            .filter(move |failure| {
+                failure.restore
+                    || failure
+                        .row
+                        .is_none_or(|subject| manages(selection, subject))
+            })
     }
 
     /// The steps the last run could not finish (a stage error, a join the
@@ -171,7 +191,7 @@ impl SetupStatus {
     pub(crate) fn failed_steps<'a>(
         &'a self,
         plan: Option<&'a Plan>,
-    ) -> impl Iterator<Item = Option<Subject>> + 'a {
+    ) -> impl Iterator<Item = Failure> + 'a {
         let signal = self.failures_signal();
         self.result_failures(plan).filter(move |_| signal)
     }
@@ -206,9 +226,241 @@ impl SetupStatus {
     }
 }
 
+/// The page's rows for what a Restore did (design §3.4), in System State's own row names,
+/// never a preference key, a keyboard or a process (`aterm doctor` lists those): one calm line
+/// saying which rows are as they were, which come back at the next login (a relaunch that
+/// failed after the write leaves its rows so), which stayed as they are because macOS hid
+/// their earlier value, and which are put back once aterm has Full Disk Access; nobody can act
+/// on any of those, so none is a failure. Each row Restore could not put back is a failure
+/// (`Restore: <row>`), which stays in view whatever the plan and which the headline names; the
+/// calm line then no longer says Restore finished.
+pub fn restore_rows(outcome: &RestoreOutcome) -> Vec<SetupStatusRow> {
+    let failed = outcome_rows(outcome, PutBack::Failed);
+    let mut sentences = put_back_sentences(outcome, UNKNOWN_TO_RESTORE);
+    if outcome.rows.is_empty() {
+        sentences.push("There was nothing to put back.".to_owned());
+    }
+    if failed.is_empty() {
+        sentences.insert(0, format!("{RESTORE_FINISHED} finished."));
+    }
+    let mut rows = Vec::new();
+    if !sentences.is_empty() {
+        rows.push(SetupStatusRow {
+            name: RESTORE_FINISHED.to_owned(),
+            status: "restored".to_owned(),
+            detail: sentences.join(" "),
+        });
+    }
+    for setting in failed {
+        rows.push(SetupStatusRow {
+            name: format!(
+                "{RESTORE_ROW}{}",
+                setting.map_or("another Mac setting", Setting::name)
+            ),
+            status: "failed".to_owned(),
+            detail: about(
+                &[setting],
+                [
+                    "could not be put back as it was.",
+                    "could not be put back as they were.",
+                    "could not be put back as they were.",
+                ],
+            ),
+        });
+    }
+    if outcome.journal_refused {
+        rows.push(SetupStatusRow {
+            name: "Change journal".to_owned(),
+            status: "error".to_owned(),
+            detail: "It did not record every change Restore made; the changes went ahead."
+                .to_owned(),
+        });
+    }
+    rows
+}
+
+/// The page's rows for what a setup pass did that its rows' readings cannot say (design §3.4,
+/// §3.6), in System State's own row names, never a preference key, a keyboard or a process
+/// (`aterm doctor` lists those): each row whose change did not take, a failure the headline
+/// names, or could not be confirmed, and one calm line for what the pass's rollback of those
+/// changes put back, in a Restore's words.
+pub fn pass_rows(outcome: &PassOutcome) -> Vec<SetupStatusRow> {
+    let not_back = outcome
+        .rolled_back
+        .as_ref()
+        .map(|rolled| outcome_rows(rolled, PutBack::Failed))
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    for (setting, how) in &outcome.unfinished {
+        rows.push(match how {
+            Unfinished::Failed => SetupStatusRow {
+                name: setting.name().to_owned(),
+                status: "error".to_owned(),
+                detail: if not_back.contains(&Some(*setting)) {
+                    "The change did not take, and aterm could not put back its value from before."
+                } else {
+                    "The change did not take."
+                }
+                .to_owned(),
+            },
+            Unfinished::Unconfirmed => SetupStatusRow {
+                name: setting.name().to_owned(),
+                status: "unverified".to_owned(),
+                detail: String::new(),
+            },
+        });
+    }
+    let Some(rolled) = &outcome.rolled_back else {
+        return rows;
+    };
+    let sentences = put_back_sentences(rolled, UNKNOWN_TO_ROLLBACK);
+    if !sentences.is_empty() {
+        rows.push(SetupStatusRow {
+            name: UNDONE.to_owned(),
+            status: "restored".to_owned(),
+            detail: format!(
+                "aterm put back what it could not finish. {}",
+                sentences.join(" ")
+            ),
+        });
+    }
+    for setting in not_back {
+        let said = setting
+            .is_some_and(|setting| outcome.unfinished.contains(&(setting, Unfinished::Failed)));
+        if !said {
+            rows.push(SetupStatusRow {
+                name: setting
+                    .map_or("Another Mac setting", Setting::name)
+                    .to_owned(),
+                status: "error".to_owned(),
+                detail: "aterm could not put back its value from before.".to_owned(),
+            });
+        }
+    }
+    if rolled.journal_refused {
+        rows.push(SetupStatusRow {
+            name: "Change journal".to_owned(),
+            status: "error".to_owned(),
+            detail: "It did not record every change aterm made; the changes went ahead.".to_owned(),
+        });
+    }
+    rows
+}
+
+/// The rows of `outcome` that came out `how`, in its order.
+fn outcome_rows(outcome: &RestoreOutcome, how: PutBack) -> Vec<Option<Setting>> {
+    outcome
+        .rows
+        .iter()
+        .filter(|(_, put_back)| *put_back == how)
+        .map(|(setting, _)| *setting)
+        .collect()
+}
+
+/// What a Restore says of a row whose earlier value macOS hid: it is left as it is.
+const UNKNOWN_TO_RESTORE: [&str; 3] = [
+    "stayed as it is: macOS hid its earlier value.",
+    "stayed as they are: macOS hid their earlier value.",
+    "stayed as they are: macOS hid their earlier values.",
+];
+
+/// What a pass's rollback says of a row whose earlier value it could not read: it is left as
+/// the pass set it.
+const UNKNOWN_TO_ROLLBACK: [&str; 3] = [
+    "stayed as aterm set it: its earlier value could not be read.",
+    "stayed as aterm set them: their earlier value could not be read.",
+    "stayed as aterm set them: their earlier values could not be read.",
+];
+
+/// The calm sentences for what was put back (`outcome`), one for each way a row came out
+/// that nobody can act on: as it was, back at the next login, left as it is (`unknown`'s
+/// words), put back once aterm has Full Disk Access. A key no row of this build writes (an
+/// older aterm's backup) is unnamed where it is back, and is another Mac setting otherwise.
+fn put_back_sentences(outcome: &RestoreOutcome, unknown: [&str; 3]) -> Vec<String> {
+    let named = |how: PutBack| -> Vec<Option<Setting>> {
+        outcome_rows(outcome, how)
+            .into_iter()
+            .filter(Option::is_some)
+            .collect()
+    };
+    [
+        (
+            named(PutBack::Back),
+            ["is as it was.", "are as they were.", "are as they were."],
+        ),
+        (
+            named(PutBack::AtLogin),
+            [
+                "comes back at your next login.",
+                "come back at your next login.",
+                "come back at your next login.",
+            ],
+        ),
+        (outcome_rows(outcome, PutBack::Unknown), unknown),
+        (
+            outcome_rows(outcome, PutBack::Waits),
+            [
+                "is put back once aterm has Full Disk Access.",
+                "are put back once aterm has Full Disk Access.",
+                "are put back once aterm has Full Disk Access.",
+            ],
+        ),
+    ]
+    .into_iter()
+    .filter(|(rows, _)| !rows.is_empty())
+    .map(|(rows, words)| about(&rows, words))
+    .collect()
+}
+
+/// One sentence about `rows`, opening with their names: `words` is what follows for one row,
+/// for one row that is a plural thing (Widgets), and for several rows.
+fn about(rows: &[Option<Setting>], words: [&str; 3]) -> String {
+    // A row's name inside a sentence: the Dock and the Desktop are things, the rest settings.
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| match row {
+            Some(setting @ (Setting::Dock | Setting::Desktop)) => format!("the {}", setting.name()),
+            Some(setting) => setting.name().to_owned(),
+            None => "another Mac setting".to_owned(),
+        })
+        .collect();
+    let list = crate::toolchain_words::and_list(&names);
+    let mut first = list.chars();
+    let list: String = first
+        .next()
+        .map(|c| c.to_uppercase().chain(first).collect())
+        .unwrap_or_default();
+    let words = match rows {
+        [Some(Setting::Widgets)] => words[1],
+        [_] => words[0],
+        _ => words[2],
+    };
+    format!("{list} {words}")
+}
+
+/// The footer's Restore button, and the name of a Restore's one calm line ([`restore_rows`]):
+/// "Restore previous settings finished. …".
+const RESTORE_FINISHED: &str = "Restore previous settings";
+
+/// The name of a pass's calm line for what its rollback put back ([`pass_rows`]).
+const UNDONE: &str = "Undo";
+
+/// What opens the name of a row Restore could not put back ([`restore_rows`]): `Restore:
+/// Widgets`.
+const RESTORE_ROW: &str = "Restore: ";
+
 impl SetupStatusRow {
-    /// The note's words: `Check again did not start. Try again.`
+    /// The note's words: `Check again did not start. Try again.`. A calm line ([`restore_rows`],
+    /// [`pass_rows`]) and a row Restore could not put back are whole sentences already.
     fn words(&self) -> String {
+        let whole = match self.status.as_str() {
+            "restored" => true,
+            "error" | "failed" => self.name.starts_with(RESTORE_ROW),
+            _ => false,
+        };
+        if whole && !self.detail.is_empty() {
+            return self.detail.clone();
+        }
         let what = match self.status.as_str() {
             "not started" => format!("{} did not start.", self.name),
             "error" | "failed" => format!("{} failed.", self.name),
@@ -417,7 +669,11 @@ fn row_view_for_source(
     let group_set_up = selection.contains(subject.setting());
     let managed = manages(selection, subject);
     let read = now.clone().unwrap_or_else(|| "—".to_owned());
-    let spoken_read = now.clone().unwrap_or_else(|| "not read".to_owned());
+    // A value's middle dot (`Control · until login`) marks it for the eye; a screen reader
+    // hears the words alone.
+    let spoken_read = now
+        .as_deref()
+        .map_or_else(|| "not read".to_owned(), |now| now.replace(" · ", " "));
     // THE ROW'S NOTE: the short line a probe gives (an approval code, what a
     // waiting row waits on), else, where the row needs a person, is not
     // needed or was opted out of, its description: the macOS step a person
@@ -465,8 +721,22 @@ fn row_view_for_source(
             Subject::Access(access) => status.access_step.is_none_or(|step| step == access),
             Subject::Setting(_) => true,
         };
+    // A row that will change changes what the Mac has after the next login: a value live only
+    // until then is no from-side, and the value saved for that login is (`Caps Lock →
+    // Control`, never `Control · until login → Control`).
+    let from = match now
+        .as_deref()
+        .map(aterm_types::macos_setup::live_until_login)
+    {
+        Some(Some(_)) => reading
+            .and_then(|o| o.after_login.clone())
+            .filter(|value| !value.trim().is_empty()),
+        _ => now.clone(),
+    };
+    let spoken_from = from.clone().unwrap_or_else(|| "not read".to_owned());
+    let from = from.unwrap_or_else(|| "—".to_owned());
     let change = || RowValue::Change {
-        now: read.clone(),
+        now: from.clone(),
         wanted: wanted.clone(),
     };
     let open = match subject {
@@ -479,11 +749,21 @@ fn row_view_for_source(
         && standing == Some(Standing::InPlace)
         && wanted != subject.wanted();
     let (value, chip, label) = match standing {
-        None | Some(Standing::Unknown) => (
+        None => (
             RowValue::One("—".to_owned()),
             None,
             format!("{name}: not read yet"),
         ),
+        // A reading that ended without an answer says why in its note (`This reading did not
+        // finish. Check again.`); one with none is still to come.
+        Some(Standing::Unknown) => {
+            let label = if note.is_some() {
+                format!("{name}: not read")
+            } else {
+                format!("{name}: not read yet")
+            };
+            (RowValue::One("—".to_owned()), None, label)
+        }
         // A row read as wanted shows the value read, never the wanted one in
         // its place: with nothing read it is `—` beside the check.
         Some(Standing::InPlace) => match now {
@@ -502,11 +782,16 @@ fn row_view_for_source(
                 format!("{name}: in place"),
             ),
         },
-        Some(Standing::AtLogin) => (
-            RowValue::One(format!("{wanted} · at login")),
-            Some(Chip::InPlace),
-            format!("{name}: {wanted} at login, in place"),
-        ),
+        // Set, and in use in full from the next login: the value with the check, and a quiet
+        // note saying so (§3.3), never a mark beside the value, which `· until login` is.
+        Some(Standing::AtLogin) => {
+            note = Some(AT_LOGIN_NOTE.to_owned());
+            (
+                RowValue::One(wanted.clone()),
+                Some(Chip::InPlace),
+                format!("{name}: {wanted}, in place"),
+            )
+        }
         // The probe's own note only (set above): never the description.
         Some(Standing::Differs | Standing::Waiting) => {
             let chip = Chip::WillChange { busy };
@@ -514,7 +799,7 @@ fn row_view_for_source(
                 change(),
                 Some(chip),
                 format!(
-                    "{name}: {spoken_read}, {} {wanted}",
+                    "{name}: {spoken_from}, {} {wanted}",
                     if busy {
                         "changing now to"
                     } else {
@@ -528,7 +813,7 @@ fn row_view_for_source(
             (
                 change(),
                 Some(Chip::NeedsYou),
-                format!("{name}: {spoken_read}, needs you"),
+                format!("{name}: {spoken_from}, needs you"),
             )
         }
         Some(Standing::Failed) => {
@@ -536,7 +821,7 @@ fn row_view_for_source(
             (
                 change(),
                 Some(Chip::Failed),
-                format!("{name}: {spoken_read}, failed"),
+                format!("{name}: {spoken_from}, failed"),
             )
         }
         Some(Standing::NotNeeded) => unreachable!("a row not needed returned above"),
@@ -565,6 +850,10 @@ fn row_view_for_source(
 /// The note of a waiting row whose probe gave no reason: it is blocked on
 /// something, and nothing more can be said of it.
 pub(crate) const WAITING_NOTE: &str = "Can't be set up yet";
+
+/// The note of a row a run set for macOS to take up in full at the next login
+/// (Trackpad scrolling): it reads in place, and says when it is all in effect.
+pub(crate) const AT_LOGIN_NOTE: &str = "Fully in effect after your next login";
 
 /// Every row of the page, in page order.
 pub(crate) fn rows(status: &SetupStatus, selection: Selection) -> Vec<RowView> {
@@ -673,15 +962,38 @@ impl Headline {
         match (status.busy, status.operation) {
             (true, None) => Self::line("Setting up this Mac…"),
             (true, Some(SetupOperation::Restore)) => Self::line("Restoring previous settings…"),
-            (false, _)
-                if status
-                    .result_failures(None)
-                    .any(|subject| subject.is_none()) =>
-            {
-                Self::line("Setup needs attention")
-            }
+            (false, _) => Self::restore_failed(status, None)
+                .or_else(|| {
+                    status
+                        .result_failures(None)
+                        .any(|failure| failure.row.is_none())
+                        .then(|| Self::line("Setup needs attention"))
+                })
+                .unwrap_or_else(|| Self::line("Checking this Mac…")),
             _ => Self::line("Checking this Mac…"),
         }
+    }
+
+    /// The headline of a Restore that could not put a row back (§3.4): `Restore previous
+    /// settings failed: Widgets`, showing that row, whose reason is the page's note. `None`
+    /// when every row Restore reached came out as nobody can change.
+    fn restore_failed(status: &SetupStatus, plan: Option<&Plan>) -> Option<Self> {
+        let rows: Vec<Option<Subject>> = status
+            .result_failures(plan)
+            .filter(|failure| failure.restore)
+            .map(|failure| failure.row)
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|row| row.map_or("another Mac setting", Subject::name))
+            .collect();
+        Some(Self {
+            show: rows.iter().flatten().next().copied(),
+            ..Self::line(format!("{RESTORE_FINISHED} failed: {}", names.join(", ")))
+        })
     }
 }
 
@@ -713,7 +1025,14 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     if let Some(busy) = Headline::busy(status, rows) {
         return busy;
     }
-    let result_failures: Vec<Subject> = status.result_failures(plan).flatten().collect();
+    if let Some(restore) = Headline::restore_failed(status, plan) {
+        return restore;
+    }
+    let result_failures: Vec<Subject> = status
+        .result_failures(plan)
+        .filter(|failure| !failure.restore)
+        .filter_map(|failure| failure.row)
+        .collect();
     let failed: Vec<Subject> = rows
         .iter()
         .filter(|row| {
@@ -726,8 +1045,11 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     if let Some(first) = failed.first() {
         let steps = if failed.len() == 1 { "step" } else { "steps" };
         let names: Vec<&str> = failed.iter().map(|subject| subject.name()).collect();
+        // Set up now tries a failed step again, even one held after two tries:
+        // the step's own note names it.
         return Headline {
             show: Some(*first),
+            start: true,
             ..Headline::line(format!(
                 "{} {steps} failed: {}",
                 failed.len(),
@@ -737,7 +1059,7 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     if status
         .result_failures(plan)
-        .any(|subject| subject.is_none())
+        .any(|failure| !failure.restore && failure.row.is_none())
     {
         return Headline::line("Setup needs attention");
     }
@@ -780,6 +1102,26 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     let managed = rows.iter().filter(|row| row.managed).count();
     if managed == 0 {
         return Headline::line("Everything is left as is");
+    }
+    // A reading that ended without an answer (its reader unwound) says so in
+    // its note: no check is under way for it, so the headline names it and
+    // shows it, where its note says to Check again.
+    let unread: Vec<Subject> = rows
+        .iter()
+        .filter(|row| row.managed && row.standing == Some(Standing::Unknown) && row.note.is_some())
+        .map(|row| row.subject)
+        .collect();
+    if let Some(first) = unread.first() {
+        let rows = if unread.len() == 1 { "row" } else { "rows" };
+        let names: Vec<&str> = unread.iter().map(|subject| subject.name()).collect();
+        return Headline {
+            show: Some(*first),
+            ..Headline::line(format!(
+                "{} {rows} could not be read: {}",
+                unread.len(),
+                names.join(", ")
+            ))
+        };
     }
     // A source change can leave just its managed rows unread. Known changes
     // and waits above stay useful, but unread rows cannot establish success.
@@ -1114,6 +1456,10 @@ struct Awaiting {
     plan: Plan,
     /// It carried the vault password (Join), which goes once accepted.
     password: bool,
+    /// The settings of the groups the person changed since the page last took the plan in
+    /// force, which the worker applies onto it ([`SetupAnswer::changed`]); `None`: the plan
+    /// as sent.
+    changed: Option<Selection>,
 }
 
 pub(crate) struct SystemStateApp {
@@ -1284,7 +1630,7 @@ impl SystemStateApp {
             self.request = None;
         }
         if !self.status.busy && active && self.pending() {
-            self.apply(Admission::Automatic, Submission::AsItStands);
+            self.apply(Admission::Automatic, Submission::AsItStands, None);
         }
         let walked = self.status.running() && shown && {
             self.anim_ticks = self.anim_ticks.wrapping_add(1);
@@ -1299,7 +1645,12 @@ impl SystemStateApp {
 
     /// A vault address or password typed and not joined yet.
     fn vault_draft(&self) -> bool {
-        !self.password.text().is_empty() || self.url.value().trim() != self.submitted.vault_url
+        !self.password.text().is_empty()
+            || self.url.value().trim() != self.submitted.vault_url
+            || self
+                .url
+                .preedit()
+                .is_some_and(|preedit| !preedit.text.is_empty())
     }
 
     /// The page's plan with the vault address as typed (what Check again
@@ -1352,8 +1703,9 @@ impl SystemStateApp {
     /// runs next: the host and the worker see to that, so nothing waits here
     /// on a view that may close. Join sends the vault address as typed and
     /// its password; any other submission sends the address the worker holds
-    /// and leaves a draft where it is.
-    fn apply(&mut self, admission: Admission, submission: Submission) {
+    /// and leaves a draft where it is. `changed` is what the worker takes of the plan onto the
+    /// plan in force ([`SetupAnswer::changed`]).
+    fn apply(&mut self, admission: Admission, submission: Submission, changed: Option<Selection>) {
         let with_vault = submission == Submission::Join;
         let mut plan = self.plan.clone();
         plan.vault_url = if with_vault {
@@ -1377,6 +1729,7 @@ impl SystemStateApp {
         self.awaiting = Some(Awaiting {
             plan: plan.clone(),
             password: password.is_some(),
+            changed,
         });
         self.actions.push_back(SystemStateAction::Apply(
             SetupAnswer {
@@ -1385,6 +1738,7 @@ impl SystemStateApp {
                 receipt: None,
                 chosen: submission != Submission::AsItStands,
                 vault_typed: with_vault,
+                changed,
             },
             admission,
         ));
@@ -1436,17 +1790,45 @@ impl SystemStateApp {
             .map_or(&self.submitted, |awaiting| &awaiting.plan)
     }
 
+    /// Whether the worker is putting back the Mac preferences aterm saved
+    /// (Restore previous settings): the groups take no choice meanwhile, since
+    /// the plan the page shows is the one the Restore is changing (§3.4).
+    fn restoring(&self) -> bool {
+        self.status.operation == Some(SetupOperation::Restore)
+    }
+
+    /// The settings of the groups the person changed since the page last took
+    /// the plan in force, with `settings` (§3.3): a group pressed and pressed
+    /// back counts, so the worker takes the page's value of each onto the plan
+    /// in force, whichever earlier choice it admitted. A plan sent whole and not
+    /// yet accepted keeps the next one whole.
+    fn changed_with(&self, settings: &[Setting]) -> Option<Selection> {
+        let mut changed = match &self.awaiting {
+            Some(awaiting) => awaiting.changed?,
+            None => Selection::none(),
+        };
+        for setting in settings {
+            changed.set(*setting, true);
+        }
+        Some(changed)
+    }
+
     /// Set every bit of `group` to `on`, and submit the plan when that changes
-    /// what the worker will run.
+    /// what the worker will run. Nothing while a Restore runs.
     fn choose(&mut self, group: Group, on: bool) {
-        if !self.plan_known {
+        if !self.plan_known || self.restoring() {
             return;
         }
         for setting in group.settings() {
             self.plan.selection.set(*setting, on);
         }
         if self.plan.selection != self.next_plan().selection {
-            self.apply(Admission::of_gesture(self.by_person), Submission::Choice);
+            let changed = self.changed_with(group.settings());
+            self.apply(
+                Admission::of_gesture(self.by_person),
+                Submission::Choice,
+                changed,
+            );
         }
     }
 
@@ -1552,6 +1934,24 @@ impl SystemStateApp {
             }
             return;
         }
+        if let Some(slug) = key.strip_prefix("system-state/headline/open/") {
+            if self.plan_known
+                && let Some(access) = Access::ALL.into_iter().find(|access| access.word() == slug)
+                && headline(
+                    &self.status,
+                    &self.reviewed_rows(),
+                    Some(&self.reviewed_plan()),
+                )
+                .open
+                    == Some(access)
+            {
+                self.actions.push_back(SystemStateAction::OpenAccess {
+                    access,
+                    by_person: self.by_person,
+                });
+            }
+            return;
+        }
         match key {
             "system-state/stop" if self.status.running() && !self.stopping => {
                 // Asked once: the worker keeps it, so a run that has not
@@ -1570,25 +1970,22 @@ impl SystemStateApp {
                 self.status.operation = Some(SetupOperation::Restore);
                 self.actions.push_back(SystemStateAction::Restore);
             }
-            "system-state/headline/start" if !self.status.busy && self.plan_known => {
+            "system-state/headline/start"
+                if !self.status.busy
+                    && self.plan_known
+                    && headline(
+                        &self.status,
+                        &self.reviewed_rows(),
+                        Some(&self.reviewed_plan()),
+                    )
+                    .start =>
+            {
+                // The plan in force as it stands: nothing of the page's own.
                 self.apply(
                     Admission::of_gesture(self.by_person),
                     Submission::AsItStands,
+                    Some(Selection::none()),
                 );
-            }
-            "system-state/headline/open" => {
-                if let Some(access) = headline(
-                    &self.status,
-                    &self.reviewed_rows(),
-                    self.plan_known.then_some(&self.reviewed_plan()),
-                )
-                .open
-                {
-                    self.actions.push_back(SystemStateAction::OpenAccess {
-                        access,
-                        by_person: self.by_person,
-                    });
-                }
             }
             "system-state/headline/show" => {
                 if let Some(subject) = headline(
@@ -1622,7 +2019,12 @@ impl SystemStateApp {
             "system-state/vault/join" if !self.status.busy && self.plan_known => {
                 self.vault_open = Some(true);
                 self.plan.selection.set(Setting::Secrets, true);
-                self.apply(Admission::of_gesture(self.by_person), Submission::Join);
+                let changed = self.changed_with(&[Setting::Secrets]);
+                self.apply(
+                    Admission::of_gesture(self.by_person),
+                    Submission::Join,
+                    changed,
+                );
             }
             "system-state/url" | "system-state/password" if !self.status.busy => {
                 // A field someone fills shows: a draft is never hidden.
@@ -2293,8 +2695,9 @@ impl<'a, 'b> Page<'a, 'b> {
 
     /// The height of the tallest headline the page's states put at this
     /// width, each with Stop beside it: waiting on the debugger password, one
-    /// that needs you with its Turn On or its Show, one failed or waiting step
-    /// with its Show, changes to make with Set up now, and the run's own words.
+    /// that needs you with its Turn On or its Show, one failed step with its Show
+    /// and Set up now, one waiting step with its Show, changes to make with Set
+    /// up now, and the run's own words.
     /// The forms that name a row name the longest, and those that count rows
     /// count every row. A longer list of names can stand taller still; the
     /// page then counts its own.
@@ -2323,6 +2726,7 @@ impl<'a, 'b> Page<'a, 'b> {
             },
             Headline {
                 show: Some(Subject::Access(Access::Debugger)),
+                start: true,
                 ..Headline::line(format!("1 step failed: {longest}"))
             },
             Headline {
@@ -2364,15 +2768,12 @@ impl<'a, 'b> Page<'a, 'b> {
         let m = &self.m;
         let row_h = subtitle_h.max(m.control_h);
         let mut faces: Vec<(&str, String, Option<&str>, StyleRef, bool)> = Vec::new();
-        if let Some(access) = headline.open {
+        let open_key = headline
+            .open
+            .map(|access| format!("system-state/headline/open/{}", access.word()));
+        if let Some((access, key)) = headline.open.zip(open_key.as_deref()) {
             let (label, visual) = open_words(access);
-            faces.push((
-                "system-state/headline/open",
-                label,
-                Some(visual),
-                StyleRef::Accent,
-                true,
-            ));
+            faces.push((key, label, Some(visual), StyleRef::Accent, true));
         }
         if let Some(subject) = headline.show {
             faces.push((
@@ -2530,7 +2931,7 @@ impl<'a, 'b> Page<'a, 'b> {
         );
         let mut restore = self.fitted_button(
             "system-state/restore",
-            "Restore previous settings".to_owned(),
+            RESTORE_FINISHED.to_owned(),
             None,
             Some("Restore"),
             StyleRef::Quiet,
@@ -2818,8 +3219,10 @@ impl<'a, 'b> Page<'a, 'b> {
     fn card_header(&self, index: usize, group: Group, count: Option<String>) -> (UiNode, f32) {
         let m = &self.m;
         let key = format!("system-state/group/{index}");
-        // Until the plan is known, neither segment is chosen or pressable.
+        // Until the plan is known, neither segment is chosen; neither is
+        // pressable then, nor while a Restore changes the plan (§3.4).
         let known = self.app.plan_known;
+        let pressable = known && !self.app.restoring();
         let choice = if known {
             group_choice(group, self.app.plan.selection)
         } else {
@@ -2857,7 +3260,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 let mut control = Control::new(spec, ActionId::new(format!("{key}/{word}")))
                     .state(ControlState {
                         selected: chosen,
-                        enabled: known,
+                        enabled: pressable,
                         ..ControlState::default()
                     })
                     .style(StyleRef::Navigation);
@@ -3760,19 +4163,38 @@ fn rule(key: String) -> UiNode {
 /// The page's scenarios for looking at it without a Mac to set up
 /// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `debugger`,
 /// `needs-you`, `vault`, `set-up`, `non-alab`, `failed`, `check-failed`, `mixed`,
-/// `named-result-failed`, `restore-at-login`, `vault-source-mismatch`, `plan-unread` and `fresh`.
+/// `named-result-failed`, `restore-at-login`, `restore-blocked`, `vault-source-mismatch`,
+/// `plan-unread` and `fresh`.
 /// Debug and dev-seam builds only: a release build carries none of
 /// their words.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     use Standing::{AtLogin, Differs, Failed, InPlace, NeedsYou, NotNeeded, Unknown, Waiting};
+    use aterm_types::macos_setup::until_login;
     let read = |subject: Subject, standing: Standing, now: Option<&str>| Observation {
         subject,
         standing,
         now: now.map(str::to_owned),
+        after_login: None,
         wanted: subject.wanted().to_owned(),
         note: None,
         detail: None,
+    };
+    // A value live until the next login, as `init_observe` marks it right after a Restore: the
+    // Mac reads `after` from then.
+    let until = |setting: Setting, live: &str, after: &str| Observation {
+        now: Some(until_login(live)),
+        after_login: Some(after.to_owned()),
+        ..read(Subject::Setting(setting), Differs, None)
+    };
+    // The plan a Restore leaves: the groups it put back are left as is.
+    let restored = |mut selection: Selection| {
+        for group in [Group::Input, Group::Desktop] {
+            for setting in group.settings() {
+                selection.set(*setting, false);
+            }
+        }
+        Plan::from(selection)
     };
     let access = |access: Access, standing: Standing, now: Option<&str>| {
         read(Subject::Access(access), standing, now)
@@ -3916,9 +4338,10 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
         }
         "set-up" => {
+            // Trackpad scrolling, set in this login session, is in full use from the next.
             status.observed = with(
                 in_place(),
-                vec![setting(Setting::CapsLock, AtLogin, Some("Caps Lock"))],
+                vec![setting(Setting::TrackpadScrolling, AtLogin, Some("All on"))],
             );
         }
         "non-alab" => {
@@ -3960,29 +4383,46 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             }];
         }
         "restore-at-login" => {
-            // The two rows a Restore's `restore_runtime` gives settings that load only at
-            // the next login: one calm note, no failure.
-            status.observed = in_place();
-            status.rows = vec![
-                SetupStatusRow {
-                    name: Setting::NaturalScrolling.name().into(),
-                    status: "login".into(),
-                    detail: "Log out and back in to use the restored scroll direction.".into(),
-                },
-                SetupStatusRow {
-                    name: Setting::CapsLock.name().into(),
-                    status: "login".into(),
-                    detail: "Log out and back in to use the restored keyboard settings.".into(),
-                },
-            ];
+            // Right after a Restore of the whole profile (§3.4): the groups it put back are
+            // left as is; the Caps Lock key and the scroll direction are back as saved and load
+            // at the next login, so each reads its live value until then, as `init_observe`
+            // marks it, and Trackpad scrolling reads its saved value; and the page's one calm
+            // line comes from the outcome such a Restore reports (`macos_doctor`'s tests hold it
+            // to that), in the page's own words.
+            status.plan = Some(restored(Selection::all()));
+            status.finished = true;
+            status.observed = with(
+                in_place(),
+                vec![
+                    until(Setting::CapsLock, "Control", "Caps Lock"),
+                    until(Setting::NaturalScrolling, "Off", "On"),
+                    setting(Setting::TrackpadScrolling, Differs, Some("Some off")),
+                    setting(Setting::Desktop, Differs, Some("Icons hidden")),
+                    setting(Setting::Widgets, Differs, Some("Shown")),
+                    setting(Setting::Dock, Differs, Some("9 apps")),
+                ],
+            );
+            status.rows = restore_rows(&RestoreOutcome::of(
+                [
+                    (Setting::CapsLock, PutBack::AtLogin),
+                    (Setting::NaturalScrolling, PutBack::AtLogin),
+                    (Setting::TrackpadScrolling, PutBack::AtLogin),
+                    (Setting::Desktop, PutBack::Back),
+                    (Setting::Widgets, PutBack::Back),
+                    (Setting::Dock, PutBack::Back),
+                ]
+                .map(|(setting, put_back)| (Some(setting), put_back)),
+            ));
         }
         "mixed" => {
+            // Some groups set up and some left as is, after a Restore put back the Mac's own
+            // scrolling, Widgets and Dock: their rows read the values the Restore line names,
+            // left as is. Permissions are set up, as they are by default: two of them, and the
+            // Rust documentation in Spotlight, are still to change.
             let mut selection = Selection::all();
-            selection.set(Setting::NaturalScrolling, false);
-            selection.set(Setting::TrackpadScrolling, false);
             selection.set(Setting::Messages, false);
             selection.set(Setting::FaceTime, false);
-            status.plan = Some(Plan::from(selection));
+            status.plan = Some(restored(selection));
             let mut accessibility = access(Access::Accessibility, NotNeeded, None);
             accessibility.detail =
                 Some("Only the Messages and FaceTime sign-outs need it.".to_owned());
@@ -3992,31 +4432,51 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     access(Access::Debugger, Differs, Some("Off")),
                     access(Access::LocalNetwork, Differs, None),
                     accessibility,
-                    setting(Setting::CapsLock, AtLogin, Some("Caps Lock")),
                     setting(Setting::NaturalScrolling, Differs, Some("On")),
+                    setting(Setting::TrackpadScrolling, Differs, Some("Some off")),
                     setting(Setting::Widgets, Differs, Some("Shown")),
+                    setting(Setting::Dock, Differs, Some("9 apps")),
                     setting(Setting::Messages, Differs, Some("Signed in")),
-                    setting(Setting::Repositories, Unknown, None),
+                    setting(Setting::FaceTime, Differs, Some("Signed in")),
+                    setting(Setting::Spotlight, Differs, Some("Docs indexed")),
                 ],
             );
-            status.rows = vec![SetupStatusRow {
-                name: "Restore previous settings".to_owned(),
-                status: "restored".to_owned(),
-                detail: "Natural scrolling and Trackpad scrolling are as they were.".to_owned(),
-            }];
+            status.rows = restore_rows(&RestoreOutcome::of(
+                [
+                    (Setting::NaturalScrolling, PutBack::Back),
+                    (Setting::TrackpadScrolling, PutBack::AtLogin),
+                    (Setting::Widgets, PutBack::Back),
+                    (Setting::Dock, PutBack::Back),
+                ]
+                .map(|(setting, put_back)| (Some(setting), put_back)),
+            ));
         }
         "restore-blocked" => {
-            // A completed Restore can leave an original unknown even while
-            // the current preference is in place for setup. Its operation
-            // result must remain visible, including for a group left as is.
-            status.plan = Some(Plan::from(Selection::none()));
+            // A Restore that put most rows back and could not put Widgets back: a failure that
+            // names Restore and the row, beside the calm line for the rest, which says a value
+            // macOS hid stayed as it is (nobody can change that, so it is no failure).
+            status.plan = Some(restored(Selection::all()));
             status.finished = true;
-            status.observed = in_place();
-            status.rows = vec![SetupStatusRow {
-                name: "Restore: Widgets".into(),
-                status: "failed".into(),
-                detail: "The original value was not backed up; Widgets were left unchanged.".into(),
-            }];
+            status.observed = with(
+                in_place(),
+                vec![
+                    until(Setting::CapsLock, "Control", "Caps Lock"),
+                    setting(Setting::NaturalScrolling, Differs, Some("On")),
+                    setting(Setting::TrackpadScrolling, Differs, Some("Some off")),
+                    setting(Setting::Dock, Differs, Some("9 apps")),
+                ],
+            );
+            status.rows = restore_rows(&RestoreOutcome::of(
+                [
+                    (Setting::CapsLock, PutBack::AtLogin),
+                    (Setting::NaturalScrolling, PutBack::Back),
+                    (Setting::TrackpadScrolling, PutBack::AtLogin),
+                    (Setting::Desktop, PutBack::Unknown),
+                    (Setting::Widgets, PutBack::Failed),
+                    (Setting::Dock, PutBack::Back),
+                ]
+                .map(|(setting, put_back)| (Some(setting), put_back)),
+            ));
         }
         "fresh" => {
             // A fresh Mac as the Plan pass reads it, every group set up: most

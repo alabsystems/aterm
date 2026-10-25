@@ -1,0 +1,27 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.133.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the ? shortcuts open from an empty composer with the context indicator up (long stub replies (CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=20)): it stands in the mode row's place
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand
+  tokens on every turn. The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn.
+  The lab stub pads this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads
+  this reply so the conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the
+  conversation grows by about a thousand tokens on every turn. The lab stub pads this reply so the conversation grows by
+  about a thousand tokens on every turn.
+
+✻ Cooked for 0s · done 11:33 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode        double tap esc to clear input      ctrl + shift + _ to undo
+  / for commands          shift + tab to auto-accept edits   ctrl + z to suspend
+  @ for file paths        ctrl + o for verbose output        ctrl + v to paste images
+  /btw for side question  ctrl + t to toggle tasks           opt + p to switch model
+                          backslash (\) + return (⏎) for     ctrl + s to stash prompt
+                          newline                            ctrl + g to edit in $EDITOR
+                                                             /keybindings to customize

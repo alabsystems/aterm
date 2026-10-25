@@ -202,35 +202,41 @@ pub struct RainConfig {
     pub theme_accent: u32,
 }
 
+impl RainConfig {
+    /// Default disabled rain configuration.
+    pub const DEFAULT: Self = Self {
+        enabled: false,
+        fps: 30,
+        density: 6,
+        speed: 5,
+        trail: 5,
+        alpha_override: None,
+        head_alpha_override: None,
+        hue: RainHue::Matrix,
+        mutation_ms: 133,
+        idle_secs: 8,
+        suppress_in_alt_screen: false,
+        turn_wave: true,
+        bell_alert: true,
+        exit_tint: true,
+        output_material: true,
+        seed: 0,
+        default_bg: 0x0011_1318,
+        theme_fg: 0x00D0_D0D0,
+        theme_accent: 0x0050_FA7B,
+    };
+}
+
 impl Default for RainConfig {
+    #[inline]
     fn default() -> Self {
-        Self {
-            enabled: false,
-            fps: 30,
-            density: 6,
-            speed: 5,
-            trail: 5,
-            alpha_override: None,
-            head_alpha_override: None,
-            hue: RainHue::Matrix,
-            mutation_ms: 133,
-            idle_secs: 8,
-            suppress_in_alt_screen: false,
-            turn_wave: true,
-            bell_alert: true,
-            exit_tint: true,
-            output_material: true,
-            seed: 0,
-            default_bg: 0x0011_1318,
-            theme_fg: 0x00D0_D0D0,
-            theme_accent: 0x0050_FA7B,
-        }
+        Self::DEFAULT
     }
 }
 
 /// The Tier-B live per-tick inputs (snapshot scalars the host read under its terminal lock; the
 /// engine never re-locks).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct RainTickInput<'a> {
     /// Visible cursor cell `(row, col)`, `None` when hidden (DECTCEM off).
     pub cursor: Option<(u16, u16)>,
@@ -244,6 +250,24 @@ pub struct RainTickInput<'a> {
     /// Whether the alternate screen is active (gates `suppress_in_alt_screen` and the scroll-quiet
     /// window).
     pub is_alt_screen: bool,
+}
+
+impl RainTickInput<'_> {
+    /// Empty per-tick rain input at the live primary screen with no cursor or selection.
+    pub const EMPTY: Self = Self {
+        cursor: None,
+        hidden_band: &[],
+        sel: None,
+        display_offset: 0,
+        is_alt_screen: false,
+    };
+}
+
+impl Default for RainTickInput<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 struct EmitCtx<'a> {

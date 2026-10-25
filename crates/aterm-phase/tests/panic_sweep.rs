@@ -214,8 +214,15 @@ fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
     }
 }
 
+/// The most rows a head or tail window holds: more than any terminal screen a reader is
+/// handed (the tallest capture here is 81 rows), so every screen's heads and tails are whole.
+/// A taller file (a policy table, a corpus, frames stacked under `## W columns` lines) gives a
+/// screen's worth of rows to each side of every cut, which keeps its sweep linear in its height.
+const SCREEN_ROWS: usize = 128;
+
 /// Sweep shard `part` of `parts`: whole screen (part 0), tail/head cuts at
-/// `k ≡ part (mod parts)`, and middle windows of heights 1..=12.
+/// `k ≡ part (mod parts)` (at most [`SCREEN_ROWS`] rows each), and middle windows of
+/// heights 1..=12.
 fn sweep(
     name: &str,
     rows: &[String],
@@ -228,8 +235,19 @@ fn sweep(
         check(name, "whole", rows, failures);
     }
     for k in (part..=n).step_by(parts) {
-        check(name, &format!("tail rows[{k}..]"), &rows[k..], failures);
-        check(name, &format!("head rows[..{k}]"), &rows[..k], failures);
+        let (top, end) = (k.saturating_sub(SCREEN_ROWS), (k + SCREEN_ROWS).min(n));
+        check(
+            name,
+            &format!("tail rows[{k}..{end}]"),
+            &rows[k..end],
+            failures,
+        );
+        check(
+            name,
+            &format!("head rows[{top}..{k}]"),
+            &rows[top..k],
+            failures,
+        );
     }
     for h in 1..=12.min(n) {
         for s in (part..=n - h).step_by(parts) {

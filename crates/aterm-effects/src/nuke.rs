@@ -83,8 +83,9 @@ pub const fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
 /// Natural tile size for `part` at `(cell_w, cell_h)`, clamped to the baker's `4*cell_h x 2*cell_h` slot.
 #[inline]
 #[must_use]
-pub fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u16) {
-    let (cw, ch) = (f32::from(cell_w.max(1)), f32::from(cell_h.max(1)));
+pub const fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u16) {
+    let cw = (if cell_w > 1 { cell_w } else { 1 }) as f32;
+    let ch = (if cell_h > 1 { cell_h } else { 1 }) as f32;
     let (cols, rows) = match part {
         NukePart::Cap => (8.0, 2.00),
         NukePart::Stem => (2.6, 2.00),

@@ -7,6 +7,38 @@
 use aterm_agent::supervise::policy::turn_end::TurnEndState;
 use aterm_spec::derive::Model;
 
+/// `st`'s values in its variables' name order: a walk's seen-set key. Every state of `m` names
+/// at least `m`'s declared variables, so one that names no more is told apart by its values
+/// alone, compared as integers rather than as a map of names; a state that names more (an
+/// action writing an undeclared variable) panics rather than sharing a key.
+pub fn key(m: &Model, st: &std::collections::BTreeMap<&'static str, i64>) -> Vec<i64> {
+    assert_eq!(
+        st.len(),
+        m.vars.len(),
+        "{} names a variable it does not declare: {st:?}",
+        m.name
+    );
+    st.values().copied().collect()
+}
+
+/// [`key`] refuses a state naming a variable its model does not declare (the interpreter walks
+/// such a model as written, and two states that differ by name could share their values).
+#[test]
+#[should_panic(expected = "names a variable it does not declare")]
+fn a_state_naming_an_undeclared_variable_has_no_key() {
+    let m = Model {
+        name: "Grows",
+        consts: vec![],
+        vars: vec![aterm_spec::derive::StateVar { name: "x", init: 0 }],
+        fn_vars: vec![],
+        actions: vec![],
+        invariants: vec![],
+    };
+    let mut st = m.init_state();
+    st.insert("z", 1);
+    let _ = key(&m, &st);
+}
+
 /// The model's constant `name`; a name it does not declare panics.
 pub fn cnst(m: &Model, name: &str) -> i64 {
     m.consts

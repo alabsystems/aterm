@@ -786,7 +786,7 @@ pub(crate) fn layout_segments(
     )
 }
 
-/// [`layout_segments`] with the seat width (`seat`, from [`strip_seat_cols`]).
+/// `layout_segments` with the seat width (`seat`, from [`strip_seat_cols`]).
 fn layout_segments_seated(
     cols: u16,
     tab_count: usize,
@@ -1743,7 +1743,7 @@ pub(crate) fn strip_hover_bg_for_test(theme: Theme) -> [u8; 3] {
     strip_colors(theme).hover_bg
 }
 
-/// A bare strip-background [`RenderCell`], to pre-fill strip rows before [`paint_strip`].
+/// A bare strip-background [`RenderCell`], to pre-fill strip rows before `paint_strip`.
 #[must_use]
 pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
     strip_cell(' ', &strip_colors(p), StripRole::Inactive)

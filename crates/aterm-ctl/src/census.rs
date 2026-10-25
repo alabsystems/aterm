@@ -64,7 +64,7 @@ pub struct Census {
     pub programs: Vec<Program>,
 }
 
-/// What the front door does with argv[1] (`aterm <word>`): a verb, or a flag it answers before
+/// What the front door does with `argv[1]` (`aterm <word>`): a verb, or a flag it answers before
 /// it routes a window (`--version`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verb {
@@ -77,12 +77,12 @@ pub enum Verb {
 /// The front door's routes, handed in by aterm-cli, whose tables they are.
 #[derive(Clone, Copy)]
 pub struct FrontDoor<'a> {
-    /// What it does when started under argv[0]'s file name with argv[1], before it reads
-    /// argv[1] as a verb: a window alias (`aterm-gui`) is `Some(Window)`, an alias of another
+    /// What it does when started under `argv[0]`'s file name with `argv[1]`, before it reads
+    /// `argv[1]` as a verb: a window alias (`aterm-gui`) is `Some(Window)`, an alias of another
     /// program (`atpkg`, `aterm-ctl`, `aterm-askpass`) `Some(Program)`, and its own names
     /// (`aterm`, `aterm-cli`, any other) `None`.
     pub alias: &'a dyn Fn(&str, &str) -> Option<Verb>,
-    /// What it does with argv[1] under its own names (`aterm <word>`).
+    /// What it does with `argv[1]` under its own names (`aterm <word>`).
     pub verb: &'a dyn Fn(&str) -> Option<Verb>,
 }
 
@@ -410,7 +410,7 @@ fn in_build_dir(exe: &Path) -> bool {
         .any(|name| name.starts_with("target"))
 }
 
-/// argv[0]'s or the executable's file name, whichever the front door routes as an alias
+/// `argv[0]`'s or the executable's file name, whichever the front door routes as an alias
 /// ([`FrontDoor::alias`]), with that route.
 fn alias_of<'a>(exe: &'a Path, argv: &'a [String], door: FrontDoor<'_>) -> Option<(&'a str, Verb)> {
     let first = argv.get(1).map_or("", String::as_str);
@@ -425,7 +425,7 @@ fn alias_of<'a>(exe: &'a Path, argv: &'a [String], door: FrontDoor<'_>) -> Optio
 
 /// What a program is called: an alias by its own name, or `aterm <verb>` for an `aterm-<verb>`
 /// alias whose verb the front door's table names; under the front door's own names,
-/// `aterm <verb>` when the table names argv[1]; else its executable's file name. A verb is
+/// `aterm <verb>` when the table names `argv[1]`; else its executable's file name. A verb is
 /// followed by the next argument when that is a word too.
 fn program_name(exe: &Path, argv: &[String], door: FrontDoor<'_>) -> String {
     let (verb, rest) = match alias_of(exe, argv, door) {

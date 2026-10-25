@@ -779,6 +779,18 @@ impl App {
         {
             return carried;
         }
+        // A frame whose deck moved under it for something other than its rows keeps its size;
+        // the grid re-grids to it once (`attach_os_window`, `CarriedDeck::keeps_frame`).
+        let moved = self.windows.get(&wid).is_some_and(|ws| {
+            self.carried_deck_of(wid, ws.head_pts, ws.scale, (rows, cols), carried.height)
+                .is_some_and(|was| was.keeps_frame(self.deck_style(), ws.deck_form))
+        });
+        if moved
+            && remainder(carried.width, exact.width, cell_w)
+            && self.grid_dims_for(wid, carried).1 == cols
+        {
+            return carried;
+        }
         aterm_log::info!(
             "restore: window {}'s carried size {}x{} does not hold the carried \
              {cols}x{rows} grid here (its frame is {}x{}); sized to the frame",
@@ -791,7 +803,26 @@ impl App {
         exact
     }
 
-    /// Window `wid`'s head at its attach for a `head_pts` titlebar band at `scale`.
+    /// Re-grid window `wid`'s tabs once to its attach frame `size` where that frame holds
+    /// another grid than the window's: the other deck style sized it, or v2 sized it in the form
+    /// it no longer takes ([`Self::attach_frame_px`] keeps it), so the deck's head moved under
+    /// it. Booked `site=deck`.
+    pub(crate) fn regrid_to_attach_frame(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
+        let Some((rows, cols)) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) else {
+            return;
+        };
+        if size != self.window_frame_px_for(wid, rows, cols)
+            && self.grid_dims_for(wid, size) != (rows, cols)
+        {
+            let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Deck);
+            self.on_resize(wid, size);
+        }
+    }
+
+    /// Window `wid`'s head at its attach for a `head_pts` titlebar band at `scale`: the form
+    /// is the one the carried frame was sized in, of either deck style
+    /// ([`crate::stats_deck::carried_deck`]), else the one a window of the live style opens
+    /// in ([`crate::stats_deck::DeckStyle::room_form`]), then decided for the frame.
     pub(crate) fn attach_deck_head(
         &mut self,
         wid: WindowId,
@@ -800,29 +831,19 @@ impl App {
         (rows, cols): (u16, u16),
         carried: Option<PhysicalSize<u32>>,
     ) -> usize {
-        use crate::stats_plan::DeckForm;
-        let frame_under = |app: &mut Self, form: DeckForm| {
-            if let Some(ws) = app.windows.get_mut(&wid) {
-                ws.deck_form = form;
-            }
-            let head = app.deck_head_px(wid, head_pts, scale, 0);
-            app.backend.set_head(head);
-            app.window_frame_px_for(wid, rows, cols)
-        };
+        let form = carried
+            .and_then(|c| self.carried_deck_of(wid, head_pts, scale, (rows, cols), c.height))
+            .map_or(self.deck_style().room_form(), |was| was.form);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.deck_form = form;
+        }
         let frame_h = match carried {
-            None => frame_under(self, DeckForm::Folded).height,
-            Some(carried) => {
-                let (_, cell_h) = self.win_cell_size(wid);
-                let full = frame_under(self, DeckForm::Full);
-                let was_full = carried
-                    .height
-                    .checked_sub(full.height)
-                    .is_some_and(|extra| (extra as usize) < cell_h);
-                if !was_full {
-                    frame_under(self, DeckForm::Folded);
-                }
-                carried.height
+            None => {
+                let head = self.deck_head_px(wid, head_pts, scale, 0);
+                self.backend.set_head(head);
+                self.window_frame_px_for(wid, rows, cols).height
             }
+            Some(carried) => carried.height,
         };
         let head = self.deck_head_px(wid, head_pts, scale, frame_h);
         self.backend.set_head(head);
@@ -1009,29 +1030,46 @@ impl App {
                     let height = crate::visible_frame_height(raw_height, pad, pad_top);
                     PhysicalSize::new(width as u32, height as u32)
                 };
-                let bars = self.stats_bars_form();
-                let (folded, full) = (
-                    crate::stats_plan::DeckForm::Folded,
-                    crate::stats_plan::DeckForm::Full,
-                );
-                let head_in = |form| band + crate::stats_deck::deck_px(bars, form, scale, cell_h);
+                let (bars, style) = (self.stats_bars_form(), self.deck_style());
+                let start = style.room_form();
+                let head_in = |style, form| {
+                    band + crate::stats_deck::deck_px(bars, style, form, scale, cell_h)
+                };
                 let carried_h = self
                     .windows
                     .get(&wid)
                     .and_then(|ws| ws.carried_inner_px)
                     .map(|c| c.height);
+                let was = carried_h.and_then(|h| {
+                    crate::stats_deck::carried_deck(h, cell_h, style, head_in, |head| {
+                        frame(head).height
+                    })
+                });
                 let (prev, frame_h) = match carried_h {
-                    Some(h) => {
-                        let was_full = h
-                            .checked_sub(frame(head_in(full)).height)
-                            .is_some_and(|extra| (extra as usize) < cell_h);
-                        (if was_full { full } else { folded }, h)
-                    }
-                    None => (folded, frame(head_in(folded)).height),
+                    Some(h) => (was.map_or(start, |was| was.form), h),
+                    None => (start, frame(head_in(style, start)).height),
                 };
-                let avail = crate::stats_plan::avail_pt(f64::from(frame_h), band as f64, scale);
-                let deck = crate::stats_plan::deck_form_for(avail, prev, self.deck_size_pref());
-                let exact = frame(head_in(deck));
+                let chrome = self.chrome_rows(wid);
+                let rows_under = |head: usize| {
+                    let rows = crate::asymmetric_pad_cells(
+                        (frame_h as usize).saturating_sub(head),
+                        pad_top,
+                        pad,
+                        cell_h,
+                    );
+                    u16::try_from(rows)
+                        .unwrap_or(u16::MAX)
+                        .saturating_sub(chrome)
+                        .max(1)
+                };
+                let room =
+                    crate::stats_deck::deck_room(style, bars, band, scale, cell_h, rows_under);
+                let deck = crate::stats_plan::deck_form_for(room, prev, self.deck_size_pref());
+                // A frame whose deck moved under it keeps its size (`attach_frame_px`).
+                let exact = match was {
+                    Some(was) if was.keeps_frame(style, deck) => frame(was.head),
+                    _ => frame(head_in(style, deck)),
+                };
                 let _ = window.request_inner_size(exact);
                 if let Some((x, y)) =
                     bootstrap_restore.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)))
@@ -1118,6 +1156,7 @@ impl App {
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, head);
         }
         size = self.attach_frame_px(wid, rows, cols, carried);
+        self.regrid_to_attach_frame(wid, size);
         let _ = window.request_inner_size(size);
         if let Some(early) = early_reveal_size {
             if early == size {
@@ -1156,8 +1195,8 @@ impl App {
         #[cfg(target_os = "linux")]
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.initial_frame_settle = Some(crate::InitialFrameSettle {
-                rows,
-                cols,
+                rows: ws.rows,
+                cols: ws.cols,
                 deadline: Instant::now() + INITIAL_FRAME_SETTLE_WINDOW,
                 corrections: INITIAL_FRAME_SETTLE_MAX_CORRECTIONS,
                 corrected: false,

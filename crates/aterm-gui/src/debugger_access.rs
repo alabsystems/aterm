@@ -2453,81 +2453,150 @@ pub(crate) struct DebuggerStepQueue {
 
 /// The access record's writer: the debugger row's outcomes
 /// (`aterm_types::macos_setup::access_record`), appended in order on a thread of its own,
-/// never in the UI thread's turn. A line whose write fails is lost with a warning, and the
-/// Permissions stage judges that row again.
-#[derive(Debug, Default)]
+/// never in the UI thread's turn. Failed lines remain ordered for the App's next retry.
+#[derive(Debug)]
 struct AccessWriter {
     queue: Arc<Mutex<AccessQueue>>,
+    spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+}
+
+impl Default for AccessWriter {
+    fn default() -> Self {
+        Self {
+            queue: Arc::default(),
+            spawn: spawn_access_writer,
+        }
+    }
+}
+
+fn spawn_access_writer(run: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    crate::qos::spawn_lane_thread("aterm-access-record", crate::qos::Role::Background, run)
+        .map(|_| ())
 }
 
 /// The lines [`AccessWriter`] has yet to write, and whether a drain runs.
 #[derive(Debug, Default)]
 struct AccessQueue {
-    lines: std::collections::VecDeque<(PathBuf, u64, AccessOutcome)>,
+    lines: std::collections::VecDeque<AccessLine>,
     draining: bool,
+    retry_at: Option<Instant>,
+    spawn_warned: bool,
+}
+
+#[derive(Debug)]
+struct AccessLine {
+    dir: PathBuf,
+    revision: u64,
+    outcome: AccessOutcome,
+    warned: bool,
 }
 
 impl AccessWriter {
-    /// Queue one line; start the drain if none runs.
-    fn append(&self, dir: PathBuf, revision: u64, outcome: AccessOutcome) {
+    const RETRY: Duration = Duration::from_secs(1);
+
+    /// Queue one line; start the drain unless it is running or backing off.
+    fn append(&self, dir: PathBuf, revision: u64, outcome: AccessOutcome, now: Instant) {
+        self.queue.lock_or_recover().lines.push_back(AccessLine {
+            dir,
+            revision,
+            outcome,
+            warned: false,
+        });
+        self.retry(now);
+    }
+
+    fn retry(&self, now: Instant) {
         let start = {
             let mut queue = self.queue.lock_or_recover();
-            queue.lines.push_back((dir, revision, outcome));
-            !std::mem::replace(&mut queue.draining, true)
+            if queue.draining || queue.lines.is_empty() || queue.retry_at.is_some_and(|at| now < at)
+            {
+                false
+            } else {
+                queue.draining = true;
+                queue.retry_at = None;
+                true
+            }
         };
         if !start {
             return;
         }
         let queue = Arc::clone(&self.queue);
-        let spawned = crate::qos::spawn_lane_thread(
-            "aterm-access-record",
-            crate::qos::Role::Background,
-            move || {
-                loop {
-                    // Taken and released per line: the UI thread never waits for a write.
-                    let next = {
-                        let mut queue = queue.lock_or_recover();
-                        let next = queue.lines.pop_front();
-                        if next.is_none() {
-                            queue.draining = false;
-                        }
-                        next
-                    };
-                    let Some((dir, revision, outcome)) = next else {
-                        return;
-                    };
-                    if let Err(error) = aterm_types::macos_setup::access_record::append(
-                        &dir,
-                        revision,
-                        aterm_types::macos_setup::Access::Debugger,
-                        outcome,
-                    ) {
+        let spawned = (self.spawn)(Box::new(move || {
+            loop {
+                // Taken and released per line: the UI thread never waits for a write.
+                let next = {
+                    let mut queue = queue.lock_or_recover();
+                    let next = queue.lines.pop_front();
+                    if next.is_none() {
+                        queue.draining = false;
+                    }
+                    next
+                };
+                let Some(mut line) = next else {
+                    return;
+                };
+                if let Err(error) = aterm_types::macos_setup::access_record::append(
+                    &line.dir,
+                    line.revision,
+                    aterm_types::macos_setup::Access::Debugger,
+                    line.outcome,
+                ) {
+                    if !line.warned {
                         aterm_log::warn!(
                             "debugger access: the access record could not be written ({}): {error}",
-                            outcome.word()
+                            line.outcome.word()
                         );
+                        line.warned = true;
                     }
+                    let mut queue = queue.lock_or_recover();
+                    // A later outcome may have arrived during this write. Keep this one
+                    // ahead of it, so a retried Handed never overwrites its Declined.
+                    queue.lines.push_front(line);
+                    queue.retry_at = Some(Instant::now() + Self::RETRY);
+                    queue.draining = false;
+                    return;
                 }
-            },
-        );
-        if let Err(error) = spawned {
+            }
+        }));
+        let warning = {
             let mut queue = self.queue.lock_or_recover();
-            let lost = queue.lines.len();
-            queue.lines.clear();
-            queue.draining = false;
-            aterm_log::warn!("debugger access: {lost} access record line(s) not written: {error}");
+            match spawned {
+                Ok(()) => {
+                    queue.spawn_warned = false;
+                    None
+                }
+                Err(error) => {
+                    queue.retry_at = Some(now + Self::RETRY);
+                    queue.draining = false;
+                    (!std::mem::replace(&mut queue.spawn_warned, true)).then_some(error)
+                }
+            }
+        };
+        if let Some(error) = warning {
+            aterm_log::warn!("debugger access: the access record worker could not start: {error}");
         }
     }
 
-    /// Wait until the queue is empty and no drain runs.
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let queue = self.queue.lock_or_recover();
+        if queue.draining {
+            // The worker can fail after the App calculated its wait. Keep a wake until it
+            // settles, including when the step ended or its page and permission lanes closed.
+            Some(now + Self::RETRY)
+        } else {
+            queue.retry_at.map(|at| at.max(now))
+        }
+    }
+
+    /// Wait until the current drain settles, including a failed save retained for retry.
     #[cfg(test)]
     fn drained_for_test(&self) {
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
-            "the access record's lines are written",
+            "the access record writer settles",
             || {
                 let queue = self.queue.lock_or_recover();
-                (queue.lines.is_empty() && !queue.draining).then_some(())
+                (!queue.draining).then_some(())
             },
         );
     }
@@ -2814,15 +2883,26 @@ impl DebuggerStepQueue {
     /// asked for before it ([`AccessWriter`]), and nothing where no folder is named.
     pub(crate) fn record(&self, revision: u64, outcome: AccessOutcome) {
         if let Some(dir) = &self.access_dir {
-            self.access_writer.append(dir.clone(), revision, outcome);
+            self.access_writer
+                .append(dir.clone(), revision, outcome, Instant::now());
         }
     }
 
-    /// Wait until every line [`Self::record`] took is written or failed (a one-minute hang
-    /// detector).
+    /// Wait until every line [`Self::record`] took is written or retained after failure
+    /// (a one-minute hang detector).
     #[cfg(test)]
     pub(crate) fn record_written_for_test(&self) {
         self.access_writer.drained_for_test();
+    }
+
+    /// Save completed outcomes again without starting another debugger change.
+    pub(crate) fn retry_records(&self, now: Instant) {
+        self.access_writer.retry(now);
+    }
+
+    /// Completed records have their own deadline, independent of permission actions.
+    pub(crate) fn record_deadline(&self, now: Instant) -> Option<Instant> {
+        self.access_writer.next_deadline(now)
     }
 
     /// Whether a look is due at `now`.
@@ -5455,6 +5535,116 @@ mod tests {
         queue.answered_by_press();
         queue.resume();
         assert!(!queue.queued(), "a press ended it for good");
+    }
+
+    #[test]
+    fn an_access_record_worker_spawn_failure_keeps_order_and_respects_retry_backoff() {
+        use aterm_types::macos_setup::{Access, access_record};
+
+        thread_local! {
+            static SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = 8_230;
+        let now = Instant::now();
+        let mut writer = AccessWriter {
+            spawn: |_| {
+                SPAWNS.with(|spawns| spawns.set(spawns.get() + 1));
+                Err(std::io::Error::other("injected worker spawn refusal"))
+            },
+            ..AccessWriter::default()
+        };
+        writer.append(root.path().to_owned(), revision, AccessOutcome::Handed, now);
+        let due = writer.next_deadline(now).unwrap();
+        assert_eq!(due, now + AccessWriter::RETRY);
+        writer.append(
+            root.path().to_owned(),
+            revision,
+            AccessOutcome::Declined,
+            now,
+        );
+        writer.append(
+            root.path().to_owned(),
+            revision - 1,
+            AccessOutcome::Granted,
+            now,
+        );
+        assert_eq!(SPAWNS.with(std::cell::Cell::get), 1);
+        assert!(access_record::read(root.path(), revision).is_empty());
+        writer.spawn = spawn_access_writer;
+        writer.retry(due - Duration::from_nanos(1));
+        {
+            let pending = writer.queue.lock_or_recover();
+            assert!(!pending.draining);
+            assert_eq!(pending.lines.len(), 3);
+        }
+        assert!(access_record::read(root.path(), revision).is_empty());
+
+        writer.retry(due);
+        writer.drained_for_test();
+        assert_eq!(
+            access_record::read(root.path(), revision),
+            [
+                (Access::Debugger, AccessOutcome::Handed),
+                (Access::Debugger, AccessOutcome::Declined),
+            ]
+        );
+        assert_eq!(
+            access_record::latest(root.path(), revision, Access::Debugger),
+            Some(AccessOutcome::Declined)
+        );
+        assert_eq!(
+            access_record::read(root.path(), revision - 1),
+            [(Access::Debugger, AccessOutcome::Granted)]
+        );
+        assert_eq!(writer.next_deadline(due), None);
+        writer.retry(due + AccessWriter::RETRY);
+        assert_eq!(access_record::read(root.path(), revision).len(), 2);
+    }
+
+    /// An unfinished write has a polling wake even once its permission step ended. Each App
+    /// turn gives it a future wake; a late completion still drains the ordered outcomes once.
+    #[test]
+    fn an_in_flight_access_writer_keeps_a_future_deadline_after_the_step_ends() {
+        use aterm_types::macos_setup::{Access, access_record};
+
+        type Worker = Box<dyn FnOnce() + Send>;
+        thread_local! {
+            static WORKER: std::cell::RefCell<Option<Worker>> = const { std::cell::RefCell::new(None) };
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = 8_231;
+        let mut step = DebuggerStepQueue::new(false).recording_in(Some(root.path().to_owned()));
+        step.access_writer.spawn = |worker| {
+            WORKER.with(|slot| assert!(slot.replace(Some(worker)).is_none()));
+            Ok(())
+        };
+        step.record(revision, AccessOutcome::Handed);
+        step.end();
+        assert!(!step.queued());
+        assert_eq!(step.next_deadline(), None);
+        let now = Instant::now();
+        assert_eq!(step.record_deadline(now), Some(now + AccessWriter::RETRY));
+        let later = now + AccessWriter::RETRY;
+        assert_eq!(
+            step.record_deadline(later),
+            Some(later + AccessWriter::RETRY),
+            "a slow writer never leaves a deadline due at once"
+        );
+        step.record(revision, AccessOutcome::Declined);
+        step.retry_records(later);
+        assert!(access_record::read(root.path(), revision).is_empty());
+        let worker = WORKER.with(|slot| slot.borrow_mut().take().unwrap());
+        spawn_access_writer(worker).unwrap();
+        step.record_written_for_test();
+        assert_eq!(
+            access_record::read(root.path(), revision),
+            [
+                (Access::Debugger, AccessOutcome::Handed),
+                (Access::Debugger, AccessOutcome::Declined),
+            ]
+        );
+        assert_eq!(step.record_deadline(later), None);
     }
 
     #[test]

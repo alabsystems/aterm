@@ -250,6 +250,7 @@ const fn noted_swatch(w: Noted) -> &'static str {
         | Noted::Deferred
         | Noted::Thawed
         | Noted::Note
+        | Noted::Unstuck
         | Noted::Sleep => "event",
     }
 }
@@ -290,6 +291,9 @@ const fn noted_marks(w: Noted) -> &'static str {
         Noted::Sleep => "watcher: a SLEEP line, a sleep the loop could not count",
         Noted::Abandoned => "watcher: an ABANDONED line, a survey left under typed text",
         Noted::RepoUnread => "watcher: a REPO UNREAD line, a repository probe did not finish",
+        Noted::Unstuck => {
+            "watcher: an UNSTUCK line, Esc on a turn the Mac slept through in the vendor's API retry"
+        }
     }
 }
 

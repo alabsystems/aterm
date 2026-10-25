@@ -1590,6 +1590,43 @@ fn a_member_reading_carries_its_program_check() {
     assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");
 }
 
+/// A terminal whose queue cannot be counted gives no word: the engine names a wait for the person
+/// at a raw or password read only over an empty queue, so an unknown count never stands in for one.
+#[cfg(unix)]
+#[test]
+fn a_terminal_whose_queue_cannot_be_counted_gives_no_word() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let (mut m, mut s) = (-1, -1);
+    // SAFETY: two writable ints; no name, mode or size is asked for.
+    let rc = unsafe {
+        libc::openpty(
+            &raw mut m,
+            &raw mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: `openpty` opened both, and nothing else owns them.
+    let (_master, follower) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+    let fd = follower.as_raw_fd();
+    assert_eq!(
+        word_of(fd, |at| {
+            assert_eq!(at, fd, "the terminal's own descriptor");
+            None
+        }),
+        None,
+        "a count that failed: no word"
+    );
+    assert_eq!(
+        word_of(fd, |_| Some(2)).map(|w| w.queued),
+        Some(2),
+        "a count: the word, its queue that count"
+    );
+    assert_eq!(word_of(-1, |_| Some(0)), None, "no terminal: no word");
+}
+
 /// A pseudo-terminal's word is read through its device node, as its
 /// reader in front last set it.
 #[cfg(unix)]

@@ -736,6 +736,9 @@ const LINK_QUARANTINE_LANE: u32 = aterm_types::control_verbs::LINK_QUARANTINE_LA
 
 const LINK_MIRROR_WAIT_LANE: u32 = 6;
 
+/// The lane that added `link gap from=<a> to=<b> [records=<n>]` (astream R4's addendum A9).
+const LINK_GAP_LANE: u32 = aterm_types::control_verbs::LINK_GAP_LANE;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Replaced {
     head: u64,
@@ -1682,6 +1685,7 @@ impl Bridge {
         while let Some(item) = self.mailbox.take_urgent() {
             match item {
                 Item::Fleet(r) => self.on_fleet_record(&r),
+                Item::Gap(source, g) => self.on_gap(source, g),
                 Item::Resume(Source::Fleet, from) => {
                     self.resume_face(Source::Fleet, from);
                     if self.conn.is_none() {
@@ -2418,6 +2422,53 @@ impl Bridge {
             self.land_inbox_commit();
         } else if self.inbox_pending_records >= INBOX_COMMIT_EVERY {
             self.flush_inbox_commit();
+        }
+    }
+
+    /// A GAP NOTICE on a face (astream R4's addendum A9, session log Phase 6 B22): the broker's
+    /// retention gave up records of the face's filter at `g.from..g.to` before this bridge
+    /// read them. On the inbox it is this node's unread mail, whose sessions the bridge cannot
+    /// name (the subjects went with the records): aterm is told once for the node (`link
+    /// gap`), and tells every session it serves (each inbox's `given_up=`, each log's
+    /// `mail-gap` mark). The group's cursor is not moved for it: a record delivered after it
+    /// commits past it, and a notice told again before one is aterm's to recognise.
+    fn on_gap(&mut self, source: Source, g: astream_broker::Gap) {
+        let lost = transport::gap_lost(&g);
+        if source != Source::Inbox {
+            eprintln!(
+                "aterm-link: the broker's retention gave up {lost} below the {} subscription; \
+                 reading on from there",
+                face_name(source)
+            );
+            return;
+        }
+        if self.attachment != Attachment::Inherited || self.endpoint_lane < LINK_GAP_LANE {
+            let why = if self.attachment == Attachment::Inherited {
+                "its aterm is older than the `link gap` lane"
+            } else {
+                "this bridge only observes"
+            };
+            eprintln!(
+                "aterm-link: the broker's retention gave up {lost} of this node's unread mail \
+                 before this bridge read it; no session is told, as {why}"
+            );
+            return;
+        }
+        eprintln!(
+            "aterm-link: the broker's retention gave up {lost} of this node's unread mail \
+             before this bridge read it; every session this node serves is told"
+        );
+        let mut line = format!("link gap from={} to={}", g.from, g.to);
+        if let Some(n) = g.records {
+            line.push_str(&format!(" records={n}"));
+        }
+        match self.ctl_request(&line) {
+            Ok(reply) if reply.ok() => {}
+            Ok(reply) => eprintln!(
+                "aterm-link: aterm did not take `{line}`: {}",
+                reply.header()
+            ),
+            Err(e) => eprintln!("aterm-link: `{line}` failed: {e}"),
         }
     }
 
@@ -7321,6 +7372,10 @@ impl Bridge {
                 self.resume_face(source, from);
                 true
             }
+            Some(Item::Gap(source, g)) => {
+                self.on_gap(source, g);
+                true
+            }
             None => true,
         };
         self.in_round = false;
@@ -8006,19 +8061,7 @@ pub(crate) fn spawn_reader(
     std::thread::Builder::new()
         .name(format!("aterm-link-{source:?}"))
         .spawn(move || loop {
-            let read = match &*closer {
-                BusCloser::Os(live) => sub.recv_live(live, deadline),
-                #[cfg(test)]
-                BusCloser::Sim(_) => sub.recv(),
-            };
-            if let Some(gap) = sub.take_gap() {
-                eprintln!(
-                    "aterm-link: the broker's retention gave up {} below the {} subscription; \
-                     reading on from there",
-                    transport::gap_lost(&gap),
-                    face_name(source)
-                );
-            }
+            let read = next_took(&mut sub, &closer, deadline);
             if !reader_took(read, &mailbox, source, generation, &closer) {
                 return;
             }
@@ -8026,16 +8069,63 @@ pub(crate) fn spawn_reader(
         .map(drop)
 }
 
+/// One read a subscription's reader hands on ([`reader_took`]).
+#[derive(Debug)]
+pub(crate) enum Took {
+    /// A record of the subscription's filter.
+    Record(BrokerRecord),
+    /// A GAP NOTICE (astream R4's addendum A9): retention gave up records of the filter below
+    /// the tail, before the records the tail delivers after it.
+    Gap(astream_broker::Gap),
+}
+
+/// The next record or gap notice on `sub`, its marks skipped: astream's `recv_live` rule (every
+/// mark re-arms `deadline` through a live closer), event by event, so a notice is not skipped.
+pub(crate) fn next_took(
+    sub: &mut astream_broker::AnySubscription,
+    closer: &BusCloser,
+    deadline: Duration,
+) -> io::Result<Option<Took>> {
+    loop {
+        let event = match closer {
+            BusCloser::Os(live) => sub.recv_live_event(live, deadline)?,
+            #[cfg(test)]
+            BusCloser::Sim(_) => {
+                let _ = deadline;
+                sub.recv_event()?
+            }
+        };
+        match event {
+            None => return Ok(None),
+            Some(astream_broker::Event::Mark { .. }) => {}
+            Some(astream_broker::Event::Delivery {
+                offset,
+                subject,
+                body,
+            }) => return Ok(Some(Took::Record((offset, subject, body)))),
+            Some(astream_broker::Event::Gap(g)) => return Ok(Some(Took::Gap(g))),
+        }
+    }
+}
+
 /// Routes one subscription read result into `mailbox` under incarnation `gen`, returning `true` to continue.
 pub(crate) fn reader_took(
-    read: io::Result<Option<BrokerRecord>>,
+    read: io::Result<Option<Took>>,
     mailbox: &Mailbox,
     source: Source,
     generation: u64,
     closer: &BusCloser,
 ) -> bool {
     match read {
-        Ok(Some(rec)) => match mailbox.push(source, rec, generation) {
+        Ok(Some(Took::Gap(g))) => {
+            if mailbox.push_gap(source, g, generation) {
+                true
+            } else {
+                closer.close();
+                false
+            }
+        }
+        Ok(Some(Took::Record(rec))) => match mailbox.push(source, rec, generation) {
             Pushed::Queued => true,
             Pushed::Paused | Pushed::Stale => {
                 closer.close();
@@ -15187,6 +15277,98 @@ mod tests {
             !bridge.per_sid.pending_admit.contains(SID),
             "and the refill finished"
         );
+    }
+
+    /// A9 — WHAT THE BROKER GAVE UP UNREAD IS TOLD TO ATERM: five mails to this node, never
+    /// read, then three `ev` records, all of 4 KiB; the broker's rules keep two `ev` records'
+    /// bytes and three mails' bytes of unread mail below the cut, so the tick gives up the two
+    /// oldest mails. Attached, the inbox group is told the range and the count before its first
+    /// mail, and the bridge says `link gap from=<cursor> to=<oldest held> records=2` on the lane,
+    /// once. An aterm older than the `link gap` lane is told nothing (its mail still comes).
+    /// NC (run): a reader that drops the notice tells aterm nothing.
+    #[cfg(unix)]
+    #[test]
+    fn unread_mail_the_broker_gave_up_is_told_to_aterm_as_a_link_gap() {
+        use crate::broker_rules::{EV_FILTER, MAIL_FILTER, MAIL_READER};
+        use astream_broker::{Retention, Rule};
+        const SID: &str = "s-gap";
+        const BODY: u64 = 4096;
+        let run = |endpoint_lane: u32| -> (Vec<u64>, Vec<u64>, Vec<String>) {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            let (socket, broker, _server) = serve_log(&lane, "broker");
+            bridge.cfg.broker = socket;
+            bridge.endpoint_lane = endpoint_lane;
+            let (mut writer, _) = bridge.connect().unwrap();
+            let mail = format!("/f/f/in/{}/{SID}/h-writer/note", bridge.node);
+            let text = format!("v=1 t=1 text={}", "m".repeat(BODY as usize));
+            let offs: Vec<u64> = (1..=5)
+                .map(|seq| writer.publish(81, seq, &mail, text.as_bytes()).unwrap().0)
+                .collect();
+            let filler = vec![b'e'; BODY as usize];
+            for seq in 1..=3 {
+                writer
+                    .publish(82, seq, "/f/f/pub/n-fill/s-fill/ev", &filler)
+                    .unwrap();
+            }
+            broker.set_retention_interval(Duration::from_secs(3600));
+            let rules = Retention::new(
+                vec![
+                    Rule::prefix(EV_FILTER).unwrap().max_bytes(5 * BODY / 2),
+                    Rule::hold(MAIL_FILTER)
+                        .unwrap()
+                        .max_bytes(7 * BODY / 2)
+                        .until_read(MAIL_READER)
+                        .unwrap(),
+                ],
+                Rule::default_keeping_all(),
+            )
+            .unwrap();
+            broker.set_retention(rules).unwrap();
+            broker.retention_tick_at(broker.now_ms()).unwrap();
+            let mails = astream_wire::Filter::new(MAIL_FILTER).unwrap();
+            assert_eq!(
+                broker.oldest(&mails),
+                offs[2],
+                "the two oldest mails given up"
+            );
+
+            assert!(bridge.refresh_sessions().is_ok());
+            assert!(bridge.attach_broker());
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the bridge to deliver the three held mails",
+                || {
+                    assert!(bridge.round(Duration::from_millis(20)), "the lane closed");
+                    (lane.delivery_offsets().len() >= 3).then_some(())
+                },
+            );
+            let gaps = lane
+                .links()
+                .into_iter()
+                .filter(|l| l.starts_with("link gap "))
+                .map(|l| l.trim_end().to_string())
+                .collect();
+            let delivered = lane.delivery_offsets();
+            bridge.close_subscriptions();
+            (offs, delivered, gaps)
+        };
+        let (offs, delivered, gaps) = run(aterm_types::control_verbs::BRIDGE_LANE);
+        assert_eq!(delivered, offs[2..].to_vec());
+        assert_eq!(
+            gaps,
+            [format!(
+                "link gap from={} to={} records=2",
+                offs[0], offs[2]
+            )],
+            "told once, with the broker's count"
+        );
+        let (offs, delivered, gaps) = run(LINK_GAP_LANE - 1);
+        assert_eq!(
+            delivered,
+            offs[2..].to_vec(),
+            "an older aterm's mail still comes"
+        );
+        assert!(gaps.is_empty(), "an older aterm is told nothing: {gaps:?}");
     }
 
     #[cfg(unix)]

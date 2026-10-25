@@ -95,8 +95,19 @@ pub struct BeamRodFrame {
     pub fp: u64,
 }
 
+impl BeamRodFrame {
+    /// Dormant frame output (`fill: None, fp: 0`).
+    pub const DORMANT: Self = Self { fill: None, fp: 0 };
+}
+
+impl Default for BeamRodFrame {
+    #[inline]
+    fn default() -> Self {
+        Self::DORMANT
+    }
+}
+
 /// Per-window light-rod animation state.
-#[derive(Default)]
 pub struct CursorBeamRod {
     /// Rolling breathing phase in turns `0..1`.
     breathe: f32,
@@ -109,14 +120,34 @@ pub struct CursorBeamRod {
     light_fill_memo: Option<((u32, u32, u32), u32)>,
 }
 
+impl Default for CursorBeamRod {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorBeamRod {
+    /// Fresh dormant light-rod animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            breathe: 0.0,
+            last: None,
+            blaze: 0.0,
+            light_ink_memo: None,
+            light_fill_memo: None,
+        }
+    }
+
     /// Reset animation state while preserving the light-theme memos.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         *self = Self {
             light_ink_memo: self.light_ink_memo,
             light_fill_memo: self.light_fill_memo,
-            ..Self::default()
+            ..Self::new()
         };
     }
 
@@ -146,7 +177,7 @@ impl CursorBeamRod {
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);
-            return BeamRodFrame { fill: None, fp: 0 };
+            return BeamRodFrame::DORMANT;
         }
         self.blaze = e;
 

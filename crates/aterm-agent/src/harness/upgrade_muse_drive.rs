@@ -1030,7 +1030,8 @@ fn carry_in_flight_with(
     r
 }
 
-/// Whether Muse Code's composer on `scr` is empty ([`aterm_phase::ScreenReader::placeholder_fg`]).
+/// Whether Muse Code's composer on `scr` is empty ([`aterm_phase::ScreenReader::placeholder_fg`]),
+/// its first glyph read as the loop reads it ([`crate::supervise::screen::composer_glyph_cell`]).
 fn composer_empty(c: &mut Client, tab: &str, scr: &super::Screen) -> bool {
     let Some((caret, lines)) = aterm_phase::muse::composer_draft(&scr.rows) else {
         return false;
@@ -1042,9 +1043,10 @@ fn composer_empty(c: &mut Client, tab: &str, scr: &super::Screen) -> bool {
     lines.iter().skip(1).all(|l| l.trim().is_empty())
         && scr.cursor == Some((caret, 2))
         && scr.first.checked_add(caret).is_some_and(|at| {
-            c.request_line(&format!("@{tab} cell {at} 2"))
-                .ok()
-                .and_then(|line| crate::supervise::screen::cell_is_placeholder(&line, hint))
+            crate::supervise::screen::composer_glyph_cell(|col| {
+                c.request_line(&format!("@{tab} cell {at} {col}")).ok()
+            })
+            .and_then(|line| crate::supervise::screen::cell_is_placeholder(&line, hint))
                 == Some(true)
         })
 }

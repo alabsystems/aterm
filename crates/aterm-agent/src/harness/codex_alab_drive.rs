@@ -852,10 +852,20 @@ pub(super) fn snapshot(
     let read_cwd = k.cwd(pid);
     let home = home_of(args, read_cwd.as_deref(), &opts.home).ok_or("home-unreadable")?;
     let files = k.open_files(pid).ok_or("files-unreadable")?;
+    // The kernel names a descriptor's file by the path it resolves to, so a lock a TUI opened
+    // as `<overlay>/thread-writer-locks/<thread>.lock`, where a pooled row's overlay home links
+    // that folder to the default home's ([`crate::ai::connector::CODEX_ACCOUNTS`]), is named
+    // under the link's target (measured on macOS 27.0.1: a `lockf -k` child that opened its lock
+    // through a linked folder was read under the target). The folder as the home names it is
+    // matched too, for a read that names a lock as it was opened.
     let locks = home.join("thread-writer-locks");
+    let resolved = canonical(&locks);
     let held: Vec<String> = files
         .iter()
-        .filter(|f| f.parent() == Some(locks.as_path()))
+        .filter(|f| {
+            f.parent()
+                .is_some_and(|dir| dir == locks || dir == resolved)
+        })
         .filter_map(|f| ca::lock_thread(&f.file_name()?.to_string_lossy()).map(str::to_owned))
         .collect();
     let thread = match held.as_slice() {

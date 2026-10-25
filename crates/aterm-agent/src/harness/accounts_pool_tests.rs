@@ -149,6 +149,7 @@ fn session<'a>(cli: Cli, supervisor: Supervisor, mode: Mode, exe: &'a Path) -> S
             exe,
             flags: NO_FLAGS,
             resume: Some("019a-rollout-id"),
+            home: None,
         },
     }
 }
@@ -179,13 +180,13 @@ fn a_low_codex_session_moves_onto_its_overlay_home_and_resumes_its_rollout() {
         }
     );
     let line = moved.line.expect("a move writes its line");
-    assert!(
-        line.contains(&format!(" CODEX_HOME={} ", work.display())),
-        "{line}"
-    );
-    assert!(
-        line.contains("'/opt/codex-old/bin/codex' 'resume' '019a-rollout-id'"),
-        "{line}"
+    assert_eq!(
+        line,
+        format!(
+            " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_HOME={}' \
+             '/opt/codex-old/bin/codex' 'resume' '019a-rollout-id'",
+            work.display()
+        )
     );
     assert!(!line.contains("CLAUDE"), "{line}");
     assert!(
@@ -213,8 +214,12 @@ fn a_low_codex_session_moves_onto_its_overlay_home_and_resumes_its_rollout() {
     assert!(!other.seat().store(Cli::Codex).state_file().exists());
 }
 
+/// A Grok Build row's line names the row's auth file, removes `GROK_AUTH` (read ahead of that
+/// file) and `GROK_LEADER_SOCKET`, and names the leader socket of the row's label and auth file in
+/// the grok home; the machine's default row removes the file's variable and `GROK_AUTH` and adds
+/// no socket.
 #[test]
-fn a_grok_line_names_the_rows_auth_file_and_the_default_rows_line_unsets_it() {
+fn a_grok_line_names_the_rows_auth_file_and_leader_and_unsets_grok_auth() {
     let world = World::new("grok-line");
     let work = world.two(Cli::Grok);
     let roster = world.seat().roster(Cli::Grok).expect("roster");
@@ -225,46 +230,200 @@ fn a_grok_line_names_the_rows_auth_file_and_the_default_rows_line_unsets_it() {
         exe,
         flags: NO_FLAGS,
         resume: Some("abc"),
+        home: Some(Path::new("/Users//u/.grok")),
     };
     let row = roster.row("work").expect("work");
     let env = login_env(Cli::Grok, row, &world.home).expect("grok env");
+    let auth = work.join("auth.json").display().to_string();
     assert_eq!(
         (env.var, env.value.clone()),
-        (
-            "GROK_AUTH_PATH",
-            Some(work.join("auth.json").display().to_string())
-        )
+        ("GROK_AUTH_PATH", Some(auth.clone()))
+    );
+    let socket = relaunch::grok_leader_socket(Path::new("/Users//u/.grok"), "work", &auth)
+        .expect("socket")
+        .display()
+        .to_string();
+    let tag = socket
+        .strip_prefix("/Users//u/.grok/leader-work-")
+        .and_then(|rest| rest.strip_suffix(".sock"))
+        .unwrap_or_default();
+    assert!(
+        tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{socket}"
     );
     let line = relaunch::pool_line(&how, Cli::Grok, &env).expect("line");
-    assert!(
-        line.contains(&format!(
-            " GROK_AUTH_PATH={} ",
-            work.join("auth.json").display()
-        )),
-        "{line}"
-    );
-    assert!(
-        line.ends_with("'/opt/grok/bin/grok' '--resume' 'abc'"),
-        "{line}"
-    );
-    assert!(
-        !line.contains("GROK_HOME"),
-        "GROK_HOME stays shared: {line}"
+    assert_eq!(
+        line,
+        format!(
+            " '/usr/bin/env' -u 'GROK_AUTH' -u 'GROK_LEADER_SOCKET' 'GROK_AUTH_PATH={auth}' \
+             '/opt/grok/bin/grok' '--leader-socket' '{socket}' '--resume' 'abc'"
+        )
     );
     assert!(
         !work.join("sessions").exists(),
         "a login-file seam makes no overlay"
     );
 
-    // Negative: nothing of Claude Code's seam, and the default row unsets the file's variable.
-    assert!(!line.contains("CLAUDE_SECURESTORAGE_CONFIG_DIR"), "{line}");
-    assert!(!line.contains("CLAUDE_CONFIG_DIR"), "{line}");
+    // Negative: the default row adds no socket and still removes `GROK_AUTH`; `GROK_HOME` stays
+    // shared and `XAI_API_KEY`, a fallback behind the stored login, stays in place.
     let main =
         login_env(Cli::Grok, roster.row("main").expect("main"), &world.home).expect("default env");
     assert_eq!(main.value, None);
     let line = relaunch::pool_line(&how, Cli::Grok, &main).expect("default line");
-    assert!(line.contains("-u 'GROK_AUTH_PATH'"), "{line}");
-    assert!(!line.contains("GROK_AUTH_PATH="), "{line}");
+    assert_eq!(
+        line,
+        " '/usr/bin/env' -u 'GROK_AUTH_PATH' -u 'GROK_AUTH' '/opt/grok/bin/grok' '--resume' 'abc'"
+    );
+    let unread = PoolRelaunch { home: None, ..how };
+    assert_eq!(
+        relaunch::pool_line(&unread, Cli::Grok, &main).as_deref(),
+        Ok(line.as_str()),
+        "the default row needs no grok home"
+    );
+    assert!(
+        relaunch::pool_line(&unread, Cli::Grok, &env).is_err(),
+        "no home, no socket"
+    );
+}
+
+/// A carried `--leader-socket`, in either spelling, may name the leader of the login the session
+/// ran on: a row of its own drops every one and names its own after the other carried flags, and
+/// the default row drops one that names a row's socket and keeps a person's own.
+#[test]
+fn a_grok_line_drops_a_carried_leader_socket() {
+    let flags: Vec<String> = [
+        "-m",
+        "grok-4",
+        "--leader-socket",
+        "/Users//u/.grok/leader-old.sock",
+        "--leader-socket=/Users//u/.grok/leader-older.sock",
+        "--leader-socket",
+        "/Users//u/dev/leader.sock",
+        "--always-approve",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let how = PoolRelaunch {
+        dialect: Dialect::Bash,
+        cd: Some("/w"),
+        exe: Path::new("/opt/grok/bin/grok"),
+        flags: &flags,
+        resume: Some("abc"),
+        home: Some(Path::new("/Users//u/.grok")),
+    };
+    let work = LoginEnv {
+        label: "work".to_string(),
+        var: "GROK_AUTH_PATH",
+        value: Some("/l/work/auth.json".to_string()),
+    };
+    assert_eq!(
+        relaunch::pool_line(&how, Cli::Grok, &work).expect("row line"),
+        " ( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH' -u 'GROK_LEADER_SOCKET' \
+         'GROK_AUTH_PATH=/l/work/auth.json' '/opt/grok/bin/grok' '-m' 'grok-4' \
+         '--always-approve' '--leader-socket' '/Users//u/.grok/leader-work-99068163.sock' \
+         '--resume' 'abc' )"
+    );
+    let main = LoginEnv {
+        value: None,
+        label: "main".to_string(),
+        ..work
+    };
+    assert_eq!(
+        relaunch::pool_line(&how, Cli::Grok, &main).expect("default line"),
+        " ( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH_PATH' -u 'GROK_AUTH' \
+         '/opt/grok/bin/grok' '-m' 'grok-4' '--leader-socket' '/Users//u/dev/leader.sock' \
+         '--always-approve' '--resume' 'abc' )"
+    );
+
+    // Negative: another CLI's flags ride as they are; a Kimi Code line removes only the
+    // variables kimi 2.3.1 reads in place of the home's login (its environment model and custom
+    // headers) and drops none of the Grok Build sockets it carries.
+    let kimi = LoginEnv {
+        label: "work".to_string(),
+        var: "KIMI_CODE_HOME",
+        value: Some("/k/work".to_string()),
+    };
+    let how = PoolRelaunch {
+        cd: None,
+        exe: Path::new("/opt/kimi/bin/kimi"),
+        ..how
+    };
+    assert_eq!(
+        relaunch::pool_line(&how, Cli::Kimi, &kimi).expect("kimi line"),
+        " '/usr/bin/env' -u 'KIMI_MODEL_NAME' -u 'KIMI_MODEL_API_KEY' \
+         -u 'KIMI_CODE_CUSTOM_HEADERS' 'KIMI_CODE_HOME=/k/work' '/opt/kimi/bin/kimi' '-m' \
+         'grok-4' '--leader-socket' '/Users//u/.grok/leader-old.sock' \
+         '--leader-socket=/Users//u/.grok/leader-older.sock' '--leader-socket' \
+         '/Users//u/dev/leader.sock' '--always-approve' '--session' 'abc'"
+    );
+}
+
+/// A Codex line removes Codex's own credential variables and leaves `OPENAI_API_KEY`, which an
+/// agent's tool reads and codex-old 0.164.0's text never names as read ahead of `auth.json`; it
+/// resumes its thread after the flags it carries (the usage begins
+/// `codex resume [OPTIONS] [SESSION_ID]`).
+#[test]
+fn a_codex_default_line_unsets_its_home_and_codex_credentials_alone() {
+    let flags = ["--no-alt-screen".to_string()];
+    let how = PoolRelaunch {
+        dialect: Dialect::Fish,
+        cd: None,
+        exe: Path::new("/opt/codex-old/bin/codex"),
+        flags: &flags,
+        resume: Some("019a"),
+        home: None,
+    };
+    let main = LoginEnv {
+        label: "main".to_string(),
+        var: "CODEX_HOME",
+        value: None,
+    };
+    let line = relaunch::pool_line(&how, Cli::Codex, &main).expect("default line");
+    assert_eq!(
+        line,
+        " '/usr/bin/env' -u 'CODEX_HOME' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' \
+         '/opt/codex-old/bin/codex' 'resume' '--no-alt-screen' '019a'"
+    );
+    assert!(!line.contains("OPENAI_API_KEY"), "{line}");
+}
+
+/// A Codex line carries only the flags codex-alab's relaunch keeps: `-i`/`--image` and its
+/// files go, since a value list ahead of the thread would read the thread as a file, and a
+/// flag that cannot resume in place refuses the line.
+#[test]
+fn a_codex_line_drops_an_image_list_ahead_of_its_thread() {
+    let flags: Vec<String> = ["-i", "a.png", "b.png", "--no-alt-screen", "--image=c.png"]
+        .map(str::to_string)
+        .into();
+    let how = PoolRelaunch {
+        dialect: Dialect::Zsh,
+        cd: None,
+        exe: Path::new("/opt/codex-old/bin/codex"),
+        flags: &flags,
+        resume: Some("019a"),
+        home: None,
+    };
+    let work = LoginEnv {
+        label: "work".to_string(),
+        var: "CODEX_HOME",
+        value: Some("/c/work".to_string()),
+    };
+    let line = relaunch::pool_line(&how, Cli::Codex, &work).expect("a row's line");
+    assert!(
+        line.ends_with(" '/opt/codex-old/bin/codex' 'resume' '--no-alt-screen' '019a'"),
+        "{line}"
+    );
+    assert!(!line.contains("png"), "{line}");
+
+    // Negative: a flag the relaunch refuses refuses the line.
+    let remote = ["--remote".to_string(), "ws://h".to_string()];
+    let how = PoolRelaunch {
+        flags: &remote,
+        ..how
+    };
+    let err = relaunch::pool_line(&how, Cli::Codex, &work).expect_err("a remote session");
+    assert!(err.contains("not-resumable --remote"), "{err}");
 }
 
 #[test]
@@ -387,7 +546,7 @@ fn a_launch_starts_under_the_pin_or_a_fresh_active_else_next() {
     );
     assert_eq!(pick.var, "CODEX_HOME");
 
-    // Negative: one row is nothing to pick between, and an unmeasured seam is never launched on.
+    // Negative: one row is nothing to pick between.
     let one = World::new("launch-one");
     std::fs::write(
         one.cfg.join("accounts-codex.toml"),
@@ -396,10 +555,39 @@ fn a_launch_starts_under_the_pin_or_a_fresh_active_else_next() {
     .expect("roster");
     one.on_main(Cli::Codex, &[]);
     assert_eq!(launch_env(&one.seat(), Cli::Codex, &no_usage), None);
-    let kimi = World::new("launch-kimi");
-    kimi.two(Cli::Kimi);
-    kimi.on_main(Cli::Kimi, &[]);
-    assert_eq!(launch_env(&kimi.seat(), Cli::Kimi, &no_usage), None);
+}
+
+#[test]
+fn a_kimi_launch_takes_its_next_row_in_an_overlay_linked_to_the_default_home() {
+    let world = World::new("launch-kimi");
+    let work = world.two(Cli::Kimi);
+    world.on_main(Cli::Kimi, &[]);
+    let pick = launch_env(&world.seat(), Cli::Kimi, &no_usage).expect("a pick");
+    assert_eq!((pick.label.as_str(), pick.value), ("main", None));
+    wall(&world, Cli::Kimi, "main", NOW + HOUR);
+    let pick = launch_env(&world.seat(), Cli::Kimi, &no_usage).expect("next");
+    assert_eq!(
+        (pick.label.as_str(), pick.var, pick.value),
+        ("work", "KIMI_CODE_HOME", Some(work.display().to_string()))
+    );
+    let default_home = world.home.join(".kimi-code");
+    for shared in ["sessions", "locks", "workspace-trust"] {
+        assert_eq!(
+            std::fs::read_link(work.join(shared)).expect(shared),
+            default_home.join(shared),
+            "{shared}"
+        );
+    }
+    assert!(
+        work.join("credentials/kimi-code.json").is_file(),
+        "the row's login stays its own"
+    );
+
+    // Negative: an overlay that holds its own `locks` (a session there would not see another
+    // home's turn) is not started on.
+    std::fs::remove_file(work.join("locks")).expect("unlink");
+    std::fs::create_dir(work.join("locks")).expect("own locks");
+    assert_eq!(launch_env(&world.seat(), Cli::Kimi, &no_usage), None);
 }
 
 /// A codex roster of `main` (the default login) and `work`, whose roster dir is what `accounts
@@ -479,7 +667,7 @@ fn a_launch_and_a_move_read_a_renewed_rows_login_where_logins_json_binds_it() {
     );
     let line = moved.line.unwrap_or_default();
     assert!(
-        line.contains(&format!("CODEX_HOME='{}'", staging.display())),
+        line.contains(&format!(" 'CODEX_HOME={}' ", staging.display())),
         "the move names the renewed home: {line}"
     );
 
@@ -822,4 +1010,116 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
     blind.on_main(Cli::Codex, &[]);
     let pick = launch_env(&blind.seat(), Cli::Codex, &no_usage).map(|p| p.label);
     assert_eq!(pick.as_deref(), Some("main"));
+}
+
+#[test]
+fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_holds() {
+    let world = World::new("drift-fallthrough");
+    let work = world.work_dir(Cli::Codex);
+    let backup = world.root.join("logins/codex/backup");
+    std::fs::create_dir_all(&backup).expect("backup dir");
+    std::fs::write(backup.join("auth.json"), "{}").expect("backup login");
+    let roster_text = format!(
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+         [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n\n\
+         [[account]]\nlabel = \"backup\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+        work.display(),
+        backup.display()
+    );
+    std::fs::write(world.cfg.join("accounts-codex.toml"), roster_text).expect("roster");
+    let default_home = world.home.join(".codex");
+    std::fs::create_dir_all(&default_home).expect("default home");
+    std::fs::write(default_home.join("state_5.sqlite"), "shared").expect("shared db");
+    std::fs::write(work.join("state_5.sqlite"), "own").expect("drifted work db");
+
+    world.on_main(Cli::Codex, &[]);
+    wall(&world, Cli::Codex, "main", NOW + 2 * HOUR);
+
+    let pick = launch_env(&world.seat(), Cli::Codex, &no_usage).expect("launch skips drifted work");
+    assert_eq!(pick.label, "backup");
+    assert_eq!(pick.value, Some(backup.display().to_string()));
+
+    let exe = Path::new("/opt/codex-old/bin/codex");
+    let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe);
+    s.point = Point::Wall {
+        window: accounts::SESSION_LIMIT.to_string(),
+        at: Some(NOW),
+    };
+    let moved = session_move(&world.seat(), &s);
+    assert!(
+        matches!(&moved.advice, Advice::Move { to, rotates: true, .. } if to == "backup"),
+        "expected rotation past drifted work to backup, got {:?}",
+        moved.advice
+    );
+    assert!(moved.line.is_some());
+    assert_eq!(world.load(Cli::Codex).active.as_deref(), Some("backup"));
+
+    // Negative: when the owner pins drifted `work`, neither launch_env nor session_move ignores
+    // the pin or starts on the drifted overlay.
+    let mut note = None;
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+            state.active = Some("work".to_string());
+            state.pinned = true;
+            state.proven = true;
+            Ok(Vec::new())
+        })
+        .expect("pin drifted work");
+    assert_eq!(launch_env(&world.seat(), Cli::Codex, &no_usage), None);
+    let pinned_move = session_move(&world.seat(), &s);
+    assert_eq!(pinned_move, Moved::stay(StayWhy::NoLine));
+}
+
+#[test]
+fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_sqlite_never_drifts() {
+    let world = World::new("usage-startup-sqlite");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let default_home = world.home.join(".codex");
+    let full = Usage {
+        sample: Sample {
+            session_pct: Some(100),
+            session_reset: Some(NOW + 2 * HOUR),
+            at: NOW,
+            ..Sample::default()
+        },
+        wall: Some((accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))),
+    };
+    let read = |cli: Cli, home: &Path, _: i64| {
+        assert_eq!(cli, Cli::Codex);
+        std::fs::create_dir_all(home).expect("home dir");
+        let db = home.join("state_5.sqlite");
+        if std::fs::symlink_metadata(&db).is_err() {
+            std::fs::write(&db, "created-at-startup").expect("startup sqlite");
+        }
+        (home == default_home).then(|| full.clone())
+    };
+    let pick = launch_env(&world.seat(), Cli::Codex, &read).expect("launch on work");
+    assert_eq!(pick.label, "work");
+    assert!(
+        work.join("state_5.sqlite").is_symlink(),
+        "default home was read before work's overlay was linked"
+    );
+
+    // Negative: a pre-existing real sqlite file in work's overlay still refuses to start there.
+    let pre_drifted = World::new("usage-pre-drifted");
+    let bad_work = pre_drifted.two(Cli::Codex);
+    pre_drifted.on_main(Cli::Codex, &[]);
+    std::fs::write(bad_work.join("state_5.sqlite"), "already-own").expect("own db");
+    let bad_default = pre_drifted.home.join(".codex");
+    let read_bad = |_: Cli, home: &Path, _: i64| {
+        std::fs::create_dir_all(home).expect("home");
+        let db = home.join("state_5.sqlite");
+        if std::fs::symlink_metadata(&db).is_err() {
+            std::fs::write(&db, "shared").expect("shared db");
+        }
+        (home == bad_default).then(|| full.clone())
+    };
+    assert_eq!(
+        launch_env(&pre_drifted.seat(), Cli::Codex, &read_bad),
+        None,
+        "pre-drifted work is still refused when main is full"
+    );
 }

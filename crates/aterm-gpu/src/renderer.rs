@@ -5733,7 +5733,7 @@ pub struct GpuRenderer {
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     fetch_probe_seam: Option<FetchProbe>,
     /// The first-frame warm the Metal arm's mint waits out ([`crate::metal::warm::FIRST_FRAME`],
-    /// or a test's own, [`Self::set_first_frame_latch_for_test`]).
+    /// or a test's own, `Self::set_first_frame_latch_for_test`).
     #[cfg(target_os = "macos")]
     first_frame: &'static crate::metal::warm::WarmLatch,
     /// [`Self::warm_effect_pipelines`] was asked for: the Metal arm's mint starts the warm that a

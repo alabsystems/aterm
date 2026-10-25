@@ -317,8 +317,45 @@ fn every_literal_agy_anchor_is_in_the_store_agy() -> Outcome {
 fn every_literal_muse_anchor_is_in_the_store_muse() -> Outcome {
     literal_anchors_are_in_the_store("muse", "ATERM_MUSE_BIN", MUSE_ANCHORS)
 }
+/// Every literal Grok Build anchor is in the store's grok. NEGATIVE CONTROL: each login-ended
+/// text (`grok.auth.*`, which aterm-agent reads its login-ended words from) with any one word
+/// changed is in no build, so the check tells a text the build carries from one it does not.
 fn every_literal_grok_anchor_is_in_the_store_grok() -> Outcome {
-    literal_anchors_are_in_the_store("grok", "ATERM_GROK_BIN", GROK_ANCHORS)
+    let Some((path, bytes)) = store_binary("grok", "ATERM_GROK_BIN") else {
+        return Outcome::CouldNotRun(
+            "CANARY NOT RUN: no grok build (set ATERM_GROK_BIN or `aterm pkg install grok`); \
+             anchors not checked"
+                .into(),
+        );
+    };
+    let outcome = literal_anchors_in_build(&path, &bytes, GROK_ANCHORS);
+    if !matches!(outcome, Outcome::Pass(_)) {
+        return outcome;
+    }
+    let version = build_version(&path);
+    let mutants: Vec<(&str, String)> = GROK_ANCHORS
+        .iter()
+        .filter(|a| a.id.starts_with("grok.auth.") && a.drawn_by(version.as_deref()))
+        .flat_map(|a| reworded(a.text).into_iter().map(move |m| (a.id, m)))
+        .collect();
+    assert!(!mutants.is_empty(), "{path}: no login text to mutate");
+    let needles: Vec<&[u8]> = mutants.iter().map(|(_, m)| m.as_bytes()).collect();
+    let held: Vec<&(&str, String)> = mutants
+        .iter()
+        .zip(found_in(&bytes, &needles))
+        .filter(|(_, found)| *found)
+        .map(|(m, _)| m)
+        .collect();
+    assert!(
+        held.is_empty(),
+        "{path}: {} login texts are held with a word changed: {held:?}",
+        held.len()
+    );
+    eprintln!(
+        "{path}: no login text is held with a word changed ({} mutants)",
+        mutants.len()
+    );
+    outcome
 }
 fn every_literal_kimi_anchor_is_in_the_store_kimi() -> Outcome {
     literal_anchors_are_in_the_store("kimi", "ATERM_KIMI_BIN", KIMI_ANCHORS)

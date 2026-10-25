@@ -81,7 +81,7 @@ const fn front(ms: u64) -> f32 {
 
 /// `v` on the field's levels.
 #[inline]
-fn quantise(v: f32) -> f32 {
+const fn quantise(v: f32) -> f32 {
     (v * GLINT_LEVELS).round() / GLINT_LEVELS
 }
 

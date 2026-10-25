@@ -105,6 +105,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             exe: exe.clone(),
             env: vec![(home_var.to_string(), "/homes/w".to_string())],
             args: Ok(Vec::new()),
+            unset: Vec::new(),
         };
         let fresh = Fresh {
             model: Some("m-1.5"),
@@ -496,6 +497,7 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
                 exe: PathBuf::from(cli.word),
                 env: vec![((*var).to_string(), value.to_string())],
                 args: Ok(Vec::new()),
+                unset: Vec::new(),
             };
             let err = line(cli, Dialect::Bash, &with("rel/dir"), &Fresh::default())
                 .expect_err("relative refused");
@@ -541,6 +543,7 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
         exe: PathBuf::from("claude"),
         env: vec![("CLAUDE_CONFIG_DIR".to_string(), String::new())],
         args: Ok(Vec::new()),
+        unset: Vec::new(),
     };
     assert!(line(claude, Dialect::Zsh, &rel, &Fresh::default()).is_err());
 }
@@ -789,6 +792,7 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
         exe: PathBuf::from("codex"),
         env: vec![("CODEX_HOME".to_string(), "rel/home".to_string())],
         args: Ok(Vec::new()),
+        unset: Vec::new(),
     };
     let err = line(cli, Dialect::Bash, &rel, &Fresh::default()).expect_err("relative refused");
     assert!(err.contains("CODEX_HOME"), "{err}");

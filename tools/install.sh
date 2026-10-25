@@ -840,11 +840,18 @@ app_already_current() { # <elected_tag> <tag_explicit> <bundle_id> <installed_ve
 # caller could take for CMD's answer. The run then never reaches a caller's
 # own rm, so bounded removes the files the caller names in BOUNDED_TEMPS, a
 # local array a nested caller extends rather than shadows (bounded_cut).
+# BOUNDED_OUT and BOUNDED_ERR, set on the call, name the files CMD's output
+# and errors go to, opened in bounded's own subshell: a redirection of the call
+# holds in this shell too, so the run's trap and its EXIT cleanup ran with
+# their NOTEs going into that file.
 VERIFY_WAIT_SECS=60
 bounded() {
 	local secs="$1"
 	shift
 	(
+		[[ -z "${BOUNDED_OUT:-}" ]] || exec >"$BOUNDED_OUT"
+		[[ -z "${BOUNDED_ERR:-}" ]] || exec 3>"$BOUNDED_ERR"
+		unset BOUNDED_OUT BOUNDED_ERR
 		set -m
 		"$@" 2>&3 </dev/null &
 		pid=$!
@@ -852,6 +859,7 @@ bounded() {
 		trap 'bounded_cut INT 130' INT
 		trap 'bounded_cut TERM 143' TERM
 		trap 'bounded_cut HUP 129' HUP
+		trap 'bounded_cut QUIT 131' QUIT
 		deadline=$((SECONDS + secs))
 		looks=0
 		while kill -0 "$pid" 2>/dev/null; do
@@ -876,10 +884,14 @@ bounded() {
 # leads, remove the caller's BOUNDED_TEMPS, and end by the signal (die_of).
 # set -e holds in a trap whatever its caller's context, so neither step may end
 # it first: a group already gone (CMD ended just before the signal) answers
-# kill with 1.
+# kill with 1. A QUIT ends it by <status>, as run_cut ends the run: die_of's
+# self-kill of it on bash 3.2 is a death by a core-dump signal, for which macOS
+# writes a crash report, and the shell waiting on this one, which the terminal
+# sent the same Ctrl-\, ends the run itself (run_cut).
 bounded_cut() { # <signal> <status>
 	kill -KILL -- "-$pid" 2>/dev/null || true
 	rm -f -- ${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} 2>/dev/null || true
+	[[ "$1" != QUIT ]] || exit "$2"
 	die_of "$1" "$2"
 }
 
@@ -908,9 +920,48 @@ die_of() { # <signal> <status>
 # before it returns, so a suite's functions run under it as a run's do. Never
 # at the top level: under `curl | bash` that line runs while the rest of the
 # script is still arriving, and a Ctrl-C that cut the download short would end
-# it with a syntax error or status 0, not by the signal.
+# it with a syntax error or status 0, not by the signal. A Ctrl-\ (QUIT) in the
+# run is the same: bash 5 ignores it, so the run read a child's death of it as
+# an answer, and bash 3.2 died of it without running its EXIT trap. One while
+# the script still arrives under bash 5 ends it with status 0, having run
+# nothing: bash 5 ignores it, curl dies of it, and no trap can be set before
+# the script has arrived (a top-level one stays pending at the cut's end of
+# file, measured), so that one exception stands.
 end_on_ctrl_c() {
-	trap 'die_of INT 130' INT
+	trap 'run_cut INT 130' INT
+	trap 'run_cut QUIT 131' QUIT
+}
+
+# The run's trap for <signal>: remove the BOUNDED_TEMPS of the step it cut
+# short (a trap runs in the function it interrupted, so it sees that
+# function's local array), then end the run by the signal (die_of). A QUIT
+# ends it by <status> instead: die_of's self-kill does nothing on bash 5, which
+# ignores QUIT, and on bash 3.2 kills the shell before its EXIT trap runs. A
+# second QUIT that bash 3.2 takes while this runs skipped the EXIT trap as
+# well (a key held down repeats it), so a QUIT is ignored from the first line.
+run_cut() { # <signal> <status>
+	[[ "$1" != QUIT ]] || trap '' QUIT
+	rm -f -- ${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} 2>/dev/null || true
+	[[ "$1" != QUIT ]] || exit "$2"
+	die_of "$1" "$2"
+}
+
+# Set <var> to a new private file in TMPDIR, named in the caller's
+# BOUNDED_TEMPS (a local array it declares first) before the file exists, so
+# run_cut removes it whenever the signal lands. Made by mktemp and named after,
+# one a Ctrl-C caught in between stayed (about one interrupt of a check in
+# twelve). mktemp -u draws the name, and a noclobber redirection makes the
+# file with mode 0600, as mktemp would: bash refuses a regular file at the
+# name (or a link to one), and opens a name where it finds nothing with
+# O_EXCL, which fails on a dangling link or on anything made there in
+# between. It opens anything else already there (a device, a FIFO, or a link
+# to either), which only a guess at that random name could have put there.
+probe_temp() { # <var> <prefix>
+	local name
+	name="$(mktemp -u "${TMPDIR:-/tmp}/$2.XXXXXX")" || return 1
+	BOUNDED_TEMPS+=("$name")
+	(umask 077 && set -C && : >"$name") 2>/dev/null || return 1
+	printf -v "$1" '%s' "$name"
 }
 
 # The gate may only vouch for a bundle the fresh install would have accepted:
@@ -924,15 +975,15 @@ end_on_ctrl_c() {
 # answers 124 when codesign did not answer and 125 when spctl did not.
 installed_bundle_verified() { # <app-path> <team-or-empty>
 	local app="$1" team="$2" s=0
-	bounded "$VERIFY_WAIT_SECS" codesign --verify --deep --strict "$app" >/dev/null 2>&1 || s=$?
+	BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" codesign --verify --deep --strict "$app" || s=$?
 	[[ $s -eq 0 ]] || { [[ $s -eq 124 ]] && return 124; return 1; }
 	[[ -n "$team" ]] || return 0
 	[[ "$team" =~ ^[A-Za-z0-9]+$ ]] || return 1
-	bounded "$VERIFY_WAIT_SECS" codesign --verify --deep --strict \
+	BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" codesign --verify --deep --strict \
 		-R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$team\"" \
-		"$app" >/dev/null 2>&1 || s=$?
+		"$app" || s=$?
 	[[ $s -eq 0 ]] || { [[ $s -eq 124 ]] && return 124; return 1; }
-	bounded "$VERIFY_WAIT_SECS" spctl -a -t exec "$app" >/dev/null 2>&1 || s=$?
+	BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" spctl -a -t exec "$app" || s=$?
 	[[ $s -eq 0 ]] || { [[ $s -eq 124 ]] && return 125; return 1; }
 }
 
@@ -2451,9 +2502,9 @@ LINUX_CANDIDATE_SAID=""
 linux_candidate_answers_tag() { # <exe> <tag>
 	local out s=0
 	LINUX_CANDIDATE_SAID=""
-	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 2
-	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$out")
-	bounded "$VERIFY_WAIT_SECS" "$1" --version >"$out" || s=$?
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp out aterm-probe || return 2
+	BOUNDED_OUT="$out" bounded "$VERIFY_WAIT_SECS" "$1" --version || s=$?
 	[[ "$s" -ne 0 ]] || LINUX_CANDIDATE_SAID="$(head -n 1 "$out")"
 	rm -f "$out"
 	[[ "$s" -eq 0 ]] || return 2
@@ -2555,6 +2606,17 @@ linux_verifier_cleanup() {
 	rm -rf -- "$LINUX_VERIFIER_DIR"
 	LINUX_VERIFIER_DIR=""
 	LINUX_VERIFIER=""
+}
+
+# install_linux_app's EXIT trap, over the TMP it sets. It replaces the
+# verifier's own trap, so it removes the verifier's directory too. Neither
+# removal may be cut short, as in install_app_cleanup: a Ctrl-C in the first
+# used to end the run before the second.
+install_linux_app_cleanup() {
+	set +e
+	trap '' INT HUP TERM QUIT
+	linux_verifier_cleanup
+	rm -rf "$TMP"
 }
 
 # Make <arch>'s verifier ready. Under the test seam that is ATERM_INSTALL_VERIFIER,
@@ -3443,7 +3505,7 @@ swap_staged_bundle() { # <dest>
 	fi
 	if [[ -n "${OLD:-}" ]]; then
 		rm -rf "$OLD" 2>/dev/null ||
-			echo "install.sh: NOTE: could not fully remove the previous copy (left at $OLD; remove with: sudo rm -rf '$OLD')" >&2
+			echo "install.sh: NOTE: could not fully remove the previous copy (left at $OLD; remove with: $(note_command --sudo rm -rf "$OLD"))" >&2
 		OLD=""
 	fi
 }
@@ -3457,6 +3519,68 @@ drop_stage() {
 	STAGE_DIR=""
 }
 
+# A command a NOTE names for the person to paste: each word spelled to read
+# back as one (shell_word), after `sudo` when acting in <dir> needs it, in a
+# root run or a folder this account cannot write, or always with --sudo, for
+# a command this account just ran and failed.
+note_command() { # <dir>|--sudo <word>...
+	local out="" word
+	[[ "$1" != --sudo && "$(installer_uid)" != 0 && -w "$1" ]] || out="sudo "
+	shift
+	for word in "$@"; do
+		out+="$(shell_word "$word") "
+	done
+	printf '%s\n' "${out% }"
+}
+
+# TERM and HUP to run_cut, from the container step (unpack_container) to the
+# end of the swap (place_bundle). A TERM or a HUP sent to this shell alone (a
+# `kill` of its pid, a supervisor) ends it through bash's own handler at once,
+# which ran install_app_cleanup while ditto still expanded the zip into MNT or
+# copied into STAGE, an attach still mounted the image, or a rename of the swap
+# was in flight: what the step made after the cleanup stayed (in TMPDIR, or a
+# partial copy in DEST), or the cleanup found no aterm.app between the
+# renames, or restored the old one under the new. Held, bash ends the run once
+# the step's child returns (a bounded check between them within its 60 s).
+# Set after install_app's EXIT trap: set before it, die_of's self-kill skips
+# that trap (bash 3.2 and 5.3). The toolset seed after the swap runs for
+# minutes, so release_kills drops them once the swap is done.
+hold_kills() {
+	trap 'run_cut TERM 143' TERM
+	trap 'run_cut HUP 129' HUP
+}
+
+release_kills() {
+	trap - TERM HUP
+}
+
+# Expand the zip, or mount the DMG, <asset> at <mnt>, TERM and HUP held from
+# here (hold_kills).
+unpack_container() { # <asset> <mnt>
+	hold_kills
+	if [[ "$CONTAINER_KIND" == zip ]]; then
+		mkdir -p "$2"
+		ditto -x -k "$1" "$2" || {
+			echo "install.sh: could not expand ${1##*/}" >&2
+			exit 1
+		}
+	else
+		hdiutil attach "$1" -nobrowse -readonly -mountpoint "$2" -quiet
+	fi
+}
+
+# Stage <bundle> next to <dest> and swap it in, TERM and HUP held (taken
+# again here, for a caller that unpacked nothing) and then dropped.
+place_bundle() { # <bundle> <dest>
+	hold_kills
+	stage_bundle "$1" "$2" || {
+		echo "install.sh: could not stage aterm.app in $2 — nothing was installed" >&2
+		exit 1
+	}
+	swap_staged_bundle "$2"
+	release_kills
+}
+
 # install_app's EXIT trap, over the TMP, MNT, STAGE, STAGE_DIR and OLD it sets
 # and the run's DEST and CONTAINER_KIND.
 install_app_cleanup() {
@@ -3467,7 +3591,7 @@ install_app_cleanup() {
 	# the first after a refusal) ended the run at the step it killed, and left a
 	# folder with no aterm.app, a staging copy or a set-aside old copy nothing
 	# later removes. A run a Ctrl-C ended still dies of it once this returns.
-	trap '' INT HUP TERM
+	trap '' INT HUP TERM QUIT
 	# If the swap was interrupted after the old bundle was set aside, restore it.
 	if [[ -n "$OLD" && -d "$OLD" && ! -e "$DEST/aterm.app" ]]; then
 		mv "$OLD" "$DEST/aterm.app"
@@ -3478,7 +3602,7 @@ install_app_cleanup() {
 		if [[ -e "$DEST/aterm.app" ]]; then
 			rm -rf "$OLD"
 		else
-			echo "install.sh: NOTE: could not put the previous aterm.app back (it is at $OLD; restore it with: sudo mv '$OLD' '$DEST/aterm.app')" >&2
+			echo "install.sh: NOTE: could not put the previous aterm.app back (it is at $OLD; restore it with: $(note_command "$DEST" mv "$OLD" "$DEST/aterm.app"))" >&2
 		fi
 	fi
 	# Only a DMG is mounted; the lean zip is expanded into this same path, and
@@ -3486,17 +3610,18 @@ install_app_cleanup() {
 	# takes a Ctrl-C, which cuts it and goes on to the -force fallback.
 	local mounted=0
 	if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
-		trap : INT HUP TERM
+		trap : INT HUP TERM QUIT
 		hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
 			{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; }
-		trap '' INT HUP TERM
+		trap '' INT HUP TERM QUIT
 		# A mount point with anything in it is the image still mounted: the
 		# -force detach failed too, or a Ctrl-C cut it. rm would walk its
 		# read-only tree, an error for each file, so it stays, and says how to
-		# detach it; the rest of the download goes.
+		# detach it (as the account that attached it, which owns TMP); the rest of
+		# the download goes.
 		if [[ -n "$(ls -A "$MNT" 2>/dev/null)" ]]; then
 			mounted=1
-			echo "install.sh: NOTE: the disk image is still mounted at $MNT (detach it with: sudo hdiutil detach -force '$MNT')" >&2
+			echo "install.sh: NOTE: the disk image is still mounted at $MNT (detach it with: $(note_command "$TMP" hdiutil detach -force "$MNT"))" >&2
 			find "$TMP" -mindepth 1 -maxdepth 1 ! -name "${MNT##*/}" -exec rm -rf {} +
 		fi
 	fi
@@ -3536,13 +3661,13 @@ retire_caffeine_startup() { # <exe>
 		found+=("$plist")
 	done
 	[[ ${#found[@]} -gt 0 ]] && may_run "$exe" || return 0
-	bounded "$VERIFY_WAIT_SECS" "$exe" help caffeine >/dev/null 2>&1 || s=$?
+	BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$exe" help caffeine || s=$?
 	[[ "$s" -ge 1 && "$s" -le 125 && "$s" -ne 124 ]] || return 0
 	for plist in "${found[@]}"; do
 		rm -f "$plist" || continue
 		label="${plist##*/}"
 		# Not loaded is as good as unloaded.
-		bounded "$VERIFY_WAIT_SECS" launchctl bootout "gui/$(installer_uid)/${label%.plist}" >/dev/null 2>&1 || true
+		BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" launchctl bootout "gui/$(installer_uid)/${label%.plist}" || true
 		echo "install.sh: turned off aterm Caffeine's Enable at Startup ($plist): this aterm has no Caffeine, so its login job would fail every 10 s — an aterm with the Caffeine menu turns it back on"
 	done
 }
@@ -4331,12 +4456,16 @@ root_entry() { # <path>
 # `curl … | bash` the inherited stdin is the rest of this script, which a binary
 # that reads it would swallow), in its own process group, and cut off at
 # VERIFY_WAIT_SECS. A run cut off answered nothing, whatever it printed first.
+# Every caller reads it through $(…), whose subshell starts with the run's
+# traps reset, so it sets them again (end_on_ctrl_c): a Ctrl-C then removes its
+# file there, which the run's own shell never named.
 first_line_bounded() {
 	local out s=0
 	may_run "$1" || return 0
-	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 0
-	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$out")
-	bounded "$VERIFY_WAIT_SECS" "$@" >"$out" 2>/dev/null || s=$?
+	end_on_ctrl_c
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp out aterm-probe || return 0
+	BOUNDED_OUT="$out" BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$@" || s=$?
 	[[ "$s" -eq 124 ]] || head -n 1 "$out"
 	rm -f "$out"
 }
@@ -4344,7 +4473,7 @@ first_line_bounded() {
 # Whether <exe> has shown it ran, asked `--version` through bounded; when it
 # has not, UNPROVEN says why. An exec waits on macOS's check of its file, so a
 # run that wrote a line, or ended other than as bounded ends one (124 at the
-# deadline; 129, 130 or 143 when a hang-up, interrupt or TERM cut it short),
+# deadline; 129, 130, 131 or 143 when HUP, INT, QUIT or TERM cut it short),
 # is past that check: by its own exit, or a signal it or macOS raised. A run
 # cut off may still be in it, and macOS 27.0.1's syspolicyd crashes when the
 # file it is checking at a first exec is removed or renamed, stranding every
@@ -4366,23 +4495,19 @@ showed_it_ran() { # <exe>
 	UNPROVEN=""
 	UNPROVEN_THEN="run this again in 10 minutes, or after a restart"
 	[[ "$(uname -s)" == Darwin && -f "$1" && -x "$1" ]] || return 0
-	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || {
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	if ! probe_temp out aterm-probe || ! probe_temp err aterm-probe; then
+		rm -f -- ${out:+"$out"} ${err:+"$err"}
 		UNPROVEN="$1 could not be asked (no temporary file)"
 		return 1
-	}
-	err="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || {
-		rm -f "$out"
-		UNPROVEN="$1 could not be asked (no temporary file)"
-		return 1
-	}
-	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$out" "$err")
+	fi
 	if may_run "$1"; then
-		bounded "$VERIFY_WAIT_SECS" "$1" --version >"$out" 2>"$err" || s=$?
+		BOUNDED_OUT="$out" BOUNDED_ERR="$err" bounded "$VERIFY_WAIT_SECS" "$1" --version || s=$?
 		[[ ! -s "$out" ]] || s=0
 	else
 		nobody=1
-		bounded "$VERIFY_WAIT_SECS" run_as_user nobody /bin/bash --norc -p -c \
-			'test -x "$0" || exit 1; "$0" --version; echo "ended $?"' "$1" >"$out" 2>"$err" || s=$?
+		BOUNDED_OUT="$out" BOUNDED_ERR="$err" bounded "$VERIFY_WAIT_SECS" run_as_user nobody /bin/bash --norc -p -c \
+			'test -x "$0" || exit 1; "$0" --version; echo "ended $?"' "$1" || s=$?
 		said="$(tail -n 1 "$out")"
 		if [[ "$said" =~ ended\ ([0-9]+)$ ]]; then
 			# Any byte before the shell's own `ended <status>` line is the program's.
@@ -4398,7 +4523,7 @@ showed_it_ran() { # <exe>
 			s=0
 		else
 			case "$s" in
-			124 | 129 | 130 | 143) ;;
+			124 | 129 | 130 | 131 | 143) ;;
 			*) s=unrun ;;
 			esac
 		fi
@@ -4410,7 +4535,7 @@ showed_it_ran() { # <exe>
 	rm -f "$out" "$err"
 	case "$s" in
 	124) UNPROVEN="$1 did not answer within ${VERIFY_WAIT_SECS}s" ;;
-	129 | 130 | 143) UNPROVEN="$1 was interrupted before it answered" ;;
+	129 | 130 | 131 | 143) UNPROVEN="$1 was interrupted before it answered" ;;
 	126 | 127)
 		UNPROVEN="$1 may not have started${nobody:+ as nobody} (exit $s${line:+, saying \`$line\`})"
 		if [[ -n "$nobody" ]]; then
@@ -4455,8 +4580,8 @@ bundle_showed_it_ran() { # <app>
 	# A failed glob looks just like a folder with no programs. Require an actual
 	# directory and a complete, successful inventory before asking any program.
 	[[ -d "$dir" && ! -L "$dir" ]] || return 1
-	inventory="$(mktemp "${TMPDIR:-/tmp}/aterm-programs.XXXXXX")" || return 1
-	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"} "$inventory")
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp inventory aterm-programs || return 1
 	if ! find "$dir" -mindepth 1 -maxdepth 1 -type f -print0 >"$inventory" 2>/dev/null; then
 		rm -f "$inventory"
 		return 1
@@ -4523,7 +4648,7 @@ find_bundle_cli() {
 		for b in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive; do
 			[[ -x "$m/$b" ]] || { ok=0; break; }
 		done
-		if [[ "$ok" -eq 1 ]] && may_run "$m/aterm-cli" && bounded "$VERIFY_WAIT_SECS" "$m/aterm-cli" --version >/dev/null 2>&1; then
+		if [[ "$ok" -eq 1 ]] && may_run "$m/aterm-cli" && BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$m/aterm-cli" --version; then
 			echo "$m/aterm-cli"
 			return 0
 		fi
@@ -4629,7 +4754,7 @@ setup_aterm() { # <verb> <bin-dir> <store-dir> <app-dir>...
 		done
 		asked+=("$c")
 		first_line_bounded "$c" --version | grep -q '^aterm ' || continue
-		bounded "$VERIFY_WAIT_SECS" "$c" pkg help "$verb" >/dev/null 2>&1 || continue
+		BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" "$c" pkg help "$verb" || continue
 		echo "$c"
 		return 0
 	done
@@ -4788,14 +4913,22 @@ persist_no_toolchain() { # <cfg>
 		printf '\n[packages]\nauto_install = false\n' >>"$cfg" || return 1
 		;;
 	insert)
-		tmp="$(mktemp "${TMPDIR:-/tmp}/aterm-config.XXXXXX")" || return 1
+		local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+		probe_temp tmp aterm-config || return 1
+		# cat's redirection empties the file before cat refills it, so cat runs
+		# with the signals that would cut it ignored: a Ctrl-C there ends the
+		# run once the file is whole again (run_cut, which removes the copy).
+		# A TERM or HUP to this shell alone is held to run_cut the same way
+		# (hold_kills): bash's own handler ended the run at once, the copy left.
+		hold_kills
 		awk '
 			{ print }
 			!done {
 				line = $0; sub(/[ \t]*#.*$/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line)
 				if (line ~ /^\[[ \t]*packages[ \t]*\]$/) { print "auto_install = false"; done = 1 }
-			}' "$cfg" >"$tmp" && cat "$tmp" >"$cfg"
+			}' "$cfg" >"$tmp" && (trap '' INT HUP TERM QUIT && exec cat "$tmp" >"$cfg")
 		local status=$?
+		release_kills
 		rm -f "$tmp"
 		[[ $status -eq 0 ]] || return 1
 		;;
@@ -5594,15 +5727,7 @@ install_app() {
 	# Both containers land the bundle at "$MNT/aterm.app", so every check below —
 	# codesign, the Team-ID designated requirement, Gatekeeper, the staged swap —
 	# is identical for either.
-	if [[ "$CONTAINER_KIND" == zip ]]; then
-		mkdir -p "$MNT"
-		ditto -x -k "$TMP/$ASSET_NAME" "$MNT" || {
-			echo "install.sh: could not expand $ASSET_NAME" >&2
-			exit 1
-		}
-	else
-		hdiutil attach "$TMP/$ASSET_NAME" -nobrowse -readonly -mountpoint "$MNT" -quiet
-	fi
+	unpack_container "$TMP/$ASSET_NAME" "$MNT"
 	[[ -d "$MNT/aterm.app" ]] || { echo "install.sh: no aterm.app inside $ASSET_NAME" >&2; exit 1; }
 
 	# A verifier that did not answer is not a verdict on the bundle: say so
@@ -5650,20 +5775,18 @@ install_app() {
 		echo "install.sh:   Code integrity was checked, but nothing binds this bundle to a publisher."
 	fi
 
-	# Stage next to the destination, swap by rename, delete the old copy last — either
-	# the old or the new bundle exists at $DEST/aterm.app at every instant, and an
-	# interrupt mid-swap restores the old one (see install_app_cleanup).
+	# Stage next to the destination, set the old bundle aside, rename the stage in
+	# and delete the old copy last. For the instant between the two renames
+	# nothing is at $DEST/aterm.app: an interrupt there restores the old one
+	# (install_app_cleanup), though a SIGKILL or a crash leaves it at its hidden
+	# set-aside name.
 	# The staging name must be visible (no leading dot): Spotlight never indexes
 	# content under dot-paths, and the final rename does not backfill the index.
 	# And unpredictable: /Applications is shared, admin-writable space, so a
 	# guessable staging name could be pre-created by another local user to ambush
 	# the swap. Same rule for the set-aside path, and for the folder a root run
 	# stages in (stage_bundle).
-	stage_bundle "$MNT/aterm.app" "$DEST" || {
-		echo "install.sh: could not stage aterm.app in $DEST — nothing was installed" >&2
-		exit 1
-	}
-	swap_staged_bundle "$DEST"
+	place_bundle "$MNT/aterm.app" "$DEST"
 
 	# Nudge Spotlight (a run as the account staged a folder whose name is no
 	# bundle's, indexed as a plain directory until the rename made it an .app
@@ -5690,7 +5813,7 @@ install_app() {
 	rm -rf "$TMP" 2>/dev/null || true
 
 	echo "install.sh: installed aterm $VERSION -> $DEST/aterm.app"
-	echo "  launch:  open '$DEST/aterm.app'"
+	echo "  launch:  open $(shell_word "$DEST/aterm.app")"
 	# Checks and staging run in the app and in `aterm` terminal sessions, but the
 	# apply (a re-exec) rides the window entry, so the line names the window.
 	echo "  updates: automatic, installed while an aterm window is open — status: aterm update status (off: Settings ▸ Software Update)"
@@ -5706,14 +5829,7 @@ install_app() {
 install_linux_app() {
 	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH)"
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
-	# This trap replaces the verifier's own, so it removes the verifier's
-	# directory too.
-	cleanup() {
-		set +e
-		rm -rf "$TMP"
-		linux_verifier_cleanup
-	}
-	trap cleanup EXIT
+	trap install_linux_app_cleanup EXIT
 
 	local asset minimum maximum proof verified remote_asset source_tag host_size
 	local name digest size build roster_seq
@@ -6017,7 +6133,7 @@ cli_path_hint() {
 		*) rc_name="your shell profile" ;;
 		esac
 		echo "install.sh: NOTE: $BIN_DIR is not on your PATH — add it in $rc_name, e.g.:" >&2
-		echo "  export PATH=\"$BIN_DIR:\$PATH\"" >&2
+		echo "  export PATH=$(shell_word "$BIN_DIR"):\"\$PATH\"" >&2
 		;;
 	esac
 }

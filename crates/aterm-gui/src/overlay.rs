@@ -76,6 +76,48 @@ impl OverlayModel for OverviewState {
     }
 }
 
+/// Room [`card_raster`] cuts around a card for its 2-step drop shadow (at most 8 px).
+const PAINT_MARGIN: f32 = 12.0;
+
+/// One overlay card's raster, as [`crate::App::splice_settings_panel`] keeps it.
+pub(crate) struct CardRaster {
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) pw: u32,
+    pub(crate) ph: u32,
+    /// The cut's top-left corner, in tray pixels.
+    pub(crate) x0: f32,
+    pub(crate) y0: f32,
+}
+
+/// Rasterize `tray`'s card and its drop shadow, cut out of a `tray_w` by `tray_h` tray: what a
+/// frame that changes an open card pays after the card's paint. `None` when none of it falls in
+/// the tray.
+pub(crate) fn card_raster(mut tray: TrayInput, tray_w: f32, tray_h: f32) -> Option<CardRaster> {
+    let (card_x, card_y, card_w, card_h) = tray.card;
+    let x0 = (card_x - PAINT_MARGIN).max(0.0).floor();
+    let y0 = (card_y - PAINT_MARGIN).max(0.0).floor();
+    let x1 = (card_x + card_w + PAINT_MARGIN).min(tray_w).ceil();
+    let y1 = (card_y + card_h + PAINT_MARGIN).min(tray_h).ceil();
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    crate::widget::translate_prims(&mut tray.prims, -x0, -y0);
+    let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
+        &tray.prims,
+        (x1 - x0) as u32,
+        (y1 - y0) as u32,
+        1.0,
+        [0, 0, 0, 0],
+    );
+    Some(CardRaster {
+        rgba,
+        pw,
+        ph,
+        x0,
+        y0,
+    })
+}
+
 /// Which surface a live [`Overlay`] holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverlayKind {

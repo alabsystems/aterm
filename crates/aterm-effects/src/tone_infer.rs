@@ -31,6 +31,15 @@ pub struct ToneTracker {
 impl Default for ToneTracker {
     #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToneTracker {
+    /// Construct a fresh tone tracker on the neutral [`Tone::Technical`] baseline.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             buf: std::collections::VecDeque::new(),
             session: None,
@@ -38,13 +47,11 @@ impl Default for ToneTracker {
             keys_since_infer: 0,
             last_infer: None,
             infer_pending: false,
-            scratch: ToneScratch::default(),
+            scratch: ToneScratch::new(),
             inferences: 0,
         }
     }
-}
 
-impl ToneTracker {
     /// The cached verdict before the `tone_melody` knob, for introspection.
     #[inline]
     #[must_use]

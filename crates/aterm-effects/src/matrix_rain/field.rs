@@ -286,14 +286,27 @@ pub const fn quad_cap(cell_w: u32, cell_h: u32) -> usize {
 }
 
 /// Bounded ring of density-staircase change points `(tick, density_byte)` for cycle-start lookups.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct DensityRing {
     entries: [(u64, u8); DENSITY_RING],
     head: usize,
     len: usize,
 }
 
+impl Default for DensityRing {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl DensityRing {
+    /// Empty density-change ring before any ticks are recorded.
+    pub const EMPTY: Self = Self {
+        entries: [(0, 0); DENSITY_RING],
+        head: 0,
+        len: 0,
+    };
     /// Record a `(tick, density)` change point once deduplicated by the caller.
     #[inline]
     pub const fn push(&mut self, tick: u64, density: u8) {

@@ -84,7 +84,6 @@ pub const ADMISSION_LOG_CAP: usize = 32;
 
 /// The fixed-size drop-oldest ring behind [`CursorGlow::admission_log`],
 /// resident in the engine (one slot write per observed move).
-#[derive(Default)]
 pub(super) struct AdmissionLog {
     pub(super) records: [Option<AdmissionRecord>; ADMISSION_LOG_CAP],
     /// Next slot to write (== oldest entry once the ring has wrapped).
@@ -95,8 +94,15 @@ pub(super) struct AdmissionLog {
     pub(super) tally: AdmissionTally,
 }
 
+impl Default for AdmissionLog {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// Cumulative licence scoreboard behind [`CursorGlow::admission_tally`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionTally {
     /// Moves the spawn seam licensed.
     pub licensed: u64,
@@ -106,8 +112,47 @@ pub struct AdmissionTally {
     pub last_decline_reason: Option<&'static str>,
 }
 
+impl Default for AdmissionTally {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl AdmissionTally {
+    /// Zeroed admission tally.
+    pub const EMPTY: Self = Self {
+        licensed: 0,
+        declined: 0,
+        last_decline_reason: None,
+    };
+}
+
 impl AdmissionLog {
-    pub(super) fn push(&mut self, mut record: AdmissionRecord) {
+    pub(super) const EMPTY: Self = Self {
+        records: [None; ADMISSION_LOG_CAP],
+        head: 0,
+        seq: 0,
+        tally: AdmissionTally::EMPTY,
+    };
+
+    #[inline]
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let (ab, bb) = (a.as_bytes(), b.as_bytes());
+        if ab.len() != bb.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < ab.len() {
+            if ab[i] != bb[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    pub(super) const fn push(&mut self, mut record: AdmissionRecord) {
         self.seq += 1;
         record.seq = self.seq;
         match record.phase {
@@ -117,28 +162,42 @@ impl AdmissionLog {
                 self.tally.last_decline_reason = Some(record.reason);
             }
         }
-        if record.phase == AdmissionPhase::Declined
-            && record.reason == CursorGlow::DECLINE_NO_FRESH_HINT
-            && self.records[self.head].as_ref().is_some_and(|old| {
-                old.phase == AdmissionPhase::Licensed
-                    || old.reason != CursorGlow::DECLINE_NO_FRESH_HINT
-            })
-            && let Some(offset) = (1..ADMISSION_LOG_CAP).find(|&off| {
-                let idx = (self.head + off) % ADMISSION_LOG_CAP;
-                self.records[idx].as_ref().is_some_and(|r| {
-                    r.phase == AdmissionPhase::Declined
-                        && r.reason == CursorGlow::DECLINE_NO_FRESH_HINT
-                })
-            })
-        {
-            for step in offset..(ADMISSION_LOG_CAP - 1) {
-                let dst = (self.head + step) % ADMISSION_LOG_CAP;
-                let src = (self.head + step + 1) % ADMISSION_LOG_CAP;
-                self.records[dst] = self.records[src];
+        let head_preservable = match &self.records[self.head] {
+            Some(old) => {
+                matches!(old.phase, AdmissionPhase::Licensed)
+                    || !Self::str_eq(old.reason, CursorGlow::DECLINE_NO_FRESH_HINT)
             }
-            let newest = (self.head + ADMISSION_LOG_CAP - 1) % ADMISSION_LOG_CAP;
-            self.records[newest] = Some(record);
-            return;
+            None => false,
+        };
+        if matches!(record.phase, AdmissionPhase::Declined)
+            && Self::str_eq(record.reason, CursorGlow::DECLINE_NO_FRESH_HINT)
+            && head_preservable
+        {
+            let mut offset = None;
+            let mut off = 1;
+            while off < ADMISSION_LOG_CAP {
+                let idx = (self.head + off) % ADMISSION_LOG_CAP;
+                if let Some(r) = &self.records[idx]
+                    && matches!(r.phase, AdmissionPhase::Declined)
+                    && Self::str_eq(r.reason, CursorGlow::DECLINE_NO_FRESH_HINT)
+                {
+                    offset = Some(off);
+                    break;
+                }
+                off += 1;
+            }
+            if let Some(offset) = offset {
+                let mut step = offset;
+                while step < ADMISSION_LOG_CAP - 1 {
+                    let dst = (self.head + step) % ADMISSION_LOG_CAP;
+                    let src = (self.head + step + 1) % ADMISSION_LOG_CAP;
+                    self.records[dst] = self.records[src];
+                    step += 1;
+                }
+                let newest = (self.head + ADMISSION_LOG_CAP - 1) % ADMISSION_LOG_CAP;
+                self.records[newest] = Some(record);
+                return;
+            }
         }
         self.records[self.head] = Some(record);
         self.head = (self.head + 1) % ADMISSION_LOG_CAP;
@@ -481,8 +540,12 @@ impl CursorGlow {
     /// Rainbow kitty v2 `trail status` counters when v2 owns the frame.
     #[inline]
     #[must_use]
-    pub fn v2_status(&self) -> Option<rk::Status> {
-        self.v2.engaged().then(|| self.v2.status())
+    pub const fn v2_status(&self) -> Option<rk::Status> {
+        if self.v2.engaged() {
+            Some(self.v2.status())
+        } else {
+            None
+        }
     }
 
     /// Whether a keypress on this engine's window would play a key sound.
@@ -495,20 +558,25 @@ impl CursorGlow {
     /// Current flow status (`flow=`, `combo=`, `combo_best=`).
     #[inline]
     #[must_use]
-    pub fn flow_status(&self) -> rk::Flow {
+    pub const fn flow_status(&self) -> rk::Flow {
         if self.v2.engaged() {
             self.v2.spine().flow()
         } else {
-            rk::Flow::default()
+            rk::Flow::EMPTY
         }
     }
 
     /// Whether the last tick's row probe captured the rows above and below the cursor.
     #[inline]
     #[must_use]
-    pub fn neighbor_rows_probed(&self) -> Option<(bool, bool)> {
-        self.row_prev_meta
-            .map(|m| (m.above == NbrProbe::Probed, m.below == NbrProbe::Probed))
+    pub const fn neighbor_rows_probed(&self) -> Option<(bool, bool)> {
+        match self.row_prev_meta {
+            Some(m) => Some((
+                matches!(m.above, NbrProbe::Probed),
+                matches!(m.below, NbrProbe::Probed),
+            )),
+            None => None,
+        }
     }
 
     /// Recent admission-diagnosis records, oldest to newest.
@@ -551,7 +619,8 @@ impl CursorGlow {
 
     /// Record a licensed verdict in the diagnosis ring under the named licence
     /// class (`AdmissionRecord::LICENCE_*`).
-    pub(super) fn log_licensed_as(
+    #[inline]
+    pub(super) const fn log_licensed_as(
         &mut self,
         at: Instant,
         origin: (u16, u16),
@@ -571,7 +640,8 @@ impl CursorGlow {
     }
 
     /// Record a declined verdict in the diagnosis ring.
-    pub(super) fn log_decline(
+    #[inline]
+    pub(super) const fn log_decline(
         &mut self,
         at: Instant,
         origin: (u16, u16),
@@ -593,11 +663,20 @@ impl CursorGlow {
     /// Count of live typing sparks in the ribbon.
     #[inline]
     #[must_use]
-    pub fn ribbon_segments(&self) -> usize {
+    pub const fn ribbon_segments(&self) -> usize {
         if self.v2.engaged() {
             return self.v2.ribbon_segments();
         }
-        self.sparks.iter().filter(|spark| spark.typing).count()
+        let sparks = self.sparks.as_slice();
+        let mut count = 0;
+        let mut i = 0;
+        while i < sparks.len() {
+            if sparks[i].typing {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
     }
 
     /// Count of ribbon boundaries whose composite reads as band ink.
@@ -655,7 +734,7 @@ impl CursorGlow {
 
     /// Recompute [`Self::probed_spans`] after rotating or lifting the previous row probe.
     pub(super) fn refresh_probed_text_spans(&mut self) {
-        let mut spans = TextSpans::default();
+        let mut spans = TextSpans::EMPTY;
         let Some(m) = self.row_prev_meta.as_ref() else {
             self.probed_spans = spans;
             return;
@@ -686,12 +765,14 @@ impl CursorGlow {
 
     /// This frame's radial light halos.
     #[inline]
+    #[must_use]
     pub const fn halos(&self) -> &[RainHalo] {
         self.halo_out.as_slice()
     }
 
     /// This frame's under-ink flame quads.
     #[inline]
+    #[must_use]
     pub const fn under_quads(&self) -> &[GlowQuad] {
         self.under_out.as_slice()
     }
@@ -704,12 +785,14 @@ impl CursorGlow {
 
     /// This frame's per-pixel fire patches.
     #[inline]
+    #[must_use]
     pub const fn patches(&self) -> &[FirePatch] {
         self.patch_out.as_slice()
     }
 
     /// This frame's charred-ink foreground overrides.
     #[inline]
+    #[must_use]
     pub const fn charred(&self) -> &[CharFg] {
         self.char_out.as_slice()
     }
@@ -735,6 +818,7 @@ impl CursorGlow {
 
     /// Caret spectrum position in `0.0..=1.0`.
     #[inline]
+    #[must_use]
     pub fn rainbow_field(&self) -> f32 {
         if self.v2.engaged() {
             return self.v2_stop.map_or_else(|| self.v2.field(), |(t, _)| t);
@@ -777,6 +861,7 @@ impl CursorGlow {
 
     /// This frame's fire contrast-halo cell strengths.
     #[inline]
+    #[must_use]
     pub const fn halo_cells(&self) -> &[FireHaloCell] {
         self.fire_halo_out.as_slice()
     }
@@ -813,13 +898,25 @@ impl CursorGlow {
 }
 
 /// Probed text lines of one frame ([`CursorGlow::probed_text_spans`]).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct TextSpans {
     rows: [Option<(i32, i32, i32)>; 3],
     read: [Option<i32>; 3],
 }
 
+impl Default for TextSpans {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl TextSpans {
+    pub(crate) const EMPTY: Self = Self {
+        rows: [None; 3],
+        read: [None; 3],
+    };
+
     /// Whether grid cell `(row, col)` lies on a probed line of text.
     #[inline]
     pub(super) const fn covers_cell(&self, row: i32, col: i32) -> bool {
@@ -844,6 +941,21 @@ impl TextSpans {
         self.rows.iter().flatten().copied()
     }
 
+    /// Column span `(first, end)` for probed `row`, if present.
+    #[inline]
+    pub(super) const fn line_at(&self, row: i32) -> Option<(i32, i32)> {
+        let mut i = 0;
+        while i < self.rows.len() {
+            if let Some((r, first, end)) = self.rows[i]
+                && r == row
+            {
+                return Some((first, end));
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Whether the probe read grid row `row` this frame, so a cell of it off
     /// every line ([`Self::covers_cell`]) is known blank rather than unknown.
     #[inline]
@@ -855,7 +967,6 @@ impl TextSpans {
 }
 
 /// Per-row text spans and cell colours read from the frame ([`CursorGlow::observe_frame_text`]).
-#[derive(Default)]
 pub(crate) struct FrameText {
     pub(super) at: Option<Instant>,
     pub(super) lo: i32,
@@ -867,7 +978,23 @@ pub(crate) struct FrameText {
     pub(super) col0: i32,
 }
 
+impl Default for FrameText {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl FrameText {
+    pub(crate) const EMPTY: Self = Self {
+        at: None,
+        lo: 0,
+        rows: Vec::new(),
+        pairs: Vec::new(),
+        cols: 0,
+        col0: 0,
+    };
+
     /// The ink (`None` for a blank cell) and ground of cell `(row, col)` in
     /// the frame's own cells, or `None` for a cell the frame did not read.
     #[inline]

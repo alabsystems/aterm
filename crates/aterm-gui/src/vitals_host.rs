@@ -18,6 +18,7 @@ use aterm_sysprobe::volumes::VolumeKey;
 use aterm_vitals::explain::{
     CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
 };
+use aterm_vitals::glance::needs::{Ask, DeckNeed, DeckWindow};
 use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
@@ -277,6 +278,8 @@ pub(crate) struct Request {
     pub(crate) tabs: Vec<TabRoot>,
     /// Those roots' terminal mode words, where read ([`TtyWord`]).
     pub(crate) ttys: Vec<TtyWord>,
+    /// Where each of those roots' words is read again ([`Request::reread_words`]).
+    pub(crate) tty_sources: Vec<TtySource>,
     /// What those roots' PTY readers read, read again at each pass
     /// ([`crate::vitals_jobs::JobFeed`]).
     pub(crate) feeds: Vec<(u64, Arc<crate::vitals_jobs::JobFeed>)>,
@@ -344,13 +347,22 @@ pub(crate) struct TtyWord {
 }
 
 impl TtyWord {
-    /// Reads the terminal mode word of session `key` behind `sink`.
+    /// Reads the terminal mode word of session `key` behind `sink`: none while a key waits unread,
+    /// or while nothing says whether one does
+    /// ([`aterm_session::sink::SinkWriter::unread_input`]), since the tty names a wait for the
+    /// person only over an empty queue.
     pub(crate) fn read(
         key: u64,
         sink: &aterm_session::sink::SinkWriter,
         output: &Arc<ScreenMoves>,
     ) -> Option<Self> {
-        Self::read_seamed(key, sink, output, || {})
+        Self::read_seamed(
+            key,
+            sink,
+            output,
+            || {},
+            aterm_session::sink::SinkWriter::unread_input,
+        )
     }
 
     fn read_seamed(
@@ -358,13 +370,14 @@ impl TtyWord {
         sink: &aterm_session::sink::SinkWriter,
         output: &Arc<ScreenMoves>,
         between: impl FnOnce(),
+        unread: impl FnOnce(&aterm_session::sink::SinkWriter) -> Option<usize>,
     ) -> Option<Self> {
         let output_seen = output.count();
         let input = sink.driven_input_watch();
         let input_seen = input.get();
         between();
         let echo = sink.tty_echo()?;
-        if aterm_pty::input_queue_len(sink.master()).is_some_and(|n| n > 0) {
+        if unread(sink) != Some(0) {
             return None;
         }
         Some(Self {
@@ -406,6 +419,37 @@ impl TtyWord {
                 },
             )
         })
+    }
+}
+
+/// Where a session's terminal mode word is read: the session's sink, held weakly so a request the
+/// probe thread keeps never keeps a closed session's master open (and never holds a bare fd number
+/// another PTY could reuse), and the reader's count of screen moves.
+#[derive(Clone, Debug)]
+pub(crate) struct TtySource {
+    key: u64,
+    sink: std::sync::Weak<aterm_session::sink::SinkWriter>,
+    output: Arc<ScreenMoves>,
+}
+
+impl TtySource {
+    /// The source of session `key`'s word, behind `sink`.
+    pub(crate) fn new(
+        key: u64,
+        sink: &Arc<aterm_session::sink::SinkWriter>,
+        output: &Arc<ScreenMoves>,
+    ) -> Self {
+        Self {
+            key,
+            sink: Arc::downgrade(sink),
+            output: Arc::clone(output),
+        }
+    }
+
+    /// Reads the word now ([`TtyWord::read`]): none once the session is gone.
+    pub(crate) fn read(&self) -> Option<TtyWord> {
+        let sink = self.sink.upgrade()?;
+        TtyWord::read(self.key, &sink, &self.output)
     }
 }
 
@@ -980,7 +1024,7 @@ fn run(
         }
         let began = Instant::now();
         let snap = if asked.pull {
-            pull(&mut source, &req, last_whole)
+            pull(&mut source, &mut req, last_whole)
         } else {
             source.reading(&req)
         };
@@ -1003,7 +1047,13 @@ fn run(
     free.keep(source.model().free_history(), Instant::now(), true);
 }
 
-fn pull(source: &mut impl Source, req: &Request, last_whole: Option<Instant>) -> Snapshot {
+/// A worker's pull: a whole reading, or a cold one's pair [`COLD_PAIR`] apart, with the thread's
+/// last request. Each reading reads every terminal word again just before it
+/// ([`Request::reread_words`]): the thread may hold its request from long before, and a write
+/// that moved a screen since a word was read (an agent's last redraw of a turn, or one inside the
+/// pair) leaves that word stamped before the output, naming no wait. `req` keeps the words the
+/// last reading read with, which the view is handed back with.
+fn pull(source: &mut impl Source, req: &mut Request, last_whole: Option<Instant>) -> Snapshot {
     if let Some(t) = last_whole {
         std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
     }
@@ -1014,14 +1064,17 @@ fn pull(source: &mut impl Source, req: &Request, last_whole: Option<Instant>) ->
     pull.pull = true;
     pull.cadence_ms = duration_ms(if cold { COLD_PAIR } else { COLD_AFTER }).max(req.cadence_ms);
     let warm = cold.then(|| {
+        pull.reread_words();
         let warm = source.reading(&pull);
         std::thread::sleep(COLD_PAIR);
         warm
     });
+    pull.reread_words();
     let mut snap = source.reading(&pull);
     if let Some(warm) = warm {
         keep_warm_events(warm, &mut snap);
     }
+    req.ttys = pull.ttys;
     snap
 }
 
@@ -1097,6 +1150,18 @@ fn platform_thermal() -> Option<Thermal> {
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+/// Pane `pane`'s published need `word` as the deck's needs read it: in its own word
+/// (`approval`), and a stuck program's (`frozen`, `stopped`: the input gate's stall or an agent's
+/// screen that stopped answering, which the jobs engine reads as `stuck`) marked so.
+pub(crate) fn deck_ask(pane: u64, word: aterm_types::needs::NeedWord) -> Ask {
+    use aterm_types::needs::NeedWord;
+    Ask {
+        pane,
+        word: word.word(),
+        stuck: matches!(word, NeedWord::Frozen | NeedWord::Stopped),
     }
 }
 
@@ -1707,6 +1772,19 @@ pub(crate) struct TabReads {
 }
 
 impl Request {
+    /// Reads every root's word again from its source, none for a session that is gone. A worker's
+    /// pull reads with the request the thread last held, however old: a write that moved the
+    /// screen since its words were read (an agent's last redraw of a turn, after the reading that
+    /// parked it) would leave each word stamped before that output, naming no wait, so each of the
+    /// pull's readings reads them afresh first.
+    pub(crate) fn reread_words(&mut self) {
+        self.ttys = self
+            .tty_sources
+            .iter()
+            .filter_map(TtySource::read)
+            .collect();
+    }
+
     /// Reads the pass's clock (`now`, ms past `epoch`, at least 1 ms), then each feed on it, then
     /// each current mode word. A reading takes them before its sweep, so a block's `D` and the exit
     /// of the command it closes, read while the sweep runs, are the next pass's, never a closed
@@ -3311,13 +3389,14 @@ impl crate::App {
         drop(store);
         let mut seen = std::collections::HashSet::new();
         tabs.retain(|tab| seen.insert(tab.key));
-        let ttys = tabs
+        let tty_sources: Vec<TtySource> = tabs
             .iter()
             .filter_map(|t| {
                 let s = self.pool.get(t.key)?;
-                TtyWord::read(t.key, &s.ctx.sink, &s.ctx.screen_moves)
+                Some(TtySource::new(t.key, &s.ctx.sink, &s.ctx.screen_moves))
             })
             .collect();
+        let ttys = tty_sources.iter().filter_map(TtySource::read).collect();
         let feeds = tabs
             .iter()
             .filter_map(|t| Some((t.key, Arc::clone(&self.pool.get(t.key)?.ctx.job_feed))))
@@ -3331,6 +3410,7 @@ impl crate::App {
             self_pid: std::process::id(),
             tabs,
             ttys,
+            tty_sources,
             feeds,
             inputs,
             layout,
@@ -3379,6 +3459,49 @@ impl crate::App {
             .get(&wid)
             .and_then(|ws| ws.tab_set.active_index().and_then(|i| ws.tab_set.tab_at(i)))
             .map_or_else(Vec::new, |tab| self.tab_sessions(tab))
+    }
+
+    /// What needs the owner in window `wid`'s tabs, worst first
+    /// ([`aterm_vitals::glance::needs::of`]): the jobs engine's verdicts on the latest snapshot,
+    /// each pane's need as the needs system published it ([`deck_ask`]), and the front tab's
+    /// volume. Under a debug build's deck scene, the scene window's.
+    pub(crate) fn deck_needs(&self, wid: crate::WindowId) -> Vec<DeckNeed> {
+        let snap = self.vitals.snapshot.as_deref();
+        #[cfg(debug_assertions)]
+        if let Some(scene) = self.vitals.deck_scene {
+            return crate::stats_deck::deck_fixtures::DeckContext::of(scene).deck_needs(snap);
+        }
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let tabs: Vec<Vec<u64>> = ws
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|tab| self.tab_sessions(tab))
+            .collect();
+        let asks: Vec<Ask> = tabs
+            .iter()
+            .flatten()
+            .filter_map(|&pane| {
+                let session = self.pool.get(pane)?;
+                let timeline = session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let need = timeline.need().need.as_ref()?;
+                Some(deck_ask(pane, need.word))
+            })
+            .collect();
+        aterm_vitals::glance::needs::of(
+            snap,
+            &DeckWindow {
+                tabs: &tabs,
+                front: ws.tab_set.active_index(),
+                asks: &asks,
+            },
+        )
     }
 
     /// The terminal sessions of `tab`, its focused pane first, then the rest

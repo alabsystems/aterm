@@ -195,12 +195,29 @@ pub struct SuperEnv {
 }
 
 /// Per-shape quad counts of one [`emit_super`] call (budget tests).
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct SuperCounts {
     pub charge: usize,
     pub wash: usize,
     pub crown: usize,
     pub ring: usize,
+}
+
+impl SuperCounts {
+    /// Zeroed quad counts before emission.
+    pub const EMPTY: Self = Self {
+        charge: 0,
+        wash: 0,
+        crown: 0,
+        ring: 0,
+    };
+}
+
+impl Default for SuperCounts {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 struct QuadSink<'a> {
@@ -253,10 +270,12 @@ impl QuadSink<'_> {
 
 /// Premultiply a `0x00RRGGBB` color by coverage (single quantization point).
 #[inline]
-fn premul(color: u32, cov: f32) -> u32 {
+const fn premul(color: u32, cov: f32) -> u32 {
     let a = cov.clamp(0.0, 1.0);
-    let m = |sh: u32| ((((color >> sh) & 0xff) as f32) * a).round() as u32;
-    (m(16) << 16) | (m(8) << 8) | m(0)
+    const fn m(color: u32, a: f32, sh: u32) -> u32 {
+        ((((color >> sh) & 0xff) as f32) * a).round() as u32
+    }
+    (m(color, a, 16) << 16) | (m(color, a, 8) << 8) | m(color, a, 0)
 }
 
 /// `sin(π·e)` — one rise-and-fall, never periodic (flash-safety shape).
@@ -464,10 +483,14 @@ fn max_channel(rgb: u32) -> u32 {
 }
 
 #[inline]
-fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
+const fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
     debug_assert!(denominator > 0);
-    let scale = |shift: u32| (((rgb >> shift) & 0xff) * numerator / denominator) << shift;
-    scale(16) | scale(8) | scale(0)
+    const fn scale(rgb: u32, numerator: u32, denominator: u32, shift: u32) -> u32 {
+        (((rgb >> shift) & 0xff) * numerator / denominator) << shift
+    }
+    scale(rgb, numerator, denominator, 16)
+        | scale(rgb, numerator, denominator, 8)
+        | scale(rgb, numerator, denominator, 0)
 }
 
 /// Charge mote `k`'s px position at progress `p` (0..1): a spiral converging on
@@ -483,6 +506,28 @@ fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
         env.cx + (cos_a * r) as i32,
         env.cy + (sin_a * r * 0.6) as i32,
     )
+}
+
+#[inline]
+fn crown_dirs() -> &'static [(f32, f32); 8] {
+    static DIRS: std::sync::OnceLock<[(f32, f32); 8]> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        std::array::from_fn(|point| {
+            let ang = core::f32::consts::TAU * point as f32 / 8.0;
+            ang.sin_cos()
+        })
+    })
+}
+
+#[inline]
+fn shock_dirs() -> &'static [(f32, f32); 16] {
+    static DIRS: std::sync::OnceLock<[(f32, f32); 16]> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        std::array::from_fn(|k| {
+            let ang = core::f32::consts::TAU * k as f32 / 16.0;
+            ang.sin_cos()
+        })
+    })
 }
 
 /// The 8-point star crown, additive (dark themes): 4 axes (2 orthogonal + 2
@@ -501,9 +546,7 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
         let tone = mix_rgb(WASH_CORE, 0x00FF_FFFF, 1.0 - f0);
         (d, sz, sz / 2, premul(tone, env_a * (1.0 - 0.55 * f0)))
     });
-    for point in 0..8 {
-        let ang = core::f32::consts::TAU * point as f32 / 8.0;
-        let (sin_a, cos_a) = ang.sin_cos();
+    for &(sin_a, cos_a) in crown_dirs() {
         let (dx, dy) = (cos_a, sin_a * 0.75);
         for &(d, sz, half_sz, color) in &segs {
             sink.push(
@@ -620,38 +663,43 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let half_w = width as f32 / 2.0;
         let base_a = 235.0 * env_a;
         let mut stamped = 0usize;
-        for dr in 0..rows_span {
-            if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
-                break;
-            }
-            let r = r0 + dr;
-            if r < 0 {
-                continue;
-            }
-            let row_u = r as u16;
-            let ny = (dr - rows_span / 2) as f32 / half_rows;
-            let ny2 = ny * ny;
-            for dc in 0..width as i32 {
+        if base_a >= 14.0 {
+            for dr in 0..rows_span {
                 if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
                     break;
                 }
-                let nx = (c0 + dc - word_mid) as f32 / half_w;
-                let d2 = (nx * nx + ny2).min(1.0);
-                let a = base_a * (1.0 - d2).powf(0.8);
-                if a < 14.0 {
+                let r = r0 + dr;
+                if r < 0 {
                     continue;
                 }
-                out.push(WordDecoration {
-                    row: row_u,
-                    col: (c0 + dc) as u16,
-                    dx: 0,
-                    dy: 0,
-                    glyph: DecoGlyph::Shade,
-                    blend: DecoBlend::Over,
-                    color: VEIL_TONE,
-                    alpha: a as u8,
-                });
-                stamped += 1;
+                let row_u = r as u16;
+                let ny = (dr - rows_span / 2) as f32 / half_rows;
+                let ny2 = ny * ny;
+                for dc in 0..width as i32 {
+                    if out.len() >= cap || stamped >= MAX_VEIL_CELLS {
+                        break;
+                    }
+                    let nx = (c0 + dc - word_mid) as f32 / half_w;
+                    let d2 = nx * nx + ny2;
+                    if d2 >= 1.0 {
+                        continue;
+                    }
+                    let a = base_a * (1.0 - d2).powf(0.8);
+                    if a < 14.0 {
+                        continue;
+                    }
+                    out.push(WordDecoration {
+                        row: row_u,
+                        col: (c0 + dc) as u16,
+                        dx: 0,
+                        dy: 0,
+                        glyph: DecoGlyph::Shade,
+                        blend: DecoBlend::Over,
+                        color: VEIL_TONE,
+                        alpha: a as u8,
+                    });
+                    stamped += 1;
+                }
             }
         }
         let crown_segs: [(f32, u8); 3] = std::array::from_fn(|i| {
@@ -661,12 +709,10 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 (230.0 * env_a * (1.0 - 0.2 * seg)) as u8,
             )
         });
-        for point in 0..8 {
+        for &(sin_a, cos_a) in crown_dirs() {
             if out.len() >= cap {
                 break;
             }
-            let ang = core::f32::consts::TAU * point as f32 / 8.0;
-            let (sin_a, cos_a) = ang.sin_cos();
             for &(d, alpha) in &crown_segs {
                 if out.len() >= cap {
                     break;
@@ -695,14 +741,10 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let r = env.r_max * ease_out(q);
         let fade = 1.0 - q;
         let alpha = (170.0 * fade * env.intensity) as u8;
-        let n = 16usize;
-        let n_f = n as f32;
-        for k in 0..n {
+        for &(sin_a, cos_a) in shock_dirs() {
             if out.len() >= cap {
                 break;
             }
-            let ang = core::f32::consts::TAU * k as f32 / n_f;
-            let (sin_a, cos_a) = ang.sin_cos();
             let x = env.cx + (cos_a * r) as i32;
             let y = env.cy + (sin_a * r * 0.75) as i32;
             if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {

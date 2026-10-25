@@ -132,15 +132,22 @@ your projects' build folders Spotlight indexes are yours, counted in the row's n
 and never moved.
 
 Only changed preference keys are backed up (no credentials). Restore preferences puts
-them back and stops automatic setup, leaving cloned repos, credentials and sign-outs
-in place; a choice after it sets only the groups it turns to Set up, a Join or a
-group turned to Leave as is sets none, and Set up now sets them all again. The
-Caps Lock key, and a scroll direction the Mac had never set, come back at your next
-login (System State and `doctor --restore` say so; nothing failed). Without
-Full Disk Access it leaves Notification Center's widget list alone and keeps its
-original in the backup (run Restore again from an app with the grant).
-`doctor --apply` applies the preference and account profile and adds aterm's
-permissions to the plan, unless setup was cancelled or restored; System State also
+them back, stops automatic setup and turns Keyboard & Trackpad and Desktop & Dock to
+Leave as is, leaving cloned repos, credentials, sign-outs and aterm's permissions in
+place (its permission steps go on by themselves); turning one of
+those groups back to Set up sets only that group, and a Join or a group turned to
+Leave as is sets none. The Caps Lock key, a scroll direction the Mac had never set,
+Trackpad scrolling, and any setting whose app did not relaunch, come back at your next
+login (System State says so in its one line about the Restore, in its row names, and
+reads a row whose live value it can read as `Control · until login` until then; `doctor
+--restore` lists each key and relaunch; nothing failed). A value macOS hid stays as it
+is, which is no failure either; only a setting Restore could not put back is one, which
+System State names as Restore's. Without
+Full Disk Access it leaves Notification Center's widget list alone, keeps its original
+in the backup and puts it back by itself once aterm has the grant, unless Desktop &
+Dock was turned back to Set up since. `doctor --apply` applies the preference and
+account profile and adds aterm's permissions to the plan, unless setup was cancelled
+(a Restore withdraws none), and finishes a run a Restore ended; System State also
 does Spotlight, the vault and repositories. The Messages and FaceTime sign-outs run
 last, only while System State is on screen, where Stop can end them.
 
@@ -572,6 +579,31 @@ FILES
         ),
     },
     Topic {
+        name: "db",
+        tagline: "encrypted embedded application databases: offline edits and direct LAN replication",
+        body: Some(
+            r#"db — encrypted embedded application databases (`aterm db`, Unix only).
+
+Every database has a dedicated private directory. One machine works alone; admitted
+peers synchronize directly over the LAN. `aterm db --help` lists every command and flag.
+
+  aterm db init --dir <directory>      create a single-machine database
+  aterm db status --dir <directory>    identity, causal health and budget summaries
+  aterm db history --dir <directory>   signed edit metadata and local receipts
+
+Use request, invite and join to enroll a peer; invitations contain a read key, so
+exchange them privately and authenticate the root key. get and scan read records;
+put and stop edit them. Record edits take a caller-held --request ID, generated with
+`aterm db nonce`, so retrying a lost reply keeps the same request. sync and serve
+repair with admitted LAN peers. budget-create and spend manage admission rights,
+not vendor billing.
+
+Account records are proposals, never permission to dispatch credentials. Raw secrets
+belong in `aterm secrets`; database records carry references to them.
+"#,
+        ),
+    },
+    Topic {
         name: "machines",
         tagline: "configure and manage a lab of Macs from this one, over SSH (no MDM, no Apple account)",
         body: Some(
@@ -634,7 +666,7 @@ WHAT IT IS
   * Human grace: after a person types, clicks or scrolls, it holds off for
     `human_grace_s` (`status human_ms=`), but on an untouched box Claude Code will
     deny on a timer (`⚠ … deny this request in M:SS`) only until 15 s before the
-    deny. While a hold stands (`hold=1`) or an external supervisor holds the lease
+    deny, and a question dialog only 15 s past the person's last input. While a hold stands (`hold=1`) or an external supervisor holds the lease
     (`supervisor=external`), the window only watches. A worker frozen past
     `stall_term_after_s` (`input=stalled`) is warned about once, or restarted under
     `stall_term = true`.
@@ -722,7 +754,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   upgrade_ask [false]             true: ask the agent before restarting for an upgrade;
                                   false: restart quietly at a genuinely idle point
   human_grace_s [120]             seconds to keep hands off after a person's input (to
-                                  15 s before an untouched box's auto-deny at most)
+                                  15 s before an untouched box's auto-deny at most; a
+                                  question dialog: 15 s at most)
   occupancy ["observe"]           wait measurement: `"observe"`, `"off"` or `"prompt"`
                                   (`"prompt"` alone types its lines: one fenced line
                                   at a drawn break, after every guard)
@@ -1526,6 +1559,9 @@ fn overview_page() -> String {
             crate::Verb::Secrets => {
                 "one credentials file for every machine: the vault, its server and ~/.secrets \
                  (status | join | sync | edit | password | approve | serve)"
+            }
+            crate::Verb::Db => {
+                "encrypted embedded application databases: offline edits, direct LAN replication, accounts and budget rights"
             }
             crate::Verb::Harness => {
                 "Claude Code's spend, limits and accounts, disk, ledger; `upgrade` (the window supervises)"
@@ -2443,9 +2479,9 @@ READING & DRIVING ACROSS THE FLEET
   * `facts` (default) — programs, agent states, redacted roles, task records, models.
   * `content` — `facts` plus titles, cwds, prompts, recent agent words and shell lines.
   * `drive` — `content`, and the nodes `aterm fleet allow drive --from` names (bound by
-    node key) may run `aterm ctl --host <h> spawn` here, with `await task`, `result`,
-    `status`, `text`, `screen`, `turn`, `key`, `send`, `hold` and `close` (`aterm help
-    workers`). A local Take Over always wins and lifts remote holds.
+    node key) may run `aterm ctl --host <h> spawn agent=<word>` here, with `await task`,
+    `result`, `status`, `text`, `screen`, `turn`, `key`, `send`, `hold` and `close`
+    (`aterm help workers`). A local Take Over always wins and lifts remote holds.
 
 FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `fleet.key`, `fleet-join-code`, `fleet-node`, `fleet-node-key`, `fleet-peers`,
@@ -3701,12 +3737,13 @@ HEADLESS, UNREAD INPUT, STUCK MODES & BELLS
   * Headless instances: `aterm --headless [--columns C] [--lines L] [--control-sock PATH]
     [--lifeline-fd N] [--ready-fd N]` runs the terminal engine + socket with no window or
     Dock icon.
-  * Unread tty input (macOS): `aterm ctl @sid status` reports `input=clear|pending|
-    typeahead|stalled|stopped`, `input_bytes=` and `input_wait_ms=`. Input verbs append
-    `warn=input-unread …` when input is queued >= 1 s, and refuse with `ERR busy
+  * Unread tty input (macOS and Linux): `aterm ctl @sid status` reports `input=clear|
+    pending|typeahead|stalled|stopped`, `input_bytes=` and `input_wait_ms=`. Input verbs
+    append `warn=input-unread …` when input is queued >= 1 s, and refuse with `ERR busy
     input-unread …` when `stalled` or `stopped` (pass `unread=ok` to force, or recover
     with `signal int|term|kill|cont` or `restart pid=<n> if-stalled`; `signal
-    term|kill|hup|quit` flushes unread raw-mode typeahead first).
+    term|kill|hup|quit` flushes unread raw-mode typeahead first). Only macOS watches for
+    `stalled` and flushes.
   * Stuck terminal modes: `aterm ctl @sid reset [flush]` (or Edit ▸ Reset Terminal)
     restores mouse, kitty-key, alt-screen and link state without losing scrollback.
   * Bell tracking: `status` reports `bells=` (at most once per 100 ms), `bells_sounded=`
@@ -3806,6 +3843,19 @@ fn agent_page(sid: Option<&str>) -> String {
          off types nothing.\n  \
          NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar\n  \
          and window border (`NEEDS YOU: nothing` takes it down); the work goes on.\n",
+    );
+    s.push_str(
+        "\nRESTART YOUR AGENT\n  \
+         When a restart is needed, including to adopt an installed update, do it yourself.\n  \
+         Save your work and a handoff first: the restart ends your current process. Read\n  \
+         `aterm ctl @self status` and `aterm ctl help restart`, then run\n  \
+         `aterm ctl @self restart` (add `pid=<agent-pid>` when known). `supervisor=` can name\n  \
+         aterm's host, not the agent. aterm validates the supervised foreground process\n  \
+         and resumes the same conversation using its recorded\n  \
+         arguments, directory and environment. A refusal names what prevents it; do not\n  \
+         bypass a hold or another driver. An agent restart is not a NEEDS YOU item; a Mac\n  \
+         restart still is. Probe the socket before declaring it unavailable: Codex tool\n  \
+         shells have different sandbox permissions. Respect an actual sandbox refusal.\n",
     );
     s.push_str(
         "\nDISK SPACE (one volume, shared by every session on it)\n  \
@@ -3975,7 +4025,9 @@ THE HALT (`hold=1`)
   keyboard continue:
   * `origin=person` (`reason=taken-over`) — local Take Over (`aterm help needs`); only
     the person's Hand Back lifts it.
-  * `origin=remote` — held by another Mac over the fleet (`aterm help fleet`).
+  * `origin=remote` — held by another Mac over the fleet (the survey's `held_from=`
+    names its node): its own `hold <sid> off` or the person's Take Over lifts it, and
+    it ends here once that Mac may drive this one no more (`aterm help fleet`).
   * `origin=fleet` — fleet-wide halt via `aterm fabric halt --cap-file <cap> <reason>`
     (lifted by `aterm fabric halt --cap-file <cap> off`).
   * `origin=local` — set/lifted by `aterm ctl hold <sid> on|off [reason=<r>]`.
@@ -4040,9 +4092,17 @@ fn page_of(t: &str) -> &str {
 }
 
 /// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's
-/// sid inside an aterm session ([`in_session`]).
+/// sid inside an aterm session ([`in_session`]); every page ends its last line.
 pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
-    let topic = topic.map(page_of);
+    let (mut page, code) = render_page(topic.map(page_of), session);
+    if !page.ends_with('\n') {
+        page.push('\n');
+    }
+    (page, code)
+}
+
+/// The page [`render`] answers, as its topic writes it.
+fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
     match topic {
         None => {
             if let Some(sid) = session {
@@ -4918,6 +4978,22 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_page_ends_its_last_line() {
+        let names = TOPICS
+            .iter()
+            .map(|t| t.name)
+            .chain(EXTRA_PAGES.iter().copied());
+        for topic in names.map(Some).chain([None, Some("no-such-page")]) {
+            let (page, _) = render(topic, None);
+            assert!(
+                page.ends_with('\n'),
+                "{topic:?} ends {:?}",
+                page.lines().last()
+            );
+        }
     }
 
     /// Every page in [`EXTRA_PAGES`] dispatches.

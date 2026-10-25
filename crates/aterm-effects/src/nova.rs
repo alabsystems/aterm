@@ -121,13 +121,30 @@ pub struct NovaEnv {
 }
 
 /// Per-shape quad counts of one [`emit_nova`] call, read by the budget regression and the spend-order truncation tests.
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct NovaCounts {
     pub ring: usize,
     pub rays: usize,
     pub crown: usize,
     /// Ray samples that emitted ≥ 1 quad this frame, summed over rays.
     pub ray_samples: usize,
+}
+
+impl NovaCounts {
+    /// Zeroed quad and sample counts before emission.
+    pub const EMPTY: Self = Self {
+        ring: 0,
+        rays: 0,
+        crown: 0,
+        ray_samples: 0,
+    };
+}
+
+impl Default for NovaCounts {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 struct QuadSink<'a> {
@@ -231,11 +248,18 @@ pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
 
 /// Band count: exactly [`RING_BANDS`] when the extent admits ≥ 2 px bands (`2r ≥ 60 px`, true from `cell_h = 14` at genome radii); below that `⌊2r/2⌋`, fewer quads, so the closed form still bounds.
 #[inline]
-pub fn ring_band_count(extent_px: f32) -> usize {
+pub const fn ring_band_count(extent_px: f32) -> usize {
     if extent_px >= 2.0 * RING_BANDS as f32 {
         RING_BANDS
     } else {
-        ((extent_px / 2.0).floor() as usize).clamp(1, RING_BANDS)
+        let b = (extent_px / 2.0).floor() as usize;
+        if b < 1 {
+            1
+        } else if b > RING_BANDS {
+            RING_BANDS
+        } else {
+            b
+        }
     }
 }
 

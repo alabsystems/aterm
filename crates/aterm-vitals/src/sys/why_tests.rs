@@ -772,6 +772,18 @@ fn each_cause_says_its_own_words() {
 }
 
 #[test]
+fn a_small_figure_is_in_mib_never_zero_gib() {
+    let mut light = mem_1142();
+    if let Some(m) = light.mem.as_mut() {
+        m.compressed = Some(18_202_624);
+    }
+    let w = mac();
+    let t = why("why mem", &ctx(&w, &read(&light, 3), true));
+    assert!(t.contains("; swap 0; 17 MiB compressed; "), "{t}");
+    assert!(!t.contains("0.0 GiB"), "{t}");
+}
+
+#[test]
 fn with_the_lane_off_the_split_is_by_subtraction() {
     let off = Scene {
         lane: CoalLane::Unsupported,

@@ -84,6 +84,93 @@
 //!     let _ = ev.held_out(s);
 //! }
 //! ```
+//!
+//! # The M6 locks (design §13.3)
+//!
+//! A training label cannot be written by hand, built, or read for anything but training facts:
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::m4::TrainLabel;
+//! let _ = TrainLabel { id: todo!(), plan: todo!(), outcome: todo!() };
+//! ```
+//!
+//! ```compile_fail,E0624
+//! use aterm_effects::aos_momentum::m4::TrainLabel;
+//! let _ = TrainLabel::of(todo!(), todo!());
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use aterm_effects::aos_momentum::m4::TrainLabel;
+//! fn peek(l: &TrainLabel) -> Option<u64> { l.held_out_ticks() }
+//! ```
+//!
+//! ```compile_fail,E0616
+//! use aterm_effects::aos_momentum::m4::TrainLabel;
+//! fn peek(l: &TrainLabel) { let _ = &l.outcome; }
+//! ```
+//!
+//! A labelling token cannot be written by hand, copied, or used twice:
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::m4::LookToken;
+//! let _ = LookToken { bound: todo!() };
+//! ```
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::m4::ReadToken;
+//! let _ = ReadToken { bound: todo!() };
+//! ```
+//!
+//! ```compile_fail,E0451
+//! use aterm_effects::aos_momentum::m4::ReplayToken;
+//! let _ = ReplayToken { bound: todo!() };
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use aterm_effects::aos_momentum::m4::LookToken;
+//! fn copy(t: &LookToken) -> LookToken { Clone::clone(t) }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use aterm_effects::aos_momentum::m4::ReadToken;
+//! fn copy(t: &ReadToken) -> ReadToken { Clone::clone(t) }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use aterm_effects::aos_momentum::m4::ReplayToken;
+//! fn copy(t: &ReplayToken) -> ReplayToken { Clone::clone(t) }
+//! ```
+//!
+//! ```compile_fail,E0382
+//! use aterm_effects::aos_momentum::m4::{Evaluator, LabelScope, LookToken, Serial};
+//! fn look_twice(ev: &Evaluator, t: LookToken, plans: &[[u8; 12]]) {
+//!     let _ = ev.label_spread(LabelScope::HeldOut(t), plans, &Serial);
+//!     let _ = ev.label_spread(LabelScope::HeldOut(t), plans, &Serial);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0382
+//! use aterm_effects::aos_momentum::m4::{Evaluator, LabelScope, ReadToken, Serial};
+//! fn read_twice(ev: &Evaluator, t: ReadToken, plans: &[[u8; 12]]) {
+//!     let _ = ev.label_spread(LabelScope::Report(t), plans, &Serial);
+//!     let _ = ev.label_spread(LabelScope::Report(t), plans, &Serial);
+//! }
+//! ```
+//!
+//! ```compile_fail,E0382
+//! use aterm_effects::aos_momentum::m4::{Evaluator, LabelScope, ReplayToken, Serial};
+//! fn replay_twice(ev: &Evaluator, t: ReplayToken, plans: &[[u8; 12]]) {
+//!     let _ = ev.label_spread(LabelScope::Replay(t), plans, &Serial);
+//!     let _ = ev.label_spread(LabelScope::Replay(t), plans, &Serial);
+//! }
+//! ```
+//!
+//! A pool's outcome is no selection, so the held-out gate does not take one:
+//!
+//! ```compile_fail,E0308
+//! use aterm_effects::aos_momentum::m4::{Evaluator, PoolOutcome};
+//! fn gate(ev: &Evaluator, o: PoolOutcome) { let _ = ev.held_out(o); }
+//! ```
 
 use core::convert::Infallible;
 use core::fmt;
@@ -110,7 +197,16 @@ use super::corpus::{Corpus, CorpusSplit, ItemKind};
 use super::dist::{Claim, ClaimKind};
 use super::fidelity::{LANE_SETTLES, LaneFidelity, ORACLE};
 use super::lane::{LANE_MODEL, Scenario, encode_glass, run};
-use super::plan::{PLAN_INTERPRETER, PLAN_LEN, PlanRefusal, SchedulePlan};
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+use super::m6_policy::{
+    JUDGED, LOOK_LIST_CAP, MAX_JUDGED, PoolRefusal, READ_LIST_CAP, SetId, SetTag, Side, set_pools,
+    sets_v1, side,
+};
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+use super::plan::PLAN_LEN;
+use super::plan::{PLAN_INTERPRETER, PlanRefusal, SchedulePlan};
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+use super::policy::GRID_V1;
 use super::policy::{
     AcceptancePolicy, Body, Budgets, CORPUS_FOLD, ItemFacts, PolicyRefusal, Totals,
 };
@@ -123,6 +219,12 @@ use super::{
     schema_artifact,
 };
 use crate::cursor_momentum::MomentumGlowFrame;
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+use core::num::NonZeroU64;
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+use std::collections::BTreeMap;
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+use std::sync::{Mutex, PoisonError};
 
 /// The name of [`CandidateRefusal::Budget`].
 pub const BUDGET: &str = "Budget";
@@ -140,6 +242,18 @@ pub const LANE_NOT_REPRODUCED: &str = "LaneNotReproduced";
 pub const GOLDEN_UNREADABLE: &str = "GoldenTraceUnreadable";
 
 const UNREPLAYED: Digest = Digest([0; 32]);
+
+/// The held-out corpus items judged in this process, by any evaluator (design §13.3).
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+static HELD_OUT_JUDGED: AtomicU64 = AtomicU64::new(0);
+
+/// How many held-out corpus items any evaluator of this process has judged; every M6 lab command
+/// requires it to read 0 (design §13.3).
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[must_use]
+pub fn held_out_judged() -> u64 {
+    HELD_OUT_JUDGED.load(Ordering::SeqCst)
+}
 
 #[inline]
 fn wide(n: usize) -> u64 {
@@ -487,11 +601,44 @@ impl TrainAdmitted {
             .fold(Totals::default(), |t, (_, r)| add(t, r.totals()));
         TrainAdmitted { plan, rows, totals }
     }
+}
 
-    /// The selection rule's key: `ΣT`, then `ΣZ`, then the plan's bytes.
-    #[inline]
-    fn key(&self) -> (u64, u64, [u8; PLAN_LEN]) {
-        (self.totals.ticks, self.totals.wasted, self.plan.encode())
+/// The selection rule's winner so far, shared by [`Fold`] and the M6 pool outcomes so both pick
+/// and judge one way (design §13.3): the lowest `ΣT`, then `ΣZ`, then the plan's bytes, the first
+/// of equal keys kept.
+struct Winner<T> {
+    best: Option<(Totals, SchedulePlan, T)>,
+}
+
+impl<T> Winner<T> {
+    const fn new() -> Winner<T> {
+        Winner { best: None }
+    }
+
+    /// Offers an admitted candidate's training totals and plan, with what to return for it.
+    fn offer(&mut self, totals: Totals, plan: SchedulePlan, with: T) {
+        let key = |t: &Totals, p: &SchedulePlan| (t.ticks, t.wasted, p.encode());
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|(t, p, _)| key(&totals, &plan) < key(t, p))
+        {
+            self.best = Some((totals, plan, with));
+        }
+    }
+
+    /// The winner, with its training sums against `policy`'s baseline: a selection iff they
+    /// [`Compared::beats`].
+    fn end(self, policy: &AcceptancePolicy) -> Option<(T, Compared)> {
+        self.best.map(|(candidate, _, with)| {
+            (
+                with,
+                Compared {
+                    candidate,
+                    baseline: policy.totals(CorpusSplit::Train),
+                },
+            )
+        })
     }
 }
 
@@ -567,7 +714,7 @@ struct Fold {
     stats: SearchStats,
     seen: BTreeSet<Digest>,
     feedback: Vec<TrainFeedback>,
-    best: Option<(TrainAdmitted, u8, u64)>,
+    best: Winner<(TrainAdmitted, u8, u64)>,
 }
 
 impl Fold {
@@ -578,7 +725,7 @@ impl Fold {
             stats: SearchStats::default(),
             seen: BTreeSet::new(),
             feedback: Vec::new(),
-            best: None,
+            best: Winner::new(),
         }
     }
 
@@ -623,9 +770,8 @@ impl Fold {
                 self.stats.admitted += 1;
                 self.feedback
                     .push(TrainFeedback::admitted(cid, t.totals.ticks));
-                if self.best.as_ref().is_none_or(|(b, _, _)| t.key() < b.key()) {
-                    self.best = Some((t, round, wide(index)));
-                }
+                let (totals, plan) = (t.totals, t.plan);
+                self.best.offer(totals, plan, (t, round, wide(index)));
             }
             Judged::Dominated { ticks } => {
                 self.stats.admitted += 1;
@@ -645,12 +791,8 @@ impl Fold {
             best,
             ..
         } = self;
-        let Some((winner, round, index)) = best else {
+        let Some(((winner, round, index), train)) = best.end(&ev.policy) else {
             return (Err(NoOutcome::NoneAdmitted { stats }), is_grid);
-        };
-        let train = Compared {
-            candidate: winner.totals,
-            baseline: ev.policy.totals(CorpusSplit::Train),
         };
         if !train.beats() {
             let no = NoOutcome::NoGain {
@@ -1177,6 +1319,13 @@ pub struct Evaluator {
     /// The grid's own selection, once a search ran the grid ([`Self::grid_selection`]); `None`
     /// inside when the grid has no training winner.
     grid: OnceLock<Option<GridSelection>>,
+    /// The M6 labels judged so far, by candidate id, for its life (design §13.3).
+    #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+    labels: Mutex<BTreeMap<Digest, TrainLabel>>,
+    /// The most distinct plans it labels ([`MAX_JUDGED`]; lower in tests:
+    /// `Evaluator::capping_labels`).
+    #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+    label_cap: usize,
     /// A held-out item's scenario replaced (tests only: `Evaluator::replacing`).
     #[cfg(test)]
     replaced: Option<(usize, Scenario)>,
@@ -1206,6 +1355,10 @@ impl Evaluator {
             origin,
             stepped: AtomicU64::new(0),
             grid: OnceLock::new(),
+            #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+            labels: Mutex::new(BTreeMap::new()),
+            #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+            label_cap: MAX_JUDGED,
             #[cfg(test)]
             replaced: None,
             #[cfg(test)]
@@ -1264,6 +1417,8 @@ impl Evaluator {
             replaced: None,
             fault: None,
             reads: Reads::default(),
+            labels: Mutex::new(BTreeMap::new()),
+            label_cap: MAX_JUDGED,
         }
     }
 
@@ -1290,6 +1445,13 @@ impl Evaluator {
     #[cfg(test)]
     pub(super) const fn reads(&self) -> &Reads {
         &self.reads
+    }
+
+    /// The evaluator with at most `cap` distinct plans labelled (tests only).
+    #[cfg(test)]
+    pub(super) const fn capping_labels(mut self, cap: usize) -> Evaluator {
+        self.label_cap = cap;
+        self
     }
 
     /// The evaluator with the judgment of item `id` faulted by `fault` (tests only).
@@ -1346,6 +1508,10 @@ impl Evaluator {
     /// Evaluate item `k`'s row under `sched` and return any refusal that stops a candidate there.
     pub(super) fn judge(&self, sched: Sched, k: usize) -> Option<(Row, Option<CandidateRefusal>)> {
         let f = self.facts(k)?;
+        #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+        if f.split == CorpusSplit::HeldOut {
+            HELD_OUT_JUDGED.fetch_add(1, Ordering::SeqCst);
+        }
         #[cfg(test)]
         match f.split {
             CorpusSplit::Train => self.reads.train.fetch_add(1, Ordering::Relaxed),
@@ -2052,6 +2218,673 @@ impl Evaluator {
             useful,
             gain,
         })
+    }
+}
+
+/// A plan's label on the training split (design §13.3): its id, the plan, and either its training
+/// `ΣT`, `ΣP`, `ΣZ` or the first law it failed. It carries no held-out figure, and only
+/// [`Evaluator::label_spread`] returns one (a copy of the evaluator's cached label).
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrainLabel {
+    id: Digest,
+    plan: SchedulePlan,
+    outcome: Result<Totals, &'static str>,
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl TrainLabel {
+    /// `plan`'s label from its judgment on every training item, the one [`Evaluator::select`] makes.
+    fn of(plan: SchedulePlan, judged: Result<TrainAdmitted, CandidateRefusal>) -> TrainLabel {
+        TrainLabel {
+            id: plan.digest(),
+            plan,
+            outcome: judged.map(|t| t.totals).map_err(|r| r.law()),
+        }
+    }
+
+    /// The candidate's id ([`candidate_id`]).
+    #[inline]
+    #[must_use]
+    pub const fn id(&self) -> Digest {
+        self.id
+    }
+
+    /// The plan.
+    #[inline]
+    #[must_use]
+    pub const fn plan(&self) -> SchedulePlan {
+        self.plan
+    }
+
+    /// Its training `ΣT`, `ΣP`, `ΣZ`, if it was admitted on every training item.
+    #[inline]
+    #[must_use]
+    pub const fn totals(&self) -> Option<Totals> {
+        match self.outcome {
+            Ok(totals) => Some(totals),
+            Err(_) => None,
+        }
+    }
+
+    /// The first law it failed on the training split, if it was refused.
+    #[inline]
+    #[must_use]
+    pub const fn law(&self) -> Option<&'static str> {
+        match self.outcome {
+            Ok(_) => None,
+            Err(law) => Some(law),
+        }
+    }
+}
+
+/// The capability to open a real pair's sets and mint their tokens (design §13.3). Only the lab's
+/// session entry builds one, and a workspace source scan confines the name.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+pub struct RealSets(
+    #[expect(
+        dead_code,
+        reason = "read by nothing: it makes the zero bit pattern invalid, so `mem::zeroed` panics"
+    )]
+    NonZeroU64,
+);
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl RealSets {
+    /// The capability, for the lab's session entry alone.
+    #[must_use]
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> RealSets {
+        RealSets(NonZeroU64::MIN)
+    }
+}
+
+/// A rehearsal's or a test's set, which needs no capability: practice-held-out `j` or
+/// practice-report `j`, and nothing else.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PracticeSet {
+    /// Practice-held-out `j`, which look and replay tokens bind.
+    HeldOut(u32),
+    /// Practice-report `j`, which a read token binds.
+    Report(u32),
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl PracticeSet {
+    /// The set it names.
+    #[inline]
+    #[must_use]
+    pub const fn set(self) -> SetId {
+        match self {
+            PracticeSet::HeldOut(index) => SetId {
+                tag: SetTag::PracticeHeldOut,
+                index,
+            },
+            PracticeSet::Report(index) => SetId {
+                tag: SetTag::PracticeReport,
+                index,
+            },
+        }
+    }
+}
+
+/// The domain of a token's list digest, which the ledger line naming the list records.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+pub const LIST_DOMAIN: &[u8] = b"aterm-aos-m6-list-v1\0";
+
+/// The digest of `list`, sorted and deduplicated, under [`LIST_DOMAIN`]: what a token over it
+/// holds, so the ledger can name a list in its line before any token over it exists.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[must_use]
+pub fn list_digest(list: &[[u8; PLAN_LEN]]) -> Digest {
+    let mut list = list.to_vec();
+    list.sort_unstable();
+    list.dedup();
+    let parts: Vec<&[u8]> = list.iter().map(<[u8; PLAN_LEN]>::as_slice).collect();
+    Digest::of(LIST_DOMAIN, &parts)
+}
+
+/// Why a token was not minted.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MintRefusal {
+    /// The list is longer than the token's bound.
+    TooLong {
+        /// Its length.
+        len: usize,
+        /// The bound.
+        cap: usize,
+    },
+    /// A plan of the list does not decode, or is not of the set's side.
+    Side {
+        /// The plan.
+        plan: [u8; PLAN_LEN],
+    },
+    /// The token does not bind that kind of set.
+    WrongSet {
+        /// The set.
+        set: SetId,
+    },
+    /// No v1 session opens the set.
+    NoSuchSet {
+        /// The set.
+        set: SetId,
+    },
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl fmt::Display for MintRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MintRefusal::TooLong { len, cap } => {
+                write!(
+                    f,
+                    "token refused: a list of {len} plans, past its bound of {cap}"
+                )
+            }
+            MintRefusal::Side { plan } => write!(
+                f,
+                "token refused: plan {} does not decode or is not of its set's side",
+                Digest::of(super::plan::PLAN_DOMAIN, &[plan]).short()
+            ),
+            MintRefusal::WrongSet { set } => {
+                write!(f, "token refused: it binds no {:?} set", set.tag)
+            }
+            MintRefusal::NoSuchSet { set } => {
+                write!(
+                    f,
+                    "token refused: no v1 session opens {:?} {}",
+                    set.tag, set.index
+                )
+            }
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl std::error::Error for MintRefusal {}
+
+/// A token's binding: its set, and its plan list, sorted and deduplicated.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Debug, PartialEq, Eq)]
+struct Bound {
+    set: SetId,
+    list: Vec<[u8; PLAN_LEN]>,
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl Bound {
+    /// `list` bound to `set`, refused past `cap` plans or for a plan not of `set`'s side.
+    fn mint(set: SetId, cap: usize, list: &[[u8; PLAN_LEN]]) -> Result<Bound, MintRefusal> {
+        if list.len() > cap {
+            return Err(MintRefusal::TooLong {
+                len: list.len(),
+                cap,
+            });
+        }
+        if let Some(plan) = list.iter().find(|b| {
+            SchedulePlan::decode(b.as_slice()).map_or(true, |p| side(&p) != set.tag.side())
+        }) {
+            return Err(MintRefusal::Side { plan: *plan });
+        }
+        let mut list = list.to_vec();
+        list.sort_unstable();
+        list.dedup();
+        Ok(Bound { set, list })
+    }
+
+    /// `H_i` or `E_i` of v1, by `tag`.
+    fn real(tag: SetTag, i: u32) -> Result<SetId, MintRefusal> {
+        let set = SetId { tag, index: i };
+        if sets_v1().contains(&set) {
+            Ok(set)
+        } else {
+            Err(MintRefusal::NoSuchSet { set })
+        }
+    }
+
+    /// The digest of its list ([`list_digest`]).
+    fn digest(&self) -> Digest {
+        list_digest(&self.list)
+    }
+
+    /// Whether `plans` is its list exactly (sorted and deduplicated, as the ledger line names
+    /// it), each plan of its set's side and in one of its set's pools.
+    fn admits(&self, plans: &[SchedulePlan]) -> Result<(), LabelRefusal> {
+        let given: Vec<[u8; PLAN_LEN]> = plans.iter().map(SchedulePlan::encode).collect();
+        if given != self.list {
+            let stray = given.iter().find(|b| self.list.binary_search(b).is_err());
+            return Err(LabelRefusal::ScopeMismatch {
+                plan: stray.copied(),
+            });
+        }
+        let pools = set_pools(self.set).map_err(LabelRefusal::Pool)?;
+        let drawn: BTreeSet<[u8; PLAN_LEN]> =
+            pools.iter().flatten().map(SchedulePlan::encode).collect();
+        match plans
+            .iter()
+            .find(|p| side(p) != self.set.tag.side() || !drawn.contains(&p.encode()))
+        {
+            Some(p) => Err(LabelRefusal::ScopeMismatch {
+                plan: Some(p.encode()),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The token a model-admission look labels its plan list under, once (design §13.3).
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Debug)]
+pub struct LookToken {
+    bound: Bound,
+}
+
+/// The token the report labels its set's plans under, once.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Debug)]
+pub struct ReadToken {
+    bound: Bound,
+}
+
+/// The token a replayed look labels its recomputed plan list under, once.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Debug)]
+pub struct ReplayToken {
+    bound: Bound,
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl LookToken {
+    /// `H_i`'s look token over `list`, for a ledger holding the real sets' capability, minted after
+    /// the `look-begin` line naming the list is durable.
+    /// # Errors
+    /// [`MintRefusal::NoSuchSet`], then [`MintRefusal::TooLong`] past [`LOOK_LIST_CAP`] plans or
+    /// [`MintRefusal::Side`].
+    pub(super) fn mint_real(
+        _sets: &RealSets,
+        i: u32,
+        list: &[[u8; PLAN_LEN]],
+    ) -> Result<LookToken, MintRefusal> {
+        let set = Bound::real(SetTag::HeldOut, i)?;
+        Bound::mint(set, LOOK_LIST_CAP, list).map(|bound| LookToken { bound })
+    }
+
+    /// A practice-held-out set's look token over `list`.
+    /// # Errors
+    /// [`MintRefusal::WrongSet`] for a practice-report set, then the bound's and the side's.
+    pub(super) fn mint_practice(
+        set: PracticeSet,
+        list: &[[u8; PLAN_LEN]],
+    ) -> Result<LookToken, MintRefusal> {
+        match set {
+            PracticeSet::HeldOut(_) => {
+                Bound::mint(set.set(), LOOK_LIST_CAP, list).map(|bound| LookToken { bound })
+            }
+            PracticeSet::Report(_) => Err(MintRefusal::WrongSet { set: set.set() }),
+        }
+    }
+
+    /// The set it binds.
+    #[inline]
+    #[must_use]
+    pub const fn set(&self) -> SetId {
+        self.bound.set
+    }
+
+    /// Its plan list, sorted and deduplicated.
+    #[inline]
+    #[must_use]
+    pub fn list(&self) -> &[[u8; PLAN_LEN]] {
+        &self.bound.list
+    }
+
+    /// Its list's digest, under [`LIST_DOMAIN`].
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        self.bound.digest()
+    }
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl ReadToken {
+    /// `E_i`'s read token over `list`, for a ledger holding the real sets' capability, minted after
+    /// the `report-begin` line naming the list is durable.
+    /// # Errors
+    /// [`MintRefusal::NoSuchSet`], then [`MintRefusal::TooLong`] past [`READ_LIST_CAP`] plans or
+    /// [`MintRefusal::Side`].
+    pub(super) fn mint_real(
+        _sets: &RealSets,
+        i: u32,
+        list: &[[u8; PLAN_LEN]],
+    ) -> Result<ReadToken, MintRefusal> {
+        let set = Bound::real(SetTag::Report, i)?;
+        Bound::mint(set, READ_LIST_CAP, list).map(|bound| ReadToken { bound })
+    }
+
+    /// A practice-report set's read token over `list`.
+    /// # Errors
+    /// [`MintRefusal::WrongSet`] for a practice-held-out set, then the bound's and the side's.
+    pub(super) fn mint_practice(
+        set: PracticeSet,
+        list: &[[u8; PLAN_LEN]],
+    ) -> Result<ReadToken, MintRefusal> {
+        match set {
+            PracticeSet::Report(_) => {
+                Bound::mint(set.set(), READ_LIST_CAP, list).map(|bound| ReadToken { bound })
+            }
+            PracticeSet::HeldOut(_) => Err(MintRefusal::WrongSet { set: set.set() }),
+        }
+    }
+
+    /// The set it binds.
+    #[inline]
+    #[must_use]
+    pub const fn set(&self) -> SetId {
+        self.bound.set
+    }
+
+    /// Its plan list, sorted and deduplicated.
+    #[inline]
+    #[must_use]
+    pub fn list(&self) -> &[[u8; PLAN_LEN]] {
+        &self.bound.list
+    }
+
+    /// Its list's digest, under [`LIST_DOMAIN`].
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        self.bound.digest()
+    }
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl ReplayToken {
+    /// `H_i`'s replay token over a recorded look's recomputed `list`, for a ledger holding the real
+    /// sets' capability.
+    /// # Errors
+    /// [`MintRefusal::NoSuchSet`], then [`MintRefusal::TooLong`] past [`LOOK_LIST_CAP`] plans or
+    /// [`MintRefusal::Side`].
+    pub(super) fn mint_real(
+        _sets: &RealSets,
+        i: u32,
+        list: &[[u8; PLAN_LEN]],
+    ) -> Result<ReplayToken, MintRefusal> {
+        let set = Bound::real(SetTag::HeldOut, i)?;
+        Bound::mint(set, LOOK_LIST_CAP, list).map(|bound| ReplayToken { bound })
+    }
+
+    /// A practice-held-out set's replay token over `list`.
+    /// # Errors
+    /// [`MintRefusal::WrongSet`] for a practice-report set, then the bound's and the side's.
+    pub(super) fn mint_practice(
+        set: PracticeSet,
+        list: &[[u8; PLAN_LEN]],
+    ) -> Result<ReplayToken, MintRefusal> {
+        match set {
+            PracticeSet::HeldOut(_) => {
+                Bound::mint(set.set(), LOOK_LIST_CAP, list).map(|bound| ReplayToken { bound })
+            }
+            PracticeSet::Report(_) => Err(MintRefusal::WrongSet { set: set.set() }),
+        }
+    }
+
+    /// The set it binds.
+    #[inline]
+    #[must_use]
+    pub const fn set(&self) -> SetId {
+        self.bound.set
+    }
+
+    /// Its plan list, sorted and deduplicated.
+    #[inline]
+    #[must_use]
+    pub fn list(&self) -> &[[u8; PLAN_LEN]] {
+        &self.bound.list
+    }
+
+    /// Its list's digest, under [`LIST_DOMAIN`].
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        self.bound.digest()
+    }
+}
+
+/// What one [`Evaluator::label_spread`] call may label (design §13.3).
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Debug)]
+pub enum LabelScope {
+    /// Side-0 plans and [`GRID_V1`]'s.
+    Train,
+    /// Practice set `j`'s side-3 plans, with no token (tests).
+    Practice(u32),
+    /// A look's plan list, exactly.
+    HeldOut(LookToken),
+    /// The report's plan list, exactly.
+    Report(ReadToken),
+    /// A replayed look's plan list, exactly.
+    Replay(ReplayToken),
+}
+
+/// Why plans were not labelled.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelRefusal {
+    /// A plan its scope does not take (`None`: the list is not its token's, though each plan of it
+    /// is), before anything was judged.
+    ScopeMismatch {
+        /// The plan.
+        plan: Option<[u8; PLAN_LEN]>,
+    },
+    /// A token's set did not draw its pools.
+    Pool(PoolRefusal),
+    /// Labelling them would take the evaluator past its cap of distinct plans labelled
+    /// ([`MAX_JUDGED`]), before anything was judged.
+    Budget {
+        /// The distinct plans labelled already.
+        labelled: usize,
+        /// The new ones asked for.
+        asked: usize,
+        /// The cap.
+        cap: usize,
+    },
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl fmt::Display for LabelRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LabelRefusal::ScopeMismatch { plan: Some(plan) } => write!(
+                f,
+                "labelling refused: plan {} is outside its scope",
+                Digest::of(super::plan::PLAN_DOMAIN, &[plan]).short()
+            ),
+            LabelRefusal::ScopeMismatch { plan: None } => {
+                write!(f, "labelling refused: the list is not its token's")
+            }
+            LabelRefusal::Pool(e) => write!(f, "labelling refused: {e}"),
+            LabelRefusal::Budget {
+                labelled,
+                asked,
+                cap,
+            } => write!(
+                f,
+                "labelling refused: {asked} new plans past the {labelled} labelled would pass the cap of {cap}"
+            ),
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl std::error::Error for LabelRefusal {}
+
+/// One pool's result under the selection rule (design §13.3): class 0 a selection that beats the
+/// training baseline, 1 `NoGain` and 2 `NoneAdmitted`, with the winner and its training sums when
+/// there is one. It is no [`Selection`], so [`Evaluator::held_out`] does not take one.
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolOutcome {
+    class: u8,
+    plan: Option<SchedulePlan>,
+    totals: Totals,
+    gain: (u64, u64),
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl PoolOutcome {
+    /// 0 for a selection, 1 for `NoGain`, 2 for `NoneAdmitted`.
+    #[inline]
+    #[must_use]
+    pub const fn class(&self) -> u8 {
+        self.class
+    }
+
+    /// The training winner, unless none was admitted.
+    #[inline]
+    #[must_use]
+    pub const fn plan(&self) -> Option<SchedulePlan> {
+        self.plan
+    }
+
+    /// The winner's training `ΣT`, `ΣP`, `ΣZ` (zero when none was admitted).
+    #[inline]
+    #[must_use]
+    pub const fn totals(&self) -> Totals {
+        self.totals
+    }
+
+    /// `(class, ΣT, ΣZ)`, which admission compares, lower being better.
+    #[inline]
+    #[must_use]
+    pub const fn key(&self) -> (u8, u64, u64) {
+        (self.class, self.totals.ticks, self.totals.wasted)
+    }
+
+    /// Its `ΣT` and `ΣZ` gains: the training baseline's totals less the winner's for a
+    /// selection, 0 otherwise (design §13.4).
+    #[inline]
+    #[must_use]
+    pub const fn gain(&self) -> (u64, u64) {
+        self.gain
+    }
+}
+
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+impl Evaluator {
+    /// Labels `plans` in their order, after every plan is checked against `scope`: the train scope
+    /// takes side-0 and grid plans, a practice scope side-3 plans, and a token scope exactly its
+    /// token's list, each plan of its set's side and pools. Only then is the cache read: each
+    /// plan not labelled before is judged on every training item through `spread`, as
+    /// [`Self::select`] judges it, and kept for the evaluator's life.
+    /// # Errors
+    /// [`LabelRefusal::ScopeMismatch`], a token set's [`LabelRefusal::Pool`] or
+    /// [`LabelRefusal::Budget`], before anything is judged.
+    pub fn label_spread(
+        &self,
+        scope: LabelScope,
+        plans: &[[u8; PLAN_LEN]],
+        spread: &dyn Spread,
+    ) -> Result<Vec<TrainLabel>, LabelRefusal> {
+        let decoded = plans
+            .iter()
+            .map(|b| {
+                SchedulePlan::decode(b.as_slice())
+                    .map_err(|_| LabelRefusal::ScopeMismatch { plan: Some(*b) })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let only = |takes: &dyn Fn(&SchedulePlan) -> bool| match decoded.iter().find(|p| !takes(p))
+        {
+            Some(p) => Err(LabelRefusal::ScopeMismatch {
+                plan: Some(p.encode()),
+            }),
+            None => Ok(()),
+        };
+        match &scope {
+            LabelScope::Train => only(&|p| {
+                side(p) == Side::Train
+                    || GRID_V1
+                        .iter()
+                        .any(|&(split, wake)| p.split() == split && p.wake() == wake)
+            }),
+            LabelScope::Practice(_) => only(&|p| side(p) == Side::Practice),
+            LabelScope::HeldOut(t) => t.bound.admits(&decoded),
+            LabelScope::Report(t) => t.bound.admits(&decoded),
+            LabelScope::Replay(t) => t.bound.admits(&decoded),
+        }?;
+        let cache = || self.labels.lock().unwrap_or_else(PoisonError::into_inner);
+        let new: Vec<SchedulePlan> = {
+            let cached = cache();
+            let mut seen = BTreeSet::new();
+            decoded
+                .iter()
+                .filter(|p| !cached.contains_key(&p.digest()) && seen.insert(p.encode()))
+                .copied()
+                .collect()
+        };
+        let labelled = cache().len();
+        if labelled.saturating_add(new.len()) > self.label_cap {
+            return Err(LabelRefusal::Budget {
+                labelled,
+                asked: new.len(),
+                cap: self.label_cap,
+            });
+        }
+        let judged = spread_map(spread, &new, &|p| {
+            TrainLabel::of(*p, self.train(&p.encode()))
+        });
+        let mut cached = cache();
+        for label in judged {
+            cached.entry(label.id).or_insert(label);
+        }
+        Ok(decoded
+            .iter()
+            .filter_map(|p| cached.get(&p.digest()).cloned())
+            .collect())
+    }
+
+    /// The outcome of one pool's `K` ranked plans, folded by the selection rule.
+    #[must_use]
+    pub(super) fn pool_outcome(&self, labels: [&TrainLabel; JUDGED]) -> PoolOutcome {
+        self.outcome(&labels)
+    }
+
+    /// The outcome of a whole pool, folded by the selection rule (the report's arm O alone).
+    #[must_use]
+    pub(super) fn oracle_outcome(&self, labels: &[&TrainLabel]) -> PoolOutcome {
+        self.outcome(labels)
+    }
+
+    fn outcome(&self, labels: &[&TrainLabel]) -> PoolOutcome {
+        let mut winner = Winner::new();
+        for label in labels {
+            if let Ok(totals) = label.outcome {
+                winner.offer(totals, label.plan, label.plan);
+            }
+        }
+        match winner.end(&self.policy) {
+            None => PoolOutcome {
+                class: 2,
+                plan: None,
+                totals: Totals::default(),
+                gain: (0, 0),
+            },
+            Some((plan, train)) if train.beats() => PoolOutcome {
+                class: 0,
+                plan: Some(plan),
+                totals: train.candidate,
+                gain: (
+                    train.baseline.ticks - train.candidate.ticks,
+                    train.baseline.wasted - train.candidate.wasted,
+                ),
+            },
+            Some((plan, train)) => PoolOutcome {
+                class: 1,
+                plan: Some(plan),
+                totals: train.candidate,
+                gain: (0, 0),
+            },
+        }
     }
 }
 

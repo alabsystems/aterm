@@ -59,13 +59,14 @@ is this machine's fleet port: init's is 7100, join's the issuer's (the port its
 code names), and either keeps the port [fleet] listen already names. --host is
 the name the others dial this machine by: $HOSTNAME when set, else on a Mac the
 HostName an administrator set, else its Bonjour name (<LocalHostName>.local),
-else the OS host name. Machines reach each other on loopback, private (10/8,
-172.16/12, 192.168/16, fc00::/7) or link-local addresses only.
+else the OS host name; a member of a loopback fleet, which listens there
+alone, at the loopback address. Machines reach each other on loopback,
+private (10/8, 172.16/12, 192.168/16, fc00::/7) or link-local addresses only.
 `allow drive` is the level above content: the nodes it names, each proved by
 the node key this machine's book binds, run `aterm ctl --host <this Mac> …`
-here (spawn and await task; any session's status, text, screen, result, turn,
-key, send and hold; close of a worker that node spawned; `aterm help workers`),
-and nobody else does; no join and no remote call turns it on.
+here (spawn agent=<word> and await task; any session's status, text, screen,
+result, turn, key, send and hold; close of a worker that node spawned; `aterm
+help workers`), and nobody else does; no join and no remote call turns it on.
 `init --rotate` mints the issuer a new secret, keeping the host and port its
 code names unless --host or --port names others (every member joins again;
 the book keeps each until then). Read the fleet with `aterm ctl survey --fleet`
@@ -480,8 +481,8 @@ struct Minted {
 }
 
 fn init_private(places: &Places, opts: Opts) -> Result<String, Failure> {
-    // The node first: its claim of the book's lock refuses while another writer holds it, and
-    // nothing of the fleet is written yet.
+    // The node first: its claim of the book's lock waits out another writer, and nothing of the
+    // fleet is written yet.
     let keyed = matches!(member::read_node_identity(&places.state), Ok(Some(_)));
     let node = member::node_identity(&places.state)
         .map_err(failed)?
@@ -735,12 +736,25 @@ fn init_again_listen(
 ) -> Result<String, Failure> {
     let asked = opts.port.is_some() || opts.host.is_some() || opts.allow.is_some();
     let issuer_already = || {
-        Failure::Usage(format!(
-            "this machine is already the fleet's issuer, and changes nothing without \
-             `--rotate`: --host and --port are in its join code, so a new one takes \
-             `--rotate` (every member joins again); a level is set by `aterm fleet allow {}`",
-            opts.allow.map_or("facts|content", FleetScope::word)
-        ))
+        let level = opts.allow.map(|level| {
+            format!(
+                "a level is set by `aterm fleet allow {}`, not `init`",
+                level.word()
+            )
+        });
+        Failure::Usage(if opts.port.is_some() || opts.host.is_some() {
+            format!(
+                "this machine is already the fleet's issuer, and changes nothing without \
+                 `--rotate`: --host and --port are in its join code, so a new one takes \
+                 `--rotate` (every member joins again){}",
+                level.map_or_else(String::new, |level| format!("; {level}"))
+            )
+        } else {
+            format!(
+                "this machine is already the fleet's issuer: {}",
+                level.unwrap_or_default()
+            )
+        })
     };
     let Held::Key(key) = book.held() else {
         return Err(unread_key(places));
@@ -842,9 +856,12 @@ fn issued_code(places: &Places, path: &Path) -> Result<JoinCode, Failure> {
 fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure> {
     let code = JoinCode::parse(code_text).map_err(failed)?;
     let secret = FleetSecret::new(&code.secret).map_err(failed)?;
-    let host = match opts.host.clone() {
-        Some(host) => host,
-        None => aterm_uds::process::lan_host_name()
+    // A member of a loopback fleet listens on the loopback alone ([`listen_on`]): it is dialled
+    // there.
+    let host = match (opts.host.clone(), code.host.parse::<IpAddr>()) {
+        (Some(host), _) => host,
+        (None, Ok(ip)) if ip.is_loopback() => ip.to_string(),
+        (None, _) => aterm_uds::process::lan_host_name()
             .filter(|host| member::is_host(host))
             .ok_or_else(|| {
                 failed(
@@ -1106,10 +1123,11 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         out.push_str(GRANTS_GONE);
     }
     out.push_str(&format!(
-        "  issuer     {} at {issuer_at} recorded this machine ({} peers in its book){}\n\
+        "  issuer     {} at {issuer_at} recorded this machine as {} ({} peers in its book){}\n\
          {FOLLOWS}\nOn a Mac, the local-network consent macOS asks for at aterm's first \
          connection into the LAN covers the survey's reads too.\n",
         aterm_codec::tty::one_line(&joined.issuer.host, 80),
+        member::host_port(&registration.host, registration.port),
         joined.peers,
         if issuer_key.is_some() {
             ", and proved its node key, which this machine binds it to"
@@ -1549,8 +1567,16 @@ fn remove_peer(places: &Places, book: &HeldBook<'_>, what: &str) -> Result<Strin
     {
         out.push_str(&line);
     }
+    if removed.node.is_some() {
+        out.push_str(STILL_READS);
+    }
     Ok(out)
 }
+
+/// A removed node proved the fleet's secret, which the book does not take back.
+const STILL_READS: &str = "  reads      it keeps the fleet's secret, so it still reads this fleet's \
+                           surveys: only `aterm fleet init --rotate` on the issuer takes that \
+                           back (every member joins again)\n";
 
 /// `peers rm` of a node only this machine's copy of its issuer's book names.
 /// # Errors
@@ -1692,6 +1718,17 @@ fn manual_peer(host: String, port: u16) -> Peer {
 fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
     // The fleet the read is made under, read before the book it reads.
     let held = aterm_net::fleet::read_key_file(&places.state);
+    if let Err(e) = &held
+        && !matches!(e, aterm_net::fleet::KeyFileError::Missing)
+    {
+        // The book's entries of a fleet are read under its key: none would show.
+        return Err(failed(format!(
+            "{} cannot be used ({e}), so the book cannot be read as its fleet's and no peer was \
+             checked: once it reads (0600, one link), run this again; `aterm fleet leave` \
+             leaves the fleet",
+            places.state.join(KEY_FILE).display()
+        )));
+    }
     let Known {
         peers,
         skipped,
@@ -2152,7 +2189,8 @@ fn write_level(
         }
     };
     out.push_str(if nodes.is_empty() {
-        "  no other Mac may drive this one's sessions; the running aterm follows at once\n"
+        "  no other Mac may drive this one's sessions: the running aterm refuses each new drive \
+         from now on, and within 3 s cuts the open ones and lifts the holds they took\n"
     } else {
         "  each node named, proving the node key it holds now, may drive this Mac's sessions \
          (`aterm ctl --host <this Mac> …` there); nobody else may, and a Mac that comes back \
@@ -2453,6 +2491,7 @@ fn drive_fleet_in(
 fn drive_again(why: &Unreached) -> bool {
     match why {
         Unreached::Handshake(_, aterm_net::fleet::FleetError::AddressBusy) => true,
+        _ if why.hung_up() => true,
         Unreached::Connect(_, e) => e.kind() == io::ErrorKind::ConnectionRefused,
         _ => false,
     }
@@ -2638,7 +2677,10 @@ fn no_key(error: &aterm_net::fleet::KeyFileError) -> String {
         aterm_net::fleet::KeyFileError::Missing => "this machine is in no fleet: `aterm fleet \
              init` on one machine, `aterm fleet join` on each other"
             .to_owned(),
-        other => format!("its fleet key cannot be used: {other}"),
+        other => format!(
+            "its fleet key cannot be used ({other}): once it reads (0600, one link), run this \
+             again"
+        ),
     }
 }
 

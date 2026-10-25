@@ -332,6 +332,23 @@ fn a_session_with_another_agent_replaces_the_vm() {
     rig.ended();
 }
 
+/// A failed send or read is the helper's end when its side of the socket is gone: a closed
+/// pipe, a reset, or a socket no longer connected (`down` racing a helper that had just found
+/// no session left read ENOTCONN). Any other failure keeps its words.
+#[test]
+fn a_socket_its_helper_left_is_a_closed_session_and_other_failures_keep_their_words() {
+    for errno in [libc::EPIPE, libc::ECONNRESET, libc::ENOTCONN] {
+        let e = ProtoError::Io(std::io::Error::from_raw_os_error(errno));
+        assert_eq!(
+            read_error(e, "Stop", SPAN),
+            ClientError::Closed,
+            "errno {errno}"
+        );
+    }
+    let e = ProtoError::Io(std::io::Error::from_raw_os_error(libc::EBADF));
+    assert!(matches!(read_error(e, "Stop", SPAN), ClientError::Io(_)));
+}
+
 /// A connection the helper closed before the lab set its span (the helper's exit, with the
 /// lab's `connect` already through) is a closed session, which every verb reads as the
 /// helper's end, never the "Invalid argument" XNU answers the span with on such a socket.

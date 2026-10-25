@@ -3,6 +3,13 @@
 
 //! Default broker retention rules ([`retain`](crate::broker_rules::retain), [`crate::mirror::NODE_WINDOW_BYTES`],
 //! [`crate::subject::inbox_group`]).
+//!
+//! The mail rule ([`MAIL_FILTER`]) carries unread mail below the cut until [`MAIL_READER`] reads
+//! it, for [`MAX_AGE`] within [`MAIL_BYTES`]; read mail goes with the cut. Mail it gives up unread
+//! is logged by astream (subject and count), answers a `Fetch` below it `ERR retained-from=`, and
+//! is TOLD to the node's inbox group subscription (astream's gap notice, R4's addendum A9): the
+//! bridge says `link gap from=<a> to=<b> [records=<n>]`, and every session the node serves names
+//! it in `inbox` (`given_up=`) and marks it in its log (`mail-gap`).
 
 use std::io;
 use std::time::Duration;

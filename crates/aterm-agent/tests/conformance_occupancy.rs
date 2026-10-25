@@ -679,7 +679,7 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
         w.check(m, &m.init_state(), &init, true, strict, run);
         let mut queue = VecDeque::from([(m.init_state(), init)]);
         while let Some((st, real)) = queue.pop_front() {
-            let key: Vec<i64> = st.values().copied().collect();
+            let key = crate::common::key(m, &st);
             if !seen.insert((key.clone(), typed(&real))) {
                 continue;
             }

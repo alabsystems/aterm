@@ -213,6 +213,14 @@ pub fn wait_of(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str) -
     leaf_wait(scene, consumer, pid, name, 0)
 }
 
+/// Whether `pid` names no wait of its own but its event loop over its terminal (a REPL's loop with
+/// the terminal in its set), as a line read's reader ([`name_job`]'s builtin read).
+#[must_use]
+pub fn reads_line(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str) -> bool {
+    leaf_wait(scene, consumer, pid, name, 0)
+        .is_none_or(|w| w.name == WaitName::EventLoop && reads_terminal(scene, pid))
+}
+
 /// Whether `pid`'s sleeping event queues may hold its terminal: one lists a read of a terminal
 /// it holds, or one lists no entries (macOS without lane L6), or none sleeps on one (Linux's
 /// `select`, by its wait channel).

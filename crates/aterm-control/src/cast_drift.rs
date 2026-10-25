@@ -1006,7 +1006,7 @@ fn analyze_seeded<D: AsRef<[u8]>>(
     report
 }
 
-/// One audit on one seed (see the module note for the method).
+/// One audit on one seed.
 #[allow(
     clippy::too_many_arguments,
     reason = "the audit's inputs, each read once; a struct would only rename them"

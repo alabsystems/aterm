@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-db-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure admission and conservation kernels for aterm's replicated application database"
+
+[dev-dependencies]
+aterm-models-db.workspace = true
+aterm-spec.workspace = true
+
+[lints]
+workspace = true

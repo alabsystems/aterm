@@ -2778,6 +2778,17 @@ pub(crate) fn attach_fleet_connection(
     .is_ok()
 }
 
+/// [`crate::fabric::lift_ungranted_remote_holds`] over this instance's sessions: how many it lifted.
+#[cfg(unix)]
+pub(crate) fn lift_ungranted_remote_holds(granted: &dyn Fn(&str) -> bool) -> usize {
+    let Some(context) = BRIDGE_CONTEXT.get() else {
+        return 0;
+    };
+    crate::fabric::lift_ungranted_remote_holds(&context.store, granted, &|sid| {
+        wake_sid_watchers(&context.store, sid);
+    })
+}
+
 /// Serve one DRIVE connection the fleet listener admitted.
 #[cfg(unix)]
 pub(crate) fn attach_fleet_drive(
@@ -3868,16 +3879,9 @@ fn serve_meta(
         let left_at_rest = report
             .state
             .is_some_and(|state| matches!(state.state, W::Idle | W::Done | W::Error));
-        let busy_entries = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent()
-            .busy_entries;
         control_session::HarnessActSnapshot {
             mark: crate::session_timeline::LandingMark {
                 program_turns: report.turns,
-                busy_entries,
             },
             left_at_rest,
         }
@@ -4394,9 +4398,13 @@ fn dispatch_bridge_verb(
     let reply = match verb {
         "deliver" => crate::fabric::cmd_deliver_waking(store, rest, &log_wake),
         "link" => {
-            let reply = crate::fabric::cmd_link_after_log_switch(store, rest, generation, || {
-                crate::session_log_mirror::forget_landed(store);
-            });
+            let reply = crate::fabric::cmd_link_waking(
+                store,
+                rest,
+                generation,
+                || crate::session_log_mirror::forget_landed(store),
+                &log_wake,
+            );
             if reply == "OK\n" && rest.split_whitespace().next() == Some("mirror") {
                 note_mirror_word(store, generation);
             }

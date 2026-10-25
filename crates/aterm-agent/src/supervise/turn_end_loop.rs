@@ -1506,6 +1506,7 @@ impl<C: Ctl> Session<'_, C> {
                     since_ms: self.unix_ms_of(since),
                 }),
             said: self.turn_end.replies(),
+            said_reset_ms: self.turn_end.replies_reset().map(|t| self.unix_ms_of(t)),
         }
     }
 
@@ -1573,7 +1574,9 @@ impl<C: Ctl> Session<'_, C> {
         true
     }
 
-    /// Whether the composer holds a PERSON'S draft, judged where it is DRAWN.
+    /// Whether the composer holds a PERSON'S draft, judged where it is DRAWN: the cell of its
+    /// first glyph, or of the glyph after it where the program draws its caret over the first
+    /// ([`crate::supervise::screen::composer_glyph_cell`]).
     pub(in crate::supervise) fn composer_draft(
         &mut self,
         composer: Option<&(usize, Vec<String>)>,
@@ -1594,16 +1597,23 @@ impl<C: Ctl> Session<'_, C> {
             return Some(true);
         }
         let row = (screen.first + caret).to_string();
-        match self.call(&["cell", &row, "2"]) {
-            Ok(r) if r.ok() => crate::supervise::screen::cell_is_placeholder(&r.stdout, hint_fg)
-                .map(|placeholder| !placeholder),
-            _ => None,
-        }
+        let cell = crate::supervise::screen::composer_glyph_cell(|col| {
+            self.call(&["cell", &row, &col.to_string()])
+                .ok()
+                .filter(|r| r.ok())
+                .map(|r| r.stdout)
+        })?;
+        crate::supervise::screen::cell_is_placeholder(&cell, hint_fg)
+            .map(|placeholder| !placeholder)
     }
 
     /// What the loop reads of the composer's cells on `screen` ([`Self::composer_draft`],
     /// [`Self::menu_colours`]).
-    fn composer_read(&mut self, reading: &aterm_phase::Reading, screen: &Screen) -> ComposerRead {
+    pub(super) fn composer_read(
+        &mut self,
+        reading: &aterm_phase::Reading,
+        screen: &Screen,
+    ) -> ComposerRead {
         let typed = self.composer_draft(
             reading.composer.as_ref(),
             reading.program.reader().placeholder(),

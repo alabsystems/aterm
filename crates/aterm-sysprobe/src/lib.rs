@@ -33,6 +33,7 @@ mod nvml;
 pub mod paths;
 #[cfg(windows)]
 pub mod peb;
+pub mod power;
 /// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate reads it through (aterm-uds re-exports it as `aterm_uds::procargs`).
 pub mod procargs;
 pub mod procs;

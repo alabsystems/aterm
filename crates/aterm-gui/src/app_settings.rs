@@ -3251,6 +3251,112 @@ mod tests {
         }
     }
 
+    /// THE AUTOMATIC STEP WAITS FOR A FULL DISK ACCESS READING STILL OUT, NEVER TAKES IT
+    /// FOR OFF: the window's own reading lives `[privacy] probe_interval_ms` and the
+    /// step's quiet moment comes `QUIET_FOR` after it was asked, so the read made then
+    /// sends a new probe with no answer yet. Taken for off, it left the step to a focus
+    /// gain a minute or more later (a fresh macOS 27 VM, after Full Disk Access's Quit &
+    /// Reopen). The step waits a panel tick, with the answer of any `spctl` run it
+    /// carries, and the grant read on, brings the page up; a reading that answered off
+    /// is refused as before, and nothing waits (the negative control).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_automatic_step_waits_for_a_full_disk_access_reading_still_out() {
+        use crate::devtools_helper::{HandOver, Moment, Origin, PANEL_TICK, Refusal, test_arms};
+        use aterm_containment::consent::{FdaProbe, FdaState, ProbeGate, ProbeLabel};
+        use std::time::{Duration, Instant};
+        fn granted(_: ProbeGate) -> FdaProbe {
+            FdaProbe {
+                state: FdaState::Granted,
+                label: ProbeLabel::OpenOk,
+            }
+        }
+        fn denied(_: ProbeGate) -> FdaProbe {
+            FdaProbe {
+                state: FdaState::Denied,
+                label: ProbeLabel::OpenEperm,
+            }
+        }
+        // A step of an approved setup revision, aterm off the list, and no Full Disk
+        // Access reading yet: the first read sends the probe. Its answer outlives the
+        // test's pace, so only that first read is out.
+        let app_with = |fda: fn(ProbeGate) -> FdaProbe| {
+            let mut app = App::headless_for_test();
+            test_arms::stand_in(&mut app, test_arms::opening());
+            app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+                revision: 1,
+                allowed: true,
+            }));
+            app.set_privacy_for_test(crate::app_config::PrivacyConfig {
+                probe_interval_ms: Some(3_600_000),
+                ..Default::default()
+            });
+            app.consent.set_fda_arm_for_test(fda);
+            app
+        };
+        let answered = |app: &App| {
+            let start = Instant::now();
+            while app.consent.fda_in_flight_for_test().is_some() {
+                assert!(start.elapsed() < Duration::from_secs(60), "hang");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let mut app = app_with(granted);
+        let before = Instant::now();
+        assert_eq!(
+            app.devtools_hand_over(Origin::Automatic, Moment::Quiet),
+            HandOver::Queued,
+            "a reading still out is no answer"
+        );
+        assert_eq!(app.devtools_helper.queued(), Some(Origin::Automatic));
+        assert!(
+            app.devtools_helper.next_deadline(before, || true) >= Some(before + PANEL_TICK),
+            "it looks again a panel tick later, by when the probe has answered"
+        );
+        answered(&app);
+        let opens = test_arms::opens();
+        let (origin, listed) = app
+            .devtools_helper
+            .take_queued(Instant::now(), true)
+            .expect("held");
+        assert_eq!(
+            app.devtools_hand_over_carrying(origin, Moment::Quiet, listed),
+            HandOver::Opened,
+            "the grant read on: the page comes up"
+        );
+        assert_eq!(test_arms::opens(), opens + 1);
+
+        // An `spctl` run's answer waits with it, so the run is not made again.
+        let mut listed = app_with(granted);
+        assert_eq!(
+            listed.devtools_hand_over_after_listing(Origin::Automatic, Ok(()), Instant::now()),
+            HandOver::Queued
+        );
+        assert_eq!(
+            listed.devtools_helper.take_queued(Instant::now(), true),
+            Some((Origin::Automatic, Some(Ok(())))),
+            "held with the run's answer"
+        );
+
+        let mut off = app_with(denied);
+        assert_eq!(
+            off.devtools_hand_over(Origin::Automatic, Moment::Quiet),
+            HandOver::Queued
+        );
+        answered(&off);
+        let (origin, listed) = off
+            .devtools_helper
+            .take_queued(Instant::now(), true)
+            .expect("held");
+        assert_eq!(
+            off.devtools_hand_over_carrying(origin, Moment::Quiet, listed),
+            HandOver::Refused(Refusal::NoFullDiskAccess),
+            "a reading that answered off is refused as before"
+        );
+        assert_eq!(off.devtools_helper.queued(), None, "and nothing waits");
+    }
+
     /// A HAND-OVER THE OWNER DID NOT PRESS, JUDGED QUIET BEFORE ITS `spctl` RUN, IS
     /// JUDGED AGAIN WHEN THE RUN ENDS (the run takes as long as syspolicyd takes): the
     /// moment has passed — here no aterm window is focused — so System Settings does

@@ -36,16 +36,40 @@ pub(crate) fn alab_marker(exe: &Path) -> Option<std::io::Result<std::fs::Metadat
     Some(std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)))
 }
 
-/// The BUILD an ALab package's `exe` runs.
+/// The BUILD an ALab package's `exe` runs, as its rollouts name it (`session_meta`'s
+/// `cli_version`, the key of [`super::codex_steps::CODEX_MEASURED_BUILDS`]).
+///
+/// From codex-alab's own version line on (codex-alab `alab/README.md`, Decision 8,
+/// 2026-10-24) a package carries two versions: the manifest's `version` (and the
+/// marker's) is codex-alab's own `0.1.0` line, and the marker's `client_version` is
+/// upstream's numbering, which upstream's code writes as every rollout's `cli_version`.
+/// So the build is the marker's `client_version` where it records one, and the
+/// manifest's `version` where it records none (a package from before that line has one
+/// version, which is also its client version). `None`, so the tap stays unmeasured, for
+/// a marker that is not a small regular JSON object, whose `client_version` is not a
+/// string, or whose `version` is not the manifest's: such a package names no build.
 #[must_use]
 pub fn alab_build(exe: &Path) -> Option<String> {
     let (root, manifest) = package_root(exe)?;
-    let marker = std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)).ok()?;
+    let marker_path = root.join(ALAB_BUILD_JSON);
+    let marker = std::fs::symlink_metadata(&marker_path).ok()?;
     if !marker.file_type().is_file() {
         return None;
     }
     let v: Value = aterm_json::from_str(&manifest).ok()?;
-    v.get("version")?.as_str().map(str::to_string)
+    let version = v.get("version")?.as_str()?;
+    let record: Value = aterm_json::from_str(&package_text(&marker_path)?).ok()?;
+    let record = record.as_object()?;
+    if record
+        .get("version")
+        .is_some_and(|own| own.as_str() != Some(version))
+    {
+        return None;
+    }
+    match record.get("client_version") {
+        None => Some(version.to_string()),
+        Some(client) => client.as_str().map(str::to_string),
+    }
 }
 
 /// `exe`'s package root (its parent or grandparent) whose manifest names

@@ -882,6 +882,141 @@ fn a_codex_alab_run_names_its_lock_or_its_resumed_thread() {
     );
 }
 
+/// A run in a pooled row's overlay home ([`crate::harness::accounts_overlay::ensure`] over
+/// Codex's shared set) names the thread whose lock it holds through the overlay's linked
+/// `thread-writer-locks`: the kernel names that open file under the link's target, the default
+/// home's folder (the double reports what the lab read on macOS 27.0.1 for a `lockf -k` child
+/// that opened its lock through a linked folder), and a fresh thread there has no `resume <id>`
+/// in its argv to fall back on. A lock held in a folder of that name the overlay does not link
+/// to is no lock of its home.
+#[test]
+fn an_overlay_run_names_the_lock_it_holds_through_its_linked_folder() {
+    let mut rig = Rig::new("alab-overlay-lock", &[]);
+    rig.opts.sock = None;
+    rig.kernel.tui_alive = true;
+    let exe = rig.dir.join("store/codex/alab/bin/codex");
+    rig.kernel.exe = Some(exe.clone());
+    let overlay = rig.dir.join("accounts-codex-work");
+    crate::harness::accounts_overlay::ensure(
+        crate::ai::connector::CODEX_ACCOUNTS.seam,
+        &overlay,
+        &rig.home,
+    )
+    .expect("the overlay home");
+    let linked = overlay.join("thread-writer-locks");
+    assert!(linked.is_symlink(), "the overlay links its writer locks");
+    let target = rig.home.join("thread-writer-locks");
+    assert_eq!(canonical(&linked), target, "to the default home's");
+    let stray = rig.dir.join("elsewhere/thread-writer-locks");
+    std::fs::create_dir_all(&stray).expect("a folder of that name");
+    let args = atpkg::caller_shell::ProcArgs {
+        exec_path: exe.to_string_lossy().into_owned(),
+        argv: vec!["codex".to_string()],
+        env: vec![format!("CODEX_HOME={}", overlay.display())],
+    };
+    let read = |files: Vec<PathBuf>| {
+        let k = Crashed {
+            files,
+            ..rig.kernel.clone_world()
+        };
+        snapshot(
+            &rig.opts,
+            TAB,
+            TUI,
+            "Thu Oct 16 08:00:00 2026".to_string(),
+            SHELL,
+            &args,
+            &k,
+        )
+        .expect("a run")
+    };
+    let lock = format!("{T2}.lock");
+    let snap = read(vec![target.join(&lock), PathBuf::from("/w/notes.txt")]);
+    assert_eq!(
+        snap.session.as_deref(),
+        Some(T2),
+        "the lock as the kernel names it"
+    );
+    assert_eq!(snap.codex().expect("a Codex run").home, canonical(&overlay));
+    let named = canonical(&overlay).join("thread-writer-locks").join(&lock);
+    let as_named = read(vec![named]);
+    assert_eq!(
+        as_named.session.as_deref(),
+        Some(T2),
+        "the lock as the home names it"
+    );
+    assert_eq!(
+        read(vec![stray.join(&lock)]).session,
+        None,
+        "another folder's lock"
+    );
+}
+
+/// A pooled Codex relaunch line ([`crate::harness::relaunch::pool_line`]) that carries flags
+/// ends on its thread, after `resume` and the flags, the order codex-alab's own relaunch types,
+/// so a TUI it started would pass [`relaunched_by_us`]; the order it had,
+/// `resume <thread> <flags…>`, ends on a flag word and would not. Nothing types a pooled Codex
+/// line yet, so this pins the two orders to each other.
+#[test]
+fn a_pooled_codex_line_with_flags_starts_the_relaunch_found_as_ours() {
+    use crate::harness::accounts::Cli;
+    use crate::harness::accounts_pool::LoginEnv;
+    use crate::harness::relaunch::{PoolRelaunch, pool_line};
+    let rig = Rig::new("pool-line-found", &[]);
+    let flags: Vec<String> = [
+        "--no-daemon",
+        "-m",
+        "gpt-6-astra",
+        "-c",
+        "model_verbosity=low",
+    ]
+    .map(str::to_string)
+    .into();
+    let how = PoolRelaunch {
+        dialect: Dialect::Zsh,
+        cd: None,
+        exe: &rig.twin,
+        flags: &flags,
+        resume: Some(T2),
+        home: None,
+    };
+    let work = LoginEnv {
+        label: "work".to_string(),
+        var: "CODEX_HOME",
+        value: Some("/u/.aterm/accounts-codex/work".to_string()),
+    };
+    let line = pool_line(&how, Cli::Codex, &work).expect("a row's line");
+    let twin = rig.twin.to_string_lossy().into_owned();
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|w| w.trim_matches('\'').to_string())
+        .collect();
+    let at = words.iter().position(|w| *w == twin).expect("the program");
+    let argv = words[at..].to_vec();
+    let st = St {
+        pid: TUI,
+        shell: SHELL,
+        thread: T2.to_string(),
+        phase: Phase::Relaunched { at_s: 5 },
+        ..St::default()
+    };
+    assert!(relaunched_by_us(NEW, &argv, &st, &rig.kernel), "{line}");
+    let want: Vec<String> = std::iter::once(twin.clone())
+        .chain(std::iter::once("resume".to_string()))
+        .chain(flags.iter().cloned())
+        .chain(std::iter::once(T2.to_string()))
+        .collect();
+    assert_eq!(argv, want, "{line}");
+    let before: Vec<String> = [twin, "resume".to_string(), T2.to_string()]
+        .into_iter()
+        .chain(flags)
+        .collect();
+    assert!(
+        !relaunched_by_us(NEW, &before, &st, &rig.kernel),
+        "the thread ahead of the flags: {before:?}"
+    );
+}
+
 impl Crashed {
     fn clone_world(&self) -> Crashed {
         Crashed {

@@ -83,7 +83,8 @@ pub(crate) fn relative_luminance_table() -> &'static RelativeLuminanceTable {
 }
 
 #[inline]
-pub(crate) fn relative_luminance_rgb(
+#[must_use]
+pub(crate) const fn relative_luminance_rgb(
     table: &RelativeLuminanceTable,
     r: usize,
     g: usize,
@@ -93,7 +94,8 @@ pub(crate) fn relative_luminance_rgb(
 }
 
 #[inline]
-pub(crate) fn relative_luminance_with(table: &RelativeLuminanceTable, rgb: u32) -> f32 {
+#[must_use]
+pub(crate) const fn relative_luminance_with(table: &RelativeLuminanceTable, rgb: u32) -> f32 {
     relative_luminance_rgb(
         table,
         ((rgb >> 16) & 0xff) as usize,
@@ -252,7 +254,7 @@ pub fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
 /// A caret body built on a PINNED cursor colour.
 #[must_use]
 #[inline]
-pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
+pub const fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
     let k = if charge.is_finite() && settled < 1.0 {
         ((charge - settled) / (1.0 - settled)).clamp(0.0, 1.0)
     } else {
@@ -261,14 +263,14 @@ pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
     if k <= 0.0 || pinned == styled {
         return pinned & 0x00FF_FFFF;
     }
-    let ch = |sh: u32| {
+    const fn ch(pinned: u32, styled: u32, k: f32, sh: u32) -> u32 {
         let (a, b) = (
             ((pinned >> sh) & 0xff) as f32,
             ((styled >> sh) & 0xff) as f32,
         );
         ((a + (b - a) * k).round().clamp(0.0, 255.0) as u32) << sh
-    };
-    ch(16) | ch(8) | ch(0)
+    }
+    ch(pinned, styled, k, 16) | ch(pinned, styled, k, 8) | ch(pinned, styled, k, 0)
 }
 
 /// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the uniform space.

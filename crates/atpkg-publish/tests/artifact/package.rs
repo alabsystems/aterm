@@ -149,6 +149,10 @@ struct Lay {
     exe: Vec<u8>,
     alab_build: bool,
     upstream: Option<String>,
+    /// The client version codex-alab's own line records beside its version.
+    client_version: Option<String>,
+    /// The upstream Codex baseline codex-alab's compound line records (`"baseline"`).
+    baseline: Option<String>,
 }
 
 impl World {
@@ -167,6 +171,8 @@ impl World {
             exe: codesigned(&self.root, &["--force", "--sign", "-"]),
             alab_build: true,
             upstream: None,
+            client_version: None,
+            baseline: None,
         }
     }
 
@@ -192,11 +198,17 @@ impl World {
             put(
                 &dir.join("alab-build.json"),
                 format!(
-                    "{{\"source\": \"{}\", \"version\": \"{}\", \"target\": \"{}\", \"compiler\": \
-                     {{\"rustc\": \"rustc\", \"rustc_vV\": {}, \"sysroot\": {}, \
+                    "{{\"source\": \"{}\", \"version\": \"{}\"{}{}, \"target\": \"{}\", \
+                     \"compiler\": {{\"rustc\": \"rustc\", \"rustc_vV\": {}, \"sysroot\": {}, \
                      \"binaries_sha256\": \"{}\", \"id\": \"{id}\"}}, \"ripgrep\": \"15.2.0\"{}}}\n",
                     lay.source,
                     lay.version,
+                    lay.client_version
+                        .as_ref()
+                        .map_or_else(String::new, |c| format!(", \"client_version\": \"{c}\"")),
+                    lay.baseline
+                        .as_ref()
+                        .map_or_else(String::new, |b| format!(", \"baseline\": \"{b}\"")),
                     lay.build_target,
                     json_string(&lay.vv),
                     json_string(&lay.sysroot),
@@ -311,7 +323,26 @@ fn the_version_form_and_the_origin_are_read_exactly() {
         dev_version("0.164.0-dev.12393+g6efbf7518"),
         Some((12393, "6efbf7518"))
     );
+    // codex-alab's own line, restarted at 0.1.0 (codex-alab alab/README.md, Decision 8).
+    assert_eq!(
+        dev_version("0.1.0-dev.13600+gabcdef012"),
+        Some((13600, "abcdef012"))
+    );
+    // Its compound form, the upstream Codex baseline in the build metadata before the commit.
+    assert_eq!(
+        dev_version("0.1.0-dev.13600+codex.0.164.0.gabcdef012"),
+        Some((13600, "abcdef012"))
+    );
     for bad in [
+        "0.1.0",
+        "0.1.0+gabcdef012",
+        "0.1.0+codex.0.164.0",
+        "0.1.1-dev.13600+codex.0.164.0.gabcdef012",
+        "0.1.0-dev.13600+codex.0.164.0",
+        "0.1.0-dev.13600+codex.0.164.gabcdef012",
+        "0.1.0-dev.13600+codex.0.164.00.gabcdef012",
+        "0.1.0-dev.13600+upstream.0.164.0.gabcdef012",
+        "0.1.0-dev.13600+codex.0.164.0.gabcdef012.x",
         "0.164.0",
         "0.164.1-dev.3+g6efbf7518",
         "0.164.0-dev.+g6efbf7518",
@@ -387,6 +418,139 @@ fn a_package_packs_whole_and_signs_what_a_client_stages() {
         "no host is written without --upload: {:?}",
         w.host.calls()
     );
+}
+
+/// CODEX-ALAB'S OWN VERSION LINE (codex-alab alab/README.md, Decision 8, 2026-10-24): its
+/// package names its own version, restarted at `0.1.0` (`0.1.0-dev.<count>+g<sha9>`), and
+/// records upstream's numbering apart as `client_version` in `alab-build.json`. The pack reads
+/// the version as it reads any other: the dev form, its count and sha the source's, one version
+/// in both records; the client verifies and reads it verbatim; the extra field changes nothing.
+/// The index pins by build number, never by version, so the line's restart below the
+/// `0.164.0-dev` packs before it is no downgrade there. POSITIVE CONTROL: the same package
+/// whose records disagree, or whose version is the bare `0.1.0` a release tag names, is refused.
+#[test]
+fn codex_alab_s_own_line_packs_with_its_client_version_beside_it() {
+    let w = world("pkg-own-line");
+    let sha9 = &w.commit[..9];
+    let own = Lay {
+        version: format!("0.1.0-dev.2+g{sha9}"),
+        client_version: Some(format!("0.165.0-dev.2+g{sha9}")),
+        ..w.lay()
+    };
+    let pkg = w.package("own-line", &own);
+    let o = w.pack(&w.request(&pkg, ALAB)).expect("packs");
+    assert_eq!(o.version, format!("0.1.0-dev.2+g{sha9}"));
+    let parsed = client_verifies(&w.ctx, &o.manifest, &o.signature).expect("the client verifies");
+    assert_eq!(parsed.version, o.version);
+    // POSITIVE CONTROL: a bare version, and records that disagree, are refused.
+    for (name, version, recorded) in [
+        ("bare", "0.1.0".to_string(), None),
+        (
+            "two",
+            format!("0.1.0-dev.2+g{sha9}"),
+            Some(format!("0.165.0-dev.2+g{sha9}")),
+        ),
+    ] {
+        let lay = Lay {
+            version,
+            ..own.clone()
+        };
+        let pkg = w.package(name, &lay);
+        if let Some(recorded) = recorded {
+            let build = pkg.join("alab-build.json");
+            let text = std::fs::read_to_string(&build).expect("read alab-build.json");
+            let swapped = text.replacen(
+                &format!("\"version\": \"{}\"", lay.version),
+                &format!("\"version\": \"{recorded}\""),
+                1,
+            );
+            assert_ne!(swapped, text, "the record's version is swapped");
+            std::fs::write(&build, swapped).expect("write alab-build.json");
+        }
+        let err = w
+            .pack(&w.request(&pkg, ALAB))
+            .expect_err("refused before anything is signed");
+        assert!(format!("{err}").contains("version"), "{name}: {err}");
+    }
+}
+
+/// CODEX-ALAB'S COMPOUND VERSION (codex-alab alab/README.md, Decision 8, amended 2026-10-24):
+/// its own core with the upstream Codex baseline in SemVer build metadata,
+/// `0.1.0-dev.<count>+codex.<A.B.C>.g<sha9>`, and the baseline recorded again as
+/// `alab-build.json`'s `baseline`. The pack reads its count and sha as it reads any dev version,
+/// and the client verifies and reads the version verbatim. POSITIVE CONTROL: records that name
+/// another baseline, or none where the version names one, or one where it names none, are
+/// refused before anything is signed, as is a baseline the version cannot spell exactly.
+#[test]
+fn codex_alab_s_compound_version_packs_naming_its_upstream_baseline() {
+    let w = world("pkg-compound");
+    let sha = "e8aa7c1678caa9a368243d72bf0e9b7859d97f15";
+    let sha9 = &w.commit[..9];
+    let upstream = |release: &str| {
+        format!(r#"{{"release": "{release}", "commits_since_release": 3, "commit": "{sha}"}}"#)
+    };
+    let compound = Lay {
+        version: format!("0.1.0-dev.2+codex.0.164.0.g{sha9}"),
+        client_version: Some(format!("0.165.0-dev.2+g{sha9}")),
+        baseline: Some("0.164.0".into()),
+        upstream: Some(upstream("rust-v0.164.0")),
+        ..w.lay()
+    };
+    let pkg = w.package("compound", &compound);
+    let o = w.pack(&w.request(&pkg, ALAB)).expect("packs");
+    assert_eq!(o.version, format!("0.1.0-dev.2+codex.0.164.0.g{sha9}"));
+    let parsed = client_verifies(&w.ctx, &o.manifest, &o.signature).expect("the client verifies");
+    assert_eq!(parsed.version, o.version);
+    // POSITIVE CONTROL: one package, one baseline, spelled exactly.
+    for (name, lay, said) in [
+        (
+            "no-baseline-field",
+            Lay {
+                baseline: None,
+                ..compound.clone()
+            },
+            "records no `baseline`",
+        ),
+        (
+            "other-baseline-field",
+            Lay {
+                baseline: Some("0.163.0".into()),
+                ..compound.clone()
+            },
+            "records 0.163.0",
+        ),
+        (
+            "other-upstream-release",
+            Lay {
+                upstream: Some(upstream("rust-v0.163.0")),
+                ..compound.clone()
+            },
+            "upstream release is rust-v0.163.0",
+        ),
+        (
+            "baseline-field-without-compound",
+            Lay {
+                version: format!("0.1.0-dev.2+g{sha9}"),
+                ..compound.clone()
+            },
+            "names none",
+        ),
+        (
+            "malformed-baseline",
+            Lay {
+                version: format!("0.1.0-dev.2+codex.0.164.g{sha9}"),
+                baseline: Some("0.164".into()),
+                ..compound.clone()
+            },
+            "is not MAJOR.MINOR.0-dev",
+        ),
+    ] {
+        let pkg = w.package(name, &lay);
+        let err = w
+            .pack(&w.request(&pkg, ALAB))
+            .expect_err("refused before anything is signed");
+        assert!(format!("{err}").contains(said), "{name}: {err}");
+    }
 }
 
 #[test]

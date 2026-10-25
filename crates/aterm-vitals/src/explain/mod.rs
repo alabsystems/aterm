@@ -450,8 +450,20 @@ pub struct CoalSplit {
     /// ([`Self::own_mc`] and [`Self::tabs`]), never below 0: work in no
     /// process alive at both ends of the window, so in no tab's figure.
     /// Taken from the parts' nanoseconds and rounded once, so the parts'
-    /// own rounding never reads as a millicore of it.
+    /// own rounding never reads as a millicore of it; 0 where aterm's
+    /// coalitions held only live figures' work ([`Self::skew_mc`]).
     pub unattributed_mc: i64,
+    /// What aterm's coalitions' counters ran past their live members' own
+    /// times over a window in which none of them made or reaped a member
+    /// (the kernel's task counters at both ends) and the sweep found every
+    /// live member (as many as the counters hold) in a live figure: no
+    /// process came or went, so none of it is finished work, only the skew
+    /// between a coalition's counter and its members' times, which the
+    /// headless run read at 2.70–3.78 ms, each giving back what the counter
+    /// fell behind in the windows before (RD §3.5, §7.3). Rounded once from
+    /// ns, as [`Self::unattributed_mc`] (which reads 0 then); 0 in any
+    /// other window, and by subtraction.
+    pub skew_mc: i64,
     /// Every listed coalition that answered, busiest first (none by subtraction), rounded as a set
     /// so they add up to the parts' total (`global_mc - unaccounted_mc`); a part's rows may still
     /// differ from the part, rounded once, by a millicore or two.
@@ -558,10 +570,18 @@ pub enum Fault {
     /// `unexplained` reads only the three parts, so the split's unaccounted residual goes uncovered
     /// however large.
     IgnoreUnaccounted,
+    /// Unattributed work up to a fixed [`Fault::TOLERANCE_MC`] is taken
+    /// for the counters' skew whatever was read: the fudge the task
+    /// counters' rule ([`CoalSplit::skew_mc`]) replaces, which calls a small
+    /// exit none (`tests/conformance_explain.rs`).
+    FixedTolerance,
 }
 
 #[cfg(any(test, debug_assertions))]
 impl Fault {
+    /// [`Fault::FixedTolerance`]'s fudge, millicores.
+    pub const TOLERANCE_MC: i64 = 5;
+
     /// `facts` with this defect in their split by coalition (`snap` the
     /// snapshot they are of); facts by subtraction as they are.
     fn inject(self, mut facts: WhyFacts, snap: &Snapshot) -> WhyFacts {
@@ -594,6 +614,11 @@ impl Fault {
                 let reaped = split.unattributed_mc.min(split.aterm_mc);
                 split.aterm_mc -= reaped;
                 split.services_mc += reaped;
+            }
+            Self::FixedTolerance => {
+                if split.unattributed_mc <= Self::TOLERANCE_MC {
+                    split.unattributed_mc = 0;
+                }
             }
             Self::MatchBySigningIdOnly | Self::NoHold | Self::IgnoreUnaccounted => {}
         }

@@ -950,6 +950,20 @@ impl EffectsPipeline {
             ink,
         );
         self.flying_sky_row = (seat.lift_rows > 0 && !seat.over_ink).then_some(cell.0);
+        // A lifted seat's top is the footprint's own, which stops at the grid top as the drawn head does.
+        let seat_y = if seat.lift_rows == 0 {
+            seat.y
+        } else {
+            self.decos
+                .kitty_cursor_footprint(crate::word_decorations::KittyCursorLayout {
+                    geom,
+                    cursor: cell,
+                    look: cat_frame.render_look(),
+                    bob: cat_frame.bob,
+                    lift: f32::from(seat.lift_rows),
+                })
+                .map_or(seat.y.max(0), |lifted| lifted.y)
+        };
         let dx = seat.x.saturating_sub(rest.x);
         if dx != 0 && geom.cell_w > 0 {
             let facing_left = self.companions.cursor_cat.placement_frame(now).facing_left;
@@ -961,8 +975,8 @@ impl EffectsPipeline {
             px: Some((
                 seat.x,
                 seat.x + i32::from(seat.w),
-                seat.y,
-                seat.y + i32::from(seat.h),
+                seat_y,
+                seat_y + i32::from(seat.h),
             )),
         }
     }

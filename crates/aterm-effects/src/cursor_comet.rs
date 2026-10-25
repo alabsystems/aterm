@@ -88,8 +88,19 @@ pub struct CometFrame {
     pub fp: u64,
 }
 
+impl CometFrame {
+    /// Dormant frame output (`fill: None, fp: 0`).
+    pub const DORMANT: Self = Self { fill: None, fp: 0 };
+}
+
+impl Default for CometFrame {
+    #[inline]
+    fn default() -> Self {
+        Self::DORMANT
+    }
+}
+
 /// Per-window nucleus state: shimmer phase, last clock reading, latched blaze.
-#[derive(Default)]
 pub struct CursorComet {
     /// Rolling shimmer phase in turns `0..1`.
     shimmer: f32,
@@ -102,14 +113,34 @@ pub struct CursorComet {
     light_fill_memo: Option<((u32, u32, u32), u32)>,
 }
 
+impl Default for CursorComet {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorComet {
+    /// Fresh dormant comet-cursor animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            shimmer: 0.0,
+            last: None,
+            blaze: 0.0,
+            light_ink_memo: None,
+            light_fill_memo: None,
+        }
+    }
+
     /// Reset animation state while preserving the light-theme memos.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         *self = Self {
             light_ink_memo: self.light_ink_memo,
             light_fill_memo: self.light_fill_memo,
-            ..Self::default()
+            ..Self::new()
         };
     }
 
@@ -139,7 +170,7 @@ impl CursorComet {
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0;
             self.last = Some(now);
-            return CometFrame { fill: None, fp: 0 };
+            return CometFrame::DORMANT;
         }
         self.blaze = e;
 
@@ -336,9 +367,9 @@ impl CursorComet {
             for i in 0..discs.len() {
                 let (_, _, cov, color) = discs[i];
                 sum += cov;
-                for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
-                    acc[k] += ((color >> sh) & 0xff) as f32 * cov;
-                }
+                acc[0] += ((color >> 16) & 0xff) as f32 * cov;
+                acc[1] += ((color >> 8) & 0xff) as f32 * cov;
+                acc[2] += (color & 0xff) as f32 * cov;
                 if sum <= 0.0 {
                     continue;
                 }

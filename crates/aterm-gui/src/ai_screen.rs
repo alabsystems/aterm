@@ -948,7 +948,7 @@ impl App {
                 return;
             }
         };
-        let Some(line) = std::env::current_exe().ok().and_then(|exe| {
+        let Some(line) = crate::ledger_key::own_front_door().and_then(|exe| {
             #[cfg(windows)]
             {
                 let (shell, _) = aterm_pty::select_shell_with_origin(

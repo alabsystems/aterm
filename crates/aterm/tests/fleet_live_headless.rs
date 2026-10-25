@@ -900,6 +900,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
             cmd.env("SHELL", "/bin/zsh")
                 .env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_DEBUG_PERSON_INVOKE", "1")
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", NEVER_MS)
                 .env(
                     "PATH",
                     format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
@@ -1089,4 +1090,98 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "a hold the person took is no longer the issuer's"
     );
     ctl_ok(&member, &[&at, "send", "y"]);
+
+    let (took, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "on"]);
+    assert_eq!(took.trim(), "OK hold=1", "{took}");
+    let cfg = member.tmp.join("cfg/aterm/aterm.toml");
+    unloadable(&cfg, true);
+    fleet_ok(&member.tmp, &["allow", "content"], None);
+    let refused = drive_refused(&issuer.tmp, &target, &[&at, "status"]);
+    assert!(
+        refused.contains("is not one this Mac lets drive it"),
+        "a grant taken back refuses the next drive before the listener moves: {refused}"
+    );
+    unloadable(&cfg, false);
+    hold_ends(&member, &worker);
+    ctl_ok(&member, &[&at, "send", "z"]);
+}
+
+const NEVER_MS: &str = "600000";
+
+const UNLOADABLE: &str = "font_px = \"not a number\"\n";
+
+fn unloadable(cfg: &Path, unload: bool) {
+    let text = std::fs::read_to_string(cfg).expect("the config");
+    let text = if unload {
+        format!("{UNLOADABLE}{text}")
+    } else {
+        text.replacen(UNLOADABLE, "", 1)
+    };
+    std::fs::write(cfg, text).expect("write the config");
+}
+
+fn hold_ends(inst: &Instance, sid: &str) {
+    let mut last = String::new();
+    let ended = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        last = status(inst, sid);
+        (field(&last, "hold_by") == Some("-")).then_some(())
+    });
+    assert!(ended.is_some(), "the remote hold never ended: {last}");
+}
+
+#[test]
+fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let port_word = port.to_string();
+    let issuer = headless_boot::boot_with(
+        "afri",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &["init", "--host", "127.0.0.1", "--port", &port_word],
+                None,
+            );
+            cmd.env("ATERM_STATE_HOME", tmp.join("state")).args([
+                "--lines",
+                "24",
+                "--columns",
+                "80",
+            ]);
+        },
+        |_| true,
+    );
+    let (_, issuer_sid) = boot_session(&issuer);
+    fleet_reads(&issuer, &issuer_sid, "listening");
+    let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
+    let issuer_node =
+        std::fs::read_to_string(issuer.tmp.join("state/fleet-node")).expect("its node id");
+    let issuer_node = issuer_node.trim().to_owned();
+    let (holder, member_port) = hold_a_port();
+    drop(holder);
+    let member_port_word = member_port.to_string();
+    let member = headless_boot::boot_with(
+        "afrm",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &["join", "--host", "127.0.0.1", "--port", &member_port_word],
+                Some(&code),
+            );
+            fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
+            cmd.env("ATERM_STATE_HOME", tmp.join("state"))
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let (_, worker) = boot_session(&member);
+    fleet_reads(&member, &worker, "listening");
+    let target = format!("127.0.0.1:{member_port}");
+    let (took, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "on"]);
+    assert_eq!(took.trim(), "OK hold=1", "{took}");
+    unloadable(&member.tmp.join("cfg/aterm/aterm.toml"), true);
+    fleet_ok(&member.tmp, &["allow", "content"], None);
+    hold_ends(&member, &worker);
+    drive_refused(&issuer.tmp, &target, &[&format!("@{worker}"), "status"]);
 }

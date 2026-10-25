@@ -132,31 +132,48 @@ pub struct StreakConfig {
     pub sound: bool,
 }
 
+impl StreakConfig {
+    /// Default inert configuration (`enabled: false`, `tail: 9`, `max_streaks: 3`).
+    pub const DEFAULT: Self = Self {
+        enabled: false,
+        intensity: 1.0,
+        tail: 9,
+        max_streaks: 3,
+        idle_secs: 10.0,
+        dark_theme: true,
+        theme_bg: 0x0000_0000,
+        theme_fg: 0x00FF_FFFF,
+        theme_cursor: 0x00FF_FFFF,
+        sound: false,
+    };
+}
+
 impl Default for StreakConfig {
     #[inline]
     fn default() -> Self {
-        Self {
-            enabled: false,
-            intensity: 1.0,
-            tail: 9,
-            max_streaks: 3,
-            idle_secs: 10.0,
-            dark_theme: true,
-            theme_bg: 0x0000_0000,
-            theme_fg: 0x00FF_FFFF,
-            theme_cursor: 0x00FF_FFFF,
-            sound: false,
-        }
+        Self::DEFAULT
     }
 }
 
 /// What a tick produced.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct StreakFrame {
     /// Fingerprint of everything emitted this frame.
     pub fp: u64,
     /// The one cue to play, if this frame crossed a sounding edge.
     pub cue: Option<StreakCue>,
+}
+
+impl StreakFrame {
+    /// Dormant frame output with fingerprint `0` and no sound cue.
+    pub const DORMANT: Self = Self { fp: 0, cue: None };
+}
+
+impl Default for StreakFrame {
+    #[inline]
+    fn default() -> Self {
+        Self::DORMANT
+    }
 }
 
 /// One resident comet.
@@ -235,7 +252,6 @@ impl ObservedGlyph {
 }
 
 /// The prism wake state machine, one per pane.
-#[derive(Default)]
 pub struct OutputStreak {
     /// The output metric: its own [`TypingMomentum`], fed only by licensed output.
     momentum: TypingMomentum,
@@ -269,14 +285,34 @@ pub struct OutputStreak {
     drawing: bool,
 }
 
+impl Default for OutputStreak {
+    #[inline]
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 impl OutputStreak {
     /// A fresh engine with variation `seed`.
     #[inline]
     #[must_use]
-    pub fn new(seed: u64) -> Self {
+    pub const fn new(seed: u64) -> Self {
         Self {
+            momentum: TypingMomentum::new(),
+            last_token: None,
+            observed_rows: Vec::new(),
+            observed_viewport: None,
+            last_key: None,
+            pending: None,
+            last_output: None,
+            last_spawn: None,
+            last_sound: None,
+            in_episode: false,
+            comets: [None; MAX_COMETS],
+            ribbon: None,
+            last_tick: None,
             seed,
-            ..Self::default()
+            drawing: false,
         }
     }
 
@@ -292,14 +328,16 @@ impl OutputStreak {
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, idle_secs: f32) -> Option<Instant> {
         if !self.drawing {
-            return [
+            let deadline = match (
                 self.pending_idle_deadline(idle_secs),
                 self.pending_settle_deadline(),
-            ]
-            .into_iter()
-            .flatten()
-            .min()
-            .map(|deadline| deadline.max(now));
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            return deadline.map(|d| d.max(now));
         }
         Some(now)
     }
@@ -333,9 +371,8 @@ impl OutputStreak {
             row.clear();
         }
         *self = Self {
-            seed,
             observed_rows,
-            ..Self::default()
+            ..Self::new(seed)
         };
     }
 
@@ -849,14 +886,22 @@ impl OutputStreak {
 /// Clip one licensed span to the visible columns without relocating a wholly off-screen or
 /// malformed span onto the viewport edge.
 #[inline]
-fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
-    if pending.right < pending.left || usize::from(pending.left) >= cols {
+const fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
+    if pending.right < pending.left || (pending.left as usize) >= cols {
         return None;
     }
-    let last_col = i32::try_from(cols.checked_sub(1)?).unwrap_or(i32::MAX);
+    let Some(last_col_usize) = cols.checked_sub(1) else {
+        return None;
+    };
+    let last_col = if last_col_usize > i32::MAX as usize {
+        i32::MAX
+    } else {
+        last_col_usize as i32
+    };
+    let right = pending.right as i32;
     Some((
-        i32::from(pending.left),
-        i32::from(pending.right).min(last_col),
+        pending.left as i32,
+        if right < last_col { right } else { last_col },
     ))
 }
 

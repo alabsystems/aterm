@@ -593,8 +593,10 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
     if let Some(ms) = s.number("human_ms").filter(|&ms| ms < NEWLY_DONE_MS) {
         line.push_str(&format!(" human={}", age(ms)));
     }
+    // A name in words at content (a tab's name, `<host> (node <8 hex>) over the fleet`), shown as
+    // the title is.
     if let (Some(by), Some(ms)) = (
-        checked(s.get("typed_by")),
+        s.get("typed_by"),
         s.number("typed_ms").filter(|&ms| ms < NEWLY_DONE_MS),
     ) {
         line.push_str(&format!(" typed by {} {} ago", shown(by, 24), age(ms)));

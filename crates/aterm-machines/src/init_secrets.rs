@@ -205,6 +205,39 @@ impl LiveSecrets {
     fn paths(&self) -> Paths {
         Paths::for_home(&self.home)
     }
+
+    fn with_join_options(
+        &self,
+        sys: &dyn System,
+        (source, replaces): (&str, &Replaces),
+        password: Option<&SecretBytes>,
+        interactive: bool,
+        requested: &dyn Fn(),
+        join: impl FnOnce(&aterm_secrets::client::JoinOptions<'_>) -> aterm_secrets::Result<JoinOutcome>,
+    ) -> aterm_secrets::Result<JoinOutcome> {
+        let confirm = |fingerprint: &str| confirm_signer(sys, fingerprint);
+        let say = |line: &str| self.say(line);
+        let password = || password.cloned();
+        // Retrying this membership's password does not rename its machine. A
+        // different vault, or a fresh join, still asks under the default name.
+        let host = match replaces {
+            Replaces::Any => None,
+            Replaces::Read(configured) => selected_vault(source, &self.home, configured.as_ref())
+                .map_err(aterm_secrets::Error::new)?
+                .map(|configured| configured.host.clone()),
+        };
+        let options = aterm_secrets::client::JoinOptions {
+            source: source.to_owned(),
+            host,
+            interactive,
+            wait: Duration::ZERO,
+            confirm: &confirm,
+            password: &password,
+            requested,
+            say: &say,
+        };
+        join(&options)
+    }
 }
 
 fn wait_for_approval(
@@ -216,6 +249,19 @@ fn wait_for_approval(
 ) -> Option<JoinOutcome> {
     if wait.is_zero() {
         return None;
+    }
+    let joined = || match aterm_secrets::client::status(paths) {
+        Ok(Status {
+            membership: Membership::In { seq, .. },
+            names,
+            ..
+        }) => Some(JoinOutcome::Joined { seq, names }),
+        _ => None,
+    };
+    // The subscriber the join started can finish it before this wait begins: a sync
+    // then long-polls for a version newer than the one this Mac already holds.
+    if let Some(joined) = joined() {
+        return Some(joined);
     }
     say(if subscribed {
         "waiting for the approval (Ctrl-C stops waiting; this Mac joins by itself once approved)"
@@ -240,13 +286,8 @@ fn wait_for_approval(
         if let Err(error) = aterm_secrets::client::sync(paths, long_poll.then_some(left)) {
             say(&format!("still waiting ({error})"));
         }
-        if let Ok(Status {
-            membership: Membership::In { seq, .. },
-            names,
-            ..
-        }) = aterm_secrets::client::status(paths)
-        {
-            return Some(JoinOutcome::Joined { seq, names });
+        if let Some(joined) = joined() {
+            return Some(joined);
         }
         let pause = Duration::from_secs(5).saturating_sub(started.elapsed());
         std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
@@ -325,28 +366,23 @@ impl SecretsOps for LiveSecrets {
         requested: &dyn Fn() -> bool,
     ) -> aterm_secrets::Result<JoinOutcome> {
         let paths = self.paths();
-        let confirm = |fingerprint: &str| confirm_signer(sys, fingerprint);
         let say = |line: &str| self.say(line);
         let mistyped = password.and_then(|_| retype(source));
-        let password = || password.cloned();
         let subscribed = Cell::new(false);
         let queued = || subscribed.set(requested());
-        let options = aterm_secrets::client::JoinOptions {
-            source: source.to_owned(),
-            host: None,
+        let outcome = self.with_join_options(
+            sys,
+            (source, replaces),
+            password,
             interactive,
-            wait: Duration::ZERO,
-            confirm: &confirm,
-            password: &password,
-            requested: &queued,
-            say: &say,
-        };
-        let outcome = match replaces {
-            Replaces::Any => aterm_secrets::client::join(&paths, &options),
-            Replaces::Read(expected) => {
-                aterm_secrets::client::join_if_unchanged(&paths, &options, expected.as_ref())
-            }
-        }?;
+            &queued,
+            |options| match replaces {
+                Replaces::Any => aterm_secrets::client::join(&paths, options),
+                Replaces::Read(expected) => {
+                    aterm_secrets::client::join_if_unchanged(&paths, options, expected.as_ref())
+                }
+            },
+        )?;
         match outcome {
             JoinOutcome::Pending { code, host } => {
                 Ok(
@@ -526,14 +562,6 @@ pub enum Replaces {
     /// Only the one the caller read (`None`: no vault configured) when it chose this try on
     /// that read.
     Read(Option<Config>),
-}
-
-fn same_vault(a: Option<&Config>, b: Option<&Config>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => (&a.source, &a.name) == (&b.source, &b.name),
-        _ => false,
-    }
 }
 
 fn configured_text(config: Option<&Config>) -> String {
@@ -855,7 +883,7 @@ impl Vault {
             return None;
         }
         match self.ops.configured() {
-            Ok(now) if same_vault(now.as_ref(), planned.over.as_ref()) => None,
+            Ok(now) if now.as_ref() == planned.over.as_ref() => None,
             Ok(now) => Some(StoodAside::Lock(format!(
                 "this Mac's vault changed while the vault was asked (now {}), so nothing was changed; the next try reads it",
                 configured_text(now.as_ref())
@@ -1198,10 +1226,10 @@ impl Item for Vault {
             match self.step(&status) {
                 Err(why) => return Probe::Blocked { why },
                 Ok(Step::Join(from)) => {
-                    // Configured for another vault since the caller chose this try on its
-                    // read: that one is the next try's to read, not this one's to replace.
+                    // A later configuration, including a new machine name or signer at
+                    // this address, is the next try's to read, not this one's to replace.
                     if let Replaces::Read(read) = &self.replaces
-                        && !same_vault(read.as_ref(), status.config.as_ref())
+                        && read.as_ref() != status.config.as_ref()
                     {
                         return Probe::Unusable {
                             why: format!(
@@ -1297,8 +1325,7 @@ impl Item for Vault {
                 let planned = self.planned();
                 match self.step(&status)? {
                     Step::Join(_)
-                        if planned.join
-                            && same_vault(planned.over.as_ref(), status.config.as_ref()) =>
+                        if planned.join && planned.over.as_ref() == status.config.as_ref() =>
                     {
                         self.join(sys, false)
                     }
@@ -3472,6 +3499,301 @@ mod tests {
             *ops.replacement_reads.lock().unwrap(),
             [Replaces::Read(None)]
         );
+    }
+
+    fn caller_read_vault() -> (String, Status) {
+        let source = "https://vault.example/v1/team";
+        let mut status = configured(Membership::Pending);
+        let config = status.config.as_mut().unwrap();
+        config.source = Source::Url(source.into());
+        config.name = "team".into();
+        let pinned = format!(
+            "{source}#{}",
+            aterm_secrets::b64::encode_padded(&config.signer.unwrap())
+        );
+        (pinned, status)
+    }
+
+    fn assert_caller_read_vault_is_not_rebound(change: impl FnOnce(&mut Config)) {
+        let (source, read) = caller_read_vault();
+        let mut newer = read.clone();
+        change(newer.config.as_mut().unwrap());
+        let ops = Scripted::new(vec![Ok(newer)]);
+        ops.subscribed(Ok(installed_state()));
+        *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
+            code: CODE.into(),
+            host: "newer-name".into(),
+        }));
+        let mut held = Some(password());
+        let row = setup_pass_over(&ops, &source, Replaces::Read(read.config), &mut held, false);
+        assert!(
+            ops.log().is_empty(),
+            "a newer configuration must not authorize the older join: {:?}",
+            ops.log()
+        );
+        assert_eq!(row.outcome, Outcome::Unknown, "{row:?}");
+        assert!(ops.replacement_reads.lock().unwrap().is_empty());
+        assert_eq!(*ops.reached.lock().unwrap(), 0);
+        assert_eq!(ops.installs(), 0);
+        assert_eq!(*ops.syncs.lock().unwrap(), 0);
+        assert!(held.is_some(), "the refused join keeps its password");
+    }
+
+    #[test]
+    fn a_new_host_does_not_replace_the_caller_read_vault_snapshot() {
+        assert_caller_read_vault_is_not_rebound(|config| config.host = "newer-name".into());
+    }
+
+    #[test]
+    fn a_new_signer_does_not_replace_the_caller_read_vault_snapshot() {
+        assert_caller_read_vault_is_not_rebound(|config| config.signer = Some([8; 32]));
+    }
+
+    #[test]
+    fn a_caller_read_vault_snapshot_change_is_refused_at_later_join_boundaries() {
+        let changes: [fn(&mut Config); 2] = [
+            |config| config.host = "newer-name".into(),
+            |config| config.signer = Some([8; 32]),
+        ];
+        for change in changes {
+            let (source, read) = caller_read_vault();
+            let mut newer = read.clone();
+            change(newer.config.as_mut().unwrap());
+            let ops = Scripted::new(vec![Ok(read.clone())]);
+            ops.subscribed(Ok(installed_state()));
+            *ops.meanwhile.lock().unwrap() = Some((newer.clone(), installed_state()));
+            let mut held = Some(password());
+            let row = setup_pass_over(
+                &ops,
+                &source,
+                Replaces::Read(read.config.clone()),
+                &mut held,
+                false,
+            );
+            assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+            assert!(matches!(row.stood_aside, Some(StoodAside::Lock(_))));
+            assert_eq!(*ops.reached.lock().unwrap(), 1);
+            assert!(ops.log().is_empty());
+            assert!(ops.replacement_reads.lock().unwrap().is_empty());
+            assert!(held.is_some());
+
+            let context = ctx(&[user("alice", 501)]);
+            let ops = Scripted::new(vec![Ok(read), Ok(newer)]);
+            let vault =
+                selected(&context, ops.clone(), &source, SETUP_WAIT, Replaces::Any).unwrap();
+            vault.hold_password(Some(password()));
+            assert!(matches!(
+                vault.probe(&fake(), &context),
+                Probe::Change { .. }
+            ));
+            assert!(vault.apply(&fake(), &context).is_err());
+            assert!(ops.log().is_empty());
+            assert!(ops.replacement_reads.lock().unwrap().is_empty());
+            assert!(vault.unspent_password().is_some());
+        }
+    }
+
+    #[test]
+    fn the_caller_read_vault_snapshot_can_still_join_with_its_verified_pin() {
+        let (source, read) = caller_read_vault();
+        for rotated in [false, true] {
+            let mut current = read.clone();
+            if rotated {
+                let config = current.config.as_mut().unwrap();
+                config.followed = vec![config.signer.unwrap()];
+                config.signer = Some([8; 32]);
+            }
+            let expected = current.config.clone();
+            let ops = Scripted::new(vec![Ok(current)]);
+            ops.subscribed(Ok(installed_state()));
+            *ops.outcome.lock().unwrap() = Some(Ok(JoinOutcome::Pending {
+                code: CODE.into(),
+                host: "m22".into(),
+            }));
+            let mut held = Some(password());
+            let row = setup_pass_over(
+                &ops,
+                &source,
+                Replaces::Read(expected.clone()),
+                &mut held,
+                false,
+            );
+            assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+            assert!(matches!(row.stood_aside, Some(StoodAside::Waiting(_))));
+            journaled_first(&ops.log());
+            assert_eq!(ops.joins(), [(source.clone(), false)]);
+            assert_eq!(
+                *ops.replacement_reads.lock().unwrap(),
+                vec![Replaces::Read(expected); 2]
+            );
+            assert!(held.is_none(), "the admitted request consumed its password");
+        }
+
+        let mut rotated = read.clone();
+        let config = rotated.config.as_mut().unwrap();
+        config.followed = vec![config.signer.unwrap()];
+        config.signer = Some([8; 32]);
+        let ops = Scripted::new(vec![Ok(rotated)]);
+        ops.subscribed(Ok(installed_state()));
+        let row = setup_pass_over(&ops, &source, Replaces::Read(read.config), &mut None, false);
+        assert_eq!(row.outcome, Outcome::Person, "{row:?}");
+        assert!(ops.log().is_empty());
+        assert_eq!(*ops.reached.lock().unwrap(), 0);
+    }
+
+    fn signed_file_vault(root: &Path, name: &str) -> String {
+        let source = root.join(format!("{name}.vault")).display().to_string();
+        let admin = Paths::for_home(&root.join(format!("{name}-admin")));
+        let created = aterm_secrets::client::create(&admin, &source, None, Some("admin")).unwrap();
+        format!("{source}#{}", created.signer)
+    }
+
+    fn pending_file_join(paths: &Paths, source: &str, host: &str) {
+        let outcome = aterm_secrets::client::join(
+            paths,
+            &aterm_secrets::client::JoinOptions {
+                source: source.into(),
+                host: Some(host.into()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: &|| None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, JoinOutcome::Pending { .. }));
+    }
+
+    fn live_file_join(live: &LiveSecrets, source: &str, replaces: &Replaces) -> JoinOutcome {
+        let paths = live.paths();
+        let held = password();
+        live.with_join_options(
+            &fake(),
+            (source, replaces),
+            Some(&held),
+            false,
+            &|| {},
+            |options| {
+                // Supply the platform default at the client boundary, so the real
+                // signed-file join never asks scutil or reads this Mac's name.
+                let options = aterm_secrets::client::JoinOptions {
+                    source: options.source.clone(),
+                    host: Some(
+                        options
+                            .host
+                            .clone()
+                            .unwrap_or_else(|| "inert-default".into()),
+                    ),
+                    interactive: options.interactive,
+                    wait: options.wait,
+                    confirm: options.confirm,
+                    password: options.password,
+                    requested: options.requested,
+                    say: options.say,
+                };
+                match replaces {
+                    Replaces::Any => aterm_secrets::client::join(&paths, &options),
+                    Replaces::Read(expected) => aterm_secrets::client::join_if_unchanged(
+                        &paths,
+                        &options,
+                        expected.as_ref(),
+                    ),
+                }
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_join_approved_before_the_wait_begins_ends_it_at_once() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = signed_file_vault(root.path(), "team");
+        let admin = Paths::for_home(&root.path().join("team-admin"));
+        let reader = Paths::for_home(&root.path().join("reader"));
+        pending_file_join(&reader, &source, "reader");
+        let (recipient, _) = aterm_secrets::client::status(&reader)
+            .unwrap()
+            .machine
+            .unwrap();
+        let opened = aterm_secrets::client::admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.add_machine("reader", &recipient.to_bech32()).unwrap();
+        aterm_secrets::client::admin_publish(&admin, &opened, &doc).unwrap();
+        // The subscriber the join started applies the approval first.
+        aterm_secrets::client::sync(&reader, None).unwrap();
+        let said = Mutex::new(Vec::new());
+        let outcome = wait_for_approval(&reader, Duration::from_secs(60), true, None, &|line| {
+            said.lock().unwrap().push(line.to_owned());
+        });
+        assert!(
+            matches!(outcome, Some(JoinOutcome::Joined { .. })),
+            "{outcome:?}"
+        );
+        assert!(said.lock().unwrap().is_empty(), "{said:?}");
+    }
+
+    #[test]
+    fn live_join_keeps_the_name_of_the_pending_selected_vault() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = signed_file_vault(root.path(), "team");
+        let live = LiveSecrets::unattended(&root.path().join("reader"));
+        pending_file_join(&live.paths(), &source, "custom-name");
+        let expected = aterm_secrets::client::config(&live.paths())
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected.host, "custom-name");
+        assert!(matches!(
+            aterm_secrets::client::status(&live.paths())
+                .unwrap()
+                .membership,
+            Membership::Pending
+        ));
+        let outcome = live_file_join(&live, &source, &Replaces::Read(Some(expected.clone())));
+        let saved = aterm_secrets::client::config(&live.paths())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved, expected,
+            "a password retry keeps the configured name"
+        );
+        assert!(matches!(
+            outcome,
+            JoinOutcome::Pending { host, .. } if host == "custom-name"
+        ));
+    }
+
+    #[test]
+    fn live_join_uses_the_default_name_for_a_fresh_or_different_vault() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = signed_file_vault(root.path(), "team");
+        let other = signed_file_vault(root.path(), "other");
+        let live = LiveSecrets::unattended(&root.path().join("reader"));
+        let outcome = live_file_join(&live, &source, &Replaces::Read(None));
+        assert!(matches!(
+            outcome,
+            JoinOutcome::Pending { host, .. } if host == "inert-default"
+        ));
+        assert_eq!(
+            aterm_secrets::client::config(&live.paths())
+                .unwrap()
+                .unwrap()
+                .host,
+            "inert-default"
+        );
+        pending_file_join(&live.paths(), &source, "custom-name");
+        let before = aterm_secrets::client::config(&live.paths()).unwrap();
+        let outcome = live_file_join(&live, &other, &Replaces::Read(before));
+        assert!(matches!(
+            outcome,
+            JoinOutcome::Pending { host, .. } if host == "inert-default"
+        ));
+        let after = aterm_secrets::client::config(&live.paths())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.host, "inert-default");
+        assert_eq!(after.name, "other");
     }
 
     #[test]

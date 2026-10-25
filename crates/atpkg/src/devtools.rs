@@ -1057,6 +1057,17 @@ pub const PRIME_VERB: &str = "__devtools-prime";
 #[cfg(target_os = "macos")]
 const PRIME_CEILING: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// [`PRIME_VERB`]'s command: the front door of the `.app` at `bundle`, `Contents/MacOS/aterm`.
+/// Not this process's own path: a window started under its alias (`Contents/MacOS/aterm-gui`)
+/// would start the verb under that name too, and the router hands a window alias's arguments to a
+/// window, which refuses `pkg`.
+#[cfg(any(target_os = "macos", test))]
+fn prime_command(bundle: &std::path::Path) -> aterm_uds::spawnfd::Command {
+    let mut command = aterm_uds::spawnfd::command(bundle.join("Contents/MacOS/aterm"));
+    command.args(["pkg", PRIME_VERB]);
+    command
+}
+
 /// Make macOS assess aterm again once the owner switched it on: [`run_prime`] in aterm's own
 /// executable, started as its own responsible process.
 ///
@@ -1068,13 +1079,10 @@ pub fn refresh_verdict() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let exe = consent::fence_exe().ok_or("aterm's own executable is unknown")?;
-        if consent::app_bundle_root(&exe).is_none() {
-            return Err("not a bundled aterm, which is what macOS asks about".to_string());
-        }
+        let bundle = consent::app_bundle_root(&exe)
+            .ok_or("not a bundled aterm, which is what macOS asks about")?;
         let out = aterm_uds::deadline::output_until(
-            aterm_uds::spawnfd::command(&exe)
-                .args(["pkg", PRIME_VERB])
-                .disclaim_responsibility(true),
+            prime_command(&bundle).disclaim_responsibility(true),
             std::time::Instant::now() + PRIME_CEILING + REACH_CEILING * 2,
         )
         .map_err(|e| format!("aterm pkg {PRIME_VERB}: {e}"))?;
@@ -1160,6 +1168,21 @@ fn prime() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prime_runs_the_bundles_front_door_whatever_name_this_aterm_ran_under() {
+        let bundle = std::path::Path::new(if cfg!(windows) {
+            r"C:\Applications\aterm.app"
+        } else {
+            "/Applications/aterm.app"
+        });
+        let command = prime_command(bundle);
+        let program = std::path::Path::new(command.get_program());
+        assert_eq!(program, bundle.join("Contents/MacOS/aterm"));
+        assert_eq!(program.file_name(), Some(std::ffi::OsStr::new("aterm")));
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(args, ["pkg", PRIME_VERB]);
+    }
 
     const ATERM: &str = "com.aterm.aterm";
 

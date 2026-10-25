@@ -11,9 +11,10 @@
 //! mockup names it ("Spotlight", not `mdworker_shared`). Outside aterm only the Mac's top
 //! programs are listed; inside it every process is, so all tabs' and each tab's counts are their
 //! rows: busy's all tabs counts 21, one more than the mockup's 20, whose tiles leave Tab 2's
-//! shell out. A program's age and the program groups are not on main yet; they join as they
-//! land. The mockups draw no past pressure level, so Memory's kept pressure holds the scene's
-//! level now over its whole run and its last two minutes.
+//! shell out. Only the programs whose chips give an age have their births read (busy's rustc,
+//! up 47 min; calm's front-tab claude, up 3 h); every other birth is unread, so no other chip
+//! gives one. The mockups draw no past pressure level, so Memory's kept pressure holds the
+//! scene's level now over its whole run and its last two minutes.
 
 use std::sync::Arc;
 
@@ -24,9 +25,9 @@ use crate::jobs::{
 use crate::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, DiskLevel, GpuSample,
     GpuView, LinkKind, LinkRates, LinkSample, LinkView, MemRates, MemSample, MemView, NetView,
-    NoFigure, PlanFact, PlanRun, Pressure, ProcLimits, ProcScope, ProcState, ProcView, Resource,
-    ResourceView, RowFacts, RowScope, ScopeFig, ScopeView, Series, Snapshot, Split, State, TabView,
-    TopProc, VolumeSample, Writer,
+    NoFigure, PlanFact, PlanRun, Pressure, ProcLimits, ProcScope, ProcState, ProcView,
+    ProgramGroup, Resource, ResourceView, RowFacts, RowScope, ScopeFig, ScopeView, Series,
+    Snapshot, Split, State, TabView, TopProc, VolumeSample, Writer,
 };
 use crate::peaks::{PlanDay, PlanWeek};
 use crate::ring::{BUCKET_MS, Cell, RING_BUCKETS};
@@ -182,6 +183,9 @@ pub struct Program {
     pub cores: &'static [f32],
     /// Its memory, GiB, split evenly over its processes.
     pub gib: f64,
+    /// How long it has run, minutes, where its birth is read (every process born then); `None`
+    /// leaves every birth unread.
+    pub up_min: Option<i64>,
 }
 
 const fn prog(name: &'static str, owner: Owner, cores: &'static [f32], gib: f64) -> Program {
@@ -190,6 +194,22 @@ const fn prog(name: &'static str, owner: Owner, cores: &'static [f32], gib: f64)
         owner,
         cores,
         gib,
+        up_min: None,
+    }
+}
+
+impl Program {
+    /// It, its processes born `min` minutes before [`AT`].
+    const fn up(self, min: i64) -> Self {
+        Self {
+            up_min: Some(min),
+            ..self
+        }
+    }
+
+    /// Its processes' birth, unix ms, where read.
+    fn birth_ms(&self) -> Option<i64> {
+        self.up_min.map(|m| AT - m * 60_000)
     }
 }
 
@@ -227,7 +247,8 @@ const BUSY_PROGRAMS: &[Program] = &[
         Owner::Pane(3),
         &[0.98, 1.0, 0.96, 1.0, 0.93, 0.99, 1.0, 0.62, 0.41],
         15.6,
-    ),
+    )
+    .up(47),
     prog("node", Owner::Pane(5), &[0.0, 0.01], 1.1),
     prog("cargo", Owner::Pane(3), &[0.0], 0.08),
     prog("zsh", Owner::Pane(3), &[0.0], 0.01),
@@ -257,7 +278,7 @@ const CALM_PROGRAMS: &[Program] = &[
     prog("tail", Owner::Pane(4), &[0.0, 0.0], 0.02),
     prog("ssh", Owner::Pane(4), &[0.0], 0.02),
     prog("caffeinate", Owner::Pane(4), &[0.0], 0.01),
-    prog("claude", Owner::Pane(2), &[0.18], 1.4),
+    prog("claude", Owner::Pane(2), &[0.18], 1.4).up(3 * 60),
     prog("node", Owner::Pane(2), &[0.01, 0.0, 0.02], 0.3),
     prog("zsh", Owner::Pane(2), &[0.0], 0.02),
     prog("caffeinate", Owner::Pane(2), &[0.0], 0.01),
@@ -748,10 +769,51 @@ fn procs(n: &Numbers) -> Vec<ProcView> {
                 scope,
                 refused: false,
                 gpu: None,
-                birth_ms: None,
+                birth_ms: p.birth_ms(),
             });
         }
     }
+    out
+}
+
+/// The scene's programs as the model groups a sweep's processes ([`Snapshot::programs`]): one
+/// group per name and scope, a split tab's panes as one tab, busiest first.
+fn program_groups(scene: DeckScene) -> Vec<ProgramGroup> {
+    let mut out: Vec<ProgramGroup> = Vec::new();
+    for p in programs(scene) {
+        let scope = p.owner.scope(scene);
+        let n = u32::try_from(p.cores.len()).unwrap_or(u32::MAX);
+        let bytes = (p.gib * GIB / p.cores.len() as f64) as u64 * u64::from(n);
+        let born = p.birth_ms();
+        let unborn = born.map_or(n, |_| 0);
+        match out
+            .iter_mut()
+            .find(|g| g.name == p.name && g.scope == scope)
+        {
+            Some(g) => {
+                g.n += n;
+                g.cores += cores_of(p) as f32;
+                g.footprint = Some(g.footprint.unwrap_or(0) + bytes);
+                g.born_ms = g.born_ms.into_iter().chain(born).min();
+                g.unborn += unborn;
+            }
+            None => out.push(ProgramGroup {
+                name: p.name.into(),
+                scope,
+                n,
+                cores: cores_of(p) as f32,
+                footprint: Some(bytes),
+                born_ms: born,
+                unborn,
+            }),
+        }
+    }
+    out.sort_by(|a, b| {
+        b.cores
+            .total_cmp(&a.cores)
+            .then(b.footprint.cmp(&a.footprint))
+            .then(a.name.cmp(&b.name))
+    });
     out
 }
 
@@ -1123,10 +1185,17 @@ fn built(n: &Numbers) -> Snapshot {
         .collect();
 
     let net_row = Resource::Network.index();
+    // The last 20 s swung up to the spread's high: the largest single reading of the newest two
+    // buckets, which Network's gauge draws as its jagged top (`glance::network::swing`).
+    let mut rx_ring = ring(&n.net.run, LINK_BPS, &[]).to_vec();
+    let high = f64::from(n.net.spread.1) * LINK_BPS;
+    for c in rx_ring.iter_mut().rev().take(2) {
+        c.max = c.max.map(|m| m.max(high));
+    }
     resources[net_row] = view(
         rx,
         LINK_BPS,
-        ring(&n.net.run, LINK_BPS, &[]),
+        rx_ring.into(),
         false,
         CapBasis::Link,
         Some(Series {
@@ -1257,6 +1326,7 @@ fn built(n: &Numbers) -> Snapshot {
             let wait = (busy && k == 3).then_some(5.2_f32);
             TabView {
                 key: k,
+                tab: tab.key(),
                 label: format!("Tab {}", i + 1),
                 program: tab.title.into(),
                 shell_pid: root,
@@ -1316,8 +1386,8 @@ fn built(n: &Numbers) -> Snapshot {
             cores: cores_of(p) as f32,
             n: p.cores.len(),
             scope: Some(p.owner.scope(scene)),
-            born_ms: None,
-            unborn: p.cores.len(),
+            born_ms: p.birth_ms(),
+            unborn: p.birth_ms().map_or(p.cores.len(), |_| 0),
         });
     let aterm_cpu = aterm_now(cpu_row) as f32;
     let others: f32 = procs
@@ -1396,6 +1466,7 @@ fn built(n: &Numbers) -> Snapshot {
             unread: 0,
         }),
         procs,
+        programs: program_groups(scene),
         load: Some(n.load),
         avail: Some(((128.0 - used - compressed) * GIB) as u64),
         self_pid: SELF_PID,
@@ -1629,6 +1700,21 @@ mod tests {
             busy.resources[Resource::Processes.index()].state,
             Some(State::Stuck)
         );
+        for (s, name, tab, up) in [
+            (&busy, "rustc", 3, "up 47 min"),
+            (&calm, "claude", 2, "up 3 h"),
+        ] {
+            let n: u32 = s.programs.iter().map(|g| g.n).sum();
+            assert_eq!(n as usize, s.procs.len(), "every process in one group");
+            let g = s
+                .programs
+                .iter()
+                .find(|g| g.name == name && g.scope == ProcScope::Tab(tab))
+                .expect("its group");
+            assert_eq!(crate::words::program_age(g, AT).as_deref(), Some(up));
+            let b = s.facts.busiest.as_ref().expect("a busiest");
+            assert_eq!((b.name.as_str(), b.age_ms(AT)), (name, g.age_ms(AT)));
+        }
         let plan = busy.facts.plan_week.as_ref().expect("a week");
         assert_eq!(plan.week.days.len(), 8, "the reset day keeps two rows");
         let top = &busy.facts.hour_writers[0];

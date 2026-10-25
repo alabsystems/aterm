@@ -18,14 +18,31 @@ struct Sample {
     moved_at: Instant,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct StrokeDetector {
     last: Option<Sample>,
     travel: f32,
     cooldown_until: Option<Instant>,
 }
 
+impl Default for StrokeDetector {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StrokeDetector {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            last: None,
+            travel: 0.0,
+            cooldown_until: None,
+        }
+    }
+
     /// `point` is the absolute pointer position in grid cells, not one relative to the pet:
     /// only its displacement earns travel, so a body moving or resizing under a still pointer
     /// earns nothing.

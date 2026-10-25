@@ -9,8 +9,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::codex_tap::RolloutTap;
-use aterm_agent::harness::footer::FOLD_BUDGET;
+use aterm_agent::harness::codex_facts::CodexFactsTail;
+use aterm_agent::harness::codex_tap::{RolloutTap, rollout_path};
+use aterm_agent::harness::footer::{FOLD_BUDGET, GitHeadRead, read_git_head};
 
 use crate::claude_footer::LogWake;
 use crate::self_claim::RolloutTarget;
@@ -64,6 +65,10 @@ pub(crate) struct Image {
     pub(crate) born_ms: fn(u32) -> Option<u64>,
     /// Running ALab package version for `pid`.
     pub(crate) build: fn(u32) -> Option<String>,
+    /// Process group of `pid`.
+    pub(crate) group: fn(u32) -> Option<i32>,
+    /// The worker task `pid` was spawned on ([`crate::survey::task_prompt_of_env`]).
+    pub(crate) task: fn(u32) -> Option<String>,
 }
 
 impl Image {
@@ -72,6 +77,8 @@ impl Image {
         start: aterm_agent::harness::restart_stamp::kernel_start,
         born_ms,
         build: running_build,
+        group: live_group,
+        task: spawned_task,
     };
 }
 
@@ -208,6 +215,12 @@ struct Held {
     run: TapRun,
     tap: RolloutTap,
     said: Option<&'static str>,
+    /// The survey's reader of the same rollout, once its file is found ([`publish_facts`]).
+    facts: Option<CodexFactsTail>,
+    /// The claimant's worker task, read once.
+    task: Option<String>,
+    /// What [`publish_facts`] last published from it.
+    shown: Option<crate::survey::CodexSurvey>,
 }
 
 /// The taps by session.
@@ -235,11 +248,23 @@ fn run(rx: &Receiver<Command>) {
 fn stop_tap(taps: &mut Taps, session: u64, timeline: Option<&Arc<Mutex<SessionTimeline>>>) {
     taps.remove(&session);
     if let Some(timeline) = timeline {
-        timeline
+        let mut timeline = timeline.lock().unwrap_or_else(PoisonError::into_inner);
+        timeline.clear_codex_survey();
+        timeline.slog_mut().rollout_stopped();
+    }
+}
+
+/// `session`'s tap goes, and the facts it published with it: a tap made again publishes afresh.
+fn drop_held(taps: &mut Taps, session: u64, ctx: Option<&crate::SessionCtx>) {
+    if taps
+        .remove(&session)
+        .is_some_and(|held| held.shown.is_some())
+        && let Some(ctx) = ctx
+    {
+        ctx.timeline
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .slog_mut()
-            .rollout_stopped();
+            .clear_codex_survey();
     }
 }
 
@@ -247,6 +272,16 @@ fn stop_tap(taps: &mut Taps, session: u64, timeline: Option<&Arc<Mutex<SessionTi
 fn born_ms(pid: u32) -> Option<u64> {
     let birth = aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)?;
     birth.seconds.checked_mul(1000)
+}
+
+/// The process group `pid` runs in.
+fn live_group(pid: u32) -> Option<i32> {
+    crate::consent_observer::live_pgid_of(i32::try_from(pid).ok()?)
+}
+
+/// The worker task file process `pid`'s environment names.
+fn spawned_task(pid: u32) -> Option<String> {
+    crate::survey::task_prompt_of_env(&atpkg::caller_shell::process_args(pid)?.env)
 }
 
 /// The build process `pid`'s image runs, when it is an ALab build's.
@@ -299,14 +334,14 @@ fn read_on(
             .then_some((ctx, arm))
     };
     let Some((ctx, arm)) = read() else {
-        taps.remove(&job.session);
+        drop_held(taps, job.session, job.ctx.upgrade().as_deref());
         return (None, "stale");
     };
     if taps
         .get(&job.session)
         .is_some_and(|held| held.target != job.target || held.run != job.run)
     {
-        taps.remove(&job.session);
+        drop_held(taps, job.session, Some(&ctx));
     }
     let held = match taps.entry(job.session) {
         Entry::Occupied(e) => e.into_mut(),
@@ -319,6 +354,9 @@ fn read_on(
                 run: job.run,
                 tap,
                 said: None,
+                facts: None,
+                task: (job.image.task)(job.target.pid),
+                shown: None,
             })
         }
     };
@@ -341,19 +379,71 @@ fn read_on(
         (false, None) => "unbound",
     };
     let batch = held.tap.take();
+    let survey = read_facts(held, &job.target);
     after_read();
     if (job.image.start)(job.target.pid).as_deref() != Some(job.target.start.as_str())
         || (job.image.build)(job.target.pid) != running
     {
-        taps.remove(&job.session);
+        drop_held(taps, job.session, Some(&ctx));
         return (None, "stale");
     }
     let applied = apply_rollout_batch(&ctx, &job.target, job.run, &batch, held.tap.is_bound());
     if applied.disarm {
-        taps.remove(&job.session);
+        drop_held(taps, job.session, Some(&ctx));
         return (Some(applied), "stale");
     }
+    if let Some(survey) = survey {
+        publish_facts(&ctx, job, held, survey);
+    }
     (Some(applied), word)
+}
+
+/// The survey's facts from `held`'s rollout, whatever build wrote it (the tap's steps are
+/// measured builds' only, these facts any codex's), when they differ from those last shown.
+fn read_facts(held: &mut Held, target: &RolloutTarget) -> Option<crate::survey::CodexSurvey> {
+    if held.facts.is_none() {
+        held.facts = Some(CodexFactsTail::new(rollout_path(
+            &target.home,
+            &target.thread,
+        )?));
+    }
+    let tail = held.facts.as_mut()?;
+    let _ = tail.read();
+    let facts = tail.facts();
+    let branch = match facts.cwd.as_deref().map(read_git_head) {
+        Some(GitHeadRead::Found(branch, _)) => Some(branch),
+        _ => None,
+    };
+    let survey = crate::survey::CodexSurvey {
+        facts,
+        branch,
+        task: held.task.clone(),
+    };
+    (held.shown.as_ref() != Some(&survey)).then_some(survey)
+}
+
+/// Publishes `survey` for the claimant's group while its claim stands; kept as shown only once
+/// the timeline took it, so a group not in front is offered it again at the next read.
+fn publish_facts(
+    ctx: &crate::SessionCtx,
+    job: &Job,
+    held: &mut Held,
+    survey: crate::survey::CodexSurvey,
+) {
+    let Some(group) = (job.image.group)(job.target.pid) else {
+        return;
+    };
+    let Some(_claim) = crate::self_claim::hold_rollout(ctx, &job.target) else {
+        return;
+    };
+    let took = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_codex_survey(group, survey.clone());
+    if took {
+        held.shown = Some(survey);
+    }
 }
 
 /// Synchronous rollout tap harness for tests.
@@ -400,6 +490,11 @@ impl Host {
             return "stale";
         };
         read_on(&mut self.0, &job, || {}).1
+    }
+
+    /// Stops `session`'s tap as the sweep's [`Ask::Stop`] does.
+    pub(crate) fn stop(&mut self, session: u64, ctx: &crate::SessionCtx) {
+        stop_tap(&mut self.0, session, Some(&ctx.timeline));
     }
 }
 

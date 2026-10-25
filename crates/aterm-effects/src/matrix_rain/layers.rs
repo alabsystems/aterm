@@ -16,7 +16,7 @@ use aterm_render::sprites::withdraw;
 /// One rain cell: glyph `glyph`'s baked tile ([`RainBaker::tile`]) drawn
 /// `w × h` at `(x, y)` (grid-interior pixels) in grid row `row`, tinted and
 /// faded under the Linear law.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RainCell {
     /// The grid row the cell lies in (its layer).
     pub row: u16,
@@ -38,6 +38,28 @@ pub struct RainCell {
     pub flip_x: bool,
 }
 
+impl RainCell {
+    /// Zeroed transparent rain cell.
+    pub const EMPTY: Self = Self {
+        row: 0,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        glyph: 0,
+        tint: 0,
+        alpha: 0,
+        flip_x: false,
+    };
+}
+
+impl Default for RainCell {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// One published row: its cells, the tile-set version they were drawn
 /// against, and the content they built.
 #[derive(Debug)]
@@ -52,7 +74,7 @@ struct Row {
 /// under every other Linear [`FxSlot::Under`] layer (the companions stand on
 /// the rain). A row whose cells and tile set did not change keeps its
 /// content's `Arc`, so its layer is unchanged.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RainLayers {
     /// The ids this publisher put into the frame last.
     ids: Vec<u64>,
@@ -64,10 +86,29 @@ pub struct RainLayers {
     fresh: Vec<FxLayer>,
 }
 
+impl Default for RainLayers {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The salt of the rain's layer ids.
 const RAIN_SALT: u64 = 0x7261_696E_2D72_6F77;
 
 impl RainLayers {
+    /// Construct an empty row-layer publisher.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ids: Vec::new(),
+            held: Vec::new(),
+            next: Vec::new(),
+            by_row: Vec::new(),
+            fresh: Vec::new(),
+        }
+    }
     /// The rain's declared CPU-GPU parity: the Linear law's bar (a glyph's
     /// white coverage under its cell's tint and fade blends in linear light).
     pub const PARITY: u8 = FxBlend::Linear.parity();

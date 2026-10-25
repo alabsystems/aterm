@@ -358,7 +358,7 @@ impl WarmupState {
         self.start_gated(folders, hold_cap, None, poke)
     }
 
-    /// [`Self::start`], the worker waiting at `gate` (when one is given) before each folder:
+    /// `Self::start`, the worker waiting at `gate` (when one is given) before each folder:
     /// the launch pass parks while the person is away from System State.
     pub(crate) fn start_gated<P>(
         &mut self,

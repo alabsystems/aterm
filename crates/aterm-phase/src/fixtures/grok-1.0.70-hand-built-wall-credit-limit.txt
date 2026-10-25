@@ -1,0 +1,18 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-24: the upsell's words are the binary's strings (its title `You’ve hit the credit limit for your plan.` with its typographic apostrophe, `Purchase credits to keep using Grok Build`, and the `Pay as you go`, `Upgrade tier` and `Try Again` options, each over its line, `Resubmit the last prompt once you have usage again` the last); the rows around them, the options' marks and each line under its label are assembled, not captured — no signed-in account has drawn a Grok Build wall yet, so where its upsell sits and how it lays out its options are unmeasured
+  ~/proj
+
+  › summarize the failing test
+
+  The failing test is `wall::reads_a_grok_limit`; it expects one wall row.
+
+  You’ve hit the credit limit for your plan.
+  Purchase credits to keep using Grok Build
+
+  › Pay as you go
+      Enable pay-as-you-go credits for on-demand usage
+    Upgrade tier
+      Upgrade to a higher tier for more credits
+    Try Again
+      Resubmit the last prompt once you have usage again
+
+                                                 ctrl+q  quit

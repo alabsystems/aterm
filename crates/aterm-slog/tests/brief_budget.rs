@@ -725,6 +725,10 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
             Kind::Row => f
                 .tok(Key::RowKind, "job-change")
                 .and_then(|f| f.text(Key::RowText, "exited job=j41 class=exited rev=1")),
+            Kind::MailGap => f
+                .u(Key::Off, 7)
+                .and_then(|f| f.u(Key::Floor, 42))
+                .and_then(|f| f.u(Key::Lost, 3)),
             _ => Ok(f),
         }
         .expect("fields")
@@ -758,6 +762,7 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
         Kind::MailFetch,
         Kind::Shown,
         Kind::Row,
+        Kind::MailGap,
     ];
     for i in 0..12u64 {
         for k in kinds {

@@ -48,7 +48,6 @@ struct WakeLightKey {
 }
 
 /// The classic wake's animation state.
-#[derive(Default)]
 pub struct ClassicWake {
     sparks: Vec<Spark>,
     path_scratch: Vec<(i32, i32)>,
@@ -78,6 +77,13 @@ pub struct ClassicWake {
     /// Test-only: lay the light-ground landing veil unbounded by the caret's cell and row.
     #[cfg(test)]
     pub(crate) veil_unbound: bool,
+}
+
+impl Default for ClassicWake {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Over-text state for the mono face's dark bed.
@@ -111,6 +117,39 @@ impl ClassicWake {
     const CHAIN_GAP_MAX: f32 = 0.40;
     const CHAIN_MARGIN: f32 = 0.10;
     const CHAIN_LIFE_MAX: f32 = 0.50;
+
+    /// Fresh dormant classic-wake animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            sparks: Vec::new(),
+            path_scratch: Vec::new(),
+            ring: None,
+            last: None,
+            last_move: None,
+            crown_until: None,
+            crown_window_ms: 0,
+            hue: 0.0,
+            heat: 0.0,
+            heat_at: None,
+            last_type: None,
+            comet_runs: Vec::new(),
+            comet_live: 0,
+            light_verts: Vec::new(),
+            spawned: None,
+            bed_scratch: BedScratch::EMPTY,
+            air_runs: Vec::new(),
+            crown_ink_memo: std::cell::Cell::new(None),
+            veil_cap_memo: std::cell::Cell::new(None),
+            #[cfg(test)]
+            mono_unbedded: false,
+            #[cfg(test)]
+            light_unsolved: false,
+            #[cfg(test)]
+            veil_unbound: false,
+        }
+    }
 
     #[inline]
     const fn typing_boost(&self) -> f32 {

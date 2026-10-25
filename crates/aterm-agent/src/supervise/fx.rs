@@ -284,6 +284,13 @@ impl Fx {
         })
     }
 
+    /// Whether the machine is in a full wake (`Some(true)`) or macOS's dark wake
+    /// (`Some(false)`), as its power manager says now; `None` where nothing says
+    /// ([`aterm_sysprobe::power::wake`]).
+    pub(crate) fn full_wake(&self) -> Option<bool> {
+        self.exchange(doors::PROBE_FULL_WAKE, Vec::new, || self.clock.full_wake())
+    }
+
     /// Sleep `d`: `thread::sleep` in the shipped loop.
     pub(crate) fn sleep(&self, d: Duration) {
         self.exchange(
@@ -675,6 +682,17 @@ impl ClockSource {
             Self::Virtual(v) => v.sleeps().1,
         }
     }
+
+    /// [`Fx::full_wake`]'s live reading.
+    fn full_wake(&self) -> Option<bool> {
+        match self {
+            Self::Os => os_full_wake(),
+            #[cfg(test)]
+            Self::Scripted(c) => c.script().full_wake,
+            #[cfg(test)]
+            Self::Virtual(_) => None,
+        }
+    }
 }
 
 /// Reads the machine's sleep count and boot session from the kernel.
@@ -701,6 +719,18 @@ fn os_last_sleep() -> Option<(i64, i64)> {
 /// A test build's system clocks keep no record of a sleep ([`os_asleep`]).
 #[cfg(test)]
 fn os_last_sleep() -> Option<(i64, i64)> {
+    None
+}
+
+/// The wake the machine is in, as its power manager says it.
+#[cfg(not(test))]
+fn os_full_wake() -> Option<bool> {
+    aterm_sysprobe::power::wake().map(|w| w == aterm_sysprobe::power::Wake::Full)
+}
+
+/// A test build's system clocks say no wake ([`os_asleep`]).
+#[cfg(test)]
+fn os_full_wake() -> Option<bool> {
     None
 }
 
@@ -760,6 +790,8 @@ struct Script {
     last_sleep: Option<(i64, i64)>,
     /// Rows are stamped by the fixed clock, not the system's ([`ScriptedClock::stamp_by_script`]).
     stamps_fixed: bool,
+    /// The wake the power manager says ([`ScriptedClock::set_full_wake`]).
+    full_wake: Option<bool>,
 }
 
 /// The boot a counting test clock counts on unless the test names another.
@@ -858,6 +890,11 @@ impl ScriptedClock {
     /// The machine's record of its last sleep, or none.
     pub(crate) fn set_last_sleep(&self, last: Option<(i64, i64)>) {
         self.script().last_sleep = last;
+    }
+
+    /// The wake the power manager says from now: full, dark, or none.
+    pub(crate) fn set_full_wake(&self, full: Option<bool>) {
+        self.script().full_wake = full;
     }
 
     /// The machine's sleep count now, including any staged sleep already observed.

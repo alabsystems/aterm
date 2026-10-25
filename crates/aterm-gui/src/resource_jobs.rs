@@ -21,9 +21,11 @@ struct State {
 
 static RUNNER: OnceLock<std::path::PathBuf> = OnceLock::new();
 
-/// Registers the current executable as the resource runner.
+/// Registers this process's front door ([`crate::ledger_key::own_front_door`]) as the resource
+/// runner: a client runs `<runner> resource-run …`, a front-door verb, which a window alias's
+/// own path would hand to a window instead.
 pub(crate) fn register_runner() {
-    if let Ok(path) = std::env::current_exe() {
+    if let Some(path) = crate::ledger_key::own_front_door() {
         let _ = RUNNER.set(path);
     }
 }

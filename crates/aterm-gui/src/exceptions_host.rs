@@ -775,11 +775,16 @@ impl App {
                     let pool = said.iter().find(|pool| pool.cli == cli);
                     let due = pool.map_or(&[][..], |pool| pool.due.as_slice());
                     let wrong = pool.map_or(&[][..], |pool| pool.wrong.as_slice());
+                    let sign_in = pool.map_or(&[][..], |pool| pool.sign_in.as_slice());
                     for (cause, entry) in [
                         ("due", message_reporters::accounts_due_entry_for(cli, due)),
                         (
                             "wrong-account",
                             message_reporters::accounts_wrong_entry_for(cli, wrong),
+                        ),
+                        (
+                            "sign-in",
+                            message_reporters::accounts_sign_in_entry_for(cli, sign_in),
                         ),
                     ] {
                         match entry {

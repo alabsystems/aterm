@@ -66,8 +66,11 @@ pub struct Warning {
 pub fn in_use(rows: &[String]) -> Option<Credits> {
     let mut found: Option<Credits> = None;
     for segment in segments(rows) {
-        for id in ["credits.started", "credits.allocation_started"] {
-            if let Some(rest) = segment.strip_prefix(crate::anchors::anchor(id)) {
+        for head in [
+            crate::anchor!("credits.started"),
+            crate::anchor!("credits.allocation_started"),
+        ] {
+            if let Some(rest) = segment.strip_prefix(head) {
                 return Some(Credits {
                     started: Some(started(rest)),
                     model: None,
@@ -97,10 +100,13 @@ pub fn in_use(rows: &[String]) -> Option<Credits> {
                 continue;
             }
         }
-        if let Some(model) = ["credits.model_drawing", "credits.model_instead"]
-            .iter()
-            .find_map(|id| segment.strip_suffix(crate::anchors::anchor(id)))
-            .and_then(model_name)
+        if let Some(model) = [
+            crate::anchor!("credits.model_drawing"),
+            crate::anchor!("credits.model_instead"),
+        ]
+        .iter()
+        .find_map(|tail| segment.strip_suffix(tail))
+        .and_then(model_name)
         {
             found = Some(Credits {
                 started: None,
@@ -109,12 +115,12 @@ pub fn in_use(rows: &[String]) -> Option<Credits> {
             continue;
         }
         let lasting = [
-            "credits.in_use",
-            "credits.allocation",
-            "credits.extra_covering",
+            crate::anchor!("credits.in_use"),
+            crate::anchor!("credits.allocation"),
+            crate::anchor!("credits.extra_covering"),
         ]
         .iter()
-        .any(|id| segment.starts_with(crate::anchors::anchor(id)));
+        .any(|head| segment.starts_with(head));
         if lasting && found.is_none() {
             found = Some(Credits {
                 started: None,

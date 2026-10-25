@@ -431,9 +431,12 @@ const fn mark_chords(mark: u8) -> Option<[u8; 2]> {
 const STEER_MAX_DEG: i32 = 3;
 
 #[inline]
-fn nearest_cand(cands: &[i32], from: i32, fall: bool, skip: i32) -> Option<i32> {
+const fn nearest_cand(cands: &[i32], from: i32, fall: bool, skip: i32) -> Option<i32> {
     let mut best: Option<i32> = None;
-    for &c in cands {
+    let mut i = 0;
+    while i < cands.len() {
+        let c = cands[i];
+        i += 1;
         if c == skip {
             continue;
         }
@@ -453,7 +456,19 @@ fn nearest_cand(cands: &[i32], from: i32, fall: bool, skip: i32) -> Option<i32> 
 }
 
 #[inline]
-fn cadence_target(mark: u8, from: i32, last_cadence: i32) -> i32 {
+const fn cadence_target(mark: u8, from: i32, last_cadence: i32) -> i32 {
+    #[inline]
+    const fn above(cs: [i32; 2], from: i32) -> Option<i32> {
+        let mut i = 0;
+        while i < cs.len() {
+            let c = cs[i];
+            if c > from && c - from <= STEER_MAX_DEG {
+                return Some(c);
+            }
+            i += 1;
+        }
+        None
+    }
     let (cands, fall): (&[i32], bool) = match mark {
         MARK_PERIOD => (&[0, 5], true),
         MARK_BANG => (&[0, 3, 5, 8], false),
@@ -461,15 +476,20 @@ fn cadence_target(mark: u8, from: i32, last_cadence: i32) -> i32 {
         MARK_SEMI => (&[2, 4, 7], true),
         MARK_COLON => (&[3, 8], false),
         MARK_QMARK => {
-            let above = |cs: [i32; 2]| {
-                cs.into_iter()
-                    .find(|c| *c > from && *c - from <= STEER_MAX_DEG)
-            };
-            return above([3, 8]).or_else(|| above([1, 6])).unwrap_or(from);
+            if let Some(c) = above([3, 8], from) {
+                return c;
+            }
+            if let Some(c) = above([1, 6], from) {
+                return c;
+            }
+            return from;
         }
         _ => return from,
     };
-    let first = nearest_cand(cands, from, fall, -1).unwrap_or(from);
+    let first = match nearest_cand(cands, from, fall, -1) {
+        Some(c) => c,
+        None => from,
+    };
     if !matches!(mark, MARK_PERIOD | MARK_BANG) || first != last_cadence {
         return first;
     }
@@ -572,7 +592,7 @@ const TING_DUCK_MARK: f32 = 0.50;
 const TING_DUCK_RAMP_S: f32 = LANE_FADE_STEAL_S;
 
 #[inline]
-fn ting_fold(mut f: f32) -> f32 {
+const fn ting_fold(mut f: f32) -> f32 {
     while f >= TING_LO_HZ * 2.0 {
         f *= 0.5;
     }
@@ -583,7 +603,7 @@ fn ting_fold(mut f: f32) -> f32 {
 }
 
 #[inline]
-fn ting(f: f32) -> Voice {
+const fn ting(f: f32) -> Voice {
     Voice {
         dur: TING_DUR_S,
         attack: TING_ATTACK_S,
@@ -592,19 +612,19 @@ fn ting(f: f32) -> Voice {
             Partial {
                 lvl: P1_LVL,
                 f0: f,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: TING_P2_LVL,
                 f0: f * P2_RATIO,
                 decay: TING_P2_TAU_S,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: TING_P3_LVL,
                 f0: f * P3_RATIO,
                 decay: TING_P3_TAU_S,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
         ],
         n_lvl: TING_MALLET_LVL,
@@ -615,7 +635,7 @@ fn ting(f: f32) -> Voice {
         n_decay: MALLET_TAU_S,
         lp_cut: TING_LP_HZ,
         lane: LANE_TING,
-        ..Voice::default()
+        ..Voice::DEFAULT
     }
 }
 
@@ -732,7 +752,7 @@ const CAD_BELL_LEVEL: f32 = 0.199_526_2;
 
 /// The ice bell at `delay` and its level trim.
 #[inline]
-pub(super) fn cad_bell_voice(delay: f32) -> (Voice, f32) {
+pub(super) const fn cad_bell_voice(delay: f32) -> (Voice, f32) {
     let bell = Voice {
         delay,
         dur: CAD_BELL_DUR_S,
@@ -745,16 +765,16 @@ pub(super) fn cad_bell_voice(delay: f32) -> (Voice, f32) {
                 fm_ratio: CAD_BELL_FM_RATIO,
                 fm_i0: CAD_BELL_FM_INDEX,
                 fm_tau: CAD_BELL_FM_TAU_S,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
-            Partial::default(),
-            Partial::default(),
+            Partial::DEFAULT,
+            Partial::DEFAULT,
         ],
         tw_rate: CAD_BELL_TWINKLE_HZ,
         tw_depth: CAD_BELL_TWINKLE_DEPTH,
         lp_cut: CAD_BELL_LP_HZ,
         lane: LANE_CADENCE,
-        ..Voice::default()
+        ..Voice::DEFAULT
     };
     (bell, KEY_TINE_TRIM * CAD_BELL_LEVEL)
 }
@@ -965,11 +985,12 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn at_boundary(&self, at: u32) -> bool {
+    const fn at_boundary(&self, at: u32) -> bool {
         self.text.word_pos == 0
-            || self
-                .last_key_ms
-                .is_some_and(|k| timing::phrase_rest_reached(at.saturating_sub(k), self.ioi_ms))
+            || match self.last_key_ms {
+                Some(k) => timing::phrase_rest_reached(at.saturating_sub(k), self.ioi_ms),
+                None => false,
+            }
     }
 
     #[inline]
@@ -978,13 +999,17 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn push_undo(&mut self) {
+    const fn push_undo(&mut self) {
         let frame = self.frame();
-        if usize::from(self.undo_len) == UNDO_N {
-            self.undo.rotate_left(1);
+        if (self.undo_len as usize) == UNDO_N {
+            let mut i = 0;
+            while i + 1 < UNDO_N {
+                self.undo[i] = self.undo[i + 1];
+                i += 1;
+            }
             self.undo[UNDO_N - 1] = frame;
         } else {
-            self.undo[usize::from(self.undo_len)] = frame;
+            self.undo[self.undo_len as usize] = frame;
             self.undo_len += 1;
         }
     }
@@ -1010,18 +1035,29 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn nearest_lit_within(&self, deg: i32, from: i32) -> i32 {
-        let deg = deg.clamp(TUNE_DEG_LO, TUNE_DEG_HI);
+    const fn nearest_lit_within(&self, deg: i32, from: i32) -> i32 {
+        let deg = if deg < TUNE_DEG_LO {
+            TUNE_DEG_LO
+        } else if deg > TUNE_DEG_HI {
+            TUNE_DEG_HI
+        } else {
+            deg
+        };
         if self.deg_is_lit(deg) {
             return deg;
         }
         let dir = if deg >= from { 1 } else { -1 };
-        for k in 1..=WORD_HEAD_SNAP_DEG {
-            for cand in [deg + dir * k, deg - dir * k] {
-                if (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&cand) && self.deg_is_lit(cand) {
-                    return cand;
-                }
+        let mut k = 1;
+        while k <= WORD_HEAD_SNAP_DEG {
+            let c0 = deg + dir * k;
+            if c0 >= TUNE_DEG_LO && c0 <= TUNE_DEG_HI && self.deg_is_lit(c0) {
+                return c0;
             }
+            let c1 = deg - dir * k;
+            if c1 >= TUNE_DEG_LO && c1 <= TUNE_DEG_HI && self.deg_is_lit(c1) {
+                return c1;
+            }
+            k += 1;
         }
         deg
     }
@@ -1137,13 +1173,13 @@ impl Default for TimbreStops {
 
 impl MelodyV2 {
     #[inline]
-    fn note_verdict(&mut self, at: u32, failed: bool, green_long: bool) {
+    const fn note_verdict(&mut self, at: u32, failed: bool, green_long: bool) {
         self.text.chord = if failed {
             CHORD_AFTER_RED
         } else {
             CHORD_AFTER_ENTER
         };
-        self.verdict_at_ms = green_long.then_some(at);
+        self.verdict_at_ms = if green_long { Some(at) } else { None };
     }
 
     #[inline]
@@ -1365,11 +1401,11 @@ impl MelodyV2 {
         }
     }
 
-    fn derive(&mut self, rank: u8, gap: u32, first: bool, word_head: bool) -> i32 {
-        let from = i32::from(self.text.walk);
+    const fn derive(&mut self, rank: u8, gap: u32, first: bool, word_head: bool) -> i32 {
+        let from = self.text.walk as i32;
 
         if !word_head && self.text.motif_play > 0 {
-            let iv = i32::from(self.text.motif[usize::from(self.text.motif_k)]);
+            let iv = self.text.motif[self.text.motif_k as usize] as i32;
             self.text.motif_k = self.text.motif_k.saturating_add(1);
             self.text.motif_play -= 1;
             let mut deg = reflect_deg(from + iv);
@@ -1384,7 +1420,7 @@ impl MelodyV2 {
         }
 
         let (raw, repeated) = if rank != 0 && self.text.prev_rank != 0 {
-            let d = i32::from(rank) - i32::from(self.text.prev_rank);
+            let d = (rank as i32) - (self.text.prev_rank as i32);
             (d, d == 0)
         } else {
             (gap as i32, false)
@@ -1416,7 +1452,13 @@ impl MelodyV2 {
                 stride = pull;
             }
         }
-        stride = stride.clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG);
+        stride = if stride < -WORD_LEAP_MAX_DEG {
+            -WORD_LEAP_MAX_DEG
+        } else if stride > WORD_LEAP_MAX_DEG {
+            WORD_LEAP_MAX_DEG
+        } else {
+            stride
+        };
 
         let mut deg = reflect_deg(from + stride);
         if stride != 0 && deg == from {
@@ -1427,37 +1469,47 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn break_run(&self, from: i32, deg: i32) -> i32 {
+    const fn break_run(&self, from: i32, deg: i32) -> i32 {
         let sounded = deg - from;
         if sounded == 0
             || self.text.run_len < MELODY_RUN_MAX
-            || i32::from(self.text.run_stride) != sounded
+            || (self.text.run_stride as i32) != sounded
         {
             return deg;
         }
         let sgn = sounded.signum();
-        [
+        let cands = [
             from - sounded,
             from - sounded - sgn,
             from + sounded + sgn,
             from + sounded - sgn,
-        ]
-        .into_iter()
-        .map(reflect_deg)
-        .find(|c| {
+        ];
+        let mut i = 0;
+        while i < cands.len() {
+            let c = reflect_deg(cands[i]);
             let s = c - from;
-            s != 0 && s != sounded && s.abs() <= WORD_LEAP_MAX_DEG
-        })
-        .unwrap_or(deg)
+            if s != 0 && s != sounded && s.abs() <= WORD_LEAP_MAX_DEG {
+                return c;
+            }
+            i += 1;
+        }
+        deg
     }
 
     #[inline]
-    fn note_run(&mut self, stride: i32) {
-        if stride != 0 && i32::from(self.text.run_stride) == stride {
+    const fn note_run(&mut self, stride: i32) {
+        if stride != 0 && (self.text.run_stride as i32) == stride {
             self.text.run_len = self.text.run_len.saturating_add(1);
         } else {
-            self.text.run_stride = stride.clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG) as i8;
-            self.text.run_len = u8::from(stride != 0);
+            let clamped = if stride < -WORD_LEAP_MAX_DEG {
+                -WORD_LEAP_MAX_DEG
+            } else if stride > WORD_LEAP_MAX_DEG {
+                WORD_LEAP_MAX_DEG
+            } else {
+                stride
+            };
+            self.text.run_stride = clamped as i8;
+            self.text.run_len = (stride != 0) as u8;
         }
     }
 
@@ -1481,17 +1533,26 @@ impl MelodyV2 {
         self.repeat_run >= AUTOREPEAT_RUN || gap <= AUTOREPEAT_FLOOR_MS
     }
 
-    fn on_space(&mut self, at: u32) -> bool {
+    const fn on_space(&mut self, at: u32) -> bool {
         let head = !self.space_run;
         if head {
             self.push_undo();
             let pending = self.pending_mark();
             let n = CHORD_LOOP.len() as u8;
             self.text.chord = match mark_chords(pending) {
-                Some(want) => (1..=n)
-                    .map(|k| (self.text.chord + k) % n)
-                    .find(|c| want.contains(c))
-                    .unwrap_or((self.text.chord + 1) % n),
+                Some(want) => {
+                    let mut chosen = (self.text.chord + 1) % n;
+                    let mut k = 1u8;
+                    while k <= n {
+                        let c = (self.text.chord + k) % n;
+                        if c == want[0] || c == want[1] {
+                            chosen = c;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    chosen
+                }
                 None => (self.text.chord + 1) % n,
             };
             if matches!(pending, MARK_PERIOD | MARK_BANG | MARK_QMARK) {
@@ -1507,7 +1568,7 @@ impl MelodyV2 {
         head
     }
 
-    fn on_enter(&mut self, at: u32) -> (bool, bool, bool) {
+    const fn on_enter(&mut self, at: u32) -> (bool, bool, bool) {
         let full = self.keys_since_enter >= ENTER_PICKUP_MIN_KEYS;
         let closed = matches!(self.pending_mark(), MARK_PERIOD | MARK_BANG);
         let asked = self.pending_mark() == MARK_QMARK;
@@ -1530,19 +1591,22 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn jump_echoes_enter(&self, at: u32) -> bool {
-        self.last_enter_ms
-            .is_some_and(|e| at.saturating_sub(e) < ENTER_ECHO_SWALLOW_MS)
+    const fn jump_echoes_enter(&self, at: u32) -> bool {
+        match self.last_enter_ms {
+            Some(e) => at.saturating_sub(e) < ENTER_ECHO_SWALLOW_MS,
+            None => false,
+        }
     }
 
-    fn on_jump(&mut self, at: u32) -> Option<bool> {
-        let in_run = self
-            .cascade_at
-            .is_some_and(|c| at.saturating_sub(c) < CASCADE_RUN_MS);
+    const fn on_jump(&mut self, at: u32) -> Option<bool> {
+        let in_run = match self.cascade_at {
+            Some(c) => at.saturating_sub(c) < CASCADE_RUN_MS,
+            None => false,
+        };
         if in_run {
             self.text.walk = self.run_theme_step();
         } else {
-            let here = i32::from(self.text.walk);
+            let here = self.text.walk as i32;
             self.text.walk = self.nearest_lit_within(here, here) as i8;
             self.run_theme_pos = 0;
             self.run_phrase = 0;
@@ -1555,9 +1619,10 @@ impl MelodyV2 {
         self.last_key_ms = Some(at);
         self.text.word_pos = 0;
         self.space_run = false;
-        let head = self
-            .cascade_at
-            .is_none_or(|c| at.saturating_sub(c) >= CASCADE_EXCLUSIVE_MS);
+        let head = match self.cascade_at {
+            Some(c) => at.saturating_sub(c) >= CASCADE_EXCLUSIVE_MS,
+            None => true,
+        };
         self.cascade_at = Some(at);
         if head {
             self.cascade_restrike_ms = at;
@@ -1570,13 +1635,13 @@ impl MelodyV2 {
         }
     }
 
-    fn run_theme_step(&mut self) -> i8 {
-        let form = |i: u8| usize::from(SONG_FORM[usize::from(i)]);
-        let (start, end) = (form(self.run_phrase), form(self.run_phrase + 1));
-        let pos = usize::from(self.run_theme_pos);
+    const fn run_theme_step(&mut self) -> i8 {
+        let start = SONG_FORM[self.run_phrase as usize] as usize;
+        let end = SONG_FORM[(self.run_phrase + 1) as usize] as usize;
+        let pos = self.run_theme_pos as usize;
         let deg = if pos == start {
             self.run_theme_pos += 1;
-            if usize::from(self.run_theme_pos) == end {
+            if (self.run_theme_pos as usize) == end {
                 self.open_next_run_phrase();
             }
             SONG_THEME[pos]
@@ -1584,7 +1649,7 @@ impl MelodyV2 {
             self.open_next_run_phrase();
             SONG_THEME[end - 1]
         };
-        reflect_deg(i32::from(deg)) as i8
+        reflect_deg(deg as i32) as i8
     }
 
     #[inline]
@@ -1616,11 +1681,16 @@ impl MelodyV2 {
     }
 
     #[inline]
-    fn answer_deg_above(&self, deg: i32) -> i32 {
-        (1..=5)
-            .map(|k| deg + k)
-            .find(|d| self.deg_is_lit(*d))
-            .unwrap_or(deg + CAPITAL_LIFT_DEG)
+    const fn answer_deg_above(&self, deg: i32) -> i32 {
+        let mut k = 1;
+        while k <= 5 {
+            let d = deg + k;
+            if self.deg_is_lit(d) {
+                return d;
+            }
+            k += 1;
+        }
+        deg + CAPITAL_LIFT_DEG
     }
 }
 
@@ -1630,7 +1700,7 @@ const fn fold_signed13(d: i32) -> i32 {
 }
 
 #[inline]
-fn reflect_deg(deg: i32) -> i32 {
+const fn reflect_deg(deg: i32) -> i32 {
     let mut d = deg;
     let mut i = 0;
     while i < 8 {
@@ -1643,7 +1713,13 @@ fn reflect_deg(deg: i32) -> i32 {
         }
         i += 1;
     }
-    d.clamp(TUNE_DEG_LO, TUNE_DEG_HI)
+    if d < TUNE_DEG_LO {
+        TUNE_DEG_LO
+    } else if d > TUNE_DEG_HI {
+        TUNE_DEG_HI
+    } else {
+        d
+    }
 }
 
 #[inline]
@@ -1687,9 +1763,10 @@ fn hue_air(hue: f32) -> f32 {
 }
 
 #[inline]
-fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
+const fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
     let mut f = f.clamp(1.0, 40_000.0);
-    for _ in 0..24 {
+    let mut i = 0;
+    while i < 24 {
         if f < lo {
             f *= 2.0;
         } else if f >= hi {
@@ -1697,12 +1774,13 @@ fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
         } else {
             break;
         }
+        i += 1;
     }
     f
 }
 
 #[inline]
-fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool, flow: f32) -> Voice {
+const fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool, flow: f32) -> Voice {
     let (p1, p2, p3, mallet) = match touch {
         Touch::Step => {
             let (p1, p2) = flow_partials(flow);
@@ -1723,19 +1801,19 @@ fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool, flow: f32)
             Partial {
                 lvl: p1,
                 f0: f,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: p2,
                 f0: f * P2_RATIO,
                 decay: P2_TAU_S,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: p3,
                 f0: f * P3_RATIO,
                 decay: P3_TAU_S,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
         ],
         n_lvl: mallet,
@@ -1746,7 +1824,7 @@ fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool, flow: f32)
         n_decay: MALLET_TAU_S,
         lp_cut: roof,
         lane: LANE_TUNE,
-        ..Voice::default()
+        ..Voice::DEFAULT
     }
 }
 
@@ -1761,7 +1839,7 @@ struct Forte {
 
 impl Forte {
     #[inline]
-    fn of(
+    const fn of(
         shifted: bool,
         class: u8,
         touch: Touch,
@@ -1769,7 +1847,7 @@ impl Forte {
         word_head: bool,
         opens_shift: bool,
     ) -> Self {
-        let step = touch == Touch::Step && !felt;
+        let step = matches!(touch, Touch::Step) && !felt;
         let letter = class == LETTER;
         let bang = class == BANG && (!felt || shifted);
         let weight = if (shifted && letter) || bang {
@@ -1838,7 +1916,7 @@ const fn forte_index(f: f32, force: f32) -> f32 {
 }
 
 #[inline]
-fn forte(v: &mut Voice, f: f32, force: f32) {
+const fn forte(v: &mut Voice, f: f32, force: f32) {
     v.p[0].fm_ratio = FORTE_FM_RATIO;
     v.p[0].fm_i0 = forte_index(f, force);
     v.p[0].fm_tau = FORTE_FM_TAU_S;
@@ -1858,12 +1936,12 @@ fn forte(v: &mut Voice, f: f32, force: f32) {
 }
 
 #[inline]
-fn wood(v: &mut Voice, f: f32, touch: Touch) {
+const fn wood(v: &mut Voice, f: f32, touch: Touch) {
     v.p[1].f0 = f * WOOD_P2_RATIO;
     v.p[1].decay = WOOD_P2_TAU_S;
     v.p[2].f0 = f * WOOD_P3_RATIO;
     v.p[2].decay = WOOD_P3_TAU_S;
-    if touch == Touch::Step {
+    if matches!(touch, Touch::Step) {
         v.p[0].lvl = WOOD_P1_LVL;
         v.p[1].lvl = WOOD_P2_LVL;
         v.p[2].lvl = WOOD_P3_LVL;
@@ -1888,8 +1966,8 @@ const fn stop_breathes(class: u8) -> bool {
 }
 
 #[inline]
-fn pluck(v: &mut Voice, f: f32, class: u8, touch: Touch) {
-    let step = touch == Touch::Step;
+const fn pluck(v: &mut Voice, f: f32, class: u8, touch: Touch) {
+    let step = matches!(touch, Touch::Step);
     v.p[1].f0 = f * PLUCK_P2_RATIO;
     v.p[1].decay = PLUCK_P2_TAU_S;
     v.p[2].lvl = 0.0;
@@ -1912,7 +1990,7 @@ fn pluck(v: &mut Voice, f: f32, class: u8, touch: Touch) {
 }
 
 #[inline]
-fn breath(delay: f32) -> Voice {
+const fn breath(delay: f32) -> Voice {
     Voice {
         delay,
         dur: BREATH_DUR_S,
@@ -1925,12 +2003,12 @@ fn breath(delay: f32) -> Voice {
         n_q: BREATH_Q,
         lp_cut: BREATH_ROOF_HZ,
         lane: LANE_BREATH,
-        ..Voice::default()
+        ..Voice::DEFAULT
     }
 }
 
 #[inline]
-fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
+const fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
     Voice {
         delay,
         dur: TAIL_DUR_PER_TAU * decay,
@@ -1940,42 +2018,42 @@ fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
             Partial {
                 lvl: BASS_ROOT_LVL,
                 f0: root,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: BASS_FIFTH_LVL,
                 f0: partner,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: BASS_OCT_LVL,
                 f0: root * 2.0,
                 decay: BASS_OCT_TAU_S,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
         ],
         lp_cut: BASS_ROOF_HZ,
         lane: LANE_BASS,
         bass: true,
-        ..Voice::default()
+        ..Voice::DEFAULT
     }
 }
 
 #[inline]
-fn p1_sine(f0: f32) -> [Partial; 3] {
+const fn p1_sine(f0: f32) -> [Partial; 3] {
     [
         Partial {
             lvl: P1_LVL,
             f0,
-            ..Partial::default()
+            ..Partial::DEFAULT
         },
-        Partial::default(),
-        Partial::default(),
+        Partial::DEFAULT,
+        Partial::DEFAULT,
     ]
 }
 
 #[inline]
-fn met_tick() -> Voice {
+const fn met_tick() -> Voice {
     Voice {
         dur: MET_TICK_DUR_S,
         attack: MET_TICK_ATTACK_S,
@@ -1987,26 +2065,26 @@ fn met_tick() -> Voice {
         n_q: MET_TICK_Q,
         lp_cut: MET_TICK_ROOF_HZ,
         lane: LANE_METEOR,
-        ..Voice::default()
+        ..Voice::DEFAULT
     }
 }
 
 #[inline]
-fn head_breath(root: f32) -> Voice {
+const fn head_breath(root: f32) -> Voice {
     let twinkle = fold_into(root, GLINT_LO_HZ, GLINT_HI_HZ);
     Voice {
         p: [
             Partial {
                 lvl: SPACE_TWINKLE_LEVEL,
                 f0: twinkle,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
             Partial {
                 lvl: SPACE_TWINKLE_UNDER,
                 f0: twinkle * 0.5,
-                ..Partial::default()
+                ..Partial::DEFAULT
             },
-            Partial::default(),
+            Partial::DEFAULT,
         ],
         ..breath(0.0)
     }
@@ -2063,7 +2141,7 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_hand_back_key(&mut self, at: u32) {
+    const fn v2_hand_back_key(&mut self, at: u32) {
         if self.v2_key_pending && self.v2.at_boundary(at) {
             self.song_key = 0;
             self.v2_key_pending = false;
@@ -2071,12 +2149,15 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_damp_same_pitch(&mut self, lane: u8, f: f32) {
-        for v in &mut self.voices {
+    const fn v2_damp_same_pitch(&mut self, lane: u8, f: f32) {
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &mut self.voices[i];
             if v.on && v.lane == lane && v.damp <= 0.0 && (v.p[0].f0 - f).abs() < SAME_PITCH_HZ {
                 v.damp = LANE_FADE_STEAL_S;
                 v.damp0 = LANE_FADE_STEAL_S;
             }
+            i += 1;
         }
     }
 
@@ -2093,7 +2174,7 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_duck_ting(&mut self, to: f32) {
+    const fn v2_duck_ting(&mut self, to: f32) {
         #[cfg(test)]
         if self.ting_unducked {
             return;
@@ -2101,7 +2182,7 @@ impl TrailSynth {
         let Some((slot, born)) = self.v2.lift else {
             return;
         };
-        let v = &mut self.voices[usize::from(slot)];
+        let v = &mut self.voices[slot as usize];
         if v.on
             && v.born == born
             && v.lane == LANE_TING
@@ -2169,9 +2250,9 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_damp(&mut self, who: Option<(u8, u32)>, ramp: f32) {
+    const fn v2_damp(&mut self, who: Option<(u8, u32)>, ramp: f32) {
         let Some((slot, born)) = who else { return };
-        let v = &mut self.voices[usize::from(slot)];
+        let v = &mut self.voices[slot as usize];
         if v.on && v.born == born && v.damp <= 0.0 {
             v.damp = ramp;
             v.damp0 = ramp;
@@ -2179,18 +2260,18 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_cancel_unsounded(&mut self, who: Option<(u8, u32)>) {
+    const fn v2_cancel_unsounded(&mut self, who: Option<(u8, u32)>) {
         let Some((slot, born)) = who else { return };
-        let v = &mut self.voices[usize::from(slot)];
+        let v = &mut self.voices[slot as usize];
         if v.on && v.born == born && v.t < 0.0 {
             v.on = false;
         }
     }
 
     #[inline]
-    fn v2_retire(&mut self, who: Option<(u8, u32)>, ramp: f32) {
+    const fn v2_retire(&mut self, who: Option<(u8, u32)>, ramp: f32) {
         let Some((slot, born)) = who else { return };
-        let v = &mut self.voices[usize::from(slot)];
+        let v = &mut self.voices[slot as usize];
         if v.on && v.born == born {
             if v.t < 0.0 {
                 v.on = false;
@@ -3040,13 +3121,16 @@ impl TrailSynth {
         }
     }
 
-    fn v2_release_arm(&mut self) {
-        for v in &mut self.voices {
+    const fn v2_release_arm(&mut self) {
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &mut self.voices[i];
             if v.on && v.lane == LANE_METEOR && v.arm_ttl > 0.0 && v.damp <= 0.0 {
                 v.arm_ttl = 0.0;
                 v.damp = LANE_FADE_STEAL_S;
                 v.damp0 = LANE_FADE_STEAL_S;
             }
+            i += 1;
         }
     }
 

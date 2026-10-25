@@ -477,8 +477,7 @@ pub fn run_app_server<T>(
         )),
         _ => None,
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    super::login_drive::end(&mut child);
     ran
 }
 

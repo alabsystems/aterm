@@ -301,7 +301,9 @@ fn refused_before_any_write(reply: &str) -> bool {
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
 }
 
-/// An attempt's own word that none of its bytes reached the PTY, for a verb that keeps an account of its writes (`turn`, through [`crate::control_session::TurnIo::witness`]); the reply alone cannot say it, since `ERR exited` or a skip answers both before and after a write.
+/// An attempt's own word that none of its bytes reached the PTY, for a verb that keeps an
+/// account of its writes (`turn`, through `TurnIo::witness`); the reply alone cannot say it,
+/// since `ERR exited` or a skip answers both before and after a write.
 #[derive(Default)]
 pub(crate) struct Witness(std::cell::Cell<bool>);
 

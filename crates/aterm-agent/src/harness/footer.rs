@@ -2596,16 +2596,25 @@ pub fn live_repl_row(rows: &[String]) -> Option<usize> {
         .or_else(|| under_composer(rows, bottom).find(|&i| is_bare_footer_row(&rows[i])))
 }
 
-/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`), for the context fact.
+/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`): the
+/// rule the window drops its context fact on and the supervisor's watch says `EVENT compacted`
+/// on. The frame stands (the `❯` one: shell mode's `!` box is never the indicator gone); Claude
+/// Code's own footer row is right under its bottom rule; no row of the footer (the rows down to a
+/// blank) reaches the rule's right edge, every row the reading looks at for the indicator's slot;
+/// no reading ([`aterm_phase::phase::context_left`]); and no box. A menu, the shortcuts or a
+/// notice in the slot is never the indicator gone. That the slot may be on a row under the mode
+/// row is measured only for the indicator itself (2.1.310 at 44 columns, which the reading
+/// holds); a notice on such a row is a constructed case.
 #[must_use]
 pub fn context_gone(rows: &[String]) -> bool {
     let Some(bottom) = aterm_phase::phase::composer_bottom(rows) else {
         return false;
     };
     let width = rows[bottom].trim_end().chars().count();
-    rows.get(bottom + 1).is_some_and(|row| {
-        (is_mode_row(row) || is_bare_footer_row(row)) && row.trim_end().chars().count() + 3 < width
-    }) && aterm_phase::phase::context_left_shown(rows).is_none()
+    rows.get(bottom + 1)
+        .is_some_and(|row| is_mode_row(row) || is_bare_footer_row(row))
+        && under_composer(rows, bottom).all(|i| rows[i].trim_end().chars().count() + 3 < width)
+        && aterm_phase::phase::context_left(rows).is_none()
         && aterm_phase::prompt::parse_prompt_v2(rows).is_none()
 }
 

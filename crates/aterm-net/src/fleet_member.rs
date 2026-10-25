@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Fleet membership (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): the state a
-//! machine keeps beside the fleet secret ([`KEY_FILE`]), namely its node id and key, book of
-//! peers, join code and copy of the issuer's book, and the exchanges made once the handshake
-//! ([`crate::fleet`]) proved both ends: join, book read, survey and drive.
+//! machine keeps beside the fleet secret ([`crate::fleet::KEY_FILE`]), namely its node id and
+//! key, book of peers, join code and copy of the issuer's book, and the exchanges made once the
+//! handshake ([`crate::fleet`]) proved both ends: join, book read, survey and drive.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -64,6 +64,30 @@ pub const RECORD_MAX: usize = 512;
 const PEERS_FILE_MAX: usize = 256 * 1024;
 
 const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's wait for the book's lock on its thread in place of [`LOCK_WAIT`], and who is told each time the lock is found held.
+    static TEST_WAIT: std::cell::RefCell<Option<(Duration, Option<std::sync::mpsc::Sender<()>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn lock_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_WAIT.with_borrow(|seam| seam.as_ref().map(|(wait, _)| *wait)) {
+        return wait;
+    }
+    LOCK_WAIT
+}
+
+fn found_held() {
+    #[cfg(test)]
+    TEST_WAIT.with_borrow(|seam| {
+        if let Some((_, Some(told))) = seam {
+            let _ = told.send(());
+        }
+    });
+}
 
 use aterm_uds::private_file::{
     PrivateDir, check_private_dir, judge_private_dir, remove_private, write_private,
@@ -131,9 +155,10 @@ const NODE_KEY_FILE_MAX: usize = 2 * NODE_SEED_LEN + 1;
 const NODE_SEED_LEN: usize = 32;
 
 /// This machine's node, its node id and node key, each minted the first time it is missing
-/// ([`node_id`]; the key 256 bits from the OS CSPRNG, written to [`NODE_KEY_FILE`]).
+/// ([`node_id`]; the key 256 bits from the OS CSPRNG, written to [`NODE_KEY_FILE`]), under the
+/// book's lock, waited for as every writer waits.
 pub fn node_identity(dir: &Path) -> io::Result<NodeIdentity> {
-    let _identity = BookLock::take(dir, Duration::ZERO)
+    let _identity = BookLock::take(dir, lock_wait())
         .map_err(|e| io::Error::new(e.kind(), lock_refused(dir, &e)))?;
     let node = node_id(dir)?;
     let seed = match read_node_seed(dir)? {
@@ -1036,7 +1061,7 @@ pub fn write_held<R>(
     write: impl FnOnce(&HeldBook<'_>) -> R,
 ) -> Result<R, Unwritten> {
     let lock =
-        BookLock::take(dir, LOCK_WAIT).map_err(|e| Unwritten::Lock(lock_refused(dir, &e)))?;
+        BookLock::take(dir, lock_wait()).map_err(|e| Unwritten::Lock(lock_refused(dir, &e)))?;
     let book = HeldBook {
         dir,
         held: Held::read(dir),
@@ -1074,7 +1099,7 @@ pub fn leave_held<R>(dir: &Path, remove: impl FnOnce(&Leaving<'_>) -> R) -> Resu
         },
         _ => None,
     };
-    let lock = match BookLock::take(dir, LOCK_WAIT) {
+    let lock = match BookLock::take(dir, lock_wait()) {
         Ok(lock) => Some(lock),
         Err(e) if stops_every_edit(&e) => None,
         Err(e) => {
@@ -1128,7 +1153,7 @@ impl Leaving<'_> {
 /// Another edit holds it past the lock's wait, or it cannot be taken.
 #[cfg(any(test, debug_assertions))]
 pub fn hold_book(dir: &Path) -> Result<HeldBook<'_>, String> {
-    let lock = BookLock::take(dir, LOCK_WAIT).map_err(|e| lock_refused(dir, &e))?;
+    let lock = BookLock::take(dir, lock_wait()).map_err(|e| lock_refused(dir, &e))?;
     Ok(HeldBook {
         dir,
         held: Held::read(dir),
@@ -1785,6 +1810,7 @@ impl BookLock {
                 Ok(()) => return Ok(Self(file)),
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    found_held();
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(50));
                 }
@@ -2884,6 +2910,22 @@ impl Unreached {
         }
     }
 
+    /// Whether the peer closed the connection during the handshake: what an aterm restarting
+    /// its fleet listener (a change of `[fleet]` there) or stopping does to a dial in flight.
+    #[must_use]
+    pub fn hung_up(&self) -> bool {
+        matches!(
+            self,
+            Self::Handshake(_, FleetError::Tls(e) | FleetError::Io(e)) if matches!(
+                e.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+            )
+        )
+    }
+
     /// Whether the connect failed with no route to the host (`EHOSTUNREACH`): what macOS's
     /// local-network privacy gives an app the person has not allowed, and a host off the LAN.
     #[must_use]
@@ -2972,6 +3014,11 @@ impl fmt::Display for Unreached {
                 ),
                 _ => write!(f, "{addr}: {e}"),
             },
+            Self::Handshake(addr, _) if self.hung_up() => write!(
+                f,
+                "{addr} hung up mid-handshake: its fleet listener restarting, or no aterm; try \
+                 again"
+            ),
             Self::Handshake(addr, e) => match e {
                 FleetError::ListenerWrongSecret => write!(
                     f,

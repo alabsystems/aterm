@@ -9,8 +9,9 @@ use aterm_models_misc::explain_honesty_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
 use aterm_vitals::explain::fixtures::{
-    Scene, USERSPACE_MS, calm_1510, finished_1032, lane_off_1032, liar_1032, reaped_1510,
-    spotlight_1032, spotlight_late_1032, tab2_build_1048, wrapped_1218,
+    Scene, USERSPACE_MS, calm_1510, exited_skewed_1510, finished_1032, idle_skewed_1510,
+    lane_off_1032, liar_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab2_build_1048,
+    wrapped_1218,
 };
 use aterm_vitals::explain::{
     ActivityId, CauseId, ClauseHold, CoalSplit, Context, Fault, OpenCause, Role, WhySubject,
@@ -184,6 +185,26 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             Truth { bound: 3, ..T1032 },
         ),
         (
+            "an idle tab over the counters' skew",
+            window(idle_skewed_1510()),
+            1,
+            Truth {
+                live: 0,
+                bound: 0,
+                ..T1510
+            },
+        ),
+        (
+            "a tab's git exited past the counters' skew",
+            window(exited_skewed_1510()),
+            1,
+            Truth {
+                live: 0,
+                bound: 1,
+                ..T1510
+            },
+        ),
+        (
             "a sweep cut at its cap",
             cut.to_vec(),
             1,
@@ -353,6 +374,26 @@ fn a_residual_left_uncovered_is_caught_by_lost_work_never_nothing_needed() {
     let broken = replay(&mutant, &states, &["Detect", "Attach"])
         .unwrap_or_else(|e| panic!("Buggy 10 does not admit the blind residual: {e}"));
     assert_eq!(broken, ["LostWorkNeverNothingNeeded"]);
+}
+
+#[test]
+fn a_fixed_tolerance_is_caught_by_role_needs_bound() {
+    let (_, samples, tab, truth) = cases()
+        .into_iter()
+        .find(|c| c.0.starts_with("a tab's git exited"))
+        .expect("the exit past the skew");
+    let model = explain_honesty_model();
+    let snap = read(&samples, Some(Fault::FixedTolerance));
+    let healthy = interp::with_buggy(&model, 0);
+    let states = project(&healthy, truth, &snap, tab);
+    assert!(
+        replay(&healthy, &states, &["Detect", "Attach"]).is_err(),
+        "the healthy model admits a small exit read as none"
+    );
+    let mutant = interp::with_buggy(&model, 7);
+    let broken = replay(&mutant, &states, &["Detect", "Attach"])
+        .unwrap_or_else(|e| panic!("Buggy 7 does not admit the fudge: {e}"));
+    assert_eq!(broken, ["RoleNeedsBound"]);
 }
 
 fn clause_states(m: &Model, ticks: &[(bool, bool)]) -> (Vec<S>, Vec<&'static str>) {

@@ -382,6 +382,11 @@ pub struct Observation {
     pub standing: Standing,
     /// The current value in the row's words, when it was read.
     pub now: Option<String>,
+    /// What the row reads after the next login, where that differs from the value live now
+    /// (`now`, marked [`until_login`]): the saved preference macOS loads then, in the row's
+    /// words, which a row that will change shows as its from-side (design §3.3). `None` for
+    /// a row whose live and saved values agree, and where the saved one names no word.
+    pub after_login: Option<String>,
     /// The wanted value in the row's words.
     pub wanted: String,
     /// A short note in a person's words, shown under the row (an approval code,
@@ -401,9 +406,135 @@ impl Observation {
             subject,
             standing: Standing::Unknown,
             now: None,
+            after_login: None,
             wanted: subject.wanted().to_owned(),
             note: None,
             detail: None,
+        }
+    }
+}
+
+/// A row's current value while what is live differs from the saved preference macOS loads
+/// at the next login (design §3.3): the live value, marked "until login", which a row that is
+/// not changing shows. The row stands as the Mac will after that login
+/// ([`Observation::after_login`]), so it is no change to make where its group is left as is,
+/// and a row that will change shows that value, unmarked, as its from-side.
+#[must_use]
+pub fn until_login(live: &str) -> String {
+    format!("{live}{UNTIL_LOGIN}")
+}
+
+/// The live value in a value [`until_login`] marked, or `None` for a value it did not mark.
+#[must_use]
+pub fn live_until_login(value: &str) -> Option<&str> {
+    value.strip_suffix(UNTIL_LOGIN)
+}
+
+/// The mark [`until_login`] puts after a live value.
+const UNTIL_LOGIN: &str = " · until login";
+
+/// How a Restore left the saved preferences of one System State row (design §3.4): the
+/// page names rows, never the preference keys `aterm doctor` lists. Worst last, so a row
+/// of several keys takes its worst key's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PutBack {
+    /// As it was, and in use.
+    Back,
+    /// As it was saved; in use from the next login.
+    AtLogin,
+    /// Its value from before aterm was never read (macOS hid it), so it was left as it is.
+    Unknown,
+    /// Its saved value is in another app's container, which macOS opens to aterm only
+    /// once aterm has Full Disk Access: it waits for a Restore with the grant.
+    Waits,
+    /// It could not be put back, or macOS did not keep it.
+    Failed,
+}
+
+/// What a Restore did, by System State row (design §3.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// Each row whose saved preferences it reached, once, in page order, as its worst key
+    /// came out; `None` gathers keys no row of this build writes (an older aterm's backup).
+    pub rows: Vec<(Option<Setting>, PutBack)>,
+    /// The change journal refused a record of a change it made, which went ahead.
+    pub journal_refused: bool,
+}
+
+impl RestoreOutcome {
+    /// The outcome of keys `keys`, each with its row and how it came out: one entry per
+    /// row, in page order, the unnamed keys last.
+    #[must_use]
+    pub fn of(keys: impl IntoIterator<Item = (Option<Setting>, PutBack)>) -> Self {
+        let mut rows: Vec<(Option<Setting>, PutBack)> = Vec::new();
+        for (setting, put_back) in keys {
+            match rows.iter_mut().find(|(row, _)| *row == setting) {
+                Some((_, worst)) => *worst = (*worst).max(put_back),
+                None => rows.push((setting, put_back)),
+            }
+        }
+        let place = |setting: &Option<Setting>| {
+            setting.map_or(Setting::ALL.len(), |setting| {
+                Setting::ALL
+                    .iter()
+                    .position(|each| *each == setting)
+                    .unwrap_or(Setting::ALL.len())
+            })
+        };
+        rows.sort_by_key(|(setting, _)| place(setting));
+        Self {
+            rows,
+            journal_refused: false,
+        }
+    }
+}
+
+/// What a setup pass did to System State's rows that the page says in its own words (design
+/// §3.4, §3.6), where `aterm doctor` lists the preference keys, keyboards and processes behind
+/// them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PassOutcome {
+    /// What the pass's rollback of the changes it could not confirm put back, by row; `None`
+    /// when none ran.
+    pub rolled_back: Option<RestoreOutcome>,
+    /// Each row a change failed for, or could not be confirmed for, once each, in page order.
+    pub unfinished: Vec<(Setting, Unfinished)>,
+}
+
+/// How a change a pass made to one row did not finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unfinished {
+    /// It could not be read back, so aterm cannot say whether it took.
+    Unconfirmed,
+    /// It did not take.
+    Failed,
+}
+
+impl PassOutcome {
+    /// Note that a change of `setting` did not finish as `how` says, once per row and how.
+    pub fn unfinished(&mut self, setting: Setting, how: Unfinished) {
+        if !self.unfinished.contains(&(setting, how)) {
+            self.unfinished.push((setting, how));
+            self.unfinished.sort_by_key(|(setting, how)| {
+                (Setting::ALL.iter().position(|s| s == setting), *how)
+            });
+        }
+    }
+
+    /// Add what a later part of the same pass did (its follow-up, a later stage).
+    pub fn merge(&mut self, later: Self) {
+        for (setting, how) in later.unfinished {
+            self.unfinished(setting, how);
+        }
+        if let Some(later) = later.rolled_back {
+            self.rolled_back = Some(match self.rolled_back.take() {
+                None => later,
+                Some(earlier) => {
+                    let mut both = RestoreOutcome::of(earlier.rows.into_iter().chain(later.rows));
+                    both.journal_refused = earlier.journal_refused || later.journal_refused;
+                    both
+                }
+            });
         }
     }
 }
@@ -753,8 +884,8 @@ impl Drop for MacosDialog {
 
 /// The per-revision record of access steps, a text file in aterm's state
 /// directory: one `<revision> <row> <outcome>` line per step. Unknown lines are
-/// skipped, so an older or newer aterm can share the file. [`append`] tells the
-/// registered watcher ([`on_append`]) once each line is on disk; System State's
+/// skipped, so an older or newer aterm can share the file. [`access_record::append`] tells the
+/// registered watcher ([`access_record::on_append`]) once each line is on disk; System State's
 /// Access rows and a run parked on the Permissions stage wait for that.
 pub mod access_record {
     use std::io::Write as _;
@@ -764,6 +895,8 @@ pub mod access_record {
 
     /// The file's name inside aterm's state directory.
     pub const FILE: &str = "system-state-access";
+
+    const LOCK_FILE: &str = ".system-state-access.lock";
 
     /// Lines kept when the file is rewritten: a few revisions of every row.
     const KEEP: usize = 64;
@@ -784,14 +917,24 @@ pub mod access_record {
     /// is on disk, the registered watcher ([`on_append`]) is told.
     ///
     /// # Errors
-    /// The state directory cannot be written.
+    /// The existing record cannot be read, or the state directory cannot be written.
     pub fn append(
         dir: &Path,
         revision: u64,
         access: Access,
         outcome: AccessOutcome,
     ) -> std::io::Result<()> {
-        write(dir, revision, access, outcome)?;
+        append_with(dir, revision, access, outcome, || {})
+    }
+
+    fn append_with(
+        dir: &Path,
+        revision: u64,
+        access: Access,
+        outcome: AccessOutcome,
+        after_read: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        write(dir, revision, access, outcome, after_read)?;
         if let Some(appended) = APPENDED.get() {
             appended(revision, access, outcome);
         }
@@ -803,19 +946,33 @@ pub mod access_record {
         revision: u64,
         access: Access,
         outcome: AccessOutcome,
+        after_read: impl FnOnce(),
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        let _lock = WriterLock::take(dir)?;
         let path = dir.join(FILE);
-        let mut lines: Vec<String> = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect();
+        let previous = match std::fs::read_to_string(&path) {
+            Ok(previous) => previous,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let mut lines: Vec<String> = previous.lines().map(str::to_owned).collect();
+        after_read();
         lines.push(format!("{revision} {} {}", access.word(), outcome.word()));
         let start = lines.len().saturating_sub(KEEP);
-        let staged = dir.join(format!(".{FILE}.{}", std::process::id()));
+        let staging = aterm_tempfile::Builder::new()
+            .prefix(".system-state-access-")
+            .tempdir_in(dir)?;
+        let staged = staging.path().join(FILE);
         {
-            let mut file = std::fs::File::create(&staged)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&staged)?;
             for line in &lines[start..] {
                 writeln!(file, "{line}")?;
             }
@@ -825,6 +982,43 @@ pub mod access_record {
             aterm_durable::ordered(&file)?;
         }
         std::fs::rename(&staged, &path)
+    }
+
+    /// Held across the whole read/merge/publication, including by independent
+    /// writers in this process. The lock's name is never renamed or removed.
+    struct WriterLock(std::fs::File);
+
+    impl WriterLock {
+        fn take(dir: &Path) -> std::io::Result<Self> {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options
+                    .mode(0o600)
+                    .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+            }
+            let file: std::fs::File = options.open(dir.join(LOCK_FILE))?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the access record lock is not a regular file",
+                ));
+            }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the access record's cross-process write guard; Drop releases its file lock"
+            )]
+            file.lock()?;
+            Ok(Self(file))
+        }
+    }
+
+    impl Drop for WriterLock {
+        fn drop(&mut self) {
+            let _ = self.0.unlock();
+        }
     }
 
     /// Every outcome recorded for `revision`, oldest first.
@@ -851,11 +1045,296 @@ pub mod access_record {
             .rev()
             .find_map(|(row, outcome)| (row == access).then_some(outcome))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        #[test]
+        fn access_record_an_unreadable_history_is_preserved_until_it_can_be_read() {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let revision = 8_176;
+            append(
+                root,
+                revision,
+                Access::DeveloperTools,
+                AccessOutcome::Declined,
+            )
+            .unwrap();
+            append(
+                root,
+                revision + 1,
+                Access::FullDiskAccess,
+                AccessOutcome::Granted,
+            )
+            .unwrap();
+            let path = root.join(FILE);
+            let readable = std::fs::read(&path).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&[0xff])
+                .unwrap();
+            let unreadable = std::fs::read(&path).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+
+            let result = append(
+                root,
+                revision,
+                Access::LocalNetwork,
+                AccessOutcome::Triggered,
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                unreadable,
+                "a failed history read must preserve the earlier answers"
+            );
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+
+            // Repair this test's damaged input, then the same append can succeed
+            // while retaining both earlier outcomes and their separate revisions.
+            std::fs::write(&path, readable).unwrap();
+            append(
+                root,
+                revision,
+                Access::LocalNetwork,
+                AccessOutcome::Triggered,
+            )
+            .unwrap();
+            assert_eq!(
+                read(root, revision),
+                [
+                    (Access::DeveloperTools, AccessOutcome::Declined),
+                    (Access::LocalNetwork, AccessOutcome::Triggered),
+                ]
+            );
+            assert_eq!(
+                latest(root, revision + 1, Access::FullDiskAccess),
+                Some(AccessOutcome::Granted)
+            );
+        }
+
+        #[test]
+        fn access_record_write_failure_releases_its_lock_and_removes_its_staging() {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert!(
+                append_with(
+                    root,
+                    8_175,
+                    Access::Debugger,
+                    AccessOutcome::Granted,
+                    || {
+                        std::fs::create_dir(root.join(FILE)).unwrap();
+                    }
+                )
+                .is_err()
+            );
+            let remaining: Vec<_> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                remaining.len(),
+                2,
+                "a failed publication kept private staging"
+            );
+            assert!(remaining.contains(&std::ffi::OsString::from(FILE)));
+            assert!(remaining.contains(&std::ffi::OsString::from(LOCK_FILE)));
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(LOCK_FILE))
+                .unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an independent handle verifies the failed publication released its writer lock"
+            )]
+            probe.try_lock().unwrap();
+            probe.unlock().unwrap();
+            std::fs::remove_dir(root.join(FILE)).unwrap();
+            append(root, 8_175, Access::Debugger, AccessOutcome::Granted).unwrap();
+            assert_eq!(
+                latest(root, 8_175, Access::Debugger),
+                Some(AccessOutcome::Granted)
+            );
+        }
+
+        #[test]
+        fn access_record_concurrent_writers_keep_independent_outcomes_and_the_latest_decline() {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let revision = 8_173;
+            let other_revision = revision + 1;
+            append(
+                root,
+                revision,
+                Access::FullDiskAccess,
+                AccessOutcome::Handed,
+            )
+            .unwrap();
+            append(
+                root,
+                other_revision,
+                Access::FullDiskAccess,
+                AccessOutcome::Granted,
+            )
+            .unwrap();
+            let (ready, read_ready) = mpsc::sync_channel(1);
+            let (release, resume) = mpsc::sync_channel(1);
+            let (first_done, first_result) = mpsc::sync_channel(1);
+            let first_root = root.to_path_buf();
+            let first = std::thread::spawn(move || {
+                let result = append_with(
+                    &first_root,
+                    revision,
+                    Access::Debugger,
+                    AccessOutcome::Granted,
+                    || {
+                        // Coordinate the old unlocked path and the corrected locked path
+                        // without waiting for a writer held behind our own lock.
+                        let probe = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(first_root.join(LOCK_FILE))
+                            .unwrap();
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "an independently opened handle samples writer ownership only to schedule this regression"
+                        )]
+                        let unlocked = match probe.try_lock() {
+                            Ok(()) => {
+                                probe.unlock().unwrap();
+                                true
+                            }
+                            Err(std::fs::TryLockError::WouldBlock) => false,
+                            Err(std::fs::TryLockError::Error(error)) => panic!("{error}"),
+                        };
+                        ready.send(unlocked).unwrap();
+                        resume.recv_timeout(Duration::from_secs(60)).unwrap();
+                    },
+                );
+                first_done.send(result).unwrap();
+            });
+            let unlocked = read_ready.recv_timeout(Duration::from_secs(60)).unwrap();
+            let (second_done, second_result) = mpsc::sync_channel(1);
+            let second_root = root.to_path_buf();
+            let second = std::thread::spawn(move || {
+                second_done
+                    .send(append(
+                        &second_root,
+                        revision,
+                        Access::FullDiskAccess,
+                        AccessOutcome::Declined,
+                    ))
+                    .unwrap();
+            });
+            let result = if unlocked {
+                let result = second_result.recv_timeout(Duration::from_secs(60)).unwrap();
+                release.send(()).unwrap();
+                result
+            } else {
+                release.send(()).unwrap();
+                second_result.recv_timeout(Duration::from_secs(60)).unwrap()
+            };
+            result.unwrap();
+            first_result
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+
+            let rows = read(root, revision);
+            assert!(rows.contains(&(Access::Debugger, AccessOutcome::Granted)));
+            assert!(rows.contains(&(Access::FullDiskAccess, AccessOutcome::Handed)));
+            assert!(
+                rows.contains(&(Access::FullDiskAccess, AccessOutcome::Declined)),
+                "an independent append lost the newer Not now: {rows:?}"
+            );
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                latest(root, revision, Access::FullDiskAccess),
+                Some(AccessOutcome::Declined)
+            );
+            assert_eq!(
+                read(root, other_revision),
+                [(Access::FullDiskAccess, AccessOutcome::Granted)]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Restore's outcome holds one entry per row, its worst key speaking for it, in page
+    /// order with the keys of no row last.
+    #[test]
+    fn a_restore_outcome_is_one_entry_per_row_in_page_order_worst_first() {
+        let outcome = RestoreOutcome::of([
+            (None, PutBack::Failed),
+            (Some(Setting::Dock), PutBack::Back),
+            (Some(Setting::NaturalScrolling), PutBack::Back),
+            (Some(Setting::NaturalScrolling), PutBack::AtLogin),
+            (Some(Setting::Dock), PutBack::Waits),
+            (Some(Setting::Dock), PutBack::Back),
+            (Some(Setting::CapsLock), PutBack::AtLogin),
+        ]);
+        assert_eq!(
+            outcome.rows,
+            [
+                (Some(Setting::CapsLock), PutBack::AtLogin),
+                (Some(Setting::NaturalScrolling), PutBack::AtLogin),
+                (Some(Setting::Dock), PutBack::Waits),
+                (None, PutBack::Failed),
+            ]
+        );
+        assert!(!outcome.journal_refused);
+        assert_eq!(until_login("Control"), "Control · until login");
+        assert_eq!(live_until_login(&until_login("Control")), Some("Control"));
+        assert_eq!(live_until_login("Control"), None);
+    }
+
+    /// A pass's outcome names each row once per way its change did not finish, in page order,
+    /// and a later part of the pass adds to it: its rollback joins the earlier one row by row.
+    #[test]
+    fn a_pass_outcome_names_each_row_once_and_takes_in_its_later_parts() {
+        let mut outcome = PassOutcome::default();
+        outcome.unfinished(Setting::Dock, Unfinished::Failed);
+        outcome.unfinished(Setting::CapsLock, Unfinished::Unconfirmed);
+        outcome.unfinished(Setting::Dock, Unfinished::Failed);
+        outcome.unfinished(Setting::CapsLock, Unfinished::Failed);
+        assert_eq!(
+            outcome.unfinished,
+            [
+                (Setting::CapsLock, Unfinished::Unconfirmed),
+                (Setting::CapsLock, Unfinished::Failed),
+                (Setting::Dock, Unfinished::Failed),
+            ]
+        );
+        outcome.rolled_back = Some(RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)]));
+        let mut later = RestoreOutcome::of([(Some(Setting::Dock), PutBack::AtLogin)]);
+        later.journal_refused = true;
+        outcome.merge(PassOutcome {
+            rolled_back: Some(later),
+            unfinished: vec![(Setting::Widgets, Unfinished::Failed)],
+        });
+        let rolled_back = outcome.rolled_back.unwrap();
+        assert_eq!(rolled_back.rows, [(Some(Setting::Dock), PutBack::AtLogin)]);
+        assert!(rolled_back.journal_refused);
+        assert_eq!(outcome.unfinished.len(), 4);
+    }
 
     #[test]
     fn every_row_defaults_on_and_each_checkbox_is_independent() {
@@ -1009,14 +1488,23 @@ mod tests {
             if !(4_201..=4_202).contains(&revision) {
                 return;
             }
-            let on_disk = DIR
-                .lock()
-                .unwrap()
-                .as_deref()
-                .and_then(|dir| access_record::latest(dir, revision, access));
+            let dir = DIR.lock().unwrap().clone().unwrap();
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.join(".system-state-access.lock"))
+                .unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the watcher must run after the publication has released its file lock"
+            )]
+            probe.try_lock().unwrap();
+            probe.unlock().unwrap();
+            let on_disk = access_record::latest(&dir, revision, access);
             SEEN.lock()
                 .unwrap()
                 .push((revision, access, outcome, on_disk));
+            access_record::append(&dir, 4_203, Access::Debugger, AccessOutcome::Granted).unwrap();
         }
         access_record::on_append(appended);
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -1041,6 +1529,11 @@ mod tests {
                 AccessOutcome::Granted,
                 Some(AccessOutcome::Granted)
             )]
+        );
+        assert_eq!(
+            access_record::latest(dir.path(), 4_203, Access::Debugger),
+            Some(AccessOutcome::Granted),
+            "the watcher can append to the record it just observed"
         );
     }
 

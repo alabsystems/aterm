@@ -231,6 +231,7 @@ fn tap_of(
         return None;
     }
     let settings = super::upgrade_drive::tap_settings(opts, launch.argv, cwd);
+    let user = super::upgrade_drive::tap_user_settings(&opts.home);
     super::tap::gate(&super::tap::GateFacts {
         exe: Some(&armed.exe),
         stored_login: launch.stored_login,
@@ -239,6 +240,7 @@ fn tap_of(
         home: launch.home,
         argv: launch.argv,
         settings: &settings,
+        user_settings: Some(&user),
         profile_store: super::upgrade_drive::tap_profile_store(opts),
     })
 }
@@ -434,6 +436,7 @@ pub fn task_launch_line(
         exe,
         &[],
         &required,
+        &[],
         &super::worker::Fresh {
             model,
             ..super::worker::Fresh::default()
@@ -2503,10 +2506,215 @@ pub struct PoolRelaunch<'a> {
     pub cd: Option<&'a str>,
     /// The program's executable.
     pub exe: &'a Path,
-    /// The launch flags it carries over.
+    /// The launch flags it carries over. A Codex line keeps only those
+    /// [`super::codex_alab::kept_flags`] keeps ([`pool_line`]).
     pub flags: &'a [String],
     /// The session it resumes, where one is known.
     pub resume: Option<&'a str>,
+    /// The CLI's own home the program runs in ([`crate::ai::facts::home_of`]: Grok Build's
+    /// `GROK_HOME`, else `~/.grok`), where a row of its own names its leader socket
+    /// ([`pool_args`]); `None` where it was not read, which a Grok Build line onto a row of its
+    /// own refuses.
+    pub home: Option<&'a Path>,
+}
+
+/// The variables of [`crate::ai::connector::Connector::credential_env`] a pooled line leaves in
+/// place: none is a login of the CLI's own carried in place of a row's, and removing one would
+/// take it from what reads it. None was measured with a login (no login was read); each rests on
+/// the CLI's own text or what the variable is.
+const KEPT_CREDENTIALS: &[(accounts::Cli, &str)] = &[
+    // codex-old 0.164.0's text names `OPENAI_API_KEY` as what its API-key sign-in screen offers
+    // ("Detected OPENAI_API_KEY environment variable. Paste a different key if you prefer to use
+    // another account.") and what `codex login --with-api-key` reads on stdin (`printenv
+    // OPENAI_API_KEY | codex login --with-api-key`, its `login --help`); none of it names the
+    // variable as read ahead of `auth.json`, where a piped key is stored (its `OPENAI_API_KEY`
+    // field) in the home a row's `CODEX_HOME` names. It is no Codex variable: tools the agent
+    // runs read it (Codex's bundled image skill's CLI fallback "Requires `OPENAI_API_KEY`"), and
+    // aterm passes it to the shells it opens, so removing it would take it from those tools.
+    (accounts::Cli::Codex, "OPENAI_API_KEY"),
+    // grok 1.0.70's own "Auth Precedence": a per-model `api_key` or `env_key`, then the session
+    // token in `auth.json`, then `XAI_API_KEY`, the "fallback when no session token is active".
+    // A row's login is read ahead of it (only a model whose own `env_key` names it, the user's
+    // config, reads it first), and it is xAI's API key ("API key from console.x.ai", grok's own
+    // table), not a variable of Grok Build's.
+    (accounts::Cli::Grok, "XAI_API_KEY"),
+    // Claude Code's provider switches pick Bedrock or Vertex and carry no login; removing one
+    // would move a session off the provider its person chose.
+    (accounts::Cli::Claude, "CLAUDE_CODE_USE_BEDROCK"),
+    (accounts::Cli::Claude, "CLAUDE_CODE_USE_VERTEX"),
+];
+
+/// The credential variables a pooled launch or relaunch of `cli` removes, so the login a row's
+/// seam names is the one used: its [`crate::ai::connector::Connector::credential_env`] but for
+/// [`KEPT_CREDENTIALS`]. Grok Build reads a `GROK_AUTH` login ahead of `GROK_AUTH_PATH`'s file
+/// (grok 1.0.70: `GROK_AUTH set but failed to parse as JSON, falling back to file`), and
+/// codex-old 0.164.0 names `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN`, both its own, as
+/// credentials in place of a login (``run `codex login` or set CODEX_API_KEY``; `Use Agent
+/// Identity auth from CODEX_ACCESS_TOKEN`). Kimi Code 2.3.1 runs on an environment model in
+/// place of its home's login and provider while `KIMI_MODEL_NAME` and `KIMI_MODEL_API_KEY` are
+/// set, and sends a `KIMI_CODE_CUSTOM_HEADERS` `Authorization` line in place of the provider's
+/// bearer (both measured, `docs/measured/kimi-credentials-2026-10-24.md`); the name is the
+/// switch, since a name with no key fails the run and a key with no name is never read, so both
+/// go.
+#[must_use]
+pub fn ahead_env(cli: accounts::Cli) -> Vec<&'static str> {
+    cli.connector()
+        .credential_env
+        .iter()
+        .copied()
+        .filter(|name| !KEPT_CREDENTIALS.contains(&(cli, *name)))
+        .collect()
+}
+
+/// Grok Build's flag naming the leader socket its client attaches to (`grok --help`).
+const LEADER_SOCKET_FLAG: &str = "--leader-socket";
+
+/// The variable Grok Build reads its leader socket from beside [`LEADER_SOCKET_FLAG`], which its
+/// client hands a leader it starts (grok 1.0.70's strings).
+const LEADER_SOCKET_ENV: &str = "GROK_LEADER_SOCKET";
+
+/// What Grok Build unified's shared daemon adds to the leader's socket path for its own
+/// (`PATH.daemon`, `grok leader list --help`).
+const LEADER_DAEMON_SUFFIX: &str = ".daemon";
+
+/// The longest socket path `sockaddr_un` holds on this platform, its NUL aside.
+const MAX_SUN_PATH: usize = if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)) {
+    103
+} else {
+    107
+};
+
+/// The leader socket Grok Build's sessions on the row `label`, signed in at the auth file `login`,
+/// share in the grok home `home`: `leader-<label>-<8 hex>.sock`, the hex the top half of the
+/// file's FNV-1a/64, so a renewal that binds the row to a fresh file names a fresh leader. That
+/// is the shape `grok leader list --help` says `grok leader list/kill` still find
+/// (`~/.grok/leader-*.sock`). Where that path and its daemon's (`PATH.daemon`) do not fit
+/// `sockaddr_un`, the name is the FNV-1a/64 of the label, a NUL and the file in hex instead
+/// (`leader-<16 hex>.sock`).
+///
+/// # Errors
+///
+/// `home` is relative, or even the hashed name does not fit.
+pub fn grok_leader_socket(home: &Path, label: &str, login: &str) -> Result<PathBuf, String> {
+    if !home.has_root() {
+        return Err(format!(
+            "the grok home {} is relative, so no leader socket is named in it",
+            home.display()
+        ));
+    }
+    let fits = |path: &Path| {
+        path.to_str()
+            .is_some_and(|p| p.len() + LEADER_DAEMON_SUFFIX.len() <= MAX_SUN_PATH)
+    };
+    let tag = aterm_hash::fnv1a_64(login.as_bytes()) >> 32;
+    let named = home.join(format!("leader-{label}-{tag:08x}.sock"));
+    if fits(&named) {
+        return Ok(named);
+    }
+    let both = aterm_hash::fnv1a_64_extend(aterm_hash::fnv1a_64(label.as_bytes()), b"\0");
+    let both = aterm_hash::fnv1a_64_extend(both, login.as_bytes());
+    let hashed = home.join(format!("leader-{both:016x}.sock"));
+    if fits(&hashed) {
+        return Ok(hashed);
+    }
+    Err(format!(
+        "{} and its daemon's socket do not fit sockaddr_un ({MAX_SUN_PATH} bytes)",
+        hashed.display()
+    ))
+}
+
+/// Whether the carried leader socket `path` is a pool row's ([`grok_leader_socket`]): named
+/// `leader-*.sock`, in the grok home `home` where that was read.
+fn names_row_socket(path: &str, home: Option<&Path>) -> bool {
+    let path = Path::new(path);
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("leader-") && name.ends_with(".sock"))
+        && home.is_none_or(|home| path.parent() == Some(home))
+}
+
+/// What a launch of a pooled CLI's program under one row carries beside the row's login
+/// variable ([`pool_args`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolArgs {
+    /// The variables it removes from the program's environment: the CLI's credential variables
+    /// carried in place of a stored login ([`ahead_env`]), and for Grok Build on a row of its
+    /// own `GROK_LEADER_SOCKET`, so the row's own socket flag is the one read. The default row
+    /// keeps `GROK_LEADER_SOCKET`, a person's own choice whose value the line does not read.
+    pub unset: Vec<&'static str>,
+    /// Its flags: the carried ones, but for a Grok Build `--leader-socket` that may name the
+    /// leader of the login the session ran on. A row of its own drops every carried one and adds
+    /// its own ([`grok_leader_socket`]); the default row drops one that names a row's socket and
+    /// keeps a person's own.
+    pub flags: Vec<String>,
+}
+
+/// [`PoolArgs`] for a launch of `cli` under `env` with the carried `flags`, its leader socket
+/// named in the CLI's home `home` ([`PoolRelaunch::home`]). Grok Build's leader (off by default;
+/// on with `[cli] use_leader = true` or `--leader`) is shared by every client that attaches to
+/// its socket. A client on another row attached to the old socket could stay on the leader's
+/// login (unmeasured: no leader was started with a login), so each row of its own gets a socket
+/// of its own, and the machine's default row adds none (its leader is `grok`'s default one).
+///
+/// # Errors
+///
+/// A Grok Build row of its own whose leader socket cannot be named: no `home`, or
+/// [`grok_leader_socket`]'s refusal.
+pub fn pool_args(
+    cli: accounts::Cli,
+    env: &super::accounts_pool::LoginEnv,
+    home: Option<&Path>,
+    flags: &[String],
+) -> Result<PoolArgs, String> {
+    let mut unset = ahead_env(cli);
+    if cli != accounts::Cli::Grok {
+        return Ok(PoolArgs {
+            unset,
+            flags: flags.to_vec(),
+        });
+    }
+    let drops = |path: &str| env.value.is_some() || names_row_socket(path, home);
+    let mut kept = Vec::with_capacity(flags.len() + 2);
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        if flag == LEADER_SOCKET_FLAG {
+            if let Some(path) = it.next()
+                && !drops(path)
+            {
+                kept.push(flag.clone());
+                kept.push(path.clone());
+            }
+        } else if let Some(path) = flag
+            .strip_prefix(LEADER_SOCKET_FLAG)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if !drops(path) {
+                kept.push(flag.clone());
+            }
+        } else {
+            kept.push(flag.clone());
+        }
+    }
+    if let Some(login) = env.value.as_deref() {
+        let home = home.ok_or_else(|| {
+            format!(
+                "Grok Build's home was not read, so account {}'s leader socket cannot be named",
+                env.label
+            )
+        })?;
+        let socket = grok_leader_socket(home, &env.label, login)?;
+        kept.push(LEADER_SOCKET_FLAG.to_string());
+        kept.push(socket.to_string_lossy().into_owned());
+        unset.push(LEADER_SOCKET_ENV);
+    }
+    Ok(PoolArgs { unset, flags: kept })
 }
 
 /// The argv that resumes session `id` of `cli`'s program, as each CLI's `--help` spells it.
@@ -2522,43 +2730,53 @@ pub fn resume_argv(cli: accounts::Cli, id: &str) -> [String; 2] {
 
 /// The line that relaunches `cli`'s program as `how` says, under the login `env` names
 /// ([`super::accounts_pool::login_env`]): that CLI's variable exported with the row's value, or
-/// unset for the machine's default login. Codex's resume subcommand leads the flags; every other
-/// CLI's resume pair follows them.
+/// unset for the machine's default login, beside [`pool_args`]' removals and flags. A Codex
+/// line is `resume`, the flags, then its thread: the order codex-alab's own relaunch types
+/// ([`super::codex_alab::resume_words`]), whose new TUI the codex-alab driver recognises by the
+/// thread being its last word. codex-old 0.164.0's `codex resume --help` usage begins
+/// `codex resume [OPTIONS] [SESSION_ID]`. Its flags are those [`super::codex_alab::kept_flags`]
+/// keeps, which drops `-i`/`--image` (a value list ahead of the thread would read it as a file)
+/// and every word that is not a flag. Every other CLI's resume pair follows the flags. Nothing
+/// types a pooled Codex line yet: [`super::accounts_pool::session_move`] is its one caller, and
+/// the host does not take that advice.
 ///
 /// # Errors
 ///
-/// Why the dialect cannot spell the line.
+/// [`pool_args`]' refusal, a carried Codex word [`super::codex_alab::kept_flags`] refuses (an
+/// unknown flag, or a flag or subcommand not resumable in place), or why the dialect cannot
+/// spell the line.
 pub fn pool_line(
     how: &PoolRelaunch<'_>,
     cli: accounts::Cli,
     env: &super::accounts_pool::LoginEnv,
 ) -> Result<String, String> {
-    let resume = how.resume.map(|id| resume_argv(cli, id));
-    let resume = resume.iter().flatten().cloned();
+    let PoolArgs { mut unset, flags } = pool_args(cli, env, how.home, how.flags)?;
     let args: Vec<String> = match cli {
-        accounts::Cli::Codex => resume.chain(how.flags.iter().cloned()).collect(),
+        accounts::Cli::Codex => {
+            let argv: Vec<String> = std::iter::once(String::new()).chain(flags).collect();
+            let kept = super::codex_alab::kept_flags(&argv, |_, _| true)
+                .map_err(|why| format!("Codex's carried flags cannot resume a thread: {why}"))?;
+            super::codex_alab::resume_words(kept, how.resume)
+        }
         accounts::Cli::Claude | accounts::Cli::Grok | accounts::Cli::Kimi => {
-            how.flags.iter().cloned().chain(resume).collect()
+            let resume = how.resume.map(|id| resume_argv(cli, id));
+            flags
+                .into_iter()
+                .chain(resume.into_iter().flatten())
+                .collect()
         }
     };
-    match env.value.as_deref() {
-        Some(value) => upgrade::relaunch_line_env(
-            how.dialect,
-            None,
-            how.cd,
-            &[(env.var, value)],
-            how.exe,
-            &args,
-        ),
-        None => upgrade::relaunch_line_env_clear(
-            how.dialect,
-            None,
-            how.cd,
-            &[],
-            &[env.var],
-            how.exe,
-            &args,
-        ),
+    let set: Vec<(&str, &str)> = match env.value.as_deref() {
+        Some(value) => vec![(env.var, value)],
+        None => {
+            unset.insert(0, env.var);
+            Vec::new()
+        }
+    };
+    if unset.is_empty() {
+        upgrade::relaunch_line_env(how.dialect, None, how.cd, &set, how.exe, &args)
+    } else {
+        upgrade::relaunch_line_env_clear(how.dialect, None, how.cd, &set, &unset, how.exe, &args)
     }
 }
 

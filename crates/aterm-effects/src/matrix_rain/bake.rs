@@ -16,7 +16,6 @@ pub const MAX_RAIN_BAKES_PER_TICK: usize = 8;
 /// white-coverage art a glyph (straight RGBA, `255, 255, 255, coverage`), so a
 /// rain cell drawn under the Linear law paints exactly its tint at its
 /// coverage times its alpha.
-#[derive(Default)]
 pub struct RainBaker {
     cell_w: u16,
     cell_h: u16,
@@ -32,7 +31,28 @@ pub struct RainBaker {
     col_off: Vec<u32>,
 }
 
+impl Default for RainBaker {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RainBaker {
+    /// Construct an unbaked tile baker before any frame metric is bound.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cell_w: 0,
+            cell_h: 0,
+            tiles: Vec::new(),
+            version: 0,
+            next_tile: 0,
+            col_seg: Vec::new(),
+            col_off: Vec::new(),
+        }
+    }
     /// Restart the bake whenever `(cell_w, cell_h)` changes.
     #[inline]
     pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {

@@ -53,10 +53,9 @@ pub(crate) struct TypedStamps {
 }
 
 impl Default for TypedStamps {
+    #[inline]
     fn default() -> Self {
-        Self {
-            slots: [None; TYPED_STAMP_DEPTH],
-        }
+        Self::EMPTY
     }
 }
 
@@ -132,14 +131,27 @@ impl HandRow {
 }
 
 impl TypedStamps {
+    pub(crate) const EMPTY: Self = Self {
+        slots: [None; TYPED_STAMP_DEPTH],
+    };
+
     /// Bank one press.
-    pub(crate) fn stamp(&mut self, now: Instant) {
-        if let Some(free) = self.slots.iter().position(Option::is_none) {
-            self.slots[free] = Some(now);
-        } else {
-            self.slots.copy_within(1.., 0);
-            self.slots[TYPED_STAMP_DEPTH - 1] = Some(now);
+    #[inline]
+    pub(crate) const fn stamp(&mut self, now: Instant) {
+        let mut i = 0;
+        while i < TYPED_STAMP_DEPTH {
+            if self.slots[i].is_none() {
+                self.slots[i] = Some(now);
+                return;
+            }
+            i += 1;
         }
+        let mut j = 0;
+        while j + 1 < TYPED_STAMP_DEPTH {
+            self.slots[j] = self.slots[j + 1];
+            j += 1;
+        }
+        self.slots[TYPED_STAMP_DEPTH - 1] = Some(now);
     }
 
     /// Wipe every banked stamp (the class-changing supersede / teardown).
@@ -150,8 +162,8 @@ impl TypedStamps {
 
     /// Take every stamp banked after `at` out of the bank, keeping the rest packed.
     pub(crate) fn split_off_after(&mut self, at: Instant) -> Self {
-        let mut kept = Self::default();
-        let mut later = Self::default();
+        let mut kept = Self::EMPTY;
+        let mut later = Self::EMPTY;
         let (mut nk, mut nl) = (0, 0);
         for t in self.slots.into_iter().map_while(|s| s) {
             if t <= at {
@@ -220,6 +232,7 @@ impl TypedStamps {
     }
 
     /// Whether any banked stamp is still within `window` of `now`.
+    #[inline]
     pub(crate) fn any_fresh(&self, now: Instant, window: f32) -> bool {
         self.slots
             .iter()
@@ -228,11 +241,13 @@ impl TypedStamps {
     }
 
     /// Drop only stamps older than `window`.
+    #[inline]
     pub(crate) fn retire_stale(&mut self, now: Instant, window: f32) {
         self.retain(|t| now.saturating_duration_since(t).as_secs_f32() <= window);
     }
 
     /// The oldest still-fresh stamp, left in place.
+    #[inline]
     pub(crate) fn peek_fresh(&self, now: Instant, window: f32) -> Option<Instant> {
         self.slots
             .iter()
@@ -280,18 +295,21 @@ pub(crate) struct PressCredits {
 }
 
 impl Default for PressCredits {
+    #[inline]
     fn default() -> Self {
-        Self {
-            slots: [None; TYPED_STAMP_DEPTH],
-            occupied: 0,
-            head: 0,
-            held_through: None,
-            admit_held: false,
-        }
+        Self::EMPTY
     }
 }
 
 impl PressCredits {
+    pub(super) const EMPTY: Self = Self {
+        slots: [None; TYPED_STAMP_DEPTH],
+        occupied: 0,
+        head: 0,
+        held_through: None,
+        admit_held: false,
+    };
+
     /// Bank one press worth `credits` cells.
     #[inline]
     pub(super) const fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
@@ -369,6 +387,7 @@ impl PressCredits {
     }
 
     /// The oldest unpaid press, or `None`.
+    #[inline]
     pub(super) fn oldest_unpaid(&self, now: Instant) -> Option<Instant> {
         let (mut free, mut held) = (None::<Instant>, None::<Instant>);
         for (t, _, _) in self.within(now) {
@@ -379,11 +398,13 @@ impl PressCredits {
     }
 
     /// The last press still funding a foreign-row park.
+    #[inline]
     pub(super) fn newest_unpaid(&self, now: Instant) -> Option<Instant> {
         self.within(now).map(|(t, _, _)| t).max()
     }
 
     /// Whether an unpaid press stamped exactly `glyph` within `freshness_s`.
+    #[inline]
     pub(super) fn fresh_glyph(&self, now: Instant, freshness_s: f32, glyph: char) -> bool {
         self.within(now).any(|(at, _, g)| {
             g == Some(glyph) && now.saturating_duration_since(at).as_secs_f32() <= freshness_s
@@ -863,8 +884,8 @@ impl EraseWitness {
 
     /// The retired glyphs still to echo.
     #[inline]
-    pub(super) fn retired(&self) -> &[char] {
-        &self.retired[..usize::from(self.retired_n)]
+    pub(super) const fn retired(&self) -> &[char] {
+        self.retired.split_at(self.retired_n as usize).0
     }
 }
 
@@ -931,8 +952,18 @@ pub struct InsertTally {
     pub last_cells: u16,
 }
 
+impl InsertTally {
+    /// Zeroed delivered-insert tally.
+    pub const EMPTY: Self = Self {
+        delivered: 0,
+        lit: 0,
+        retracted: 0,
+        last_cells: 0,
+    };
+}
+
 /// The delivered-insert seam.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct InsertSeam {
     /// The licence armed by the host when an insert's bytes provably landed.
     pub(super) armed: Option<InsertLicence>,
@@ -989,7 +1020,7 @@ impl OrphanExactRun {
 }
 
 /// What an arm overwrote, restored when that arm is revoked at its exact instant.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct InsertArmUndo {
     /// The still-fresh, unspent licence the newest arm accumulated.
     pub(super) licence: Option<InsertLicence>,
@@ -997,7 +1028,37 @@ pub(super) struct InsertArmUndo {
     pub(super) last_cells: u16,
 }
 
+impl InsertArmUndo {
+    pub(super) const EMPTY: Self = Self {
+        licence: None,
+        last_cells: 0,
+    };
+}
+
+impl Default for InsertArmUndo {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl Default for InsertSeam {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl InsertSeam {
+    pub(super) const EMPTY: Self = Self {
+        armed: None,
+        undo: InsertArmUndo::EMPTY,
+        span: None,
+        pending_hop: None,
+        orphans: None,
+        orphan_exact: None,
+        tally: InsertTally::EMPTY,
+    };
     /// Arm a delivered insert of `cells` at `at` on `row`.
     pub(super) fn arm(
         &mut self,
@@ -1198,6 +1259,18 @@ pub struct InFlightTally {
     pub park_returns: u64,
     /// Held parks flushed through the ordinary body at their own clock.
     pub park_flushed: u64,
+}
+
+impl InFlightTally {
+    /// Zeroed in-flight tally.
+    pub const EMPTY: Self = Self {
+        licensed: 0,
+        forgotten: 0,
+        credits: 0,
+        swallowed_no_echo: 0,
+        park_returns: 0,
+        park_flushed: 0,
+    };
 }
 
 impl CursorGlow {

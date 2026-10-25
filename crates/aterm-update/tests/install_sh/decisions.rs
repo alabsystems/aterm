@@ -155,7 +155,15 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
 /// callers' temporary files go with the run: first_line_bounded's, and those of
 /// a caller around it. The script resets the run's INT trap, as the subshells
 /// and command substitutions bounded mostly runs in do, so bounded's own traps
-/// are what end it.
+/// are what end it. In every row CMD is killed. A Ctrl-\ (the quit row) kills
+/// it too: bounded's subshell used to die of the signal and leave CMD running,
+/// in a process group of its own the terminal's signal never reaches. CMD's
+/// output goes nowhere the call reads, so one that lives on is named (orphan)
+/// and killed once the call's minute is up; the call ticks the batch while it
+/// waits, so the batch's own detector, a minute too, never ends it first. A
+/// QUIT ends bounded's trap by exit 131, never by a death of it, for which
+/// macOS writes a crash report (the cut row runs the trap in the process the
+/// group leader waits on, which bash 3.2's self-kill of it would end by it).
 #[test]
 fn a_ctrl_c_while_bounded_waits_ends_the_run() {
     let scratch = Scratch::new();
@@ -176,9 +184,19 @@ sleep() {
 \t[[ -e \"$go.read\" ]] || { : >\"$go.read\"; read -r _ <\"$go\" || :; }
 \t/bin/sleep \"$@\"
 }
-# The close is an exec of its own: bash 3.2 saves the fd an `exec 9>&- cmd`
-# closes to fd 10 and leaves it open in cmd, so the reader waited out the sleep.
-ctrl_c() { exec 9>\"$go\"; kill -INT -- \"-$G\"; exec 9>&-; exec /bin/sleep 30; }
+# The read ends on a line, not on the close: on macOS a FIFO read begun after
+# the only writer closed can wait for a writer that never comes, and so did
+# the reader, until the sleep ended. The close is an exec of its own: bash 3.2
+# saves the fd an `exec 9>&- cmd` closes to fd 10 and leaves it open in cmd.
+# CMD names its pid (sh's parent) before the signal, for the call to see it end.
+ctrl_c() {
+\tsh -c 'echo \"$PPID\"' >\"$TMPDIR/cmd-$row\"
+\texec 9>\"$go\"
+\tkill -\"$SIG\" -- \"-$G\"
+\techo >&9
+\texec 9>&-
+\texec /bin/sleep 300 >/dev/null 2>&1
+}
 codesign() { ctrl_c; }
 around() {
 \tlocal t
@@ -186,23 +204,28 @@ around() {
 \tlocal BOUNDED_TEMPS=(\"$t\")
 \tfirst_line_bounded ctrl_c
 }
-s=0
+s=0 SIG=INT
 case \"$1\" in
 bounded) bounded 60 ctrl_c || s=$? ;;
+quit) SIG=QUIT; bounded 60 ctrl_c || s=$? ;;
 gate) installed_bundle_verified /nonexistent/aterm.app '' || s=$? ;;
 gone) kill() { if [[ \"$1\" == -KILL ]]; then builtin kill \"$@\"; return 1; fi; builtin kill \"$@\"; }; bounded 60 ctrl_c || s=$? ;;
 temps) around || s=$? ;;
+cut) set -m; /bin/sleep 300 >/dev/null 2>&1 & pid=$!; set +m; echo \"$pid\" >\"$TMPDIR/cmd-$row\"; bounded_cut QUIT 131 ;;
 esac
 echo \"went on ($s)\"
 EOF",
     );
-    let tags = ["bounded", "gate", "gone", "temps"];
+    let tags = ["bounded", "gate", "gone", "temps", "quit", "cut"];
     let calls: Vec<usize> = tags
         .iter()
         .map(|tag| {
             lib.call(
                 format!(
-                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null), $(ls \"$TMPDIR\" | grep -c '^aterm-probe') left\"",
+                    "r=\"$({})\"; p=\"$(cat \"$TMPDIR/cmd-{tag}\" 2>/dev/null)\" i=0 k=nocmd; \
+                     while [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); __tick; done; \
+                     if [ -n \"$p\" ]; then if kill -0 \"$p\" 2>/dev/null; then k=orphan; kill -KILL \"$p\"; else k=killed; fi; fi; \
+                     echo \"$r $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null), $(ls \"$TMPDIR\" | grep -c '^aterm-probe') left, $k\"",
                     group_run(&format!("\"$TMPDIR/ctrl-c.bash\" {tag}"))
                 ),
                 &[],
@@ -210,12 +233,14 @@ EOF",
         })
         .collect();
     let recs = lib.run(&scratch);
+    // A Ctrl-\ ends the run by exit 131 (run_cut), CMD killed all the same.
     for (tag, call) in tags.iter().zip(calls) {
-        assert_eq!(
-            recs[call].out, "signal 2 cleaned, 0 left",
-            "{tag}: {}",
-            recs[call].err
-        );
+        let want = if matches!(*tag, "quit" | "cut") {
+            "exit 131 cleaned, 0 left, killed"
+        } else {
+            "signal 2 cleaned, 0 left, killed"
+        };
+        assert_eq!(recs[call].out, want, "{tag}: {}", recs[call].err);
     }
 }
 
@@ -223,7 +248,8 @@ EOF",
 /// as python3 does while it starts up. Before, bash went on
 /// (wait-and-cooperative-exit): the tools probe read the exit as no Python 3.11,
 /// and a Linux run skipped its app and seeded the toolset, and the binary's
-/// verify exited 1 with Python's error.
+/// verify exited 1 with Python's error. The run's trap also removes the temp
+/// files the step it cut named in BOUNDED_TEMPS, which only bounded's own did.
 #[test]
 fn a_ctrl_c_a_child_catches_ends_the_run() {
     let scratch = Scratch::new();
@@ -241,16 +267,21 @@ trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
 case \"$1\" in
 probe) linux_verifier_ready aarch64 || echo \"went on: $LINUX_VERIFIER_WHY\" ;;
 verify) linux_release_verify \"$TMPDIR\" v1.2.0 example/aterm aarch64 \"$TMPDIR/store\" || echo \"went on ($?)\" ;;
+temps)
+\tt=\"$(mktemp \"$TMPDIR/aterm-probe.t.XXXXXX\")\"
+\tf() { local BOUNDED_TEMPS=(\"$t\"); python3 -c 1 || echo \"went on ($?)\"; }
+\tf
+\t;;
 esac
 EOF",
     );
-    let tags = ["probe", "verify"];
+    let tags = ["probe", "verify", "temps"];
     let calls: Vec<usize> = tags
         .iter()
         .map(|tag| {
             lib.call(
                 format!(
-                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null)\"",
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null) $(ls \"$TMPDIR\" | grep -c '^aterm-probe')\"",
                     group_run(&format!("\"$TMPDIR/caught.bash\" {tag}"))
                 ),
                 &[],
@@ -260,7 +291,290 @@ EOF",
     let recs = lib.run(&scratch);
     for (tag, call) in tags.iter().zip(calls) {
         assert_eq!(
-            recs[call].out, "signal 2 cleaned",
+            recs[call].out, "signal 2 cleaned 0",
+            "{tag}: {}",
+            recs[call].err
+        );
+    }
+}
+
+/// A Ctrl-\ (SIGQUIT) the terminal sends the whole group ends the run once its
+/// EXIT trap has run, by exit 131: bash 5 ignores the signal, so the run read
+/// the child's death of it as an answer and went on, and bash 3.2 died of it
+/// without running the trap. A second one while the run's trap removes the
+/// step's files (the twice row: the rm stand-in sends it), as a key held down
+/// repeats it, skipped the EXIT trap on bash 3.2. Nothing dies of a QUIT here,
+/// a death by a core-dump signal, for which macOS writes a crash report: the
+/// python3 stand-in catches its own and exits, and the rm stand-in starts with
+/// it ignored (run_cut).
+#[test]
+fn a_ctrl_backslash_ends_the_run_after_its_cleanup() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\nexit 0\\n' >\"$TMPDIR/bin/openssl\" && \
+         printf '#!/bin/sh\\ntrap \"exit 1\" QUIT\\nkill -s \"$SIG\" 0\\nexit 1\\n' >\"$TMPDIR/bin/python3\" && \
+         chmod +x \"$TMPDIR/bin/openssl\" \"$TMPDIR/bin/python3\" && cat >\"$TMPDIR/rm\" <<'EOF'
+#!/bin/sh
+[ \"$1 $2\" != \"-f --\" ] || [ -e \"$TMPDIR/again\" ] || { : >\"$TMPDIR/again\"; kill -s \"$SIG\" 0; }
+exec /bin/rm \"$@\"
+EOF
+chmod +x \"$TMPDIR/rm\" && cat >\"$TMPDIR/quit.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+unset ATERM_INSTALL_VERIFIER
+PATH=\"$TMPDIR/bin:$PATH\" LINUX_VERIFIER_SHA256_AARCH64=\"\" LINUX_VERIFIER=\"\" LINUX_ARCH=aarch64 row=$1 SIG=QUIT
+export SIG
+[ \"$1\" != twice ] || cp \"$TMPDIR/rm\" \"$TMPDIR/bin/rm\"
+trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
+linux_verifier_ready aarch64 || echo \"went on: $LINUX_VERIFIER_WHY\"
+EOF",
+    );
+    let calls: Vec<usize> = ["once", "twice"]
+        .iter()
+        .map(|tag| {
+            lib.call(
+                format!(
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null)\"",
+                    group_run(&format!("\"$TMPDIR/quit.bash\" {tag}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for call in calls {
+        assert_eq!(recs[call].out, "exit 131 cleaned", "{}", recs[call].err);
+    }
+}
+
+/// A Ctrl-C while install_linux_app's EXIT trap cleans up never cuts it short:
+/// the fetched verifier's folder and the download both go, and a refusal keeps
+/// its status. Before, a Ctrl-C in the first removal ended the run before the
+/// second.
+#[test]
+fn a_ctrl_c_never_cuts_the_linux_cleanup_short() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/rm\" <<'EOF'
+#!/bin/sh
+[ -e \"$TMPDIR/cut\" ] || { : >\"$TMPDIR/cut\"; kill -s INT 0; }
+exec /bin/rm \"$@\"
+EOF
+chmod +x \"$TMPDIR/bin/rm\" && cat >\"$TMPDIR/linux.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+TMP=\"$TMPDIR/tmp\" LINUX_VERIFIER_DIR=\"$TMPDIR/verifier\"
+mkdir -p \"$TMP\" \"$LINUX_VERIFIER_DIR\" && : >\"$TMP/aterm\" && : >\"$LINUX_VERIFIER_DIR/verify\"
+PATH=\"$TMPDIR/bin:$PATH\"
+trap install_linux_app_cleanup EXIT
+exit 1
+EOF",
+    );
+    let call = lib.call(
+        format!(
+            "echo \"$({})\" $(ls \"$TMPDIR\" | grep -E '^(tmp|verifier|cut)$')",
+            group_run("\"$TMPDIR/linux.bash\"")
+        ),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[call].out, "exit 1 cut", "{}", recs[call].err);
+}
+
+/// A Ctrl-C while --no-toolchain rewrites an aterm.toml in place leaves the file
+/// whole, and the run ends by it once the rewrite is done, its copy gone. Before,
+/// it could land after cat's redirection had emptied the file and before cat
+/// refilled it, which left the file empty and its only copy in TMPDIR. A Ctrl-\
+/// is the same, and so is a TERM or a HUP sent to the shell alone, which bash
+/// answered at once, leaving the copy. The cat stand-in sends each. Once the
+/// rewrite is done, a TERM ends the run at once again (the after row).
+#[test]
+fn a_ctrl_c_never_empties_the_config() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/cat\" <<'EOF'
+#!/bin/sh
+case \"$1:$SIG\" in
+*:) ;;
+*/aterm-config.*:INT | */aterm-config.*:QUIT) kill -s \"$SIG\" 0 ;;
+*/aterm-config.*:*) kill -s \"$SIG\" \"$PPID\" ;;
+esac
+exec /bin/cat \"$@\"
+EOF
+cat >\"$TMPDIR/bin/later\" <<'EOF'
+#!/bin/sh
+kill -s TERM \"$PPID\"
+i=0
+while kill -0 \"$PPID\" 2>/dev/null && [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
+if kill -0 \"$PPID\" 2>/dev/null; then echo waited >\"$TMPDIR/later\"; else echo ended >\"$TMPDIR/later\"; fi
+EOF
+chmod +x \"$TMPDIR/bin/cat\" \"$TMPDIR/bin/later\" && cat >\"$TMPDIR/config.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+export SIG=${1#after} row=$1
+cfg=\"$TMPDIR/aterm-$1.toml\"
+printf '[packages]\\nkeep = 1\\n' >\"$cfg\"
+PATH=\"$TMPDIR/bin:$PATH\"
+trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
+persist_no_toolchain \"$cfg\" >/dev/null || echo \"went on ($?)\"
+[ \"$1\" != after ] || later
+EOF",
+    );
+    let rows = [
+        ("INT", "signal 2"),
+        ("QUIT", "exit 131"),
+        ("HUP", "signal 1"),
+        ("TERM", "signal 15"),
+        ("after", "signal 15"),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(sig, _)| {
+            lib.call(
+                format!(
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{sig}\" 2>/dev/null)\" \
+                     $(printf '[packages]\\nauto_install = false\\nkeep = 1\\n' | cmp -s - \"$TMPDIR/aterm-{sig}.toml\" && echo whole) \
+                     $(ls \"$TMPDIR\" | grep -c '^aterm-config') $(cat \"$TMPDIR/later\" 2>/dev/null)",
+                    group_run(&format!("\"$TMPDIR/config.bash\" {sig}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((sig, end), call) in rows.iter().zip(calls) {
+        let later = if *sig == "after" { " ended" } else { "" };
+        assert_eq!(
+            recs[call].out,
+            format!("{end} cleaned whole 0{later}"),
+            "{sig}: {}",
+            recs[call].err
+        );
+    }
+}
+
+/// A Ctrl-C at any instant of a check leaves none of its temporary files: the
+/// mktemp stand-in sends it once mktemp has run. Before, mktemp made the file
+/// and the step named it in BOUNDED_TEMPS only after, so one caught in between
+/// stayed in TMPDIR. first_line_bounded runs in a command substitution, whose
+/// subshell starts with the run's traps reset, so its file stayed when the
+/// Ctrl-C landed outside bounded (the read row: in its head).
+#[test]
+fn a_ctrl_c_in_a_check_leaves_none_of_its_files() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" \"$TMPDIR/app/Contents/MacOS\" && cat >\"$TMPDIR/bin/mktemp\" <<'EOF'
+#!/bin/sh
+\"$REAL_MKTEMP\" \"$@\"; s=$?
+[ \"$ROW\" = read ] || [ -e \"$TMPDIR/sent-$ROW\" ] || { : >\"$TMPDIR/sent-$ROW\"; kill -s INT 0; }
+exit $s
+EOF
+cat >\"$TMPDIR/bin/head\" <<'EOF'
+#!/bin/sh
+[ \"$ROW\" != read ] || kill -s INT 0
+exec \"$REAL_HEAD\" \"$@\"
+EOF
+printf '#!/bin/sh\\necho aterm 1.0\\n' >\"$TMPDIR/aterm\" && \
+chmod +x \"$TMPDIR/bin/mktemp\" \"$TMPDIR/bin/head\" \"$TMPDIR/aterm\" && cat >\"$TMPDIR/make.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+export ROW=$1 REAL_MKTEMP=\"$(command -v mktemp)\" REAL_HEAD=\"$(command -v head)\"
+printf '[packages]\\nkeep = 1\\n' >\"$TMPDIR/cfg-$1.toml\"
+PATH=\"$TMPDIR/bin:$PATH\"
+trap 'echo cleaned >\"$TMPDIR/cleaned-$ROW\"' EXIT
+case \"$1\" in
+version) linux_candidate_answers_tag \"$TMPDIR/aterm\" v1.0 ;;
+line | read) said=\"$(first_line_bounded \"$TMPDIR/aterm\" --version)\" ;;
+showed) showed_it_ran \"$TMPDIR/aterm\" ;;
+inventory) bundle_showed_it_ran \"$TMPDIR/app\" ;;
+config) persist_no_toolchain \"$TMPDIR/cfg-$1.toml\" ;;
+esac
+echo \"went on ($?)\"
+EOF",
+    );
+    // showed_it_ran asks a program only on macOS.
+    let mut tags = vec!["version", "line", "read", "inventory", "config"];
+    if cfg!(target_os = "macos") {
+        tags.push("showed");
+    }
+    let calls: Vec<usize> = tags
+        .iter()
+        .map(|tag| {
+            lib.call(
+                format!(
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{tag}\" 2>/dev/null)\" \
+                     $(ls \"$TMPDIR\" | grep -cE '^aterm-(probe|programs|config)[.]')",
+                    group_run(&format!("\"$TMPDIR/make.bash\" {tag}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for (tag, call) in tags.iter().zip(calls) {
+        assert_eq!(
+            recs[call].out, "signal 2 cleaned 0",
+            "{tag}: {}",
+            recs[call].err
+        );
+    }
+}
+
+/// A Ctrl-C in a check whose answer goes to a file ends the run with the
+/// cleanup's output reaching the run's own: bounded opens the check's files in
+/// its own subshell (BOUNDED_OUT, BOUNDED_ERR). Before, the check's call was
+/// redirected in the run's shell, so the trap and the EXIT cleanup ran with
+/// their output going into that file, and a NOTE saying how to detach a
+/// mounted image was never shown. The stand-in program sends the Ctrl-C to
+/// the run's group (bounded runs it in a group of its own).
+#[test]
+fn a_ctrl_c_in_a_check_leaves_the_cleanup_its_output() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "printf '#!/bin/sh\\nkill -s INT -- \"-$G\"\\necho aterm 1.0\\n' >\"$TMPDIR/said\" && chmod +x \"$TMPDIR/said\" && \
+         cat >\"$TMPDIR/note.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+export G=$PPID
+trap 'echo NOTE; echo ERRNOTE >&2' EXIT
+case \"$1\" in
+version) linux_candidate_answers_tag \"$TMPDIR/said\" v1.0 ;;
+showed) showed_it_ran \"$TMPDIR/said\" ;;
+esac
+echo \"went on ($?)\"
+EOF",
+    );
+    // showed_it_ran asks a program only on macOS.
+    let mut tags = vec!["version"];
+    if cfg!(target_os = "macos") {
+        tags.push("showed");
+    }
+    let calls: Vec<usize> = tags
+        .iter()
+        .map(|tag| {
+            lib.call(
+                format!(
+                    "echo $({} 2>&1)",
+                    group_run(&format!("\"$TMPDIR/note.bash\" {tag}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for (tag, call) in tags.iter().zip(calls) {
+        assert_eq!(
+            recs[call].out, "NOTE ERRNOTE signal 2",
             "{tag}: {}",
             recs[call].err
         );

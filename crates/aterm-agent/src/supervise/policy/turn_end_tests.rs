@@ -1009,6 +1009,8 @@ fn a_sleep_never_reopens_the_hot_loop_breakers() {
     });
     let mut now = t;
     let mut tripped = false;
+    // Each answer works before the wall cuts it, and a turn is read once, at the point it ended.
+    r.ran_tools = true;
     for _ in 0..40 {
         let a = at(&mut st, &r, now);
         if matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.starts_with("a breaker:")) {
@@ -1019,6 +1021,7 @@ fn a_sleep_never_reopens_the_hot_loop_breakers() {
         r.worked = Some(Duration::from_secs(4));
         now += Duration::from_secs(5);
         st.observe(&r, now);
+        r.worked = None;
     }
     assert!(tripped, "the breaker trips");
     assert_eq!(st.wall_acts_of(RULE_API_RETRY, now).0, WALL_ACTS_PER_WINDOW);
@@ -8609,6 +8612,15 @@ fn the_reset_jitter_is_added_to_the_grace() {
     );
 }
 
+/// A try's answer in words of its own ([`a_wall_no_reset_ends_is_retried_on_the_entitlement_ladder`]).
+const TRY_WORDS: [&str; 5] = [
+    " · now",
+    " · today",
+    " · billing",
+    " · settings",
+    " · account",
+];
+
 fn bucket(reset: Option<Instant>, worked: Duration) -> TurnEndReading {
     let mut r = walled(
         WallKind::ModelBucket { consent: false },
@@ -8634,7 +8646,8 @@ fn a_wall_no_reset_ends_is_retried_on_the_entitlement_ladder() {
         );
         r.reset_at = None;
         let mut now = t;
-        for wait in [30, 120, 360, 360, 360] {
+        // Each try answered in its own words, so no reply comes again past the ladder's rungs; a turn is read once, at the point it ended.
+        for (wait, word) in [30, 120, 360, 360, 360].into_iter().zip(TRY_WORDS) {
             assert!(
                 waits_until(&at_under(&mut st, &r, now, &cfg), now + wait * MIN),
                 "{kind:?} at {now:?}"
@@ -8644,7 +8657,9 @@ fn a_wall_no_reset_ends_is_retried_on_the_entitlement_ladder() {
             assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}");
             st.acted(&a, &r, now);
             r.worked = Some(Duration::from_secs(4));
+            r.wall_message = format!("You're out of usage credits · add funds{word}");
             st.observe(&r, now + Duration::from_secs(5));
+            r.worked = None;
             now += Duration::from_secs(5);
         }
     }
@@ -8829,7 +8844,7 @@ fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
         r.reset_at = None;
         let mut now = t;
         let mut tries = Vec::new();
-        for _ in 0..n {
+        for word in &TRY_WORDS[..n] {
             now = match at_under(&mut st, &r, now, &cfg) {
                 TurnEndAction::WaitUntil { until, .. } => until,
                 other => panic!("{kind:?}: {other:?}"),
@@ -8838,8 +8853,11 @@ fn a_met_try_older_than_its_next_rung_is_owed_at_the_followers_first_point() {
             assert_eq!(a, typed(RULE_LIMIT_RESUME), "{kind:?}");
             st.acted(&a, &r, now);
             tries.push((now, st.limit_try().expect("the limit's try")));
+            // Each try answered in its own words, a turn read once, at the point it ended.
             r.worked = Some(Duration::from_secs(4));
+            r.wall_message = format!("{message}{word}");
             st.observe(&r, now + five);
+            r.worked = None;
             now += five;
         }
         r.worked = None;
@@ -9210,6 +9228,8 @@ fn acts_per_hour(
     let mut per_hour = vec![0usize; hours];
     let mut now = t;
     let horizon = t + Duration::from_secs(hours as u64 * 3600);
+    // Each answer works before the wall cuts it, so no same-reply hold stops the loop and the breaker bounds it.
+    r.ran_tools = true;
     while now < horizon {
         let a = at(st, r, now);
         if a.rule_id() == Some(rule) && !matches!(a, TurnEndAction::WaitUntil { .. }) {
@@ -9218,6 +9238,8 @@ fn acts_per_hour(
             r.worked = Some(Duration::from_secs(busy));
             now += Duration::from_secs(cycle);
             st.observe(r, now);
+            // A turn is read once, at the point it ended.
+            r.worked = None;
             continue;
         }
         match a {
@@ -16151,6 +16173,52 @@ fn the_run_of_no_work_answers_holds_only_while_the_screen_shows_its_newest_reply
     // The program started again since the books: another process's replies.
     st.launched_since_books();
     assert!(!st.repeats(&shown), "{:?}", st.replies());
+}
+
+#[test]
+fn the_programs_own_long_turn_that_ran_no_tool_counts_as_an_acts_answer_does() {
+    let kept = idle("Still waiting on the background suite.", None);
+    let seeded = Replies {
+        run: 2,
+        ..Replies::of(&[Kept {
+            mark: reply_mark(&kept),
+            answers: 1,
+            walled: false,
+            tries: 0,
+        }])
+    };
+    let long = |said: &str| TurnEndReading {
+        ran_tools: false,
+        ..idle(said, Some(4 * MIN))
+    };
+    let after = |reading: &TurnEndReading| {
+        let mut st = TurnEndState::default();
+        st.seed_replies(seeded, MIN, t0());
+        st.observe(reading, t0() + MIN);
+        st
+    };
+    // Its own words again after a long spell with no tool row: no work, one more in the run, and held.
+    let st = after(&long("Still waiting on the background suite."));
+    assert_eq!(st.replies().run, 3, "{:?}", st.replies());
+    assert!(st.repeats(&kept), "{:?}", st.replies());
+    // In new words it is work where tool rows are read: the run starts afresh.
+    let st = after(&long("Reworked the parser; the suite is building."));
+    assert_eq!(st.replies().run, 0, "{:?}", st.replies());
+    // At a read wall it is no work whatever its words, as an act's answer is.
+    let wall = TurnEndReading {
+        ran_tools: false,
+        ..walled(
+            WallKind::Overloaded,
+            "Overloaded · try again soon",
+            Some(4 * MIN),
+        )
+    };
+    assert_eq!(
+        after(&wall).replies().run,
+        3,
+        "{:?}",
+        after(&wall).replies()
+    );
 }
 
 #[test]

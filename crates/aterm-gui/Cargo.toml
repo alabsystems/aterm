@@ -56,6 +56,16 @@ path = "benches/deck_frame_cost.rs"
 harness = false
 required-features = ["bench-support"]
 
+# An open overlay card's redraw (the Overview's and the palette's tray, then its
+# raster) at 1x, 2x and 2x with the width cap in device pixels, timed: a
+# measurement, not a gate; by hand it is
+# `targo --unverified bench -p aterm-gui --features bench-support --bench overlay_card_cost`.
+[[bench]]
+name = "overlay_card_cost"
+path = "benches/overlay_card_cost.rs"
+harness = false
+required-features = ["bench-support"]
+
 # The byte arm's C cut (card engine §3.6), timed over `verify perf
 # throughput`'s corpus without and with the cut; by hand it is
 # `targo --unverified bench -p aterm-gui --features bench-support --bench c_cut_cost`.

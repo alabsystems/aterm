@@ -55,25 +55,10 @@ pub fn is_label(text: &str) -> bool {
             })
 }
 
-fn xml_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// Render the launchd plist for `label` running `program caffeine serve` ([`EXIT_RESTART`]).
 #[must_use]
 pub fn plist_text(label: &str, program: &Path, log: &Path, bundle_id: Option<&str>) -> String {
-    let string = |s: &str| format!("<string>{}</string>", xml_escape(s));
+    let string = |s: &str| format!("<string>{}</string>", aterm_codec::xml::escape(s));
     let mut args = String::new();
     for arg in std::iter::once(program.to_string_lossy().as_ref()).chain(SERVE_ARGS) {
         args.push_str(&format!("\t\t{}\n", string(arg)));
@@ -706,16 +691,6 @@ mod tests {
         ));
         let bare = plist_text("l", Path::new("/t/aterm"), Path::new("/l.log"), None);
         assert!(!bare.contains("AssociatedBundleIdentifiers"));
-    }
-
-    #[test]
-    fn xml_escaping_covers_the_five_entities() {
-        assert_eq!(
-            xml_escape("a&b<c>d\"e'f"),
-            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
-        );
-        assert_eq!(xml_escape("&amp;"), "&amp;amp;");
-        assert_eq!(xml_escape("plain/π"), "plain/π");
     }
 
     /// `plutil -lint` reads the plist as launchd will: well formed, with and without the

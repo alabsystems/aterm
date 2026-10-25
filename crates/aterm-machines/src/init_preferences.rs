@@ -106,6 +106,26 @@ pub fn setting_of(id: &str) -> Option<Setting> {
         .map(|(setting, _)| setting)
 }
 
+/// The System State row whose items write the preference `key` of `domain` (a ByHost key
+/// too), read off the keys the items themselves write: a model's Caps Lock mapping, the
+/// trackpad's keys, and each desktop item's. `None` for a key no item of this build writes,
+/// such as one an older aterm backed up.
+#[must_use]
+pub fn setting_of_preference(domain: &str, key: &str) -> Option<Setting> {
+    if domain == "-g" && keyboard::Model::of_key(key).is_some() {
+        return Some(Setting::CapsLock);
+    }
+    crate::init_trackpad::setting_of(domain, key).or_else(|| {
+        desktop()
+            .find(|(_, kind)| {
+                kind.keys()
+                    .iter()
+                    .any(|(each_domain, each_key, _)| *each_domain == domain && *each_key == key)
+            })
+            .map(|(setting, _)| setting)
+    })
+}
+
 /// The ids of this build's items that `id`, from a record an older aterm wrote, stands for:
 /// `init.widgets@<user>` stands for each `[consumer] widgets` row's own item (where `withheld`,
 /// only those whose domain is in another app's container), and any other id for itself.
@@ -1349,7 +1369,7 @@ fn dock_app_path(pin: &PValue) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::init::Workstation;
     use crate::items::defaults::tests::{ctx, export, user};
@@ -1375,7 +1395,7 @@ mod tests {
             .collect()
     }
 
-    fn installed_dock_apps(sys: &Fake, who: &User) {
+    pub(crate) fn installed_dock_apps(sys: &Fake, who: &User) {
         for (path, bundle, _) in DOCK_APPS {
             installed_at(sys, who, path, bundle);
         }

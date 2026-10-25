@@ -49,6 +49,9 @@ enum Chosen {
     Wrapped(Vec<usize>),
     /// None is marked: option 1.
     Unmarked,
+    /// None is marked and option 1 names a destructive act (`why`, as "would <word>"): `took`,
+    /// the first option that names none and keeps no answer ([`unmarked_pick`]).
+    FirstSafe { why: String, took: String },
 }
 
 /// What a key's ledger row says where its option was chosen as marked `(Recommended)`.
@@ -56,6 +59,10 @@ pub const CHOSE_RECOMMENDED: &str = "answered with its recommended option";
 
 /// Ledger label when no option was marked and the first was taken ([`Chosen::Unmarked`]).
 pub const CHOSE_UNMARKED: &str = "no option is marked (Recommended): option 1";
+
+/// Ledger label when no option was marked and option 1 was passed over for the first option that
+/// names no destructive act and keeps no answer ([`Chosen::FirstSafe`]).
+pub const CHOSE_FIRST_SAFE: &str = "no option is marked (Recommended), and option 1 is passed over";
 
 impl Chosen {
     fn unproven(&self) -> String {
@@ -69,6 +76,10 @@ impl Chosen {
                     .join(", ")
             ),
             Chosen::Unmarked => CHOSE_UNMARKED.to_string(),
+            Chosen::FirstSafe { why, took } => format!(
+                "{CHOSE_FIRST_SAFE}: option 1 {why}, so {took}, the first that names no \
+                 destructive act and keeps no answer"
+            ),
         }
     }
 }
@@ -98,10 +109,18 @@ fn recommended(options: &[QuestionOption]) -> (Vec<u8>, Chosen) {
     (vec![1], Chosen::Unmarked)
 }
 
-/// The options the window answers a question with, by number ([`recommended`]).
+/// The options the window answers a question with, by number: the ones marked `(Recommended)`, else
+/// the one [`unmarked_pick`] takes (option 1 where it cannot take one: the decision escalates
+/// there, so no answer is made from this set).
 #[must_use]
 pub fn recommended_set(options: &[QuestionOption]) -> Vec<u8> {
-    recommended(options).0
+    match recommended(options) {
+        (_, Chosen::Unmarked) => {
+            unmarked_pick(options, |o| (o.label.as_str(), o.description.as_str()))
+                .map_or_else(|_| vec![1], |(k, _)| vec![options[k].n])
+        }
+        (marked, _) => marked,
+    }
 }
 
 /// Where `focus` stands in the dialog's focus order, from 0.
@@ -358,6 +377,54 @@ pub fn text_keeps_its_rows(text: &str, cols: u16, label_col: usize) -> bool {
         (Some(drawn), Some(laid_out)) => drawn == laid_out,
         _ => false,
     }
+}
+
+/// The destructive word the question's own row names: an act every answer to it bears on.
+fn asks_to(question: &QuestionText) -> Option<&'static str> {
+    super::turn_end::destructive_word(&question.text.to_lowercase())
+}
+
+/// The destructive word one option's own label or description names.
+fn option_would(label: &str, description: &str) -> Option<&'static str> {
+    super::turn_end::destructive_word(&format!("{label}\n{description}").to_lowercase())
+}
+
+/// THE OPTION AN UNMARKED QUESTION IS ANSWERED WITH, where its own row names no destructive act
+/// ([`asks_to`]): option 1 (the documented fallback, `Ok((0, None))`), unless option 1's own
+/// words name one; then the first option whose own words name none and keep no answer
+/// ([`kept`]), with why option 1 was passed over (`Ok((k, Some("would <word>")))`).
+///
+/// A destructive word in one option's text is a fact about that option alone: answering with
+/// another option approves none of it. Before 2026-10-24 any such word anywhere in the dialog sent
+/// the whole question to a person; under Land a question whose option 1 described a bug in words
+/// holding `reset` waited 44 minutes that way (`claude-2.1.310-question-reset-in-description.txt`).
+/// `Err` only where every option names a destructive act or keeps its answer: then no option
+/// refuses the act either (a refusal names none), and a person answers it.
+fn unmarked_pick<T>(
+    options: &[T],
+    said: impl Fn(&T) -> (&str, &str),
+) -> Result<(usize, Option<String>), String> {
+    let Some(first) = options.first() else {
+        return Err("a question with no option to answer".to_string());
+    };
+    let (label, description) = said(first);
+    let Some(w) = option_would(label, description) else {
+        return Ok((0, None));
+    };
+    options
+        .iter()
+        .position(|o| {
+            let (label, description) = said(o);
+            option_would(label, description).is_none() && kept(label, description).is_none()
+        })
+        .map(|k| (k, Some(format!("would {w}"))))
+        .ok_or_else(|| {
+            format!(
+                "a question with no recommended option whose every option names a destructive \
+                 act or a kept answer (option 1 would {w}), and no one option that refuses it: a \
+                 person answers that"
+            )
+        })
 }
 
 fn destructive(question: &QuestionText, options: &[QuestionOption]) -> Option<&'static str> {
@@ -1078,16 +1145,25 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
     };
     let mut o = chosen.unwrap_or(first);
     if chosen.is_none() {
-        let mut text = format!("{}\n{}", prompt.title, prompt.description).to_lowercase();
-        for o in &answers {
-            text.push('\n');
-            text.push_str(&o.label.to_lowercase());
-        }
-        if let Some(w) = super::turn_end::destructive_word(&text) {
+        let asked = format!("{}\n{}", prompt.title, prompt.description).to_lowercase();
+        if let Some(w) = super::turn_end::destructive_word(&asked) {
             match the_refusal(w, &answers, |o| o.label.clone()) {
                 Ok(refusal) => {
                     o = refusal;
                     how = refused(w);
+                }
+                Err(why) => return Decision::escalate(why),
+            }
+        } else {
+            match unmarked_pick(&answers, |o| (o.label.as_str(), "")) {
+                Ok((_, None)) => {}
+                Ok((k, Some(why))) => {
+                    o = answers[k];
+                    how = Chosen::FirstSafe {
+                        why,
+                        took: format!("`{}`", o.label),
+                    }
+                    .unproven();
                 }
                 Err(why) => return Decision::escalate(why),
             }
@@ -1188,8 +1264,8 @@ fn stay_on_model(dialog: &QuestionDialog) -> Option<TextChosen> {
 }
 
 fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), String> {
-    let no_mark_that_would = |question: &QuestionText, options: &[QuestionOption]| {
-        destructive(question, options).map(|w| {
+    let no_mark_that_would = |question: &QuestionText| {
+        asks_to(question).map(|w| {
             format!("a question with no recommended option that would {w}: a person answers that")
         })
     };
@@ -1226,11 +1302,20 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
             if !free_text.pristine || free_text.checked == Some(true) {
                 return Err(begun("text in its free-text row"));
             }
-            let (marked, how) = recommended(options);
-            if how == Chosen::Unmarked
-                && let Some(why) = no_mark_that_would(question, options)
-            {
-                return Err(why);
+            let (mut marked, mut how) = recommended(options);
+            if how == Chosen::Unmarked {
+                if let Some(why) = no_mark_that_would(question) {
+                    return Err(why);
+                }
+                if let (k, Some(why)) =
+                    unmarked_pick(options, |o| (o.label.as_str(), o.description.as_str()))?
+                {
+                    marked = vec![options[k].n];
+                    how = Chosen::FirstSafe {
+                        why,
+                        took: format!("option {}", options[k].n),
+                    };
+                }
             }
             if let Some(why) = options
                 .iter()
@@ -1302,11 +1387,24 @@ fn choose_one(
     options: &[QuestionOption],
 ) -> Result<(AnswerTarget, String, String), String> {
     let (marked, how) = recommended(options);
-    let (o, unproven) = match destructive(question, options) {
-        Some(w) if how == Chosen::Unmarked => (
+    let (o, unproven) = match (&how, asks_to(question)) {
+        (Chosen::Unmarked, Some(w)) => (
             the_refusal(w, options, |o| format!("{}\n{}", o.label, o.description))?,
             refused(w),
         ),
+        (Chosen::Unmarked, None) => {
+            let (k, passed) =
+                unmarked_pick(options, |o| (o.label.as_str(), o.description.as_str()))?;
+            let o = &options[k];
+            let how = match passed {
+                None => Chosen::Unmarked,
+                Some(why) => Chosen::FirstSafe {
+                    why,
+                    took: format!("option {}", o.n),
+                },
+            };
+            (o, how.unproven())
+        }
         _ => (
             options
                 .iter()

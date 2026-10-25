@@ -133,7 +133,7 @@ fn relaunchable(
 }
 
 /// WHETHER THE ACT IS OFFERED FOR PROCESS `pid` IN TAB `sid` as far as a word outside the
-/// session can tell (the Claude Code footer's `weekly ? · restart tab`): the host's published
+/// session can tell (the Claude Code footer's `weekly ? · until relaunch`): the host's published
 /// snapshot names that process (else `not-the-hosts-agent`: an Autopilot-off tab has none) and
 /// its relaunch would bring it back (else `not-relaunchable`, a program with no shell under it
 /// among them). The host's hand (`not-supervised`, `halted`, a driver's lease or turn) is the

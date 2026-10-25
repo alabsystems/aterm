@@ -291,10 +291,25 @@ mod system_state_host;
 mod workstation_setup;
 #[cfg(target_os = "macos")]
 pub use devtools_helper_drive::run_devtools_helper_drive;
+pub use quit_reopen::{REOPEN_VERB, run_reopen_after};
 pub use system_state::{
     Admission as InitialSetupAdmission, InitialSetupPermissionPolicy, SetupCheck, SetupOperation,
-    SetupStatus, SetupStatusRow,
+    SetupStatus, SetupStatusRow, pass_rows, restore_rows,
 };
+/// Mend this Mac's vault subscriber off the event loop, at once and every
+/// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
+/// setup is finished, or a run that just finished. One mend lane per process.
+pub fn mend_secrets_subscriber() {
+    mend_secrets_subscriber_once(false);
+}
+
+fn mend_secrets_subscriber_once(headless: bool) {
+    static MENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !headless && !MENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        secrets_join::spawn_mend_lane(headless, app_config::config_path());
+    }
+}
+
 pub use system_state_host::{
     CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
     set_initial_setup_handlers,
@@ -326,6 +341,26 @@ pub fn settings_frame_cost(frames: usize) -> Vec<(&'static str, f64, f64, f64)> 
     settings_frame_probe::settings_frame_cost(frames)
         .into_iter()
         .map(|c| (c.what, c.p50_us, c.p90_us, c.p99_us))
+        .collect()
+}
+#[cfg(feature = "bench-support")]
+mod overlay_card_probe;
+/// What the `overlay_card_cost` bench measures: per card and scale, what it timed (with the
+/// card's raster in pixels) and µs per redraw at p50, p90 and p99.
+#[cfg(feature = "bench-support")]
+#[doc(hidden)]
+#[must_use]
+pub fn overlay_card_cost(frames: usize) -> Vec<(String, f64, f64, f64)> {
+    overlay_card_probe::overlay_card_cost(frames)
+        .into_iter()
+        .map(|c| {
+            (
+                format!("{} {}x{} px", c.what, c.px.0, c.px.1),
+                c.p50_us,
+                c.p90_us,
+                c.p99_us,
+            )
+        })
         .collect()
 }
 #[cfg(all(feature = "bench-support", debug_assertions))]
@@ -528,6 +563,7 @@ mod logging;
 mod manual_reset;
 mod markdown;
 mod menu;
+mod merged_marks;
 mod metrics;
 use aterm_effects::motion;
 mod bounded_child;
@@ -597,6 +633,7 @@ mod kitty_animation;
 mod login_notice_verb;
 #[cfg(target_os = "macos")]
 mod memory_pressure;
+mod merged_plan;
 mod needs;
 mod predict_seen;
 #[cfg(any(test, debug_assertions))]
@@ -609,6 +646,7 @@ mod program_state;
 mod proxy;
 mod pty_idem;
 mod qos;
+mod quit_reopen;
 mod quit_safety;
 mod reader_guard;
 #[cfg(unix)]
@@ -657,6 +695,7 @@ mod split_regrid_hold;
 mod startup_token;
 mod stats_deck;
 mod stats_lens;
+mod stats_merged;
 mod stats_paint;
 mod stats_plan;
 mod stats_sill;
@@ -10160,11 +10199,15 @@ impl App {
         self.devtools_hand_over_carrying(origin, moment, None)
     }
 
+    /// The facts [`devtools_helper::admit`] judges, and whether the window's own Full Disk Access
+    /// reading is still out ([`aterm_containment::consent::ProbeLabel::Pending`]): its answer
+    /// lives `[privacy] probe_interval_ms`, and a read after that sends a new probe and says
+    /// nothing yet.
     fn devtools_admit_facts(
         &mut self,
         origin: devtools_helper::Origin,
         now: Instant,
-    ) -> (devtools_helper::Reading, devtools_helper::Facts) {
+    ) -> (devtools_helper::Reading, devtools_helper::Facts, bool) {
         let reading = self.devtools_reading();
         let reach = self.devtools_helper.reach();
         let key = self.access_marks().devtools;
@@ -10175,6 +10218,7 @@ impl App {
                 (reach.last_declined)().as_ref(),
                 (reach.declined)().is_some(),
             );
+        let fda = self.consent_panel_facts();
         let facts = devtools_helper::Facts {
             grant: reading.grant,
             list: reading.list,
@@ -10186,9 +10230,37 @@ impl App {
                 || (origin == devtools_helper::Origin::Ctl { now: true }
                     && (self.devtools_helper.now_answered_within_its_minute(now)
                         || self.devtools_helper.fda_first())),
-            fda_on: self.consent_panel_facts().fda == aterm_containment::consent::FdaState::Granted,
+            fda_on: fda.fda == aterm_containment::consent::FdaState::Granted,
         };
-        (reading, facts)
+        (
+            reading,
+            facts,
+            fda.probe == aterm_containment::consent::ProbeLabel::Pending,
+        )
+    }
+
+    /// The automatic step, refused for Full Disk Access
+    /// ([`devtools_helper::Refusal::NoFullDiskAccess`]) while the window's own reading of it was
+    /// still out, has had no answer: that reading lives `[privacy] probe_interval_ms` and the
+    /// step's quiet moment comes [`devtools_helper::QUIET_FOR`] after it was asked, so a read
+    /// then is often out. It waits a [`devtools_helper::PANEL_TICK`], by when the probe that read
+    /// sent has answered, with the answer of any `spctl` run it `carried`, as the Full Disk
+    /// Access step waits for its own reading (`App::look_for_fda_moment`).
+    fn hold_devtools_for_fda_reading(
+        &mut self,
+        origin: devtools_helper::Origin,
+        carried: Option<Result<(), String>>,
+        now: Instant,
+    ) -> devtools_helper::HandOver {
+        match carried {
+            Some(listed) => self
+                .devtools_helper
+                .queue_after_listing(origin, now, listed),
+            None => self.devtools_helper.queue(origin, now),
+        }
+        self.devtools_helper
+            .defer(now + devtools_helper::PANEL_TICK);
+        devtools_helper::HandOver::Queued
     }
 
     fn devtools_moment_is_quiet(&self, now: Instant) -> bool {
@@ -10225,8 +10297,11 @@ impl App {
             }
             return HandOver::Queued;
         }
-        let (reading, facts) = self.devtools_admit_facts(origin, now);
+        let (reading, facts, fda_pending) = self.devtools_admit_facts(origin, now);
         let answer = match devtools_helper::admit(origin, moment, &facts) {
+            Admit::Refuse(devtools_helper::Refusal::NoFullDiskAccess) if fda_pending => {
+                self.hold_devtools_for_fda_reading(origin, carried, now)
+            }
             Admit::Refuse(why) => HandOver::Refused(why),
             Admit::Queue => {
                 self.devtools_helper.queue(origin, now);
@@ -11877,13 +11952,18 @@ impl App {
                 .queue_after_listing(origin, now, listed);
             return HandOver::Queued;
         }
-        let (_, facts) = self.devtools_admit_facts(origin, now);
+        let (_, facts, fda_pending) = self.devtools_admit_facts(origin, now);
         let moment = if origin.system_state_step() {
             self.access_step_moment(now)
         } else {
             self.devtools_moment_is_quiet(now)
         };
         let answer = match devtools_helper::admit(origin, devtools_helper::Moment::Quiet, &facts) {
+            devtools_helper::Admit::Refuse(devtools_helper::Refusal::NoFullDiskAccess)
+                if fda_pending =>
+            {
+                self.hold_devtools_for_fda_reading(origin, Some(listed), now)
+            }
             devtools_helper::Admit::Refuse(why) => HandOver::Refused(why),
             _ if !moment => {
                 self.devtools_helper
@@ -24797,7 +24877,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             && aterm_types::dirs::runs_under_private_state_root()
             && aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP").is_some());
     if !unified_setup {
-        secrets_join::spawn_mend_lane(headless, app_config::config_path());
+        mend_secrets_subscriber_once(headless);
     }
     spawn::prime_agents_if_due(spawn::PrimeCue::Launch);
     let carry_frame = seamless_window.clone();
@@ -26500,6 +26580,10 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     let input_replies = control::input_replies_of(&app.store);
     if !control::settle_final_replies(std::time::Duration::from_millis(500), &input_replies) {
         aterm_log::warn!("exiting with a control reply still undelivered after 500 ms");
+    }
+    #[cfg(target_os = "macos")]
+    if app.desk.kept() {
+        quit_reopen::leave_reopen_at_quit();
     }
     #[cfg(unix)]
     aterm_log::info!("{}", recovery_census::QUIT_LINE);

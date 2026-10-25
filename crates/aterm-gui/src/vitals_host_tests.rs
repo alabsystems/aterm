@@ -2153,12 +2153,17 @@ fn feed(app: &crate::App, bytes: &[u8]) {
 /// Feeds `bytes` to tab `tab`'s engine as its PTY reader does, counting the move and feeding the
 /// jobs feed.
 fn feed_tab(app: &crate::App, tab: u64, bytes: &[u8]) {
+    feed_tab_at(app, tab, bytes, Instant::now);
+}
+
+/// [`feed_tab`] with the feed stamped by `clock`.
+fn feed_tab_at(app: &crate::App, tab: u64, bytes: &[u8], clock: impl FnOnce() -> Instant) {
     let s = app.pool.get(tab).expect("the tab");
     s.ctx.job_feed.read(bytes);
     let mut t = s.term.lock().unwrap_or_else(PoisonError::into_inner);
     t.process(bytes);
     let moved = s.ctx.screen_moves.fed(crate::control::screen_gen(&t));
-    s.ctx.job_feed.fed(&t, bytes, moved, Instant::now);
+    s.ctx.job_feed.fed(&t, bytes, moved, clock);
 }
 
 const MUSE_RESET: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[5;3H";
@@ -2952,58 +2957,132 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
     assert!(read_req(&rx, "its redraw is an edge").jobs_now);
 }
 
-/// The real probe thread ([`run`]) reads a raw program at the person's read and hands its view
-/// back with the request's words; the loop names the park from them (the job's group, the word's
-/// raw mode and the input driven before it).
+/// What a [`ThreadEngine`] reading saw: whether a worker's pull asked it, the wait its view names
+/// for tab 0's live job, and whether the view parks tab 0 at the person's read.
 #[cfg(target_os = "macos")]
-#[test]
-fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
-    struct Engine {
-        vitals: aterm_vitals::Vitals,
-        pass: crate::vitals_jobs::JobsPass,
-        t0: Instant,
-        seq: u64,
-    }
-    impl Source for Engine {
-        fn reading(&mut self, req: &Request) -> Snapshot {
-            self.seq += 1;
-            let sweep = aterm_sysprobe::processes().expect("this machine's process table");
-            let at_ms = 1_000 + u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(0);
-            Snapshot {
-                seq: self.seq,
-                jobs: jobs_step(
-                    &mut self.pass,
-                    &req.tab_reads(epoch_of(at_ms), Instant::now),
-                    Some(&sweep.procs),
-                    req,
-                    false,
-                ),
-                ..Snapshot::default()
-            }
-        }
-        fn model(&mut self) -> &mut aterm_vitals::Vitals {
-            &mut self.vitals
-        }
-    }
-    static BOARD: JobsBoard = JobsBoard::new();
-    let job = JobAtRest::new(true);
-    let sink = Arc::new(aterm_session::sink::SinkWriter::new(job.master()));
-    let input = sink.driven_input();
-    let mut app = crate::App::headless_for_test_with_sink(sink);
-    app.pool.sessions.get_mut(&0).expect("tab 0").session.pid =
-        i32::try_from(job.leader.as_ref().expect("owned leader").id()).expect("pid");
-    app.vitals.board = &BOARD;
-    app.vitals.start(
-        || Engine {
+type EngineSaw = (bool, Option<aterm_vitals::jobs::WaitName>, bool);
+
+/// What a [`ThreadEngine`] does once, on the probe thread, right after the first reading a pull
+/// asks of it: a write between a cold pull's pair of readings.
+#[cfg(target_os = "macos")]
+type Between = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// A probe thread's source that steps the stuck engine over this machine's process table, as the
+/// thread's [`Reader`] does, and keeps what each reading saw. Its clock runs a minute ahead at
+/// each reading, so the engine, which looks again only once its own cadence is due (a pull asks
+/// with `jobs_now` off), looks at every one.
+#[cfg(target_os = "macos")]
+struct ThreadEngine {
+    vitals: aterm_vitals::Vitals,
+    pass: crate::vitals_jobs::JobsPass,
+    t0: Instant,
+    seq: u64,
+    saw: Arc<Mutex<Vec<EngineSaw>>>,
+    /// Whether every pull is cold ([`Source::split_cold`]): read as a pair, [`COLD_PAIR`] apart.
+    cold: bool,
+    between: Between,
+}
+
+#[cfg(target_os = "macos")]
+impl ThreadEngine {
+    fn new(saw: Arc<Mutex<Vec<EngineSaw>>>) -> Self {
+        Self {
             vitals: aterm_vitals::Vitals::new(),
             pass: crate::vitals_jobs::JobsPass::new(),
             t0: Instant::now(),
             seq: 0,
-        },
-        || true,
-        None,
-        None,
-    );
+            saw,
+            cold: false,
+            between: Between::default(),
+        }
+    }
+
+    /// An engine whose every pull is a cold pair, running `between` after the first reading a pull
+    /// asks of it.
+    fn cold(saw: Arc<Mutex<Vec<EngineSaw>>>, between: Between) -> Self {
+        Self {
+            cold: true,
+            between,
+            ..Self::new(saw)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Source for ThreadEngine {
+    fn reading(&mut self, req: &Request) -> Snapshot {
+        self.seq += 1;
+        let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+        let at_ms = self.seq * 60_000 + u64::try_from(self.t0.elapsed().as_millis()).unwrap_or(0);
+        let jobs = jobs_step(
+            &mut self.pass,
+            &req.tab_reads(epoch_of(at_ms), Instant::now),
+            Some(&sweep.procs),
+            req,
+            false,
+        );
+        let wait = jobs.as_ref().and_then(|view| {
+            view.rows
+                .iter()
+                .find(|r| r.tab == 0 && r.verdict != aterm_vitals::jobs::Verdict::Exited)
+                .and_then(|r| r.wait.as_ref().map(|w| w.name))
+        });
+        let parks = jobs
+            .as_ref()
+            .is_some_and(|view| view.parked_tabs.contains(&0));
+        self.saw
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((req.pull, wait, parks));
+        if req.pull {
+            let between = self
+                .between
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(between) = between {
+                between();
+            }
+        }
+        Snapshot {
+            seq: self.seq,
+            jobs,
+            ..Snapshot::default()
+        }
+    }
+    fn model(&mut self) -> &mut aterm_vitals::Vitals {
+        &mut self.vitals
+    }
+    fn split_cold(&self) -> bool {
+        self.cold
+    }
+}
+
+/// An app over `job`'s terminal whose real probe thread ([`run`]) reads with a [`ThreadEngine`]
+/// keeping what it saw in `saw`, and the park its first reading at an edge makes of tab 0.
+#[cfg(target_os = "macos")]
+fn parked_by_the_thread(
+    job: &JobAtRest,
+    board: &'static JobsBoard,
+    saw: &Arc<Mutex<Vec<EngineSaw>>>,
+) -> (crate::App, Parked) {
+    let saw = Arc::clone(saw);
+    parked_by_the_thread_with(job, board, move || ThreadEngine::new(saw))
+}
+
+/// [`parked_by_the_thread`] with the thread's engine `engine` makes.
+#[cfg(target_os = "macos")]
+fn parked_by_the_thread_with(
+    job: &JobAtRest,
+    board: &'static JobsBoard,
+    engine: impl FnOnce() -> ThreadEngine + Send + 'static,
+) -> (crate::App, Parked) {
+    let sink = Arc::new(aterm_session::sink::SinkWriter::new(job.master()));
+    let mut app = crate::App::headless_for_test_with_sink(sink);
+    app.pool.sessions.get_mut(&0).expect("tab 0").session.pid =
+        i32::try_from(job.leader.as_ref().expect("owned leader").id()).expect("pid");
+    app.vitals.board = board;
+    app.vitals.start(engine, || true, None, None);
     assert!(app.vitals.parked.is_empty(), "nothing read: nothing parked");
     app.vitals.note_edge();
     let park = aterm_spec::wait::within(
@@ -3017,6 +3096,19 @@ fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
         },
     )
     .expect("the thread's reading parks tab 0");
+    (app, park)
+}
+
+/// The real probe thread ([`run`]) reads a raw program at the person's read and hands its view
+/// back with the request's words; the loop names the park from them (the job's group, the word's
+/// raw mode and the input driven before it).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let (mut app, park) = parked_by_the_thread(&job, &BOARD, &Arc::default());
+    let input = app.pool.get(0).expect("tab 0").ctx.sink.driven_input();
     assert_eq!(
         i32::try_from(park.pgid).ok(),
         job.job,
@@ -3032,6 +3124,125 @@ fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
         },
         "the word the request carried"
     );
+    assert!(
+        app.vitals.stop_at_exit(aterm_spec::wait::MUST_HAPPEN),
+        "the thread ended"
+    );
+}
+
+/// A worker's pull reads each terminal's word afresh. The loop parks a raw program from the
+/// reading that named its wait and builds no request after it, so a redraw past that reading (an
+/// agent's last of its turn) left the word the thread held stamped before that output: the first
+/// `sys jobs` after a turn named no wait, and the loop read again 2 s later before it rested.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pull_after_the_last_redraw_reads_the_word_afresh_and_arms_nothing() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let saw = Arc::default();
+    let (mut app, _) = parked_by_the_thread(&job, &BOARD, &saw);
+    assert_eq!(held_wait(&app), (Some(WaitName::TtyRaw), Demand::Idle));
+    // The redraw after the reading that parked it, stamped as long before the pull as a pull a
+    // minute after the turn finds it: the program has been quiet since.
+    feed_tab_at(&app, 0, b"x", || {
+        let now = Instant::now();
+        now.checked_sub(Duration::from_secs(50)).unwrap_or(now)
+    });
+    let before = saw.lock().unwrap_or_else(PoisonError::into_inner).len();
+    assert!(app.vitals.offer(Msg::Pull), "a worker's pull");
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || {
+            app.adopt_vitals(Audience::None, Instant::now(), false)
+                .then_some(())
+        },
+    )
+    .expect("the pull's view lands");
+    let pulled = saw.lock().unwrap_or_else(PoisonError::into_inner)[before..].to_vec();
+    assert!(
+        !pulled.is_empty()
+            && pulled
+                .iter()
+                .all(|r| *r == (true, Some(WaitName::TtyRaw), true)),
+        "the pull parks the program's read from a word read after the redraw: {pulled:?}"
+    );
+    assert_eq!(held_wait(&app), (Some(WaitName::TtyRaw), Demand::Idle));
+    assert!(app.vitals.parked.contains_key(&0), "still parked");
+    assert_eq!(app.vitals.jobs_due, None, "no reading armed after the pull");
+    assert!(
+        app.vitals.stop_at_exit(aterm_spec::wait::MUST_HAPPEN),
+        "the thread ended"
+    );
+}
+
+/// A cold pull reads twice, [`COLD_PAIR`] apart, and a redraw between its two readings is past
+/// every word read when the pull began: each reading of a pull reads the words afresh, so its last
+/// still names the person's read, the view it hands back parks it, and nothing is armed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_redraw_between_a_cold_pulls_pair_is_read_past_by_its_last_reading() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let saw: Arc<Mutex<Vec<EngineSaw>>> = Arc::default();
+    let between = Between::default();
+    let (mut app, _) = parked_by_the_thread_with(&job, &BOARD, {
+        let (saw, between) = (Arc::clone(&saw), Arc::clone(&between));
+        move || ThreadEngine::cold(saw, between)
+    });
+    assert_eq!(held_wait(&app), (Some(WaitName::TtyRaw), Demand::Idle));
+    let s = app.pool.get(0).expect("tab 0");
+    let (term, feed, moves) = (
+        Arc::clone(&s.term),
+        Arc::clone(&s.ctx.job_feed),
+        Arc::clone(&s.ctx.screen_moves),
+    );
+    // The redraw lands on the probe thread between the pull's warm reading and its last, stamped
+    // as old as a quiet program's: only the word's own reading can say it is past it.
+    *between.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+        feed.read(b"x");
+        let mut t = term.lock().unwrap_or_else(PoisonError::into_inner);
+        t.process(b"x");
+        let moved = moves.fed(crate::control::screen_gen(&t));
+        assert!(moved, "the redraw moves the screen");
+        feed.fed(&t, b"x", moved, || {
+            let now = Instant::now();
+            now.checked_sub(Duration::from_secs(50)).unwrap_or(now)
+        });
+    }));
+    let before = saw.lock().unwrap_or_else(PoisonError::into_inner).len();
+    assert!(app.vitals.offer(Msg::Pull), "a worker's pull");
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || {
+            app.adopt_vitals(Audience::None, Instant::now(), false)
+                .then_some(())
+        },
+    )
+    .expect("the pull's view lands");
+    let pulled = saw.lock().unwrap_or_else(PoisonError::into_inner)[before..].to_vec();
+    assert!(
+        between
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none(),
+        "the redraw ran inside the pull"
+    );
+    assert_eq!(
+        pulled,
+        [
+            (true, Some(WaitName::TtyRaw), true),
+            (true, Some(WaitName::TtyRaw), true)
+        ],
+        "both readings of the cold pull name the read; the last one reads the word past the \
+         redraw"
+    );
+    assert_eq!(held_wait(&app), (Some(WaitName::TtyRaw), Demand::Idle));
+    assert!(app.vitals.parked.contains_key(&0), "still parked");
+    assert_eq!(app.vitals.jobs_due, None, "no reading armed after the pull");
     assert!(
         app.vitals.stop_at_exit(aterm_spec::wait::MUST_HAPPEN),
         "the thread ended"
@@ -3445,6 +3656,98 @@ fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
     assert_eq!(read_wait(&held), (Some(WaitName::Unnamed), Demand::Fast));
 }
 
+/// A terminal whose unread input nothing measures (a platform with no count, a slave that cannot
+/// be opened for one) gives no word, as one with a key waiting does: an empty queue is what lets
+/// the tty name a wait for the person, so an unknown one never stands in for it, and the engine
+/// keeps reading the job.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_terminal_whose_unread_input_is_unknown_gives_no_word() {
+    let job = JobAtRest::new(true);
+    let sink = aterm_session::sink::SinkWriter::new(job.master());
+    let output = Arc::new(ScreenMoves::default());
+    let read = |unread: Option<usize>| {
+        TtyWord::read_seamed(
+            3,
+            &sink,
+            &output,
+            || {},
+            |read: &aterm_session::sink::SinkWriter| {
+                assert_eq!(read.master(), job.master(), "the session's own sink");
+                unread
+            },
+        )
+        .map(|w| (w.canonical, w.echo))
+    };
+    assert_eq!(
+        read(Some(0)),
+        Some((false, false)),
+        "nothing unread: the word"
+    );
+    assert_eq!(read(Some(1)), None, "a key unread: no word");
+    assert_eq!(read(None), None, "unread input unknown: no word");
+}
+
+/// A request holds each session's sink weakly ([`TtySource`]). The probe thread keeps its last
+/// request until the next one lands, and a closed tab's master closes with its session, so the
+/// program's terminal hangs up then, not when that request goes; the request reads no word of it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_request_the_thread_keeps_never_holds_a_closed_sessions_master_open() {
+    use std::os::fd::FromRawFd as _;
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty");
+    // SAFETY: `master` is the pair's fresh master and the sink below its only owner.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+    let mut session = crate::stub_session_with_sink(
+        1,
+        Arc::new(aterm_session::sink::SinkWriter::new_owned(owned)),
+    );
+    session.pid = i32::try_from(std::process::id()).expect("pid");
+    let mut app = crate::App::headless_for_test();
+    crate::App::register_session(&app.store, &session, None);
+    app.pool.insert(session);
+    let hung_up = || {
+        let mut fd = libc::pollfd {
+            fd: slave,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd` of this test's own slave, and no wait.
+        let rc = unsafe { libc::poll(&raw mut fd, 1, 0) };
+        assert!(rc >= 0, "poll the slave");
+        fd.revents & libc::POLLHUP != 0
+    };
+    let req = app.vitals_request(Duration::from_secs(2), false);
+    let source = req
+        .tty_sources
+        .iter()
+        .find(|s| s.key == 1)
+        .expect("the session's source");
+    assert!(source.read().is_some(), "the live session's word");
+    assert!(!hung_up(), "the master is open while its session lives");
+    let _ = app
+        .store
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .deregister_local(1);
+    drop(app.pool.sessions.remove(&1));
+    // A child another test forks holds a copy of every descriptor until it execs, so the hangup
+    // may come a moment later; nothing in the request may hold it off.
+    assert!(
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(5),
+            || hung_up().then_some(())
+        )
+        .is_some(),
+        "the closed session's master closed under the request still held"
+    );
+    assert!(source.read().is_none(), "a gone session reads no word");
+    drop(req);
+    // SAFETY: `slave` is this test's own descriptor, closed once.
+    assert_eq!(unsafe { libc::close(slave) }, 0);
+}
+
 /// Output landing between the word's stamps and its `tcgetattr` leaves the word its mode but
 /// stamps it before all output, so it names no wait (§6.6).
 #[cfg(target_os = "macos")]
@@ -3454,14 +3757,27 @@ fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
     let sink = aterm_session::sink::SinkWriter::new(job.master());
     let output = Arc::new(ScreenMoves::default());
     output.fed(drawn(5));
-    let word = TtyWord::read_seamed(3, &sink, &output, || {
-        output.fed(drawn(6));
-    })
+    let word = TtyWord::read_seamed(
+        3,
+        &sink,
+        &output,
+        || {
+            output.fed(drawn(6));
+        },
+        aterm_session::sink::SinkWriter::unread_input,
+    )
     .expect("a terminal's word");
     let stamp = |w: &TtyWord| w.current().map(|(_, m)| m.stamped_ms);
     assert_eq!(stamp(&word), Some(0), "output mid-read: no wait from it");
     output.fed(drawn(7));
-    let word = TtyWord::read_seamed(3, &sink, &output, || {}).expect("a terminal's word");
+    let word = TtyWord::read_seamed(
+        3,
+        &sink,
+        &output,
+        || {},
+        aterm_session::sink::SinkWriter::unread_input,
+    )
+    .expect("a terminal's word");
     assert_eq!(
         stamp(&word),
         Some(u64::MAX),

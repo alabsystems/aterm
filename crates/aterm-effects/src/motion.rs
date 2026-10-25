@@ -24,12 +24,14 @@ impl MotionMode {
     }
 
     /// Parse a config string (case-insensitive, trimmed); unknown → [`Self::Auto`] (use the platform accessibility sample when available).
+    #[must_use]
     #[inline]
-    pub fn parse(s: &str) -> Self {
-        let s = s.trim();
-        if s.eq_ignore_ascii_case("full") {
+    pub const fn parse(s: &str) -> Self {
+        use crate::cursor_glow::spellings::{eq_ascii_ci, trim_whitespace_bytes};
+        let s = trim_whitespace_bytes(s);
+        if eq_ascii_ci(s, "full") {
             Self::Full
-        } else if s.eq_ignore_ascii_case("reduced") || s.eq_ignore_ascii_case("reduce") {
+        } else if eq_ascii_ci(s, "reduced") || eq_ascii_ci(s, "reduce") {
             Self::Reduced
         } else {
             Self::Auto
@@ -400,12 +402,31 @@ mod tests {
     /// (case-insensitively); anything else — including empty — is `Auto`.
     #[test]
     fn mode_parses_documented_spellings() {
+        const REDUCED: MotionMode = MotionMode::parse("\u{00a0}REDUCE\u{2003}");
+        const FULL: MotionMode = MotionMode::parse("\u{2003}FULL\u{00a0}");
+        assert_eq!(REDUCED, MotionMode::Reduced);
+        assert_eq!(FULL, MotionMode::Full);
         assert_eq!(MotionMode::parse("auto"), MotionMode::Auto);
         assert_eq!(MotionMode::parse("Full"), MotionMode::Full);
         assert_eq!(MotionMode::parse(" REDUCED "), MotionMode::Reduced);
         assert_eq!(MotionMode::parse("reduce"), MotionMode::Reduced);
-        assert_eq!(MotionMode::parse(""), MotionMode::Auto);
-        assert_eq!(MotionMode::parse("bogus"), MotionMode::Auto);
+        for (raw, want) in [
+            ("\u{00a0}Full\u{2003}", MotionMode::Full),
+            ("\u{2003}REDUCED\u{00a0}", MotionMode::Reduced),
+            ("\u{00a0}reduce\u{2003}", MotionMode::Reduced),
+        ] {
+            assert_eq!(MotionMode::parse(raw), want);
+        }
+        for unknown in [
+            "",
+            "bogus",
+            "\u{200b}full",
+            "reduced\u{feff}",
+            "fu\u{2003}ll",
+            "re\u{00a0}duced",
+        ] {
+            assert_eq!(MotionMode::parse(unknown), MotionMode::Auto);
+        }
     }
 
     /// Serious mode's truth table: every fun effect is allowed in normal mode

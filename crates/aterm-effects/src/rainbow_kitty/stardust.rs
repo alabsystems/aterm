@@ -501,10 +501,13 @@ pub const fn stream_travel_px(px_per_s: f32) -> f32 {
 #[inline]
 #[must_use]
 fn stream_unit(age_ms: f32) -> f32 {
+    if age_ms <= 0.0 {
+        return 0.0;
+    }
     if age_ms >= STREAM_END_MS {
         return 1.0;
     }
-    ((1.0 - (-age_ms.max(0.0) / STREAM_TAU_MS).exp()) / STREAM_SPENT).min(1.0)
+    ((1.0 - (-age_ms / STREAM_TAU_MS).exp()) / STREAM_SPENT).min(1.0)
 }
 
 /// The mend's pull window, ms: a key that mends a typo run ([`super::Mend`], §23) takes its strike
@@ -689,6 +692,19 @@ impl StarClass {
             Self::M2 => px_at(ch, M2_ARM_MIN_PX),
             Self::M1 | Self::M3 => 1,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    const fn arms(self, ch: f32) -> (f32, i32, f32, i32, i32) {
+        let nominal = star_arm(ch, self.arm_ratio());
+        let min_arm = self.arm_min_px(ch);
+        let arm_floor = self.arm_floor();
+        let raw_lo = (nominal * arm_floor).round() as i32;
+        let arm_lo = if raw_lo > min_arm { raw_lo } else { min_arm };
+        let raw_hi = nominal.round() as i32;
+        let arm_hi = if raw_hi > min_arm { raw_hi } else { min_arm };
+        (nominal, min_arm, arm_floor, arm_lo, arm_hi)
     }
 
     /// The core-brightness floor on the luminance clock (§5.5's table): m1 `0.85 + 0.15·e`, m2
@@ -1005,7 +1021,7 @@ impl Star {
     /// This star's grid column: its home pixel read back as a column (stable for its life, §5.4).
     #[inline]
     #[must_use]
-    pub fn grid_col(&self, geom: Geom) -> i32 {
+    pub const fn grid_col(&self, geom: Geom) -> i32 {
         px_col(self.x, geom)
     }
 
@@ -1013,25 +1029,32 @@ impl Star {
     /// ([`in_sky_of_row`]).
     #[inline]
     #[must_use]
-    pub fn in_sky_of(&self, row: u16, geom: Geom) -> bool {
+    pub const fn in_sky_of(&self, row: u16, geom: Geom) -> bool {
         in_sky_of_row(self.y, row, geom)
     }
 
     /// True for a warm tint: R, O, Y of the seven stops, plus gold and the achromatic white (§5.5).
     #[inline]
     #[must_use]
-    pub fn is_warm(&self) -> bool {
+    pub const fn is_warm(&self) -> bool {
         if self.tint == TINT_WHITE_RGB || self.tint == TINT_GOLD_RGB {
             return true;
         }
-        !SPECTRUM_ANCHORS[WARM_STOPS..].contains(&self.tint)
+        let mut i = WARM_STOPS;
+        while i < SPECTRUM_ANCHORS.len() {
+            if SPECTRUM_ANCHORS[i] == self.tint {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// The luminance phase, radians (§5.5): `φ = hash(row, col, seed)·2π`; warm tints take `φ`,
     /// cool ones `φ + π`, so warm and cool neighbours never blink together.
     #[inline]
     #[must_use]
-    pub fn lum_phase(&self) -> f32 {
+    pub const fn lum_phase(&self) -> f32 {
         let base = hash01(mix32(self.seed ^ SALT_PHASE)) * std::f32::consts::TAU;
         if self.is_warm() {
             base
@@ -1058,8 +1081,8 @@ impl Star {
 
     #[inline]
     #[must_use]
-    fn inks(&self, cfg: &Config) -> bool {
-        self.lane != StarLane::Exhaust || light_keeps(self.seed, cfg)
+    const fn inks(&self, cfg: &Config) -> bool {
+        !matches!(self.lane, StarLane::Exhaust) || light_keeps(self.seed, cfg)
     }
 
     /// Whether this star moves or ramps every frame: a throw inside its window, a mend pull inside
@@ -1185,7 +1208,7 @@ impl Star {
     }
 
     #[inline]
-    fn pull_px(&self, age_ms: f32) -> i32 {
+    const fn pull_px(&self, age_ms: f32) -> i32 {
         if self.pull <= 0.0 || age_ms >= MEND_PULL_MS {
             return 0;
         }
@@ -1206,7 +1229,11 @@ impl Star {
     #[must_use]
     fn pos_at_age(&self, age_s: f32) -> (i32, i32) {
         let age_ms = age_s * 1000.0;
-        let (x, y) = self.at_k(self.lane.motion().k_at(age_ms));
+        let (x, y) = if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
+            self.origin()
+        } else {
+            self.at_k(self.lane.motion().k_at(age_ms))
+        };
         (x - self.stream_px(age_ms) - self.pull_px(age_ms), y)
     }
 
@@ -1218,7 +1245,11 @@ impl Star {
     pub fn rest(&self) -> (i32, i32) {
         let motion = self.lane.motion();
         let end_ms = motion.end_ms(self.life_s() * 1000.0);
-        let (x, y) = self.at_k(motion.k_at(end_ms));
+        let (x, y) = if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
+            self.origin()
+        } else {
+            self.at_k(motion.k_at(end_ms))
+        };
         (x - self.stream_px(end_ms), y)
     }
 
@@ -1325,11 +1356,18 @@ pub struct Glint {
 
 /// What this frame knows about the glyphs: the snapshot §5.4's birth gate is asked of, so a star is
 /// never drawn over a stroke (L4).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct GlyphProbe {
     rows: [ProbedRow; Self::ROWS],
     live: usize,
     at: usize,
+}
+
+impl Default for GlyphProbe {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// What one probed cell holds for §5.4's gate.
@@ -1390,17 +1428,33 @@ const _: () = assert!(
 /// headroom share.
 #[inline]
 #[must_use]
-pub fn rule_stroke_px(ch: usize) -> std::ops::Range<i32> {
+pub const fn rule_stroke_px(ch: usize) -> std::ops::Range<i32> {
     let ch = ch as f32;
     (RULE_INK_TOP_CH * ch).ceil() as i32..(RULE_INK_BOT_CH * ch).round() as i32
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ProbedRow {
     row: i32,
     ink: Vec<u64>,
     rule: Vec<u64>,
     width: u16,
+}
+
+impl Default for ProbedRow {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl ProbedRow {
+    const EMPTY: Self = Self {
+        row: 0,
+        ink: Vec::new(),
+        rule: Vec::new(),
+        width: 0,
+    };
 }
 
 impl GlyphProbe {
@@ -1412,8 +1466,12 @@ impl GlyphProbe {
     /// looked (§5.4).
     #[inline]
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            rows: [ProbedRow::EMPTY; Self::ROWS],
+            live: 0,
+            at: 0,
+        }
     }
 
     /// Record that grid `row` was probed, with `occupied[col]` true where a glyph stands.
@@ -1501,23 +1559,29 @@ impl GlyphProbe {
     /// this probe's knowledge.
     #[inline]
     #[must_use]
-    pub fn at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
-        self.cell_at(row, col, rows).map(|(inked, _)| inked)
+    pub const fn at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
+        match self.cell_at(row, col, rows) {
+            Some((inked, _)) => Some(inked),
+            None => None,
+        }
     }
 
     /// [`Self::at`] asked of a window pixel; a pixel left or right of the grid is `Some(false)`.
     #[inline]
     #[must_use]
-    pub fn at_px(&self, x: i32, y: i32, geom: Geom) -> Option<bool> {
+    pub const fn at_px(&self, x: i32, y: i32, geom: Geom) -> Option<bool> {
         let col = px_col(x as f32, geom);
         if col < 0 || col as usize >= geom.cols {
             return Some(false);
         }
         let row = px_row(y as f32, geom);
-        let (inked, is_rule) = self.cell_at(row, col as u16, geom.rows)?;
+        let Some((inked, is_rule)) = self.cell_at(row, col as u16, geom.rows) else {
+            return None;
+        };
         if inked && is_rule {
-            let off = y - i32::from(geom.origin_y) - row * geom.ch as i32;
-            return Some(rule_stroke_px(geom.ch).contains(&off));
+            let off = y - (geom.origin_y as i32) - row * geom.ch as i32;
+            let band = rule_stroke_px(geom.ch);
+            return Some(off >= band.start && off < band.end);
         }
         Some(inked)
     }
@@ -1527,35 +1591,62 @@ impl GlyphProbe {
     /// band ends where the zone begins) while [`Self::at`] still says `Some(true)`.
     #[inline]
     #[must_use]
-    pub fn sky_at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
-        let (inked, is_rule) = self.cell_at(row, col, rows)?;
+    pub const fn sky_at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
+        let Some((inked, is_rule)) = self.cell_at(row, col, rows) else {
+            return None;
+        };
         Some(inked && !is_rule)
     }
 
     #[inline]
-    fn cell_at(&self, row: i32, col: u16, rows: usize) -> Option<(bool, bool)> {
+    const fn cell_at(&self, row: i32, col: u16, rows: usize) -> Option<(bool, bool)> {
         if row < 0 || row as usize >= rows {
             return Some((false, false));
         }
-        let r = self.rows[..self.live].iter().find(|r| r.row == row)?;
+        let mut idx = 0;
+        let mut found: Option<&ProbedRow> = None;
+        while idx < self.live {
+            if self.rows[idx].row == row {
+                found = Some(&self.rows[idx]);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(r) = found else {
+            return None;
+        };
         if col >= r.width {
             return Some((false, false));
         }
-        let i = usize::from(col);
+        let i = col as usize;
         let word = i / 64;
         let shift = i % 64;
-        let inked = r.ink.get(word).is_some_and(|w| (w >> shift) & 1 == 1);
-        let is_rule = inked && r.rule.get(word).is_some_and(|w| (w >> shift) & 1 == 1);
+        let ink = r.ink.as_slice();
+        let inked = word < ink.len() && (ink[word] >> shift) & 1 == 1;
+        let rule = r.rule.as_slice();
+        let is_rule = inked && word < rule.len() && (rule[word] >> shift) & 1 == 1;
         Some((inked, is_rule))
     }
 
     #[inline]
-    fn has_rule_in(&self, row: i32, cols: std::ops::RangeInclusive<i32>) -> bool {
-        let Some(r) = self.rows[..self.live].iter().find(|r| r.row == row) else {
+    const fn has_rule_in(&self, row: i32, cols: std::ops::RangeInclusive<i32>) -> bool {
+        let mut idx = 0;
+        let mut found: Option<&ProbedRow> = None;
+        while idx < self.live {
+            if self.rows[idx].row == row {
+                found = Some(&self.rows[idx]);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(r) = found else {
             return false;
         };
-        let lo = (*cols.start()).max(0);
-        let hi = (*cols.end()).min(i32::from(r.width) - 1);
+        let start = *cols.start();
+        let lo = if start > 0 { start } else { 0 };
+        let end = *cols.end();
+        let max_col = r.width as i32 - 1;
+        let hi = if end < max_col { end } else { max_col };
         if hi < lo {
             return false;
         }
@@ -1563,22 +1654,26 @@ impl GlyphProbe {
         let (w0, w1) = (lo / 64, hi / 64);
         let low_mask = u64::MAX << (lo % 64);
         let high_mask = u64::MAX >> (63 - (hi % 64));
+        let rule = r.rule.as_slice();
         if w0 == w1 {
-            return r
-                .rule
-                .get(w0)
-                .is_some_and(|&w| (w & low_mask & high_mask) != 0);
+            return w0 < rule.len() && (rule[w0] & low_mask & high_mask) != 0;
         }
-        r.rule.get(w0).is_some_and(|&w| (w & low_mask) != 0)
-            || r.rule
-                .get(w0 + 1..w1)
-                .is_some_and(|mid| mid.iter().any(|&w| w != 0))
-            || r.rule.get(w1).is_some_and(|&w| (w & high_mask) != 0)
+        if w0 < rule.len() && (rule[w0] & low_mask) != 0 {
+            return true;
+        }
+        let mut w = w0 + 1;
+        while w < w1 && w < rule.len() {
+            if rule[w] != 0 {
+                return true;
+            }
+            w += 1;
+        }
+        w1 < rule.len() && (rule[w1] & high_mask) != 0
     }
 
     #[cfg(test)]
-    fn rule_at(&self, row: i32, col: u16) -> bool {
-        let c = i32::from(col);
+    const fn rule_at(&self, row: i32, col: u16) -> bool {
+        let c = col as i32;
         self.has_rule_in(row, c..=c)
     }
 
@@ -1755,12 +1850,12 @@ impl SkyMark {
 /// A star's quad as its mark keys it ([`SkyMark::lights`]).
 #[inline]
 #[must_use]
-pub fn sky_quad_key(q: &GlowQuad) -> u64 {
-    let place = u64::from(q.x) | u64::from(q.y) << 16 | u64::from(q.w) << 32 | u64::from(q.h) << 48;
-    let ink = u64::from(q.color)
-        | u64::from(q.alpha) << 24
-        | u64::from(q.color2) << 32
-        | u64::from(q.alpha2) << 56;
+pub const fn sky_quad_key(q: &GlowQuad) -> u64 {
+    let place = (q.x as u64) | (q.y as u64) << 16 | (q.w as u64) << 32 | (q.h as u64) << 48;
+    let ink = (q.color as u64)
+        | (q.alpha as u64) << 24
+        | (q.color2 as u64) << 32
+        | (q.alpha2 as u64) << 56;
     aterm_hash::fnv_mix_u64(
         aterm_hash::fnv_mix_u64(aterm_hash::FNV64_OFFSET, place),
         ink,
@@ -1770,12 +1865,11 @@ pub fn sky_quad_key(q: &GlowQuad) -> u64 {
 /// A star's halo as its mark keys it ([`SkyMark::lights`]).
 #[inline]
 #[must_use]
-pub fn sky_halo_key(h: &RainHalo) -> u64 {
-    let place = u64::from(h.x) | u64::from(h.y) << 16 | u64::from(h.w) << 32 | u64::from(h.h) << 48;
-    let shape =
-        u64::from(h.cx) | u64::from(h.cy) << 16 | u64::from(h.rx) << 32 | u64::from(h.ry) << 48;
+pub const fn sky_halo_key(h: &RainHalo) -> u64 {
+    let place = (h.x as u64) | (h.y as u64) << 16 | (h.w as u64) << 32 | (h.h as u64) << 48;
+    let shape = (h.cx as u64) | (h.cy as u64) << 16 | (h.rx as u64) << 32 | (h.ry as u64) << 48;
     let seed = aterm_hash::fnv_mix_u64(aterm_hash::FNV64_OFFSET ^ 0x4841_4C4F, place);
-    aterm_hash::fnv_mix_u64(aterm_hash::fnv_mix_u64(seed, shape), u64::from(h.color))
+    aterm_hash::fnv_mix_u64(aterm_hash::fnv_mix_u64(seed, shape), h.color as u64)
 }
 
 impl Default for Stardust {
@@ -1801,28 +1895,28 @@ impl Stardust {
             veil: Vec::with_capacity(AURORA_CAP),
             last_typed: None,
             ioi_ms: STREAM_IOI_MAX_MS,
-            sky_index: SkyIndex::default(),
-            shade: PetShade::default(),
-            keep_out: KeepOut::default(),
+            sky_index: SkyIndex::EMPTY,
+            shade: PetShade::EMPTY,
+            keep_out: KeepOut::EMPTY,
             marks: Vec::with_capacity(STAR_POOL_MAX),
             mark_lights: Vec::with_capacity(STAR_POOL_MAX * 8),
-            paper_ink: PaperInkMemo::default(),
+            paper_ink: PaperInkMemo::EMPTY,
         }
     }
 
     /// Each star the last frame painted ([`SkyMark`]).
     #[inline]
     #[must_use]
-    pub fn marks(&self) -> &[SkyMark] {
-        &self.marks
+    pub const fn marks(&self) -> &[SkyMark] {
+        self.marks.as_slice()
     }
 
     /// The keys of the lights the last frame's stars painted, each star's a
     /// range ([`SkyMark::lights`]).
     #[inline]
     #[must_use]
-    pub fn mark_lights(&self) -> &[u64] {
-        &self.mark_lights
+    pub const fn mark_lights(&self) -> &[u64] {
+        self.mark_lights.as_slice()
     }
 
     /// Forget the frame's marks (a frame whose output was withdrawn).
@@ -2087,20 +2181,28 @@ impl Stardust {
         }
         let mut haloed = 0usize;
         let n = self.stars.len();
+        let mut classes = 0u8;
+        for star in &self.stars {
+            classes |= 1u8 << (star.class as u8);
+        }
+        let ch = ctx.geom.ch as f32;
         let mut i = 0usize;
         for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
+            if classes & (1u8 << (class as u8)) == 0 {
+                continue;
+            }
+            let arms = class.arms(ch);
             for star in self.stars.iter().filter(|s| s.class == class) {
                 let turn = i;
                 i += 1;
                 if !star.inks(ctx.cfg) {
                     continue;
                 }
-                let Some(paint) = Paint::of(star, &self.probe, &self.shade, ctx) else {
+                let Some(paint) =
+                    Paint::of_kept(star, &self.probe, &self.shade, &self.keep_out, ctx, arms)
+                else {
                     continue;
                 };
-                if paint.kept_out(ctx, &self.keep_out) {
-                    continue;
-                }
                 let left = quad_cap.saturating_sub(frame.out.len());
                 if left == 0 {
                     self.sky_index = index;
@@ -2801,8 +2903,16 @@ impl Stardust {
     }
 
     #[inline]
-    fn pixel_taken(&self, x: f32, y: f32) -> bool {
-        self.stars.iter().any(|s| s.x == x && s.y == y)
+    const fn pixel_taken(&self, x: f32, y: f32) -> bool {
+        let stars = self.stars.as_slice();
+        let mut i = 0;
+        while i < stars.len() {
+            if stars[i].x == x && stars[i].y == y {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
@@ -2945,32 +3055,46 @@ impl Stardust {
     }
 
     #[inline]
-    fn field_t(&self, cell: (u16, u16), ctx: &Ctx<'_>, ribbon: &Ribbon) -> f32 {
-        ribbon.field_at(cell.0, cell.1).unwrap_or(ctx.caret_t)
+    const fn field_t(&self, cell: (u16, u16), ctx: &Ctx<'_>, ribbon: &Ribbon) -> f32 {
+        match ribbon.field_at(cell.0, cell.1) {
+            Some(t) => t,
+            None => ctx.caret_t,
+        }
     }
 
     #[inline]
-    fn hero_allowed(&self, cell: (u16, u16), y: f32, geom: Geom) -> bool {
+    const fn hero_allowed(&self, cell: (u16, u16), y: f32, geom: Geom) -> bool {
         let band = px_row(y, geom);
+        let stars = self.stars.as_slice();
         let mut on_row = 0usize;
-        for s in &self.stars {
-            if s.class != StarClass::M1 || !s.lane.is_sky() || px_row(s.y, geom) != band {
+        let mut i = 0;
+        while i < stars.len() {
+            let s = &stars[i];
+            i += 1;
+            if !matches!(s.class, StarClass::M1) || !s.lane.is_sky() || px_row(s.y, geom) != band {
                 continue;
             }
             on_row += 1;
-            let dc = (i32::from(cell.1) - px_col(s.x, geom)).abs();
-            if dc < i32::from(HERO_MIN_SPACING_CELLS) {
+            let dc = (cell.1 as i32 - px_col(s.x, geom)).abs();
+            if dc < HERO_MIN_SPACING_CELLS as i32 {
                 return false;
             }
         }
-        on_row < usize::from(HERO_MAX_LIVE_PER_ROW)
+        on_row < HERO_MAX_LIVE_PER_ROW as usize
     }
 
     #[inline]
-    fn sky_star_live(&self, cell: (u16, u16), geom: Geom) -> bool {
-        self.stars
-            .iter()
-            .any(|s| s.lane.is_sky() && star_over_cell(s, cell, geom))
+    const fn sky_star_live(&self, cell: (u16, u16), geom: Geom) -> bool {
+        let stars = self.stars.as_slice();
+        let mut i = 0;
+        while i < stars.len() {
+            let s = &stars[i];
+            if s.lane.is_sky() && star_over_cell(s, cell, geom) {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
@@ -3194,9 +3318,9 @@ const fn fan_class(k: usize, hero: bool) -> StarClass {
 }
 
 #[inline]
-fn star_over_cell(star: &Star, cell: (u16, u16), geom: Geom) -> bool {
-    let up = i32::from(cell.0) - px_row(star.y, geom);
-    px_col(star.x, geom) == i32::from(cell.1) && (0..=1).contains(&up)
+const fn star_over_cell(star: &Star, cell: (u16, u16), geom: Geom) -> bool {
+    let up = cell.0 as i32 - px_row(star.y, geom);
+    px_col(star.x, geom) == cell.1 as i32 && up >= 0 && up <= 1
 }
 
 #[inline]
@@ -3244,20 +3368,51 @@ impl Paint {
         (if self.arm > hi { self.arm } else { hi }) + 1
     }
 
-    /// Whether this star lies where no star is drawn: on a word icon or a
-    /// lettered or filled cell of another row ([`KeepOut`], its centre within
-    /// half its reach of one), or, on paper, with its reach within a cell of
-    /// the caret's block ([`Ctx::near_paper_caret`]); the reach is the arm at
-    /// its peak, so the answer holds for the star's life while it stands still.
+    /// Whether `(x, y)` with peak `reach` lies where no star is drawn: on a
+    /// word icon or a lettered or filled cell of another row ([`KeepOut`], its
+    /// centre within half its reach of one), or, on paper, with its reach
+    /// within a cell of the caret's block ([`Ctx::near_paper_caret`]); the
+    /// reach is the arm at its peak, so the answer holds for the star's life
+    /// while it stands still.
     #[inline]
-    fn kept_out(&self, ctx: &Ctx<'_>, keep_out: &KeepOut) -> bool {
-        let reach = self.reach();
-        keep_out.covers((self.x, self.y), reach / 2)
-            || ctx.near_paper_caret((self.x, self.y), reach)
+    const fn kept_out(x: i32, y: i32, reach: i32, ctx: &Ctx<'_>, keep_out: &KeepOut) -> bool {
+        keep_out.covers((x, y), reach / 2) || ctx.near_paper_caret((x, y), reach)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn of(star: &Star, probe: &GlyphProbe, shade: &PetShade, ctx: &Ctx<'_>) -> Option<Self> {
+        Self::of_inner(
+            star,
+            probe,
+            shade,
+            None,
+            ctx,
+            star.class.arms(ctx.geom.ch as f32),
+        )
     }
 
     #[inline]
-    fn of(star: &Star, probe: &GlyphProbe, shade: &PetShade, ctx: &Ctx<'_>) -> Option<Self> {
+    fn of_kept(
+        star: &Star,
+        probe: &GlyphProbe,
+        shade: &PetShade,
+        keep_out: &KeepOut,
+        ctx: &Ctx<'_>,
+        arms: (f32, i32, f32, i32, i32),
+    ) -> Option<Self> {
+        Self::of_inner(star, probe, shade, Some(keep_out), ctx, arms)
+    }
+
+    #[inline]
+    fn of_inner(
+        star: &Star,
+        probe: &GlyphProbe,
+        shade: &PetShade,
+        keep_out: Option<&KeepOut>,
+        ctx: &Ctx<'_>,
+        (nominal, min_arm, arm_floor, arm_lo, arm_hi): (f32, i32, f32, i32, i32),
+    ) -> Option<Self> {
         let rm = ctx.cfg.reduced_motion;
         let age_s = star.age_s(ctx.now);
         let alpha = star.envelope_at_age(age_s, ctx.now, rm);
@@ -3271,6 +3426,12 @@ impl Paint {
         };
         if shade.hides((x, y), ctx.geom.cw) {
             return None;
+        }
+        if let Some(ko) = keep_out {
+            let peak_reach = arm_hi.max(arm_lo) + 1;
+            if Self::kept_out(x, y, peak_reach, ctx, ko) {
+                return None;
+            }
         }
         let held = rm || age_s < star.class.envelope_s(star.lane).0;
         let can_glint = !rm && star.gold && star.class == StarClass::M1;
@@ -3290,12 +3451,6 @@ impl Paint {
         if star.lane.is_transient() && probe.at_px(x, y, ctx.geom) != Some(false) {
             c /= TEXT_SAFE_DIV;
         }
-        let ch = ctx.geom.ch as f32;
-        let nominal = star_arm(ch, star.class.arm_ratio());
-        let min_arm = star.class.arm_min_px(ch);
-        let arm_floor = star.class.arm_floor();
-        let arm_lo = ((nominal * arm_floor).round() as i32).max(min_arm);
-        let arm_hi = (nominal.round() as i32).max(min_arm);
         let arm = if held {
             arm_hi
         } else {
@@ -3460,7 +3615,7 @@ impl Paint {
     }
 
     #[inline]
-    fn halo_r(&self, ch: f32) -> f32 {
+    const fn halo_r(&self, ch: f32) -> f32 {
         let nominal = star_arm(ch, self.class.arm_ratio());
         match self.class {
             StarClass::M1 => M1_HALO_R_ARM * nominal,
@@ -3470,8 +3625,8 @@ impl Paint {
     }
 
     #[inline]
-    fn halo_request(&self, share: f32, haloed: usize) -> (u32, u8) {
-        if self.lane == StarLane::Exhaust
+    const fn halo_request(&self, share: f32, haloed: usize) -> (u32, u8) {
+        if matches!(self.lane, StarLane::Exhaust)
             || haloed >= STARDUST_HALO_BUDGET
             || self.alpha * self.env < CHROMA_CULL_ALPHA
         {
@@ -3585,28 +3740,25 @@ const M3_NEEDLE_HALOS: usize = 4;
 
 #[cfg(test)]
 #[inline]
-fn arm_trough_px(class: StarClass, ch: f32) -> i32 {
-    let nominal = star_arm(ch, class.arm_ratio());
-    ((nominal * class.arm_floor()).round() as i32).max(class.arm_min_px(ch))
+const fn arm_trough_px(class: StarClass, ch: f32) -> i32 {
+    class.arms(ch).3
 }
 
 /// A star's arm at its scintillation's peak (and while held), px: no
 /// drawn arm is longer ([`arm_px_with`]).
 #[cfg(test)]
 #[inline]
-fn arm_peak_px(class: StarClass, ch: f32) -> i32 {
-    (star_arm(ch, class.arm_ratio()).round() as i32).max(class.arm_min_px(ch))
+const fn arm_peak_px(class: StarClass, ch: f32) -> i32 {
+    class.arms(ch).4
 }
 
 #[cfg(test)]
 #[inline]
 fn arm_px_with(star: &Star, ch: f32, held: bool, age_s: f32, phase: f32) -> i32 {
+    let (nominal, min, floor, _, arm_hi) = star.class.arms(ch);
     if held {
-        return arm_peak_px(star.class, ch);
+        return arm_hi;
     }
-    let nominal = star_arm(ch, star.class.arm_ratio());
-    let min = star.class.arm_min_px(ch);
-    let floor = star.class.arm_floor();
     let s = (std::f32::consts::TAU * star.f * age_s + phase).sin();
     ((nominal * (floor + (1.0 - floor) * s * s)).round() as i32).max(min)
 }
@@ -3746,18 +3898,19 @@ const fn cov_byte(v: f32) -> u8 {
 }
 
 #[inline]
-fn px_row(y: f32, geom: Geom) -> i32 {
-    ((y - f32::from(geom.origin_y)) / geom.ch as f32).floor() as i32
+const fn px_row(y: f32, geom: Geom) -> i32 {
+    ((y - geom.origin_y as f32) / geom.ch as f32).floor() as i32
 }
 
 #[inline]
-fn px_col(x: f32, geom: Geom) -> i32 {
-    ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32
+const fn px_col(x: f32, geom: Geom) -> i32 {
+    ((x - geom.origin_x as f32) / geom.cw as f32).floor() as i32
 }
 
 #[inline]
-fn in_sky_of_row(y: f32, row: u16, geom: Geom) -> bool {
-    (0..=1).contains(&(i32::from(row) - px_row(y, geom)))
+const fn in_sky_of_row(y: f32, row: u16, geom: Geom) -> bool {
+    let d = row as i32 - px_row(y, geom);
+    d >= 0 && d <= 1
 }
 
 /// Whether a device pixel is inside the effects box (`Geom::fx_*`: the grid plus the `head` band,
@@ -3768,11 +3921,24 @@ pub(super) const fn on_glass(p: (i32, i32), geom: Geom) -> bool {
 }
 
 #[inline]
-fn clamp_to_glass(p: (i32, i32), geom: Geom) -> (i32, i32) {
-    (
-        p.0.clamp(geom.fx_left(), geom.fx_right() - 1),
-        p.1.clamp(geom.fx_top(), geom.fx_bot() - 1),
-    )
+const fn clamp_to_glass(p: (i32, i32), geom: Geom) -> (i32, i32) {
+    let (l, r) = (geom.fx_left(), geom.fx_right() - 1);
+    let (t, b) = (geom.fx_top(), geom.fx_bot() - 1);
+    let x = if p.0 < l {
+        l
+    } else if p.0 > r {
+        r
+    } else {
+        p.0
+    };
+    let y = if p.1 < t {
+        t
+    } else if p.1 > b {
+        b
+    } else {
+        p.1
+    };
+    (x, y)
 }
 
 #[inline]
@@ -3801,9 +3967,9 @@ fn fan_ray(a: f32, reach: f32, up: f32, down: f32, j: f32) -> (f32, f32) {
 }
 
 #[inline]
-fn default_band_top(geom: Geom, cfg: &Config, row: u16) -> f32 {
+const fn default_band_top(geom: Geom, cfg: &Config, row: u16) -> f32 {
     let ch = geom.ch as f32;
-    let cell_top = f32::from(geom.origin_y) + f32::from(row) * ch;
+    let cell_top = geom.origin_y as f32 + row as f32 * ch;
     if cfg.ribbon_tall {
         cell_top + ch - super::ribbon::TALL_UP_CH * ch
     } else {
@@ -3975,8 +4141,8 @@ impl Veil {
     /// row's top, so under `underline` the veil still sits wholly above the text.
     #[inline]
     #[must_use]
-    pub fn bottom_px(&self, geom: Geom, cfg: &Config) -> f32 {
-        let cell_top = f32::from(geom.origin_y) + f32::from(self.row) * geom.ch as f32;
+    pub const fn bottom_px(&self, geom: Geom, cfg: &Config) -> f32 {
+        let cell_top = geom.origin_y as f32 + self.row as f32 * geom.ch as f32;
         default_band_top(geom, cfg, self.row).min(cell_top)
     }
 }
@@ -4001,7 +4167,7 @@ pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bo
 /// at a spine of one (0.37 at 0.5, 0.71 at 0.7).
 #[inline]
 #[must_use]
-pub fn veil_gain(birth_disp: f32) -> f32 {
+pub const fn veil_gain(birth_disp: f32) -> f32 {
     if !birth_disp.is_finite() || birth_disp < AURORA_COLD_DISP {
         return 0.0;
     }
@@ -4010,18 +4176,19 @@ pub fn veil_gain(birth_disp: f32) -> f32 {
 
 #[inline]
 #[must_use]
-fn mix_rgb(a: u32, b: u32, k: f32) -> u32 {
-    let k = clamp01(k);
-    let ch = |sh: u32| -> u32 {
+const fn mix_rgb(a: u32, b: u32, k: f32) -> u32 {
+    #[inline]
+    const fn ch(a: u32, b: u32, k: f32, sh: u32) -> u32 {
         let (x, y) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
         (x + (y - x) * k).round().clamp(0.0, 255.0) as u32
-    };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    }
+    let k = clamp01(k);
+    (ch(a, b, k, 16) << 16) | (ch(a, b, k, 8) << 8) | ch(a, b, k, 0)
 }
 
 #[inline]
 #[must_use]
-fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
+const fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
     if gold || tint == TINT_WHITE_RGB {
         return tint;
     }
@@ -4030,10 +4197,27 @@ fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
     if step == 0 {
         return tint;
     }
-    let Some(stop) = SPECTRUM_ANCHORS.iter().position(|&c| c == tint) else {
+    let mut stop = None;
+    let mut i = 0;
+    while i < SPECTRUM_ANCHORS.len() {
+        if SPECTRUM_ANCHORS[i] == tint {
+            stop = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(stop) = stop else {
         return tint;
     };
-    let at = (SPECTRUM_ANCHOR_AT[stop] as i32 + step).clamp(0, SPECTRUM_LUT_LEN as i32 - 1);
+    let raw = SPECTRUM_ANCHOR_AT[stop] as i32 + step;
+    let max_idx = SPECTRUM_LUT_LEN as i32 - 1;
+    let at = if raw < 0 {
+        0
+    } else if raw > max_idx {
+        max_idx
+    } else {
+        raw
+    };
     SPECTRUM_LUT[at as usize]
 }
 
@@ -4061,7 +4245,7 @@ const SKY_INDEX_HALO_NODES: usize = STARDUST_LIGHT_HALO_BUDGET + 9 * STARDUST_HA
 
 const SKY_INDEX_WIDE_CELLS: i64 = 16;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct SkyIndex {
     origin: (i32, i32),
     cell: (i32, i32),
@@ -4075,7 +4259,27 @@ struct SkyIndex {
     dirty: Vec<u32>,
 }
 
+impl Default for SkyIndex {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl SkyIndex {
+    const EMPTY: Self = Self {
+        origin: (0, 0),
+        cell: (0, 0),
+        from: (0, 0),
+        filed: (0, 0),
+        spilled: false,
+        quad_head: Vec::new(),
+        halo_head: Vec::new(),
+        quad_node: Vec::new(),
+        halo_node: Vec::new(),
+        dirty: Vec::new(),
+    };
+
     #[inline]
     fn open(&mut self, geom: Geom, from: (usize, usize)) {
         if self.quad_head.len() == SKY_INDEX_SLOTS {
@@ -4340,9 +4544,9 @@ fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
 
 #[inline]
 #[must_use]
-fn quad_covers(q: &GlowQuad, x: i32, y: i32) -> bool {
-    let (qx, qy) = (i32::from(q.x), i32::from(q.y));
-    q.alpha == 0 && qx <= x && x < qx + i32::from(q.w) && qy <= y && y < qy + i32::from(q.h)
+const fn quad_covers(q: &GlowQuad, x: i32, y: i32) -> bool {
+    let (qx, qy) = (q.x as i32, q.y as i32);
+    q.alpha == 0 && qx <= x && x < qx + q.w as i32 && qy <= y && y < qy + q.h as i32
 }
 
 /// The pixels [`settle_under_ceiling`] watches on one star: its centre, the first pixel of each arm
@@ -4418,15 +4622,15 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
 
 #[inline]
 #[must_use]
-fn under_ceil_with(table: &RelativeLuminanceTable, px: u32) -> bool {
+const fn under_ceil_with(table: &RelativeLuminanceTable, px: u32) -> bool {
     relative_luminance_with(table, px) <= STAR_LIGHT_CEIL
 }
 
 #[inline]
 #[must_use]
-fn stacked_centre(base: u32, rgb: u32, cov: u8) -> u32 {
+const fn stacked_centre(base: u32, rgb: u32, cov: u8) -> u32 {
     let lay = premul_rgb(rgb, cov);
-    let core = premul_rgb(rgb, (f32::from(cov) * STAR_CORE_ADD) as u8);
+    let core = premul_rgb(rgb, (cov as f32 * STAR_CORE_ADD) as u8);
     add_sat(add_sat(add_sat(base, lay), lay), core)
 }
 
@@ -4543,14 +4747,27 @@ pub(crate) struct LightStar {
     pub(crate) cov: u8,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct PaperInkMemo {
     theme: (u32, u32),
     len: u8,
     entries: [(u32, u32); 9],
 }
 
+impl Default for PaperInkMemo {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl PaperInkMemo {
+    const EMPTY: Self = Self {
+        theme: (0, 0),
+        len: 0,
+        entries: [(0, 0); 9],
+    };
+
     #[inline]
     fn get(&mut self, tint: u32, cfg: &Config) -> u32 {
         let theme = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
@@ -4603,11 +4820,19 @@ pub(crate) fn push_twinkle_over_twin(
     if cov == 0 || mass < 0.75 {
         return;
     }
-    let lay_of = |cap_a: u32| -> u32 {
-        let a = cap_a as f32 / 255.0;
-        let lay = (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32)) * 255.0;
-        (rgb & 0x00FF_FFFF) | ((lay.round() as u32).clamp(1, cap_a) << 24)
-    };
+    static LAY_ALPHA: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let lay_alpha = LAY_ALPHA.get_or_init(|| {
+        std::array::from_fn(|cap_a| {
+            let cap_a = cap_a as u32;
+            if cap_a == 0 {
+                return 0;
+            }
+            let a = cap_a as f32 / 255.0;
+            let lay = (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32)) * 255.0;
+            (lay.round() as u32).clamp(1, cap_a) << 24
+        })
+    });
+    let lay_of = |cap_a: u32| -> u32 { (rgb & 0x00FF_FFFF) | lay_alpha[cap_a as usize] };
     let core_cap = u32::from(cov).clamp(1, InkRole::Leading.alpha_cap() as u32);
     let arm_cap = u32::from(cov).clamp(1, InkRole::OverText.alpha_cap() as u32);
     let core_ink = lay_of(core_cap);
@@ -4687,11 +4912,16 @@ pub(crate) fn push_twinkle_over_twin(
 
 #[inline]
 fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
-    let lays = STAR_OVER_CENTRE_LAYS;
-    let a1 = f32::from(cov.min(role.alpha_cap() as u8)) / 255.0;
-    let cap1 = role.alpha_cap() / 255.0;
-    let ceiling = (1.0 - (1.0 - cap1).powf(lays)) * 255.0;
-    ((1.0 - (1.0 - a1).powf(lays)) * 255.0).clamp(1.0, ceiling) as u32
+    static CENTRE_ALPHA: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let table = CENTRE_ALPHA.get_or_init(|| {
+        std::array::from_fn(|b| {
+            let a = b as f32 / 255.0;
+            (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS)) * 255.0
+        })
+    });
+    let cap_b = role.alpha_cap() as u8;
+    let ceiling = table[usize::from(cap_b)];
+    table[usize::from(cov.min(cap_b))].clamp(1.0, ceiling) as u32
 }
 
 #[cfg(test)]

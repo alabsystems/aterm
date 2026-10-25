@@ -21,6 +21,9 @@ pub const RIGHT_CONTROL: i64 = 0x7_0000_00E4;
 const SRC: &str = "HIDKeyboardModifierMappingSrc";
 const DST: &str = "HIDKeyboardModifierMappingDst";
 
+/// What each model's ByHost global remap key starts with ([`Model::key`]).
+const MAPPING_KEY: &str = "com.apple.keyboard.modifiermapping.";
+
 /// The system domain listing the keyboard models this Mac has identified.
 pub const KEYBOARD_TYPE: &str = "com.apple.keyboardtype";
 
@@ -64,7 +67,13 @@ impl Model {
     /// The ByHost global key that holds this model's remaps.
     #[must_use]
     pub fn key(self) -> String {
-        format!("com.apple.keyboard.modifiermapping.{}", self.suffix())
+        format!("{MAPPING_KEY}{}", self.suffix())
+    }
+
+    /// The model whose remaps the ByHost global key `key` holds ([`Self::key`]).
+    #[must_use]
+    pub fn of_key(key: &str) -> Option<Self> {
+        Self::parse(key.strip_prefix(MAPPING_KEY)?)
     }
 
     /// `<vendor>-<product>` (or `<vendor>-<product>-0`), decimal.

@@ -30,7 +30,7 @@ fn reachable(m: &Model) -> Vec<S> {
     let mut queue = VecDeque::from([m.init_state()]);
     let mut out = Vec::new();
     while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
+        if !seen.insert(crate::common::key(m, &s)) {
             continue;
         }
         for a in &m.actions {

@@ -40,6 +40,12 @@ use super::{
     VoidCookie, WindowId, XConnection,
 };
 
+// LOCAL PATCH (aterm): the requests are aterm-x11's encoders and ICCCM properties, where upstream
+// used x11rb's; there is no input shape (`set_cursor_hittest` is Windows-only). A failed request is
+// reported (`XConnection::report`), never a panic, so the event loop can end the run on a lost
+// display. Where the server has SYNC the window offers EWMH's resize sync counter
+// (`sync_request.rs`).
+
 #[derive(Debug)]
 pub struct SharedState {
     pub cursor_pos: Option<(f64, f64)>,

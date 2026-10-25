@@ -131,7 +131,7 @@ impl SelView<'_> {
 }
 
 /// Per-frame effect geometry (§2.4 `EffectGeom`): the cell metrics and grid extent the cat emitter sizes against.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct EffectGeom {
     /// Cell width in px.
     pub cell_w: u16,
@@ -141,6 +141,23 @@ pub struct EffectGeom {
     pub rows: u16,
     /// Viewport cols (the horizontal anchor clamp bound).
     pub cols: u16,
+}
+
+impl EffectGeom {
+    /// Zeroed effect geometry before any frame is prepared.
+    pub const EMPTY: Self = Self {
+        cell_w: 0,
+        cell_h: 0,
+        rows: 0,
+        cols: 0,
+    };
+}
+
+impl Default for EffectGeom {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// The host's per-frame view of the cursor companion, for the one-cat-per-caret suppression ([`WordDecorations::tick`]).
@@ -207,12 +224,23 @@ impl CompanionOnGlass {
 }
 
 /// The pixels the live cursor companion owns this frame — up to two rects; an ambient cat yields if it overlaps either.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct CompanionFootprint {
     rects: [Option<(i32, i32, i32, i32)>; 2],
 }
 
+impl Default for CompanionFootprint {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl CompanionFootprint {
+    pub(crate) const EMPTY: Self = Self {
+        rects: [None, None],
+    };
+
     /// Is the cat rect `(x, w, top..bottom)` stacked on any companion rect?
     #[inline]
     #[must_use]
@@ -378,7 +406,6 @@ struct KittyCursorActiveFold {
     from_sprite: Option<(i32, i32)>,
 }
 
-#[derive(Default)]
 struct KittyCursorPlacementState {
     key: Option<KittyCursorPlacementKey>,
     last_target: Option<CatFootprint>,
@@ -387,6 +414,25 @@ struct KittyCursorPlacementState {
     settle: Option<(f32, f32)>,
     seen_fold: Option<(Instant, crate::kitty_cursor::CatFoldDirection)>,
     active: Option<KittyCursorActiveFold>,
+}
+
+impl KittyCursorPlacementState {
+    const EMPTY: Self = Self {
+        key: None,
+        last_target: None,
+        last_sprite: None,
+        last_emitted_at: None,
+        settle: None,
+        seen_fold: None,
+        active: None,
+    };
+}
+
+impl Default for KittyCursorPlacementState {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// The fully-resolved per-frame decoration settings (host config → engine).
@@ -745,7 +791,7 @@ enum PersistAdmission {
     Grace,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AlignScore {
     stationary: u16,
     matches: u16,
@@ -754,7 +800,22 @@ struct AlignScore {
     distance: u64,
 }
 
+impl Default for AlignScore {
+    #[inline]
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 impl AlignScore {
+    const ZERO: Self = Self {
+        stationary: 0,
+        matches: 0,
+        seed_matches: 0,
+        context_matches: 0,
+        distance: 0,
+    };
+
     #[inline]
     const fn with_edge(self, stationary: bool, tier: u8, distance: u32) -> Self {
         Self {
@@ -780,7 +841,7 @@ impl AlignScore {
     }
 }
 
-fn alignment_edge(
+const fn alignment_edge(
     ep: &Episode,
     candidate: PendingBirth,
     occ: &Occurrence,
@@ -793,39 +854,47 @@ fn alignment_edge(
     // also needs the completed token to end at the live caret: passive
     // redraws may restore a spent episode, a retyped `fuck` must re-arm.
     if ep.continuity_tainted
-        && (occ.class == Class::Feline
-            || (occ.class == Class::Profanity && candidate.live_caret_completion))
+        && (matches!(occ.class, Class::Feline)
+            || (matches!(occ.class, Class::Profanity) && candidate.live_caret_completion))
     {
         return None;
     }
-    if occ.class == Class::Feline
+    if matches!(occ.class, Class::Feline)
         && ep.peek_done
         && candidate.at_live_cursor
         && seq.wrapping_sub(ep.seen_seq) >= 2
     {
         return None;
     }
-    let width = u32::from(cols.max(1));
-    let old_pos = u32::from(ep.last_row)
+    let width = (if cols > 1 { cols } else { 1 }) as u32;
+    let old_pos = (ep.last_row as u32)
         .saturating_mul(width)
-        .saturating_add(u32::from(ep.last_col));
-    let new_pos = u32::from(occ.row)
+        .saturating_add(ep.last_col as u32);
+    let new_pos = (occ.row as u32)
         .saturating_mul(width)
-        .saturating_add(u32::from(occ.start_col));
+        .saturating_add(occ.start_col as u32);
     let distance = old_pos.abs_diff(new_pos);
     let max_distance = width.saturating_mul(REKEY_MAX_LINEAR_ROWS);
     let recent = seq.wrapping_sub(ep.seen_seq) <= REKEY_MAX_SEQ_GAP;
 
     if recent && ep.seed == occ.seed {
-        return (distance <= max_distance).then_some((0, distance));
+        return if distance <= max_distance {
+            Some((0, distance))
+        } else {
+            None
+        };
     }
     if ep.ctx_fp == candidate.ctx_fp {
         return Some((1, distance));
     }
-    if occ.class == Class::Profanity {
+    if matches!(occ.class, Class::Profanity) {
         return Some((1, distance));
     }
-    (same_width && recent && distance <= max_distance).then_some((2, distance))
+    if same_width && recent && distance <= max_distance {
+        Some((2, distance))
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -893,10 +962,24 @@ struct DoneMarkNode {
     newer: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DoneMarkMutation {
     evicted: Option<u64>,
     link_writes: u8,
+}
+
+impl DoneMarkMutation {
+    const NONE: Self = Self {
+        evicted: None,
+        link_writes: 0,
+    };
+}
+
+impl Default for DoneMarkMutation {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 struct DoneMarkLru {
@@ -1951,8 +2034,12 @@ impl WordDecorations {
         } else {
             0
         };
-        let y = rest_top - rise - (lift * ch_i as f32).round() as i32
-            + (bob * ch_i as f32).round() as i32;
+        // The head is taller than its row, so on row 0 (and the row-1 sky seat) the centred seat
+        // starts above the grid, where a pane divider cuts it and the window pad or the tab strip
+        // hides it: the seat stops at the grid top, less the hover bob's reach.
+        let headroom = (crate::kitty_cursor::BOB_AMP * ch_i as f32).ceil() as i32;
+        let seated = (rest_top - rise - (lift * ch_i as f32).round() as i32).max(headroom);
+        let y = (seated + (bob * ch_i as f32).round() as i32).max(0);
         Some(CatFootprint { x, y, w, h })
     }
 
@@ -2184,9 +2271,11 @@ impl WordDecorations {
                                 .map(|prev| at.saturating_duration_since(prev).as_secs_f32())
                                 .unwrap_or(0.0)
                                 .min(0.1);
-                            let alpha = 1.0 - (-dt / Self::PLACE_TAU).exp();
-                            px += (rest.0 - px) * alpha;
-                            py += (rest.1 - py) * alpha;
+                            if dt > 0.0 && (px != rest.0 || py != rest.1) {
+                                let alpha = 1.0 - (-dt / Self::PLACE_TAU).exp();
+                                px += (rest.0 - px) * alpha;
+                                py += (rest.1 - py) * alpha;
+                            }
                             settle = Some((px, py));
                             (
                                 px.round() as i32 + scale_dx,
@@ -2244,7 +2333,8 @@ impl WordDecorations {
         PreparedKittyCursorDraw {
             rect: CatFootprint {
                 x: sprite_x,
-                y: sprite_y,
+                // A stretch about the centre and a fold's arc may not lift it above the grid either.
+                y: sprite_y.max(0),
                 w: dest_w,
                 h: dest_h,
             },
@@ -2375,8 +2465,12 @@ impl WordDecorations {
             z: FreeZ::OverText,
         };
 
-        let mut note_sprites: [Option<FreeSprite>; crate::kitty_sing::MAX_NOTES] =
-            [const { None }; crate::kitty_sing::MAX_NOTES];
+        if let Some(at) = placement.sampled_at {
+            self.kitty_cursor_placement.last_sprite = Some((sprite.x, sprite.y));
+            self.kitty_cursor_placement.last_emitted_at = Some(at);
+        }
+
+        let mut fp = fold_free(FNV64_OFFSET, &sprite);
         if sing > 0.0 {
             let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
             let mouth_x = if flip_x {
@@ -2389,7 +2483,7 @@ impl WordDecorations {
             let alpha_f = f32::from(alpha);
             let cw_f = f32::from(geom.cell_w);
             let ch_f = f32::from(geom.cell_h);
-            for (slot, note) in note_sprites.iter_mut().zip(notes.iter().flatten()) {
+            for note in notes.iter().flatten() {
                 let a = (f32::from(note.alpha) * alpha_f / 255.0 * sing) as u8;
                 if a == 0 {
                     continue;
@@ -2414,13 +2508,13 @@ impl WordDecorations {
                 };
                 let nx = mouth_x + (note_dir * note.dx * cw_f).round() as i32 - i32::from(nw) / 2;
                 let ny = mouth_y + (note.dy * ch_f).round() as i32 - i32::from(nh) / 2;
-                *slot = Some(FreeSprite {
+                let note_sprite = FreeSprite {
                     x: if placement.in_motion() {
                         nx
                     } else {
                         nx.clamp(0, grid_w - i32::from(nw))
                     },
-                    y: ny,
+                    y: ny.max(0),
                     w: nw,
                     h: nh,
                     art: tile.art,
@@ -2429,19 +2523,10 @@ impl WordDecorations {
                     alpha: a,
                     flip_x: false,
                     z: FreeZ::OverText,
-                });
+                };
+                fp = fold_free(fp, &note_sprite);
+                free.push(note_sprite);
             }
-        }
-
-        if let Some(at) = placement.sampled_at {
-            self.kitty_cursor_placement.last_sprite = Some((sprite.x, sprite.y));
-            self.kitty_cursor_placement.last_emitted_at = Some(at);
-        }
-
-        let mut fp = fold_free(FNV64_OFFSET, &sprite);
-        for note in note_sprites.into_iter().flatten() {
-            fp = fold_free(fp, &note);
-            free.push(note);
         }
         free.push(sprite);
         fp = fnv_mix_u64(fp, self.cat_baker.version());
@@ -3547,7 +3632,13 @@ impl WordDecorations {
                     }
                     continue;
                 }
-                if cell.ch != ' ' && !cell.ch.is_whitespace() {
+                if cell.ch != ' '
+                    && !if cell.ch.is_ascii() {
+                        cell.ch.is_ascii_whitespace()
+                    } else {
+                        cell.ch.is_whitespace()
+                    }
+                {
                     if !occupied {
                         occupied = true;
                         if need_text {
@@ -3639,7 +3730,13 @@ impl WordDecorations {
                 }
                 continue;
             }
-            if cell.ch != ' ' && !cell.ch.is_whitespace() {
+            if cell.ch != ' '
+                && !if cell.ch.is_ascii() {
+                    cell.ch.is_ascii_whitespace()
+                } else {
+                    cell.ch.is_whitespace()
+                }
+            {
                 if !occupied {
                     occupied = true;
                     for (prev_c, prev) in row_cells[..c].iter().enumerate() {
@@ -5736,30 +5833,32 @@ struct CatGeom {
 
 /// §5.2 base art height before age scaling: `Hart = round(1.7·ch)`.
 #[inline]
-pub fn cat_hart(cell_h: u16) -> u16 {
-    ((1.7 * f32::from(cell_h)).round() as u16).max(1)
+pub const fn cat_hart(cell_h: u16) -> u16 {
+    let h = (1.7 * (cell_h as f32)).round() as u16;
+    if h > 1 { h } else { 1 }
 }
 
 /// §5.2 chin slice: `floor(0.15·Hart)` — the part spilling into the word row (occluded by the word's ascenders: the cat is visibly behind the word).
 #[inline]
-pub fn cat_chin(hart: u16) -> u16 {
-    (0.15 * f32::from(hart)).floor() as u16
+pub const fn cat_chin(hart: u16) -> u16 {
+    (0.15 * (hart as f32)).floor() as u16
 }
 
 #[inline]
-fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> (u16, u16) {
+const fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> (u16, u16) {
     let max_w = cell_h.saturating_mul(4).saturating_sub(PATCH_STRIP);
     fit_glyph(&GLYPHS[variant as usize], desired_h, max_w, cell_h)
 }
 
 #[inline]
-fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16, u16) {
-    let aspect = (f32::from(glyph.aspect_x1000) / 1000.0).max(0.001);
-    let max_w = f32::from(max_w.max(1));
-    let max_h = f32::from(cell_h.saturating_mul(2).max(1));
+const fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16, u16) {
+    let aspect = ((glyph.aspect_x1000 as f32) / 1000.0).max(0.001);
+    let max_w = (if max_w > 1 { max_w } else { 1 }) as f32;
+    let ch2 = cell_h.saturating_mul(2);
+    let max_h = (if ch2 > 1 { ch2 } else { 1 }) as f32;
     let fitted_h = desired_h.max(1.0).min(max_h).min(max_w / aspect);
     let h = fitted_h.round().clamp(1.0, max_h) as u16;
-    let w = (f32::from(h) * aspect).round().clamp(1.0, max_w) as u16;
+    let w = ((h as f32) * aspect).round().clamp(1.0, max_w) as u16;
     (w, h)
 }
 
@@ -5789,37 +5888,45 @@ const fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
 }
 
 #[inline]
-fn cat_geometry(occ: &Occurrence, geom: EffectGeom, variant: CatGlyphId) -> CatGeom {
+const fn cat_geometry(occ: &Occurrence, geom: EffectGeom, variant: CatGlyphId) -> CatGeom {
     cat_geometry_for(occ.start_col, occ.end_col, occ.genome.gkey, geom, variant)
 }
 
 #[inline]
-fn cat_geometry_for(
+const fn cat_geometry_for(
     start_col: u16,
     end_col: u16,
     gkey: u64,
     geom: EffectGeom,
     variant: CatGlyphId,
 ) -> CatGeom {
-    let desired_h = f32::from(cat_hart(geom.cell_h)) * cat_age_v4(gkey).scale();
+    let desired_h = (cat_hart(geom.cell_h) as f32) * cat_age_v4(gkey).scale();
     let size = authored_cat_size(variant, desired_h, geom.cell_h);
     anchored_geom(start_col, end_col, geom, size, &GLYPHS[variant as usize])
 }
 
 #[inline]
-fn anchored_geom(
+const fn anchored_geom(
     start_col: u16,
     end_col: u16,
     geom: EffectGeom,
     (w, hart): (u16, u16),
     glyph: &GlyphDef,
 ) -> CatGeom {
-    let cw = i32::from(geom.cell_w);
-    let w_i = i32::from(w);
-    let grid_w = i32::from(geom.cols) * cw;
-    let mid = (i32::from(start_col) * cw + (i32::from(end_col) + 1) * cw) / 2;
-    let center = f32::from(glyph.center_x) / f32::from(FIXED_ONE);
-    let x = (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - w_i).max(0));
+    let cw = geom.cell_w as i32;
+    let w_i = w as i32;
+    let grid_w = (geom.cols as i32) * cw;
+    let mid = ((start_col as i32) * cw + ((end_col as i32) + 1) * cw) / 2;
+    let center = (glyph.center_x as f32) / (FIXED_ONE as f32);
+    let max_x = if grid_w > w_i { grid_w - w_i } else { 0 };
+    let raw_x = mid - (center * (w as f32)).round() as i32;
+    let x = if raw_x < 0 {
+        0
+    } else if raw_x > max_x {
+        max_x
+    } else {
+        raw_x
+    };
     CatGeom {
         w,
         hart,
@@ -5829,10 +5936,10 @@ fn anchored_geom(
 }
 
 #[inline]
-fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -> CatGeom {
+const fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -> CatGeom {
     let glyph = &ANIMAL_GLYPHS[species as usize];
     let max_w = geom.cell_h.saturating_mul(4);
-    let size = fit_glyph(glyph, f32::from(cat_hart(geom.cell_h)), max_w, geom.cell_h);
+    let size = fit_glyph(glyph, cat_hart(geom.cell_h) as f32, max_w, geom.cell_h);
     anchored_geom(occ.start_col, occ.end_col, geom, size, glyph)
 }
 
@@ -6572,22 +6679,27 @@ fn emit_ink(
     let start_col = occ.start_col;
     let row = occ.row;
     let has_glare = glare > 0.0;
+    let has_strength = strength > 0.0;
     let dim = fx.dim;
     let has_dim = dim < 1.0;
     for (&col, &fg_rgb) in cols.iter().zip(fgs) {
-        let u = f32::from(col.saturating_sub(start_col)) / span;
-        let base = mix_rgb(c0, c1, u);
-        let raw = if has_glare {
-            let lobe = glare * spec_lobe(u, center);
-            if lobe > 0.0 {
-                mix_rgb(base, 0x00FF_FFFF, lobe)
+        let mut color = if has_strength {
+            let u = f32::from(col.saturating_sub(start_col)) / span;
+            let base = mix_rgb(c0, c1, u);
+            let raw = if has_glare {
+                let lobe = glare * spec_lobe(u, center);
+                if lobe > 0.0 {
+                    mix_rgb(base, 0x00FF_FFFF, lobe)
+                } else {
+                    base
+                }
             } else {
                 base
-            }
+            };
+            mix_rgb(rgb3_to_u32(fg_rgb), raw, strength)
         } else {
-            base
+            rgb3_to_u32(fg_rgb)
         };
-        let mut color = mix_rgb(rgb3_to_u32(fg_rgb), raw, strength);
         if has_dim {
             color = dim_rgb(color, dim);
         }
@@ -6704,20 +6816,25 @@ fn emit_rainbow_ink(
     let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
     let cols_len = cols.len();
     let row = occ.row;
+    let has_strength = strength > 0.0;
     let has_lift = fx.lift > 0.0;
     let dim = fx.dim;
     let has_dim = dim < 1.0;
     for (i, (&col, &fg_rgb)) in cols.iter().zip(fgs).enumerate() {
-        let target = if span_used == 0.0 || i == 0 {
-            guard_hues[0]
-        } else if cols_len == 4 {
-            guard_hues[i]
-        } else if i + 1 == cols_len {
-            guard_hues[3]
+        let mut color = if has_strength {
+            let target = if span_used == 0.0 || i == 0 {
+                guard_hues[0]
+            } else if cols_len == 4 {
+                guard_hues[i]
+            } else if i + 1 == cols_len {
+                guard_hues[3]
+            } else {
+                hue_at(i as f32 / denom)
+            };
+            mix_rgb(rgb3_to_u32(fg_rgb), target, strength)
         } else {
-            hue_at(i as f32 / denom)
+            rgb3_to_u32(fg_rgb)
         };
-        let mut color = mix_rgb(rgb3_to_u32(fg_rgb), target, strength);
         if has_lift {
             color = mix_rgb(color, lift_target, lift_t);
         }
@@ -6812,10 +6929,12 @@ pub(crate) const fn fold_ink(mut h: u64, c: InkCell) -> u64 {
 }
 
 #[inline]
-fn dim_rgb(c: u32, f: f32) -> u32 {
+const fn dim_rgb(c: u32, f: f32) -> u32 {
     let f = f.clamp(0.0, 1.0);
-    let m = |sh: u32| ((((c >> sh) & 0xff) as f32) * f).round() as u32;
-    (m(16) << 16) | (m(8) << 8) | m(0)
+    const fn m(c: u32, f: f32, sh: u32) -> u32 {
+        ((((c >> sh) & 0xff) as f32) * f).round() as u32
+    }
+    (m(c, f, 16) << 16) | (m(c, f, 8) << 8) | m(c, f, 0)
 }
 
 #[inline]
@@ -6846,12 +6965,20 @@ fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey 
     let lo = start.saturating_sub(4);
     let hi = end.saturating_add(4).min(cells.len().saturating_sub(1));
     for cell in cells[lo..start].iter().chain(&cells[end + 1..hi + 1]) {
-        if cell.wide || cell.ch == ' ' || cell.ch == '\0' || cell.ch.is_whitespace() {
+        if cell.wide
+            || cell.ch == ' '
+            || cell.ch == '\0'
+            || (if cell.ch.is_ascii() {
+                cell.ch.is_ascii_whitespace()
+            } else {
+                cell.ch.is_whitespace()
+            })
+        {
             continue;
         }
-        for (dst, src) in sum.iter_mut().zip(cell.fg) {
-            *dst += u32::from(src);
-        }
+        sum[0] += u32::from(cell.fg[0]);
+        sum[1] += u32::from(cell.fg[1]);
+        sum[2] += u32::from(cell.fg[2]);
         count += 1;
     }
     let surrounding = [
@@ -6936,19 +7063,23 @@ fn cat_color_context_footprint(
             };
             min_background_band = min_background_band.min(band);
             max_background_band = max_background_band.max(band);
-            for (dst, src) in bg_sum.iter_mut().zip(background) {
-                *dst += u32::from(src);
-            }
+            bg_sum[0] += u32::from(background[0]);
+            bg_sum[1] += u32::from(background[1]);
+            bg_sum[2] += u32::from(background[2]);
             sampled += 1;
             if let Some(cell) = cell
                 && !cell.wide
                 && cell.ch != ' '
                 && cell.ch != '\0'
-                && !cell.ch.is_whitespace()
+                && !(if cell.ch.is_ascii() {
+                    cell.ch.is_ascii_whitespace()
+                } else {
+                    cell.ch.is_whitespace()
+                })
             {
-                for (dst, src) in fg_sum.iter_mut().zip(cell.fg) {
-                    *dst += u32::from(src);
-                }
+                fg_sum[0] += u32::from(cell.fg[0]);
+                fg_sum[1] += u32::from(cell.fg[1]);
+                fg_sum[2] += u32::from(cell.fg[2]);
                 visible += 1;
             }
             if sampled == MAX_SAMPLES {
@@ -7012,7 +7143,14 @@ fn clear_band_occupancy(
                 return None;
             }
             let ch = cell.ch;
-            if ch != ' ' && ch != '\0' && !ch.is_whitespace() {
+            if ch != ' '
+                && ch != '\0'
+                && !(if ch.is_ascii() {
+                    ch.is_ascii_whitespace()
+                } else {
+                    ch.is_whitespace()
+                })
+            {
                 if !('\u{2500}'..='\u{259F}').contains(&ch) {
                     return None;
                 }
@@ -7050,7 +7188,14 @@ fn band_occupancy(
         return None;
     }
     let is_occupied = |cell: &RenderCell| {
-        cell.wide || (cell.ch != ' ' && cell.ch != '\0' && !cell.ch.is_whitespace())
+        cell.wide
+            || (cell.ch != ' '
+                && cell.ch != '\0'
+                && !(if cell.ch.is_ascii() {
+                    cell.ch.is_ascii_whitespace()
+                } else {
+                    cell.ch.is_whitespace()
+                }))
     };
     let mut occupied = 0u32;
     for r in r0..=r1 {
@@ -7264,7 +7409,7 @@ const fn jitter(j: i8, s: u64) -> i8 {
 }
 
 #[inline]
-fn scale_u8(v: f32) -> u8 {
+const fn scale_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
@@ -14617,9 +14762,9 @@ mod tests {
         let top_right = emit(&mut wd, (0, g.cols - 1));
         assert_eq!(top_right.x + i32::from(top_right.w), grid_w);
         assert!(
-            top_right.y < 0 && top_right.y + i32::from(top_right.h) > 0,
-            "row-zero custom art is partially clipped, never wholly misplaced or dropped: \
-             {top_right:?}"
+            top_right.y >= 0 && top_right.y < i32::from(g.cell_h),
+            "row-zero custom art lands whole beside its row, never clipped above the grid, \
+             misplaced or dropped: {top_right:?}"
         );
 
         wd.set_kitty_sprite_source(KittySpriteSource::BuiltIn);
@@ -15332,6 +15477,122 @@ mod tests {
             i32::from(g.cell_h),
             "control: a lift in the bob jumps a whole row"
         );
+    }
+
+    /// Row 0 has no row above it, and the row-1 sky seat lifts the head into row 0: no pose,
+    /// bob, fold leg or song note may start a pixel above the grid top, where a pane divider
+    /// cuts it, the window pad hides it, or (after the tab-strip splice) the strip covers it.
+    #[test]
+    fn the_flying_head_on_the_top_rows_stays_inside_the_grid() {
+        use crate::kitty_cursor::{
+            CatFoldDirection, CatFoldFrame, CatPose, CursorCatPlacementFrame,
+        };
+        use crate::kitty_sing::{MAX_NOTES, NoteKind, NoteSprite};
+
+        let stretched = CatPose {
+            scale_x: 0.9,
+            scale_y: 1.25,
+            ..CatPose::STILL
+        };
+        let mut notes = [None; MAX_NOTES];
+        notes[0] = Some(NoteSprite {
+            kind: NoteKind::Eighth,
+            dx: 0.5,
+            dy: -1.0,
+            alpha: 255,
+            tint: 0x00FF_AA44,
+        });
+        let small = EffectGeom {
+            cell_w: 9,
+            cell_h: 19,
+            rows: 24,
+            cols: 80,
+        };
+        for g in [geom20(), small] {
+            let ch = i32::from(g.cell_h);
+            for (row, lift) in [(0u16, 0.0f32), (1, 0.0), (1, 1.0)] {
+                let cursor = (row, 5);
+                let caret_top = i32::from(row) * ch;
+                for bob in [-0.09f32, 0.0, 0.09] {
+                    let at = format!(
+                        "{}x{} caret {cursor:?} lift {lift} bob {bob}",
+                        g.cell_w, g.cell_h
+                    );
+                    let layout = KittyCursorLayout {
+                        bob,
+                        lift,
+                        ..still_layout(g, cursor)
+                    };
+                    let fp = WordDecorations::default()
+                        .kitty_cursor_footprint(layout)
+                        .expect("a footprint");
+                    assert!(
+                        fp.y >= 0,
+                        "{at}: the footprint starts {} px above the grid",
+                        -fp.y
+                    );
+                    assert!(
+                        fp.y < caret_top + ch && fp.y + i32::from(fp.h) > caret_top,
+                        "{at}: the head stays beside the caret's row: {fp:?}"
+                    );
+                    for pose in [CatPose::STILL, stretched] {
+                        let mut wd = WordDecorations::default();
+                        let t0 = Instant::now();
+                        let fold = |progress: f32, ms: u64| CursorCatPlacementFrame {
+                            sampled_at: t0 + Duration::from_millis(ms),
+                            fold: Some(CatFoldFrame {
+                                started: t0 + Duration::from_millis(16),
+                                direction: CatFoldDirection::Forward,
+                                progress,
+                            }),
+                            facing_left: false,
+                        };
+                        let frame = KittyCursorFrame {
+                            bob,
+                            lift,
+                            pose,
+                            sing: 1.0,
+                            notes,
+                            ..still_frame(g, cursor)
+                        };
+                        for (leg, motion) in [
+                            ("settled", settled_at(t0)),
+                            ("exit", fold(0.25, 24)),
+                            ("enter", fold(0.75, 32)),
+                        ] {
+                            let placement = wd
+                                .resolve_kitty_cursor_placement(layout, motion)
+                                .expect("placeable companion");
+                            let mut free = Vec::new();
+                            wd.kitty_cursor_at_placement(frame, placement, &mut free)
+                                .expect("companion emitted");
+                            assert_eq!(free.len(), 2, "{at} {leg}: fixture: the note and the body");
+                            for s in &free {
+                                assert!(
+                                    s.y >= 0,
+                                    "{at} {leg} scale_y {}: a {}x{} sprite starts {} px above the grid",
+                                    pose.scale_y,
+                                    s.w,
+                                    s.h,
+                                    -s.y
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let open = WordDecorations::default()
+                .kitty_cursor_footprint(KittyCursorLayout {
+                    lift: 1.0,
+                    ..still_layout(g, (3, 5))
+                })
+                .expect("a footprint");
+            assert_eq!(
+                open.y,
+                3 * ch + ch / 2 - i32::from(open.h) / 2 - ch,
+                "control: with room above, the sky seat still rises a whole row"
+            );
+        }
     }
 
     #[test]
@@ -17148,6 +17409,112 @@ mod pet_stays_inside_the_grid_tests {
             (body.0, body.2, body.1 - body.0, body.3 - body.2),
             "the emitted sprite must still BE `body_px`"
         );
+    }
+
+    /// A pane at the window's top leaves its top edge open (a sprite may overhang the pad, and
+    /// after the tab-strip splice that overhang is the strip), and a pane below another clips
+    /// hard at its divider: with the caret on either of the first two rows, both cursor
+    /// companions must land whole inside either pane.
+    #[test]
+    fn both_companions_on_the_top_rows_land_whole_in_a_top_pane_and_a_lower_pane() {
+        use crate::kitty_cursor::CatPose;
+        use crate::pane::{PanePlace, translate_free_into_pane};
+
+        let ch = i32::from(GEOM.cell_h);
+        let pane = |row_off: u16| PanePlace {
+            row_off,
+            col_off: 0,
+            rows: GEOM.rows,
+            cols: GEOM.cols,
+            win_rows: GEOM.rows + 16,
+            win_cols: GEOM.cols,
+            cell_w: u32::from(GEOM.cell_w),
+            cell_h: u32::from(GEOM.cell_h),
+        };
+        for row in [0u16, 1] {
+            let mut cases: Vec<(String, Vec<FreeSprite>)> = Vec::new();
+            let pet = crate::kitty_pet::PetFrame {
+                row: f32::from(row),
+                ..sleeper_on_the_top_row()
+            };
+            let mut wd = WordDecorations::default();
+            let mut free = Vec::new();
+            for _ in 0..12 {
+                wd.begin_host_frame();
+                free.clear();
+                wd.pet_cursor(
+                    PetCursorFrame {
+                        geom: GEOM,
+                        colors: CatColorKey::default(),
+                        coat: 3,
+                        iris: 1,
+                        pet,
+                        page: None,
+                    },
+                    &mut free,
+                );
+                if free.len() >= 2 {
+                    break;
+                }
+            }
+            assert!(
+                free.len() >= 2,
+                "fixture: the pet's body and mote on row {row}"
+            );
+            cases.push((format!("pet on row {row}"), free));
+            let lifts: &[f32] = if row == 0 { &[0.0] } else { &[0.0, 1.0] };
+            for &lift in lifts {
+                let mut wd = WordDecorations::default();
+                let mut free = Vec::new();
+                wd.kitty_cursor(
+                    KittyCursorFrame {
+                        geom: GEOM,
+                        cursor: (row, 30),
+                        look: KittyLook::default(),
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        lift,
+                        alpha: 255,
+                        pose: CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    &mut free,
+                )
+                .expect("the flying head emitted");
+                cases.push((format!("flying head on row {row} lift {lift}"), free));
+            }
+            for (label, free) in cases {
+                for row_off in [0u16, 16] {
+                    let mut placed = free.clone();
+                    translate_free_into_pane(&mut placed, pane(row_off));
+                    assert_eq!(
+                        placed.len(),
+                        free.len(),
+                        "{label}, pane at row {row_off}: a sprite was cut away whole"
+                    );
+                    let top = i32::from(row_off) * ch;
+                    for s in &placed {
+                        assert!(
+                            s.y >= top,
+                            "{label}, pane at row {row_off}: a sprite starts {} px above the \
+                             pane's grid, in the {}",
+                            top - s.y,
+                            if row_off == 0 {
+                                "window pad or the tab strip"
+                            } else {
+                                "pane above"
+                            }
+                        );
+                        assert_eq!(
+                            s.visible(),
+                            PxRect::at(s.x, s.y, u32::from(s.w), u32::from(s.h)),
+                            "{label}, pane at row {row_off}: the pane's edge cut the sprite"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

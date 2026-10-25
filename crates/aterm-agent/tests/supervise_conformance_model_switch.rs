@@ -261,11 +261,11 @@ fn walk(m: &Model, strict: bool) -> (usize, Vec<State>) {
         now: base,
         appeared: base,
     };
-    let mut seen: BTreeSet<State> = BTreeSet::new();
+    let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
     let mut disagree = Vec::new();
     while let Some((st, real)) = queue.pop_front() {
-        if !seen.insert(st.clone()) {
+        if !seen.insert(crate::common::key(m, &st)) {
             continue;
         }
         if strict {

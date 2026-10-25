@@ -1460,7 +1460,8 @@ mod macos {
                     aterm_objc::msg();
                 send(obj, sel)
             };
-            // SAFETY: `obj` is live.
+            // SAFETY: `obj` is live; `-methodSignatureForSelector:` answers an autoreleased
+            // signature or nil.
             let sig: Id = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = checked_msg();
                 f(obj, sel!(methodSignatureForSelector:), sel)
@@ -1540,7 +1541,8 @@ mod macos {
                     aterm_objc::msg();
                 send(obj, sel)
             };
-            // SAFETY: `obj` is live.
+            // SAFETY: `obj` is live; `-methodSignatureForSelector:` answers an autoreleased
+            // signature or nil.
             let sig: Id = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = checked_msg();
                 f(obj, sel!(methodSignatureForSelector:), sel)

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Embedded encrypted replicated application database over astream"
+[dependencies]
+aterm-db-core.workspace = true
+aterm-secrets.workspace = true
+aterm-spec-anchor.workspace = true
+aterm-codec.workspace = true
+aterm-digest.workspace = true
+aterm-json.workspace = true
+aterm-net.workspace = true
+aterm-uds.workspace = true
+aterm-time.workspace = true
+ring.workspace = true
+astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+[dev-dependencies]
+aterm-tempfile.workspace = true
+aterm-spec.workspace = true
+aterm-models-db.workspace = true
+[lints]
+workspace = true

@@ -59,6 +59,10 @@ pub const ATTENTION_KEPT: &str = "kept";
 /// The line a stall's hold writes (`stall.rs`'s `hold_for_stall`).
 pub const FROZEN: &str = "FROZEN";
 
+/// How the line of a turn the Mac slept through in the vendor's API retry, Escaped once the API
+/// was back, begins (`supervise::run::woken_turn`).
+pub const UNSTUCK: &str = "UNSTUCK";
+
 /// How an `ESCALATED seq=<n> attention=<reply>` line's tail begins where no badge went.
 pub const ATTENTION_SKIPPED: &str = "attention=skipped: ";
 /// Why [`ATTENTION_SKIPPED`] behind another supervisor's claim.
@@ -245,11 +249,12 @@ pub enum Noted {
     Sleep,
     Abandoned,
     RepoUnread,
+    Unstuck,
 }
 
 impl Noted {
     /// Every word, in declaration order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Done,
         Self::Left,
         Self::Parked,
@@ -283,6 +288,7 @@ impl Noted {
         Self::Sleep,
         Self::Abandoned,
         Self::RepoUnread,
+        Self::Unstuck,
     ];
 
     /// How a line of this word begins (`NOT ESCALATED` is two words).
@@ -322,6 +328,7 @@ impl Noted {
             Self::Sleep => "SLEEP",
             Self::Abandoned => "ABANDONED",
             Self::RepoUnread => "REPO UNREAD",
+            Self::Unstuck => UNSTUCK,
         }
     }
 
@@ -362,6 +369,7 @@ impl Noted {
             Self::Sleep => "sleep",
             Self::Abandoned => "abandoned",
             Self::RepoUnread => "repo-unread",
+            Self::Unstuck => "unstuck",
         }
     }
 

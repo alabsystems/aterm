@@ -620,8 +620,7 @@ fn an_install_removes_the_fetched_verifier_when_it_ends() {
     let pin = pinned(&sha256(STAND_IN.as_bytes()));
     let held = pinned_copy(&scratch, "held/install.sh", &pin);
     let text = read(&held);
-    let forgetful =
-        "\tcleanup() {\n\t\tset +e\n\t\trm -rf \"$TMP\"\n\t\tlinux_verifier_cleanup\n\t}\n";
+    let forgetful = "install_linux_app_cleanup() {\n\tset +e\n\ttrap '' INT HUP TERM QUIT\n\tlinux_verifier_cleanup\n\trm -rf \"$TMP\"\n}\n";
     assert_eq!(
         text.matches(forgetful).count(),
         1,
@@ -631,7 +630,7 @@ fn an_install_removes_the_fetched_verifier_when_it_ends() {
         "broken/install.sh",
         text.replacen(
             forgetful,
-            "\tcleanup() {\n\t\tset +e\n\t\trm -rf \"$TMP\"\n\t}\n",
+            "install_linux_app_cleanup() {\n\tset +e\n\ttrap '' INT HUP TERM QUIT\n\trm -rf \"$TMP\"\n}\n",
             1,
         ),
     );

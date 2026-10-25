@@ -477,7 +477,7 @@ fn prompt_words(content: Option<&Value>) -> Option<String> {
     clean_prompt_words(&text)
 }
 
-fn clean_prompt_words(text: &str) -> Option<String> {
+pub(crate) fn clean_prompt_words(text: &str) -> Option<String> {
     let words = super::upgrade::typed_words(text);
     if words.is_empty()
         || words.starts_with("[aterm harness]")
@@ -753,7 +753,7 @@ fn tool_calls(parts: &[Value]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn tool_name(name: &str) -> String {
+pub(crate) fn tool_name(name: &str) -> String {
     name.chars()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
         .take(64)

@@ -481,7 +481,7 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
         let mut seen: HashSet<Vec<i64>> = HashSet::new();
         let mut queue = VecDeque::from([(m.init_state(), init)]);
         while let Some((st, real)) = queue.pop_front() {
-            if !seen.insert(st.values().copied().collect()) {
+            if !seen.insert(crate::common::key(m, &st)) {
                 continue;
             }
             let env = m.eval_env(&st);

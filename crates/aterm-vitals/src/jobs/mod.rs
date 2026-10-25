@@ -307,6 +307,10 @@ pub struct JobProc {
     /// Whether macOS's program check holds it before its first instruction
     /// (`aterm_sysprobe::jobs::AtStart::Held`).
     pub program_check: bool,
+    /// Its pid version where read (macOS `p_idversion`, read for each tab's root): a new process
+    /// and each exec take a new one, so it moves where the pid, the start and the name stay
+    /// (`exec zsh`); `None` elsewhere.
+    pub version: Option<u64>,
 }
 
 /// What keeps a process whose one thread never ran from its first instruction past 20 s
@@ -525,6 +529,9 @@ pub struct JobTab {
     /// When aterm last read PTY output that drew the screen (put the cursor on a row of its own
     /// choosing or moved rows: nvim, Emacs, a pager, whose line feeds are cursor moves), host ms.
     pub drawn_ms: Option<u64>,
+    /// The terminal shows its alternate screen, as the reader last fed it (a full-screen
+    /// program's: vim, less, htop; never a line editor's at a prompt).
+    pub alt_screen: bool,
     /// PTY bytes read so far (cumulative).
     pub output_bytes: u64,
     /// When the program last consumed typed input, host ms.

@@ -1351,7 +1351,6 @@ fn phase_6_shown_keys_are_appended_wire_and_the_mark_is_local() {
 
 #[test]
 fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
-    assert_eq!(Kind::ALL.last(), Some(&Kind::Row), "the last kind");
     let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
     assert_eq!(kind_at(Kind::Row), kind_at(Kind::Shown).map(|i| i + 1));
     assert_eq!(Kind::Row.word(), "row");
@@ -1421,6 +1420,99 @@ fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
             .expect("fits")
             .contains("QZP6ROW1"),
         "CONTROL: the host tier holds a host key's text"
+    );
+}
+
+/// A9 (B22): THE MAIL GAP MARK is appended last, local, and names no key of its own. A
+/// broker's gap notice says which offsets of the node's mail lanes retention gave up unread
+/// (`off=` the tail's cursor, `floor=` the oldest offset the lane still reaches, both host
+/// facts as every mail offset is) and, where the broker counted them, how many (`lost=`, a
+/// wire count). The host tier holds the range, the wire tier the count alone; it never crosses
+/// the bus (mail crosses only as counts); an older reader reads an unknown kind and its keys.
+/// The fold counts no mail arrival for it. CONTROL: the same fields as a `mail dir=in` mark count
+/// one, so the count is the kind's.
+#[test]
+fn a9_mail_gap_is_appended_local_at_its_keys_tiers() {
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(Kind::ALL.last(), Some(&Kind::MailGap), "the last kind");
+    assert_eq!(
+        kind_at(Kind::MailGap),
+        kind_at(Kind::Row).map(|i| i + 1),
+        "it follows phase 6's row mark"
+    );
+    assert_eq!(Kind::MailGap.word(), "mail-gap");
+    assert!(Kind::MailGap.is_mark() && Kind::MailGap.node_level().is_none());
+    assert_eq!(Kind::from_word("mail-gap"), Kind::MailGap);
+    assert_eq!(
+        [Key::Off, Key::Floor, Key::Lost].map(|k| (k.word(), k.tier(), k.cap())),
+        [
+            ("off", Tier::Host, Cap::U),
+            ("floor", Tier::Host, Cap::U),
+            ("lost", Tier::Wire, Cap::U),
+        ],
+        "its keys, at the tiers every mail offset and every count has"
+    );
+    let r = Rec {
+        seq: 51,
+        t: 1_760_545_012_345,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::MailGap,
+        f: Fields::new()
+            .u(Key::Off, 7)
+            .and_then(|f| f.u(Key::Floor, 42))
+            .and_then(|f| f.u(Key::Lost, 3))
+            .expect("a mail gap's fields"),
+        src: Src::Fabric,
+        conf: Conf::Exact,
+        by: Actor::Bridge,
+    };
+    let host = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        host,
+        "51 mark - mail-gap off=7 floor=42 lost=3 by=bridge src=fabric conf=exact t=1760545012345"
+    );
+    assert_eq!(decode(&host), Ok(r.clone()), "{host}");
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(
+        wire.contains(" lost=3 ") && !wire.contains("off=") && !wire.contains("floor="),
+        "{wire}"
+    );
+    assert!(!r.is_bus_class() && !r.is_turn_class(), "local");
+    let mut unknown = r.clone();
+    unknown.f.remove(Key::Lost);
+    let unknown = encode(&unknown, Tier::Host).expect("fits");
+    assert!(
+        !unknown.contains("lost="),
+        "a count the broker did not give: {unknown}"
+    );
+    let older = host
+        .replace(" mail-gap ", " zz-kind-of-phase-9 ")
+        .replace(" lost=", " zz_lost=")
+        .replace(" floor=", " zz_floor=")
+        .replace(" off=", " zz_off=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.k, Kind::Unknown, "{older}");
+    assert_eq!(read.f.iter().count(), 0, "every key skipped: {older}");
+    let folded = |k: Kind, f: Fields| {
+        let mut log = aterm_slog::Log::new(0);
+        let mark = aterm_slog::Mark::new(k, Src::Fabric, Conf::Exact)
+            .by(Actor::Bridge)
+            .fields(f);
+        log.mark(mark, crate::support::at(1)).expect("a mark");
+        (log.state().totals.mail_in, log.state().mail_open)
+    };
+    assert_eq!(
+        folded(Kind::MailGap, r.f.clone()),
+        (0, 0),
+        "a give-up is no mail arrival"
+    );
+    let arrival = r.f.clone().word(Key::Dir, "in").expect("a direction");
+    assert_eq!(
+        folded(Kind::Mail, arrival),
+        (1, 1),
+        "CONTROL: the same fields as a `mail dir=in` mark are one"
     );
 }
 

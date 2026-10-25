@@ -64,7 +64,7 @@ fn cells_text(cells: &[RenderCell]) -> String {
 const CHROME_TITLE: bool = cfg!(any(test, debug_assertions));
 
 /// What the chip's node says on one `autopilot` line: its label (`spoken=`), its description and,
-/// in a development build, the title its hover reads ([`App::hovered_title`]).
+/// in a development build, the title its hover reads ([`super::title_parts`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Said<'a> {
     pub(crate) spoken: &'a str,

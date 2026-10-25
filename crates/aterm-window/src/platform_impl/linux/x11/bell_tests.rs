@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
+//
+// Added by the aterm project in 2026 to its copy of winit 0.30.13
+// (see the repository NOTICE).
 
 //! A window's bell (`UnownedWindow::ring_bell`, `platform::x11::WindowExtX11::ring_x11_bell`) is an
 //! XKB bell request naming the window, which the X server announces to every client that selected

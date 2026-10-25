@@ -147,6 +147,8 @@ fn a_spawn_over_a_drive_names_no_folder_of_this_mac() {
     for (bad, why) in [
         ("agent=claude", "end the request with -"),
         ("model=haiku -", "a worker alone"),
+        ("", "a worker alone"),
+        ("-e /bin/sh -c true", "a worker alone"),
         ("agent=claude len=4 -", "len="),
         ("agent=claude cwd=proj -", "absolute path"),
     ] {

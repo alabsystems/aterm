@@ -212,6 +212,10 @@ pub(crate) fn main() -> ExitCode {
         return aterm_containment::consent::run_open_probe_verb(rest.get(1..).unwrap_or(&[]));
     }
 
+    if first == aterm_gui::REOPEN_VERB {
+        return aterm_gui::run_reopen_after(rest.get(1..).unwrap_or(&[]));
+    }
+
     #[cfg(unix)]
     if first == "hook" && rest.get(1).is_some_and(|a| a == "run") {
         return dispatch_link(
@@ -264,6 +268,13 @@ pub(crate) fn main() -> ExitCode {
                 ExitCode::from(u8::try_from(aterm_gui::run_ship(&args)).unwrap_or(2))
             }
             aterm_cli::Verb::Update => update_verb(&forwarded),
+            #[cfg(unix)]
+            aterm_cli::Verb::Db => aterm_db::cli::main_entry(forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Db => {
+                eprintln!("aterm db: not available on this platform (Unix only)");
+                ExitCode::from(2)
+            }
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
             aterm_cli::Verb::Ai => aterm_agent::ai::cli::main_entry(forwarded),
             #[cfg(target_os = "macos")]
@@ -906,26 +917,377 @@ fn apply_first_run_doctor() -> bool {
                     "first-run macOS doctor: the automatic plan upgrade did not finish: {why}"
                 );
             }
-            let mut password = None;
-            let (prepared, sent) = prepare_first_run_doctor(|initial, on_begin| {
-                let mut answer = aterm_gui::await_initial_setup_answer_while(
-                    initial,
-                    || {
-                        startup_offer_withdrawn(|| {
-                            aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
-                        })
-                    },
-                    on_begin,
-                );
-                password = answer.password.take();
-                answer
-            });
-            run_prepared_setup(prepared, password, sent);
+            run_startup_setup(None);
         }) {
         Ok(_) => true,
         Err(why) => {
             aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
             false
+        }
+    }
+}
+
+/// A plan a watch widened ([`widen_on_alab_signal`]), as the run it admitted registers
+/// ([`register_admitted_run`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Default)]
+struct Widened {
+    /// The admission number ([`SETUP_SENT`]) the look took before it read the Stop hold: a Stop
+    /// pressed since covers the widened run.
+    sent: u64,
+    /// The revision it widened: a Stop asked for it holds the widened run too.
+    from: u64,
+}
+
+/// Offer or resume setup as a launch does, then run it. A plan aterm chose by itself before it
+/// heard the ALab vault is watched meanwhile ([`maintain_setup_watch`]). `widened`: the plan a
+/// watch widened, so a Stop pressed since its look, or asked for the plan it widened, stops the
+/// run it admitted.
+#[cfg(target_os = "macos")]
+fn run_startup_setup(widened: Option<Widened>) {
+    let mut password = None;
+    let (prepared, mut sent) = prepare_first_run_doctor(|initial, on_begin| {
+        let mut answer = aterm_gui::await_initial_setup_answer_while(
+            initial,
+            || {
+                startup_offer_withdrawn(|| {
+                    aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
+                })
+            },
+            on_begin,
+        );
+        password = answer.password.take();
+        answer
+    });
+    if let Some(widened) = widened {
+        sent.sent = sent.sent.min(widened.sent);
+        sent.widened_from = Some(widened.from);
+    }
+    with_setup_watch(
+        false,
+        || run_prepared_setup(prepared, password, sent),
+        maintain_setup_watch,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum WatchMaintenance {
+    Spawn,
+    Inline,
+}
+
+/// The common worker's reservation boundaries. Inline maintenance belongs after the
+/// closure has returned, once all the run's leases and registration have been released.
+#[cfg(target_os = "macos")]
+fn with_setup_watch<T>(
+    entering_worker: bool,
+    run: impl FnOnce() -> T,
+    mut maintain: impl FnMut(WatchMaintenance),
+) -> T {
+    if entering_worker {
+        maintain(WatchMaintenance::Spawn);
+    }
+    let result = run();
+    maintain(WatchMaintenance::Inline);
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn read_setup_park_mark_with<M>(read: impl FnOnce() -> M, maintain: impl FnOnce()) -> M {
+    maintain();
+    read()
+}
+
+/// How soon a watch for the ALab vault looks again by itself after its first look that heard
+/// none, doubling with each look to [`ALAB_LOOK_LONGEST`]. A wake looks sooner.
+#[cfg(any(target_os = "macos", test))]
+const ALAB_LOOK_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The longest a watch for the ALab vault waits between two looks without a wake.
+#[cfg(any(target_os = "macos", test))]
+const ALAB_LOOK_LONGEST: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The least time between two looks for the ALab vault, however many wakes come in between.
+#[cfg(any(target_os = "macos", test))]
+const ALAB_LOOK_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest a watch waits after `looks` looks that heard no ALab vault.
+#[cfg(any(target_os = "macos", test))]
+fn alab_look_after(looks: u32) -> std::time::Duration {
+    ALAB_LOOK_FIRST
+        .saturating_mul(1 << looks.min(16))
+        .min(ALAB_LOOK_LONGEST)
+}
+
+/// What [`widen_on_alab_signal`] does on this Mac, or in a test.
+#[cfg(any(target_os = "macos", test))]
+trait AlabWatch {
+    /// The saved plan is aterm's own provisional one, which the ALab signal widens, or an
+    /// upgrade of it this watch holds; an error when aterm's records cannot be read just now.
+    fn widens(&mut self) -> Result<bool, String>;
+    /// Wait out `gap`, then until a wake since the last look, or until `limit` has passed.
+    fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration);
+    /// Look for the ALab signal and widen the plan on it: the widened plan's revision.
+    fn look(&mut self) -> Result<Option<u64>, String>;
+    /// Run the widened plan as a launch runs it.
+    fn run(&mut self);
+}
+
+/// While the plan aterm chose by itself is provisional, look for the ALab vault again on each
+/// wake (the window's Local Network step, System State coming to the front, Check again) and on
+/// a slow timer: on a first launch the scoping probe is aterm's first request to the LAN, which
+/// macOS holds until the person answers its Local Network question, so it hears nothing. Once
+/// one hears it, the plan widens and runs in this launch, as the next launch would run it.
+#[cfg(any(target_os = "macos", test))]
+fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
+    let mut looks = 0;
+    // Only a definite no ends the watch: a read that fails (a pass saving its records) waits
+    // for the next look and probes nothing.
+    loop {
+        let eligible = match watch.widens() {
+            Ok(false) => return,
+            Ok(true) => true,
+            Err(why) => {
+                aterm_log::warn!(
+                    "setup: reading whether the automatic plan may widen failed: {why}"
+                );
+                false
+            }
+        };
+        watch.wait(ALAB_LOOK_GAP, alab_look_after(looks));
+        if !eligible {
+            looks = looks.saturating_add(1);
+            continue;
+        }
+        match watch.look() {
+            Ok(Some(_)) => {
+                watch.run();
+                return;
+            }
+            Ok(None) => {}
+            Err(why) => {
+                aterm_log::warn!("setup: widening the automatic plan did not finish: {why}")
+            }
+        }
+        looks = looks.saturating_add(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct LiveAlabWatch {
+    wakes_seen: u64,
+    /// The upgrade this watch began, held while a commit that failed can still finish.
+    upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade,
+    /// The plan the last look widens, or widened.
+    widened: Widened,
+}
+
+#[cfg(target_os = "macos")]
+impl AlabWatch for LiveAlabWatch {
+    fn widens(&mut self) -> Result<bool, String> {
+        if self.upgrade.pending() {
+            Ok(true)
+        } else {
+            aterm_cli::macos_doctor::provisional_setup_widens()
+        }
+    }
+
+    fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration) {
+        std::thread::sleep(gap);
+        SETUP_WAKES.back_off(&mut self.wakes_seen, limit.saturating_sub(gap));
+    }
+
+    fn look(&mut self) -> Result<Option<u64>, String> {
+        // The look notes the plan it widens and numbers its admission before it reads the
+        // Stop hold: a Stop pressed before is seen here, and one pressed after stops the widened
+        // run as it registers. An upgrade this watch holds widens the plan it began from, under
+        // the number the look that began it took: only this watch's looks begin one it holds,
+        // each after taking its number.
+        self.widened = match self.upgrade.widens_from() {
+            Some(from) => Widened {
+                from,
+                sent: self.widened.sent,
+            },
+            None => Widened {
+                from: aterm_cli::macos_doctor::initial_setup_revision()?,
+                sent: send_admission(),
+            },
+        };
+        // A Stop asked in this launch holds the plan in force, even one too late for its run,
+        // until a choice, Set up now or a relaunch (System State design §3.5). An upgrade this
+        // watch holds finishes its failed save instead, which giving it up would strand, and the
+        // Stop holds the widened run as it registers.
+        if !self.upgrade.pending() && setup_stop_requested(self.widened.from) {
+            return Ok(None);
+        }
+        let upgraded = self.upgrade.persist()?;
+        Ok(upgraded.map(|upgrade| {
+            // The revision the upgrade itself widened, which a Set up now since the read above
+            // may have replaced: a Stop asked for it holds the widened run as it registers.
+            self.widened.from = upgrade.from;
+            upgrade.to
+        }))
+    }
+
+    fn run(&mut self) {
+        // A worker parked on the narrower revision wakes, finds it gone, and ends.
+        wake_setup();
+        run_startup_setup(Some(self.widened));
+    }
+}
+
+/// Keep one watch of aterm's own provisional plan. Active runs try a worker; a finished
+/// coordinator can use its now-free thread without needing another successful spawn.
+#[cfg(target_os = "macos")]
+fn maintain_setup_watch(how: WatchMaintenance) {
+    static WATCHING: SetupWatch = SetupWatch::new();
+    maintain_setup_watch_with(
+        &WATCHING,
+        how,
+        aterm_cli::macos_doctor::provisional_setup_widens,
+        |reservation| {
+            let mut watch = LiveAlabWatch {
+                wakes_seen: SETUP_WAKES.count(),
+                upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade::default(),
+                widened: Widened::default(),
+            };
+            std::thread::Builder::new()
+                .name("aterm-setup-alab-watch".into())
+                .spawn(move || {
+                    run_reserved_alab_watch(reservation, || widen_on_alab_signal(&mut watch));
+                })
+                .map(|_| ())
+        },
+        |reservation| {
+            let mut watch = LiveAlabWatch {
+                wakes_seen: SETUP_WAKES.count(),
+                upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade::default(),
+                widened: Widened::default(),
+            };
+            run_reserved_alab_watch(reservation, || widen_on_alab_signal(&mut watch));
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn maintain_setup_watch_with<'a>(
+    watching: &'a SetupWatch,
+    how: WatchMaintenance,
+    mut eligible: impl FnMut() -> Result<bool, String>,
+    spawn: impl FnOnce(WatchReservation<'a>) -> std::io::Result<()>,
+    inline: impl FnOnce(WatchReservation<'a>),
+) {
+    use std::sync::atomic::Ordering;
+    // Request before testing ownership. The retiring watch sees this even if this
+    // run completes before it releases its reservation.
+    watching.requests.fetch_add(1, Ordering::SeqCst);
+    let Some(mut reservation) = watching.reserve() else {
+        return;
+    };
+    loop {
+        let seen = reservation.requests();
+        if !matches!(eligible(), Ok(false)) {
+            break;
+        }
+        if !reservation.recheck(seen) {
+            return;
+        }
+    }
+    match how {
+        WatchMaintenance::Spawn => {
+            if let Err(why) = spawn(reservation) {
+                aterm_log::warn!("setup: the watch for the ALab vault could not start: {why}");
+            }
+        }
+        WatchMaintenance::Inline => inline(reservation),
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct SetupWatch {
+    running: std::sync::atomic::AtomicBool,
+    requests: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(target_os = "macos")]
+impl SetupWatch {
+    const fn new() -> Self {
+        Self {
+            running: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn reserve(&self) -> Option<WatchReservation<'_>> {
+        use std::sync::atomic::Ordering;
+        self.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| WatchReservation {
+                watch: self,
+                held: true,
+            })
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct WatchReservation<'a> {
+    watch: &'a SetupWatch,
+    held: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl WatchReservation<'_> {
+    fn requests(&self) -> u64 {
+        self.watch
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            self.held = false;
+            self.watch
+                .running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn recheck(&mut self, seen: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        self.release();
+        // Sequential consistency orders request-before-reserve against release-before-read:
+        // an entrant either acquires the free reservation or leaves a visible recheck here.
+        if self.requests() != seen
+            && self
+                .watch
+                .running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.held = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for WatchReservation<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_reserved_alab_watch(mut reservation: WatchReservation<'_>, mut run: impl FnMut()) {
+    loop {
+        let seen = reservation.requests();
+        run();
+        if !reservation.recheck(seen) {
+            return;
         }
     }
 }
@@ -976,6 +1338,8 @@ fn prepare_first_run_doctor(
 struct StartupSent {
     sent: u64,
     under_way: std::sync::Arc<std::sync::Mutex<Option<UnderWay>>>,
+    /// The revision a watch widened into the plan this startup resumes ([`Widened`]).
+    widened_from: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1463,7 +1827,7 @@ fn run_prepared_setup(
             // Registered at once, while the claim makes this revision the one in force and
             // before the run waits for the slot: a Stop pressed from now, or while the page's
             // answer was being admitted, stops it. A quit waited for this.
-            register_admitted_run(revision, sent.sent, false);
+            register_admitted_run(revision, sent.sent, false, sent.widened_from);
             drop(sent);
             // One lock order, the setup slot before the automatic claim: never wait for the slot
             // holding the claim, or a person's choice, which holds the slot while it waits for
@@ -1480,21 +1844,39 @@ fn run_prepared_setup(
         }
         PreparedSetup::Finished => {
             aterm_gui::publish_initial_setup_status(initial_setup_status());
+            // A finished setup runs no Secrets stage: the mend keeps a vault subscriber whose
+            // plist runs a copy that is gone, or that this window owes the Mac.
+            (setup_io().mend_subscriber)();
             finish_withheld_preferences();
         }
         PreparedSetup::Unavailable => {}
     }
 }
 
-/// At the launch of a window whose setup has finished, and once this aterm holds Full Disk
-/// Access, clear what setup left alone in another app's container for want of it (Notification
-/// Center's widgets), logging only. While it may hold the profile lock it holds System State's
-/// busy slot, so the page offers no Apply, Check or Restore that would fail on that lock; a launch
-/// with nothing owed reads only aterm's record and takes no slot. Without the grant it changes and
-/// asks nothing; a try that did not verify is retried at a later launch once it is due.
+/// At the launch of a window whose setup has finished, and as the window records Full Disk
+/// Access granted, once this aterm holds that grant: put back what a Restore could not for want
+/// of it, and clear what setup left alone in another app's container (Notification Center's
+/// widgets). It logs, and a Restore it finished says so on the page. While it may hold the
+/// profile lock it holds System State's busy slot, so the page offers no Apply, Check or Restore
+/// that would fail on that lock; a launch with nothing owed reads only aterm's records and takes
+/// no slot. Without the grant it changes and asks nothing; a try that did not verify is retried
+/// at a later launch once it is due.
 #[cfg(target_os = "macos")]
 fn finish_withheld_preferences() {
-    match finish_withheld_preferences_with(aterm_cli::macos_doctor::finish_withheld_preferences) {
+    let report =
+        finish_withheld_preferences_with(aterm_cli::macos_doctor::finish_withheld_preferences);
+    // A Restore it finished says so on the page in place of what that Restore left waiting.
+    if let Ok(Some(report)) = &report
+        && report.restore.is_some()
+    {
+        remember_initial_setup_rows(
+            report,
+            None,
+            aterm_cli::macos_doctor::initial_setup_observation().ok(),
+        );
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+    match report {
         Ok(Some(report)) if report.needs_attention() => aterm_log::warn!(
             "setup follow-up with Full Disk Access: {}",
             report.to_text()
@@ -1552,21 +1934,27 @@ fn run_first_run_doctor(
     // the loop before each pass once its revision reads current, never here:
     // a startup run that waited for the slot while a person's choice admitted
     // a newer run must not take that run's place for a Stop (`register`).
-    with_setup_run(revision, || {
-        run_setup_retry(
-            &mut LiveSetupRetry {
-                revision,
-                password,
-                last_failure: None,
-                success_reported: false,
-                wakes_seen: SETUP_WAKES.count(),
-                park_due_seen: SetupRetryDeadlines::default(),
-            },
-            claim,
-            busy,
-            revision,
-        );
-    });
+    with_setup_watch(
+        true,
+        || {
+            with_setup_run(revision, || {
+                run_setup_retry(
+                    &mut LiveSetupRetry {
+                        revision,
+                        password,
+                        last_failure: None,
+                        success_reported: false,
+                        wakes_seen: SETUP_WAKES.count(),
+                        park_due_seen: SetupRetryDeadlines::default(),
+                    },
+                    claim,
+                    busy,
+                    revision,
+                );
+            })
+        },
+        maintain_setup_watch,
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1903,6 +2291,7 @@ impl SetupRetryHost for LiveSetupRetry {
         })
     }
     fn backoff(&mut self) {
+        maintain_setup_watch(WatchMaintenance::Spawn);
         // A wake (Check again, Stop, a new plan, a person's grant) ends it early,
         // once: a read or a claim that keeps failing waits a minute each time.
         SETUP_WAKES.back_off(&mut self.wakes_seen, std::time::Duration::from_secs(60));
@@ -1918,7 +2307,10 @@ impl SetupRetryHost for LiveSetupRetry {
         let mut previous = None;
         let mark = wait_for_setup_park_change(
             || {
-                let mut mark = aterm_cli::macos_doctor::initial_setup_park_mark();
+                let mut mark = read_setup_park_mark_with(
+                    aterm_cli::macos_doctor::initial_setup_park_mark,
+                    || maintain_setup_watch(WatchMaintenance::Spawn),
+                );
                 if let Some(known) = &previous {
                     mark.retain_known_from(known);
                 }
@@ -1940,7 +2332,11 @@ impl SetupRetryHost for LiveSetupRetry {
     fn failure(&mut self, why: &str) {
         report_first_run_doctor_failure(&mut self.last_failure, why);
     }
-    fn completed(&mut self) {}
+    fn completed(&mut self) {
+        // From now no Secrets stage keeps the vault subscriber: the mend keeps a stale or owed
+        // one, and System State's Secrets rows show the rest.
+        (setup_io().mend_subscriber)();
+    }
 }
 
 /// The admitted revision whose worker still retries by itself what its passes
@@ -1965,6 +2361,304 @@ fn set_setup_retrying(revision: u64, retrying: bool) {
     };
     if changed {
         aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod watch_spawn_recovery_tests;
+
+#[cfg(test)]
+mod alab_watch_tests {
+    use super::{
+        ALAB_LOOK_FIRST, ALAB_LOOK_GAP, ALAB_LOOK_LONGEST, AlabWatch, alab_look_after,
+        widen_on_alab_signal,
+    };
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// A watch whose answers come from a script; the last `widens` answer sticks.
+    #[derive(Default)]
+    struct Scripted {
+        widens: VecDeque<Option<bool>>,
+        looks: VecDeque<Result<Option<u64>, String>>,
+        waits: Vec<(Duration, Duration)>,
+        runs: u32,
+    }
+
+    impl AlabWatch for Scripted {
+        fn widens(&mut self) -> Result<bool, String> {
+            if self.widens.len() > 1 {
+                self.widens.pop_front().unwrap()
+            } else {
+                self.widens.front().copied().unwrap_or(Some(false))
+            }
+            .ok_or_else(|| "a pass is saving the records".to_string())
+        }
+        fn wait(&mut self, gap: Duration, limit: Duration) {
+            self.waits.push((gap, limit));
+        }
+        fn look(&mut self) -> Result<Option<u64>, String> {
+            self.looks.pop_front().expect("a look the script answers")
+        }
+        fn run(&mut self) {
+            self.runs += 1;
+        }
+    }
+
+    #[test]
+    fn a_watch_looks_again_more_slowly_and_runs_the_widened_plan_once() {
+        let mut watch = Scripted {
+            widens: [Some(true)].into(),
+            looks: [
+                Ok(None),
+                Err("a profile pass is running".into()),
+                Ok(None),
+                Ok(Some(9)),
+            ]
+            .into(),
+            ..Scripted::default()
+        };
+        widen_on_alab_signal(&mut watch);
+        let minute = Duration::from_secs(60);
+        assert_eq!(
+            watch.waits,
+            [
+                (ALAB_LOOK_GAP, ALAB_LOOK_FIRST),
+                (ALAB_LOOK_GAP, minute),
+                (ALAB_LOOK_GAP, 2 * minute),
+                (ALAB_LOOK_GAP, 4 * minute),
+            ]
+        );
+        assert_eq!(watch.runs, 1);
+        assert!(watch.looks.is_empty());
+    }
+
+    #[test]
+    fn a_watch_ends_once_the_plan_is_no_longer_aterms_to_widen() {
+        let mut watch = Scripted {
+            widens: [Some(true), Some(true), Some(false)].into(),
+            looks: [Ok(None), Ok(None)].into(),
+            ..Scripted::default()
+        };
+        widen_on_alab_signal(&mut watch);
+        assert_eq!(watch.waits.len(), 2);
+        assert_eq!(watch.runs, 0);
+        let mut unread = Scripted {
+            widens: [None, Some(true), None, Some(false)].into(),
+            looks: [Ok(None)].into(),
+            ..Scripted::default()
+        };
+        widen_on_alab_signal(&mut unread);
+        assert_eq!(
+            unread.waits.len(),
+            3,
+            "records that cannot be read keep the watch"
+        );
+        assert!(
+            unread.looks.is_empty(),
+            "and take no look while they cannot"
+        );
+        let mut found_later = Scripted {
+            widens: [None, None, Some(true)].into(),
+            looks: [Ok(Some(4))].into(),
+            ..Scripted::default()
+        };
+        widen_on_alab_signal(&mut found_later);
+        assert_eq!(found_later.runs, 1);
+        assert!(found_later.looks.is_empty());
+        let mut idle = Scripted::default();
+        widen_on_alab_signal(&mut idle);
+        assert!(idle.waits.is_empty(), "nothing to widen, nothing to watch");
+    }
+
+    #[test]
+    fn a_watch_waits_at_most_half_an_hour_between_looks() {
+        assert_eq!(alab_look_after(0), ALAB_LOOK_FIRST);
+        assert_eq!(alab_look_after(5), Duration::from_secs(16 * 60));
+        assert_eq!(alab_look_after(6), ALAB_LOOK_LONGEST);
+        assert_eq!(alab_look_after(u32::MAX), ALAB_LOOK_LONGEST);
+        assert!(ALAB_LOOK_GAP < ALAB_LOOK_FIRST);
+    }
+
+    #[cfg(target_os = "macos")]
+    mod recovery {
+        use super::*;
+        use aterm_cli::macos_doctor::ProvisionalSetupWatchTest;
+        use aterm_types::macos_setup::Selection;
+
+        #[derive(Clone, Copy)]
+        enum Replacement {
+            Stop,
+            OldStop(u64),
+            Person,
+        }
+
+        struct RealWatch<'a> {
+            setup: ProvisionalSetupWatchTest<'a>,
+            faults: VecDeque<Option<(usize, bool)>>,
+            replacement: Option<Replacement>,
+            failed_read: bool,
+            reads: usize,
+            waits: usize,
+            looks: usize,
+            recovered: Vec<u64>,
+        }
+
+        impl<'a> RealWatch<'a> {
+            fn new(root: &'a std::path::Path) -> Self {
+                Self {
+                    setup: ProvisionalSetupWatchTest::new(root).unwrap(),
+                    faults: VecDeque::new(),
+                    replacement: None,
+                    failed_read: false,
+                    reads: 0,
+                    waits: 0,
+                    looks: 0,
+                    recovered: Vec::new(),
+                }
+            }
+        }
+
+        impl AlabWatch for RealWatch<'_> {
+            fn widens(&mut self) -> Result<bool, String> {
+                self.reads += 1;
+                if std::mem::take(&mut self.failed_read) {
+                    assert_eq!(self.looks, 0, "a failed read authorizes no probe or write");
+                    let before = self.setup.snapshot().unwrap();
+                    let eligible = self.setup.widens_after_failed_read();
+                    let repaired = self.setup.snapshot().unwrap();
+                    assert_eq!(repaired.observation, before.observation);
+                    assert_eq!(repaired.permissions_allowed, before.permissions_allowed);
+                    eligible
+                } else {
+                    self.setup.widens()
+                }
+            }
+
+            fn wait(&mut self, gap: Duration, limit: Duration) {
+                assert!(gap <= limit);
+                self.waits += 1;
+            }
+
+            fn look(&mut self) -> Result<Option<u64>, String> {
+                self.looks += 1;
+                assert!(
+                    self.looks <= 3,
+                    "the watch must converge without a retry spin"
+                );
+                let upgraded = self.setup.upgrade(self.faults.pop_front().flatten());
+                if let Some(replacement) = self.replacement.take() {
+                    assert!(upgraded.is_err());
+                    assert_eq!(
+                        self.setup.snapshot().unwrap().plan.selection,
+                        Selection::all()
+                    );
+                    match replacement {
+                        Replacement::Stop => self.setup.stop().unwrap(),
+                        Replacement::OldStop(revision) => {
+                            self.setup.stop_revision(revision).unwrap()
+                        }
+                        Replacement::Person => self.setup.choose().unwrap(),
+                    }
+                }
+                upgraded
+            }
+
+            fn run(&mut self) {
+                self.recovered.push(self.setup.recover().unwrap());
+                let resumed = self.setup.snapshot().unwrap();
+                assert_eq!(resumed.plan.selection, Selection::all());
+                assert!(!resumed.finished, "the widened stages are still owed");
+                assert!(
+                    resumed.permissions_allowed,
+                    "recovery confirms real admission"
+                );
+                assert_eq!(resumed.revision, *self.recovered.last().unwrap());
+            }
+        }
+
+        #[test]
+        fn watch_recovery_starts_after_a_real_upgrade_publication_reports_failure() {
+            for fault in [(1, false), (3, true)] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let mut watch = RealWatch::new(root.path());
+                let original = watch.setup.snapshot().unwrap().revision;
+                watch.faults.push_back(Some(fault));
+                widen_on_alab_signal(&mut watch);
+                assert_eq!(
+                    watch.recovered.len(),
+                    1,
+                    "save {fault:?}: the published full run needs startup recovery in this process"
+                );
+                assert_eq!(
+                    watch.looks, 2,
+                    "retry only the owned admission after its failed publication"
+                );
+                assert_eq!(watch.waits, 2);
+                assert_eq!(watch.recovered[0], original + 1);
+            }
+        }
+
+        #[test]
+        fn watch_recovery_ignores_a_delayed_stop_of_its_completed_predecessor() {
+            for fault in [(1, false), (3, false), (3, true)] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let mut watch = RealWatch::new(root.path());
+                let original = watch.setup.snapshot().unwrap().revision;
+                watch.faults.push_back(Some(fault));
+                watch.replacement = Some(Replacement::OldStop(original));
+                widen_on_alab_signal(&mut watch);
+                assert_eq!(watch.recovered, vec![original + 1], "save {fault:?}");
+                assert_eq!(watch.looks, 2, "the same owned admission must recover");
+                assert_eq!(watch.waits, 2);
+            }
+        }
+
+        #[test]
+        fn watch_recovery_retries_a_repaired_eligibility_read_without_granting_authority() {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let mut watch = RealWatch::new(root.path());
+            watch.failed_read = true;
+            widen_on_alab_signal(&mut watch);
+            assert_eq!(
+                watch.recovered.len(),
+                1,
+                "a transient record read must not end the only in-process ALab watch"
+            );
+            assert!(watch.reads >= 2);
+            assert_eq!(watch.looks, 1, "probe only after eligibility is readable");
+            assert!(watch.waits >= 1);
+        }
+
+        #[test]
+        fn watch_recovery_keeps_prepublication_retries_and_authoritative_replacements() {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let mut watch = RealWatch::new(root.path());
+            watch.faults.push_back(Some((0, false)));
+            widen_on_alab_signal(&mut watch);
+            assert_eq!(watch.recovered.len(), 1);
+            assert_eq!(
+                watch.looks, 2,
+                "an unpublished failure may try the upgrade again"
+            );
+
+            for replacement in [Replacement::Stop, Replacement::Person] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let mut watch = RealWatch::new(root.path());
+                watch.faults.push_back(Some((1, false)));
+                watch.replacement = Some(replacement);
+                widen_on_alab_signal(&mut watch);
+                assert!(
+                    watch.recovered.is_empty(),
+                    "a later choice remains authoritative"
+                );
+                assert_eq!(
+                    watch.looks, 2,
+                    "the retained ticket confirms its retirement"
+                );
+                assert!(!watch.setup.widens().unwrap());
+            }
+        }
     }
 }
 
@@ -3067,6 +3761,9 @@ struct SetupIo {
         Option<aterm_secrets::SecretBytes>,
         InitialSetupBusy,
     ),
+    /// Watch this Mac's vault subscriber once setup is finished
+    /// (`aterm_gui::mend_secrets_subscriber`).
+    mend_subscriber: fn(),
 }
 
 #[cfg(target_os = "macos")]
@@ -3079,6 +3776,7 @@ impl SetupIo {
         claim_rerun: aterm_cli::macos_doctor::claim_initial_setup_rerun,
         persist: aterm_cli::macos_doctor::InitialSetupRestart::persist_observed,
         run: run_first_run_doctor,
+        mend_subscriber: aterm_gui::mend_secrets_subscriber,
     };
 }
 
@@ -3134,12 +3832,23 @@ fn watch_setup_signals() {
 #[cfg(target_os = "macos")]
 fn access_step_recorded(
     _revision: u64,
-    _access: aterm_types::macos_setup::Access,
-    _outcome: aterm_types::macos_setup::AccessOutcome,
+    access: aterm_types::macos_setup::Access,
+    outcome: aterm_types::macos_setup::AccessOutcome,
 ) {
-    use aterm_types::macos_setup::{Access, Subject};
+    use aterm_types::macos_setup::{Access, AccessOutcome, Subject};
     request_observation(None, Access::ALL.map(Subject::Access).to_vec(), false);
     wake_setup();
+    // Full Disk Access granted: what a Restore or setup left in another app's container for
+    // want of it goes in now (design §3.4), not at the next launch. A run going does it at its
+    // pass's end; this worker then finds nothing owed, or the profile lock taken.
+    if access == Access::FullDiskAccess
+        && outcome == AccessOutcome::Granted
+        && let Err(why) = std::thread::Builder::new()
+            .name("aterm-setup-follow-up".into())
+            .spawn(finish_withheld_preferences)
+    {
+        aterm_log::warn!("setup follow-up with Full Disk Access did not start: {why}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3262,6 +3971,22 @@ fn request_observation(
 /// between capturing its scope and acquiring the queue.
 #[cfg(target_os = "macos")]
 fn queue_observation(request: ObserveRequest) -> bool {
+    queue_observation_with(request, |job| {
+        std::thread::Builder::new()
+            .name("aterm-setup-observe".into())
+            .spawn(job)
+            .map(|_| ())
+    })
+}
+
+#[cfg(target_os = "macos")]
+type ObservationJob = Box<dyn FnOnce() + Send>;
+
+#[cfg(target_os = "macos")]
+fn queue_observation_with(
+    request: ObserveRequest,
+    spawn: impl FnOnce(ObservationJob) -> std::io::Result<()>,
+) -> bool {
     let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
         return false;
     };
@@ -3297,30 +4022,28 @@ fn queue_observation(request: ObserveRequest) -> bool {
         return true;
     }
     queue.running = true;
-    drop(queue);
-    let spawned = std::thread::Builder::new()
-        .name("aterm-setup-observe".into())
-        .spawn(move || {
-            let mut request = request;
-            loop {
-                observe_rows(request);
-                let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
+    // Admit another caller only after this worker exists. A failed spawn
+    // cannot leave a concurrently acknowledged request without a worker.
+    let spawned = spawn(Box::new(move || {
+        let mut request = request;
+        loop {
+            observe_rows(request);
+            let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
+                return;
+            };
+            match queue.next.take() {
+                Some(next) => request = next,
+                None => {
+                    queue.running = false;
                     return;
-                };
-                match queue.next.take() {
-                    Some(next) => request = next,
-                    None => {
-                        queue.running = false;
-                        return;
-                    }
                 }
             }
-        });
+        }
+    }));
+    queue.running = spawned.is_ok();
+    drop(queue);
     if let Err(why) = spawned {
         aterm_log::warn!("System State could not read its rows: {why}");
-        if let Ok(mut queue) = OBSERVE_QUEUE.lock() {
-            queue.running = false;
-        }
         return false;
     }
     true
@@ -3329,7 +4052,7 @@ fn queue_observation(request: ObserveRequest) -> bool {
 /// Read, keep what no stage changed meanwhile, and publish the new readings.
 #[cfg(target_os = "macos")]
 fn observe_rows(request: ObserveRequest) {
-    use aterm_types::macos_setup::Setting;
+    use aterm_types::macos_setup::{Observation, Setting};
     let Some((plan, choices)) = observed_plan(request.plan, request.choices) else {
         return;
     };
@@ -3352,7 +4075,20 @@ fn observe_rows(request: ObserveRequest) {
         })
         .collect();
     let started = SETUP_ACTIVITY.lock().map_or(0, |activity| activity.epoch);
-    let read = (setup_io().read)(&plan, &subjects, network);
+    let read = std::panic::catch_unwind(|| (setup_io().read)(&plan, &subjects, network))
+        .unwrap_or_else(|_| {
+            // Do not keep a previous success as this reading's result, nor
+            // retry the failed batch. The worker still drains accepted work;
+            // publication below retains its choice, source and stage fences.
+            aterm_log::warn!("System State's row reading unwound; the requested rows are unknown");
+            subjects
+                .iter()
+                .map(|subject| Observation {
+                    note: Some("This reading did not finish. Check again.".into()),
+                    ..Observation::unknown(*subject)
+                })
+                .collect()
+        });
     let access_steps = aterm_cli::macos_doctor::initial_setup_access_revision()
         .ok()
         .zip(aterm_types::dirs::state_dir())
@@ -3496,16 +4232,26 @@ fn stop_runs_sent_through(through: u64) -> bool {
 
 /// Register admitted run `revision` as the one a Stop stops ([`SETUP_RUN`]),
 /// the moment its revision is durable, before its worker takes a step: a Stop
-/// that covers the admission it came from (`sent`, [`stop_covers`]), or
-/// `overtaken` (a later choice made while it was being admitted), stops it
-/// before its first stage. Callers hold the automatic claim, so no newer run
-/// can have registered first.
+/// that covers the admission it came from (`sent`, [`stop_covers`]),
+/// `overtaken` (a later choice made while it was being admitted), or a Stop
+/// asked for the revision a watch widened into it (`widened_from`), or one
+/// covering an admission still under way when a watch widened it, stops it
+/// before its first stage. Those are read under [`SETUP_RUN`], which every
+/// Stop takes, so one pressed while the watch looked is never missed. Callers
+/// hold the automatic claim, so no newer run can have registered first.
 #[cfg(target_os = "macos")]
-fn register_admitted_run(revision: u64, sent: u64, overtaken: bool) {
+fn register_admitted_run(revision: u64, sent: u64, overtaken: bool, widened_from: Option<u64>) {
     start_stop_worker();
     if let Ok(mut run) = SETUP_RUN.lock() {
         *run = Some(revision);
-        if overtaken || stop_covers(sent) {
+        let held = widened_from.is_some_and(|from| {
+            setup_stop_requested(from)
+                || stop_saves()
+                    .under_way
+                    .iter()
+                    .any(|under_way| stop_covers(*under_way))
+        });
+        if overtaken || stop_covers(sent) || held {
             stop_setup_run(revision);
         }
     }
@@ -3826,36 +4572,46 @@ fn remember_initial_setup_rows(
 fn initial_setup_report_rows(
     report: &aterm_cli::macos_doctor::Report,
 ) -> Vec<aterm_gui::SetupStatusRow> {
+    // A Restore reaches the page as what it did to each System State row, in the page's
+    // own words (one calm line, and a row for each setting it could not put back), never
+    // as the preference keys `aterm doctor` lists: those stay in the CLI's text.
+    if let Some(restore) = &report.restore {
+        return aterm_gui::restore_rows(&restore.outcome);
+    }
     let checked = report.action == aterm_cli::macos_doctor::Action::Check;
-    report
-        .rows
-        .iter()
-        .map(|row| {
-            // Setup's blocked steps are explained by their observed row, but
-            // Restore's are operation results: even an in-place preference
-            // can have an unknown or inaccessible original. Keep that reason
-            // visible independently of the current plan's selected groups. A
-            // setting back that loads at the next login (`LOGIN`) is no
-            // failure and passes as itself.
-            let not_restored = report.action == aterm_cli::macos_doctor::Action::Restore
-                && row.status == "blocked";
-            aterm_gui::SetupStatusRow {
-                name: if not_restored {
-                    format!("Restore: {}", row.name)
-                } else if checked {
-                    format!("Check: {}", row.name)
-                } else {
-                    row.name.clone()
-                },
-                status: if not_restored {
-                    "failed".into()
-                } else {
-                    row.status.clone()
-                },
-                detail: row.detail.clone(),
-            }
-        })
-        .collect()
+    // A pass reaches the page the same way (design §3.6): a change that failed, or could not
+    // be confirmed, by its row, and what its rollback put back in a Restore's words, never an
+    // item's own title (a preference key, a keyboard's ID); its other rows as they are.
+    let (mut page, rows) = match &report.page {
+        Some(page) if !checked => (aterm_gui::pass_rows(&page.outcome), page.rows.as_slice()),
+        _ => (Vec::new(), report.rows.as_slice()),
+    };
+    page.extend(rows.iter().map(|row| {
+        // Setup's blocked steps are explained by their observed row, but
+        // Restore's are operation results: even an in-place preference
+        // can have an unknown or inaccessible original. Keep that reason
+        // visible independently of the current plan's selected groups. A
+        // setting back that loads at the next login (`LOGIN`) is no
+        // failure and passes as itself.
+        let not_restored =
+            report.action == aterm_cli::macos_doctor::Action::Restore && row.status == "blocked";
+        aterm_gui::SetupStatusRow {
+            name: if not_restored {
+                format!("Restore: {}", row.name)
+            } else if checked {
+                format!("Check: {}", row.name)
+            } else {
+                row.name.clone()
+            },
+            status: if not_restored {
+                "failed".into()
+            } else {
+                row.status.clone()
+            },
+            detail: row.detail.clone(),
+        }
+    }));
+    page
 }
 
 #[cfg(target_os = "macos")]
@@ -4066,12 +4822,14 @@ fn admit_setup_change(
     under_way: UnderWay,
 ) {
     // A group choice makes the plan the person's for good; Set up now leaves a
-    // provisional plan provisional (design §3.5).
+    // provisional plan provisional (design §3.5). Either takes only what the page
+    // changed onto the plan in force as it is admitted (§3.3).
     let restart = if receipt.chosen() {
         aterm_cli::macos_doctor::InitialSetupRestart::chosen()
     } else {
         aterm_cli::macos_doctor::InitialSetupRestart::default()
-    };
+    }
+    .changing(receipt.changed());
     let mut host = LiveSetupRestart {
         restart,
         vault_typed,
@@ -4241,7 +4999,12 @@ impl SetupRestartHost for LiveSetupRestart {
         // Registered at once, holding the slot and the claim: a Stop from now stops this run,
         // saved by the worker started here. A choice or a Stop made while this plan was being
         // admitted stops it before its first stage.
-        register_admitted_run(revision, self.sent, setup_choice_overtaken(self.generation));
+        register_admitted_run(
+            revision,
+            self.sent,
+            setup_choice_overtaken(self.generation),
+            None,
+        );
         drop(self.under_way.take());
         clear_initial_setup_rows();
         receipt.accept();
@@ -4833,27 +5596,134 @@ mod initial_setup_result_tests {
         )));
     }
 
-    /// A Restore row for a setting back as saved that loads at the next login is no failure:
-    /// it reaches the page as itself, which says to log out without counting it failed.
+    /// A Restore reaches the page as what it did to each System State row: one calm line in
+    /// the page's own row names, never a preference key, a process or a row per login reload.
+    /// A reader that did not relaunch leaves the rows it reads to the next login, which the
+    /// login sentence says (`aterm doctor --restore` keeps its `Reload` line); a setting it
+    /// could not put back stays a failure, named as Restore's and its row's.
     #[test]
-    fn a_restore_row_back_at_the_next_login_reaches_the_page_as_itself() {
-        use aterm_cli::macos_doctor::{Action, LOGIN, Report, Row};
-        let report = Report {
+    fn a_restore_reaches_the_page_in_row_names_not_preference_keys() {
+        use aterm_cli::macos_doctor::{Action, LOGIN, Report, RestoreRows, Row};
+        use aterm_types::macos_setup::{PutBack, RestoreOutcome};
+        const KEY: &str = "-g com.apple.keyboard.modifiermapping.1452-834-0";
+        let report = |outcome: RestoreOutcome| Report {
             action: Action::Restore,
-            rows: vec![Row {
-                name: "Caps Lock key".into(),
-                status: LOGIN.into(),
-                detail: "log out and back in to load the saved mappings".into(),
-            }],
+            rows: vec![
+                Row {
+                    name: KEY.into(),
+                    status: "restored".into(),
+                    detail: "original value restored".into(),
+                },
+                Row {
+                    name: "Caps Lock key".into(),
+                    status: LOGIN.into(),
+                    detail: "log out and back in to load the saved mappings".into(),
+                },
+                Row {
+                    name: "Reload Dock".into(),
+                    status: "error".into(),
+                    detail: "Dock did not come back".into(),
+                },
+            ],
             manual_steps: Vec::new(),
             backup: std::path::PathBuf::from("original-preferences.json"),
+            restore: Some(RestoreRows { outcome }),
+            page: None,
+        };
+        let back = initial_setup_report_rows(&report(RestoreOutcome::of([
+            (Some(Setting::CapsLock), PutBack::AtLogin),
+            (Some(Setting::Dock), PutBack::AtLogin),
+        ])));
+        assert_eq!(
+            back.iter()
+                .map(|row| (row.name.as_str(), row.status.as_str()))
+                .collect::<Vec<_>>(),
+            [("Restore previous settings", "restored")]
+        );
+        assert_eq!(
+            back[0].detail,
+            "Restore previous settings finished. Caps Lock key and the Dock come back at your \
+             next login."
+        );
+        let failed = initial_setup_report_rows(&report(RestoreOutcome::of([(
+            Some(Setting::CapsLock),
+            PutBack::Failed,
+        )])));
+        assert_eq!(
+            failed
+                .iter()
+                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
+                .collect::<Vec<_>>(),
+            [(
+                "Restore: Caps Lock key",
+                "failed",
+                "Caps Lock key could not be put back as it was."
+            )]
+        );
+        for row in back.iter().chain(&failed) {
+            for engine in ["com.apple", "Reload", "did not come back"] {
+                assert!(
+                    !row.name.contains(engine) && !row.detail.contains(engine),
+                    "{row:?}"
+                );
+            }
+        }
+    }
+
+    /// A setup pass reaches the page in row names too (design §3.6): a change that did not take
+    /// is a failure of its row, and what its rollback put back is one calm line in a Restore's
+    /// words. `aterm doctor`'s rows, which name each key, stay in the terminal; the pass's
+    /// other rows reach the page as they are.
+    #[test]
+    fn a_pass_reaches_the_page_in_row_names_not_preference_keys() {
+        use aterm_cli::macos_doctor::{Action, PassPage, Report, Row};
+        use aterm_types::macos_setup::{PassOutcome, PutBack, RestoreOutcome, Unfinished};
+        let row = |name: &str, status: &str, detail: &str| Row {
+            name: name.into(),
+            status: status.into(),
+            detail: detail.into(),
+        };
+        let repositories = row("GitHub repositories", "ok", "all 3 cloned");
+        let report = Report {
+            action: Action::Apply,
+            rows: vec![
+                row(
+                    "Dock: com.apple.dock show-recents",
+                    "error",
+                    "absent → false",
+                ),
+                row(
+                    "Preference rollback",
+                    "restored",
+                    "rolled back com.apple.dock show-recents",
+                ),
+                repositories.clone(),
+            ],
+            manual_steps: Vec::new(),
+            backup: std::path::PathBuf::from("original-preferences.json"),
+            restore: None,
+            page: Some(PassPage {
+                outcome: PassOutcome {
+                    rolled_back: Some(RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)])),
+                    unfinished: vec![(Setting::Dock, Unfinished::Failed)],
+                },
+                rows: vec![repositories],
+            }),
         };
         let rows = initial_setup_report_rows(&report);
         assert_eq!(
             rows.iter()
-                .map(|row| (row.name.as_str(), row.status.as_str()))
+                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
                 .collect::<Vec<_>>(),
-            [("Caps Lock key", "login")]
+            [
+                ("Dock", "error", "The change did not take."),
+                (
+                    "Undo",
+                    "restored",
+                    "aterm put back what it could not finish. The Dock is as it was."
+                ),
+                ("GitHub repositories", "ok", "all 3 cloned"),
+            ]
         );
     }
 
@@ -4874,6 +5744,8 @@ mod initial_setup_result_tests {
                 }],
                 manual_steps: Vec::new(),
                 backup: root.path().join("original-preferences.json"),
+                restore: None,
+                page: None,
             };
             let rows = initial_setup_report_rows(&report);
             let last = if action == Action::Check {
@@ -4958,6 +5830,8 @@ mod initial_setup_result_tests {
         readings: VecDeque<Vec<Observation>>,
         /// Readings wait while this is set.
         hold: bool,
+        /// The next held reading unwinds after releasing the script lock.
+        panic_read: bool,
         /// Stop saves begun: the run each names and the thread it ran on.
         stop_attempts: Vec<(u64, std::thread::ThreadId)>,
         /// Stop saves that landed.
@@ -5014,6 +5888,7 @@ mod initial_setup_result_tests {
             reads: Vec::new(),
             readings: VecDeque::new(),
             hold: false,
+            panic_read: false,
             stop_attempts: Vec::new(),
             stops: Vec::new(),
             stop_hold: false,
@@ -5127,6 +6002,7 @@ mod initial_setup_result_tests {
                 claim_rerun: Self::claim_rerun,
                 persist: Self::persist,
                 run: Self::run,
+                mend_subscriber: || {},
             };
             reset_worker_state();
             Self { _claims: claims }
@@ -5138,8 +6014,10 @@ mod initial_setup_result_tests {
                 .reads
                 .push((plan.clone(), subjects.to_vec(), network));
             let reading = script.readings.pop_front().unwrap_or_default();
+            let panics = std::mem::take(&mut script.panic_read);
             SCRIPT_MOVED.notify_all();
             drop(wait_while(script, |script| script.hold));
+            assert!(!panics, "injected reader unwind");
             reading
         }
 
@@ -5813,6 +6691,198 @@ mod initial_setup_result_tests {
         }
     }
 
+    /// Restore the queue even when an original-behavior assertion fails, so
+    /// TestIo's teardown never waits for a worker that failed to start or died.
+    struct ObserverDispatchReset;
+
+    impl Drop for ObserverDispatchReset {
+        fn drop(&mut self) {
+            let mut queue = OBSERVE_QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.running = false;
+            queue.next = None;
+        }
+    }
+
+    #[test]
+    fn observer_dispatch_does_not_acknowledge_work_to_a_failed_start() {
+        let _globals = globals();
+        let _io = TestIo::install();
+        let _queue = ObserverDispatchReset;
+        let mut plan = left_as_is();
+        plan.vault_url = "https://example.invalid/forced-current".into();
+        let expected = plan.clone();
+        let request = ObserveRequest {
+            plan: Some(plan),
+            choices: OBSERVED_ROWS.lock().unwrap().choices,
+            subjects: vec![Subject::Setting(Setting::Repositories)],
+            forced: true,
+        };
+        let mut second = None;
+        let started = queue_observation_with(
+            ObserveRequest {
+                plan: Some(left_as_is()),
+                choices: request.choices,
+                subjects: vec![Subject::Setting(Setting::Dock)],
+                forced: false,
+            },
+            |_| {
+                let (reached, wait) = std::sync::mpsc::sync_channel(1);
+                second = Some(std::thread::spawn(move || {
+                    // Coordinate without a timing assertion: if admission is
+                    // unlocked, force the second call to finish before the
+                    // failed spawn returns. If locked, signal before waiting
+                    // for the first caller to release its failed admission.
+                    let unlocked = match OBSERVE_QUEUE.try_lock() {
+                        Ok(queue) => {
+                            drop(queue);
+                            true
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => false,
+                        Err(std::sync::TryLockError::Poisoned(_)) => panic!("queue poisoned"),
+                    };
+                    if !unlocked {
+                        reached.send(()).unwrap();
+                    }
+                    let mut worker = None;
+                    let accepted = queue_observation_with(request, |job| {
+                        worker = Some(std::thread::spawn(job));
+                        Ok(())
+                    });
+                    if unlocked {
+                        reached.send(()).unwrap();
+                    }
+                    (accepted, worker)
+                }));
+                wait.recv_timeout(HANG).unwrap();
+                Err(std::io::Error::other("injected worker spawn refusal"))
+            },
+        );
+        assert!(!started, "the failed caller reports refusal");
+        let (accepted, worker) = second.take().unwrap().join().unwrap();
+        assert!(accepted);
+        let ran = worker.is_some();
+        if let Some(worker) = worker {
+            worker.join().unwrap();
+        }
+        assert!(
+            ran,
+            "accepted work must have a worker after the failed start"
+        );
+        let script = script();
+        assert_eq!(script.reads.len(), 1);
+        assert_eq!(script.reads[0].0, expected);
+        assert_eq!(script.reads[0].1, [Subject::Setting(Setting::Repositories)]);
+        assert!(
+            script.reads[0].2,
+            "the accepted Check retains its forced scope"
+        );
+        assert!(observe_idle());
+    }
+
+    #[test]
+    fn observer_dispatch_retires_an_unwound_read_and_drains_the_next_check_once() {
+        use aterm_types::macos_setup::Standing;
+
+        let _globals = globals();
+        for panics in [false, true] {
+            let _io = TestIo::install();
+            let _queue = ObserverDispatchReset;
+            let preference = Subject::Setting(Setting::Dock);
+            let personal = Subject::Setting(Setting::Messages);
+            let independent = Subject::Setting(Setting::Spotlight);
+            let repositories = Subject::Setting(Setting::Repositories);
+            let seen = |subject, standing| Observation {
+                standing,
+                ..Observation::unknown(subject)
+            };
+            let old = seen(preference, Standing::InPlace);
+            let private = seen(personal, Standing::InPlace);
+            let kept = seen(independent, Standing::NeedsYou);
+            let fresh = seen(repositories, Standing::InPlace);
+            let choices = {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.rows = vec![old.clone(), private.clone(), kept.clone()];
+                rows.choices
+            };
+            change(|script| {
+                script.hold = true;
+                script.panic_read = panics;
+                script.readings = [vec![old], vec![fresh.clone()]].into();
+            });
+            let mut worker = None;
+            assert!(queue_observation_with(
+                ObserveRequest {
+                    plan: Some(left_as_is()),
+                    choices,
+                    subjects: vec![preference, personal],
+                    forced: false,
+                },
+                |job| {
+                    worker = Some(std::thread::spawn(job));
+                    Ok(())
+                },
+            ));
+            wait_until("the observer reads its first batch", || {
+                script().reads.len() == 1
+            });
+            let mut next = left_as_is();
+            next.vault_url = "https://example.invalid/next-check".into();
+            assert!(queue_observation_with(
+                ObserveRequest {
+                    plan: Some(next.clone()),
+                    choices,
+                    subjects: vec![repositories],
+                    forced: true,
+                },
+                |_| panic!("the current worker owns the queued Check"),
+            ));
+            release_readings();
+            let finished = worker.take().unwrap().join();
+            assert!(
+                finished.is_ok(),
+                "one read cannot strand the accepted Check"
+            );
+            assert!(observe_idle());
+            let rows = OBSERVED_ROWS.lock().unwrap();
+            let current = rows
+                .rows
+                .iter()
+                .find(|row| row.subject == preference)
+                .unwrap();
+            assert_eq!(
+                current.standing,
+                if panics {
+                    Standing::Unknown
+                } else {
+                    Standing::InPlace
+                }
+            );
+            if panics {
+                // The words the page shows under the row, which say to Check again.
+                assert!(
+                    current
+                        .note
+                        .as_ref()
+                        .is_some_and(|note| note.contains("Check again"))
+                );
+            }
+            assert!(
+                rows.rows.contains(&private),
+                "filtered-out personal rows stay untouched"
+            );
+            assert!(rows.rows.contains(&kept));
+            assert!(rows.rows.contains(&fresh));
+            assert_eq!(rows.plan, Some(next.clone()));
+            drop(rows);
+            let script = script();
+            assert_eq!(script.reads.len(), 2, "the unwound batch is never retried");
+            assert_eq!(script.reads[0].1, [preference]);
+            assert_eq!(script.reads[1].0, next);
+            assert_eq!(script.reads[1].1, [repositories]);
+            assert!(script.reads[1].2, "the queued Check keeps its own scope");
+        }
+    }
+
     #[test]
     fn a_queued_checks_scope_belongs_to_its_reviewed_plan() {
         let _globals = globals();
@@ -5951,6 +7021,7 @@ mod initial_setup_result_tests {
             subject,
             standing,
             now: None,
+            after_login: None,
             wanted: subject.wanted().to_owned(),
             note: Some(note.to_owned()),
             detail: None,
@@ -6433,6 +7504,7 @@ mod initial_setup_result_tests {
             subject,
             standing,
             now: None,
+            after_login: None,
             wanted: subject.wanted().to_owned(),
             note: Some(note.to_owned()),
             detail: None,

@@ -131,6 +131,118 @@ pub fn package_version(root: &Path) -> Option<String> {
         .then(|| version.to_string())
 }
 
+/// A CODEX-ALAB VERSION, in one of the four shapes codex-alab's `alab/package.sh` mints
+/// (codex-alab `alab/README.md`, Decision 8):
+///
+/// * `X.Y.Z`, a bare release (the upstream-numbered `0.164.0` of 2026-10-16);
+/// * `X.Y.Z+codex.<A.B.C>`, a COMPOUND release: codex-alab's own core with the upstream Codex
+///   baseline it is built on in SemVer build metadata;
+/// * `X.Y.Z-dev.<count>+g<sha9>`, a dev build;
+/// * `X.Y.Z-dev.<count>+codex.<A.B.C>.g<sha9>`, a compound dev build.
+///
+/// Every number is decimal without a leading zero (SemVer's rule for the core, kept for the
+/// baseline so one baseline has one spelling), at most nine digits; the sha is nine lowercase
+/// hex digits. Any other pre-release or build metadata is refused, never guessed at. Build
+/// metadata never orders ([`AlabVersion::precedence`]): codex-alab's own line does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlabVersion<'a> {
+    /// The core, `MAJOR.MINOR.PATCH`.
+    pub core: (u64, u64, u64),
+    /// A dev build's `<count>` (`git rev-list --count` of its source).
+    pub dev: Option<u64>,
+    /// The upstream Codex baseline, `+codex.<A.B.C>`: the newest upstream stable `rust-vA.B.C`
+    /// whose branch point the build's source has merged.
+    pub baseline: Option<(u64, u64, u64)>,
+    /// The baseline as the version spells it (`0.164.0`).
+    pub baseline_text: Option<&'a str>,
+    /// The source commit a dev build names, nine lowercase hex digits.
+    pub sha9: Option<&'a str>,
+}
+
+/// The longest codex-alab version [`AlabVersion::parse`] reads (as [`package_version`] bounds one).
+const MAX_ALAB_VERSION_BYTES: usize = 128;
+
+/// One canonical decimal: digits only, no leading zero, at most nine digits.
+fn canonical_number(part: &str) -> Option<u64> {
+    let digits = !part.is_empty() && part.len() <= 9 && part.bytes().all(|b| b.is_ascii_digit());
+    (digits && (part == "0" || !part.starts_with('0')))
+        .then(|| part.parse().ok())
+        .flatten()
+}
+
+/// `A.B.C`, each part a [`canonical_number`].
+fn canonical_triple(text: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = text.split('.');
+    let version = (
+        canonical_number(parts.next()?)?,
+        canonical_number(parts.next()?)?,
+        canonical_number(parts.next()?)?,
+    );
+    parts.next().is_none().then_some(version)
+}
+
+impl<'a> AlabVersion<'a> {
+    /// `text` as a codex-alab version, or `None` for any shape the type does not name.
+    #[must_use]
+    pub fn parse(text: &'a str) -> Option<Self> {
+        if text.len() > MAX_ALAB_VERSION_BYTES {
+            return None;
+        }
+        let (rest, metadata) = match text.split_once('+') {
+            Some((rest, metadata)) => (rest, Some(metadata)),
+            None => (text, None),
+        };
+        let (core, dev) = match rest.split_once('-') {
+            Some((core, pre)) => (core, Some(canonical_number(pre.strip_prefix("dev.")?)?)),
+            None => (rest, None),
+        };
+        let core = canonical_triple(core)?;
+        let hex9 = |hex: &'a str| {
+            (hex.len() == 9 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                .then_some(hex)
+        };
+        let (baseline_text, sha9) = match metadata {
+            None => (None, None),
+            Some(m) => match m.strip_prefix("codex.") {
+                // `codex.<A.B.C>`, a dev build's followed by `.g<sha9>`.
+                Some(compound) => match compound.rsplit_once(".g") {
+                    Some((baseline, hex)) if dev.is_some() => (Some(baseline), Some(hex9(hex)?)),
+                    _ => (Some(compound), None),
+                },
+                None => (None, Some(hex9(m.strip_prefix('g')?)?)),
+            },
+        };
+        // A dev build names its commit; a release names none.
+        if dev.is_some() != sha9.is_some() {
+            return None;
+        }
+        let baseline = match baseline_text {
+            Some(b) => Some(canonical_triple(b)?),
+            None => None,
+        };
+        Some(Self {
+            core,
+            dev,
+            baseline,
+            baseline_text,
+            sha9,
+        })
+    }
+
+    /// The SemVer precedence key: the core, then a dev build below its release, then the
+    /// dev `<count>`. The baseline and the sha (build metadata) take no part in it.
+    #[must_use]
+    pub fn precedence(&self) -> ((u64, u64, u64), bool, u64) {
+        (self.core, self.dev.is_none(), self.dev.unwrap_or(0))
+    }
+
+    /// `codex 0.164.0`: the upstream Codex baseline, as a line names it.
+    #[must_use]
+    pub fn baseline_words(&self) -> Option<String> {
+        Some(format!("codex {}", self.baseline_text?))
+    }
+}
+
 /// Whether the executable `exe` runs ALab bytes.
 #[must_use]
 pub fn exe_is_alab(exe: &Path) -> bool {

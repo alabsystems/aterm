@@ -190,3 +190,119 @@ fn a_native_composition_retires_its_old_field_projection_after_focus_moves() {
         "neither the old preedit nor its commit belongs to the new field"
     );
 }
+
+fn url_review(known: bool) -> (App, WindowId, crate::native_app::AppInstanceId, ViewId) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let window = app.windows.get_mut(&wid).unwrap();
+    window.rows = 90;
+    window.cols = 160;
+    window.a11y_active = true;
+    app.set_system_state_handlers_for_test(
+        crate::system_state_host::InitialSetupHandlers::inert_for_test(),
+    );
+    assert!(app.open_system_state_tab());
+    if known {
+        app.publish_system_state(crate::SetupStatus {
+            plan: Some(aterm_types::macos_setup::Plan::default()),
+            ..crate::SetupStatus::default()
+        });
+    }
+    let (instance, view) = app.active_native_view(wid).unwrap();
+    app.dispatch_native_event(
+        wid,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("system-state/row/secrets/disclose"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    focus(&mut app, wid, view, "system-state/url");
+    (app, wid, instance, view)
+}
+
+#[test]
+fn a_url_composition_survives_status_hydration_and_same_selection_vault_updates() {
+    let source = aterm_types::macos_setup::Plan::default();
+    let updated = aterm_types::macos_setup::Plan {
+        vault_url: "http://newer.invalid/v1/team".into(),
+        ..source.clone()
+    };
+
+    // A passive form still follows the saved vault when no draft is being typed.
+    let (mut passive, _, instance, _) = url_review(true);
+    passive.publish_system_state(crate::SetupStatus {
+        plan: Some(updated.clone()),
+        ..crate::SetupStatus::default()
+    });
+    assert_eq!(values(&passive, instance).0, updated.vault_url);
+
+    for known in [false, true] {
+        let (mut app, wid, instance, _) = url_review(known);
+        app.on_ime_preedit(wid, COMPOSED.into(), Some((0, COMPOSED.len())));
+        let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+            panic!("the URL's review stays live");
+        };
+        let draft = model.field_projection("system-state/url").unwrap();
+        assert!(draft.preedit.is_some());
+        assert_eq!(draft.text, format!("{}{COMPOSED}", source.vault_url));
+        app.publish_system_state(crate::SetupStatus {
+            plan: Some(updated.clone()),
+            ..crate::SetupStatus::default()
+        });
+        let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+            panic!("the URL's review stays live");
+        };
+        assert_eq!(
+            model.field_projection("system-state/url").unwrap(),
+            draft,
+            "a saved vault update must preserve the current marked URL draft"
+        );
+        commit(&mut app, wid);
+        assert_eq!(values(&app, instance).0, draft.text);
+        let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+            panic!("the URL's review stays live");
+        };
+        assert!(
+            model
+                .field_projection("system-state/url")
+                .unwrap()
+                .preedit
+                .is_none()
+        );
+        assert!(app.native_runtime.take_system_state_action().is_none());
+    }
+}
+
+#[test]
+fn a_url_composition_rejects_an_incoming_automatic_offer_without_losing_its_commit() {
+    let (mut app, wid, instance, _) = url_review(true);
+    app.on_ime_preedit(wid, COMPOSED.into(), None);
+    let draft = values(&app, instance);
+    let (send, receive) = std::sync::mpsc::channel();
+    let request = crate::workstation_setup::Request::new(
+        aterm_types::macos_setup::Plan {
+            vault_url: "http://offered.invalid/v1/team".into(),
+            ..aterm_types::macos_setup::Plan::default()
+        },
+        send,
+    );
+    // Exercise the actual windowed offer preflight without an OS surface or probe.
+    assert!(!app.apprt.probe_preferences);
+    assert!(app.windows[&wid].os_window.is_none());
+    app.headless = false;
+    app.offer_system_state(request.clone());
+    assert_eq!(
+        values(&app, instance),
+        draft,
+        "an automatic offer cannot replace a composing URL"
+    );
+    assert_eq!(
+        receive.try_recv().unwrap().decision,
+        crate::WorkstationSetupDecision::Unavailable
+    );
+    assert!(!request.pending());
+    commit(&mut app, wid);
+    assert_eq!(values(&app, instance), draft);
+    assert!(app.native_runtime.take_system_state_action().is_none());
+}

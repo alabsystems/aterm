@@ -66,3 +66,8 @@ path = "tests/input_backlog_pty.rs"
 [[test]]
 name = "conformance_input_unread"
 path = "tests/conformance_input_unread.rs"
+
+# Alone: (macOS and Linux) a real pty's unread keys, read the way every reader reads them.
+[[test]]
+name = "unread_input_pty"
+path = "tests/unread_input_pty.rs"

@@ -1387,7 +1387,7 @@ fn codex_items(jsonl: &str, thread: &str) -> Vec<Item> {
 /// tagged fragments (`<environment_context>`, `<user_shell_command>`, …), but
 /// no media label ([`codex_media_label`]), and the project's `AGENTS.md`
 /// (`# AGENTS.md instructions`, ` for <dir>` where it names one).
-fn codex_context(text: &str) -> bool {
+pub(crate) fn codex_context(text: &str) -> bool {
     let text = text.trim_start();
     (text.starts_with('<') && !codex_media_label(text))
         || text.starts_with("# AGENTS.md instructions")
@@ -1396,7 +1396,7 @@ fn codex_context(text: &str) -> bool {
 /// Whether a user message's text part is a label Codex puts around a file the
 /// person attached (`<image name=…>`, `</image>`, `<audio>`, …): part of their
 /// own message, and none of its words.
-fn codex_media_label(text: &str) -> bool {
+pub(crate) fn codex_media_label(text: &str) -> bool {
     let text = text.trim();
     [
         "<image>",

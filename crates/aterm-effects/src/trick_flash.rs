@@ -110,7 +110,7 @@ struct Located {
 }
 
 /// The flash state a word engine owns.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TrickFlash {
     slot: Option<Slot>,
     /// When the last flash became visible.
@@ -122,7 +122,26 @@ pub(crate) struct TrickFlash {
     base_y_len: u8,
 }
 
+impl Default for TrickFlash {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrickFlash {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: None,
+            last_start: None,
+            declared: None,
+            base_y: [(None, 0); BASE_Y_MEMO_CAP],
+            base_y_len: 0,
+        }
+    }
+
     #[inline]
     const fn base_y_slice(&self) -> &[(Option<u64>, i64)] {
         self.base_y.split_at(self.base_y_len as usize).0
@@ -437,9 +456,14 @@ impl TrickFlash {
         let denom = steps.max(1.0);
         let time_deg = 360.0 * (t as f32 / FLASH_MS as f32);
         let mut search_from = 0usize;
+        let has_tint = tint > 0.0;
         for i in 0..n {
-            let hue = hue0 + (i as f32 / denom) * span + time_deg;
-            let target = hsv2rgb(hue, loc.sat, loc.val);
+            let target = if has_tint {
+                let hue = hue0 + (i as f32 / denom) * span + time_deg;
+                hsv2rgb(hue, loc.sat, loc.val)
+            } else {
+                0
+            };
             let col = loc.cols[i];
             let cell = if ink.last().is_none_or(|c| (c.row, c.col) < (loc.row, col)) {
                 let cell = InkCell {
@@ -451,7 +475,13 @@ impl TrickFlash {
                 search_from = ink.len();
                 cell
             } else {
-                match ink[search_from..].binary_search_by_key(&(loc.row, col), |c| (c.row, c.col)) {
+                let key = (loc.row, col);
+                let lookup = match ink.get(search_from).map(|c| (c.row, c.col)) {
+                    Some(pos) if pos == key => Ok(0),
+                    Some(pos) if pos > key => Err(0),
+                    _ => ink[search_from..].binary_search_by_key(&key, |c| (c.row, c.col)),
+                };
+                match lookup {
                     Ok(rel) => {
                         let j = search_from + rel;
                         search_from = j + 1;
@@ -591,7 +621,6 @@ fn resolve_sat_val(bg: u32) -> (f32, f32) {
 fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let lum_bg = crate::color_math::relative_luminance_with(table, bg);
-    let contrast = |lum: f32| (lum.max(lum_bg) + 0.05) / (lum.min(lum_bg) + 0.05);
     let floor = MIN_INK_CONTRAST;
     let text_is_lighter = crate::color_math::relative_luminance_with(table, fg) >= lum_bg;
     let c = val * sat;
@@ -612,7 +641,8 @@ fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
         for corner in corners {
             let lum =
                 crate::color_math::relative_luminance_with(table, mix_rgb(fg, corner, strength));
-            if (lum >= lum_bg) != text_is_lighter || contrast(lum) < floor {
+            let contrast = (lum.max(lum_bg) + 0.05) / (lum.min(lum_bg) + 0.05);
+            if (lum >= lum_bg) != text_is_lighter || contrast < floor {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }
@@ -877,12 +907,13 @@ fn follow(
 /// against.
 #[inline]
 fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
-    let Some(first) = cells.get(usize::from(loc.cols[0])) else {
+    let first_col = loc.cols[0] as usize;
+    let Some(first) = cells.get(first_col) else {
         return false;
     };
     let same_lead = loc.strength > 0.0 && first.fg == loc.fg[0] && first.bg == loc.bg;
     for i in 0..n {
-        if let Some(cell) = cells.get(usize::from(loc.cols[i])) {
+        if let Some(cell) = cells.get(loc.cols[i] as usize) {
             loc.fg[i] = cell.fg;
         }
     }

@@ -7,6 +7,7 @@ use crate::items::defaults::{Pref, Target, Want};
 use crate::items::{Ctx, Item};
 use crate::model::{PValue, Probe, Read, User};
 use crate::port::System;
+use aterm_types::macos_setup::Setting;
 
 const KEY: &str = "com.apple.swipescrolldirection";
 
@@ -32,18 +33,27 @@ pub fn behavior_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("trackpad behavior requires exactly one local user".into());
     };
-    let mut items: Vec<Box<dyn Item>> = Vec::new();
-    let mut add = |target: Target, value: PValue| {
-        let id = format!("init.trackpad.{}@{}", target.describe(), user.name);
-        let title = format!("Trackpad scrolling: {}", target.describe());
-        items.push(Box::new(Pref::new(
-            "trackpad",
-            id,
-            title,
-            target,
-            Want::Value(value),
-        )));
-    };
+    Ok(behavior_keys()
+        .into_iter()
+        .map(|(domain, key, by_host, value)| {
+            let target = if by_host {
+                Target::host(domain, key, user)
+            } else {
+                Target::user(domain, key, user)
+            };
+            let id = format!("init.trackpad.{}@{}", target.describe(), user.name);
+            let title = format!("Trackpad scrolling: {}", target.describe());
+            let item: Box<dyn Item> =
+                Box::new(Pref::new("trackpad", id, title, target, Want::Value(value)));
+            item
+        })
+        .collect())
+}
+
+/// The trackpad scrolling keys [`behavior_items`] turns on: each one's domain, key, whether it
+/// is a ByHost key, and the value it wants.
+fn behavior_keys() -> Vec<(&'static str, &'static str, bool, PValue)> {
+    let mut keys = Vec::new();
     for domain in [
         "com.apple.AppleMultitouchTrackpad",
         "com.apple.driver.AppleBluetoothMultitouch.trackpad",
@@ -53,18 +63,34 @@ pub fn behavior_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             "TrackpadHorizScroll",
             "TrackpadMomentumScroll",
         ] {
-            add(Target::user(domain, key, user), PValue::Bool(true));
+            keys.push((domain, key, false, PValue::Bool(true)));
         }
     }
-    add(
-        Target::host("-g", "com.apple.trackpad.momentumScroll", user),
+    keys.push((
+        "-g",
+        "com.apple.trackpad.momentumScroll",
+        true,
         PValue::Bool(true),
-    );
-    add(
-        Target::host("-g", "com.apple.trackpad.scrollBehavior", user),
+    ));
+    keys.push((
+        "-g",
+        "com.apple.trackpad.scrollBehavior",
+        true,
         PValue::Int(2),
-    );
-    Ok(items)
+    ));
+    keys
+}
+
+/// The System State row whose item here writes `key` of `domain`, if one does: Natural
+/// scrolling's direction, or one of Trackpad scrolling's keys ([`behavior_keys`]).
+pub(crate) fn setting_of(domain: &str, key: &str) -> Option<Setting> {
+    if domain == "-g" && key == KEY {
+        return Some(Setting::NaturalScrolling);
+    }
+    behavior_keys()
+        .iter()
+        .any(|(each_domain, each_key, ..)| *each_domain == domain && *each_key == key)
+        .then_some(Setting::TrackpadScrolling)
 }
 
 #[derive(Debug)]
@@ -130,8 +156,13 @@ impl Item for ScrollDirection {
                 now: "Natural scrolling is saved as off in macOS and System Settings".into(),
             },
             Ok(natural) => {
-                self.reading
-                    .set(natural.then_some(crate::init_observe::Reading::NaturalOn));
+                // Off now, as wanted, while the saved preference macOS loads at the next login
+                // is not (a Restore of a direction the Mac had never set): off until then.
+                self.reading.set(Some(if natural {
+                    crate::init_observe::Reading::NaturalOn
+                } else {
+                    crate::init_observe::Reading::UntilLogin
+                }));
                 Probe::Change {
                     from: format!(
                         "Natural scrolling: {} in System Settings; preferred value {}persisted",
@@ -189,6 +220,38 @@ mod tests {
 
     fn context() -> Ctx {
         ctx(&[user("alice", 501)])
+    }
+
+    /// After a Restore of a scroll direction the Mac had never set, the saved key is gone and
+    /// the live direction stays off until the next login: System State reads Off, marked so,
+    /// and the row differs, as the Mac will be on natural scrolling after that login.
+    #[test]
+    fn natural_scrolling_off_until_the_next_login_reads_so() {
+        let seen = |live: bool, saved: &str| {
+            let sys = Fake::root();
+            sys.scroll_state(live).on(READ, export(saved));
+            let rows = engine::run(
+                &items(&context()).unwrap(),
+                Mode::Plan,
+                &sys,
+                &context(),
+                &mut NoJournal,
+            );
+            let rows: Vec<&crate::model::ItemReport> = rows.iter().collect();
+            crate::init_observe::observation(Setting::NaturalScrolling, &rows)
+        };
+        let restored = seen(false, "<dict></dict>");
+        assert_eq!(
+            restored.standing,
+            aterm_types::macos_setup::Standing::Differs
+        );
+        assert_eq!(restored.now.as_deref(), Some("Off · until login"));
+        assert_eq!(restored.after_login.as_deref(), Some("On"));
+        let saved_on = seen(false, &format!("<dict><key>{KEY}</key><true/></dict>"));
+        assert_eq!(saved_on.now.as_deref(), Some("Off · until login"));
+        assert_eq!(saved_on.after_login.as_deref(), Some("On"));
+        // On now reads On, whatever is saved.
+        assert_eq!(seen(true, "<dict></dict>").now.as_deref(), Some("On"));
     }
 
     #[test]

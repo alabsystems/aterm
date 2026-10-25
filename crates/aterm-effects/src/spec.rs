@@ -7,7 +7,7 @@ use aterm_hash::FxHashMap;
 use aterm_lexicon::{fold, form_hash, is_no_space_surface};
 
 /// One word's composed effect over the three axes.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WordEffectSpec {
     /// Peek-up sprite show.
     pub graphic: Option<GraphicSpec>,
@@ -15,6 +15,22 @@ pub struct WordEffectSpec {
     pub ink: Option<InkSpec>,
     /// Light show.
     pub burst: Option<BurstSpec>,
+}
+
+impl WordEffectSpec {
+    /// Silent effect spec with all three channels disabled (`None`).
+    pub const NONE: Self = Self {
+        graphic: None,
+        ink: None,
+        burst: None,
+    };
+}
+
+impl Default for WordEffectSpec {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 /// The graphic axis: which sprite collection peeks, and its dwell range (ms).
@@ -132,7 +148,7 @@ pub struct SpecTable {
 }
 
 /// Which shared runtime tunings have at least one admitted word-effect consumer, derived from the compiled [`SpecTable`]: graphic-only, Glow, SuperNova and zero-chance recipes do not make unrelated controls effective.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpecConsumerCapabilities {
     /// A positive-chance classic Nova burst consumes the shared magic toggle.
     pub nova_burst: bool,
@@ -146,6 +162,25 @@ pub struct SpecConsumerCapabilities {
     pub nova_twotone_ink: bool,
     /// At least one scannable, non-ignored Emphasis surface reaches the class default rather than a custom override.
     pub emphasis_class_default: bool,
+}
+
+impl SpecConsumerCapabilities {
+    /// Empty capability set with all consumer features disabled.
+    pub const NONE: Self = Self {
+        nova_burst: false,
+        sparkle_or_starburst_burst: false,
+        rainbow_ink: false,
+        twotone_ink: false,
+        nova_twotone_ink: false,
+        emphasis_class_default: false,
+    };
+}
+
+impl Default for SpecConsumerCapabilities {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl SpecTable {

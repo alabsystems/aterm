@@ -39,6 +39,8 @@ pub mod partition;
 pub mod receipt;
 pub mod steps;
 pub mod subject;
+/// Transport-independent causal replication of independently authored records.
+pub mod sync;
 
 pub use cut::{CausalCut, CausalEdge, CutViolation};
 pub use frame::{

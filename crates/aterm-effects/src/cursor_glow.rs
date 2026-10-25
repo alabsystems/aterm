@@ -168,14 +168,27 @@ struct BoltPts {
 impl Default for BoltPts {
     #[inline]
     fn default() -> Self {
-        Self {
-            buf: [(0.0, 0.0); BOLT_MAX_PTS],
-            len: 0,
-        }
+        Self::EMPTY
     }
 }
 
 impl BoltPts {
+    const EMPTY: Self = Self {
+        buf: [(0.0, 0.0); BOLT_MAX_PTS],
+        len: 0,
+    };
+
+    #[inline]
+    const fn as_slice(&self) -> &[(f32, f32)] {
+        self.buf.split_at(self.len as usize).0
+    }
+
+    #[inline]
+    const fn as_mut_slice(&mut self) -> &mut [(f32, f32)] {
+        let len = self.len as usize;
+        self.buf.split_at_mut(len).0
+    }
+
     #[inline]
     const fn push(&mut self, pt: (f32, f32)) {
         let i = self.len as usize;
@@ -203,15 +216,14 @@ impl std::ops::Deref for BoltPts {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.buf[..usize::from(self.len)]
+        self.as_slice()
     }
 }
 
 impl std::ops::DerefMut for BoltPts {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let len = usize::from(self.len);
-        &mut self.buf[..len]
+        self.as_mut_slice()
     }
 }
 
@@ -503,12 +515,27 @@ pub struct CursorGlow {
 
 /// Which of a frame's glow colours the user chose: a chosen colour is drawn
 /// as itself, never re-hued or brightened ([`CursorGlow::set_colour_pins`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColourPins {
     /// `cursor_trail_color` is set (a colour, or the cursor's).
     pub trail: bool,
     /// `cursor_trail_accent` is set.
     pub accent: bool,
+}
+
+impl Default for ColourPins {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl ColourPins {
+    /// Neither colour is pinned.
+    pub const NONE: Self = Self {
+        trail: false,
+        accent: false,
+    };
 }
 
 /// Window-space geometry the host passes in (pixels).
@@ -620,10 +647,17 @@ struct MoveCtx<'a> {
     nav_taken: Option<Instant>,
 }
 
-#[derive(Default)]
 struct FrameFingerprint(Option<u64>);
 
+impl Default for FrameFingerprint {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl FrameFingerprint {
+    const EMPTY: Self = Self(None);
     const GLOW_OUT: u64 = 0x676c_6f77_5f6f_7574;
     const FIRE_PATCH: u64 = 0x6669_7265_7061_7463;
     const GLOW_UNDER: u64 = 0x676c_6f77_756e_6472;
@@ -653,20 +687,11 @@ impl FrameFingerprint {
             return;
         }
         self.begin_stream(tag, quads.len());
-        let mut hash = match self.0 {
-            Some(h) => h,
-            None => FNV64_OFFSET,
-        };
-        let mut qi = 0;
-        while qi < quads.len() {
-            let words = quads[qi].damage_words();
-            let words = words.as_slice();
-            let mut wi = 0;
-            while wi < words.len() {
-                hash = fnv_mix_u64(hash, words[wi]);
-                wi += 1;
+        let mut hash = self.0.unwrap_or(FNV64_OFFSET);
+        for q in quads {
+            for w in q.damage_words() {
+                hash = fnv_mix_u64(hash, w);
             }
-            qi += 1;
         }
         self.0 = Some(hash);
     }
@@ -1115,10 +1140,12 @@ impl CursorGlow {
 
     /// Returns whether any light or pending witness keeps the animation timer armed.
     #[inline]
-    pub fn is_active(&self) -> bool {
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
         self.has_live_motion()
             || self.ember_live()
-            || self.poof_hint_pending().is_some()
+            || self.kill_hint.is_some()
+            || self.bs_poof_hint.is_some()
             || (self.v2.engaged()
                 && (self.held_park.is_some()
                     || self.torn_lay.is_some()
@@ -1353,7 +1380,7 @@ impl CursorGlow {
             Some(now) if self.v2.engaged() => self.v2.curtain(now),
             _ => self.v2.set_engaged(false),
         }
-        self.v2_caret = CaretSeam::default();
+        self.v2_caret = CaretSeam::EMPTY;
         self.v2_stop = None;
         self.flow_open = false;
         self.scroll_rows = 0;
@@ -1894,7 +1921,7 @@ impl CursorGlow {
                 halos: &mut halos,
                 beams: &mut self.v2_beams,
                 cues: &mut self.v2_cues,
-                caret: CaretSeam::default(),
+                caret: CaretSeam::EMPTY,
                 companion: None,
                 fp: 0,
             };
@@ -1974,7 +2001,7 @@ impl CursorGlow {
         self.under_out.truncate(Self::MAX_QUADS);
 
         self.halo_out.truncate(Self::MAX_HALOS);
-        let mut fp = FrameFingerprint::default();
+        let mut fp = FrameFingerprint::EMPTY;
         fp.glow_quads(FrameFingerprint::GLOW_OUT, out);
         fp.fire_patches(&self.patch_out);
         fp.glow_quads(FrameFingerprint::GLOW_UNDER, &self.under_out);
@@ -2132,7 +2159,7 @@ impl CursorGlow {
 }
 
 #[inline]
-fn witness_samples(
+const fn witness_samples(
     rows: &[WitnessRowBuf],
     n: usize,
 ) -> ([rk::witness::RowSample<'_>; CURSOR_WITNESS_ROWS], usize) {
@@ -2140,12 +2167,15 @@ fn witness_samples(
         row: u16::MAX,
         cols: &[],
     }; CURSOR_WITNESS_ROWS];
-    let n = n.min(samples.len()).min(rows.len());
-    for (sample, slot) in samples.iter_mut().zip(&rows[..n]) {
-        *sample = rk::witness::RowSample {
-            row: slot.row,
-            cols: &slot.cols,
+    let n = if n < samples.len() { n } else { samples.len() };
+    let n = if n < rows.len() { n } else { rows.len() };
+    let mut i = 0;
+    while i < n {
+        samples[i] = rk::witness::RowSample {
+            row: rows[i].row,
+            cols: rows[i].cols.as_slice(),
         };
+        i += 1;
     }
     (samples, n)
 }

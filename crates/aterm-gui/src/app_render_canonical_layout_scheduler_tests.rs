@@ -914,6 +914,10 @@ fn modal_transform_tracks_visible_route_across_mixed_focus_and_zoom() {
         .overlay_coordinate_transform(wid)
         .expect("mixed modal transform");
     assert_eq!(mixed.scale, 2.0);
+    assert_eq!(
+        mixed.geom.px_per_pt, 1.0,
+        "point geometry: the transform scales it"
+    );
     assert_eq!(mixed.geom.font_px, 13.0);
     assert_eq!(
         mixed.origin_y,
@@ -938,6 +942,10 @@ fn modal_transform_tracks_visible_route_across_mixed_focus_and_zoom() {
         .overlay_coordinate_transform(wid)
         .expect("zoomed terminal transform");
     assert_eq!(zoomed_terminal.scale, 1.0);
+    assert_eq!(
+        zoomed_terminal.geom.px_per_pt, 2.0,
+        "device-pixel geometry caps its card in points at the window's scale"
+    );
     assert_eq!(zoomed_terminal.geom.font_px, app.win_font_px(wid));
     assert_eq!(
         zoomed_terminal.origin_y,

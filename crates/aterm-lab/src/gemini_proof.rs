@@ -811,7 +811,10 @@ mod tests {
         );
         let read = crate::selftest::open_files_report(
             7,
-            Ok(vec!["/Users//owner/.gemini/oauth_creds.json".into()]),
+            Ok(crate::procs::OpenPaths {
+                paths: vec!["/Users//owner/.gemini/oauth_creds.json".into()],
+                complete: true,
+            }),
         );
         assert!(read.complete);
         assert!(read.text.contains("n/Users//owner/.gemini/oauth_creds.json"));

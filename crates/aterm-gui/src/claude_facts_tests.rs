@@ -222,14 +222,14 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
         )
     };
     let (title, spoken) = said(&with(None));
-    assert!(title.contains("weekly ? \u{b7} restart tab"), "{title}");
+    assert!(title.contains("weekly ? \u{b7} until relaunch"), "{title}");
     assert_eq!(
         spoken,
-        "Account: owner@example.com, Max 20x, weekly figure unknown, a restart of the tab adds it"
+        "Account: owner@example.com, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"
     );
     let (title, spoken) = said(&with(Some("weekly 62% left")));
     assert!(
-        title.contains("weekly 62% left") && !title.contains("restart tab"),
+        title.contains("weekly 62% left") && !title.contains("until relaunch"),
         "{title}"
     );
     assert_eq!(

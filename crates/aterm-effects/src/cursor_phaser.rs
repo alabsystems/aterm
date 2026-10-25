@@ -97,8 +97,19 @@ pub struct PhaserFrame {
     pub fp: u64,
 }
 
+impl PhaserFrame {
+    /// Dormant frame output (`fill: None, fp: 0`).
+    pub const DORMANT: Self = Self { fill: None, fp: 0 };
+}
+
+impl Default for PhaserFrame {
+    #[inline]
+    fn default() -> Self {
+        Self::DORMANT
+    }
+}
+
 /// Per-window emitter animation state — one breath phase plus the last clock reading and a latched charge.
-#[derive(Default)]
 pub struct CursorPhaser {
     /// Idle-breath phase in turns `0..1`.
     pulse: f32,
@@ -109,13 +120,32 @@ pub struct CursorPhaser {
     light_fill_memo: Option<((u32, u32), u32)>,
 }
 
+impl Default for CursorPhaser {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorPhaser {
+    /// Fresh dormant phaser-cursor animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            pulse: 0.0,
+            last: None,
+            energy: 0.0,
+            light_fill_memo: None,
+        }
+    }
+
     /// Reset animation state while preserving the light-fill memo.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         *self = Self {
             light_fill_memo: self.light_fill_memo,
-            ..Self::default()
+            ..Self::new()
         };
     }
 
@@ -143,7 +173,7 @@ impl CursorPhaser {
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.energy = 0.0;
             self.last = Some(now);
-            return PhaserFrame { fill: None, fp: 0 };
+            return PhaserFrame::DORMANT;
         }
         let was_active = self.energy > SETTLED_ENERGY;
         self.energy = e;
@@ -161,7 +191,11 @@ impl CursorPhaser {
         if active {
             self.pulse = (self.pulse + dt * PULSE_HZ).fract();
         }
-        let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin();
+        let breath = if self.pulse == 0.0 {
+            0.5
+        } else {
+            0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin()
+        };
 
         let fill = match cfg.base {
             Some(pinned) if e <= SETTLED_ENERGY => pinned & 0x00FF_FFFF,

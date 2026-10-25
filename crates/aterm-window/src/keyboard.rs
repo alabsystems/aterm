@@ -55,6 +55,7 @@
 //
 // End of W3C Short Notice.
 
+// LOCAL PATCH (aterm): the crate's own key-text type, not a re-export of the `smol_str` crate.
 mod smol_str;
 pub use self::smol_str::SmolStr;
 

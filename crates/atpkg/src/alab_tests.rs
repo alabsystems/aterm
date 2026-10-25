@@ -1515,3 +1515,100 @@ fn a_vendor_choice_never_writes_through_a_link() {
     assert!(!vendor_chosen(&l, "codex"));
     assert_eq!(std::fs::read_link(&marker).unwrap(), target);
 }
+
+/// CODEX-ALAB'S COMPOUND VERSION (codex-alab `alab/README.md`, Decision 8, 2026-10-24): its own
+/// core with the upstream Codex baseline in SemVer build metadata. Each of the four shapes
+/// codex-alab mints is read whole, the baseline named; every other pre-release or metadata is
+/// refused, never guessed at.
+#[test]
+fn a_codex_alab_version_names_its_core_its_dev_count_and_its_upstream_baseline() {
+    let compound = AlabVersion::parse("0.1.0-dev.13600+codex.0.164.0.gabcdef012").unwrap();
+    assert_eq!(compound.core, (0, 1, 0));
+    assert_eq!(compound.dev, Some(13_600));
+    assert_eq!(compound.baseline, Some((0, 164, 0)));
+    assert_eq!(compound.baseline_text, Some("0.164.0"));
+    assert_eq!(compound.sha9, Some("abcdef012"));
+    assert_eq!(compound.baseline_words().as_deref(), Some("codex 0.164.0"));
+    let release = AlabVersion::parse("0.1.0+codex.0.164.2").unwrap();
+    assert_eq!(
+        (release.core, release.dev, release.baseline, release.sha9),
+        ((0, 1, 0), None, Some((0, 164, 2)), None)
+    );
+    let dev = AlabVersion::parse("0.164.0-dev.12479+g07a25d86a").unwrap();
+    assert_eq!(
+        (dev.core, dev.dev, dev.baseline, dev.sha9),
+        ((0, 164, 0), Some(12_479), None, Some("07a25d86a"))
+    );
+    assert_eq!(dev.baseline_words(), None);
+    let bare = AlabVersion::parse("0.164.0").unwrap();
+    assert_eq!((bare.dev, bare.baseline, bare.sha9), (None, None, None));
+    for bad in [
+        "",
+        "0.1",
+        "0.1.0.0",
+        "v0.1.0",
+        "00.1.0",
+        "0.1.0-rc.1",
+        "0.1.0-dev",
+        "0.1.0-dev.",
+        "0.1.0-dev.01+gabcdef012",
+        "0.1.0+gabcdef012",
+        "0.1.0+codex.0.164.0.gabcdef012",
+        "0.1.0-dev.2",
+        "0.1.0-dev.2+codex.0.164.0",
+        "0.1.0-dev.2+codex.0.164.gabcdef012",
+        "0.1.0-dev.2+codex.0.164.00.gabcdef012",
+        "0.1.0-dev.2+codex.v0.164.0.gabcdef012",
+        "0.1.0-dev.2+codex.0.164.0-rc.1.gabcdef012",
+        "0.1.0-dev.2+codex.0.164.0.gabcdef01",
+        "0.1.0-dev.2+codex.0.164.0.gABCDEF012",
+        "0.1.0-dev.2+codex.0.164.0.gabcdef012.x",
+        "0.1.0-dev.2+codex.0.164.0+gabcdef012",
+        "0.1.0-dev.2+openai.0.164.0.gabcdef012",
+        "0.1.0+codex.",
+        "0.1.0+codex.0.164.0.",
+        "0.1.0+codex.1234567890.0.0",
+    ] {
+        assert_eq!(AlabVersion::parse(bad), None, "{bad}");
+    }
+    let long = format!("0.1.0+codex.0.164.0{}", "0".repeat(MAX_ALAB_VERSION_BYTES));
+    assert_eq!(AlabVersion::parse(&long), None);
+}
+
+/// Build metadata never orders: codex-alab's own line does. Two builds on the same baseline
+/// order by their core and count, a build on a newer baseline is no newer for it, and a dev
+/// build sorts below the release of its core, as SemVer puts every pre-release.
+#[test]
+fn a_codex_alab_version_orders_by_its_own_line_never_by_its_baseline() {
+    let p = |text: &str| AlabVersion::parse(text).unwrap().precedence();
+    assert!(p("0.1.0-dev.5+codex.0.170.0.gabcdef012") < p("0.1.0-dev.6+codex.0.164.0.gabcdef012"));
+    assert!(p("0.1.0+codex.0.170.0") < p("0.2.0+codex.0.164.0"));
+    assert!(p("0.1.0-dev.99999+codex.0.164.0.gabcdef012") < p("0.1.0+codex.0.164.0"));
+    assert_eq!(p("0.1.0+codex.0.164.0"), p("0.1.0+codex.0.165.0"));
+    assert_eq!(
+        p("0.1.0-dev.7+codex.0.164.0.gabcdef012"),
+        p("0.1.0-dev.7+gabcdef012")
+    );
+}
+
+/// The installed client reads a compound package as it reads every ALab package: its version
+/// verbatim, the record's upstream block whole, and a `baseline` field the client has no use
+/// for changes neither.
+#[test]
+fn a_compound_package_is_read_verbatim_and_its_baseline_field_changes_nothing() {
+    let d = crate::testdir::dir("atpkg-alab-compound-");
+    let root = d.join("pkg");
+    let version = "0.1.0-dev.13600+codex.0.163.0.gabcdef012";
+    package(&root, version, b"x", true);
+    let record = format!(
+        r#"{{"source":"0","version":"{version}","client_version":"0.164.0-dev.13600+gabcdef012","baseline":"0.163.0","upstream":{}}}"#,
+        full_upstream()
+    );
+    std::fs::write(root.join(ALAB_BUILD_JSON), record).unwrap();
+    assert!(is_alab_package(&root));
+    assert_eq!(package_version(&root).as_deref(), Some(version));
+    assert_eq!(
+        upstream_of(&root).map(|u| u.words()).as_deref(),
+        Some("based on upstream rust-v0.163.0+g0123456789ab")
+    );
+}

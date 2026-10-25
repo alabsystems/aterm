@@ -115,7 +115,9 @@ pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
-/// Device-pixel geometry of the in-grid overlay card slot ([`crate::overlay::OverlayModel::tray`]).
+/// Geometry of the in-grid overlay card slot ([`crate::overlay::OverlayModel::tray`]): device pixels on
+/// the terminal route, points on the native route, whose transform scales them
+/// ([`crate::OverlayCoordinateTransform`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SettingsGeom {
     pub cw: f32,
@@ -123,6 +125,9 @@ pub(crate) struct SettingsGeom {
     pub font_px: f32,
     pub cols: usize,
     pub panel_rows: usize,
+    /// This geometry's units per point: the window's backing scale where they are device pixels,
+    /// 1 where they are points. A length meant in points (a card's width cap) is multiplied by it.
+    pub px_per_pt: f32,
 }
 
 const BLOB_CORAL: [u8; 3] = [0xFF, 0x51, 0x48];

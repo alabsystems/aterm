@@ -56,7 +56,7 @@ pub enum AliasRoute {
     FrontDoor,
 }
 
-/// The route of an invocation whose argv[0] file name is `argv0` and whose argv[1] is `first`.
+/// The route of an invocation whose `argv[0]` file name is `argv0` and whose `argv[1]` is `first`.
 #[must_use]
 pub fn alias_route(argv0: &str, first: &str) -> AliasRoute {
     match argv0 {
@@ -82,7 +82,7 @@ pub fn alias_route(argv0: &str, first: &str) -> AliasRoute {
     }
 }
 
-/// Whether the front door answers argv[1] `first` with [`crate::parse_args`] and exits before it
+/// Whether the front door answers `argv[1]` `first` with [`crate::parse_args`] and exits before it
 /// routes: `help`, `-h`, `--help`, `-V`, `--version` or a diagnostic ([`DIAG_COMMANDS`]).
 #[must_use]
 pub fn mode_free(first: &str) -> bool {
@@ -90,8 +90,8 @@ pub fn mode_free(first: &str) -> bool {
         || DIAG_COMMANDS.iter().any(|(name, _)| *name == first)
 }
 
-/// Whether argv[1] `first` asks the front door for a completion script: `--completions` (the
-/// shell in argv[2]) or `--completions=<shell>`.
+/// Whether `argv[1]` `first` asks the front door for a completion script: `--completions` (the
+/// shell in `argv[2]`) or `--completions=<shell>`.
 #[must_use]
 pub fn asks_completions(first: &str) -> bool {
     first == "--completions" || first.starts_with("--completions=")

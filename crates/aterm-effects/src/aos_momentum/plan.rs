@@ -2,6 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! Schedule plans: closed, validated candidate data and the first-party interpreter for it.
+//!
+//! # The bytes
+//!
+//! ```text
+//! byte 0      format = PLAN_FORMAT (1)
+//! byte 1      split: 0 Shipped | 1 SettleAtStep
+//! byte 2      wake:  0 NextStep | 1 ColdOnly | 2 Poll | 3 Cadence | 4 Never
+//! byte 3      reserved = 0
+//! bytes 4..8  u32 LE gap_us, 0..=1_000_000 (SettleAtStep), else 0
+//! bytes 8..12 u32 LE period_us, 1_000..=1_000_000 (Poll), else 0
+//! ```
 
 use core::fmt;
 use std::time::Duration;

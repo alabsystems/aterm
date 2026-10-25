@@ -121,6 +121,53 @@ fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
     }
 }
 
+/// codex-alab's own version line (codex-alab Decision 8, 2026-10-24): the manifest and the
+/// marker's `version` are codex-alab's `0.1.0` line, the marker's `client_version` is what
+/// upstream's code writes as the rollout's `cli_version`. The build is the client version.
+#[test]
+fn codex_alab_s_own_line_names_its_build_by_its_client_version() {
+    const OWN: &str = "0.1.0-dev.12521+g3d3eb12d8";
+    const CLIENT: &str = "0.164.0-dev.12521+g3d3eb12d8";
+    let d = aterm_tempfile::tempdir().expect("private package fixture");
+    let root = d.path().join(format!("codex/{OWN}"));
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe is never run");
+    std::fs::write(
+        root.join(PACKAGE_JSON),
+        PACKAGE_0_157_1.replace("0.157.1", OWN),
+    )
+    .expect("manifest");
+    let marker = root.join(ALAB_BUILD_JSON);
+    let record = |text: &str| std::fs::write(&marker, text).expect("marker");
+    record(&format!(
+        r#"{{"source":"3d3eb12d8","version":"{OWN}","client_version":"{CLIENT}"}}"#
+    ));
+    assert!(alab_bytes(&exe));
+    assert_eq!(
+        alab_build(&exe).as_deref(),
+        Some(CLIENT),
+        "the rollouts name the client version, never codex-alab's own"
+    );
+    record(&format!(r#"{{"source":"3d3eb12d8","version":"{OWN}"}}"#));
+    assert_eq!(
+        alab_build(&exe).as_deref(),
+        Some(OWN),
+        "a package from before the line has one version"
+    );
+    for bad in [
+        format!(r#"{{"version":"0.2.0-dev.1+g000000000","client_version":"{CLIENT}"}}"#),
+        format!(r#"{{"version":"{OWN}","client_version":164}}"#),
+        format!(r#"{{"version":"{OWN}","client_version":null}}"#),
+        format!(r#"["{CLIENT}"]"#),
+        "not json".to_string(),
+    ] {
+        record(&bad);
+        assert_eq!(alab_build(&exe), None, "{bad}");
+        assert!(alab_bytes(&exe), "still ALab bytes, but no build: {bad}");
+    }
+}
+
 #[test]
 fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it() {
     let d = crate::supervise::ScratchDir::new("codex", "pkg");

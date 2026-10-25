@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use super::fixtures::{
-    Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, finished_1032, lane_off_1032,
-    liar_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab2_build_1048,
-    wrapped_1218,
+    Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, exited_skewed_1510,
+    finished_1032, idle_skewed_1510, lane_off_1032, liar_1032, reaped_1510, spotlight_1032,
+    spotlight_late_1032, tab, tab2_build_1048, wrapped_1218,
 };
 use super::*;
 use crate::model::{MemRates, MemSample, MemView, Pressure, Thermal, Throttle, Vitals};
@@ -1078,6 +1078,7 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
     build.busy_mc += 1000;
     for c in build.coalitions.iter_mut().filter(|c| c.id == 1342) {
         c.mc += 1000;
+        c.reaped = 10;
     }
     let g = you(&build, 2);
     assert_eq!(
@@ -1088,11 +1089,12 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
 }
 
 /// An idle tab beside aterm's coalition and its live work 0.30 mc apart
-/// (aterm's coalition 200.50 mc, aterm itself 200.20): rounded on their own
-/// they read a millicore apart, rounded once from their nanoseconds none, so
-/// the role stays `none` and no `finished_tab_work` is claimed. NEGATIVE
-/// CONTROL: 0.80 mc apart is a millicore no live process holds, and the
-/// bound rule reads `not_sampled`.
+/// (aterm's coalition 200.50 mc, aterm itself 200.20, a member made and
+/// reaped inside the window, so the gap may be finished work): rounded on
+/// their own they read a millicore apart, rounded once from their
+/// nanoseconds none, so the role stays `none` and no `finished_tab_work` is
+/// claimed. NEGATIVE CONTROL: 0.80 mc apart is a millicore no live process
+/// holds, and the bound rule reads `not_sampled`.
 #[test]
 fn the_parts_rounding_never_reads_as_unattributed_work() {
     let idle = |coalition_ns: u64| {
@@ -1112,6 +1114,8 @@ fn the_parts_rounding_never_reads_as_unattributed_work() {
         for r in now.coalitions.iter_mut().flat_map(|c| c.rows.iter_mut()) {
             if r.id == 1342 {
                 r.cpu_ns += coalition_ns;
+                r.tasks_started += 1;
+                r.tasks_exited += 1;
             }
         }
         for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1187) {
@@ -1140,6 +1144,154 @@ fn the_parts_rounding_never_reads_as_unattributed_work() {
     assert_eq!(
         (a.you.role, a.you.unattributed_mc),
         (Role::Unavailable("not_sampled"), Some(1))
+    );
+    assert!(a.cannot.contains(&("finished_tab_work", "not_sampled")));
+}
+
+/// An idle tab over a window in which aterm's coalition's counter moved
+/// 3.26 ms past its members' times (`idle_skewed_1510`, the headless run's
+/// flip): its task counters show no member made or reaped and every member
+/// is swept and in a live figure, so none of it is finished work; it reads
+/// as the counters' skew and the role stays `none`. NEGATIVE CONTROLS: the
+/// same window with a member made and reaped, with a member in no live
+/// figure (a process of aterm's coalition reparented to launchd), with a
+/// member whose coalition went unread (the sweep found fewer than the
+/// counters hold), with a member whose CPU was not read at both ends (a
+/// root `sudo` in tab 1 at 500 mc), or with one whose user went unread at
+/// the window's end (tab 1's `claude` at 300 mc) keeps what no tab's figure
+/// holds as work, and the role `not_sampled`; so does a `git` that exited
+/// after 3 mc (`exited_skewed_1510`).
+#[test]
+fn the_counters_skew_never_reads_as_finished_work() {
+    let read = |scene: &Scene, tweak: fn(&mut Sample)| {
+        let mut v = Vitals::new();
+        let [base, sweep, mut now] = scene.samples();
+        tweak(&mut now);
+        v.absorb(&base);
+        v.absorb(&sweep);
+        let s = v.absorb(&now);
+        let split = s.why.as_deref().expect("a window").split.clone();
+        (split, account(WhySubject::Cpu, Some(1), &s))
+    };
+    let (split, a) = read(&idle_skewed_1510(), |_| {});
+    assert_eq!(
+        (
+            split.aterm_mc,
+            split.own_mc,
+            split.tabs.as_slice(),
+            split.skew_mc,
+            split.unattributed_mc
+        ),
+        (201, 200, &[(1, 0)][..], 1, 0)
+    );
+    assert_eq!((a.you.role, a.you.unattributed_mc), (Role::None, None));
+    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
+
+    let (split, a) = read(&idle_skewed_1510(), |now| {
+        for r in now.coalitions.iter_mut().flat_map(|c| c.rows.iter_mut()) {
+            if r.id == 1342 {
+                r.tasks_started += 1;
+                r.tasks_exited += 1;
+            }
+        }
+    });
+    assert_eq!(
+        (split.skew_mc, split.unattributed_mc),
+        (0, 1),
+        "a member reaped"
+    );
+    assert_eq!(
+        (a.you.role, a.you.unattributed_mc),
+        (Role::Unavailable("not_sampled"), Some(1))
+    );
+    let mut stray = idle_skewed_1510();
+    stray.procs.push(Proc::new(
+        1230,
+        1,
+        501,
+        1342,
+        USERSPACE_MS + 400_000,
+        "ssh-agent",
+        0,
+    ));
+    for c in stray.coalitions.iter_mut().filter(|c| c.id == 1342) {
+        c.started += 1;
+    }
+    let (split, a) = read(&stray, |_| {});
+    assert_eq!(
+        (split.skew_mc, split.unattributed_mc),
+        (0, 1),
+        "a member in no live figure"
+    );
+    assert_eq!(a.you.role, Role::Unavailable("not_sampled"));
+    let (split, a) = read(&idle_skewed_1510(), |now| {
+        for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1210) {
+            p.coalition = None;
+        }
+    });
+    assert_eq!(
+        (split.skew_mc, split.unattributed_mc),
+        (0, 1),
+        "a member whose coalition went unread"
+    );
+    assert_eq!(a.you.role, Role::Unavailable("not_sampled"));
+    let mut root = idle_skewed_1510();
+    root.busy_mc += 500;
+    root.procs.push(Proc::new(
+        1240,
+        1200,
+        0,
+        1342,
+        USERSPACE_MS + 300_000,
+        "sudo",
+        500,
+    ));
+    for c in root.coalitions.iter_mut().filter(|c| c.id == 1342) {
+        c.mc += 500;
+        c.started += 1;
+    }
+    let (split, a) = read(&root, |_| {});
+    assert_eq!(
+        (split.skew_mc, split.unattributed_mc),
+        (0, 501),
+        "a member whose CPU was not read at both ends"
+    );
+    assert_eq!(
+        (a.you.role, a.you.unattributed_mc),
+        (Role::Unavailable("not_sampled"), Some(501))
+    );
+    let mut busy = idle_skewed_1510();
+    busy.busy_mc += 300;
+    for p in busy.procs.iter_mut().filter(|p| p.pid == 1210) {
+        *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "claude", 300);
+    }
+    for c in busy.coalitions.iter_mut().filter(|c| c.id == 1342) {
+        c.mc += 300;
+    }
+    let (split, a) = read(&busy, |now| {
+        for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1210) {
+            p.uid = None;
+        }
+    });
+    assert_eq!(
+        (split.skew_mc, split.unattributed_mc),
+        (0, 301),
+        "a member whose user went unread at the window's end"
+    );
+    assert_eq!(
+        (a.you.role, a.you.unattributed_mc),
+        (Role::Unavailable("not_sampled"), Some(301))
+    );
+
+    let (split, a) = read(&exited_skewed_1510(), |_| {});
+    assert_eq!(
+        (split.aterm_mc, split.skew_mc, split.unattributed_mc),
+        (204, 0, 4),
+        "the git's 15 ms and the counters' 3.26 ms, with a member reaped"
+    );
+    assert_eq!(
+        (a.you.role, a.you.figure, a.you.unattributed_mc),
+        (Role::Unavailable("not_sampled"), Some(0), Some(4))
     );
     assert!(a.cannot.contains(&("finished_tab_work", "not_sampled")));
 }

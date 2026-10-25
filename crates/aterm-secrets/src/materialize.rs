@@ -60,6 +60,11 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Where entry `name` lands under `home`.
 pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
+    if crate::commons::reserved_name(name) {
+        return Err(Error::new(
+            "the Commons control record has no plaintext file path",
+        ));
+    }
     if !text::valid_entry_name(name) {
         return Err(Error::new(
             "an invalid entry name: a file name [A-Za-z0-9][A-Za-z0-9._-]{0,127} or a ~/ home path",
@@ -119,6 +124,32 @@ pub fn apply_resuming(
     now: u64,
     ahead: &mut dyn FnMut(&Manifest, &Pending) -> crate::Result<()>,
 ) -> crate::Result<(Manifest, Report)> {
+    // Control records stay in the encrypted vault cache. Filtering before any
+    // path/standing/pending computation also prevents reporting their keys as
+    // ordinary materialization failures or treating them as files to restore.
+    let ordinary;
+    let entries = if entries
+        .iter()
+        .any(|entry| crate::commons::reserved_name(&entry.name))
+    {
+        ordinary = entries
+            .iter()
+            .filter(|entry| !crate::commons::reserved_name(&entry.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        ordinary.as_slice()
+    } else {
+        entries
+    };
+    let ordinary_held = Manifest {
+        files: held
+            .files
+            .iter()
+            .filter(|(name, _)| !crate::commons::reserved_name(name))
+            .map(|(name, digest)| (name.clone(), digest.clone()))
+            .collect(),
+    };
+    let held = &ordinary_held;
     let secrets = home.join(".secrets");
     let places = Places::new(home, &secrets, now);
     let mut resumed_held = held.clone();
@@ -794,6 +825,58 @@ mod tests {
             if_absent: false,
             anchor: None,
         }
+    }
+
+    #[test]
+    fn commons_control_is_not_materialized_resumed_reported_or_removed() {
+        let root = scratch();
+        let name = crate::commons::ENTRY;
+        let entries = [
+            entry("ordinary", b"ordinary value"),
+            entry(name, b"inert control key"),
+            entry("aterm-commons-control-v2", b"inert future control key"),
+        ];
+        let path = root.path().join(".secrets").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        plant(&path, b"an existing local file", 0o600);
+        let held = Manifest {
+            files: BTreeMap::from([(name.into(), digest_hex(b"an existing local file"))]),
+        };
+        let resumed = Pending::from([(name.into(), digest_hex(b"inert control key"))]);
+        let (manifest, report) = apply_resuming(
+            root.path(),
+            &entries,
+            &held,
+            &resumed,
+            1,
+            &mut |held, pending| {
+                assert!(!held.files.contains_key(name));
+                assert!(!pending.contains_key(name));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(read(&path), b"an existing local file");
+        assert_eq!(report.written, ["ordinary"]);
+        assert!(
+            report.removed.is_empty() && report.failed.is_empty() && report.moved_aside.is_empty()
+        );
+        assert!(!manifest.files.contains_key(name));
+        for spelling in [
+            name.to_owned(),
+            name.to_uppercase(),
+            format!("~/.secrets/{name}"),
+            format!("~/.SECRETS/{}", name.to_uppercase()),
+            "aterm-commons-control-v2".into(),
+        ] {
+            assert!(target_path(root.path(), &spelling).is_err(), "{spelling}");
+        }
+        let empty = scratch();
+        apply(empty.path(), &entries[1..], &Manifest::default(), 2).unwrap();
+        assert!(
+            !empty.path().join(".secrets").join(name).exists(),
+            "a control record never creates a plaintext key file"
+        );
     }
 
     fn mode(path: &Path) -> u32 {

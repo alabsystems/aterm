@@ -665,11 +665,22 @@ pub(crate) struct StatsMeter {
     pub(crate) words: String,
 }
 
+/// What needs the owner on the merged deck's rail, read before its meters.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatsNeeds {
+    /// "Needs you", or "Nothing needs you" while none does.
+    pub(crate) name: String,
+    /// Each need in words, worst first.
+    pub(crate) needs: Vec<String>,
+}
+
 /// Stats deck resource meters and per-core meters.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatsGroup {
-    /// "Stats deck, last 10 minutes".
+    /// "Stats deck, last 10 minutes" (v2), "Stats deck" (the merged deck).
     pub(crate) name: &'static str,
+    /// The merged deck's needs; none on v2's deck and the sill.
+    pub(crate) needs: Option<StatsNeeds>,
     /// One meter a resource, in row order.
     pub(crate) meters: Vec<StatsMeter>,
     /// The cores' group's name: "18 CPU cores".
@@ -704,10 +715,32 @@ pub(crate) struct StatsLens {
     pub(crate) bounds: Option<Rect>,
 }
 
+/// The stats deck's node ids past [`STATS_BASE`] (the group itself): its meters at 1..=15, the
+/// needs group at 16 and its needs at 17..=23, 24..=47 kept for the merged deck's chips, the lens
+/// at 48 and its wells after it, the cores' group at 64 and each core from 128.
+const STATS_NEEDS: u64 = STATS_BASE + 16;
+const STATS_NEEDS_MAX: usize = 7;
 const STATS_LENS: u64 = STATS_BASE + 48;
 
 fn stats_meter_id(k: usize) -> Option<NodeId> {
     (k < 15).then(|| NodeId(STATS_BASE + 1 + k as u64))
+}
+
+/// The needs group: one label a need, the first [`STATS_NEEDS_MAX`] of them.
+fn push_stats_needs(nodes: &mut Vec<(NodeId, Node)>, needs: &StatsNeeds) -> NodeId {
+    let mut children = Vec::with_capacity(needs.needs.len().min(STATS_NEEDS_MAX));
+    for (k, words) in needs.needs.iter().take(STATS_NEEDS_MAX).enumerate() {
+        let id = NodeId(STATS_NEEDS + 1 + k as u64);
+        let mut node = Node::new(Role::Label);
+        node.set_label(words.clone());
+        nodes.push((id, node));
+        children.push(id);
+    }
+    let mut node = Node::new(Role::Group);
+    node.set_label(needs.name.clone());
+    node.set_children(children);
+    nodes.push((NodeId(STATS_NEEDS), node));
+    NodeId(STATS_NEEDS)
 }
 
 fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> NodeId {
@@ -724,7 +757,10 @@ fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> NodeId {
     };
     let group = &stats.group;
     let group_id = NodeId(STATS_BASE);
-    let mut children = Vec::with_capacity(group.meters.len() + 1);
+    let mut children = Vec::with_capacity(group.meters.len() + 2);
+    if let Some(needs) = &group.needs {
+        children.push(push_stats_needs(nodes, needs));
+    }
     for (k, m) in group.meters.iter().enumerate() {
         let Some(id) = stats_meter_id(k) else {
             break;
@@ -1792,6 +1828,7 @@ mod tests {
         let stats = GridStats {
             group: StatsGroup {
                 name: "Stats deck, last 10 minutes",
+                needs: None,
                 meters: vec![meter("CPU", Some(98.0)), meter("Tokens", None)],
                 cores_name: "2 CPU cores".into(),
                 cores: vec![
@@ -1862,6 +1899,136 @@ mod tests {
             Some("Now"),
             "the well is named by its heading"
         );
+    }
+
+    /// The merged deck's group reads its needs first, then its meters, then its cores; at most
+    /// seven needs are read, and no node of the deck shares an id with another.
+    #[test]
+    fn the_merged_deck_reads_its_needs_first() {
+        let snap = live_grid(2, 20, b"", None);
+        let meter = |name: &str| StatsMeter {
+            name: name.into(),
+            value: Some(10.0),
+            words: format!("{name} said"),
+        };
+        let blocks = ["Processes", "CPU", "Memory", "GPU", "Disk", "Network"];
+        let read = |needs: Vec<String>| {
+            let stats = GridStats {
+                group: StatsGroup {
+                    name: "Stats deck",
+                    needs: Some(StatsNeeds {
+                        name: if needs.is_empty() {
+                            "Nothing needs you"
+                        } else {
+                            "Needs you"
+                        }
+                        .into(),
+                        needs,
+                    }),
+                    meters: blocks.iter().map(|b| meter(b)).collect(),
+                    cores_name: "2 CPU cores".into(),
+                    cores: vec![meter("Super core 1"), meter("Super core 2")],
+                },
+                bounds: None,
+                lens: Some(StatsLens {
+                    keys: false,
+                    name: "CPU close-up".into(),
+                    explainer: "Heat is the share of the cores in use.".into(),
+                    wells: (0..15)
+                        .map(|k| (format!("Well {k}"), "said".into()))
+                        .collect(),
+                    bounds: None,
+                }),
+            };
+            let frame = GridFrame {
+                stats: Some(&stats),
+                ..GridFrame::default()
+            };
+            grid_tree(&snap, Some(GEOM), &frame)
+        };
+
+        let calm = read(Vec::new());
+        let kids = node(&calm, NodeId(STATS_BASE)).children().to_vec();
+        assert_eq!(kids.len(), 1 + blocks.len() + 1, "needs, meters, cores");
+        assert_eq!(kids[0], NodeId(STATS_NEEDS), "the needs come first");
+        let needs = node(&calm, kids[0]);
+        assert_eq!(
+            (needs.role(), needs.label(), needs.children().len()),
+            (Role::Group, Some("Nothing needs you"), 0)
+        );
+        let meters: Vec<_> = kids[1..=blocks.len()]
+            .iter()
+            .map(|&id| (id, node(&calm, id).label()))
+            .collect();
+        let want: Vec<_> = blocks
+            .iter()
+            .enumerate()
+            .map(|(k, b)| (NodeId(STATS_BASE + 1 + k as u64), Some(*b)))
+            .collect();
+        assert_eq!(meters, want, "one meter a block, in block order");
+        assert_eq!(kids[blocks.len() + 1], NodeId(STATS_BASE + 64));
+
+        let said: Vec<String> = (1..=10).map(|k| format!("need {k}")).collect();
+        let busy = read(said.clone());
+        let needs = node(&busy, NodeId(STATS_NEEDS));
+        assert_eq!(needs.label(), Some("Needs you"));
+        let pills: Vec<_> = needs
+            .children()
+            .iter()
+            .map(|&id| {
+                let n = node(&busy, id);
+                (id, n.role(), n.label().map(str::to_owned))
+            })
+            .collect();
+        let want: Vec<_> = said
+            .iter()
+            .take(STATS_NEEDS_MAX)
+            .enumerate()
+            .map(|(k, w)| {
+                (
+                    NodeId(STATS_NEEDS + 1 + k as u64),
+                    Role::Label,
+                    Some(w.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(pills, want, "the first seven needs, in order");
+        let deck: Vec<u64> = busy
+            .nodes
+            .iter()
+            .map(|(id, _)| id.0)
+            .filter(|id| (STATS_BASE..STATS_BASE + 128 + STATS_CORES as u64).contains(id))
+            .collect();
+        let mut unique = deck.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            deck.len(),
+            "no deck id is pushed twice: {deck:?}"
+        );
+        let needs_ids = STATS_NEEDS..=STATS_NEEDS + STATS_NEEDS_MAX as u64;
+        let chips_kept = STATS_BASE + 24..STATS_LENS;
+        assert_eq!(*needs_ids.end(), STATS_BASE + 23);
+        for id in deck {
+            let k = id - STATS_BASE;
+            let place = match k {
+                0 => "group",
+                1..=15 => "meter",
+                16..=23 => "needs",
+                48..=63 => "lens",
+                64 => "cores",
+                _ if k >= 128 => "core",
+                _ => "nowhere",
+            };
+            assert_ne!(place, "nowhere", "id +{k}");
+            assert!(!chips_kept.contains(&id), "+{k} is kept for the chips");
+            assert_eq!(
+                needs_ids.contains(&id),
+                place == "needs",
+                "+{k} is a need only in the needs' ids"
+            );
+        }
     }
 
     fn message(message: ChromeMessage, text: &str) -> GridMessage {

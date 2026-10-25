@@ -210,22 +210,6 @@ fn unit_name(job: Job) -> String {
     format!("{}.service", job.label())
 }
 
-/// `text` as XML character data.
-fn xml_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// The home a log at [`log_path`] lies under: `<home>` of `<home>/.config/aterm/secrets/<file>`.
 fn home_of_log(log: &Path) -> Option<&Path> {
     let dir = log.parent()?;
@@ -238,7 +222,7 @@ fn home_of_log(log: &Path) -> Option<&Path> {
 
 /// The launchd property list for a job, setting `HOME` when `log` is a [`log_path`].
 pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> String {
-    let string = |s: &str| format!("<string>{}</string>", xml_escape(s));
+    let string = |s: &str| format!("<string>{}</string>", aterm_codec::xml::escape(s));
     let mut argv = String::new();
     for arg in
         std::iter::once(program.to_string_lossy().as_ref()).chain(args.iter().map(String::as_str))
@@ -833,6 +817,33 @@ fn turn_off_subscriber_with(
     remove()
 }
 
+/// Exercise explicit subscriber On with an inert local service action.
+#[cfg(any(test, debug_assertions))]
+pub fn install_subscriber_for_test(
+    home: &Path,
+    install: impl FnOnce() -> crate::Result<String>,
+) -> crate::Result<String> {
+    install_subscriber_with(home, install)
+}
+
+/// Exercise automatic subscriber repair with an inert local service action.
+#[cfg(any(test, debug_assertions))]
+pub fn repair_subscriber_for_test(
+    home: &Path,
+    install: impl FnOnce() -> crate::Result<String>,
+) -> crate::Result<Option<String>> {
+    repair_subscriber_with(home, install)
+}
+
+/// Exercise subscriber Off with an inert local service action.
+#[cfg(any(test, debug_assertions))]
+pub fn turn_off_subscriber_for_test(
+    home: &Path,
+    remove: impl FnOnce() -> crate::Result<bool>,
+) -> crate::Result<bool> {
+    turn_off_subscriber_with(home, remove)
+}
+
 fn uninstall_job(home: &Path, job: Job) -> crate::Result<bool> {
     let remove = |path: &Path| match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -1181,16 +1192,6 @@ mod tests {
         assert_eq!(home_of_log(Path::new("/h/.config/aterm/other/l.log")), None);
     }
 
-    #[test]
-    fn xml_escaping_covers_the_five_entities() {
-        assert_eq!(
-            xml_escape("a&b<c>d\"e'f"),
-            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
-        );
-        assert_eq!(xml_escape("&amp;"), "&amp;amp;");
-        assert_eq!(xml_escape("plain/π"), "plain/π");
-    }
-
     /// `plutil -lint` reads the plist as launchd will.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1487,7 +1488,7 @@ mod tests {
         );
         assert!(text.contains(&format!(
             "<string>{}</string>",
-            xml_escape(&home.to_string_lossy())
+            aterm_codec::xml::escape(&home.to_string_lossy())
         )));
         write_plist(&home, Job::Subscriber, &program, &args).expect("rewritten");
         let names: Vec<_> = std::fs::read_dir(plist.parent().expect("dir"))

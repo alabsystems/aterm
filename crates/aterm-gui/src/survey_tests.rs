@@ -1154,3 +1154,169 @@ fn the_program_kind_names_a_shell() {
     assert_eq!(program_kind(false, Some("nvim")), "program");
     assert_eq!(program_kind(false, None), "-");
 }
+
+const CODEX_PGID: i32 = 5151;
+
+/// `h` with codex-alab in front: its reader names no state (`unknown`), as `CodexReader` does.
+fn codex_session(h: &SessionHandle) {
+    let mut tl = h.ctx.timeline.lock().unwrap();
+    tl.note_foreground_group(CODEX_PGID);
+    tl.set_program(CODEX_PGID, Some("codex".into()));
+    tl.publish_agent(
+        "unknown",
+        None,
+        None,
+        Some(aterm_phase::Program::Codex),
+        crate::session_timeline::AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 7 },
+            fp: 0xc0de,
+        },
+    );
+}
+
+fn codex_survey() -> CodexSurvey {
+    CodexSurvey {
+        facts: aterm_agent::harness::codex_facts::CodexFacts {
+            excerpts: Excerpts {
+                prompts: vec![prompt("port the parser")],
+                said: Some("Reading the grammar.".into()),
+                said_end: Some("Ported; the tests pass.".into()),
+                doing: Some("exec_command".into()),
+            },
+            model: Some("gpt-5.5".into()),
+            effort: Some("high".into()),
+            ctx_left_pct: Some(67),
+            cwd: Some("/private/tmp/codex-work".into()),
+        },
+        branch: Some("feat/parser".into()),
+        task: None,
+    }
+}
+
+fn shown(
+    state: aterm_core::terminal::program_state::ProgramStateWord,
+    kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
+) -> Option<aterm_core::terminal::program_state::ProgramState> {
+    Some(aterm_core::terminal::program_state::ProgramState { state, kind })
+}
+
+/// A codex row: its agent word is what codex-alab says of itself (OSC 7501) and its model,
+/// effort, context, doing, prompt, said, cwd and branch are its rollout's (`CodexSurvey`), where a
+/// Claude row reads its screen and footer; a Claude row with a shown state keeps its own word.
+#[test]
+fn a_codex_row_reads_its_own_state_and_its_rollouts_facts() {
+    use aterm_core::terminal::program_state::{ProgramBlockedKind as K, ProgramStateWord as W};
+    let store = crate::session_store::new_store();
+    let codex = crate::session_store::test_handle(7);
+    codex_session(&codex);
+    store.write().unwrap().register(codex.clone());
+    let row = || {
+        let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+        fields(out.lines().nth(2).expect("the codex row"))
+    };
+    let before = row();
+    for key in [
+        "model",
+        "effort",
+        "ctx_left_pct",
+        "doing",
+        "prompt",
+        "said",
+        "branch",
+    ] {
+        assert_eq!(before[key], "-", "{key} before any facts: {before:?}");
+    }
+    assert_eq!(before["agent"], "unknown");
+
+    let mut tl = codex.ctx.timeline.lock().unwrap();
+    assert!(tl.set_codex_survey(CODEX_PGID, codex_survey()));
+    tl.note_program_state(shown(W::Working, None));
+    drop(tl);
+    let working = row();
+    for (key, want) in [
+        ("agent", "busy"),
+        ("program_kind", "agent"),
+        ("model", "gpt-5.5"),
+        ("effort", "high"),
+        ("ctx_left_pct", "67"),
+        ("doing", "exec_command"),
+        ("prompt", "port the parser"),
+        ("said", "Reading the grammar."),
+        ("cwd", "/private/tmp/codex-work"),
+        ("branch", "feat/parser"),
+    ] {
+        assert_eq!(working[key], want, "{key}: {working:?}");
+    }
+
+    for (state, kind, word) in [
+        (W::Blocked, Some(K::Permission), "prompt"),
+        (W::Blocked, None, "prompt"),
+        (W::Blocked, Some(K::Question), "question"),
+        (W::Blocked, Some(K::Auth), "wall:auth"),
+        (W::Error, None, "idle"),
+        (W::Done, None, "idle"),
+    ] {
+        codex
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .note_program_state(shown(state, kind));
+        assert_eq!(row()["agent"], word, "{state:?} {kind:?}");
+    }
+    assert_eq!(
+        row()["said"],
+        "Ported; the tests pass.",
+        "a codex at rest says its turn's end"
+    );
+
+    let mut tl = codex.ctx.timeline.lock().unwrap();
+    tl.note_program_state(None);
+    drop(tl);
+    assert_eq!(
+        row()["agent"],
+        "unknown",
+        "no report shown: its reader's word"
+    );
+
+    let mut tl = codex.ctx.timeline.lock().unwrap();
+    assert!(
+        !tl.set_codex_survey(CODEX_PGID + 1, codex_survey()),
+        "another group's facts are not taken"
+    );
+    tl.note_foreground_group(CODEX_PGID + 1);
+    tl.set_program(CODEX_PGID + 1, Some("zsh".into()));
+    drop(tl);
+    let shell = row();
+    for key in [
+        "model",
+        "effort",
+        "ctx_left_pct",
+        "doing",
+        "prompt",
+        "said",
+        "branch",
+    ] {
+        assert_eq!(
+            shell[key], "-",
+            "{key} once codex left the front: {shell:?}"
+        );
+    }
+
+    let claude = crate::session_store::test_handle(9);
+    claude_session(&claude);
+    claude
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .note_program_state(shown(W::Idle, None));
+    store.write().unwrap().register(claude);
+    let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+    let claude_row = fields(out.lines().nth(3).expect("the claude row"));
+    assert_eq!(
+        claude_row["agent"], "busy",
+        "a word its reader names stands"
+    );
+    assert_eq!(claude_row["model"], "Opus 5.5");
+}

@@ -527,7 +527,7 @@ pub fn turn_whole(rows: &[String]) -> bool {
     turn_before(rows).is_some_and(|(opened, _)| opened)
 }
 
-/// Returns whether the last turn on `rows` ran a tool: a call's row (`⏺ Bash(…)`, [`stop_task`]) or a collapsed tool group's ([`tool_group`]) under the `❯` prompt that opened it.
+/// Returns whether the last turn on `rows` ran a tool: a call's row (`⏺ Bash(…)`, [`bare_call`]), a collapsed tool group's ([`tool_group`]) or a background task's end ([`task_notice`]) under the `❯` prompt that opened it.
 #[must_use]
 pub fn turn_ran_tools(rows: &[String]) -> bool {
     let end = crate::phase::composer_frame(rows).map_or(rows.len(), |f| f.top);
@@ -536,15 +536,155 @@ pub fn turn_ran_tools(rows: &[String]) -> bool {
         .rev()
         .take_while(|&i| !rows[i].starts_with('❯'))
         .any(|i| {
-            is_tool_call(&rows[i]) || stop_task(rows, i, end) || tool_group(rows, i, end, width)
+            is_tool_call(&rows[i])
+                || bare_call(rows, i, end)
+                || tool_group(rows, i, end, width)
+                || task_notice(rows, i, end)
         })
 }
 
-/// TaskStop's call row, drawn with no `(…)` as its use message is empty: `⏺ Stop Task`, its `⎿` output row under it.
-fn stop_task(rows: &[String], i: usize, until: usize) -> bool {
-    rows[i].strip_prefix("⏺ ").is_some_and(|name| {
-        crate::text::trim_end(name) == const { crate::anchor!("turn.call.stop_task") }
-    }) && i + 1 < until
+/// What a task's notice draws past its end ([`TASK_NOTICES`]).
+#[derive(Clone, Copy)]
+enum Tail {
+    /// Nothing more.
+    Bare,
+    /// An exit code between these, or nothing.
+    Code(&'static str, &'static str),
+    /// One of these, or nothing.
+    Or(&'static [&'static str]),
+    /// A reason or an error to the row's end.
+    Words,
+}
+
+/// A background task's notice heads and each end 2.1.268's notice builders draw after its quoted description.
+const TASK_NOTICES: [(&str, &str, Tail); 19] = {
+    let command = crate::anchor!("turn.task.command");
+    let monitor = crate::anchor!("turn.task.monitor");
+    let agent = crate::anchor!("turn.task.agent");
+    let workflow = crate::anchor!("turn.task.workflow");
+    let remote = crate::anchor!("turn.task.remote");
+    let completed = crate::anchor!("turn.task.completed");
+    let was_stopped = crate::anchor!("turn.task.was_stopped");
+    let failed_with = crate::anchor!("turn.task.failed_with");
+    let exit = Tail::Code(crate::anchor!("turn.task.exit"), ")");
+    [
+        (
+            command,
+            completed,
+            Tail::Code(crate::anchor!("turn.task.exit_code"), ")"),
+        ),
+        (
+            command,
+            crate::anchor!("turn.task.failed"),
+            Tail::Code(crate::anchor!("turn.task.with_exit_code"), ""),
+        ),
+        (
+            command,
+            was_stopped,
+            Tail::Or(&[crate::anchor!("turn.task.memory_pressure")]),
+        ),
+        (monitor, crate::anchor!("turn.task.quiet"), exit),
+        (
+            monitor,
+            crate::anchor!("turn.task.stream_ended"),
+            Tail::Bare,
+        ),
+        (monitor, crate::anchor!("turn.task.script_failed"), exit),
+        (monitor, crate::anchor!("turn.task.stopped"), Tail::Bare),
+        (agent, crate::anchor!("turn.task.finished"), Tail::Bare),
+        (agent, crate::anchor!("turn.task.waiting"), Tail::Bare),
+        (agent, failed_with, Tail::Words),
+        (
+            agent,
+            was_stopped,
+            Tail::Or(&[
+                crate::anchor!("turn.task.by_claude"),
+                crate::anchor!("turn.task.by_user"),
+            ]),
+        ),
+        (agent, crate::anchor!("turn.task.turn_limit"), Tail::Words),
+        (workflow, completed, Tail::Bare),
+        (workflow, failed_with, Tail::Words),
+        (workflow, was_stopped, Tail::Bare),
+        (remote, crate::anchor!("turn.task.succeeded"), Tail::Bare),
+        (remote, crate::anchor!("turn.task.failed"), Tail::Bare),
+        (remote, crate::anchor!("turn.task.blocked"), Tail::Words),
+        (remote, was_stopped, Tail::Bare),
+    ]
+};
+
+/// A background task's notice of its run's end, the turn it opens, read across the rows its description wraps onto: `⏺ Background command "…" completed (exit code 0)` or `failed with exit code 1`, `⏺ Monitor "…" stream ended`, `⏺ Agent "…" finished · 2s`, `⏺ Dynamic workflow "…" completed · 5s`, each [`TASK_NOTICES`] end, then the time and the delivery the notice row adds after ` · `. A Monitor's event is none: the monitor runs on.
+fn task_notice(rows: &[String], i: usize, until: usize) -> bool {
+    let Some(r) = rows[i].strip_prefix("⏺ ") else {
+        return false;
+    };
+    if !TASK_NOTICES.iter().any(|(head, ..)| r.starts_with(head)) {
+        return false;
+    }
+    let end = (i + 1..until)
+        .find(|&j| {
+            crate::text::blank(&rows[j])
+                || crate::text::trim_start(&rows[j]).starts_with(['⎿', '⏺', '❯', '✻'])
+        })
+        .unwrap_or(until);
+    let line = crate::wrap::rejoined(&rows[i..end]);
+    let Some(said) = crate::text::trim(&line).strip_prefix("⏺ ") else {
+        return false;
+    };
+    TASK_NOTICES.iter().any(|&(head, ended, tail)| {
+        let Some(said) = said.strip_prefix(head) else {
+            return false;
+        };
+        let close = format!("\" {ended}");
+        said.rfind(&close).is_some_and(|at| {
+            let after = &said[at + close.len()..];
+            at > 0
+                && match tail {
+                    Tail::Words => true,
+                    Tail::Bare => notice_suffix(after),
+                    Tail::Or(more) => {
+                        notice_suffix(after)
+                            || more
+                                .iter()
+                                .any(|m| after.strip_prefix(m).is_some_and(notice_suffix))
+                    }
+                    Tail::Code(open, shut) => {
+                        notice_suffix(after)
+                            || after
+                                .strip_prefix(open)
+                                .map(|r| r.trim_start_matches('-'))
+                                .and_then(|r| {
+                                    let n = r.bytes().take_while(u8::is_ascii_digit).count();
+                                    (n > 0).then(|| &r[n..])
+                                })
+                                .and_then(|r| r.strip_prefix(shut))
+                                .is_some_and(notice_suffix)
+                    }
+                }
+        })
+    })
+}
+
+/// What a notice's row adds past its end: nothing, or after ` · ` each the task's time or its delivery to the model.
+fn notice_suffix(after: &str) -> bool {
+    after.is_empty()
+        || after.strip_prefix(" · ").is_some_and(|r| {
+            r.split(" · ").all(|part| {
+                duration(part) || part.starts_with(crate::anchor!("turn.task.delivered"))
+            })
+        })
+}
+
+/// A call's row drawn with no `(…)`, its `⎿` output row under it: TaskStop's `⏺ Stop Task`, an edit of the plan file's `⏺ Updated plan`.
+fn bare_call(rows: &[String], i: usize, until: usize) -> bool {
+    let names = [
+        crate::anchor!("turn.call.stop_task"),
+        crate::anchor!("turn.call.updated_plan"),
+    ];
+    rows[i]
+        .strip_prefix("⏺ ")
+        .is_some_and(|name| names.contains(&crate::text::trim_end(name)))
+        && i + 1 < until
         && rows[i + 1].starts_with("  ⎿")
 }
 
@@ -555,8 +695,8 @@ pub fn turn_opens_above(rows: &[String]) -> bool {
     !rows[..end].iter().any(|r| r.starts_with('❯'))
 }
 
-/// The verbs a collapsed tool group's first clause opens with, a count and its nouns after (`Read 1 file`, `Running 2 shell commands…`).
-const GROUP_VERBS: [&str; 8] = [
+/// The verbs of 2.1.268's group renderer a count and its nouns follow (`Read 1 file`, `running 2 shell commands…`, `edited 2 files +10 -3`).
+const GROUP_VERBS: [&str; 20] = [
     crate::anchor!("turn.group.reading"),
     crate::anchor!("turn.group.read"),
     crate::anchor!("turn.group.searched"),
@@ -565,61 +705,238 @@ const GROUP_VERBS: [&str; 8] = [
     crate::anchor!("turn.group.listing"),
     crate::anchor!("turn.group.running"),
     crate::anchor!("turn.group.ran"),
+    crate::anchor!("turn.group.edited"),
+    crate::anchor!("turn.group.editing"),
+    crate::anchor!("turn.group.made"),
+    crate::anchor!("turn.group.making"),
+    crate::anchor!("turn.group.repld"),
+    crate::anchor!("turn.group.repling"),
+    crate::anchor!("turn.group.called"),
+    crate::anchor!("turn.group.calling"),
+    crate::anchor!("turn.group.recalled"),
+    crate::anchor!("turn.group.recalling"),
+    crate::anchor!("turn.group.wrote"),
+    crate::anchor!("turn.group.writing"),
 ];
 
-/// The nouns a group's clause counts with no expand hint, singular or plural (`Read 1 file`, `Ran 2 shell commands`).
-const GROUP_NOUNS: [&str; 4] = [
+/// The nouns a group's count takes with no expand hint, singular or plural (`Read 1 file`, `Ran 2 shell commands`, `recalled 3 memories`).
+const GROUP_NOUNS: [&str; 8] = [
     crate::anchor!("turn.group.file"),
     crate::anchor!("turn.group.pattern"),
     crate::anchor!("turn.group.directory"),
     crate::anchor!("turn.group.shell_command"),
+    crate::anchor!("turn.group.agent"),
+    crate::anchor!("turn.group.tool"),
+    crate::anchor!("turn.group.memory"),
+    crate::anchor!("turn.group.team_memory"),
 ];
 
-/// Whether row `i` opens Claude Code's collapsed tool group, read across the rows it wraps onto: a `⏺ ` or two-space row whose first clause is a verb, a count and up to three lower-case nouns (`⏺ Reading 1 file… (ctrl+o to expand)`), or `Called` and a server, then the expand hint; with no hint, every clause such a count of a [`GROUP_NOUNS`] noun, a two-space row standing alone under a blank row, another group or the screen's top (`  Read 1 file`), never a reply's next row. A stop hook's summary is no tool.
+/// The renderer's git clauses and what each names (`Committed 1a2b3c4`, `pushed to main`, `rebased onto origin/main`).
+const GROUP_GIT: [(&str, Item); 6] = [
+    (crate::anchor!("turn.group.committed"), Item::Sha),
+    (crate::anchor!("turn.group.amended"), Item::Sha),
+    (crate::anchor!("turn.group.cherry_picked"), Item::Sha),
+    (crate::anchor!("turn.group.pushed"), Item::Ref),
+    (crate::anchor!("turn.group.merged"), Item::Ref),
+    (crate::anchor!("turn.group.rebased"), Item::Ref),
+];
+
+/// The renderer's pull and merge request verbs, each before `PR #<n>` or `MR !<n>` (`created PR #12`, `enabled auto-merge on PR #12`).
+const GROUP_PR: [&str; 10] = [
+    crate::anchor!("turn.group.created"),
+    crate::anchor!("turn.group.edited"),
+    crate::anchor!("turn.group.merged"),
+    crate::anchor!("turn.group.commented_on"),
+    crate::anchor!("turn.group.closed"),
+    crate::anchor!("turn.group.reopened"),
+    crate::anchor!("turn.group.marked_ready"),
+    crate::anchor!("turn.group.marked_draft"),
+    crate::anchor!("turn.group.enabled_auto_merge"),
+    crate::anchor!("turn.group.disabled_auto_merge"),
+];
+
+/// What a git or MCP clause names, a list of them going on after `, ` (`committed 1a2b3c4, 5d6e7f8`, `called github, slack 2 times`).
+#[derive(Clone, Copy)]
+enum Item {
+    Sha,
+    Ref,
+    Server,
+}
+
+impl Item {
+    fn reads(self, s: &str) -> bool {
+        match self {
+            Self::Sha => s.len() >= 4 && s.bytes().all(|b| b.is_ascii_hexdigit()),
+            Self::Ref => {
+                !s.is_empty()
+                    && !s.ends_with(['.', '/'])
+                    && !s.contains("..")
+                    && s.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-')
+                    })
+            }
+            Self::Server => {
+                let (server, times) = s.split_once(' ').unwrap_or((s, ""));
+                !server.is_empty()
+                    && server
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                    && (times.is_empty()
+                        || times.strip_suffix(" times").is_some_and(|n| {
+                            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                        }))
+            }
+        }
+    }
+}
+
+/// A collapsed group's clause read ([`group_clause`]).
+#[derive(Clone, Copy)]
+enum Clause {
+    /// A tool's, a list of the [`Item`] it names going on after it.
+    Tool(Option<Item>),
+    /// A git or pull request operation's, which a reply's own words can say too.
+    Git(Option<Item>),
+    /// A lone agent's description to the row's end (`ran agent · `, or its first word conjugated).
+    ToEnd,
+    /// `Thought for` the turn's thinking, opening the row.
+    Thought,
+}
+
+/// Whether row `i` is Claude Code's collapsed tool group of a tool run, read across the rows it wraps onto: a `⏺ ` or two-space row of clauses (`⏺ Thought for 3s, read 1 file, pushed to main (ctrl+o to expand)`), the first the renderer's and any one a tool's, before the expand hint; with no hint, every clause the renderer's and its counts of [`GROUP_NOUNS`], a two-space row standing alone under a blank row, another group or the screen's top (`  Read 1 file`), never a reply's next row, and one whose tool clauses are all git or pull request clauses [`apart`] from a reply's words. A stop hook's summary and a `PreToolUse` hooks' are none.
 fn tool_group(rows: &[String], i: usize, until: usize, width: usize) -> bool {
     let row = rows[i].as_str();
     let headed = row.starts_with("⏺ ");
     if !headed && !(row.starts_with("  ") && leading_spaces(row) == 2) {
         return false;
     }
-    let (_, line) = crate::phase::line_at(rows, i, until, width);
+    let (end, line) = crate::phase::line_at(rows, i, until, width);
     let text = crate::text::trim(&line);
     let text = text.strip_prefix('⏺').map_or(text, crate::text::trim_start);
     let hinted = text.strip_suffix(const { crate::anchor!("turn.group.expand") });
     let text = crate::text::trim_end(hinted.unwrap_or(text));
     let text = text.strip_suffix('…').unwrap_or(text);
-    let mut clauses = text.split(", ");
-    let first = clauses.next().unwrap_or_default();
     match hinted {
-        Some(_) => counted(first, false, false) || called(first),
+        Some(_) => group_ran(text, false).is_some(),
         None => {
             let alone = headed
                 || i == 0
                 || crate::text::trim(&rows[i - 1]).is_empty()
                 || tool_group(rows, i - 1, until, width);
-            alone && counted(first, false, true) && clauses.all(|c| counted(c, true, true))
+            alone && group_ran(text, true).is_some_and(|tool| tool || apart(rows, i, end, until))
         }
     }
 }
 
-/// A group's clause of a verb ([`GROUP_VERBS`], lower-case past the first), a count and up to three lower-case nouns, `named` one of [`GROUP_NOUNS`]; a stop hook's is none.
-fn counted(clause: &str, later: bool, named: bool) -> bool {
+/// Whether the hint-less group row `i..=end` stands apart from a reply's words, as the renderer draws a group between messages: a `⏺` row comes next, or no reply's `⏺` row heads it. A reply's own paragraph in a git or pull request clause's words (`  Pushed to main`, `  Merged PR #12`) does neither where it ends the turn.
+fn apart(rows: &[String], i: usize, end: usize, until: usize) -> bool {
+    let next = (end + 1..until)
+        .map(|k| rows[k].as_str())
+        .find(|r| !crate::text::blank(r));
+    let head = (0..=i)
+        .rev()
+        .map(|k| rows[k].as_str())
+        .find(|r| !crate::text::blank(r) && !r.starts_with(' '));
+    next.is_some_and(|r| r.starts_with('⏺'))
+        || !head.is_some_and(|r| r.starts_with('⏺') && !is_tool_call(r))
+}
+
+/// Whether a group row's `text` ran a tool by its clauses, which 2.1.268's renderer joins with `, `: the first the renderer's and any one a tool's; `strict`, every one the renderer's. `Some(false)` where every tool clause is a git or pull request one.
+fn group_ran(text: &str, strict: bool) -> Option<bool> {
+    // A lone agent's few words, never an error the vendor cut at 1000 characters and drew the hint under.
+    let described = !strict && text.len() <= DESCRIBED;
+    let (mut ran, mut tool, mut list) = (false, false, None);
+    for (k, clause) in text.split(", ").map(crate::text::trim_end).enumerate() {
+        match group_clause(clause, k == 0, strict, described) {
+            Some(Clause::ToEnd) => return Some(true),
+            Some(Clause::Tool(item)) => (ran, tool, list) = (true, true, item),
+            Some(Clause::Git(item)) => (ran, list) = (true, item),
+            Some(Clause::Thought) => list = None,
+            None if list.is_some_and(|item| item.reads(clause)) => {}
+            None if strict || k == 0 => return None,
+            None => list = None,
+        }
+    }
+    ran.then_some(tool)
+}
+
+/// The longest hinted group row a lone agent's conjugated description is read in ([`group_ran`]).
+const DESCRIBED: usize = 500;
+
+/// One clause of a group row, `first` where it opens the row; `named`, a count's nouns one of [`GROUP_NOUNS`]; `described`, a lone agent's description may stand as one ([`lone_agent`]).
+fn group_clause(clause: &str, first: bool, named: bool, described: bool) -> Option<Clause> {
+    let after = |head: &str| opens(clause, head, first).and_then(|r| r.strip_prefix(' '));
+    let thought = [
+        crate::anchor!("turn.group.thought"),
+        crate::anchor!("turn.group.thinking"),
+    ];
+    if first && thought.iter().any(|h| after(h).is_some_and(duration)) {
+        return Some(Clause::Thought);
+    }
+    if counted(clause, first, named) || bare(clause, first) {
+        return Some(Clause::Tool(None));
+    }
+    if pull_request(clause, first) {
+        return Some(Clause::Git(None));
+    }
+    let called = [
+        crate::anchor!("turn.group.called"),
+        crate::anchor!("turn.group.calling"),
+    ];
+    if called
+        .iter()
+        .any(|h| after(h).is_some_and(|r| Item::Server.reads(r)))
+    {
+        return Some(Clause::Tool(Some(Item::Server)));
+    }
+    if let Some(&(_, item)) = GROUP_GIT
+        .iter()
+        .find(|(h, item)| after(h).is_some_and(|r| item.reads(r)))
+    {
+        return Some(Clause::Git(Some(item)));
+    }
+    let ran = [
+        crate::anchor!("turn.group.ran"),
+        crate::anchor!("turn.group.running"),
+    ];
+    (ran.iter()
+        .any(|h| after(h).is_some_and(|r| r.starts_with(crate::anchor!("turn.group.agent_named"))))
+        || (described && lone_agent(clause)))
+    .then_some(Clause::ToEnd)
+}
+
+/// `clause` past `head` as the renderer draws it: as it stands where the clause opens the row, its first letter lower-case after it (an acronym's, `REPL'd`, as it stands).
+fn opens<'a>(clause: &'a str, head: &str, first: bool) -> Option<&'a str> {
+    let rest = clause.get(head.len()..)?;
+    let (h, c) = (head.as_bytes(), clause.as_bytes());
+    let lead = if first || h.get(1).is_some_and(u8::is_ascii_uppercase) {
+        h[0]
+    } else {
+        h[0].to_ascii_lowercase()
+    };
+    (c[0] == lead && c[1..h.len()] == h[1..]).then_some(rest)
+}
+
+/// The renderer's time: `3s`, `1m 5s`, `2h 3m`.
+fn duration(text: &str) -> bool {
+    text.split(' ').all(|t| {
+        t.strip_suffix(['s', 'm', 'h', 'd']).is_some_and(|n| {
+            n.starts_with(|c: char| c.is_ascii_digit())
+                && n.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        })
+    })
+}
+
+/// A group's clause of a verb ([`GROUP_VERBS`]), a count and up to three lower-case nouns (an edit's `+a -r` after them), `named` one of [`GROUP_NOUNS`]; a stop hook's is none.
+fn counted(clause: &str, first: bool, named: bool) -> bool {
     GROUP_VERBS.iter().any(|verb| {
-        let Some((n, nouns)) = clause
-            .get(..verb.len())
-            .filter(|head| {
-                if later {
-                    head.eq_ignore_ascii_case(verb)
-                        && head.starts_with(|c: char| c.is_ascii_lowercase())
-                } else {
-                    head == verb
-                }
-            })
-            .and_then(|_| clause[verb.len()..].strip_prefix(' '))
+        let Some((n, nouns)) = opens(clause, verb, first)
+            .and_then(|r| r.strip_prefix(' '))
             .and_then(|r| r.split_once(' '))
         else {
             return false;
         };
+        let nouns = without_lines(nouns);
         let words: Vec<&str> = nouns.split(' ').collect();
         !n.is_empty()
             && n.bytes().all(|b| b.is_ascii_digit())
@@ -632,6 +949,19 @@ fn counted(clause: &str, later: bool, named: bool) -> bool {
     })
 }
 
+/// `nouns` without an edit's `+a -r` after them.
+fn without_lines(nouns: &str) -> &str {
+    let mut out = nouns;
+    while let Some((head, tail)) = out.rsplit_once(' ')
+        && tail.len() > 1
+        && tail.starts_with(['+', '-'])
+        && tail[1..].bytes().all(|b| b.is_ascii_digit())
+    {
+        out = head;
+    }
+    out
+}
+
 /// Whether `nouns` is `noun`, or its plural (`files`, `directories`).
 fn group_noun(nouns: &str, noun: &str) -> bool {
     nouns == noun
@@ -641,22 +971,264 @@ fn group_noun(nouns: &str, noun: &str) -> bool {
             .is_some_and(|stem| nouns.strip_suffix("ies") == Some(stem))
 }
 
-/// A group's `Called` clause: the server's name, and how many times past one (`Called github 2 times`).
-fn called(clause: &str) -> bool {
-    clause
-        .strip_prefix(const { crate::anchor!("turn.group.called") })
-        .and_then(|r| r.strip_prefix(' '))
-        .is_some_and(|r| {
-            let (server, times) = r.split_once(' ').unwrap_or((r, ""));
-            !server.is_empty()
-                && server
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-                && (times.is_empty()
-                    || times
-                        .strip_suffix(" times")
-                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+/// A pull or merge request's clause: one of [`GROUP_PR`], then `PR #<n>` or `MR !<n>`.
+fn pull_request(clause: &str, first: bool) -> bool {
+    let tags = [
+        crate::anchor!("turn.group.pr"),
+        crate::anchor!("turn.group.mr"),
+    ];
+    GROUP_PR.iter().any(|verb| {
+        opens(clause, verb, first)
+            .and_then(|r| r.strip_prefix(' '))
+            .is_some_and(|r| {
+                tags.iter().any(|tag| {
+                    r.strip_prefix(tag)
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+            })
+    })
+}
+
+/// A clause with no count: `Published`, `searched memories`, `searched team memories`.
+fn bare(clause: &str, first: bool) -> bool {
+    let published = [
+        crate::anchor!("turn.group.published"),
+        crate::anchor!("turn.group.publishing"),
+    ];
+    let searched = [
+        crate::anchor!("turn.group.searched_bare"),
+        crate::anchor!("turn.group.searching_bare"),
+    ];
+    let memories = [
+        crate::anchor!("turn.group.memory"),
+        crate::anchor!("turn.group.team_memory"),
+    ];
+    published
+        .iter()
+        .any(|h| opens(clause, h, first) == Some(""))
+        || searched.iter().any(|h| {
+            opens(clause, h, first)
+                .and_then(|r| r.strip_prefix(' '))
+                .is_some_and(|r| memories.iter().any(|noun| group_noun(r, noun)))
         })
+}
+
+/// A lone agent's description as 2.1.268's group renderer draws it in place of `ran agent · `: its first word conjugated ([`agent_verb`]), past where the agent is done, `-ing` while it runs (`Reviewed the diff`), never a count after it (a stop hook's `Ran 2 stop hooks`, `Ran 2 PreToolUse hooks`).
+fn lone_agent(clause: &str) -> bool {
+    let (word, rest) = clause.split_once(' ').unwrap_or((clause, ""));
+    !rest.starts_with(|c: char| c.is_ascii_digit()) && agent_verb::conjugated(word)
+}
+
+/// 2.1.268's verb forms for an agent's description, its UWt as read in the binary: the irregular tables ([`crate::anchors`]' `turn.agent.*`), then its suffix rules.
+mod agent_verb {
+    const PAST: &str = crate::anchor!("turn.agent.past");
+    const RUNNING: &str = crate::anchor!("turn.agent.running");
+
+    /// The irregular form `table` gives `base`.
+    fn irregular(table: &'static str, base: &str) -> Option<&'static str> {
+        table.split(',').find_map(|pair| {
+            let (k, v) = pair.split_once(':')?;
+            (k == base).then(|| v.trim_matches('"'))
+        })
+    }
+
+    /// The bases `table` gives `form`.
+    fn bases(table: &'static str, form: &str) -> impl Iterator<Item = &'static str> {
+        table.split(',').filter_map(move |pair| {
+            let (k, v) = pair.split_once(':')?;
+            (v.trim_matches('"') == form).then_some(k)
+        })
+    }
+
+    /// A past form no description opens with (`ran`, `written`).
+    fn participle(t: &str) -> bool {
+        PAST.split(',').any(|pair| {
+            pair.split_once(':')
+                .is_some_and(|(k, v)| v.trim_matches('"') == t && k != v.trim_matches('"'))
+        }) || crate::anchor!("turn.agent.participles")
+            .split(',')
+            .any(|p| p.trim_matches('"') == t)
+    }
+
+    fn vowel(b: u8) -> bool {
+        b"aeiou".contains(&b.to_ascii_lowercase())
+    }
+
+    /// A consonant, a vowel and a consonant the binary doubles, at the word's end, its only vowel.
+    fn doubles(w: &str) -> bool {
+        let b = w.as_bytes();
+        let n = b.len();
+        n >= 3
+            && !vowel(b[n - 3])
+            && vowel(b[n - 2])
+            && b"bcdfghjklmnpqrstvz".contains(&b[n - 1].to_ascii_lowercase())
+            && b.iter().filter(|&&c| vowel(c)).count() == 1
+    }
+
+    fn ends(w: &str, end: &str) -> bool {
+        w.len() >= end.len() && w[w.len() - end.len()..].eq_ignore_ascii_case(end)
+    }
+
+    /// Before its last letter, a letter not in `not`.
+    fn before_last(w: &str, not: &[u8]) -> bool {
+        w.len() >= 2 && !not.contains(&w.as_bytes()[w.len() - 2].to_ascii_lowercase())
+    }
+
+    fn running(w: &str) -> String {
+        let n = w.len();
+        if let Some(f) = irregular(RUNNING, &w.to_ascii_lowercase()) {
+            f.to_owned()
+        } else if ends(w, "ie") {
+            format!("{}ying", &w[..n - 2])
+        } else if ends(w, "e") && before_last(w, b"eoy") {
+            format!("{}ing", &w[..n - 1])
+        } else if doubles(w) {
+            format!("{w}{}ing", &w[n - 1..])
+        } else if ends(w, "c") {
+            format!("{w}king")
+        } else {
+            format!("{w}ing")
+        }
+    }
+
+    fn done(w: &str) -> String {
+        let n = w.len();
+        let t = w.to_ascii_lowercase();
+        if let Some(f) = irregular(PAST, &t) {
+            f.to_owned()
+        } else if ends(w, "e") {
+            format!("{w}d")
+        } else if ends(w, "y") && before_last(w, b"aeiou") {
+            format!("{}ied", &w[..n - 1])
+        } else if doubles(w) {
+            format!("{w}{}ed", &w[n - 1..])
+        } else if ends(w, "c") {
+            format!("{w}ked")
+        } else if let Some(f) = irregular(RUNNING, &t) {
+            format!("{}ed", &f[..f.len() - 3])
+        } else {
+            format!("{w}ed")
+        }
+    }
+
+    /// `form` with `base`'s capital, where it opens with one.
+    fn capital(base: &str, form: String) -> String {
+        if base.starts_with(|c: char| c.is_ascii_uppercase()) {
+            let mut out = form;
+            out[..1].make_ascii_uppercase();
+            out
+        } else {
+            form
+        }
+    }
+
+    /// A word the binary conjugates: 2 to 16 letters, not all capitals, no past participle, no `-ing`, `-ed` or plural form.
+    fn verb(e: &str) -> bool {
+        let n = e.len();
+        let t = e.to_ascii_lowercase();
+        (2..=16).contains(&n)
+            && e.bytes().all(|b| b.is_ascii_alphabetic())
+            && e != e.to_ascii_uppercase()
+            && !participle(&t)
+            && (irregular(PAST, &t).is_some()
+                || !((t.ends_with("ing") && n > 4)
+                    || (t.ends_with("ed") && !t.ends_with("eed") && n > 3)
+                    || (t.ends_with('s') && !t.ends_with("ss") && !t.ends_with("us") && n > 3))
+                    && t.bytes().any(|b| vowel(b) || b == b'y'))
+    }
+
+    /// The running and done forms of a description's first word, a prefix's hyphen kept (`Re-ran`).
+    fn forms(word: &str) -> Option<(String, String)> {
+        if let Some((p, c)) = word.split_once('-')
+            && crate::anchor!("turn.agent.prefixes")
+                .split('|')
+                .any(|x| x.eq_ignore_ascii_case(p))
+            && verb(c)
+        {
+            let f = format!("{p}{c}").to_ascii_lowercase();
+            if participle(&f) || participle(&c.to_ascii_lowercase()) {
+                return None;
+            }
+            let joined = |table: &'static str, form: fn(&str) -> String| {
+                let own = irregular(table, &f).and_then(|v| v.get(p.len()..));
+                format!(
+                    "{p}-{}",
+                    capital(c, own.map_or_else(|| form(c), str::to_owned))
+                )
+            };
+            return Some((joined(RUNNING, running), joined(PAST, done)));
+        }
+        verb(word).then(|| (capital(word, running(word)), capital(word, done(word))))
+    }
+
+    /// The bases `form` may be drawn from, by the tables and the suffix rules.
+    fn candidates(form: &str) -> Vec<String> {
+        let t = form.to_ascii_lowercase();
+        let n = form.len();
+        let mut out: Vec<String> = bases(PAST, &t)
+            .chain(bases(RUNNING, &t))
+            .map(str::to_owned)
+            .collect();
+        if t.ends_with("ed") {
+            out.extend([&form[..n - 2], &form[..n - 1]].map(str::to_owned));
+            if n > 3 {
+                out.extend([format!("{}y", &form[..n - 3]), form[..n - 3].to_owned()]);
+            }
+            out.extend(
+                RUNNING
+                    .split(',')
+                    .filter_map(|pair| pair.split_once(':'))
+                    .filter(|(_, v)| {
+                        v.trim_matches('"')
+                            .strip_suffix("ing")
+                            .is_some_and(|s| format!("{s}ed") == t)
+                    })
+                    .map(|(k, _)| k.to_owned()),
+            );
+        }
+        if t.ends_with("ing") && n > 3 {
+            out.extend([form[..n - 3].to_owned(), format!("{}e", &form[..n - 3])]);
+            if n > 4 {
+                out.extend([format!("{}ie", &form[..n - 4]), form[..n - 4].to_owned()]);
+            }
+        }
+        out
+    }
+
+    /// Whether `word` is how the renderer draws a description's first word, done or running, the case of its first letter aside.
+    pub(super) fn conjugated(word: &str) -> bool {
+        let same = |drawn: &str| {
+            drawn.len() == word.len()
+                && drawn[1..] == word[1..]
+                && drawn[..1].eq_ignore_ascii_case(&word[..1])
+        };
+        if word.is_empty() || !word.is_ascii() {
+            return false;
+        }
+        let bases: Vec<String> = match word.split_once('-') {
+            // A prefix's own irregular form keeps its part past the prefix (`over-ride`: `Over-rode`).
+            Some((p, c)) => {
+                let (p_low, c_low) = (p.to_ascii_lowercase(), c.to_ascii_lowercase());
+                let own = [PAST, RUNNING].into_iter().flat_map(|table| {
+                    table.split(',').filter_map(|pair| {
+                        let (k, v) = pair.split_once(':')?;
+                        let v = v.trim_matches('"');
+                        (k.starts_with(&p_low) && v.get(p.len()..) == Some(c_low.as_str()))
+                            .then(|| k[p.len()..].to_owned())
+                    })
+                });
+                candidates(c)
+                    .into_iter()
+                    .chain(own.collect::<Vec<_>>())
+                    .map(|b| format!("{p}-{b}"))
+                    .collect()
+            }
+            None => candidates(word),
+        };
+        bases
+            .iter()
+            .any(|base| forms(base).is_some_and(|(running, done)| same(&running) || same(&done)))
+    }
 }
 
 /// Returns whether `row` is a column-0 turn header that stops a scrollback history scan.
@@ -1070,6 +1642,24 @@ mod tests {
         planned.extend(rows(&["⏺ Tool call done.", "", "✻ Sautéed for 0s"]));
         planned.extend(composer("  ? for shortcuts"));
         assert!(!turn_ran_tools(&planned), "{planned:?}");
+        // An edit of the plan file is drawn with no `(…)` too (2.1.308).
+        let plan = screen(crate::prompt::fixtures::BOX_RM_TOO_MANY_2_1_308);
+        let at = plan
+            .iter()
+            .position(|x| x == "⏺ Updated plan")
+            .expect("the row measured");
+        let mut edited = rows(&["❯ go on", ""]);
+        edited.extend(plan[at..at + 2].iter().cloned());
+        edited.extend(rows(&["", "⏺ Tool call done.", "", "✻ Churned for 0s"]));
+        edited.extend(composer("  ? for shortcuts"));
+        assert!(turn_ran_tools(&edited), "{:?}", &plan[at..at + 2]);
+        assert!(
+            !turn_ran_tools(&swapped(&edited, "⏺ Updated plan", "⏺ Updated plan ideas")),
+            "the control: words"
+        );
+        let mut said = edited.clone();
+        said.remove(3);
+        assert!(!turn_ran_tools(&said), "the control: no output under it");
         // Hand-built; `Searched for` unwrapped is measured (2.1.295) in aterm-agent's
         // `claude_codes_measured_group_rows_are_a_tool_run`.
         let wrapped = screen(WRAPPED_GROUP_ROW_CONTEXT_WALL);
@@ -1086,6 +1676,269 @@ mod tests {
             !turn_ran_tools(&hooked),
             "the control: a stop hook is no tool"
         );
+    }
+
+    #[test]
+    fn a_turn_a_background_tasks_end_opens_ran_a_tool() {
+        use crate::prompt::fixtures::{
+            BOX_BASH_RM_GLOB_SUBAGENT_2_1_292, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH,
+            VERBOSE_BACKGROUND_COMMAND_LOGIN_WORDS_MEASURED,
+        };
+        // The notice's rows as measured, then the turn it opened: the program's own, no `❯` row.
+        let opened = |text: &str, head: &str| -> Vec<String> {
+            let r = screen(text);
+            let at = r
+                .iter()
+                .position(|x| x.starts_with(head))
+                .expect("the row measured");
+            let to = (at + 1..r.len())
+                .find(|&k| r[k].is_empty())
+                .expect("its end");
+            let mut out = rows(&["❯ go on", "", "⏺ Started it.", ""]);
+            out.extend(r[at..to].iter().cloned());
+            out.extend(rows(&[
+                "",
+                "⏺ The suite passed. Done.",
+                "",
+                "✻ Churned for 2s",
+            ]));
+            out.extend(composer("  ? for shortcuts"));
+            out
+        };
+        for (name, text, head) in [
+            (
+                "2.1.304",
+                VERBOSE_BACKGROUND_COMMAND_LOGIN_WORDS_MEASURED,
+                "⏺ Background command \"",
+            ),
+            (
+                "2.1.283, its description wrapped",
+                include_str!(
+                    "fixtures/claude-2.1.283-wall-session-goal-checkin-shell-measured.txt"
+                ),
+                "⏺ Dynamic workflow \"",
+            ),
+            ("2.1.292", BOX_BASH_RM_GLOB_SUBAGENT_2_1_292, "⏺ Agent \""),
+            (
+                "2.1.304",
+                include_str!("fixtures/claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt"),
+                "⏺ Agent \"bg probe\" is waiting",
+            ),
+            (
+                "no version",
+                IDLE_AFTER_LIMIT_AND_MODEL_SWITCH,
+                "⏺ Background command \"",
+            ),
+            (
+                "no version",
+                IDLE_AFTER_LIMIT_AND_MODEL_SWITCH,
+                "⏺ Dynamic workflow \"Second",
+            ),
+        ] {
+            let r = opened(text, head);
+            assert!(turn_ran_tools(&r), "{name}: {r:?}");
+            let at = r.iter().position(|x| x.starts_with(head)).expect("the row");
+            let mut said = r.clone();
+            said[at] = said[at].replacen('"', "", 1);
+            assert!(!turn_ran_tools(&said), "the control, {name}: words");
+        }
+        // 2.1.268's notice builders, read in its binary: every end of each head, the time and delivery its row adds after them.
+        for row in [
+            "⏺ Background command \"Run the suite\" failed with exit code 1",
+            "⏺ Background command \"Run the suite\" failed",
+            "⏺ Background command \"Run the suite\" completed",
+            "⏺ Background command \"Run the suite\" completed (exit code 0) · delivered to Claude as a \
+             Bash result (1,204 chars)",
+            "⏺ Background command \"Run the suite\" was stopped",
+            "⏺ Background command \"Run the suite\" was stopped because the system is running low on memory",
+            "⏺ Monitor \"suite watch\" stream ended",
+            "⏺ Monitor \"suite watch\" ended without producing output (exit 0)",
+            "⏺ Monitor \"suite watch\" script failed (exit 2)",
+            "⏺ Monitor \"suite watch\" stopped",
+            "⏺ Agent \"probe\" failed: Unknown error · 4s",
+            "⏺ Agent \"probe\" was stopped by user",
+            "⏺ Agent \"probe\" stopped at its 30-turn limit (partial result; SendMessage to task-id to \
+             continue) · 3m 2s",
+            "⏺ Dynamic workflow \"wave\" failed: a step threw · 1m 5s",
+            "⏺ Dynamic workflow \"wave\" was stopped",
+            "⏺ Remote task \"review\" completed successfully",
+            "⏺ Remote task \"review\" is blocked: it asks for a permission",
+        ] {
+            let r = framed(
+                &["❯ go on", "", row, "", "⏺ Done.", "", "✻ Churned for 2s"],
+                "  ? for shortcuts",
+            );
+            assert!(turn_ran_tools(&r), "{row:?}");
+        }
+        // A reply that names a task in words, an end another task's notice takes, or a Monitor's event: no tool run.
+        for row in [
+            "⏺ Background command \"Run the suite\" is still running.",
+            "⏺ Background command \"Run the suite\" completed, so I am done.",
+            "⏺ Background command \"Run the suite\" failed again, so I am rerunning it.",
+            "⏺ Background command \"Run the suite\" was started earlier.",
+            "⏺ Agent \"probe\" completed (exit code 0)",
+            "⏺ Monitor \"suite watch\" is still quiet.",
+            "⏺ Monitor event: \"24-run load test progress (baseline vs candidate), one line per run\"",
+        ] {
+            let r = framed(
+                &["❯ go on", "", row, "", "⏺ Done.", "", "✻ Churned for 2s"],
+                "  ? for shortcuts",
+            );
+            assert!(!turn_ran_tools(&r), "the control: {row:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_runs_tools_by_any_clause_of_its_collapsed_group() {
+        let turn = |group: &str| {
+            framed(
+                &["❯ go on", "", group, "", "⏺ Done.", "", "✻ Worked for 3s"],
+                "  ? for shortcuts",
+            )
+        };
+        // Measured, no version: a turn whose only Bash calls were git commands.
+        let measured = screen(include_str!("fixtures/wait_bg17.out"));
+        let git = "  Pushed to main, rebased onto origin/main";
+        let at = measured
+            .iter()
+            .position(|r| r == git)
+            .expect("the row measured");
+        let mut r = measured[..at].to_vec();
+        r.extend(turn(git));
+        assert!(turn_ran_tools(&r), "{git:?}");
+        // 2.1.268's group renderer, read in its binary: every clause it draws, the first capitalised.
+        for group in [
+            "  Committed 1a2b3c4, pushed to main",
+            "  Committed 1a2b3c4, 5d6e7f8, pushed to main, release",
+            "⏺ Committed 1a2b3c4, pushed to main (ctrl+o to expand)",
+            "⏺ Edited 2 files +10 -3 (ctrl+o to expand)",
+            "  Edited 1 file +3",
+            "⏺ Thought for 3s, read 2 files (ctrl+o to expand)",
+            "  Thought for 1m 5s, edited 1 file +3 -1, committed 1a2b3c4, pushed to main, \
+             created PR #12, ran 3 shell commands",
+            "  Merged feature, rebased onto origin/main",
+            "  Amended commit 1a2b3c4",
+            "  Cherry-picked 1a2b3c4",
+            "  Merged PR #12",
+            "  Enabled auto-merge on PR #12",
+            "  Commented on MR !7",
+            "  Ran 2 agents",
+            "  Ran 1 agent",
+            "⏺ Ran agent · Fix the parser, then rerun the suite (ctrl+o to expand)",
+            "  Recalled 2 memories",
+            "  Read 2 files, recalled 1 team memory",
+            "  Called github",
+            "  Called github 2 times",
+            "  Called github, slack 3 times",
+            "  Called 2 tools",
+            "⏺ REPL'd 3 times (ctrl+o to expand)",
+            "⏺ Read 1 file, REPL'd 3 times (ctrl+o to expand)",
+            "⏺ Made 2 scratchpad edits +4 (ctrl+o to expand)",
+            "⏺ Searched memories (ctrl+o to expand)",
+            "⏺ Published (ctrl+o to expand)",
+            "⏺ Thinking for 4s, running 2 shell commands… (ctrl+o to expand)",
+            // A lone agent's description, its first word conjugated by the binary's UWt.
+            "⏺ Reviewed the diff (ctrl+o to expand)",
+            "⏺ Explored the codebase (ctrl+o to expand)",
+            "  Reviewing the diff… (ctrl+o to expand)",
+            "⏺ Re-ran the suite (ctrl+o to expand)",
+            "⏺ Copied the fixtures, then reran the suite (ctrl+o to expand)",
+            "⏺ Thought for 3s, reviewed the diff (ctrl+o to expand)",
+            "⏺ Ran 1 agent (ctrl+o to expand)",
+        ] {
+            assert!(turn_ran_tools(&turn(group)), "{group:?}");
+        }
+        for words in [
+            "⏺ Thought for 3s (ctrl+o to expand)",
+            "  Thought for 3s",
+            "⏺ Ran 2 PreToolUse hooks (12ms) (ctrl+o to expand)",
+            "  Ran 2 PreToolUse hooks (12ms)",
+            "  Pushed to main.",
+            "  Pushed to the main branch",
+            "  Pushed to main, then waited for the checks",
+            "  Committed the fix, pushed to main",
+            "  Committed 1a2b3c4 and pushed it",
+            "  Merged the two branches",
+            "  Opened PR #12 on GitHub",
+            "  Ran 2 agents in parallel",
+            "  Called github about it",
+            "  Called the owner twice",
+            "  Recalled 2 earlier sessions",
+            "  Thought for a while, read 2 files",
+            "  Searched memories for the lifetime",
+            "  Published the report",
+            "  Waiting on PR #12",
+            "  Opened PR #12",
+            "⏺ Ran 2 stop hooks (ctrl+o to expand)",
+            "  Reviewed the diff",
+            "⏺ Bg probe (ctrl+o to expand)",
+            "⏺ The diff, reviewed (ctrl+o to expand)",
+        ] {
+            assert!(
+                !turn_ran_tools(&turn(words)),
+                "the control: {words:?} is words"
+            );
+        }
+        // An error the vendor cut at 1000 characters draws the hint under it: its first word is no agent's.
+        let mut cut = vec!["❯ go on".to_owned(), String::new()];
+        let words = "Failed to reach the service, the route timed out again ".repeat(20);
+        let mut wrapped = words
+            .as_bytes()
+            .chunks(100)
+            .map(|c| String::from_utf8_lossy(c).into_owned());
+        cut.push(format!("⏺ {}", wrapped.next().unwrap_or_default()));
+        cut.extend(wrapped.map(|r| format!("  {r}")));
+        cut.extend(rows(&[
+            "  …",
+            "  (ctrl+o to expand)",
+            "",
+            "✻ Worked for 3s",
+        ]));
+        cut.extend(composer("  ? for shortcuts"));
+        assert!(!turn_ran_tools(&cut), "the control: a cut error");
+        // A reply's own paragraph in a git or pull request clause's words, ending the turn, is words; between messages, as the renderer draws a group, a tool run.
+        for (row, git) in [
+            ("  Pushed to main", true),
+            ("  Merged cleanly", true),
+            ("  Merged PR #12", true),
+            ("  Committed 1a2b3c4, pushed to main", true),
+            ("  Pushed to main, rebased onto origin/main", true),
+            ("⏺ Pushed to main", true),
+            ("  Waiting on PR #12", false),
+            ("  Blocked on PR #12", false),
+            ("  See PR #12", false),
+            ("⏺ Waiting on PR #12", false),
+        ] {
+            let mut paragraph = vec![
+                "❯ go on",
+                "",
+                "⏺ I can't land this until it is reviewed.",
+                "",
+            ];
+            if row.starts_with('⏺') {
+                paragraph.truncate(2);
+            }
+            paragraph.extend([row, "", "✻ Worked for 3s"]);
+            let ends = framed(&paragraph, "  ? for shortcuts");
+            assert!(!turn_ran_tools(&ends), "a reply's paragraph: {row:?}");
+            let at = paragraph.len() - 1;
+            paragraph.splice(at..at, ["⏺ Landed.", ""]);
+            let between = framed(&paragraph, "  ? for shortcuts");
+            assert_eq!(turn_ran_tools(&between), git, "between messages: {row:?}");
+        }
+        // A reply's next row is its words, whatever clause it reads as.
+        let said = framed(
+            &[
+                "❯ go on",
+                "",
+                "⏺ Landed it:",
+                "  Pushed to main, rebased onto origin/main",
+                "",
+                "✻ Worked for 3s",
+            ],
+            "  ? for shortcuts",
+        );
+        assert!(!turn_ran_tools(&said), "the control: a reply's next row");
     }
 
     #[test]

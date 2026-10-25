@@ -241,9 +241,11 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
     )
 }
 
-/// The deadline of a retryable try now due, for a parked worker. Waiting on a
-/// person has no timer, and two failed changes stay held until a fact changes.
-/// The worker consumes a deadline once; only a later actual try advances it.
+/// The deadline of a retryable try now due, for a parked worker. A row that
+/// waits ([`super::WAITING`]: a person, an approval, a vault this network does
+/// not have) has no timer, and two failed changes stay held until a fact
+/// changes; an unreached vault ([`super::UNREACHED`]) is asked again. The
+/// worker consumes a deadline once; only a later actual try advances it.
 pub(super) fn retry_due(root: &Path, revision: u64, now: u64) -> Option<u64> {
     let last = Attempt::load(root)?;
     if last.revision != revision
@@ -310,6 +312,12 @@ pub(super) fn record(
         .iter_mut()
         .filter(|row| !matches!(row.status.as_str(), "ok" | "applied"))
     {
+        // A row that waits has no timer ([`retry_due`]).
+        let note = if row.status == super::WAITING && failures < TRIES {
+            WAITS
+        } else {
+            &note
+        };
         row.detail = format!("{}; {note}", row.detail);
     }
     Attempt {
@@ -329,6 +337,9 @@ pub(super) fn record(
 }
 
 const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State";
+
+/// What a waiting row's try adds: no timer, only a change or a person.
+const WAITS: &str = "aterm tries again by itself when this Mac's network or vault changes, or on Set up now or Join in System State";
 
 fn note(pause: Duration) -> String {
     let minutes = pause.as_secs() / 60;
@@ -438,6 +449,21 @@ mod tests {
         waiting[0].status = super::super::WAITING.into();
         record(root, 3, &pace("m", 1_500), false, &mut waiting).unwrap();
         assert_eq!(retry_due(root, 3, 9_000), None);
+        assert_eq!(
+            waiting[0].detail,
+            format!("an administrator must approve; {WAITS}"),
+            "a row that waits names no timer"
+        );
+        let mut unreached = blocked(super::super::scope::NOT_REACHED);
+        unreached[0].status = super::super::UNREACHED.into();
+        record(root, 3, &pace("u", 1_600), false, &mut unreached).unwrap();
+        assert!(unreached[0].detail.contains("a minute after this try"));
+        assert_eq!(retry_due(root, 3, 1_659), None);
+        assert_eq!(
+            retry_due(root, 3, 1_660),
+            Some(1_660),
+            "a vault that did not answer is asked again"
+        );
         let failed = || {
             let mut rows = blocked("the change failed");
             rows[0].status = "error".into();

@@ -5,7 +5,7 @@
 //! [`Driver`] in [`crate::linux::Up`] instead of a `Lima`. Its arms are lima's VM (the
 //! default until §14's switch), the lane's own VM through `aterm-vz-host`
 //! ([`crate::linux_vz_driver::Vz`]), and, in tests and debug builds, a scripted guest
-//! ([`fake::Guest`]).
+//! (`fake::Guest`).
 //!
 //! Every lane call site reaches the guest through these six operations: `shell`,
 //! `shell_streamed`, `copy_out`, `copy_dir_in`, `copy_dir_out`, and the host disk and

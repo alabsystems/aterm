@@ -227,22 +227,22 @@ pub struct OpenFiles {
     pub complete: bool,
 }
 
-/// The [`OpenFiles`] report of one read of `pid`'s paths: complete when the read is, and empty
-/// when it is not.
+/// The [`OpenFiles`] report of one read of `pid`'s paths: known paths retain the read's
+/// completeness, and a failed read is empty and incomplete.
 #[must_use]
-pub fn open_files_report(pid: i32, read: std::io::Result<Vec<std::path::PathBuf>>) -> OpenFiles {
+pub fn open_files_report(pid: i32, read: std::io::Result<crate::procs::OpenPaths>) -> OpenFiles {
     let Ok(paths) = read else {
         return OpenFiles::default();
     };
     let mut text = format!("p{pid}\n");
-    for path in paths {
+    for path in paths.paths {
         text.push('n');
         text.push_str(&path.to_string_lossy().replace('\n', "\\n"));
         text.push('\n');
     }
     OpenFiles {
         text,
-        complete: true,
+        complete: paths.complete,
     }
 }
 
@@ -664,7 +664,12 @@ mod tests {
     fn an_open_file_absence_requires_a_whole_read() {
         use std::path::PathBuf;
         let home = ["/Users//owner".to_string()];
-        let read = |paths: &[&str]| Ok(paths.iter().map(PathBuf::from).collect());
+        let read = |paths: &[&str]| {
+            Ok(crate::procs::OpenPaths {
+                paths: paths.iter().map(PathBuf::from).collect(),
+                complete: true,
+            })
+        };
         let clean = open_files_report(7, read(&["/private/tmp/scratch/home/file"]));
         assert_eq!(clean.text, "p7\nn/private/tmp/scratch/home/file\n");
         assert_eq!(

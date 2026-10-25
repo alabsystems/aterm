@@ -77,6 +77,9 @@ pub struct Window {
     pub opening: Option<(i64, String)>,
     /// Its row one level into its manager's submenu ([`worker_of`]): `-` where none names it.
     pub worker: Vec<(i64, String)>,
+    /// A same-reply chain's looks in front past its hold ([`held::look_step`]): each its
+    /// `autopilot` line, title and all (`-` where its label was not in the strip).
+    pub held: Vec<(i64, String)>,
 }
 
 impl Window {
@@ -962,7 +965,7 @@ pub fn holds_at_end(c: Chain) -> bool {
 /// The chains whose chip's title is read and judged ([`title_words`]): the measured pass's and
 /// the coverage chains (`--mode cover`), each brought in front once before its first prompt
 /// ([`opening_sweep`]); the worker once it is spawned.
-pub const TITLED: [Chain; 23] = [
+pub const TITLED: [Chain; 25] = [
     Chain::LandA,
     Chain::LandB,
     Chain::LandC,
@@ -986,6 +989,8 @@ pub const TITLED: [Chain; 23] = [
     Chain::LandT,
     Chain::Worker,
     Chain::CruiseO,
+    Chain::SameLand,
+    Chain::SameCruise,
 ];
 
 /// Reason a run of `chains` skips reading window surfaces, or `None` if it reads them: it reads
@@ -2980,6 +2985,21 @@ fn in_front(door: &Door<'_>, tab: &Tab) -> Option<(String, String)> {
     Some((format!("tab {i}: {}", r.trim()), line))
 }
 
+/// [`in_front`], and where its chip was not drawn ([`undrawn`]) captured again until it is, the
+/// hang detector [`STEP_WAIT`].
+fn in_front_drawn(door: &Door<'_>, tab: &Tab) -> Option<(String, String)> {
+    in_front(door, tab).map(|(said, mut line)| {
+        if undrawn(&line) {
+            let _ = wait_until(STEP_WAIT, || {
+                let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
+                line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
+                !undrawn(&line)
+            });
+        }
+        (said, line)
+    })
+}
+
 /// Whether an `autopilot` line says its chip was not drawn in the last frame (`why=not-drawn`),
 /// where a footer (no `no-footer`) would draw it.
 #[must_use]
@@ -3002,16 +3022,11 @@ pub(super) fn opening_sweep(
 ) {
     for tab in tabs.iter_mut() {
         let label = tab.seen.window.label.clone();
-        let read = in_front(door, tab).map(|(said, mut line)| {
-            if until_drawn && undrawn(&line) {
-                let _ = wait_until(STEP_WAIT, || {
-                    let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
-                    line = chip_of(&door.out(&["chrome"]), &tab.sid).unwrap_or_else(|| "-".into());
-                    !undrawn(&line)
-                });
-            }
-            (said, line)
-        });
+        let read = if until_drawn {
+            in_front_drawn(door, tab)
+        } else {
+            in_front(door, tab)
+        };
         match read {
             Some((said, line)) => {
                 println!("  opening   {label} ({said}): {}", one_line(&line, 400));
@@ -3580,6 +3595,9 @@ pub(super) fn end_steps(
 
 #[path = "forever_hold.rs"]
 pub mod hold;
+
+#[path = "forever_held.rs"]
+pub mod held;
 
 #[cfg(test)]
 #[path = "forever_surfaces_tests.rs"]

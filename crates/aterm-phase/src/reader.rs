@@ -6,8 +6,8 @@
 use crate::anchors::guard_regex;
 use crate::login::LoginScreen;
 use crate::phase::{
-    Phase, busy_signal, composer_draft, context_left, context_left_shown, has_composer_frame,
-    has_shell_mode_frame, prompt_box_holds, worker_phase,
+    Phase, busy_signal, composer_draft, context_left, has_composer_frame, has_shell_mode_frame,
+    prompt_box_holds, worker_phase,
 };
 use crate::prompt::{CancelEffect, PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
@@ -264,11 +264,15 @@ pub trait ScreenReader: Sync {
     fn end_hidden(&self, _rows: &[String]) -> bool {
         false
     }
-    /// Remaining context percentage read by the `--context-warn` supervisor watch.
+    /// Remaining context percentage before the program compacts it, as the screen shows it: what
+    /// the supervisor's context watch (`EVENT context`) and `aterm drive phase` (`context <n>%`)
+    /// read, and what the window's displays read unless [`Self::context_shown`] says otherwise.
     fn context(&self, _rows: &[String]) -> Option<u8> {
         None
     }
-    /// Remaining context percentage shown on screen for display surfaces.
+    /// Remaining context percentage shown on screen for the window's displays
+    /// ([`Reading::context_left`]): [`Self::context`], unless the program shows a context share
+    /// the watch does not take (Kimi Code's footer).
     fn context_shown(&self, rows: &[String]) -> Option<u8> {
         self.context(rows)
     }
@@ -518,9 +522,6 @@ impl ScreenReader for ClaudeReader {
     }
     fn context(&self, rows: &[String]) -> Option<u8> {
         context_left(rows)
-    }
-    fn context_shown(&self, rows: &[String]) -> Option<u8> {
-        context_left_shown(rows)
     }
     fn suggestion(&self, rows: &[String], cursor_col: usize) -> Option<String> {
         continuation_suggestion(rows, cursor_col)
@@ -1714,9 +1715,9 @@ mod tests {
         }
     }
 
-    /// The reading carries the context the screen shows ([`ScreenReader::context_shown`]), the
-    /// indicator at the end of Claude Code's mode row included, while the supervisor's watch
-    /// ([`ScreenReader::context`]) reads only the zone above the composer.
+    /// The reading carries the context the screen shows, the one reading the supervisor's watch
+    /// takes too ([`ScreenReader::context`]): the indicator at the end of Claude Code's mode row
+    /// (2.1.281 and later, every build measured) or above the composer (2.1.267/2.1.268).
     #[test]
     fn a_reading_carries_the_context_the_screen_shows() {
         let mut on_mode_row = rows(&["⏺ Done.", ""]);
@@ -1724,19 +1725,15 @@ mod tests {
             "  ⏸ manual mode on · ? for shortcuts",
             "0% until auto-compact",
         )));
-        let claude = Program::Claude.reader();
-        assert_eq!(
-            read(Some("claude"), &on_mode_row, None).context_left,
-            Some(0)
-        );
-        assert_eq!(claude.context(&on_mode_row), None, "the watch's zone");
         let mut above = rows(&["⏺ Done.", "", &format!("{:>120}", "7% until auto-compact")]);
         above.extend(composer("  ? for shortcuts"));
-        assert_eq!(read(Some("claude"), &above, None).context_left, Some(7));
-        assert_eq!(claude.context(&above), Some(7));
         let mut none = rows(&["⏺ Done.", ""]);
         none.extend(composer("  ? for shortcuts"));
-        assert_eq!(read(Some("claude"), &none, None).context_left, None);
+        let claude = Program::Claude.reader();
+        for (screen, left) in [(on_mode_row, Some(0)), (above, Some(7)), (none, None)] {
+            assert_eq!(read(Some("claude"), &screen, None).context_left, left);
+            assert_eq!(claude.context(&screen), left, "the watch's reading");
+        }
     }
 
     /// Claude Code's watchdog usage-limit retry row reads as [`Phase::Busy`] with no wall.

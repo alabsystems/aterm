@@ -175,43 +175,136 @@ const fn row_names<const N: usize>() -> [&'static str; N] {
 /// Canonical [`TRAIL_STYLES`] names in table order.
 pub const TRAIL_STYLE_NAMES: [&str; TRAIL_STYLES.len()] = row_names();
 
+/// Trim Unicode whitespace with the same property as [`str::trim`], including in const parsers.
+pub(crate) const fn trim_whitespace_bytes(raw: &str) -> &[u8] {
+    // Each cut removes a whole scalar, leaving both edges on UTF-8 boundaries.
+    let mut bytes = raw.as_bytes();
+    while !bytes.is_empty() {
+        let (white, width) = scalar_whitespace(bytes);
+        if !white {
+            break;
+        }
+        bytes = bytes.split_at(width).1;
+    }
+    while !bytes.is_empty() {
+        let mut start = bytes.len() - 1;
+        while bytes[start] & 0xc0 == 0x80 {
+            start -= 1;
+        }
+        let (white, _) = scalar_whitespace(bytes.split_at(start).1);
+        if !white {
+            break;
+        }
+        bytes = bytes.split_at(start).0;
+    }
+    bytes
+}
+
+/// Decode the first scalar of a nonempty slice cut at scalar boundaries from a valid `str`.
+/// UTF-8's leading byte gives its width; the continuation bytes carry six bits each.
+const fn scalar_whitespace(bytes: &[u8]) -> (bool, usize) {
+    let lead = bytes[0];
+    let width = if lead < 0x80 {
+        1
+    } else if lead < 0xe0 {
+        2
+    } else if lead < 0xf0 {
+        3
+    } else {
+        4
+    };
+    let mut scalar = if width == 1 {
+        lead as u32
+    } else {
+        (lead & (0x7f >> width)) as u32
+    };
+    let mut i = 1;
+    while i < width {
+        scalar = (scalar << 6) | (bytes[i] & 0x3f) as u32;
+        i += 1;
+    }
+    let white = match char::from_u32(scalar) {
+        Some(c) => c.is_whitespace(),
+        None => false,
+    };
+    (white, width)
+}
+
+/// ASCII case-insensitive byte comparison against a lower-case `target`.
+#[inline]
+pub(crate) const fn eq_ascii_ci(bytes: &[u8], target: &str) -> bool {
+    let t = target.as_bytes();
+    if bytes.len() != t.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].to_ascii_lowercase() != t[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Resolves `raw` (trimmed, ASCII case-insensitive) to its canonical [`TRAIL_STYLES`] name.
 #[inline]
 #[must_use]
-pub fn canonical(raw: &str) -> Option<&'static str> {
-    let raw = raw.trim();
-    TRAIL_STYLES
-        .iter()
-        .map(|row| row.name)
-        .find(|name| raw.eq_ignore_ascii_case(name))
-        .or_else(|| {
-            TRAIL_STYLE_ALIASES
-                .iter()
-                .find(|(alias, _)| raw.eq_ignore_ascii_case(alias))
-                .map(|&(_, name)| name)
-        })
+pub const fn canonical(raw: &str) -> Option<&'static str> {
+    match row(raw) {
+        Some(r) => Some(r.name),
+        None => None,
+    }
 }
 
 /// The [`TRAIL_STYLES`] row a spelling resolves to.
 #[inline]
 #[must_use]
-pub fn row(raw: &str) -> Option<&'static TrailStyleRow> {
-    let name = canonical(raw)?;
-    TRAIL_STYLES.iter().find(|row| row.name == name)
+pub const fn row(raw: &str) -> Option<&'static TrailStyleRow> {
+    let raw = trim_whitespace_bytes(raw);
+    let mut i = 0;
+    while i < TRAIL_STYLES.len() {
+        if eq_ascii_ci(raw, TRAIL_STYLES[i].name) {
+            return Some(&TRAIL_STYLES[i]);
+        }
+        i += 1;
+    }
+    let mut ai = 0;
+    while ai < TRAIL_STYLE_ALIASES.len() {
+        let (alias, target) = TRAIL_STYLE_ALIASES[ai];
+        if eq_ascii_ci(raw, alias) {
+            let mut ri = 0;
+            while ri < TRAIL_STYLES.len() {
+                if eq_ascii_ci(target.as_bytes(), TRAIL_STYLES[ri].name) {
+                    return Some(&TRAIL_STYLES[ri]);
+                }
+                ri += 1;
+            }
+            return None;
+        }
+        ai += 1;
+    }
+    None
 }
 
 /// The Settings name of the style a spelling resolves to.
 #[inline]
 #[must_use]
-pub fn label(raw: &str) -> Option<&'static str> {
-    row(raw).map(|row| row.label)
+pub const fn label(raw: &str) -> Option<&'static str> {
+    match row(raw) {
+        Some(r) => Some(r.label),
+        None => None,
+    }
 }
 
 /// The one-line description of the style a spelling resolves to.
 #[inline]
 #[must_use]
-pub fn blurb(raw: &str) -> Option<&'static str> {
-    row(raw).map(|row| row.blurb)
+pub const fn blurb(raw: &str) -> Option<&'static str> {
+    match row(raw) {
+        Some(r) => Some(r.blurb),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -260,15 +353,50 @@ mod tests {
 
     #[test]
     fn spellings_resolve_trimmed_and_case_insensitively() {
+        const PADDED: Option<&str> = canonical("\u{00a0}RAINBOW DOG\u{2003}");
+        assert_eq!(PADDED, Some("rainbow dog pet"));
+        for raw in [
+            "",
+            "\u{00a0}\u{2003}\t\r\n\u{3000}",
+            "\u{3000}é🦀\u{0085}",
+            "\u{2003}\u{200b}x\u{feff}\u{00a0}",
+            "\u{00a0}a\u{2003}b\u{3000}",
+        ] {
+            assert_eq!(trim_whitespace_bytes(raw), raw.trim().as_bytes());
+        }
+        let mut boundary = String::with_capacity(12);
+        for code in 0..=char::MAX as u32 {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            boundary.clear();
+            boundary.push(c);
+            boundary.push('x');
+            boundary.push(c);
+            assert_eq!(
+                trim_whitespace_bytes(&boundary),
+                boundary.trim().as_bytes(),
+                "U+{code:04X}"
+            );
+        }
         for row in TRAIL_STYLES {
             assert_eq!(canonical(row.name), Some(row.name));
-            assert_eq!(
-                canonical(&format!("  {}  ", row.name.to_ascii_uppercase())),
-                Some(row.name)
-            );
+            for padding in ["  ", "\u{00a0}", "\u{2003}\u{3000}", "\u{000b}\t\r\n"] {
+                assert_eq!(
+                    canonical(&format!(
+                        "{padding}{}{padding}",
+                        row.name.to_ascii_uppercase()
+                    )),
+                    Some(row.name)
+                );
+            }
         }
         for &(alias, target) in TRAIL_STYLE_ALIASES {
             assert_eq!(canonical(alias), Some(target), "{alias:?}");
+            assert_eq!(
+                canonical(&format!("\u{00a0}{}\u{2003}", alias.to_ascii_uppercase())),
+                Some(target)
+            );
             assert_eq!(canonical(target), Some(target), "{target:?} is canonical");
         }
         assert_eq!(canonical("Rainbow dog"), Some("rainbow dog pet"));
@@ -285,6 +413,9 @@ mod tests {
             "retro",
             "pack:synthwave",
             "pack:",
+            "\u{200b}rainbow kitty pet",
+            "rainbow kitty pet\u{feff}",
+            "rainbow\u{00a0}kitty pet",
         ] {
             assert_eq!(canonical(unknown), None, "{unknown:?}");
         }
@@ -314,6 +445,15 @@ mod tests {
     /// `classic` and still name the mono face.
     #[test]
     fn spellings_drive_glow_style_parse() {
+        use crate::{cursor_fx::GlowSpelling, kitty_pet::PetSpecies};
+
+        const OFF: GlowSpelling = GlowSpelling::parse("\u{00a0}OFF\u{2003}");
+        const DOG: Option<PetSpecies> = GlowSpelling::pet_of("\u{00a0}RAINBOW DOG\u{3000}");
+        const CLASSIC: GlowStyle = GlowStyle::parse("\u{2003}classic mono\u{00a0}");
+        assert_eq!(OFF.style, None);
+        assert_eq!(DOG, Some(PetSpecies::Dog));
+        assert_eq!(CLASSIC, GlowStyle::Classic);
+
         for row in TRAIL_STYLES {
             assert_eq!(
                 GlowStyle::parse(row.name),
@@ -331,9 +471,27 @@ mod tests {
         }
         assert_eq!(GlowStyle::parse("pack:synthwave"), GlowStyle::Lumen);
         assert_eq!(GlowStyle::parse("plasma"), GlowStyle::Lumen);
-        for mono in ["classic mono", "Classic Lumen", " mono classic "] {
+        assert_eq!(GlowSpelling::parse("\u{00a0}OFF\u{2003}").style, None);
+        for (raw, species) in [
+            ("\u{00a0}Rainbow dog\u{2003}", PetSpecies::Dog),
+            ("\u{3000}rainbow kitty pet\u{202f}", PetSpecies::Cat),
+        ] {
+            assert_eq!(GlowStyle::parse(raw), GlowStyle::RainbowKitty);
+            assert_eq!(
+                GlowSpelling::parse(raw).style,
+                Some(GlowStyle::RainbowKitty)
+            );
+            assert_eq!(GlowSpelling::pet_of(raw), Some(species));
+        }
+        for mono in [
+            "classic mono",
+            "Classic Lumen",
+            " mono classic ",
+            "\u{00a0}classic mono\u{3000}",
+        ] {
             assert_eq!(canonical(mono), Some("classic"), "{mono:?}");
             assert!(GlowStyle::style_names_classic_mono(mono), "{mono:?}");
+            assert!(GlowSpelling::parse(mono).classic_mono, "{mono:?}");
         }
         assert!(!GlowStyle::style_names_classic_mono("classic"));
     }

@@ -912,12 +912,7 @@ fn is_machine_account_label(key: &str) -> bool {
     valid_m && valid_slot
 }
 
-/// Derive a canonical machine/slot account label (such as `"m27"` or `"m27-2"`) from an email
-/// address.
-#[must_use]
-pub fn derive_account_label_from_email(email: &str) -> Option<String> {
-    let (raw_local, _) = email.trim().split_once('@')?;
-    let local = raw_local.split('+').next().unwrap_or(raw_local);
+fn parse_local_machines_and_slot_label(local: &str) -> (Vec<String>, Option<u32>) {
     let tokens: Vec<String> = local
         .split(['.', '-', '_'])
         .map(str::to_ascii_lowercase)
@@ -952,13 +947,41 @@ pub fn derive_account_label_from_email(email: &str) -> Option<String> {
                 }
             }
         }
-        let base = machines.join("-");
-        return Some(match slot {
-            Some(n) => format!("{base}-{n}"),
-            None => base,
-        });
+        return (machines, slot);
     }
-    None
+    (Vec::new(), None)
+}
+
+/// Derive a canonical machine/slot account label (such as `"m27"` or `"m27-2"`) from an email
+/// address.
+#[must_use]
+pub fn derive_account_label_from_email(email: &str) -> Option<String> {
+    let (raw_local, _) = email.trim().split_once('@')?;
+    let (base, plus_tag) = raw_local
+        .split_once('+')
+        .map_or((raw_local, None), |(b, t)| (b, Some(t)));
+    let (mut machines, mut slot) = parse_local_machines_and_slot_label(base);
+    if let Some(tag) = plus_tag {
+        if machines.is_empty() {
+            (machines, slot) = parse_local_machines_and_slot_label(tag);
+        } else if slot.is_none()
+            && let Some(first) = tag.split(['.', '-', '_', '+']).next()
+            && !first.is_empty()
+            && first.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = first.parse::<u32>()
+            && (2..=9).contains(&n)
+        {
+            slot = Some(n);
+        }
+    }
+    if machines.is_empty() {
+        return None;
+    }
+    let joined = machines.join("-");
+    Some(match slot {
+        Some(n) => format!("{joined}-{n}"),
+        None => joined,
+    })
 }
 
 fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
@@ -976,17 +999,31 @@ fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
     push_unique(sanitize_profile_key(&lower));
     if let Some((raw_local, domain)) = lower.split_once('@') {
         let base_local = raw_local.split('+').next().unwrap_or(raw_local);
-        if base_local != raw_local && !base_local.is_empty() {
-            let base_email = format!("{base_local}@{domain}");
-            push_unique(base_email.clone());
-            push_unique(sanitize_profile_key(&base_email));
+        let derived_full = derive_account_label_from_email(&lower);
+        let base_email = (base_local != raw_local && !base_local.is_empty())
+            .then(|| format!("{base_local}@{domain}"));
+        let derived_base = base_email
+            .as_deref()
+            .and_then(derive_account_label_from_email);
+        if derived_full != derived_base {
+            push_unique(raw_local.to_owned());
+            push_unique(raw_local.replace(['.', '_'], "-"));
+            push_unique(raw_local.replace(['.', '-'], "_"));
+            if let Some(lbl) = &derived_full {
+                push_unique(lbl.clone());
+                push_unique(lbl.replace('-', "_"));
+            }
+        }
+        if let Some(base_em) = &base_email {
+            push_unique(base_em.clone());
+            push_unique(sanitize_profile_key(base_em));
         }
         for loc in [raw_local, base_local] {
             push_unique(loc.to_owned());
             push_unique(loc.replace(['.', '_'], "-"));
             push_unique(loc.replace(['.', '-'], "_"));
         }
-        if let Some(lbl) = derive_account_label_from_email(&lower) {
+        if let Some(lbl) = derived_full {
             push_unique(lbl.clone());
             push_unique(lbl.replace('-', "_"));
         }
@@ -1821,8 +1858,30 @@ pub fn browser_profile_dir(store_dir: &Path, account_key: Option<&str>) -> PathB
 
 fn strip_email_subaddress(email: &str) -> Option<String> {
     let (local, domain) = email.trim().split_once('@')?;
-    let base = local.split('+').next().unwrap_or(local);
-    (base != local && !base.is_empty()).then(|| format!("{base}@{domain}"))
+    let (base, tag) = local.split_once('+')?;
+    if base.is_empty() {
+        return None;
+    }
+    let base_email = format!("{base}@{domain}");
+    if derive_account_label_from_email(email) != derive_account_label_from_email(&base_email) {
+        return None;
+    }
+    let tag_has_account_number = tag
+        .split(['.', '-', '_', '+'])
+        .any(|tok| !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_digit()));
+    (!tag_has_account_number).then_some(base_email)
+}
+
+fn exact_email_profile_dir(store_dir: &Path, email: &str) -> PathBuf {
+    let lower = email.trim().to_ascii_lowercase();
+    let key = sanitize_profile_key(&lower);
+    if key == lower.replace('@', "-at-") {
+        store_dir.join(BROWSER_PROFILES_DIR).join(key)
+    } else {
+        store_dir
+            .join(BROWSER_PROFILES_DIR)
+            .join(format!("{key}-{}", &fnv1a_hex(&lower)[..8]))
+    }
 }
 
 /// Whether `store_dir` already has a persistent headless browser profile for `label` or `email`.
@@ -1848,9 +1907,9 @@ pub fn resolve_browser_profile_dir(
 ) -> PathBuf {
     let base_email = email.and_then(strip_email_subaddress);
     if let Some(em) = email {
-        let dir = browser_profile_dir(store_dir, Some(em));
-        if dir.is_dir() {
-            return dir;
+        let exact_dir = exact_email_profile_dir(store_dir, em);
+        if exact_dir.is_dir() {
+            return exact_dir;
         }
         if let Some(base) = base_email.as_deref() {
             let base_dir = browser_profile_dir(store_dir, Some(base));
@@ -1875,7 +1934,13 @@ pub fn resolve_browser_profile_dir(
             return dir;
         }
     }
-    browser_profile_dir(store_dir, base_email.as_deref().or(email).or(label))
+    if let Some(base) = base_email.as_deref() {
+        exact_email_profile_dir(store_dir, base)
+    } else if let Some(em) = email {
+        exact_email_profile_dir(store_dir, em)
+    } else {
+        browser_profile_dir(store_dir, label)
+    }
 }
 
 /// The persistent browser profile a vendor sign-in of the row with `email` (else its
@@ -3026,17 +3091,22 @@ struct ParsedImapUrl {
     mailbox: String,
 }
 
+fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
+}
+
 fn parse_imap_url(url: &str) -> Option<ParsedImapUrl> {
-    let (tls, rest) = if let Some(r) = url.strip_prefix("imaps://") {
+    let trimmed = url.trim();
+    let (tls, rest) = if let Some(r) = strip_ascii_prefix_ci(trimmed, "imaps://") {
         (true, r)
     } else {
-        let r = url.strip_prefix("imap://")?;
+        let r = strip_ascii_prefix_ci(trimmed, "imap://")?;
         (false, r)
     };
-    let (authority, path_part) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx + 1..]),
-        None => (rest, ""),
-    };
+    let (authority, tail) = authority_and_tail(rest);
+    let path_part = tail.strip_prefix('/').unwrap_or("");
     let (user, password, host_port) = match authority.rsplit_once('@') {
         Some((userinfo, hp)) => match userinfo.split_once(':') {
             Some((u, p)) => (Some(percent_decode(u)), Some(percent_decode(p)), hp),
@@ -3045,15 +3115,27 @@ fn parse_imap_url(url: &str) -> Option<ParsedImapUrl> {
         None => (None, None, authority),
     };
     let default_port = if tls { 993 } else { 143 };
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h.to_owned(), p.parse::<u16>().ok()?),
-        None => (host_port.to_owned(), default_port),
+    let (host, port) = if let Some(v6) = host_port.strip_prefix('[') {
+        let (addr, after) = v6.split_once(']')?;
+        if !addr.contains(':') {
+            return None;
+        }
+        let port = match after {
+            "" => default_port,
+            _ => after.strip_prefix(':')?.parse::<u16>().ok()?,
+        };
+        (addr.to_owned(), port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h.to_owned(), p.parse::<u16>().ok()?),
+            None => (host_port.to_owned(), default_port),
+        }
     };
-    if host.is_empty() || port == 0 {
+    if host.is_empty() || port == 0 || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let mailbox_raw = path_part
-        .split('?')
+        .split(['?', '#'])
         .next()
         .unwrap_or(path_part)
         .trim_matches('/');
@@ -3086,37 +3168,97 @@ fn escape_imap_quoted(s: &str) -> String {
     out
 }
 
-fn imap_read_until_tag(
-    reader: &mut BufReader<TcpStream>,
-    tag: &str,
-) -> Option<(bool, Vec<String>)> {
+fn imap_tagged_status(trimmed: &str, tag: &str) -> Option<bool> {
+    for (status, ok) in [("OK", true), ("NO", false), ("BAD", false)] {
+        let prefix = format!("{tag} {status}");
+        if trimmed
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+            && trimmed
+                .as_bytes()
+                .get(prefix.len())
+                .is_none_or(|b| matches!(b, b' ' | b'\t'))
+        {
+            return Some(ok);
+        }
+    }
+    None
+}
+
+fn imap_literal_suffix_len(line: &str) -> std::io::Result<Option<usize>> {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let Some((_, inner)) = trimmed.strip_suffix('}').and_then(|s| s.rsplit_once('{')) else {
+        return Ok(None);
+    };
+    let digits = inner.strip_suffix('+').unwrap_or(inner);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let n = digits
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n <= usize::try_from(EMAIL_FILE_MAX).unwrap_or(usize::MAX))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IMAP literal exceeds mail limit",
+            )
+        })?;
+    Ok(Some(n))
+}
+
+fn imap_read_until_tag(reader: &mut impl BufRead, tag: &str) -> Option<(bool, Vec<String>)> {
+    const MAX_PROTOCOL_LINES: usize = 16_384;
+    let max_bytes = usize::try_from(EMAIL_FILE_MAX).unwrap_or(512 * 1024) + 64 * 1024;
+    let mut total_bytes = 0usize;
     let mut lines = Vec::new();
-    let ok_prefix = format!("{tag} OK");
-    let no_prefix = format!("{tag} NO");
-    let bad_prefix = format!("{tag} BAD");
-    for _ in 0..512 {
+    let mut continuing_untagged = false;
+    for _ in 0..MAX_PROTOCOL_LINES {
         let mut line = String::new();
         let n = reader.read_line(&mut line).ok()?;
         if n == 0 {
             return None;
         }
+        total_bytes = total_bytes.saturating_add(n);
+        if total_bytes > max_bytes {
+            return None;
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed
-            .get(..ok_prefix.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&ok_prefix))
-        {
-            return Some((true, lines));
+        if let Some(ok) = imap_tagged_status(trimmed, tag) {
+            return Some((ok, lines));
         }
-        if trimmed
-            .get(..no_prefix.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&no_prefix))
-            || trimmed
-                .get(..bad_prefix.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&bad_prefix))
-        {
-            return Some((false, lines));
-        }
+        let is_untagged = continuing_untagged || trimmed.trim_start().starts_with("* ");
+        // An oversized literal still owns the following octets: refuse it rather than
+        // treating its body as protocol lines, where a tag-like line could end the read.
+        let literal_n = if is_untagged {
+            imap_literal_suffix_len(&line).ok()?
+        } else {
+            None
+        };
         lines.push(line);
+        if let Some(lit_len) = literal_n {
+            total_bytes = total_bytes.saturating_add(lit_len);
+            if total_bytes > max_bytes {
+                return None;
+            }
+            if lit_len == 0 {
+                lines.push(String::new());
+            } else {
+                let mut lit = Vec::with_capacity(lit_len.min(64 * 1024));
+                reader
+                    .by_ref()
+                    .take(lit_len as u64)
+                    .read_to_end(&mut lit)
+                    .ok()?;
+                if lit.len() != lit_len {
+                    return None;
+                }
+                lines.push(String::from_utf8_lossy(&lit).into_owned());
+            }
+            continuing_untagged = true;
+        } else {
+            continuing_untagged = false;
+        }
     }
     None
 }
@@ -3150,6 +3292,34 @@ fn imap_search_responses_ignore_utf8_and_require_the_search_word() {
         ]),
         [1, 2, 3, 4]
     );
+}
+
+#[test]
+fn oversized_imap_literals_cannot_turn_body_lines_into_command_responses() {
+    let read = |wire: &str| imap_read_until_tag(&mut BufReader::new(wire.as_bytes()), "f0");
+    for size in [(EMAIL_FILE_MAX + 1).to_string(), format!("{}0", usize::MAX)] {
+        for suffix in ["", "+"] {
+            let wire = format!(
+                "* 1 FETCH (BODY[] {{{size}{suffix}}}\r\nf0 OK text inside the literal\r\n"
+            );
+            assert!(read(&wire).is_none(), "refuse literal size {size}{suffix}");
+        }
+    }
+
+    let limit = usize::try_from(EMAIL_FILE_MAX).unwrap();
+    let mut body = String::from("f0 OK text inside the literal\r\n");
+    body.push_str(&"x".repeat(limit - body.len()));
+    for body in [String::new(), body] {
+        for suffix in ["", "+"] {
+            let wire = format!(
+                "* 1 FETCH (BODY[] {{{}{suffix}}}\r\n{body})\r\nf0 NO actual response\r\n",
+                body.len()
+            );
+            let (ok, lines) = read(&wire).expect("a literal within the mail limit");
+            assert!(!ok, "only the actual tagged response ends the command");
+            assert_eq!(lines[1], body);
+        }
+    }
 }
 
 #[expect(
@@ -3223,14 +3393,40 @@ fn fetch_imap_tcp_credential(
             let t = l.trim_start();
             t.starts_with("* ") && t.to_ascii_uppercase().contains("FETCH")
         });
-        let literal_len = fetch_idx.and_then(|fi| {
-            let hdr = msg_lines[fi].trim_end();
-            let inner = hdr.strip_suffix('}')?.rsplit_once('{')?.1;
-            inner
-                .strip_suffix('+')
-                .unwrap_or(inner)
-                .parse::<usize>()
-                .ok()
+        let literal_body = fetch_idx.and_then(|fi| {
+            let mut li = fi;
+            let mut fallback_literal: Option<&str> = None;
+            while li < msg_lines.len() {
+                if li > fi && msg_lines[li].trim_start().starts_with("* ") {
+                    break;
+                }
+                if imap_literal_suffix_len(&msg_lines[li])
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    && let Some(body) = msg_lines.get(li + 1)
+                {
+                    let upper = msg_lines[li].to_ascii_uppercase();
+                    let is_full_body = upper.contains("BODY[]")
+                        || upper.contains("BODY.PEEK[]")
+                        || (upper.contains("RFC822")
+                            && !upper.contains("RFC822.HEADER")
+                            && !upper.contains("RFC822.SIZE")
+                            && !upper.contains("RFC822.TEXT"));
+                    if is_full_body {
+                        return Some(body.as_str());
+                    }
+                    let is_header_only =
+                        upper.contains("RFC822.HEADER") || upper.contains("BODY[HEADER");
+                    if !is_header_only || fallback_literal.is_none() {
+                        fallback_literal = Some(body.as_str());
+                    }
+                    li += 2;
+                    continue;
+                }
+                li += 1;
+            }
+            fallback_literal
         });
         let start = fetch_idx.map_or_else(
             || {
@@ -3242,13 +3438,9 @@ fn fetch_imap_tcp_credential(
             },
             |fi| fi + 1,
         );
-        let full_from_start: String = msg_lines[start..].concat();
         let trimmed_fallback: String;
-        let raw_msg = if let Some(n) = literal_len
-            && n <= full_from_start.len()
-            && full_from_start.is_char_boundary(n)
-        {
-            &full_from_start[..n]
+        let raw_msg = if let Some(body) = literal_body {
+            body
         } else {
             let mut end = msg_lines.len();
             while end > start && msg_lines[end - 1].trim_start().starts_with("* ") {
@@ -3315,9 +3507,13 @@ fn fetch_imaps_curl_credential(
     filter: &MailFilter<'_>,
 ) -> Option<MailboxCredential> {
     let userpwd = format!("{user}:{password}");
+    let url_host = if parsed.host.contains(':') {
+        format!("[{}]", parsed.host)
+    } else {
+        parsed.host.clone()
+    };
     let search_url = format!(
-        "imaps://{}:{}/{}?ALL",
-        parsed.host,
+        "imaps://{url_host}:{}/{}?ALL",
         parsed.port,
         percent_encode(&parsed.mailbox)
     );
@@ -3341,8 +3537,7 @@ fn fetch_imaps_curl_credential(
     let seqs = imap_search_sequences(search_stdout.lines());
     for seq in seqs.into_iter().rev().take(8) {
         let msg_url = format!(
-            "imaps://{}:{}/{};MAILINDEX={seq}",
-            parsed.host,
+            "imaps://{url_host}:{}/{};MAILINDEX={seq}",
             parsed.port,
             percent_encode(&parsed.mailbox)
         );
@@ -3443,7 +3638,11 @@ fn authority_and_tail(rest: &str) -> (&str, &str) {
 
 /// Whether `host` is this machine's loopback (`localhost`, `127.0.0.0/8`, `::1`).
 fn is_loopback_host(host: &str) -> bool {
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .filter(|s| s.contains(':'))
+        .unwrap_or(host);
     bare.eq_ignore_ascii_case("localhost")
         || bare
             .parse::<std::net::IpAddr>()
@@ -3453,17 +3652,36 @@ fn is_loopback_host(host: &str) -> bool {
 /// Why no credential is sent to `url`: `imap://` and `http://` carry it in cleartext, so they are
 /// used only for a loopback host.
 fn cleartext_refusal(url: &str) -> Option<&'static str> {
-    if let Some(imap) = parse_imap_url(url) {
-        return (!imap.tls && !is_loopback_host(&imap.host)).then_some(
+    let trimmed = url.trim();
+    if strip_ascii_prefix_ci(trimmed, "imap://").is_some() {
+        let allowed = parse_imap_url(trimmed).is_some_and(|imap| is_loopback_host(&imap.host));
+        return (!allowed).then_some(
             "imap:// sends its login in cleartext, so it is used only for a loopback host; \
              name an imaps:// mailbox",
         );
     }
-    let (authority, _) = authority_and_tail(url.strip_prefix("http://")?);
+    let rest = strip_ascii_prefix_ci(trimmed, "http://")?;
+    let (authority, _) = authority_and_tail(rest);
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
     let host = match host_port.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(v6),
-        None => host_port.rsplit_once(':').map_or(host_port, |(h, _)| h),
+        Some(v6) => v6
+            .split_once(']')
+            .filter(|(addr, after)| {
+                addr.contains(':')
+                    && (after.is_empty()
+                        || after
+                            .strip_prefix(':')
+                            .and_then(|p| p.parse::<u16>().ok())
+                            .is_some_and(|p| p > 0))
+            })
+            .map_or("", |(addr, _)| addr),
+        None => host_port.rsplit_once(':').map_or(host_port, |(h, p)| {
+            if p.parse::<u16>().is_ok_and(|port| port > 0) {
+                h
+            } else {
+                ""
+            }
+        }),
     };
     (!is_loopback_host(host)).then_some(
         "http:// sends its password or token in cleartext, so it is used only for a loopback \
@@ -3485,30 +3703,64 @@ pub fn plaintext_credential_refusal(
     {
         return Some(why);
     }
-    let url = cfg.http_url.as_deref()?;
-    let credentialed = url_has_embedded_userinfo(url)
-        || cfg.bearer_token.as_deref().is_some_and(|t| !t.is_empty())
-        || (cfg.webmail_user_for(target_email).is_some()
-            && cfg.password_for(target_email).is_some());
-    credentialed.then(|| cleartext_refusal(url)).flatten()
+    if let Some(url) = cfg.http_url.as_deref() {
+        let credentialed = url_has_embedded_userinfo(url)
+            || cfg.bearer_token.as_deref().is_some_and(|t| !t.is_empty())
+            || (cfg.webmail_user_for(target_email).is_some()
+                && cfg.password_for(target_email).is_some());
+        if credentialed && let Some(why) = cleartext_refusal(url) {
+            return Some(why);
+        }
+    }
+    if let Some(wurl) = cfg.effective_webmail_url(target_email) {
+        let credentialed = url_has_embedded_userinfo(&wurl)
+            || cfg.password_for(target_email).is_some()
+            || cfg.mailbox_password_for(target_email).is_some()
+            || cfg.totp_secret_for(target_email).is_some();
+        if credentialed && let Some(why) = cleartext_refusal(&wurl) {
+            return Some(why);
+        }
+    }
+    None
 }
 
 struct LoopbackHttpUrl<'a> {
     authority: &'a str,
+    host: String,
     userinfo: Option<&'a str>,
     port: u16,
     target: String,
 }
 
 fn parse_loopback_http_url(url: &str) -> Option<LoopbackHttpUrl<'_>> {
-    let rest = url.strip_prefix("http://")?;
+    let rest = strip_ascii_prefix_ci(url.trim(), "http://")?;
     let (raw_authority, tail) = authority_and_tail(rest);
     let (userinfo, authority) = match raw_authority.rsplit_once('@') {
         Some((ui, host_port)) => (Some(ui), host_port),
         None => (None, raw_authority),
     };
-    let (host, port) = authority.rsplit_once(':')?;
-    if !matches!(host, "127.0.0.1" | "localhost") {
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (addr, after) = v6.split_once(']')?;
+        if !addr.contains(':') {
+            return None;
+        }
+        let port = match after {
+            "" => 80,
+            _ => after.strip_prefix(':')?.parse::<u16>().ok()?,
+        };
+        (addr.to_owned(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_owned(), p.parse::<u16>().ok()?),
+            None => (authority.to_owned(), 80),
+        }
+    };
+    if port == 0
+        || !is_loopback_host(&host)
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
         return None;
     }
     let target = tail.split('#').next().unwrap_or("");
@@ -3517,10 +3769,14 @@ fn parse_loopback_http_url(url: &str) -> Option<LoopbackHttpUrl<'_>> {
     } else {
         target.to_owned()
     };
+    if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
     Some(LoopbackHttpUrl {
         authority,
+        host,
         userinfo,
-        port: port.parse().ok()?,
+        port,
         target,
     })
 }
@@ -3534,14 +3790,28 @@ fn fetch_loopback_http_body(
     bearer_token: Option<&str>,
     basic_auth: Option<(&str, &str)>,
 ) -> Option<String> {
+    if bearer_token.is_some_and(|t| t.contains(['\r', '\n'])) {
+        return None;
+    }
     let parsed = parse_loopback_http_url(url)?;
     let LoopbackHttpUrl {
         authority,
+        host,
         userinfo: embedded_userinfo,
         port,
         target: path_and_query,
     } = parsed;
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !ip.is_loopback() {
+            return None;
+        }
+        std::net::SocketAddr::new(ip, port)
+    } else {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .ok()?
+            .find(|sa| sa.ip().is_loopback())?
+    };
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -3573,9 +3843,9 @@ fn fetch_loopback_http_body(
 }
 
 fn url_has_embedded_userinfo(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
+    let trimmed = url.trim();
+    let rest = strip_ascii_prefix_ci(trimmed, "https://")
+        .or_else(|| strip_ascii_prefix_ci(trimmed, "http://"))
         .unwrap_or("");
     let (raw_authority, _) = authority_and_tail(rest);
     raw_authority
@@ -3588,28 +3858,31 @@ fn fetch_http_url_body(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
 ) -> Option<String> {
+    let trimmed = url.trim();
     let cfg_pw = cfg.password_for(target_email);
     let cfg_user = cfg.webmail_user_for(target_email);
     let basic_auth = cfg_user.as_deref().zip(cfg_pw.as_deref());
-    if is_loopback_http_url(url) {
-        fetch_loopback_http_body(url, cfg.bearer_token.as_deref(), basic_auth)
-    } else if url.starts_with("https://") || url.starts_with("http://") {
+    if is_loopback_http_url(trimmed) {
+        fetch_loopback_http_body(trimmed, cfg.bearer_token.as_deref(), basic_auth)
+    } else if strip_ascii_prefix_ci(trimmed, "https://").is_some()
+        || strip_ascii_prefix_ci(trimmed, "http://").is_some()
+    {
         let credential = if let Some(token) = cfg.bearer_token.as_deref().filter(|t| !t.is_empty())
         {
             Some(("header", format!("Authorization: Bearer {token}")))
-        } else if !url_has_embedded_userinfo(url)
+        } else if !url_has_embedded_userinfo(trimmed)
             && let Some((u, p)) = basic_auth
         {
             Some(("user", format!("{u}:{p}")))
         } else {
             None
         };
-        if (credential.is_some() || url_has_embedded_userinfo(url))
-            && cleartext_refusal(url).is_some()
+        if (credential.is_some() || url_has_embedded_userinfo(trimmed))
+            && cleartext_refusal(trimmed).is_some()
         {
             return None;
         }
-        let mut options = vec![("url", url)];
+        let mut options = vec![("url", trimmed)];
         if let Some((name, value)) = &credential {
             options.push((*name, value.as_str()));
         }
@@ -4053,6 +4326,9 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
     timeout: Duration,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
+        return Err(why);
+    }
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
         || cfg.http_url.is_some();
@@ -4061,9 +4337,6 @@ pub(super) fn poll_mailbox_config_for_credential_with_seen_otps(
             return Err("webmail inbox requires headless browser");
         }
         return Err("headless browser requires sign-in, but no mailbox is configured");
-    }
-    if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
-        return Err(why);
     }
     let deadline = Instant::now() + timeout;
     let mut tried_files = BTreeSet::new();
@@ -4924,9 +5197,22 @@ pub fn poll_webmail_via_cdp(
     seen_digests: &mut BTreeSet<String>,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
-    let webmail_url = cfg
+    if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
+        return Err(why);
+    }
+    let raw_webmail_url = cfg
         .effective_webmail_url(target_email)
         .ok_or("headless browser requires sign-in, but no webmail URL is configured")?;
+    let webmail_url = raw_webmail_url.trim();
+    if let Some(why) = cleartext_refusal(webmail_url) {
+        return Err(why);
+    }
+    if !strip_ascii_prefix_ci(webmail_url, "https://")
+        .is_some_and(|rest| !authority_and_tail(rest).0.is_empty())
+        && !is_loopback_http_url(webmail_url)
+    {
+        return Err("webmail URL must use https:// or loopback http://");
+    }
     let login_user = cfg.webmail_user_for(target_email);
     let password = cfg.password_for(target_email);
     let mailbox_password = cfg.mailbox_password_for(target_email);
@@ -5114,6 +5400,9 @@ pub fn poll_mailbox_or_webmail_for_credential(
     poll_interval: Duration,
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
+    if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
+        return Err(why);
+    }
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
         || cfg.http_url.is_some();
@@ -6971,7 +7260,7 @@ mod uri_authority_tests {
             ("https://mail.example", false),
             ("https://?to=a@b", false),
             ("ftp://user:password@mail.example", false),
-            ("HTTPS://user@mail.example", false),
+            ("HTTPS://user@mail.example", true),
         ] {
             assert_eq!(super::url_has_embedded_userinfo(url), embedded, "{url}");
         }
@@ -6979,10 +7268,11 @@ mod uri_authority_tests {
         for (url, selected) in [
             ("http://localhost:1777", true),
             ("http://user:password@127.0.0.1:1777?to=a@b", true),
+            ("http://[::1]:1777?to=a@b", true),
+            ("http://[2001:db8::1]:1777?to=a@b", false),
             ("http://remote.example?to=owner@127.0.0.1:1777", false),
             ("http://remote.example#owner@localhost:1777", false),
             ("http://remote.example/path@127.0.0.1:1777", false),
-            ("http://[::1]:1777?to=a@b", false),
             ("https://localhost:1777", false),
         ] {
             assert_eq!(super::is_loopback_http_url(url), selected, "{url}");
@@ -6990,6 +7280,12 @@ mod uri_authority_tests {
 
         for (url, authority, userinfo, target) in [
             ("http://localhost:1777", "localhost:1777", None, "/"),
+            (
+                "http://[::1]:1777?to=a@b#fragment@tail",
+                "[::1]:1777",
+                None,
+                "/?to=a@b",
+            ),
             (
                 "http://user:password@127.0.0.1:1777?to=a@b#fragment@tail",
                 "127.0.0.1:1777",

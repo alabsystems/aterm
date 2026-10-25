@@ -463,7 +463,30 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
         .map(|r| r.replace("Above the tab strip.", "Drops the legacy table."))
         .collect();
     assert_ne!(rows, drops, "PRECONDITION: the edit landed");
-    assert!(reason(&decide_rows(&drops)).contains("would drop"));
+    let passed = decide_rows(&drops);
+    let (steps, target, _, subject, unproven) = answer(&passed);
+    assert_eq!(
+        (steps, target),
+        (1, AnswerTarget::Option(2)),
+        "option 1's own words drop a table, the question asks nothing irreversible: the first \
+         option that names nothing irreversible"
+    );
+    assert!(subject.ends_with("→ Bottom"), "{subject}");
+    assert!(unproven.contains("option 1 would drop"), "{unproven}");
+    let every: Vec<String> = drops
+        .iter()
+        .map(|r| {
+            r.replace("Below the last terminal row.", "Removes the old band.")
+                .replace("An overlay in the corner.", "Deletes the overlay layer.")
+        })
+        .collect();
+    assert_ne!(every, drops, "PRECONDITION: the edit landed");
+    let held = decide_rows(&every);
+    assert!(
+        reason(&held).contains("every option names a destructive act")
+            && reason(&held).contains("option 1 would drop"),
+        "{held:?}"
+    );
 }
 
 #[test]
@@ -491,7 +514,10 @@ fn the_incidents_unmarked_publish_question_is_escalated() {
         rows.iter().any(|r| r.trim() == "❯ 1. Deploy and push"),
         "PRECONDITION: the edit landed, the cursor on option 1: {rows:#?}"
     );
-    assert!(reason(&decide_rows(&rows)).contains("would deploy"));
+    assert!(
+        reason(&decide_rows(&rows)).contains("would publish, and no one option that refuses it"),
+        "the question's own row asks to publish: every answer to it bears on that"
+    );
     let neutral: Vec<String> = rows
         .iter()
         .map(|r| {
@@ -502,6 +528,64 @@ fn the_incidents_unmarked_publish_question_is_escalated() {
     assert_eq!(answer(&decide_rows(&neutral)).1, AnswerTarget::Option(1));
     let refused = incident("3. No, hold everything");
     assert_eq!(answer(&decide_rows(&refused)).1, AnswerTarget::Option(3));
+}
+
+/// The 2026-10-24 hold (`claude-2.1.310-question-reset-in-description.txt`): an AskUserQuestion
+/// under Land with no option marked (Recommended) whose question asks nothing irreversible, but
+/// whose option 1 describes a bug in words holding `reset`, was escalated as "would reset, and no
+/// one option that refuses it" and waited 44 minutes for the person. Option 1 is passed over (its
+/// own words name the act) and the harness answers with the first option that names nothing
+/// irreversible.
+#[test]
+fn a_destructive_word_in_one_options_description_never_holds_the_question() {
+    let (rows, d) = decided(f::QUESTION_RESET_IN_DESCRIPTION_2_1_310);
+    let (steps, target, guard, subject, unproven) = answer(&d);
+    assert_eq!((steps, target), (1, AnswerTarget::Option(2)), "{d:?}");
+    assert!(subject.ends_with("→ Split = codex-alab first"), "{subject}");
+    assert!(
+        unproven.starts_with(CHOSE_FIRST_SAFE) && unproven.contains("option 1 would reset"),
+        "{unproven}"
+    );
+    let q = row_of(
+        &rows,
+        "Which did you mean by \"no no claude code harness, codex-alab\"?",
+    );
+    assert_eq!(guard, row_guard(&rows[q]));
+    let clean: Vec<String> = rows
+        .iter()
+        .map(|r| r.replace("usage limit reset", "usage limit ended"))
+        .collect();
+    assert_ne!(clean, rows, "PRECONDITION: the edit landed");
+    let fallback = decide_rows(&clean);
+    let (steps, target, _, _, unproven) = answer(&fallback);
+    assert_eq!(
+        (steps, target, unproven),
+        (0, AnswerTarget::Option(1), CHOSE_UNMARKED),
+        "with no destructive word option 1 is the documented fallback"
+    );
+}
+
+/// The same incident's question under every priority word: a text priority hands the question
+/// back to the recommended path (its options name a destructive word), which answers it too.
+#[test]
+fn the_reset_in_a_description_incident_is_answered_under_every_priority() {
+    let rows = screen(f::QUESTION_RESET_IN_DESCRIPTION_2_1_310);
+    let p = parse_prompt_v2(&rows).expect("the dialog");
+    for priority in QuestionPriority::ALL {
+        let d = answer_question(&p, &rows, priority, None, false, Pane::of(&rows));
+        let Decision::Approve {
+            choice: Choice::Answer(Answer::FocusEnter { steps, target }),
+            ..
+        } = d
+        else {
+            panic!("{priority:?} held the question: {d:?}");
+        };
+        assert_eq!(
+            (steps, target),
+            (1, AnswerTarget::Option(2)),
+            "{priority:?}"
+        );
+    }
 }
 
 #[test]

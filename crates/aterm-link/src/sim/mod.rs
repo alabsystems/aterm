@@ -218,9 +218,11 @@ impl Core {
             readers.remove(i)
         };
         let mut reader = reader;
-        let read = reader.sub.recv();
+        let read =
+            crate::bridge::next_took(&mut reader.sub, &reader.closer, std::time::Duration::ZERO);
         let what = match &read {
-            Ok(Some((off, subject, _))) => format!("@{off} {subject}"),
+            Ok(Some(crate::bridge::Took::Record((off, subject, _)))) => format!("@{off} {subject}"),
+            Ok(Some(crate::bridge::Took::Gap(g))) => format!("gap {}..{}", g.from, g.to),
             Ok(None) => "end".to_string(),
             Err(e) => format!("err {:?}", e.kind()),
         };

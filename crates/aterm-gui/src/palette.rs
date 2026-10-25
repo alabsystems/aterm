@@ -23,8 +23,8 @@ const MAX_CMD_ROWS: usize = 14;
 /// Chrome rows framing the command band: the title and pinned query row on top, the key-hint footer below.
 const CHROME_ROWS: usize = 3;
 
-/// Maximum logical width of the floating command card, so wide windows keep enough of the owning app visible to read as a modal layer.
-const MAX_CARD_WIDTH: f32 = 820.0;
+/// Maximum width of the floating command card in points, so wide windows keep enough of the owning app visible to read as a modal layer.
+const MAX_CARD_WIDTH_PT: f32 = 820.0;
 
 /// Windows sets the palette as a Fluent flyout: its words in the system UI face (Segoe UI) where they were the terminal's monospace, the section chips in one right-aligned column instead of trailing each label, a scroll indicator when the list overflows, and the window behind it dimmed ([`palette_scrim`]).
 const PALETTE_FLUENT: bool = cfg!(windows);
@@ -59,17 +59,22 @@ struct PaletteLayout {
     body_rows: usize,
 }
 
-/// One pure geometry projection shared by paint and hit-testing. The overlay supplies the whole available viewport; the command card remains content-height, width-capped, and centred within it.
-fn palette_layout_for_count(count: usize, g: &SettingsGeom) -> PaletteLayout {
+/// The horizontal span `(x, w)` of an overlay card centred in the tray: the tray less a margin of two cells (16 points at least) on each side, at most `max_pt` points wide. The floor and the cap are points scaled by [`SettingsGeom::px_per_pt`], so the card is one width on the screen at every backing scale; each card's one layout function (paint and hit-testing both) takes its span here.
+pub(crate) fn overlay_card_span(g: &SettingsGeom, max_pt: f32) -> (f32, f32) {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
-    let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
-    let desired_margin = (g.cw * 2.0).max(16.0);
+    let desired_margin = (g.cw * 2.0).max(16.0 * g.px_per_pt);
     let max_margin = (tray_w * 0.5 - g.cw.max(0.0)).max(0.0);
     let margin = desired_margin.min(max_margin);
-    let card_w = (tray_w - margin * 2.0).clamp(0.0, MAX_CARD_WIDTH);
+    let card_w = (tray_w - margin * 2.0).clamp(0.0, (max_pt * g.px_per_pt).max(0.0));
+    (((tray_w - card_w) * 0.5).max(0.0), card_w)
+}
+
+/// One pure geometry projection shared by paint and hit-testing. The overlay supplies the whole available viewport; the command card remains content-height, width-capped, and centred within it.
+fn palette_layout_for_count(count: usize, g: &SettingsGeom) -> PaletteLayout {
+    let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
+    let (card_x, card_w) = overlay_card_span(g, MAX_CARD_WIDTH_PT);
     let card_rows = (CHROME_ROWS + count.clamp(1, MAX_CMD_ROWS)).min(g.panel_rows);
     let card_h = (card_rows as f32 * g.ch).clamp(0.0, tray_h);
-    let card_x = ((tray_w - card_w) * 0.5).max(0.0);
     let card_y = ((tray_h - card_h) * 0.5).max(0.0);
     PaletteLayout {
         card: (card_x, card_y, card_w, card_h),
@@ -2895,12 +2900,13 @@ mod tests {
             font_px: 14.0,
             cols: 200,
             panel_rows: 40,
+            px_per_pt: 1.0,
         };
         let layout = palette_layout(&state, &wide);
         let (x, y, width, height) = layout.card;
         let tray_w = wide.cols as f32 * wide.cw;
         let tray_h = wide.panel_rows as f32 * wide.ch;
-        assert_eq!(width, MAX_CARD_WIDTH);
+        assert_eq!(width, MAX_CARD_WIDTH_PT);
         assert_eq!(height, state.wanted_rows() as f32 * wide.ch);
         assert!(((x * 2.0 + width) - tray_w).abs() < f32::EPSILON);
         assert!(((y * 2.0 + height) - tray_h).abs() < f32::EPSILON);
@@ -2911,6 +2917,7 @@ mod tests {
             font_px: 14.0,
             cols: 3,
             panel_rows: 2,
+            px_per_pt: 1.0,
         };
         let layout = palette_layout(&state, &small);
         let (x, y, width, height) = layout.card;
@@ -2923,6 +2930,69 @@ mod tests {
         assert_eq!(layout.body_rows, 0, "chrome cannot overlap command rows");
     }
 
+    /// The same window at backing scale `k`: its cells, type and width cap scaled together.
+    fn geom_at(k: f32) -> SettingsGeom {
+        SettingsGeom {
+            cw: 9.0 * k,
+            ch: 20.0 * k,
+            font_px: 14.0 * k,
+            cols: 144,
+            panel_rows: 40,
+            px_per_pt: k,
+        }
+    }
+
+    /// A window too narrow for the cap at backing scale `k`, whose cell (7 points) makes two cells
+    /// less than the margin's 16-point floor, so the floor decides the card's width.
+    fn narrow_at(k: f32) -> SettingsGeom {
+        SettingsGeom {
+            cw: 7.0 * k,
+            cols: 60,
+            ..geom_at(k)
+        }
+    }
+
+    #[test]
+    fn the_card_is_one_width_in_points_at_1x_and_2x_and_says_the_same() {
+        let state = PaletteState::new();
+        for at in [geom_at, narrow_at] {
+            let (g1, g2) = (at(1.0), at(2.0));
+            let (c1, c2) = (
+                palette_layout(&state, &g1).card,
+                palette_layout(&state, &g2).card,
+            );
+            for (one, two) in [(c1.0, c2.0), (c1.1, c2.1), (c1.2, c2.2), (c1.3, c2.3)] {
+                assert!(
+                    (two / g2.px_per_pt - one).abs() < 0.01,
+                    "the 2x card {c2:?} is the 1x card {c1:?} in points"
+                );
+            }
+            let words = |g: &SettingsGeom| -> Vec<String> {
+                texts(&palette_tray(&state, g, Theme::default()))
+                    .into_iter()
+                    .map(|(s, ..)| s)
+                    .collect()
+            };
+            assert_eq!(
+                words(&g2),
+                words(&g1),
+                "the 2x card cuts its rows where the 1x card does"
+            );
+        }
+        let card_w = |g: SettingsGeom| palette_layout(&state, &g).card.2;
+        assert_eq!(
+            card_w(geom_at(1.0)),
+            MAX_CARD_WIDTH_PT,
+            "the wide card at its widest"
+        );
+        let narrow = narrow_at(1.0);
+        assert_eq!(
+            card_w(narrow),
+            narrow.cols as f32 * narrow.cw - 2.0 * 16.0,
+            "the narrow card: the tray less a 16-point margin on each side"
+        );
+    }
+
     #[test]
     fn every_painted_row_is_contained_by_the_card_and_outside_points_miss() {
         let state = PaletteState::new();
@@ -2932,6 +3002,7 @@ mod tests {
             font_px: 14.0,
             cols: 180,
             panel_rows: 36,
+            px_per_pt: 1.0,
         };
         let layout = palette_layout(&state, &geom);
         let (card_x, card_y, card_w, card_h) = layout.card;
@@ -2968,6 +3039,7 @@ mod tests {
             font_px: 14.0,
             cols: 80,
             panel_rows: state.wanted_rows(),
+            px_per_pt: 1.0,
         };
 
         for slot in 0..state.body() {
@@ -3027,6 +3099,7 @@ mod tests {
             font_px: 14.0,
             cols: 111,
             panel_rows: 35,
+            px_per_pt: 1.0,
         }
     }
 

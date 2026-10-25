@@ -81,11 +81,18 @@ pub struct Style<'a> {
     pub bg: &'a str,
     /// The attribute list explicitly names dim.
     pub dim: bool,
+    /// The attribute list names inverse: the cell's colours swapped, as a caret a program draws
+    /// itself over a glyph.
+    pub inverse: bool,
+    /// The attribute list names wide: the leading cell of a glyph that spans two columns.
+    pub wide: bool,
 }
 
-fn dim_of(raw: &str) -> Option<bool> {
+/// The attribute list's set, one bit per [`Attribute`]; `None` for an attribute the wire does not
+/// name, one named twice, `none` beside another, or both halves of a wide glyph.
+fn attributes_of(raw: &str) -> Option<u16> {
     if raw == NONE {
-        return Some(false);
+        return Some(0);
     }
     let mut seen = 0_u16;
     for word in raw.split(',') {
@@ -100,7 +107,11 @@ fn dim_of(raw: &str) -> Option<bool> {
     if seen & wide == wide {
         return None;
     }
-    Some(seen & (1_u16 << Attribute::Dim as u8) != 0)
+    Some(seen)
+}
+
+const fn has(set: u16, attr: Attribute) -> bool {
+    set & (1_u16 << attr as u8) != 0
 }
 
 fn token(raw: &str) -> bool {
@@ -143,13 +154,19 @@ pub fn parse_style(line: &str) -> Option<Style<'_>> {
     if !token(glyph) || !crate::hex::is_hex(fg, 6) || !crate::hex::is_hex(bg, 6) {
         return None;
     }
-    let dim = dim_of(attrs)?;
+    let set = attributes_of(attrs)?;
     if let Some(extra) = fields.next()
         && (!token(extra.strip_prefix("link=")?) || fields.next().is_some())
     {
         return None;
     }
-    Some(Style { fg, bg, dim })
+    Some(Style {
+        fg,
+        bg,
+        dim: has(set, Attribute::Dim),
+        inverse: has(set, Attribute::Inverse),
+        wide: has(set, Attribute::Wide),
+    })
 }
 
 #[cfg(test)]
@@ -163,16 +180,35 @@ mod tests {
             Some(Style {
                 fg: "999999",
                 bg: "111318",
-                dim: true
+                dim: true,
+                inverse: false,
+                wide: false,
             })
         );
         let plain = parse_style(
             "OK %E2%9D%AF d0d0d0 111318 bold,underline link=https%3A%2F%2Fexample.test\n",
         )
         .expect("actual complete shape");
-        assert!(!plain.dim);
+        assert!(!plain.dim && !plain.inverse && !plain.wide);
         assert_eq!(plain.fg, "d0d0d0");
         assert!(parse_style("OK x 8A8F99 111318 none\r\n").is_some());
+    }
+
+    /// Claude Code 2.1.310's drawn caret (`inverse`) over a narrow and a wide glyph, read from the
+    /// one attribute set. NEGATIVE CONTROLS: a wide glyph's continuation is not its leading cell,
+    /// and a plain or dim cell is no caret.
+    #[test]
+    fn a_cell_style_says_inverse_and_wide() {
+        let caret = parse_style("OK k 111318 d0d0d0 inverse").expect("a caret");
+        assert!(caret.inverse && !caret.wide && !caret.dim);
+        let wide = parse_style("OK %E4%BD%A0 111318 d0d0d0 bold,inverse,wide").expect("wide");
+        assert!(wide.inverse && wide.wide);
+        let cont = parse_style("OK  111318 d0d0d0 inverse,wide_cont").expect("continuation");
+        assert!(cont.inverse && !cont.wide);
+        for plain in ["OK e 999999 111318 dim", "OK k d0d0d0 111318 none"] {
+            let style = parse_style(plain).expect("a plain cell");
+            assert!(!style.inverse && !style.wide, "{plain}");
+        }
     }
 
     #[test]

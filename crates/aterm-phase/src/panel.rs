@@ -3,7 +3,7 @@
 
 //! Claude Code Settings panel detection ([`settings_panel`]) and Usage tab row predicates.
 
-use crate::anchors::{anchor, guard_regex};
+use crate::anchors::guard_regex;
 use crate::phase::{has_composer_frame, is_rule};
 use crate::prompt::is_panel_rule;
 
@@ -20,16 +20,16 @@ const USAGE_MARKS: [&str; 2] = ["Total cost:", "Current session"];
 const ERROR_HEAD: &str = "Error:";
 const RATE_LIMITED: &str = "rate limited";
 
-/// The anchors whose row says the tab's figures are not settled: a load or
+/// The anchor texts whose row says the tab's figures are not settled: a load or
 /// a refresh in flight, or figures the vendor itself calls last-known,
 /// partial or unrefreshed.
 const UNSETTLED: [&str; 6] = [
-    "usage.refreshing",
-    "usage.loading",
-    "usage.last_known",
-    "usage.could_not_refresh",
-    "usage.partial",
-    "usage.per_model",
+    crate::anchor!("usage.refreshing"),
+    crate::anchor!("usage.loading"),
+    crate::anchor!("usage.last_known"),
+    crate::anchor!("usage.could_not_refresh"),
+    crate::anchor!("usage.partial"),
+    crate::anchor!("usage.per_model"),
 ];
 
 /// Claude Code renderer that drew the Settings panel.
@@ -147,7 +147,7 @@ pub fn usage_tab_mark(row: &str) -> bool {
 #[must_use]
 pub fn usage_unsettled(row: &str) -> bool {
     let t = crate::text::trim(row);
-    UNSETTLED.iter().any(|id| t.starts_with(anchor(id)))
+    UNSETTLED.iter().any(|head| t.starts_with(head))
         || t.starts_with(ERROR_HEAD)
         || t.contains(RATE_LIMITED)
 }

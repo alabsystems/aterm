@@ -303,6 +303,7 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
         subject,
         standing,
         now: now.map(str::to_owned),
+        after_login: None,
         wanted: subject.wanted().to_owned(),
         note: note.map(str::to_owned),
         detail: detail.map(str::to_owned),

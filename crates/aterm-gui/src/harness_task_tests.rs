@@ -823,97 +823,17 @@ fn a_self_claims_landing_act_is_landed_and_every_other_act_is_open() {
     }
 }
 
-fn paint_claude(app: &App, session: u64, busy: bool) {
-    let rule = "\u{2500}".repeat(120);
-    let mut rows = vec![String::new(); 24];
-    rows[0] = "\u{23fa} Working on it.".into();
-    if busy {
-        rows[19] = "\u{2736} Deliberating\u{2026} (3s \u{00b7} thinking)".into();
-    }
-    rows[20] = rule.clone();
-    rows[21] = "\u{276f} ".into();
-    rows[22] = rule;
-    rows[23] = if busy {
-        "  \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt".into()
-    } else {
-        "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)".into()
+/// The program in session `session` reports a turn begun (OSC 7501 `working`, codex-alab's
+/// report), read as the status sweep reads it.
+fn reports_a_turn(app: &mut App, session: u64) {
+    let report = {
+        let pooled = app.pool.get(session).expect("pooled");
+        let mut term = crate::term_lock(&pooled.term);
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        term.program_state()
     };
-    let pooled = app.pool.get(session).expect("pooled");
-    let mut term = crate::term_lock(&pooled.term);
-    if term.cols() != 120 {
-        term.resize(24, 120);
-    }
-    let mut bytes = String::from("\x1b[H\x1b[2J");
-    for (i, row) in rows.iter().enumerate() {
-        bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
-    }
-    term.process(bytes.as_bytes());
-}
-
-#[test]
-fn the_status_sweep_reopens_a_proven_self_claims_landing_at_a_later_turn() {
-    let mut app = App::headless_for_test();
-    let host = idle_host();
-    app.harness = Some(host.clone());
-    let session = app.next_session_id;
-    app.push_stub_tab(crate::WindowId(0), crate::stub_session(session));
-    let ctx = app.pool.get(session).unwrap().ctx.clone();
-    ctx.meta
-        .lock()
-        .unwrap()
-        .set("autopilot", Some("land".into()));
-    let sid = ctx.self_id.as_str().to_string();
-    crate::session_timeline::claim_supervisor_as(
-        &ctx,
-        &format!("codex-alab@{}", std::process::id()),
-        Some(1),
-        None,
-        Some(crate::self_claim::stand_in::running()),
-        crate::metrics::now_us(),
-        aterm_slog::Actor::Ctl,
-    )
-    .expect("a proof takes a free session");
-    assert!(app.beside_proven_self_claim(session));
-    let face = |app: &App| {
-        app.pool
-            .get(session)
-            .unwrap()
-            .ctx
-            .timeline
-            .lock()
-            .unwrap()
-            .task_face()
-            .map(|(f, _)| f)
-    };
-    let mut t = Instant::now();
-    let mut sweep = |app: &mut App, busy: bool| {
-        for _ in 0..3 {
-            paint_claude(app, session, busy);
-            let _ = app.observe_session_statuses(t);
-            t += Duration::from_millis(300);
-        }
-    };
-    sweep(&mut app, false);
-    ctx.timeline
-        .lock()
-        .unwrap()
-        .queue_self_task(TaskFace::Landed);
-    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
-    assert_eq!(face(&app), Some(TaskFace::Landed));
-    sweep(&mut app, false);
-    assert_eq!(face(&app), Some(TaskFace::Landed), "quiet: still landed");
-    sweep(&mut app, true);
-    assert_eq!(
-        ctx.timeline.lock().unwrap().agent().word,
-        "busy",
-        "the sweep read the turn"
-    );
-    assert_eq!(
-        face(&app),
-        Some(TaskFace::Open),
-        "the sweep's read of a later turn reopens it"
-    );
-    host.shutdown_and_join();
+    app.session_status
+        .observe_program_state(session, report, true, false, Instant::now());
 }
 
 #[test]
@@ -1033,19 +953,7 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
     );
     app.reopen_self_claim_landing(0);
     assert_eq!(face(&app), Some(TaskFace::Landed), "quiet: still landed");
-    let publish = |word: &'static str| {
-        ctx.timeline.lock().unwrap().publish_agent(
-            word,
-            None,
-            None,
-            Some(aterm_phase::Program::Claude),
-            crate::session_timeline::AgentStamp {
-                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                fp: 1,
-            },
-        );
-    };
-    publish("busy");
+    reports_a_turn(&mut app, 0);
     app.reopen_self_claim_landing(0);
     assert_eq!(face(&app), Some(TaskFace::Open), "anyone's turn reopens it");
     assert!(crate::session_timeline::release_supervisor(
@@ -1222,16 +1130,7 @@ fn a_proven_self_claims_landing_marks_its_workers_task_done_with_its_rollout_rep
             "{shown}"
         );
 
-        ctx.timeline.lock().unwrap().publish_agent(
-            "busy",
-            None,
-            None,
-            Some(aterm_phase::Program::Codex),
-            crate::session_timeline::AgentStamp {
-                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
-                fp: 1,
-            },
-        );
+        reports_a_turn(&mut app, 0);
         let _ = ctx.fabric.fence_hold(false);
         app.reopen_self_claim_landing(0);
         assert_eq!(app.chip_glass(0).task, Some(TaskFace::Open));

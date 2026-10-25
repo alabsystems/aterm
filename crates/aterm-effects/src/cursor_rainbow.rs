@@ -192,7 +192,7 @@ pub struct RainbowConfig {
 }
 
 /// Tick output: the block fill colour and a frame fingerprint (`0` when dormant).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RainbowFrame {
     /// Block-fill colour (`0x00RRGGBB`), or `None` when the rainbow cursor is off.
     pub fill: Option<u32>,
@@ -200,8 +200,20 @@ pub struct RainbowFrame {
     pub fp: u64,
 }
 
+impl RainbowFrame {
+    /// Dormant frame output (`fill: None, fp: 0`).
+    pub const DORMANT: Self = Self { fill: None, fp: 0 };
+}
+
+impl Default for RainbowFrame {
+    #[inline]
+    fn default() -> Self {
+        Self::DORMANT
+    }
+}
+
 /// Per-window rainbow-cursor animation state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CursorRainbow {
     /// Standalone spin in unit turns (`0..1`).
     phase: f32,
@@ -239,7 +251,40 @@ pub struct CursorRainbow {
     settle_sink: Vec<GlowQuad>,
 }
 
+impl Default for CursorRainbow {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorRainbow {
+    /// Fresh dormant rainbow-cursor animation state.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            phase: 0.0,
+            pulse: 0.0,
+            last: None,
+            energy: 0.0,
+            paint: 0.0,
+            flare_rung: 0,
+            twinkle_at: None,
+            twinkle_seq: 0,
+            spin: 0.0,
+            twinkling: false,
+            flaring: false,
+            fp_last: 0,
+            fp_prev: 0,
+            rim_scratch: Vec::new(),
+            rim_memo: None,
+            settle_probe: None,
+            settle_memo: None,
+            settle_sink: Vec::new(),
+        }
+    }
+
     /// Reset animation state while preserving pooled scratch buffers and the rim LUT memo.
     #[inline]
     pub fn reset(&mut self) {
@@ -252,7 +297,7 @@ impl CursorRainbow {
             rim_scratch,
             rim_memo,
             settle_sink,
-            ..Self::default()
+            ..Self::new()
         };
     }
 
@@ -566,9 +611,12 @@ impl CursorRainbow {
             };
             fill = mix_rgb(fill, glint, TWINKLE_MIX * pop * cfg.intensity);
         }
-        let caret_floor =
-            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE);
-        let fill = if dark_theme {
+        let caret_floor = if dark_theme && paint > 0.0 {
+            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE)
+        } else {
+            0.0
+        };
+        let fill = if caret_floor > 0.0 {
             lift_to_light_floor(fill, caret_floor)
         } else {
             fill
@@ -594,7 +642,11 @@ impl CursorRainbow {
             }
         };
 
-        let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin();
+        let breath = if self.pulse == 0.0 {
+            0.5
+        } else {
+            0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin()
+        };
         let halo_energy = HALO_IDLE_FLOOR * (0.35 + PULSE_DEPTH * breath) + paint;
         let mut flare_pop = 1.0f32;
         let mut rim_key: Option<RimMemoKey> = None;
@@ -608,7 +660,11 @@ impl CursorRainbow {
             let cx = geom.origin_x as i32 + cc as i32 * cw;
             let cy = geom.origin_y as i32 + cr as i32 * ch;
             flare_pop = flare_age.map_or(1.0, |age| {
-                1.0 + FLARE_RING_POP * (-age / FLARE_RING_TAU_S).exp()
+                if age >= 20.0 * FLARE_RING_TAU_S {
+                    1.0
+                } else {
+                    1.0 + FLARE_RING_POP * (-age / FLARE_RING_TAU_S).exp()
+                }
             });
             let halo_r = lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, paint);
             let radius_x = (halo_r * cw as f32 * flare_pop).max(1.0);
@@ -831,20 +887,27 @@ impl CursorRainbow {
 
     /// Apply equalised ring colours across each ring's quad slice.
     #[inline]
-    fn apply_equalised_rings(
+    const fn apply_equalised_rings(
         quads: &mut [GlowQuad],
         rings: &[(usize, u8, u32, u32)],
         best: &[u32; HALO_LAYERS as usize],
     ) {
-        for (i, &(start, _, _, _)) in rings.iter().enumerate() {
-            let end = rings
-                .get(i + 1)
-                .map_or(quads.len(), |&(next, _, _, _)| next);
+        let mut i = 0;
+        while i < rings.len() {
+            let start = rings[i].0;
+            let end = if i + 1 < rings.len() {
+                rings[i + 1].0
+            } else {
+                quads.len()
+            };
             let col = best[i];
-            for q in &mut quads[start..end] {
-                q.color = col;
-                q.color2 = col;
+            let mut j = start;
+            while j < end {
+                quads[j].color = col;
+                quads[j].color2 = col;
+                j += 1;
             }
+            i += 1;
         }
     }
 
@@ -1203,7 +1266,7 @@ const CARET_LIGHT_KNEE: f32 = 0.25;
 /// Lift a colour toward white until its relative luminance reaches `floor`.
 pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     let floor = floor.clamp(0.0, 255.0);
-    if floor <= 0.0 {
+    if floor <= 0.0 || (rgb & 0x00FF_FFFF) == 0x00FF_FFFF {
         return rgb;
     }
     let table = crate::color_math::relative_luminance_table();
@@ -1243,7 +1306,7 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
 
 /// Relative luminance of one additive quad-pixel over `page`.
 #[inline]
-fn light_on_glass_with(
+const fn light_on_glass_with(
     table: &crate::color_math::RelativeLuminanceTable,
     (pr, pg, pb): (usize, usize, usize),
     premul: u32,
@@ -1251,13 +1314,12 @@ fn light_on_glass_with(
     let r = ((premul >> 16) & 0xff) as usize;
     let g = ((premul >> 8) & 0xff) as usize;
     let b = (premul & 0xff) as usize;
-    crate::color_math::relative_luminance_rgb(
-        table,
-        (pr + r).min(255),
-        (pg + g).min(255),
-        (pb + b).min(255),
-    ) + aterm_render::hdr::HDR_GLOW_BOOST
-        * crate::color_math::relative_luminance_rgb(table, r, g, b)
+    let r_sum = if pr + r < 255 { pr + r } else { 255 };
+    let g_sum = if pg + g < 255 { pg + g } else { 255 };
+    let b_sum = if pb + b < 255 { pb + b } else { 255 };
+    crate::color_math::relative_luminance_rgb(table, r_sum, g_sum, b_sum)
+        + aterm_render::hdr::HDR_GLOW_BOOST
+            * crate::color_math::relative_luminance_rgb(table, r, g, b)
 }
 
 /// Solve one ring's premultiplied colour on `page` for [`RIM_LIGHT`].

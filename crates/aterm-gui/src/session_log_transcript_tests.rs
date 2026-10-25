@@ -733,9 +733,20 @@ const MEASURED: Image = Image {
     start: captured_start,
     born_ms: unborn,
     build: alab_12521,
+    group: own_group,
+    task: no_task,
 };
 
 fn unborn(_: u32) -> Option<u64> {
+    None
+}
+
+/// The rig's claimant leads its own group (300, [`super::super::tests::with_agent`]).
+fn own_group(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok()
+}
+
+fn no_task(_: u32) -> Option<String> {
     None
 }
 
@@ -863,6 +874,8 @@ fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
         start: captured_start,
         born_ms: born_late,
         build: alab_12521,
+        group: own_group,
+        task: no_task,
     };
     let _ = host.ask(0xC0DE_0021, &claim.0, target, born);
     let got = lines_of(&tl);
@@ -872,6 +885,8 @@ fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
         start: captured_start,
         born_ms: unborn,
         build: alab_unmeasured,
+        group: own_group,
+        task: no_task,
     };
     let _ = host.ask(0xC0DE_0022, &claim.0, target, unmeasured);
     let got = lines_of(&tl);
@@ -923,6 +938,8 @@ fn each_ask_the_rollout_tap_answers_is_counted_after_its_records() {
         start: captured_start,
         born_ms: unborn,
         build: alab_unmeasured,
+        group: own_group,
+        task: no_task,
     };
     for ((name, agent, build, image, thread, word, asks), session) in [
         (
@@ -1173,4 +1190,75 @@ fn a_new_target_is_read_by_a_new_tap() {
         .is_none()
     );
     assert!(turns_opened(&lines_of(&tl)).is_empty());
+}
+
+/// THE SURVEY'S FACTS: the tap publishes what the rollout says (model, effort, cwd) to the
+/// timeline's codex slot for the claimant's group in front, whatever codex-alab build wrote it
+/// (the steps' fold is gated to measured builds, these facts are not); a group not in front takes
+/// nothing; the tap's stop takes them away.
+#[test]
+fn the_rollout_tap_publishes_the_survey_facts_for_the_claimants_group_whatever_its_build() {
+    let survey = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().codex_survey().cloned();
+    let fields = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().slog().rollout_fields();
+    let mut host = Host::default();
+    let unmeasured = Image {
+        build: alab_unmeasured,
+        ..MEASURED
+    };
+    for (name, image, word) in [
+        ("measured", MEASURED, "bound"),
+        ("unmeasured", unmeasured, "unmeasured"),
+    ] {
+        let (tl, _home, target, claim) = codex_rig(
+            &format!("facts-{name}"),
+            "codex",
+            "0.164.0-dev.12521+g3d3eb12d8",
+        );
+        assert_eq!(survey(&tl), None, "{name}");
+        let _ = host.ask(0xC0DE_0070, &claim.0, target.clone(), image);
+        assert_eq!(
+            fields(&tl),
+            format!("rollout={word} rollout_asks=1"),
+            "{name}"
+        );
+        let got = survey(&tl).unwrap_or_else(|| panic!("{name}: no facts published"));
+        assert_eq!(got.facts.model.as_deref(), Some("gpt-5.5"), "{name}");
+        assert_eq!(got.facts.effort.as_deref(), Some("high"), "{name}");
+        assert_eq!(
+            got.facts.cwd.as_deref(),
+            Some(std::path::Path::new("/private/tmp/x")),
+            "{name}"
+        );
+        assert_eq!(got.task, None, "{name}");
+        host.stop(0xC0DE_0070, &claim.0);
+        assert_eq!(survey(&tl), None, "{name}: the stop forgets them");
+        assert_eq!(fields(&tl), "rollout=stopped rollout_asks=1", "{name}");
+    }
+
+    let (tl, _home, target, claim) =
+        codex_rig("facts-behind", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let behind = Image {
+        group: |_| Some(301),
+        ..MEASURED
+    };
+    let _ = host.ask(0xC0DE_0071, &claim.0, target.clone(), behind);
+    assert_eq!(survey(&tl), None, "a group not in front takes nothing");
+    let _ = host.ask(0xC0DE_0071, &claim.0, target, MEASURED);
+    assert_eq!(
+        survey(&tl).and_then(|s| s.facts.model),
+        Some("gpt-5.5".into()),
+        "facts no group took are offered again, though the rollout did not move"
+    );
+    let tasked = Image {
+        task: |_| Some("port the parser".into()),
+        ..MEASURED
+    };
+    let (tl, _home, target, claim) =
+        codex_rig("facts-tasked", "codex", "0.164.0-dev.12521+g3d3eb12d8");
+    let _ = host.ask(0xC0DE_0072, &claim.0, target, tasked);
+    assert_eq!(
+        survey(&tl).and_then(|s| s.task),
+        Some("port the parser".into()),
+        "a worker's task rides with the facts"
+    );
 }

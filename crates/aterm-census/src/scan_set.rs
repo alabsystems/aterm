@@ -238,7 +238,8 @@ pub fn classify_patch_target(
     Ok(PatchTargetKind::FirstParty)
 }
 
-/// Vendored or absorbed crate scanned in namespaced identity mode.
+/// Vendored, absorbed, or separately managed workspace library scanned with
+/// its own lock and function identities. This does not exempt internal cycles.
 #[derive(Debug)]
 pub struct ScannedVendored {
     /// Package name.
@@ -251,6 +252,8 @@ pub struct ScannedVendored {
     pub scan_dir: String,
     /// Labeled per-platform subtrees.
     pub platform_slices: &'static [PlatformSlice],
+    /// A separately managed workspace library, rather than a redistributed fork.
+    pub external_workspace: bool,
 }
 
 /// Derived census scan set and package classifications.
@@ -260,7 +263,7 @@ pub struct ScanSet {
     pub scan_dirs: Vec<String>,
     /// Excluded proc-macro crates as `(package, crate_dir)`.
     pub proc_macros: Vec<(String, String)>,
-    /// Vendored and absorbed crates scanned in namespaced mode.
+    /// Libraries with independently scoped lock and function identities.
     pub vendored_scanned: Vec<ScannedVendored>,
     /// First-party `[patch.*]` redirects as `(package, path)`.
     pub first_party_patches: Vec<(String, String)>,
@@ -481,6 +484,8 @@ struct Manifest {
     proc_macro: bool,
     features: BTreeMap<String, Vec<String>>,
     deps: Vec<DepEdge>,
+    ws_deps: BTreeMap<String, WsSpec>,
+    workspace_root: String,
 }
 
 enum SectionKind {
@@ -655,6 +660,8 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
         proc_macro: false,
         features: BTreeMap::new(),
         deps: Vec::new(),
+        ws_deps: BTreeMap::new(),
+        workspace_root: String::new(),
     };
     for (header, entries) in &doc.sections {
         if header.is_empty() {
@@ -725,19 +732,22 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
     if m.name.is_empty() {
         return Err(format!("{file_rel}: no `[package] name` (fail-closed)"));
     }
+    let (workspace_root, tables) = declaring_workspace(root, dir, &doc)?;
+    m.workspace_root = workspace_root;
+    m.ws_deps = tables.ws_deps;
     Ok(m)
 }
 
 /// Returns normal external dependency package names declared in `<root>/<dir>/Cargo.toml`.
 pub(crate) fn external_dependency_names(root: &Path, dir: &str) -> Result<Vec<String>, String> {
-    let tables = load_root_tables(root)?;
-    Ok(load_manifest(root, dir)?
+    let manifest = load_manifest(root, dir)?;
+    Ok(manifest
         .deps
         .into_iter()
         .filter(|edge| {
             edge.path.is_none()
                 && !(edge.workspace
-                    && tables
+                    && manifest
                         .ws_deps
                         .get(&edge.key)
                         .is_some_and(|ws| ws.dir.is_some()))
@@ -751,16 +761,15 @@ pub(crate) fn member_reach(
     root: &Path,
     dir: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let tables = load_root_tables(root)?;
     let mut reach: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut queue = std::collections::VecDeque::from([(dir.to_string(), Vec::new())]);
     while let Some((at, chain)) = queue.pop_front() {
         let manifest = load_manifest(root, &at)?;
         for edge in &manifest.deps {
             let child = if edge.workspace {
-                let Some(ws) = tables.ws_deps.get(&edge.key) else {
+                let Some(ws) = manifest.ws_deps.get(&edge.key) else {
                     return Err(format!(
-                        "{at}/Cargo.toml: `{}` says `workspace = true` but the root \
+                        "{at}/Cargo.toml: `{}` says `workspace = true` but its workspace \
                          [workspace.dependencies] has no such entry (fail-closed)",
                         edge.key
                     ));
@@ -957,10 +966,75 @@ fn patch_row(key: &str, value: &Value) -> (String, Value) {
 }
 
 fn load_root_tables(root: &Path) -> Result<RootTables, String> {
-    let file_rel = "Cargo.toml";
-    let text = crate::tree::read_to_string(&root.join(file_rel))
+    load_tables(root, "")
+}
+
+/// Cargo inheritance belongs to the package's nearest (or explicitly named)
+/// workspace. A vendored workspace does not inherit the consumer's root table.
+fn declaring_workspace(root: &Path, dir: &str, doc: &Doc) -> Result<(String, RootTables), String> {
+    let explicit = doc
+        .sections
+        .iter()
+        .filter(|(header, _)| header == "package")
+        .flat_map(|(_, entries)| entries)
+        .find_map(|(key, value)| {
+            if key == "workspace" {
+                Some(value)
+            } else {
+                None
+            }
+        });
+    let mut candidate = match explicit {
+        Some(Value::Str(path)) if !Path::new(path).is_absolute() => normalize_rel(dir, path)?,
+        Some(_) => {
+            return Err(format!(
+                "{dir}/Cargo.toml: package.workspace must be a repository-relative path"
+            ));
+        }
+        None => dir.to_string(),
+    };
+    loop {
+        let file = if candidate.is_empty() {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{candidate}/Cargo.toml")
+        };
+        match crate::tree::read_to_string(&root.join(&file)) {
+            Ok(text) => {
+                let parent = parse_doc(&text, &file)?;
+                if parent
+                    .sections
+                    .iter()
+                    .any(|(header, _)| header == "workspace" || header.starts_with("workspace."))
+                {
+                    let tables = load_tables(root, &candidate)?;
+                    return Ok((candidate, tables));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => {}
+            Err(error) => return Err(format!("cannot read declaring workspace {file}: {error}")),
+        }
+        if explicit.is_some() || candidate.is_empty() {
+            return Err(format!(
+                "{dir}/Cargo.toml: inherited dependency has no declaring workspace (fail-closed)"
+            ));
+        }
+        candidate = candidate
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            .to_string();
+    }
+}
+
+fn load_tables(root: &Path, base: &str) -> Result<RootTables, String> {
+    let file_rel = if base.is_empty() {
+        "Cargo.toml".to_string()
+    } else {
+        format!("{base}/Cargo.toml")
+    };
+    let text = crate::tree::read_to_string(&root.join(&file_rel))
         .map_err(|e| format!("cannot read the workspace root {file_rel}: {e} (fail-closed)"))?;
-    let doc = parse_doc(&text, file_rel)?;
+    let doc = parse_doc(&text, &file_rel)?;
     let mut out = RootTables {
         ws_deps: BTreeMap::new(),
         patches: BTreeMap::new(),
@@ -969,10 +1043,10 @@ fn load_root_tables(root: &Path) -> Result<RootTables, String> {
         if header.is_empty() {
             continue;
         }
-        match classify_section(header, file_rel)? {
+        match classify_section(header, &file_rel)? {
             SectionKind::WorkspaceDeps => {
                 for (k, v) in entries {
-                    let edge = dep_edge(k, v, file_rel)?;
+                    let edge = dep_edge(k, v, &file_rel)?;
                     if edge.workspace {
                         return Err(format!(
                             "{file_rel}: workspace dep `{k}` cannot itself say \
@@ -980,7 +1054,7 @@ fn load_root_tables(root: &Path) -> Result<RootTables, String> {
                         ));
                     }
                     let dir = match &edge.path {
-                        Some(p) => Some(normalize_rel("", p)?),
+                        Some(p) => Some(normalize_rel(base, p)?),
                         None => None,
                     };
                     out.ws_deps.insert(
@@ -996,7 +1070,7 @@ fn load_root_tables(root: &Path) -> Result<RootTables, String> {
             SectionKind::Patch => {
                 for (k, v) in entries {
                     let (package, spec) = patch_row(k, v);
-                    let edge = dep_edge(k, &spec, file_rel)?;
+                    let edge = dep_edge(k, &spec, &file_rel)?;
                     let Some(p) = edge.path else {
                         return Err(format!(
                             "{file_rel}: `[patch]` entry `{k}` is not a path redirect — \
@@ -1004,7 +1078,7 @@ fn load_root_tables(root: &Path) -> Result<RootTables, String> {
                         ));
                     };
                     out.patches
-                        .insert(k.clone(), (package, normalize_rel("", &p)?));
+                        .insert(k.clone(), (package, normalize_rel(base, &p)?));
                 }
             }
             _ => {}
@@ -1153,9 +1227,9 @@ pub fn derive_linked_scan_set(
             let mut updates: Vec<(String, bool, BTreeSet<String>)> = Vec::new();
             for edge in &m.deps {
                 let (child_dir, mut defaults, mut feats) = if edge.workspace {
-                    let Some(ws) = tables.ws_deps.get(&edge.key) else {
+                    let Some(ws) = m.ws_deps.get(&edge.key) else {
                         return Err(format!(
-                            "{dir}/Cargo.toml: `{}` says `workspace = true` but the root \
+                            "{dir}/Cargo.toml: `{}` says `workspace = true` but its workspace \
                              [workspace.dependencies] has no such entry (fail-closed)",
                             edge.key
                         ));
@@ -1335,6 +1409,7 @@ pub fn derive_linked_scan_set(
             crate_dir: path.clone(),
             scan_dir,
             platform_slices: &[],
+            external_workspace: false,
         });
     }
     for r in &reviewed {
@@ -1375,6 +1450,23 @@ pub fn derive_linked_scan_set(
         };
         vendored_scanned.push(scan_absorbed(root, row, &package, &mut scan_dirs)?);
         absorbed.push((package, row.path.to_string()));
+    }
+    for (dir, manifest) in &manifests {
+        if manifest.workspace_root.is_empty()
+            || manifest.proc_macro
+            || !state.contains_key(dir)
+            || vendored_scanned.iter().any(|entry| entry.crate_dir == *dir)
+        {
+            continue;
+        }
+        vendored_scanned.push(ScannedVendored {
+            package: manifest.name.clone(),
+            namespace: intern(&format!("external::{}", manifest.name)),
+            crate_dir: dir.clone(),
+            scan_dir: format!("{dir}/src"),
+            platform_slices: &[],
+            external_workspace: true,
+        });
     }
     {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -1427,6 +1519,7 @@ fn scan_absorbed(
         crate_dir: row.path.to_string(),
         scan_dir,
         platform_slices: row.platform_slices,
+        external_workspace: false,
     })
 }
 
@@ -1459,7 +1552,9 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             .vendored_scanned
             .iter()
             .map(|v| {
-                if v.platform_slices.is_empty() {
+                if v.external_workspace {
+                    format!("{} ({}; separate workspace)", v.package, v.crate_dir)
+                } else if v.platform_slices.is_empty() {
                     format!("{} ({})", v.package, v.crate_dir)
                 } else {
                     let labels: Vec<&str> = v.platform_slices.iter().map(|s| s.label).collect();
@@ -1474,9 +1569,9 @@ pub fn render_scan_set(set: &ScanSet) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "      vendored [patch] and absorbed crate(s) SCANNED in vendored-identity \
-             mode (vendor/forge.toml's [[fork]] blocks and ABSORBED_CRATES, fail-closed both \
-             ways) — upstream process code, each crate's lock identities in its own \
+            "      vendored, absorbed, and external-workspace libraries SCANNED in isolated-identity \
+             mode (fork provenance remains checked; external workspaces are derived from manifests) \
+             — process code, each crate's lock identities in its own \
              `<crate>::…` namespace so foreign receiver names can never merge with \
              aterm identities or each other: {}",
             listed.join(", ")
@@ -1947,6 +2042,78 @@ mod tests {
                 "crates/aterm-gui/src",
                 "crates/aterm-types/src",
             ]
+        );
+    }
+
+    #[test]
+    fn a_nested_workspaces_dependencies_and_features_belong_to_that_workspace() {
+        for explicit in ["", "workspace = \"../..\"\n"] {
+            let mut files = test_fixtures::workspace_manifests(&[(
+                "aterm-a",
+                "[dependencies]\nstart = { path = \"../../vendor/nested/crates/start\" }\n",
+            )]);
+            let outer = files
+                .iter_mut()
+                .find(|(path, _)| path == "Cargo.toml")
+                .unwrap();
+            outer.1 = outer.1.replacen(
+                "[workspace.dependencies]\n",
+                "[workspace.dependencies]\nshared = { path = \"wrong-root-package\" }\n",
+                1,
+            );
+            files.extend([
+                ("vendor/nested/Cargo.toml".into(), "[workspace]\nmembers = [\"crates/*\"]\n[workspace.dependencies]\nshared = { path = \"crates/leaf\", features = [\"wanted\"] }\n".into()),
+                ("vendor/nested/crates/start/Cargo.toml".into(), format!("[package]\nname = \"start\"\n{explicit}[dependencies]\nshared.workspace = true\n")),
+                ("vendor/nested/crates/leaf/Cargo.toml".into(), "[package]\nname = \"leaf\"\n[features]\nwanted = [\"dep:extra\"]\n[dependencies]\nextra = { path = \"../extra\", optional = true }\n".into()),
+                ("vendor/nested/crates/extra/Cargo.toml".into(), "[package]\nname = \"extra\"\n".into()),
+                ("vendor/nested/crates/start/src/lib.rs".into(), "// start\n".into()),
+                ("vendor/nested/crates/leaf/src/lib.rs".into(), "// leaf\n".into()),
+                ("vendor/nested/crates/extra/src/lib.rs".into(), "// extra\n".into()),
+            ]);
+            let root = synth_tree("aterm-scan-set", "nested-workspace", &with_src(files));
+            let set = derive_gui_scan_set(&root).expect("nested inheritance");
+            assert!(
+                set.scan_dirs
+                    .contains(&"vendor/nested/crates/leaf/src".into())
+            );
+            assert!(
+                set.scan_dirs
+                    .contains(&"vendor/nested/crates/extra/src".into())
+            );
+            assert!(
+                external_dependency_names(&root, "vendor/nested/crates/start")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_nested_workspace_entry_does_not_fall_back_to_the_outer_workspace() {
+        let mut files = test_fixtures::workspace_manifests(&[(
+            "aterm-a",
+            "[dependencies]\nstart = { path = \"../../vendor/nested/crates/start\" }\n",
+        )]);
+        files.extend([
+            (
+                "vendor/nested/Cargo.toml".into(),
+                "[workspace]\nmembers = [\"crates/*\"]\n".into(),
+            ),
+            (
+                "vendor/nested/crates/start/Cargo.toml".into(),
+                "[package]\nname = \"start\"\n[dependencies]\naterm-types.workspace = true\n"
+                    .into(),
+            ),
+            (
+                "vendor/nested/crates/start/src/lib.rs".into(),
+                "// start\n".into(),
+            ),
+        ]);
+        let error =
+            derive("missing-nested-entry", with_src(files)).expect_err("no outer inheritance");
+        assert!(
+            error.contains("aterm-types") && error.contains("no such entry"),
+            "{error}"
         );
     }
 

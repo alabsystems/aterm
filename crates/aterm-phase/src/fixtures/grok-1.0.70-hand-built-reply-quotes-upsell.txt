@@ -1,0 +1,14 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-24: a reply whose prose quotes the upsells' titles and their `Try Again` row, assembled as grok-1.0.70-hand-built-wall-credit-limit is, with no upsell — every row is the reply's own words, so none opens with an upsell's text
+  ~/proj
+
+  › what does grok print when the credits run out?
+
+  When the plan's credits are spent it prints "You’ve hit the credit limit for your plan."
+  over its options, and at the weekly cap it prints "You hit your weekly limit." instead.
+  Try Again is the last option, and its line says "Resubmit the last prompt once you have
+  usage again"; pay-as-you-go adds "You’ve hit your spending cap." when that runs out too.
+
+
+
+
+                                                 ctrl+q  quit

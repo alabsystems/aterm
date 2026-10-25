@@ -577,14 +577,24 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
         "stalls",
         format!("showed_it_ran {}", q(s(&stalls))),
     );
-    let interrupted = lib.call(
-        format!(
-            "( bounded() {{ return 130; }}; showed_it_ran {}; rc=$?; printf %s \"$UNPROVEN\"; \
-             exit $rc )",
-            q(s(&answers))
-        ),
-        &[],
-    );
+    let mut interrupted = Vec::new();
+    for status in [129, 130, 131, 143] {
+        for as_root in [false, true] {
+            let identity = if as_root {
+                root("return 1") + "; "
+            } else {
+                String::new()
+            };
+            interrupted.push(lib.call(
+                format!(
+                    "( {identity}bounded() {{ return {status}; }}; showed_it_ran {}; rc=$?; \
+                     printf %s \"$UNPROVEN\"; exit $rc )",
+                    q(s(&answers))
+                ),
+                &[],
+            ));
+        }
+    }
     let sudo_refused = lib.call(
         format!("( {}; showed_it_ran {} )", root("return 1"), q(s(&answers))),
         &[],
@@ -669,7 +679,6 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     }
     for i in [
         cut_off,
-        interrupted,
         sudo_refused,
         unasked,
         as_nobody_cut_off,
@@ -684,10 +693,13 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
         recs[cut_off].var("UNPROVEN"),
         format!("{} did not answer within 60s", s(&stalls))
     );
-    assert_eq!(
-        recs[interrupted].out,
-        format!("{} was interrupted before it answered", s(&answers))
-    );
+    for i in interrupted {
+        assert_eq!(recs[i].rc, 1, "no proof: {}", recs[i].err);
+        assert_eq!(
+            recs[i].out,
+            format!("{} was interrupted before it answered", s(&answers))
+        );
+    }
     assert_eq!(
         recs[sibling].var("UNPROVEN"),
         format!("{} did not answer within 60s", s(&siblings.join("atpkg"))),

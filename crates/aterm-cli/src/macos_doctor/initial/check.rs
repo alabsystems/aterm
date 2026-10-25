@@ -227,6 +227,8 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
         rows: Vec::new(),
         manual_steps: Vec::new(),
         backup: root.join("original-preferences.json"),
+        restore: None,
+        page: None,
     };
     let mut vault_ready = !Stage::Secrets.selected(plan);
     for stage in Stage::ALL {

@@ -42,7 +42,6 @@ pub struct DogLook {
 }
 
 /// Per-window dog-cameo lifecycle state; `Default` is "never summoned".
-#[derive(Default)]
 pub struct DogCameo {
     /// The current visit's entry instant (`None` before the first summon; the accessors
     /// self-expire).
@@ -51,7 +50,24 @@ pub struct DogCameo {
     look: Option<DogLook>,
 }
 
+impl Default for DogCameo {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DogCameo {
+    /// Construct a fresh dog-cameo state before any summon.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            since: None,
+            look: None,
+        }
+    }
+
     /// Summon a dog by rolling a breed and coat from `seed` and restarting the envelope.
     #[inline]
     pub fn on_summon(&mut self, now: Instant, seed: u64) {

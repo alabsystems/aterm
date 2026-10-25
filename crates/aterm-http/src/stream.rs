@@ -168,28 +168,89 @@ pub struct TcpConnector;
 impl Connect for TcpConnector {
     fn connect(&self, host: &str, port: u16, deadline: Deadline) -> io::Result<TcpStream> {
         use std::net::ToSocketAddrs;
-        let within = deadline.remaining_or_timeout()?;
-        let addrs = resolve_within(host, port, within, |host, port| {
-            (host, port).to_socket_addrs()
-        })?;
-        let mut last = None;
-        for addr in addrs {
-            let (budget, cap) = deadline.per_call()?;
-            match crate::connect::connect_timeout(&addr, budget) {
-                Ok(stream) => {
-                    stream.set_nodelay(true)?;
-                    return Ok(stream);
-                }
-                Err(error) => last = Some(deadline.as_timeout(error, cap)),
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("dns: {host}: resolved to no addresses"),
-            )
-        }))
+        connect_with(
+            host,
+            port,
+            deadline,
+            |host, port| (host, port).to_socket_addrs(),
+            crate::local_network::denied,
+        )
     }
+}
+
+/// [`TcpConnector::connect`] over `resolver`, a failed lookup asking `denied`
+/// ([`refused_local`]).
+fn connect_with<F, I>(
+    host: &str,
+    port: u16,
+    deadline: Deadline,
+    resolver: F,
+    denied: impl FnOnce(&str, Duration) -> bool,
+) -> io::Result<TcpStream>
+where
+    F: FnOnce(&str, u16) -> io::Result<I> + Send + 'static,
+    I: Iterator<Item = SocketAddr>,
+{
+    let within = deadline.remaining_or_timeout()?;
+    let addrs = resolve_within(host, port, within, resolver)
+        .map_err(|error| refused_local(host, error, denial_wait(&deadline), denied))?;
+    let mut last = None;
+    for addr in addrs {
+        let (budget, cap) = deadline.per_call()?;
+        match crate::connect::connect_timeout(&addr, budget) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Err(error) => last = Some(deadline.as_timeout(error, cap)),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("dns: {host}: resolved to no addresses"),
+        )
+    }))
+}
+
+/// How long a failed lookup of a local name waits for mDNSResponder to say
+/// whether it refuses this process the name ([`refused_local`]).
+const DENIAL_WAIT: Duration = Duration::from_secs(1);
+
+/// [`DENIAL_WAIT`], or what is left of `deadline` when less (nothing once it
+/// has passed).
+fn denial_wait(deadline: &Deadline) -> Duration {
+    deadline
+        .remaining()
+        .map_or(Duration::ZERO, |left| left.min(DENIAL_WAIT))
+}
+
+/// `error`, a failed lookup of `host`, named as macOS's Local Network refusal
+/// when `denied` says mDNSResponder refuses this process the local name within
+/// `wait` (`crate::local_network`). `getaddrinfo` reports that refusal as a
+/// definite "no such name", read as "nothing there"; a connect macOS refuses
+/// the same app fails `HostUnreachable`, so the lookup's refusal takes that
+/// kind too. A lookup that timed out (a question still on screen holds it) and
+/// a name the gate does not cover are left as they are, without asking.
+fn refused_local(
+    host: &str,
+    error: io::Error,
+    wait: Duration,
+    denied: impl FnOnce(&str, Duration) -> bool,
+) -> io::Error {
+    if error.kind() == io::ErrorKind::TimedOut
+        || wait.is_zero()
+        || !crate::local_network::is_local_name(host)
+        || !denied(host, wait)
+    {
+        return error;
+    }
+    io::Error::new(
+        io::ErrorKind::HostUnreachable,
+        format!(
+            "dns: {host}: macOS does not let this app use the local network (Local Network privacy)"
+        ),
+    )
 }
 
 /// Resolve `host:port` through `resolver` on a helper thread, waiting at most
@@ -638,6 +699,100 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "dns: no answer within 100ms");
         drop(never_tx);
+    }
+
+    /// A local name mDNSResponder refuses is named as macOS's refusal, the kind
+    /// a refused connect has; a timeout, a name the gate does not cover, no
+    /// time left and no refusal keep the lookup's own error, and only a local
+    /// name with time left is asked about.
+    #[test]
+    fn only_a_refused_local_name_is_named_as_the_local_network_refusal() {
+        let no_such_name =
+            || io::Error::other("dns: alab-secrets.local: nodename nor servname provided");
+        let wait = Duration::from_secs(1);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refuses = |host: &str, within: Duration| {
+            asked.borrow_mut().push((host.to_owned(), within));
+            true
+        };
+        let error = refused_local("alab-secrets.local", no_such_name(), wait, refuses);
+        assert_eq!(error.kind(), io::ErrorKind::HostUnreachable);
+        assert_eq!(
+            error.to_string(),
+            "dns: alab-secrets.local: macOS does not let this app use the local network (Local Network privacy)"
+        );
+        assert_eq!(*asked.borrow(), [("alab-secrets.local".to_owned(), wait)]);
+
+        let held = io::Error::new(io::ErrorKind::TimedOut, "dns: no answer within 8000ms");
+        for (host, error, wait) in [
+            ("alab-secrets.local", held, wait),
+            ("github.com", no_such_name(), wait),
+            ("alab-secrets.local", no_such_name(), Duration::ZERO),
+        ] {
+            let kind = error.kind();
+            let text = error.to_string();
+            let kept = refused_local(host, error, wait, refuses);
+            assert_eq!((kept.kind(), kept.to_string()), (kind, text), "{host}");
+        }
+        assert_eq!(asked.borrow().len(), 1, "none of those asks mDNSResponder");
+
+        let kept = refused_local("alab-secrets.local", no_such_name(), wait, |_, _| false);
+        assert_eq!(kept.kind(), io::ErrorKind::Other);
+        assert!(kept.to_string().contains("nodename nor servname"), "{kept}");
+    }
+
+    /// The wait to ask is [`DENIAL_WAIT`] with time to spare, never more than
+    /// the deadline has left, and nothing once it has passed.
+    #[test]
+    fn the_wait_to_ask_is_capped_by_what_the_deadline_has_left() {
+        assert_eq!(denial_wait(&Deadline::after(HANG_DETECTOR)), DENIAL_WAIT);
+        let short = DENIAL_WAIT / 4;
+        assert!(denial_wait(&Deadline::after(short)) <= short);
+        assert_eq!(
+            denial_wait(&Deadline::after(Duration::ZERO)),
+            Duration::ZERO
+        );
+    }
+
+    /// The connector's failed lookup goes through that naming, with at most
+    /// [`DENIAL_WAIT`] to ask; CONTROL: no refusal keeps the lookup's error.
+    #[test]
+    fn the_connector_names_a_refused_local_lookup() {
+        let lookup = |_: &str, _: u16| {
+            Err::<std::iter::Empty<SocketAddr>, _>(io::Error::other(
+                "nodename nor servname provided",
+            ))
+        };
+        let waits = std::cell::RefCell::new(Vec::new());
+        let error = connect_with(
+            "alab-secrets.local",
+            7484,
+            Deadline::after(HANG_DETECTOR),
+            lookup,
+            |_, within| {
+                waits.borrow_mut().push(within);
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::HostUnreachable, "{error}");
+        assert_eq!(*waits.borrow(), [DENIAL_WAIT]);
+
+        let error = connect_with(
+            "alab-secrets.local",
+            7484,
+            Deadline::after(HANG_DETECTOR),
+            lookup,
+            |_, _| false,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other, "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("dns: alab-secrets.local: nodename"),
+            "{error}"
+        );
     }
 
     #[test]

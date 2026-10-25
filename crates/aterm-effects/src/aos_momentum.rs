@@ -67,9 +67,13 @@ pub mod m4;
 #[cfg(test)]
 mod m4_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-learn"))]
+pub mod m6;
+#[cfg(any(test, debug_assertions, feature = "aos-learn"))]
 pub mod m6_policy;
 #[cfg(test)]
 mod m6_policy_tests;
+#[cfg(test)]
+mod m6_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
 pub mod plan;
 #[cfg(test)]

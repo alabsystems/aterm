@@ -1,0 +1,24 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, a 128-column aterm tab, autopilot=land · the dialog rows are the harness journal's DIALOG row for seq=56156 verbatim (an AskUserQuestion with no option marked (Recommended), escalated 19:49:32Z as "would reset, and no one option that refuses it" and answered by the person 44 minutes later); the journal keeps no rows above the dialog, so the two transcript rows above it stand in for the turn's last rows
+
+❯ no no claude code harness, codex-alab
+
+⏺ Two readings of that fit, so I will ask which one you meant.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Target
+
+Which did you mean by "no no claude code harness, codex-alab"?
+
+❯ 1. Esc fix goes in codex-alab
+     The 'had to press Esc after the usage limit reset' bug should be fixed in codex-alab (its own capacity/autopilot code), not
+     in aterm's Claude Code harness.
+  2. Split = codex-alab first
+     The repo/version work is about codex-alab: give it its own version line starting at v0.1.0 and ship it via atpkg under its
+     own name. Don't build a Claude Code harness repo.
+  3. Both of the above
+     Fix the Esc bug in codex-alab AND do the codex-alab repo/version/atpkg work; no Claude Code harness repo.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

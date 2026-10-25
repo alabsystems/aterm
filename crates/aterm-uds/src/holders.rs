@@ -1043,7 +1043,8 @@ mod win_pids {
             return Err(io::Error::last_os_error());
         }
         let mut buf = vec![0u8; len as usize];
-        // SAFETY: `buf` has `len` writable bytes.
+        // SAFETY: `buf` has `len` writable bytes; `TOKEN_USER` fills it with a `SID_AND_ATTRIBUTES`
+        // whose `Sid` points inside `buf`.
         let ok = unsafe {
             ffi::GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len)
         };

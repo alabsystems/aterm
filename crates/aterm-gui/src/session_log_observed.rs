@@ -921,6 +921,12 @@ impl SessionLog {
                 let f = with(Fields::new(), Key::Off, Some(Val::U(off)));
                 (Kind::MailFetch, aterm_slog::Actor::Nobody, f)
             }
+            F::MailGap { from, to, records } => {
+                let f = with(Fields::new(), Key::Off, Some(Val::U(from)));
+                let f = with(f, Key::Floor, Some(Val::U(to)));
+                let f = with(f, Key::Lost, records.map(Val::U));
+                (Kind::MailGap, aterm_slog::Actor::Bridge, f)
+            }
         };
         let elastic = (kind == Kind::Mail).then_some(Key::Via);
         let mark = |f: Fields| {

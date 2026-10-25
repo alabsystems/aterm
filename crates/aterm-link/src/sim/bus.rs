@@ -1216,6 +1216,8 @@ impl State {
         }
         match req {
             Request::Hello => vec![self.hello()],
+            // GapNotices is taken as the real broker takes it; a simulated log retains
+            // everything, so no tail of it is ever told a gap.
             Request::Attach { .. }
             | Request::IdleMarks
             | Request::GapNotices

@@ -284,6 +284,9 @@ pub fn spring_snap(age_s: f32) -> f32 {
         return 0.0;
     }
     let wt = SPRING_SNAP_OMEGA * age_s;
+    if wt >= 20.0 {
+        return 1.0;
+    }
     1.0 - (1.0 + wt) * (-wt).exp()
 }
 

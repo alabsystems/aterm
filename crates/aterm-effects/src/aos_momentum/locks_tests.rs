@@ -26,6 +26,7 @@ const M4: &str = "aterm-effects/src/aos_momentum/m4.rs";
 const PUBLISH: &str = "aterm-effects/src/aos_momentum/publish.rs";
 const DIST: &str = "aterm-effects/src/aos_momentum/dist.rs";
 const SEARCH: &str = "aterm-effects/src/aos_momentum/search.rs";
+const M6: &str = "aterm-effects/src/aos_momentum/m6.rs";
 const JOB: &str = "aterm-gpu/src/compute/job.rs";
 
 const LOCKS: &[Lock] = &[
@@ -73,6 +74,76 @@ const LOCKS: &[Lock] = &[
         file: M4,
         code: "E0382",
         line: "fn twice(ev: &Evaluator) {",
+    },
+    Lock {
+        file: M4,
+        code: "E0451",
+        line: "let _ = TrainLabel { id: todo!(), plan: todo!(), outcome: todo!() };",
+    },
+    Lock {
+        file: M4,
+        code: "E0624",
+        line: "let _ = TrainLabel::of(todo!(), todo!());",
+    },
+    Lock {
+        file: M4,
+        code: "E0599",
+        line: "fn peek(l: &TrainLabel) -> Option<u64> { l.held_out_ticks() }",
+    },
+    Lock {
+        file: M4,
+        code: "E0616",
+        line: "fn peek(l: &TrainLabel) { let _ = &l.outcome; }",
+    },
+    Lock {
+        file: M4,
+        code: "E0451",
+        line: "let _ = LookToken { bound: todo!() };",
+    },
+    Lock {
+        file: M4,
+        code: "E0451",
+        line: "let _ = ReadToken { bound: todo!() };",
+    },
+    Lock {
+        file: M4,
+        code: "E0451",
+        line: "let _ = ReplayToken { bound: todo!() };",
+    },
+    Lock {
+        file: M4,
+        code: "E0277",
+        line: "fn copy(t: &LookToken) -> LookToken { Clone::clone(t) }",
+    },
+    Lock {
+        file: M4,
+        code: "E0277",
+        line: "fn copy(t: &ReadToken) -> ReadToken { Clone::clone(t) }",
+    },
+    Lock {
+        file: M4,
+        code: "E0277",
+        line: "fn copy(t: &ReplayToken) -> ReplayToken { Clone::clone(t) }",
+    },
+    Lock {
+        file: M4,
+        code: "E0382",
+        line: "fn look_twice(ev: &Evaluator, t: LookToken, plans: &[[u8; 12]]) {",
+    },
+    Lock {
+        file: M4,
+        code: "E0382",
+        line: "fn read_twice(ev: &Evaluator, t: ReadToken, plans: &[[u8; 12]]) {",
+    },
+    Lock {
+        file: M4,
+        code: "E0382",
+        line: "fn replay_twice(ev: &Evaluator, t: ReplayToken, plans: &[[u8; 12]]) {",
+    },
+    Lock {
+        file: M4,
+        code: "E0308",
+        line: "fn gate(ev: &Evaluator, o: PoolOutcome) { let _ = ev.held_out(o); }",
     },
     Lock {
         file: PUBLISH,
@@ -143,6 +214,21 @@ const LOCKS: &[Lock] = &[
         file: JOB,
         code: "E0277",
         line: "// A job sent to another thread.",
+    },
+    Lock {
+        file: M6,
+        code: "E0451",
+        line: "let _ = ModelAdmitted {",
+    },
+    Lock {
+        file: M6,
+        code: "E0277",
+        line: "fn copy(a: &ModelAdmitted) -> ModelAdmitted { Clone::clone(a) }",
+    },
+    Lock {
+        file: M6,
+        code: "E0382",
+        line: "fn twice<S: DurableStore>(store: &mut Store<S>, a: ModelAdmitted, ledger: Digest) {",
     },
 ];
 

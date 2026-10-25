@@ -239,13 +239,21 @@ const HELP_TAP: &str = "\
 It is added only on the machine's own login (the default one, the roster's lone one, or,
 where `accounts.toml` lists two or more accounts, any login it lists or one a renewal moved
 one of its rows away from; one row's tap follows only its current login) in the default
-Claude home, and only where no custom `CLAUDE_CONFIG_DIR`, credential, `statusLine`,
-`disableAllHooks`, `apiKeyHelper`, `--settings` or `--bare` is present; a session started by
-hand gets it when aterm restarts it in place. The window's footer shows the tab's week from
-the tap or from `/usage`, whichever is newer: `weekly <p>% left` up to 15 minutes old,
-`weekly <p>% left \u{b7} 40m ago` up to an hour, then nothing. Without a figure it says why:
-`weekly ? \u{b7} restart tab` (a restart in place, offered now, would add the tap),
-`weekly ? \u{b7} /usage` (the tap is off, or no restart would add it),
+Claude home, and only where no custom `CLAUDE_CONFIG_DIR`, credential, `disableAllHooks`,
+`apiKeyHelper`, `--settings` or `--bare` is present. Your own `statusLine` in
+`~/.claude/settings.json` (a plain `command`, at most a `padding` beside it) is carried, not
+refused: the line's command is `<aterm> harness tap --then <hex of your command>`, which writes
+the reading, then runs your command (`/bin/sh -c`) on the same input, so your row and its exit
+status are the ones Claude Code shows; a statusLine anywhere else (a project's, a local, a
+managed one) or of another shape still keeps the tap off. A session started by hand gets it
+at the next relaunch aterm makes of it (a live upgrade, a restart in place). The window's
+footer shows the tab's week from the tap, from Claude Code's own `/usage` cache, or from the
+accounts store (another tapped session on the same login), whichever is newer:
+`weekly <p>% left` up to 15 minutes old, `weekly <p>% left \u{b7} 40m ago` up to an hour, then
+nothing. Without a figure it says why, and never asks you to act:
+`weekly ? \u{b7} until relaunch` (a relaunch aterm offers now would add the tap),
+`weekly ? \u{b7} untapped` (no relaunch line can carry it, or none is offered),
+`weekly ? \u{b7} tap off` (the tap is off),
 `weekly ? \u{b7} no reply yet` (tapped, and no reply since it started brought the week),
 `weekly ? \u{b7} no reply 1h` (tapped, and its week is over an hour old),
 `weekly unavailable` (no account profile is trusted for this process, so neither figure is:
@@ -415,9 +423,10 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
   - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
     next one (`next:`), once each row's usage was read in its own home (Codex's app server);
     `[harness] accounts = \"off\"` keeps only the pin, and a login kept in the OS keyring
-    picks none. No running session of these CLIs is moved, and a Kimi launch or move is held
-    (`unmeasured`) until a lab pass measures its home. `ledger accounts --cli <id>` reads the
-    pool's ledger.
+    picks none. No running session of these CLIs is moved. Kimi's overlay home is measured on
+    2.3.1 (a session one home wrote resumes in another; two signed-in logins not measured),
+    but no Kimi worker starts yet.
+    `ledger accounts --cli <id>` reads the pool's ledger.
 
 FLEET ACCOUNTS (off unless this machine names a source):
   - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
@@ -5786,6 +5795,12 @@ fn accounts_text(
             },
             login_words(row, state, logins, now),
         ));
+        if let Some(task) = logins.get(&row.label).and_then(|b| b.sign_in_task) {
+            text.push_str(&format!(
+                "  sign-in needed: {}\n",
+                task.action.next_step(cli, &row.label)
+            ));
+        }
     }
     let next = accounts_next(roster, state, enrolled, now);
     text.push_str(&match (&next.to, next.wait_until) {
@@ -5866,6 +5881,20 @@ fn login_words(
         words.push_str(", last renewal: wrong account");
     }
     words
+}
+
+fn sign_in_task_json(cli: Cli, label: &str, logins: &accounts::Logins) -> Value {
+    let Some(task) = logins.get(label).and_then(|b| b.sign_in_task) else {
+        return Value::Null;
+    };
+    let mut view = Map::new();
+    view.insert("action".into(), Value::from(task.action.as_str()));
+    put_time(&mut view, "at", Some(task.at));
+    view.insert(
+        "next_step".into(),
+        Value::from(task.action.next_step(cli, label)),
+    );
+    Value::Object(view)
 }
 
 fn put_time(o: &mut Map, key: &str, t: Option<i64>) {
@@ -5966,6 +5995,10 @@ fn accounts_json(
             m.insert("auth".to_owned(), Value::from(account.auth.as_str()));
             put_time(&mut m, "auth_at", account.auth_at);
             let binding = logins.get(&row.label);
+            m.insert(
+                "sign_in_task".into(),
+                sign_in_task_json(cli, &row.label, logins),
+            );
             m.insert("renews".to_owned(), Value::from(row.email.is_some()));
             m.insert(
                 "login".to_owned(),
@@ -7428,6 +7461,106 @@ fn sign_in_plan(
     })
 }
 
+/// Copies `src` to `dst` with mode `0600` iff `dst` does not yet exist (`Ok(true)` when created, `Ok(false)` when `dst` already exists).
+fn copy_new_private_file(src: &Path, dst: &Path) -> io::Result<bool> {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600);
+    }
+    match open.open(dst) {
+        Ok(mut out) => {
+            let mut input = match std::fs::File::open(src) {
+                Ok(file) => file,
+                Err(e) => {
+                    let _ = std::fs::remove_file(dst);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = io::copy(&mut input, &mut out).and_then(|_| out.flush()) {
+                drop(out);
+                let _ = std::fs::remove_file(dst);
+                return Err(e);
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Adopts any `Shared::Suffix` files (such as Codex's `state_*.sqlite`) created in a fresh sign-in `staging` home into `default_home` when missing there, removes the transient `staging` copies (and SQLite journal companions), and re-links `staging` via [`super::accounts_overlay::ensure`] so the new overlay never starts drifted.
+fn reconcile_staging_overlay_suffixes(
+    seam: crate::ai::connector::Seam,
+    stores: &[&str],
+    staging: &Path,
+    default_home: &Path,
+) -> io::Result<()> {
+    let crate::ai::connector::Seam::Overlay { shared, .. } = seam else {
+        return Ok(());
+    };
+    let suffixes: Vec<&str> = shared
+        .iter()
+        .filter_map(|entry| match *entry {
+            crate::ai::connector::Shared::Suffix(suffix) => Some(suffix),
+            _ => None,
+        })
+        .collect();
+    if suffixes.is_empty() {
+        return Ok(());
+    }
+    let mut created = Vec::new();
+    for entry in std::fs::read_dir(staging)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if stores.contains(&name.as_str()) {
+            continue;
+        }
+        if suffixes.iter().any(|suffix| name.ends_with(suffix)) {
+            created.push(name);
+        }
+    }
+    if created.is_empty() {
+        return Ok(());
+    }
+    aterm_types::fs_restricted::ensure_private_dir(default_home)?;
+    created.sort();
+    for name in &created {
+        let src = staging.join(name);
+        let dst = default_home.join(name);
+        let adopted = copy_new_private_file(&src, &dst)?;
+        for journal in ["-wal", "-shm", "-journal"] {
+            let companion = format!("{name}{journal}");
+            let c_src = staging.join(&companion);
+            if c_src
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_file())
+            {
+                if adopted {
+                    let _ = copy_new_private_file(&c_src, &default_home.join(&companion));
+                }
+                let _ = std::fs::remove_file(&c_src);
+            }
+        }
+        std::fs::remove_file(&src)?;
+    }
+    let ensured = super::accounts_overlay::ensure(seam, staging, default_home)?;
+    if let Some(drift) = ensured.drift.first() {
+        return Err(io::Error::other(format!(
+            "staging overlay holds its own {}",
+            drift.name
+        )));
+    }
+    Ok(())
+}
+
 /// Binds `row` to the signed-in staging directory once its login file exists there (`stat`ed, never opened), proved as `proof`: the checkpoint, then [`accounts::note_renewed`] and [`accounts::note_proof`] in one transaction.
 #[allow(clippy::too_many_arguments)]
 fn bind_signed_in(
@@ -7459,6 +7592,24 @@ fn bind_signed_in(
             "the sign-in ended and left no login in its staging directory; nothing was recorded",
         );
         return Renewal::AuthFailed;
+    }
+    let seam = cli.accounts().seam;
+    if let (crate::ai::connector::Seam::Overlay { .. }, Some(default_home)) =
+        (seam, store.default_home().as_deref())
+        && let Err(why) =
+            reconcile_staging_overlay_suffixes(seam, c.stores, &plan.staging, default_home)
+    {
+        say(
+            err,
+            &format!(
+                "the new login checked out, but its staging home could not link shared files to \
+                 {} ({}); nothing was recorded; its home is kept at {}",
+                default_home.display(),
+                super::one_line(&why.to_string(), 160),
+                plan.staging.display(),
+            ),
+        );
+        return Renewal::Failed;
     }
     let now = host.now().max(floor);
     let email = row.email.as_deref().unwrap_or("");
@@ -7582,7 +7733,18 @@ pub(super) fn renew_one_for(
     let now = host.now().max(floor);
     let record = |err: &mut dyn Write, kind: accounts::Kind| {
         let event = accounts::Event::new(now, kind, label).because(&drove.why(plan.route.flow));
-        accounts_transact_logins(store, now, err, |_, _| Ok(vec![event])).is_ok()
+        accounts_transact_logins(store, now, err, |_, logins| {
+            let action = match &drove.outcome {
+                Outcome::NeedsSignIn(_) => Some(accounts::SignInAction::Browser),
+                Outcome::NeedsYou(_) | Outcome::Hung => Some(accounts::SignInAction::Login),
+                _ => None,
+            };
+            if let Some(action) = action {
+                accounts::note_sign_in_task(logins, label, action, now);
+            }
+            Ok(vec![event])
+        })
+        .is_ok()
     };
     let proof = match &drove.outcome {
         Outcome::SignedIn {
@@ -7741,7 +7903,14 @@ fn run_accounts_renew_for(
             }
         };
         let enrolled = accounts::enrolled_for(cli, &roster);
-        for label in accounts::renew_due(&roster, &logins, &state, &enrolled, now) {
+        let mut due_labels = accounts::renew_due(&roster, &logins, &state, &enrolled, now);
+        due_labels.sort_by_key(|label| {
+            (
+                super::accounts_sync::unaddressed_sign_in_task_at(&store, &logins, label),
+                logins.get(label).and_then(|b| b.wrong_at),
+            )
+        });
+        for label in due_labels {
             if !chosen.contains(&label) {
                 chosen.push(label);
             }
@@ -8450,6 +8619,10 @@ fn run_accounts_stats_of(
                 r.insert("condition".to_owned(), Value::from(l.condition.as_str()));
                 r.insert("login".to_owned(), Value::from(l.login));
                 r.insert(
+                    "sign_in_task".into(),
+                    sign_in_task_json(cli, &l.row.label, &logins),
+                );
+                r.insert(
                     "session".to_owned(),
                     l.sample
                         .map_or(Value::Null, |s| window(s.session_pct, s.session_reset)),
@@ -8537,6 +8710,13 @@ fn run_accounts_stats_of(
                 rfc3339_utc(t)
             ))
         );
+        if let Some(task) = logins.get(&l.row.label).and_then(|b| b.sign_in_task) {
+            let _ = writeln!(
+                out,
+                "    sign-in needed: {}",
+                task.action.next_step(cli, &l.row.label)
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -8804,6 +8984,40 @@ fn run_tap(out: &mut dyn Write) -> ExitCode {
     )
 }
 
+/// `aterm harness tap --then <hex>`: the tap that carries the owner's own statusLine
+/// ([`super::tap::run_chained`]), then becomes that command ([`super::tap::chain_command`]), so
+/// Claude Code reads the owner's row and exit status. Where `hex` spells no command (no line
+/// aterm types carries one: [`super::tap::is_ours`]) it is the plain tap; where the owner's
+/// command cannot start, no row shows, as for a command that printed nothing.
+fn run_tap_chained(hex: &str) -> ExitCode {
+    use std::io::IsTerminal as _;
+    let Some(cmd) = super::tap::text_of_hex(hex).filter(|cmd| !cmd.is_empty()) else {
+        return run_tap(&mut io::stdout().lock());
+    };
+    let stdin = io::stdin();
+    let tty = stdin.is_terminal();
+    let Some(payload) = super::tap::run_chained(
+        &mut stdin.lock(),
+        tty,
+        &super::tap::TapVars::from_process(),
+        super::tap::rl_dir().as_deref(),
+        limit::unix_now(),
+    ) else {
+        return ExitCode::SUCCESS;
+    };
+    #[cfg(unix)]
+    {
+        if let Ok(mut owner) = super::tap::chain_command(&cmd, &payload) {
+            let _ = owner.exec();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cmd, payload);
+    }
+    ExitCode::SUCCESS
+}
+
 /// The front door's entry point (`aterm harness …`).
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     use std::io::IsTerminal as _;
@@ -8813,6 +9027,12 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
         .collect();
     if args == ["tap"] {
         return run_tap(&mut io::stdout().lock());
+    }
+    if let [verb, flag, hex] = args.as_slice()
+        && verb == "tap"
+        && flag == super::tap::CHAIN_FLAG
+    {
+        return run_tap_chained(hex);
     }
     if let Some(verb) = args.first().map(String::as_str)
         && matches!(verb, "hook" | "statusline")

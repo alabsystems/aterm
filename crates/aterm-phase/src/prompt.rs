@@ -660,52 +660,56 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
         return None;
     }
     let (command, rest) = [
-        (RmCommand::Rm, "box.rm_breaker.head"),
-        (RmCommand::Rmdir, "box.rmdir_breaker.head"),
+        (RmCommand::Rm, crate::anchor!("box.rm_breaker.head")),
+        (RmCommand::Rmdir, crate::anchor!("box.rmdir_breaker.head")),
     ]
     .into_iter()
-    .find_map(|(c, id)| note.strip_prefix(crate::anchor(id)).map(|r| (c, r)))?;
+    .find_map(|(c, head)| note.strip_prefix(head).map(|r| (c, r)))?;
     const SUFFIXES: &[(&str, &str, RmBreakerKind)] = &[
         (
-            "box.rm_breaker.empty_var_in_substitution",
+            crate::anchor!("box.rm_breaker.empty_var_in_substitution"),
             ": ",
             RmBreakerKind::EmptyVariable {
                 in_substitution: true,
             },
         ),
         (
-            "box.rm_breaker.empty_var",
+            crate::anchor!("box.rm_breaker.empty_var"),
             ": ",
             RmBreakerKind::EmptyVariable {
                 in_substitution: false,
             },
         ),
         (
-            "box.rm_breaker.unresolvable",
+            crate::anchor!("box.rm_breaker.unresolvable"),
             "",
             RmBreakerKind::Unresolvable,
         ),
         (
-            "box.rm_breaker.critical_path",
+            crate::anchor!("box.rm_breaker.critical_path"),
             "",
             RmBreakerKind::CriticalPath,
         ),
         (
-            "box.rm_breaker.working_dir",
+            crate::anchor!("box.rm_breaker.working_dir"),
             "",
             RmBreakerKind::WorkingDirectory,
         ),
-        ("box.rm_breaker.drive_root", "", RmBreakerKind::DriveRoot),
         (
-            "box.rm_breaker.mounted_drive",
+            crate::anchor!("box.rm_breaker.drive_root"),
+            "",
+            RmBreakerKind::DriveRoot,
+        ),
+        (
+            crate::anchor!("box.rm_breaker.mounted_drive"),
             "",
             RmBreakerKind::MountedDrivePath,
         ),
     ];
     let (kind, target) = SUFFIXES
         .iter()
-        .find_map(|&(id, then, kind)| {
-            rest.strip_prefix(crate::anchor(id))
+        .find_map(|&(head, then, kind)| {
+            rest.strip_prefix(head)
                 .and_then(|t| t.strip_prefix(then))
                 .map(|t| (kind, t))
         })
@@ -2060,13 +2064,15 @@ fn key_ok(key: &str, chars: usize, words: usize) -> bool {
 }
 
 fn agents_note(item: &str) -> Option<(&str, &str)> {
-    use crate::anchors::anchor_text as a;
-    [a("hint.agents_twice"), a("hint.agents_again")]
-        .into_iter()
-        .find_map(|action| {
-            let chord = item.strip_suffix(action)?.strip_suffix(' ')?;
-            key_ok(chord, 40, 4).then_some((chord, action))
-        })
+    [
+        crate::anchor!("hint.agents_twice"),
+        crate::anchor!("hint.agents_again"),
+    ]
+    .into_iter()
+    .find_map(|action| {
+        let chord = item.strip_suffix(action)?.strip_suffix(' ')?;
+        key_ok(chord, 40, 4).then_some((chord, action))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2201,66 +2207,76 @@ fn rule_width(rows: &[String]) -> Option<usize> {
 }
 
 fn header_kind(row: &str) -> Option<PromptKind> {
-    use crate::anchors::anchor_text as a;
     let raw = crate::text::trim(row);
-    if raw.starts_with(a("mcp.title"))
+    if raw.starts_with(crate::anchor!("mcp.title"))
         || raw.split_once(' ').is_some_and(|(n, rest)| {
-            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest == a("mcp.title_many")
+            !n.is_empty()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && rest == crate::anchor!("mcp.title_many")
         })
     {
         return Some(PromptKind::McpServer);
     }
     let t = without_position(raw);
-    if t.starts_with(a("box.bash")) {
+    if t.starts_with(crate::anchor!("box.bash")) {
         return Some(PromptKind::Bash);
-    } else if t.starts_with(a("box.edit")) {
+    } else if t.starts_with(crate::anchor!("box.edit")) {
         return Some(PromptKind::Edit);
-    } else if t.starts_with(a("box.write")) || t.starts_with(a("box.create")) {
+    } else if t.starts_with(crate::anchor!("box.write"))
+        || t.starts_with(crate::anchor!("box.create"))
+    {
         return Some(PromptKind::Write);
-    } else if t.starts_with(a("box.overwrite")) {
+    } else if t.starts_with(crate::anchor!("box.overwrite")) {
         return Some(PromptKind::Overwrite);
-    } else if t.starts_with(a("box.read")) {
+    } else if t.starts_with(crate::anchor!("box.read")) {
         return Some(PromptKind::Read);
-    } else if t.starts_with(a("box.workflow")) {
+    } else if t.starts_with(crate::anchor!("box.workflow")) {
         return Some(PromptKind::Workflow);
     } else if t.starts_with("Accessing workspace") {
         return Some(PromptKind::Trust);
     }
     let base = parse_header(t)?.base;
     let b = base.as_str();
-    let kind = if b == a("box.powershell") {
+    let kind = if b == crate::anchor!("box.powershell") {
         PromptKind::PowerShell
-    } else if b == a("box.edit_notebook") || is_ide_diff(b) {
+    } else if b == crate::anchor!("box.edit_notebook") || is_ide_diff(b) {
         PromptKind::Edit
-    } else if b == a("box.fetch") {
+    } else if b == crate::anchor!("box.fetch") {
         PromptKind::Fetch
-    } else if b == a("box.network") {
+    } else if b == crate::anchor!("box.network") {
         PromptKind::NetworkRequest
-    } else if b.len() > a("box.browser").len() && b.starts_with(a("box.browser")) {
+    } else if b.len() > crate::anchor!("box.browser").len()
+        && b.starts_with(crate::anchor!("box.browser"))
+    {
         PromptKind::Browser
-    } else if b == a("box.skill_this")
-        || b.strip_prefix(a("box.skill"))
+    } else if b == crate::anchor!("box.skill_this")
+        || b.strip_prefix(crate::anchor!("box.skill"))
             .and_then(|s| s.strip_suffix("\"?"))
             .is_some_and(|name| !name.is_empty())
     {
         PromptKind::Skill
-    } else if b == a("box.monitor") {
+    } else if b == crate::anchor!("box.monitor") {
         PromptKind::Monitor
-    } else if b == a("box.tool") {
+    } else if b == crate::anchor!("box.tool") {
         PromptKind::Tool
-    } else if b == a("plan.enter") {
+    } else if b == crate::anchor!("plan.enter") {
         PromptKind::PlanEnter
-    } else if b == a("plan.ready") || b == a("plan.exit") || b == a("plan.proceed") {
+    } else if b == crate::anchor!("plan.ready")
+        || b == crate::anchor!("plan.exit")
+        || b == crate::anchor!("plan.proceed")
+    {
         PromptKind::PlanExit
-    } else if b == a("held.title") {
+    } else if b == crate::anchor!("held.title") {
         PromptKind::HeldMessage
-    } else if b == a("goal.proposal") {
+    } else if b == crate::anchor!("goal.proposal") {
         PromptKind::GoalProposal
-    } else if b == a("computer_use.title") {
+    } else if b == crate::anchor!("computer_use.title") {
         PromptKind::ComputerUse
-    } else if b == a("read_outside.title") {
+    } else if b == crate::anchor!("read_outside.title") {
         PromptKind::ReadOutsideSetting
-    } else if b == a("model_switch.title") || b == a("effort_switch.title") {
+    } else if b == crate::anchor!("model_switch.title")
+        || b == crate::anchor!("effort_switch.title")
+    {
         PromptKind::ModelSwitch
     } else {
         return None;
@@ -2324,11 +2340,11 @@ const KEPT: &[&str] = &[
 ];
 
 const KEPT_ANSWERS: &[&str] = &[
-    "mcp.use",
-    "mcp.use_all",
-    "mcp.skip",
-    "mcp.submit",
-    "setup.chrome_continue",
+    crate::anchor!("mcp.use"),
+    crate::anchor!("mcp.use_all"),
+    crate::anchor!("mcp.skip"),
+    crate::anchor!("mcp.submit"),
+    crate::anchor!("setup.chrome_continue"),
 ];
 
 /// Returns `true` if option `text` grants persistent permission for future prompts.
@@ -2342,17 +2358,14 @@ pub fn settles_later(text: &str) -> bool {
 #[must_use]
 pub fn kept_answer(label: &str) -> bool {
     let l = crate::text::trim(label).replace('’', "'").to_lowercase();
-    KEPT_ANSWERS
-        .iter()
-        .any(|id| l == crate::anchors::anchor(id).to_lowercase())
+    KEPT_ANSWERS.iter().any(|text| l == text.to_lowercase())
 }
 
 fn kept_answer_head(text: &str) -> bool {
     let t = crate::text::trim(text).replace('’', "'").to_lowercase();
     t.split(' ').filter(|w| !w.is_empty()).count() >= 2
-        && KEPT_ANSWERS.iter().any(|id| {
-            crate::anchors::anchor(id)
-                .to_lowercase()
+        && KEPT_ANSWERS.iter().any(|text| {
+            text.to_lowercase()
                 .strip_prefix(&t)
                 .is_some_and(|rest| rest.starts_with(' '))
         })
@@ -2650,7 +2663,7 @@ fn unnumbered(
 fn kept_rows(lines: &[&str], starts: &[usize]) -> Vec<bool> {
     let longest = KEPT_ANSWERS
         .iter()
-        .map(|id| crate::anchors::anchor(id).chars().count())
+        .map(|text| text.chars().count())
         .max()
         .unwrap_or(0);
     let owner = |i: usize| starts.partition_point(|&s| s <= i).saturating_sub(1);
@@ -3751,6 +3764,8 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.282-question-do-you-want-live-geometry.txt");
     pub const QUESTION_MULTISELECT_ALONE: &str =
         include_str!("fixtures/claude-2.1.282-question-multiselect-alone.txt");
+    pub const QUESTION_RESET_IN_DESCRIPTION_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-question-reset-in-description.txt");
     pub const QUESTION_SCROLLED: &str =
         include_str!("fixtures/claude-2.1.282-question-scrolled.txt");
     pub const QUESTION_PREVIEW_LONG_LABEL: &str =
@@ -4620,15 +4635,17 @@ pub struct OwnerReview {
 }
 
 fn review_kind_of(row: &str) -> Option<ReviewKind> {
-    use crate::anchors::anchor_text as a;
     let t = unbarred(row);
-    if t.contains(a("box.reason_auto_rule")) {
+    if t.contains(crate::anchor!("box.reason_auto_rule")) {
         Some(ReviewKind::AutoModeRule)
-    } else if t.starts_with(a("box.reason_rule")) && t.contains(a("box.reason_confirm")) {
+    } else if t.starts_with(crate::anchor!("box.reason_rule"))
+        && t.contains(crate::anchor!("box.reason_confirm"))
+    {
         Some(ReviewKind::Rule)
-    } else if (t.starts_with(a("box.reason_remote_hook"))
-        && t.contains(a("box.reason_remote_confirm")))
-        || (t.starts_with(a("box.reason_hook")) && t.contains(a("box.reason_confirm")))
+    } else if (t.starts_with(crate::anchor!("box.reason_remote_hook"))
+        && t.contains(crate::anchor!("box.reason_remote_confirm")))
+        || (t.starts_with(crate::anchor!("box.reason_hook"))
+            && t.contains(crate::anchor!("box.reason_confirm")))
     {
         Some(ReviewKind::Hook)
     } else {
@@ -4637,12 +4654,11 @@ fn review_kind_of(row: &str) -> Option<ReviewKind> {
 }
 
 fn opens_owner_reason(row: &str) -> bool {
-    use crate::anchors::anchor_text as a;
     let t = unbarred(row);
     [
-        a("box.reason_rule"),
-        a("box.reason_hook"),
-        a("box.reason_remote_hook"),
+        crate::anchor!("box.reason_rule"),
+        crate::anchor!("box.reason_hook"),
+        crate::anchor!("box.reason_remote_hook"),
     ]
     .iter()
     .any(|head| t.starts_with(head))
@@ -4674,13 +4690,12 @@ fn reason_rows_of(body: &[String]) -> Vec<String> {
 }
 
 fn loose_reasons(body: &[String]) -> Vec<String> {
-    use crate::anchors::anchor_text as a;
     let mut out = Vec::new();
     for (i, row) in body.iter().enumerate() {
         let t = unbarred(row);
         if t.is_empty()
             || crate::phase::leading_spaces(row) > 1
-            || !(opens_owner_reason(t) || t.contains(a("box.reason_auto_rule")))
+            || !(opens_owner_reason(t) || t.contains(crate::anchor!("box.reason_auto_rule")))
         {
             continue;
         }

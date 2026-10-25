@@ -249,19 +249,16 @@ fn turn_wait(parts: &mut Vec<String>) -> io::Result<()> {
 fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
     let usage = |why: &str| {
         refused(format!(
-            "spawn agent= over the fleet: {why} (aterm ctl --host <h> spawn agent=claude \
+            "spawn agent= over the fleet: {why} (aterm ctl --host <h> spawn agent=<word> \
              [model=<m>] [cwd=<absolute folder there>] - < task)"
         ))
     };
-    let Some((last, args)) = args.split_last() else {
-        return Err(usage("the task is read from stdin: end the request with -"));
-    };
-    if last != "-" {
-        return Err(usage("the task is read from stdin: end the request with -"));
-    }
     if !args.iter().any(|a| a.starts_with("agent=")) {
         return Err(usage("a drive spawns a worker alone"));
     }
+    let Some(("-", args)) = args.split_last().map(|(last, args)| (last.as_str(), args)) else {
+        return Err(usage("the task is read from stdin: end the request with -"));
+    };
     if args.iter().any(|a| a.starts_with("len=")) {
         return Err(usage("len= is the client's to write"));
     }

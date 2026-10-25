@@ -367,6 +367,16 @@ impl Document {
             .find(|entry| entry.audience == audience && entry.name == name)
     }
 
+    /// Explicit Commons eligibility without copying the secret entry values.
+    #[cfg(unix)]
+    pub(crate) fn commons_audience(&self) -> Option<&Audience> {
+        self.model
+            .entries
+            .iter()
+            .find(|entry| entry.entry.name == crate::commons::ENTRY)
+            .map(|entry| &entry.entry.audience)
+    }
+
     /// Whether any entry is anchored (` if-absent=<anchor>`), which an aterm older than anchors cannot read.
     pub fn anchored(&self) -> bool {
         self.model
@@ -455,7 +465,7 @@ impl Document {
         Ok(())
     }
 
-    /// Remove a machine: its `[machines]` line, its `[admins]` line, and its name from every multi-host section header.
+    /// Remove a machine: its `[machines]` line, its `[admins]` line, and its name from every multi-host section header. Refuses to erase the Commons control record when removing its last audience member, even when dropping other private sections is allowed.
     pub fn remove_machine(
         &mut self,
         name: &str,
@@ -491,6 +501,17 @@ impl Document {
             };
             if !hosts.iter().any(|h| h == name) {
                 continue;
+            }
+            if hosts.len() == 1
+                && self.model.entries.iter().any(|entry| {
+                    entry.entry.name == crate::commons::ENTRY
+                    && matches!(&entry.entry.audience, Audience::Hosts(audience) if audience == hosts)
+                })
+            {
+                return Err(at(
+                    section.header + 1,
+                    "move the Commons control audience before removing its last member",
+                ));
             }
             if hosts.len() > 1 {
                 let rest: Vec<String> = hosts.iter().filter(|h| *h != name).cloned().collect();
@@ -562,7 +583,7 @@ impl Document {
         Ok(true)
     }
 
-    /// Set an entry in the section for `audience` (the first such section, created at the end if absent): replaces the existing entry's line(s) in place, or appends to the section.
+    /// Set an entry in the section for `audience` (the first such section, created at the end if absent): replaces the existing entry's line(s) in place, or appends to the section. The reserved Commons control record moves atomically between audiences and removes its old empty section headers.
     pub fn set_entry(
         &mut self,
         audience: &Audience,
@@ -597,6 +618,37 @@ impl Document {
             if !valid_entry_name(anchor) || anchor == name {
                 return Err(whole(ANCHOR_NAME));
             }
+        }
+        if name == crate::commons::ENTRY
+            && let Some(previous) = self
+                .model
+                .entries
+                .iter()
+                .find(|entry| entry.entry.name == name && entry.entry.audience != audience)
+                .map(|entry| entry.entry.audience.clone())
+        {
+            // A control record has one audience. Rehome it on an isolated copy
+            // so an invalid new audience never erases the current descriptor.
+            let mut next = self.clone();
+            next.unset_entry(&previous, name)?;
+            let mut lines = next.lines.clone();
+            for header in next
+                .model
+                .sections
+                .iter()
+                .rev()
+                .filter(|section| {
+                    section.kind == SectionKind::Audience(previous.clone())
+                        && section.header == section.last_item
+                })
+                .map(|section| section.header)
+            {
+                lines.remove(header).zeroize();
+            }
+            next.commit(lines)?;
+            next.set_entry_with(&audience, name, value, if_absent, anchor)?;
+            *self = next;
+            return Ok(());
         }
         let spelled = spell(name, value, if_absent, anchor);
         let existing = self
@@ -906,6 +958,26 @@ fn parse_lines(lines: &[String], mode: Mode) -> Result<Model, TextError> {
             }
             SectionKind::Audience(audience) => {
                 let (entry, last) = parse_entry(lines, i, audience)?;
+                if crate::commons::reserved_name(&entry.name) {
+                    if entry.name != crate::commons::ENTRY
+                        || mode == Mode::Plain
+                        || !matches!(entry.audience, Audience::Hosts(_))
+                        || entry.if_absent
+                        || entry.anchor.is_some()
+                    {
+                        return Err(at(
+                            n,
+                            "the Commons control entry requires its canonical name and an explicit signed host audience, without if-absent or an anchor",
+                        ));
+                    }
+                    if model
+                        .entries
+                        .iter()
+                        .any(|located| located.entry.name == crate::commons::ENTRY)
+                    {
+                        return Err(at(n, "the Commons control entry has exactly one audience"));
+                    }
+                }
                 model.entries.push(Located {
                     entry,
                     first: i,

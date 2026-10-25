@@ -46,19 +46,18 @@ pub(crate) const fn landing_turns(counted: u64, typed_at: Option<u64>) -> u64 {
     }
 }
 
-/// THE LANDING'S OWN TURN ON BOTH COUNTS a reopen reads ([`App::reopen_self_claim_landing`]): [`landing_turns`] for the program's turns and for the screen reader's busy entries, each against the count the holder's last turn-starting act stood at. The reader's first `busy` read of a land turn answered in moments can come after its `landed@v1`, as the program's own reports can (the codex-alab lab's reland leg, 2026-10-23).
+/// THE LANDING'S MARK a reopen reads ([`App::reopen_self_claim_landing`]): [`landing_turns`] against the count the holder's last turn-starting act stood at. The program's own reports are the one count: a proven self-claim is codex-alab's, whose screen aterm's reader reads no phase from (`aterm_phase::CodexReader`).
 #[must_use]
 pub(crate) const fn landing_mark(
     counted: crate::session_timeline::LandingMark,
     typed_at: Option<crate::session_timeline::LandingMark>,
 ) -> crate::session_timeline::LandingMark {
-    let (turns, busy) = match typed_at {
-        Some(at) => (Some(at.program_turns), Some(at.busy_entries)),
-        None => (None, None),
+    let turns = match typed_at {
+        Some(at) => Some(at.program_turns),
+        None => None,
     };
     crate::session_timeline::LandingMark {
         program_turns: landing_turns(counted.program_turns, turns),
-        busy_entries: landing_turns(counted.busy_entries, busy),
     }
 }
 
@@ -186,14 +185,13 @@ impl App {
         let Some(entry) = self.pool.get(session) else {
             return;
         };
-        let (held, busy_entries, mark) = {
+        let (held, mark) = {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 timeline
                     .task_face()
                     .map(|(f, _)| f)
                     .filter(|f| holds_until_another_turn(*f)),
-                timeline.agent().busy_entries,
                 timeline.landing_mark().unwrap_or_default(),
             )
         };
@@ -201,13 +199,11 @@ impl App {
             return;
         };
         let program_turns = self.session_status.program_turns(session);
-        let begun = program_turns > mark.program_turns || busy_entries > mark.busy_entries;
-        if begun && self.beside_proven_self_claim(session) {
+        if program_turns > mark.program_turns && self.beside_proven_self_claim(session) {
             aterm_log::info!(
-                "task: @{}: a turn begun past its {held:?} face's mark reopens it (program turns {program_turns}, marked {}; busy entries {busy_entries}, marked {})",
+                "task: @{}: a turn begun past its {held:?} face's mark reopens it (program turns {program_turns}, marked {})",
                 entry.ctx.self_id.as_str(),
-                mark.program_turns,
-                mark.busy_entries
+                mark.program_turns
             );
             self.apply_task_face(session, Some(TaskFace::Open), None, None);
         }

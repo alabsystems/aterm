@@ -147,6 +147,10 @@ pub struct Settings {
     pub api_key_helper: bool,
     /// It sets a `statusLine`: any value but `null`.
     pub status_line: bool,
+    /// Its `statusLine`'s command, where that statusLine is exactly one aterm's tap can carry
+    /// (`super::tap::settings_line`): `type` `"command"`, a non-empty `command` string, and at
+    /// most a numeric `padding` beside them.
+    pub status_command: Option<String>,
     /// It sets `disableAllHooks` to `true`, which also drops a status line.
     pub hooks_off: bool,
 }
@@ -180,11 +184,27 @@ pub fn settings_of(text: &str) -> Option<Settings> {
             _ => true,
         });
     let status_line = object.get("statusLine").is_some_and(|line| !line.is_null());
+    let status_command = object
+        .get("statusLine")
+        .and_then(Value::as_object)
+        .filter(|line| {
+            line.get("type").and_then(Value::as_str) == Some("command")
+                && line.iter().all(|(key, value)| match key.as_str() {
+                    "type" | "command" => true,
+                    "padding" => matches!(value, Value::Number(_)),
+                    _ => false,
+                })
+        })
+        .and_then(|line| line.get("command"))
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .map(str::to_owned);
     let hooks_off = object.get("disableAllHooks") == Some(&Value::Bool(true));
     Some(Settings {
         env,
         api_key_helper,
         status_line,
+        status_command,
         hooks_off,
     })
 }

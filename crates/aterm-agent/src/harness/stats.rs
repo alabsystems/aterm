@@ -19,7 +19,7 @@ use crate::supervise::policy::approval::{
     RULE_ALLOW_ONCE, RULE_LIMIT_RESET, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_TRUST_ANY,
     SUBJECT_OPTION, WARNED_UNDER_SAFE,
 };
-use crate::supervise::policy::question::{CHOSE_RECOMMENDED, CHOSE_UNMARKED};
+use crate::supervise::policy::question::{CHOSE_FIRST_SAFE, CHOSE_RECOMMENDED, CHOSE_UNMARKED};
 use crate::supervise::policy::reset::KeepWhy;
 use crate::supervise::policy::turn_end::{
     LAND, LAND_NUDGE, LAND_NUDGE_REMOTE_MAIN_BEFORE, LAND_REMOTE_MAIN_BEFORE, RULE_ANSWER,
@@ -843,23 +843,30 @@ fn told_tabs<'a>(
 }
 
 fn chose_why(reasons: &[&str], policy: &str) -> String {
-    let (mut marked, mut unmarked) = (false, false);
+    let (mut marked, mut unmarked, mut passed) = (false, false, false);
     for reason in reasons {
         let reason = reason.strip_prefix(UNPROVEN).unwrap_or(reason).trim_start();
         if reason.starts_with(CHOSE_RECOMMENDED) {
             marked = true;
         } else if reason.starts_with(CHOSE_UNMARKED) {
             unmarked = true;
+        } else if reason.starts_with(CHOSE_FIRST_SAFE) {
+            (unmarked, passed) = (true, true);
         } else {
-            (marked, unmarked) = (false, false);
+            (marked, unmarked, passed) = (false, false, false);
             break;
         }
     }
+    let first = if passed {
+        "the first that names no destructive act"
+    } else {
+        "the first"
+    };
     match (marked, unmarked) {
         (true, false) if reasons.len() > 1 => "the options marked Recommended".to_string(),
         (true, false) => "the option marked Recommended".to_string(),
-        (false, true) => "no option was marked Recommended, so it took the first".to_string(),
-        (true, true) => "the option marked Recommended where one was, else the first".to_string(),
+        (false, true) => format!("no option was marked Recommended, so it took {first}"),
+        (true, true) => format!("the option marked Recommended where one was, else {first}"),
         (false, false) => {
             let word = match policy {
                 "long-term" => "Long-term",

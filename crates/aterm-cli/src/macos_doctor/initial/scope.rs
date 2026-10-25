@@ -11,8 +11,12 @@
 
 use super::*;
 use aterm_types::macos_setup::{DIALOG_WAIT, MacosDialog};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+#[cfg(any(test, debug_assertions))]
+mod watch_test;
+#[cfg(any(test, debug_assertions))]
+pub use watch_test::ProvisionalSetupWatchTest;
 
 /// The Secrets vault row's note when a server answered at the ALab vault's
 /// address and holds no ALab vault: there is none on this network.
@@ -42,7 +46,9 @@ pub(super) enum VaultHere {
 
 impl VaultHere {
     /// The Secrets row's note for a plan that names the ALab vault, when the probe
-    /// leaves that row waiting: until the next launch, a new plan or Check again.
+    /// leaves that row unjoined: an absent vault waits for a change of network, the
+    /// next launch, a new plan or Check again; an unreached one is asked again after
+    /// the Secrets retry pause.
     pub(super) const fn note(self) -> Option<&'static str> {
         match self {
             Self::Absent => Some(NO_VAULT),
@@ -105,10 +111,14 @@ pub(super) fn probe_vault() -> VaultHere {
 /// one gesture at a time). One still up past the hang detector leaves the vault
 /// unreached for this launch; a provisional plan is probed again on the next.
 fn vault_here_now() -> VaultHere {
-    match MacosDialog::when_none_up(DIALOG_WAIT) {
-        Some(_dialog) => probe_vault(),
-        None => VaultHere::Unreached,
-    }
+    let Some(dialog) = MacosDialog::when_none_up(DIALOG_WAIT) else {
+        return VaultHere::Unreached;
+    };
+    // Only this process's first request to the LAN can raise macOS's Local Network alert: a
+    // later probe waits out a dialog that is up, but puts none on screen, so it holds no slot
+    // (a Debugger Turn On… pressed meanwhile is refused while one is held).
+    let _dialog = (vault_here() == VaultHere::Unasked).then_some(dialog);
+    probe_vault()
 }
 
 /// This login already belongs to a vault, or has asked to join the ALab one
@@ -146,11 +156,27 @@ fn fleet_member() -> bool {
     aterm_types::dirs::state_dir().is_some_and(|dir| dir.join("fleet.key").is_file())
 }
 
-/// Whether this is an ALab Mac (§3.5), read once per process: local records
-/// first, then one bounded probe of the ALab vault.
+/// Whether this is an ALab Mac (§3.5): local records first, then one bounded
+/// probe of the ALab vault. Only a yes is kept for the process: a probe that
+/// heard nothing (macOS's Local Network question still open, the network, the
+/// vault down) proves nothing, so the next caller asks again.
 pub fn alab_mac() -> bool {
-    static ALAB: OnceLock<bool> = OnceLock::new();
-    *ALAB.get_or_init(|| vault_member() || fleet_member() || vault_here_now() == VaultHere::Found)
+    static ALAB: AtomicBool = AtomicBool::new(false);
+    kept_if_found(&ALAB, || {
+        vault_member() || fleet_member() || vault_here_now() == VaultHere::Found
+    })
+}
+
+/// `found`, read only until it says yes once.
+fn kept_if_found(kept: &AtomicBool, found: impl FnOnce() -> bool) -> bool {
+    if kept.load(Ordering::Acquire) {
+        return true;
+    }
+    let found = found();
+    if found {
+        kept.store(true, Ordering::Release);
+    }
+    found
 }
 
 /// The plan aterm admits by itself where nobody chose one: the whole profile on
@@ -200,19 +226,107 @@ fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Option<Plan> {
     })
 }
 
+/// Whether [`upgrade_provisional_setup`] has work: the saved plan is aterm's own
+/// provisional one, which it widens once this Mac shows the ALab signal. Reads
+/// aterm's records only: no probe. An error when they cannot be read just now (a
+/// pass writing them, say) or whose person is not settled yet.
+pub fn provisional_setup_widens() -> Result<bool, String> {
+    if aterm_types::dirs::runs_under_private_state_root() {
+        return Ok(false);
+    }
+    match person_scope() {
+        PersonScope::Refused(_) => return Ok(false),
+        PersonScope::Unresolved(why) => return Err(why),
+        PersonScope::Person => {}
+    }
+    widens_at(&state_root()?)
+}
+
+fn widens_at(root: &Path) -> Result<bool, String> {
+    let records = InitialSetupAuthorization::capture_at(root)?.baseline_records()?;
+    Ok(upgrade_of(&records, || true).is_some())
+}
+
+/// A provisional plan an [`InitialSetupUpgrade`] widened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupUpgrade {
+    /// The revision it widened: the one its ticket observed, which the commit
+    /// went through only while it was still in force.
+    pub from: u64,
+    /// The revision it admitted.
+    pub to: u64,
+}
+
+/// A provisional upgrade retaining its exact admission through a failed publication.
+#[derive(Default)]
+pub struct InitialSetupUpgrade {
+    attempt: Option<(InitialSetupAuthorization, Plan)>,
+}
+
+impl InitialSetupUpgrade {
+    /// A published prefix still owes this attempt's final admission even though the
+    /// expanded plan is no longer eligible to widen.
+    pub fn pending(&self) -> bool {
+        self.attempt.is_some()
+    }
+
+    /// The revision the held attempt widens: the one its ticket observed.
+    pub fn widens_from(&self) -> Option<u64> {
+        self.attempt.as_ref().map(|(ticket, _)| ticket.revision())
+    }
+
+    /// Widen the provisional plan ([`upgrade_provisional_setup`]), or finish the held
+    /// attempt's commit: what it widened, or `None` when nothing changed.
+    pub fn persist(&mut self) -> Result<Option<SetupUpgrade>, String> {
+        if aterm_types::dirs::runs_under_private_state_root() {
+            self.attempt = None;
+            return Ok(None);
+        }
+        match person_scope() {
+            PersonScope::Refused(why) => {
+                self.attempt = None;
+                return Err(why);
+            }
+            PersonScope::Unresolved(why) => return Err(why),
+            PersonScope::Person => {}
+        }
+        self.persist_with(
+            &state_root()?,
+            alab_mac,
+            live_configured_vault,
+            |ticket, full| ticket.upgrade_observed(full).result,
+        )
+    }
+
+    fn persist_with(
+        &mut self,
+        root: &Path,
+        alab: impl FnOnce() -> bool,
+        read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
+        admit: impl FnOnce(&mut InitialSetupAuthorization, &Plan) -> Result<Option<u64>, String>,
+    ) -> Result<Option<SetupUpgrade>, String> {
+        if self.attempt.is_none() {
+            self.attempt = prepare_upgrade(root, alab, read)?;
+        }
+        let Some((ticket, full)) = self.attempt.as_mut() else {
+            return Ok(None);
+        };
+        let from = ticket.revision();
+        let result = admit(ticket, full);
+        if result.is_ok() || !ticket.pending() {
+            self.attempt = None;
+        }
+        result.map(|to| to.map(|to| SetupUpgrade { from, to }))
+    }
+}
+
 /// Widen a provisional plan to the whole profile when this launch finds the ALab
 /// signal, as a new revision bound by its own reviewed-state ticket. Returns the
 /// admitted revision, or `None` when nothing changed.
 pub fn upgrade_provisional_setup() -> Result<Option<u64>, String> {
-    if aterm_types::dirs::runs_under_private_state_root() {
-        return Ok(None);
-    }
-    ensure_person_scope()?;
-    let root = state_root()?;
-    let Some((mut ticket, full)) = prepare_upgrade(&root, alab_mac, live_configured_vault)? else {
-        return Ok(None);
-    };
-    ticket.upgrade_observed(&full).result
+    InitialSetupUpgrade::default()
+        .persist()
+        .map(|upgrade| upgrade.map(|upgrade| upgrade.to))
 }
 
 fn prepare_upgrade(
@@ -556,6 +670,85 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn widens_says_whether_an_upgrade_would_widen_the_saved_plan() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        assert!(!widens_at(root.path()).unwrap(), "no plan saved yet");
+        let narrow = provisional(root.path());
+        assert!(widens_at(root.path()).unwrap());
+        let (mut ticket, full) = prepare_upgrade(root.path(), || true, || Ok(None))
+            .unwrap()
+            .unwrap();
+        ticket
+            .upgrade_at(root.path(), &full)
+            .result
+            .unwrap()
+            .unwrap();
+        assert!(!widens_at(root.path()).unwrap(), "the whole profile");
+        InitialSetupAuthorization::capture_at(root.path())
+            .unwrap()
+            .persist_at(root.path(), &narrow)
+            .result
+            .unwrap()
+            .expect("the person's narrow plan is durably admitted");
+        assert!(!widens_at(root.path()).unwrap(), "a person's plan");
+
+        // A partial publication is unknown, rather than a valid decision not to widen.
+        save_plan_as(root.path(), &full, false).unwrap();
+        assert!(widens_at(root.path()).is_err());
+    }
+
+    /// An upgrade whose commit stops part-way is held, saying the revision it widens, and the
+    /// next look finishes that commit, not a fresh one, from the revision it began from.
+    #[test]
+    fn an_upgrade_that_stops_part_way_is_finished_from_where_it_began() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        let mut upgrade = InitialSetupUpgrade::default();
+        let stopped = upgrade.persist_with(
+            root.path(),
+            || true,
+            || Ok(None),
+            |ticket, full| ticket.persist_for_watch_test(root.path(), full, true, Some((1, false))),
+        );
+        assert!(stopped.is_err());
+        let base = upgrade.widens_from();
+        assert!(
+            base.is_some() && upgrade.pending(),
+            "kept for the next look"
+        );
+        let finished = upgrade
+            .persist_with(
+                root.path(),
+                || panic!("the held upgrade is finished, not looked for again"),
+                || Ok(None),
+                |ticket, full| ticket.upgrade_at(root.path(), full).result,
+            )
+            .unwrap()
+            .expect("admitted");
+        assert_eq!(Some(finished.from), base, "from the revision it began from");
+        assert!(!upgrade.pending() && upgrade.widens_from().is_none());
+        let admitted = progress(root.path()).unwrap().unwrap();
+        assert_eq!((admitted.revision, admitted.admitted), (finished.to, true));
+    }
+
+    #[test]
+    fn only_a_yes_is_kept_for_the_process() {
+        let kept = AtomicBool::new(false);
+        let asked = std::cell::Cell::new(0);
+        let ask = |answer: bool| {
+            kept_if_found(&kept, || {
+                asked.set(asked.get() + 1);
+                answer
+            })
+        };
+        assert!(!ask(false));
+        assert!(!ask(false), "a probe that heard nothing is asked again");
+        assert!(ask(true));
+        assert!(ask(false), "kept");
+        assert_eq!(asked.get(), 3);
     }
 
     #[test]

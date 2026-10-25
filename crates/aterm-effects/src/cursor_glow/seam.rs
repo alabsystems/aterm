@@ -1768,15 +1768,22 @@ impl CursorGlow {
 
     /// One past the last glyph of a sampled row inside the focused pane (the whole row when no pane is set).
     #[inline]
-    pub(super) fn ink_end_in_pane(&self, cols: &[char]) -> usize {
-        let pane_end = self
-            .pane_columns
-            .map_or(cols.len(), |(c0, n)| usize::from(c0) + usize::from(n))
-            .min(cols.len());
-        cols[..pane_end]
-            .iter()
-            .rposition(|&c| c != ' ')
-            .map_or(0, |i| i + 1)
+    pub(super) const fn ink_end_in_pane(&self, cols: &[char]) -> usize {
+        let pane_end = match self.pane_columns {
+            Some((c0, n)) => {
+                let end = c0 as usize + n as usize;
+                if end < cols.len() { end } else { cols.len() }
+            }
+            None => cols.len(),
+        };
+        let mut i = pane_end;
+        while i > 0 {
+            i -= 1;
+            if cols[i] != ' ' {
+                return i + 1;
+            }
+        }
+        0
     }
 
     /// The licence class: the classifier's verdict in v2's vocabulary, read by the forget edges for every style.
@@ -2436,7 +2443,7 @@ impl CursorGlow {
 
     /// Record a licensed typed-class verdict.
     #[inline]
-    pub(super) fn log_typed_licensed(
+    pub(super) const fn log_typed_licensed(
         &mut self,
         at: Instant,
         origin: (u16, u16),
@@ -2453,12 +2460,12 @@ impl CursorGlow {
 
     /// How much born geometry the engine holds now.
     #[inline]
-    pub(super) fn born_geometry_census(&self) -> usize {
+    pub(super) const fn born_geometry_census(&self) -> usize {
         self.sparks.len()
             + self.particles.len()
             + self.fire_meteors.len()
             + self.bolts.len()
-            + usize::from(self.ring.is_some())
+            + self.ring.is_some() as usize
     }
 
     /// Classify one licensed cursor move (typing vs. jump, with the wrap, re-anchor and coalesced-echo collapses and bounded classifier hints) and feed the fast-glide velocity spine.

@@ -429,9 +429,11 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         .iter()
         .flat_map(|&p| match crate::procs::open_paths(p) {
             Ok(paths) => paths
+                .paths
                 .into_iter()
                 .filter(|f| owner_codex.iter().any(|c| f.starts_with(c)))
                 .map(|f| f.display().to_string())
+                .chain((!paths.complete).then(|| format!("(pid {p} paths incomplete)")))
                 .collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => vec![format!("(pid {p} unread: {e})")],

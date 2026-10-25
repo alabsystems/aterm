@@ -1,0 +1,13 @@
+# grok 1.0.70 · HAND-BUILT 2026-10-24: the error row's words are the binary's string (`Your auth token is invalid or expired. Run `grok login` to re-authenticate.`, beside `Not authenticated.` in its strings); the rows around it and its leading mark are assembled, not captured — no signed-in account has drawn a Grok Build turn yet, so where an ended login's row sits is unmeasured
+  ~/proj
+
+  › summarize the failing test
+
+  The failing test is `wall::reads_a_grok_login`; it expects one wall row.
+
+  ✗ Your auth token is invalid or expired. Run `grok login` to re-authenticate.
+
+
+
+
+                                                 ctrl+q  quit

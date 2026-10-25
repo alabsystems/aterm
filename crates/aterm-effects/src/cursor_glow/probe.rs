@@ -42,10 +42,23 @@ pub(super) struct RowProbe {
 }
 
 /// One sampled grid row for Rainbow Kitty's content witness, per-column chars in the row probe's convention.
-#[derive(Default)]
 pub(super) struct WitnessRowBuf {
     pub(super) row: u16,
     pub(super) cols: Vec<char>,
+}
+
+impl Default for WitnessRowBuf {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl WitnessRowBuf {
+    pub(super) const EMPTY: Self = Self {
+        row: 0,
+        cols: Vec::new(),
+    };
 }
 
 impl CursorGlow {
@@ -72,7 +85,7 @@ impl CursorGlow {
         self.row_above_prev.clear();
         self.row_below_cur.clear();
         self.row_below_prev.clear();
-        self.probed_spans = TextSpans::default();
+        self.probed_spans = TextSpans::EMPTY;
     }
 
     /// Host observation.
@@ -327,8 +340,12 @@ impl CursorGlow {
     /// Rainbow Kitty's laid ribbon, read-only, `Some` only while v2 owns the frame (for conformance tests).
     #[inline]
     #[must_use]
-    pub fn v2_ribbon(&self) -> Option<&rk::ribbon::Ribbon> {
-        self.v2.engaged().then(|| self.v2.ribbon())
+    pub const fn v2_ribbon(&self) -> Option<&rk::ribbon::Ribbon> {
+        if self.v2.engaged() {
+            Some(self.v2.ribbon())
+        } else {
+            None
+        }
     }
 
     /// Neighbour probe.

@@ -29,6 +29,9 @@ pub enum Item {
     Refused(Source, &'static str),
     /// A paused broker source drained to low water and can resubscribe from this offset.
     Resume(Source, u64),
+    /// A GAP NOTICE on a broker source (astream R4's addendum A9): retention gave up records
+    /// of its filter below the tail, taken in its place among the source's records.
+    Gap(Source, astream_broker::Gap),
 }
 
 /// Outcome of pushing a broker record.
@@ -86,11 +89,20 @@ struct Face {
     generation: u64,
     /// While the face is PAUSED: the offset its subscription resumes from.
     paused: Option<u64>,
+    /// The gap notices waiting, each with how many records this generation had pushed when it
+    /// came: one is due once every record pushed before it is taken. Two with no record between
+    /// them are one ([`astream_broker::Gap::and`]), so there are never more than records + 1.
+    gaps: VecDeque<(u64, astream_broker::Gap)>,
+    /// Records pushed under this generation.
+    pushed: u64,
+    /// Records taken under this generation.
+    taken: u64,
 }
 
 impl Face {
     fn take(&mut self) -> Option<(Record, Option<Stamp>, Option<u64>)> {
         let (r, stamp) = self.records.pop_front()?;
+        self.taken = self.taken.saturating_add(1);
         self.bytes = self.bytes.saturating_sub(record_bytes(&r));
         let resume = if at_low_water(self.records.len(), self.bytes) {
             self.paused.take()
@@ -105,6 +117,24 @@ impl Face {
         self.records.clear();
         self.bytes = 0;
         self.paused = None;
+        self.gaps.clear();
+        self.pushed = 0;
+        self.taken = 0;
+    }
+
+    /// The gap notice due now: every record pushed before it was taken.
+    fn take_gap(&mut self) -> Option<astream_broker::Gap> {
+        if self.gaps.front().is_some_and(|(at, _)| *at <= self.taken) {
+            return self.gaps.pop_front().map(|(_, g)| g);
+        }
+        None
+    }
+
+    fn push_gap(&mut self, g: astream_broker::Gap) {
+        match self.gaps.back_mut() {
+            Some((at, before)) if *at == self.pushed => *before = before.and(g),
+            _ => self.gaps.push_back((self.pushed, g)),
+        }
     }
 }
 
@@ -190,6 +220,9 @@ impl Queues {
             && self.say.records.is_empty()
             && self.closed.is_empty()
             && self.resume.is_empty()
+            && self.fleet.gaps.is_empty()
+            && self.inbox.gaps.is_empty()
+            && self.say.gaps.is_empty()
     }
 
     const fn face(&mut self, s: Source) -> Option<&mut Face> {
@@ -205,13 +238,16 @@ impl Queues {
         if let Some(item) = self.closed.pop_front() {
             return Some((item, false));
         }
+        if let Some(g) = self.fleet.take_gap() {
+            return Some((Item::Gap(Source::Fleet, g), false));
+        }
         if let Some(r) = self.take_record(Source::Fleet) {
             return Some((Item::Fleet(r), false));
         }
         if let Some((s, from)) = self.resume.pop_front() {
             return Some((Item::Resume(s, from), false));
         }
-        let waiting = !self.inbox.records.is_empty();
+        let waiting = !self.inbox.records.is_empty() || !self.inbox.gaps.is_empty();
         #[cfg(test)]
         let inbox_due = waiting && !self.events_first && self.events_run >= EVENT_RUN_MAX;
         #[cfg(not(test))]
@@ -225,9 +261,16 @@ impl Queues {
                 return Some((Item::Event(e), over_bound(self.events.len() + 1, 0)));
             }
         }
+        if let Some(g) = self.inbox.take_gap() {
+            self.events_run = 0;
+            return Some((Item::Gap(Source::Inbox, g), false));
+        }
         if let Some(r) = self.take_record(Source::Inbox) {
             self.events_run = 0;
             return Some((Item::Inbox(r), false));
+        }
+        if let Some(g) = self.say.take_gap() {
+            return Some((Item::Gap(Source::Say, g), false));
         }
         self.take_record(Source::Say).map(|r| (Item::Say(r), false))
     }
@@ -242,6 +285,9 @@ impl Queues {
     }
 
     fn take_urgent(&mut self) -> Option<Item> {
+        if let Some(g) = self.fleet.take_gap() {
+            return Some(Item::Gap(Source::Fleet, g));
+        }
         if let Some(r) = self.take_record(Source::Fleet) {
             return Some(Item::Fleet(r));
         }
@@ -299,7 +345,7 @@ impl Mailbox {
             || q.resume.iter().any(|(source, _)| *source == Source::Fleet)
         {
             ReplayPressure::Urgent
-        } else if !q.events.is_empty() || !q.inbox.records.is_empty() {
+        } else if !q.events.is_empty() || !q.inbox.records.is_empty() || !q.inbox.gaps.is_empty() {
             ReplayPressure::Pending
         } else {
             ReplayPressure::Clear
@@ -355,6 +401,7 @@ impl Mailbox {
         };
         let resume_from = r.0.saturating_add(1);
         face.bytes = face.bytes.saturating_add(record_bytes(&r));
+        face.pushed = face.pushed.saturating_add(1);
         face.records.push_back((r, stamp));
         let pushed = if over_bound(face.records.len(), face.bytes) {
             face.paused = Some(resume_from);
@@ -365,6 +412,19 @@ impl Mailbox {
         drop(q);
         self.ready.notify_all();
         pushed
+    }
+
+    /// Push one gap notice from broker source `s` under its reader `generation`, in its place
+    /// among the source's records ([`Item::Gap`]); `false` for a torn-down generation's.
+    pub fn push_gap(&self, s: Source, g: astream_broker::Gap, generation: u64) -> bool {
+        let mut q = self.lock();
+        let Some(face) = q.face(s).filter(|face| face.generation == generation) else {
+            return false;
+        };
+        face.push_gap(g);
+        drop(q);
+        self.ready.notify_all();
+        true
     }
 
     /// Where paused broker source `s` resumes from, while it is paused.
@@ -474,7 +534,8 @@ impl Mailbox {
         }
     }
 
-    /// THE URGENT ITEMS.
+    /// THE URGENT ITEMS: the fleet face's records, each of its gap notices in its place among
+    /// them ([`Item::Gap`]), its resume, then a broker closure.
     pub(crate) fn take_urgent(&self) -> Option<Item> {
         self.lock().take_urgent()
     }
@@ -594,9 +655,146 @@ mod tests {
                 Item::Event(_) => "event",
                 Item::Inbox(_) => "inbox",
                 Item::Say(_) => "say",
+                Item::Gap(..) => "gap",
             });
         }
         assert_eq!(seen, ["closed", "fleet", "resume", "event", "inbox", "say"]);
+    }
+
+    /// A GAP NOTICE IS TAKEN IN ITS PLACE among its source's records (astream's tail writes it
+    /// before the records past what retention gave up): records 1 and 2, a notice, record 9 are
+    /// taken in that order; two notices with no record between them are one (`Gap::and`); a
+    /// notice of a torn-down generation is refused; and a notice alone wakes a parked take.
+    /// NEGATIVE CONTROL (run, B22): a `push_gap` that queues nothing fails the order.
+    #[test]
+    fn a_gap_notice_is_taken_in_its_place_among_the_records() {
+        use astream_broker::Gap;
+        let mb = Mailbox::default();
+        let gap = |from, to, records| Gap { from, to, records };
+        assert_eq!(mb.push(Source::Inbox, rec(1), 0), Pushed::Queued);
+        assert_eq!(mb.push(Source::Inbox, rec(2), 0), Pushed::Queued);
+        assert!(mb.push_gap(Source::Inbox, gap(3, 6, Some(2)), 0));
+        assert!(mb.push_gap(Source::Inbox, gap(6, 9, Some(1)), 0));
+        assert_eq!(mb.push(Source::Inbox, rec(9), 0), Pushed::Queued);
+        assert!(
+            !mb.push_gap(Source::Inbox, gap(0, 1, None), 7),
+            "a stale reader's"
+        );
+        let mut seen = Vec::new();
+        while let Some(item) = mb.take(Duration::ZERO) {
+            seen.push(match item {
+                Item::Inbox((off, _, _)) => format!("inbox {off}"),
+                Item::Gap(Source::Inbox, g) => format!("gap {}..{} {:?}", g.from, g.to, g.records),
+                other => panic!("{other:?}"),
+            });
+        }
+        assert_eq!(
+            seen,
+            ["inbox 1", "inbox 2", "gap 3..9 Some(3)", "inbox 9"],
+            "in place, the two adjacent notices one"
+        );
+        assert!(mb.is_idle());
+        let mb = std::sync::Arc::new(mb);
+        let taker = {
+            let mb = std::sync::Arc::clone(&mb);
+            std::thread::spawn(move || mb.take(aterm_spec::wait::MUST_HAPPEN))
+        };
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the taker parked on the mailbox",
+            || mb.parked().then_some(()),
+        );
+        assert!(mb.push_gap(Source::Inbox, gap(10, 12, None), 0));
+        assert!(
+            matches!(
+                taker.join().expect("the taker"),
+                Some(Item::Gap(
+                    Source::Inbox,
+                    Gap {
+                        from: 10,
+                        to: 12,
+                        records: None
+                    }
+                ))
+            ),
+            "a notice alone wakes the loop"
+        );
+        mb.reset_source(Source::Inbox);
+        assert!(
+            !mb.push_gap(Source::Inbox, gap(0, 1, None), 0),
+            "reset: generation 0 is gone"
+        );
+        assert!(mb.push_gap(Source::Inbox, gap(0, 1, None), 1));
+        assert!(!mb.is_idle());
+    }
+
+    /// AN INBOX GAP NOTICE IS INBOX WORK: alone on its face it still waits behind at most
+    /// [`EVENT_RUN_MAX`] events, as a record does, and it holds broadcast replay back as one does
+    /// ([`ReplayPressure::Pending`]). NEGATIVE CONTROL (run, B22 land): with the gap clause gone
+    /// from `waiting`, the notice waits behind every event; gone from the pressure, replay reads
+    /// `Clear` over it.
+    #[test]
+    fn an_inbox_gap_notice_waits_as_an_inbox_record_does() {
+        use astream_broker::Gap;
+        let k = usize::try_from(EVENT_RUN_MAX).expect("a small bound");
+        let mb = Mailbox::default();
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+        let gap = Gap {
+            from: 3,
+            to: 6,
+            records: Some(2),
+        };
+        assert!(mb.push_gap(Source::Inbox, gap, 0));
+        assert_eq!(
+            mb.replay_pressure(),
+            ReplayPressure::Pending,
+            "a lone inbox notice holds replay back"
+        );
+        for i in 0..2 * k {
+            mb.push_event(format!("EVENT 1 post {i}"));
+        }
+        let mut seen = Vec::new();
+        while let Some(item) = mb.take(Duration::ZERO) {
+            seen.push(match item {
+                Item::Event(_) => "event".to_string(),
+                Item::Gap(Source::Inbox, g) => format!("gap {}..{}", g.from, g.to),
+                other => panic!("{other:?}"),
+            });
+        }
+        let mut want: Vec<String> = std::iter::repeat_n("event".to_string(), k).collect();
+        want.push("gap 3..6".to_string());
+        want.extend(std::iter::repeat_n("event".to_string(), k));
+        assert_eq!(seen, want, "a run of {k}, then the notice");
+        assert_eq!(mb.replay_pressure(), ReplayPressure::Clear);
+    }
+
+    /// A FLEET GAP NOTICE KEEPS ITS PLACE ON THE URGENT PATH, as on [`Mailbox::take`]: a notice
+    /// queued ahead of the fleet records and one between them are handed out where they came.
+    /// NEGATIVE CONTROL (run, B22 land): a `take_urgent` that drains the records without looking
+    /// for a due notice hands both records out first, and the notices fall to `take`.
+    #[test]
+    fn a_fleet_gap_notice_keeps_its_place_on_the_urgent_path() {
+        use astream_broker::Gap;
+        let gap = |from, to| Gap {
+            from,
+            to,
+            records: None,
+        };
+        let mb = Mailbox::default();
+        assert!(mb.push_gap(Source::Fleet, gap(0, 2), 0));
+        assert_eq!(mb.push(Source::Fleet, rec(2), 0), Pushed::Queued);
+        assert!(mb.push_gap(Source::Fleet, gap(3, 5), 0));
+        assert_eq!(mb.push(Source::Fleet, rec(5), 0), Pushed::Queued);
+        let mut urgent = Vec::new();
+        while let Some(item) = mb.take_urgent() {
+            urgent.push(match item {
+                Item::Fleet((off, _, _)) => format!("fleet {off}"),
+                Item::Gap(Source::Fleet, g) => format!("gap {}..{}", g.from, g.to),
+                other => panic!("not urgent: {other:?}"),
+            });
+        }
+        assert_eq!(urgent, ["gap 0..2", "fleet 2", "gap 3..5", "fleet 5"]);
+        assert!(mb.is_idle(), "nothing left for take");
     }
 
     #[test]
@@ -849,6 +1047,7 @@ mod tests {
                 Item::Event(_) => "event",
                 Item::Inbox(_) => "inbox",
                 Item::Say(_) => "say",
+                Item::Gap(..) => "gap",
             });
         }
         assert_eq!(

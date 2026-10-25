@@ -69,7 +69,6 @@ struct RowLight {
 }
 
 /// The guard's resident scratch ([`CursorGlow::guard_letters`]).
-#[derive(Default)]
 pub(crate) struct LetterGuard {
     /// The lights that reach the row being read.
     row: Vec<RowLight>,
@@ -100,6 +99,33 @@ pub(crate) struct LetterGuard {
     /// A test's negative control: each cell cut alone, no ramp along the row.
     #[cfg(any(test, debug_assertions))]
     pub(crate) comb: bool,
+}
+
+impl LetterGuard {
+    pub(crate) const EMPTY: Self = Self {
+        row: Vec::new(),
+        cell: Vec::new(),
+        by_px: Vec::new(),
+        px_at: Vec::new(),
+        px_fill: Vec::new(),
+        lum: Vec::new(),
+        ring_lo: Vec::new(),
+        ring_hi: Vec::new(),
+        lift_under: Vec::new(),
+        lift_over: Vec::new(),
+        cuts: Vec::new(),
+        #[cfg(any(test, debug_assertions))]
+        off: false,
+        #[cfg(any(test, debug_assertions))]
+        comb: false,
+    };
+}
+
+impl Default for LetterGuard {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Ease a row's cuts (`(column, share)`, columns ascending) into one ramp
@@ -252,6 +278,7 @@ impl LetterGuard {
         &mut self,
         j: Judge,
         (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
+        has_over: bool,
     ) -> bool {
         let additive = self.cell.iter().all(|&(stream, i)| match stream {
             Stream::Under => under[i as usize].alpha | under[i as usize].alpha2 == 0,
@@ -262,7 +289,6 @@ impl LetterGuard {
         if !additive {
             return false;
         }
-        let has_over = self.cell.iter().any(|&(stream, _)| stream != Stream::Under);
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
         let mut lu = std::mem::take(&mut self.lift_under);
         let mut lo = std::mem::take(&mut self.lift_over);
@@ -272,11 +298,17 @@ impl LetterGuard {
             lo.clear();
             lo.resize(w * h, [0; 3]);
         }
-        let unpack_rgb = |c: u32| [16u32, 8, 0].map(|sh| ((c >> sh) & 0xff) as u16);
+        let unpack_rgb = |c: u32| {
+            [
+                ((c >> 16) & 0xff) as u16,
+                ((c >> 8) & 0xff) as u16,
+                (c & 0xff) as u16,
+            ]
+        };
         let add_rgb = |acc: &mut [u16; 3], rgb: [u16; 3]| {
-            for (a, v) in acc.iter_mut().zip(rgb) {
-                *a = a.saturating_add(v);
-            }
+            acc[0] = acc[0].saturating_add(rgb[0]);
+            acc[1] = acc[1].saturating_add(rgb[1]);
+            acc[2] = acc[2].saturating_add(rgb[2]);
         };
         for &(stream, i) in &self.cell {
             let i = i as usize;
@@ -441,7 +473,7 @@ impl LetterGuard {
         s: f32,
         bar: f32,
         streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
-        additive: bool,
+        (additive, has_over): (bool, bool),
         table: &crate::color_math::RelativeLuminanceTable,
     ) -> bool {
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
@@ -455,30 +487,44 @@ impl LetterGuard {
         lum.resize(w * h, 0.0);
         ring_lo.resize(w * h, 0.0);
         ring_hi.resize(w * h, 0.0);
-        let lift = |c: u32, a: [u16; 3], b: [u16; 3]| {
+        let lift = |c: u32, a: [u16; 3]| {
             let ch = |sh: u32, k: usize| {
-                let l = (f32::from(a[k]) + f32::from(b[k])) * s;
+                let l = f32::from(a[k]) * s;
                 (((c >> sh) & 0xff) + l as u32).min(255)
             };
             (ch(16, 0) << 16) | (ch(8, 1) << 8) | ch(0, 2)
         };
         let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
-        let has_over = self.cell.iter().any(|&(stream, _)| stream != Stream::Under);
         let mut holds = true;
         let mut last_g: Option<(u32, f32)> = None;
+        let mut last_g_lift: Option<([u16; 3], f32)> = None;
         let mut last_ink: Option<(u32, f32)> = None;
+        let mut last_ink_lift: Option<([u16; 3], f32)> = None;
         'rows: for gy in 0..h {
             let row = gy * w;
             for x in 0..w {
                 let k = row + x;
                 let lg = if additive {
                     let a = self.lift_under[k];
-                    let b = if has_over { self.lift_over[k] } else { [0; 3] };
-                    if a == [0; 3] && b == [0; 3] {
-                        j.l_ground
+                    let ab = if has_over {
+                        let b = self.lift_over[k];
+                        [
+                            a[0].saturating_add(b[0]),
+                            a[1].saturating_add(b[1]),
+                            a[2].saturating_add(b[2]),
+                        ]
                     } else {
-                        let g = lift(j.ground, a, b);
-                        if g == j.ground {
+                        a
+                    };
+                    if ab == [0; 3] {
+                        j.l_ground
+                    } else if let Some((prev_ab, prev_lum)) = last_g_lift
+                        && prev_ab == ab
+                    {
+                        prev_lum
+                    } else {
+                        let g = lift(j.ground, ab);
+                        let l = if g == j.ground {
                             j.l_ground
                         } else {
                             match last_g {
@@ -489,7 +535,9 @@ impl LetterGuard {
                                     l
                                 }
                             }
-                        }
+                        };
+                        last_g_lift = Some((ab, l));
+                        l
                     }
                 } else if self.px_at[k] == self.px_at[k + 1] {
                     j.l_ground
@@ -533,9 +581,13 @@ impl LetterGuard {
                     let b = self.lift_over[k];
                     if b == [0; 3] {
                         j.l_ink
+                    } else if let Some((prev_b, prev_lum)) = last_ink_lift
+                        && prev_b == b
+                    {
+                        prev_lum
                     } else {
-                        let ink = lift(j.ink, [0; 3], b);
-                        if ink == j.ink {
+                        let ink = lift(j.ink, b);
+                        let l = if ink == j.ink {
                             j.l_ink
                         } else {
                             match last_ink {
@@ -546,7 +598,9 @@ impl LetterGuard {
                                     l
                                 }
                             }
-                        }
+                        };
+                        last_ink_lift = Some((b, l));
+                        l
                     }
                 } else if self.px_at[k] == self.px_at[k + 1] {
                     j.l_ink
@@ -592,17 +646,19 @@ impl LetterGuard {
         streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
         table: &crate::color_math::RelativeLuminanceTable,
     ) -> f32 {
-        let additive = self.prepare(j, streams);
+        let has_over = self.cell.iter().any(|&(stream, _)| stream != Stream::Under);
+        let additive = self.prepare(j, streams, has_over);
         if !additive {
             self.index_pixels(j, streams);
         }
-        if self.holds(j, 1.0, bar, streams, additive, table) {
+        let flags = (additive, has_over);
+        if self.holds(j, 1.0, bar, streams, flags, table) {
             return 1.0;
         }
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         for _ in 0..STEPS {
             let mid = 0.5 * (lo + hi);
-            if self.holds(j, mid, bar, streams, additive, table) {
+            if self.holds(j, mid, bar, streams, flags, table) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -621,9 +677,9 @@ impl LetterGuard {
     ) -> Option<([u32; 3], [u32; 3])> {
         let (mut on_ink, mut all) = ([0u32; 3], [0u32; 3]);
         let add = |acc: &mut [u32; 3], c: u32| {
-            for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
-                acc[k] += (c >> sh) & 0xff;
-            }
+            acc[0] += (c >> 16) & 0xff;
+            acc[1] += (c >> 8) & 0xff;
+            acc[2] += c & 0xff;
         };
         for &(stream, i) in &self.cell {
             let i = i as usize;
@@ -674,7 +730,7 @@ const PET_VEIL_EASE_PX: i32 = 3;
 /// on the bare page, `bare`: [`LETTER_FLOOR`], or [`OWN_SHARE`] of `bare`
 /// where the bare page itself reads under the floor.
 #[inline]
-fn letter_bar(bare: f32) -> f32 {
+const fn letter_bar(bare: f32) -> f32 {
     if bare >= LETTER_FLOOR {
         LETTER_FLOOR
     } else {
@@ -684,9 +740,13 @@ fn letter_bar(bare: f32) -> f32 {
 
 /// `c` lifted by `lift` per channel, saturating.
 #[inline]
-fn lifted(c: u32, lift: [u32; 3]) -> u32 {
-    let ch = |sh: u32, l: u32| (((c >> sh) & 0xff) + l).min(255);
-    (ch(16, lift[0]) << 16) | (ch(8, lift[1]) << 8) | ch(0, lift[2])
+const fn lifted(c: u32, lift: [u32; 3]) -> u32 {
+    #[inline]
+    const fn ch(c: u32, sh: u32, l: u32) -> u32 {
+        let sum = ((c >> sh) & 0xff) + l;
+        if sum < 255 { sum } else { 255 }
+    }
+    (ch(c, 16, lift[0]) << 16) | (ch(c, 8, lift[1]) << 8) | ch(c, 0, lift[2])
 }
 
 /// The solid ink of a letter drawn in `ink` on `ground`: the colour on the
@@ -729,7 +789,7 @@ fn solid_ink(ink: u32, ground: u32, table: &crate::color_math::RelativeLuminance
 
 impl InkLedger {
     /// Cut every quad of `quads` (additive or source-over) to the guard's
-    /// dims ([`Self::mask_at`]), easing back to the whole light off them.
+    /// dims ([`Self::mask_at_with`]), easing back to the whole light off them.
     fn guard_mask_quads(&mut self, quads: &mut Vec<GlowQuad>) {
         let (bx0, by0, bx1, by1) = self.dims_bounds();
         let feather = self.feather();
@@ -1308,7 +1368,7 @@ impl CursorGlow {
     /// A test's negative control: lights drawn without the letter guard.
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letter_guard(&mut self, on: bool) {
+    pub const fn set_letter_guard(&mut self, on: bool) {
         self.letter_guard.off = !on;
     }
 
@@ -1316,7 +1376,7 @@ impl CursorGlow {
     /// ramp along the row ([`RAMP_SLOPE`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letter_guard_ramp(&mut self, on: bool) {
+    pub const fn set_letter_guard_ramp(&mut self, on: bool) {
         self.letter_guard.comb = !on;
     }
 }

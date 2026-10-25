@@ -2520,3 +2520,41 @@ fn agy_jsonl_tail_reads_only_regular_files_with_the_same_window() {
     );
     assert!(muse_excerpts_for(0, &explicit_a, &env, dir.path(), None).is_none());
 }
+
+/// THE FOOTER NEVER ASKS THE PERSON FOR THE WEEK (owner ruling R-12, 2026-10-24: "why does it
+/// say \"?\" and \"/usage\" ??? THE HARNESS MUST DO THIS STOP ASKING THE USER"): no reason a
+/// Claude Code footer gives for a missing weekly figure, in its words or its spoken form, names
+/// `/usage` or a step for the person to take; each still says the figure is unknown.
+#[test]
+fn no_weekly_gap_tells_the_person_to_act() {
+    use super::super::tap::Refusal;
+    for gap in [
+        WeeklyGap::TapOff,
+        WeeklyGap::Unoffered(Refusal::Exe),
+        WeeklyGap::Unoffered(Refusal::Home),
+        WeeklyGap::Unoffered(Refusal::Login),
+        WeeklyGap::Unoffered(Refusal::Line),
+        WeeklyGap::Unoffered(Refusal::Argv),
+        WeeklyGap::Unoffered(Refusal::Settings),
+        WeeklyGap::Untapped,
+        WeeklyGap::Unrestarted,
+        WeeklyGap::NoReply,
+        WeeklyGap::Stale,
+    ] {
+        for said in [gap.words(), gap.spoken()] {
+            let lower = said.to_lowercase();
+            for asks in [
+                "/usage",
+                "restart tab",
+                "restart of the tab",
+                "open ",
+                "run ",
+                "press ",
+            ] {
+                assert!(!lower.contains(asks), "{gap:?}: {said:?} asks {asks:?}");
+            }
+        }
+        assert!(gap.words().starts_with("weekly ? "), "{gap:?}");
+        assert!(gap.spoken().starts_with("weekly figure unknown"), "{gap:?}");
+    }
+}

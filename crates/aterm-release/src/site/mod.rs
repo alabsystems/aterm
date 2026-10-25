@@ -1306,6 +1306,10 @@ fn steps(
     );
     planned.insert("public/install.sh", served);
 
+    // The /terminal engine — the sync's first write into the checkout, so a real run marks
+    // itself in flight first (until its commit) — is built here (engine.rs) on the wasm32
+    // pin publish/config.sh names (a STOCK EXCEPTION: Trust ships only its host std),
+    // else on rustup's stable.
     if !dry {
         std::fs::write(&in_flight, format!("{commit}\n")).map_err(|e| {
             refusal(

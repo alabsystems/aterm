@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// Supervisor policy protocol (`aterm_spec::derive::harness_policy_one_writer_model`), model-checked by Clean.
+// Supervisor policy protocol (`aterm_models_harness::harness_policy_one_writer_model`), model-checked by Clean.
 clean {
     import Trust.Protocol
     namespace HarnessPolicy

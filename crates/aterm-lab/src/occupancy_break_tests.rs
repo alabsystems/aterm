@@ -40,9 +40,17 @@ fn the_scenario_is_listed_with_its_lab() {
     assert!(
         scenarios()
             .iter()
-            .filter(|s| s.name != NAME)
+            .filter(|s| s.name != NAME && !matches!(s.plan, Plan::Autopilot(_)))
             .all(|s| s.kw.instance_env.is_empty()),
-        "no other scenario's instance gets a seam"
+        "no other scenario's instance gets a seam (the Autopilot scenes' is their ladder's, \
+         `autopilot_scenes::INSTANCE_ENV`)"
+    );
+    assert!(
+        scenarios()
+            .iter()
+            .filter(|s| s.name != NAME)
+            .all(|s| !s.kw.instance_env.contains(INSTANCE_ENV)),
+        "no other scenario's instance gets this one's seam"
     );
 }
 

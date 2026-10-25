@@ -6712,6 +6712,7 @@ mod tests {
             font_px: 13.0,
             cols: window.cols as usize,
             panel_rows: window.overlay_rows(),
+            px_per_pt: 1.0,
         };
         let (rx, ry, rw, rh) =
             crate::palette::palette_row_rect(window.palette().expect("open palette"), &geom, slot)
@@ -7568,6 +7569,7 @@ mod tests {
             font_px: app.win_font_px(wid),
             cols,
             panel_rows: window.overlay_rows(),
+            px_per_pt: window.scale as f32,
         };
         let visible = 3;
         let to_window = |x: f32, y: f32| {
@@ -7605,6 +7607,65 @@ mod tests {
                     "slot {slot} {band} exterior band misses"
                 );
             }
+        }
+    }
+
+    /// On a Retina window a pointer lands on a palette row as far right as the row is painted: past
+    /// where a card capped at 820 device pixels would end, and not one pixel further.
+    #[test]
+    fn a_retina_pointer_lands_on_a_palette_row_past_a_device_pixel_cap() {
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cols = 400;
+            ws.scale = 2.0;
+            ws.input_scratch.cells = vec![Vec::new(); 50];
+        }
+        app.palette_enter();
+        let (cw, ch) = app.win_cell_size(wid);
+        let window = &app.windows[&wid];
+        let painted = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px: app.win_font_px(wid),
+            cols: usize::from(window.cols),
+            panel_rows: window.overlay_rows(),
+            px_per_pt: 2.0,
+        };
+        let t = app
+            .overlay_coordinate_transform(wid)
+            .expect("the open palette's transform");
+        assert_eq!(t.scale, 1.0, "the terminal route: device-pixel geometry");
+        let (ox, oy) = app.frame_origin(wid);
+        let to_window = |x: f32, y: f32| {
+            (
+                ox as f64 + t.origin_x + f64::from(x),
+                oy as f64 + t.origin_y + f64::from(y),
+            )
+        };
+        let palette = window.palette().expect("open palette");
+        for slot in 0..3 {
+            let (rx, ry, rw, rh) =
+                crate::palette::palette_row_rect(palette, &painted, slot).expect("a painted row");
+            assert!(
+                rw > 820.0,
+                "the 2x row ({rw} px) reaches past a card capped at 820 px"
+            );
+            let (x, y) = to_window(rx + rw - 0.5, ry + rh * 0.5);
+            assert_eq!(
+                app.palette_row_at_pointer(wid, x, y),
+                Some(slot),
+                "slot {slot}'s right end"
+            );
+            let (x, y) = to_window(rx + rw + 0.5, ry + rh * 0.5);
+            assert_eq!(
+                app.palette_row_at_pointer(wid, x, y),
+                None,
+                "slot {slot}: past its painted right end"
+            );
         }
     }
 

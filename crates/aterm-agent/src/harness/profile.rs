@@ -863,22 +863,24 @@ impl WeeklyFigure {
     }
 }
 
-/// Why a Claude Code footer has no weekly figure ([`SubscriptionDisplay::weekly_gap`]).
+/// Why a Claude Code footer has no weekly figure ([`SubscriptionDisplay::weekly_gap`]). Its
+/// words state the fact and never ask the person to act (owner ruling R-12: the harness reads
+/// the week itself, and where it cannot, says so plainly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WeeklyGap {
-    /// `[harness] usage_tap` is off, or the harness is off for Claude Code: only a person's
-    /// `/usage` gives a figure.
+    /// `[harness] usage_tap` is off, or the harness is off for Claude Code: the harness reads
+    /// no figure for it.
     TapOff,
     /// The tap is on, and no relaunch line could carry it for this process (why: the
-    /// [`super::tap::Refusal`]): only a person's `/usage` gives a figure.
+    /// [`super::tap::Refusal`]): the harness reads no figure for it.
     Unoffered(super::tap::Refusal),
     /// The tap is on, and a relaunch line would carry it, but this process was not started
-    /// with it, and aterm's restart in place is offered for it now: a restart adds it (the
-    /// host's hand, a hold or a driver's lease, is judged at the restart).
+    /// with it, and aterm's restart in place is offered for it now: the next relaunch aterm
+    /// makes of it (a live upgrade, a restart in place) adds it.
     Untapped,
     /// As [`Self::Untapped`], but no restart in place is offered for it now (the host
     /// supervises no such process in its tab, as with its Autopilot off, or its relaunch would
-    /// not bring it back): only a person's `/usage` gives a figure.
+    /// not bring it back): the harness reads no figure for it.
     Unrestarted,
     /// The process carries the tap, and no reply since it started brought a weekly figure.
     NoReply,
@@ -892,8 +894,9 @@ impl WeeklyGap {
     #[must_use]
     pub const fn words(self) -> &'static str {
         match self {
-            Self::TapOff | Self::Unoffered(_) | Self::Unrestarted => "weekly ? \u{b7} /usage",
-            Self::Untapped => "weekly ? \u{b7} restart tab",
+            Self::TapOff => "weekly ? \u{b7} tap off",
+            Self::Unoffered(_) | Self::Unrestarted => "weekly ? \u{b7} untapped",
+            Self::Untapped => "weekly ? \u{b7} until relaunch",
             Self::NoReply => "weekly ? \u{b7} no reply yet",
             Self::Stale => "weekly ? \u{b7} no reply 1h",
         }
@@ -903,10 +906,11 @@ impl WeeklyGap {
     #[must_use]
     pub const fn spoken(self) -> &'static str {
         match self {
-            Self::TapOff | Self::Unoffered(_) | Self::Unrestarted => {
-                "weekly figure unknown, /usage shows it"
+            Self::TapOff => "weekly figure unknown, aterm's usage tap is off",
+            Self::Unoffered(_) | Self::Unrestarted => {
+                "weekly figure unknown, this Claude Code runs without aterm's usage tap"
             }
-            Self::Untapped => "weekly figure unknown, a restart of the tab adds it",
+            Self::Untapped => "weekly figure unknown until aterm next relaunches this Claude Code",
             Self::NoReply => "weekly figure unknown, no reply has brought it yet",
             Self::Stale => "weekly figure unknown, no reply in the last hour",
         }

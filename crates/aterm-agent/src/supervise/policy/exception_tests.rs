@@ -670,12 +670,10 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
         let mut futile_after = Vec::new();
         // Each try answered in its own words: no reply comes again, and the hour bounds the word.
         let words = ["", " · later", " · try later", " · still"];
+        let mut worked = Some(3 * MIN);
         while tries < FUTILE_AFTER_TRIES + 1 {
-            r.worked = Some(if tries == 0 {
-                3 * MIN
-            } else {
-                Duration::from_secs(4)
-            });
+            // A turn is read once, at the point it ended.
+            r.worked = worked.take();
             r.wall_message = format!("{said}{}", words[tries]);
             st.observe(&r, now);
             match decide_turn_end(&st, &r, &cfg, now) {
@@ -684,6 +682,7 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
                     tries += 1;
                     futile_after.push(exception_for(&st, &r, &cfg, now).map(|e| e.kind));
                     now += Duration::from_secs(5);
+                    worked = Some(Duration::from_secs(4));
                 }
                 TurnEndAction::WaitUntil { until, .. } => now = until,
                 other => panic!("{kind:?}: {other:?}"),

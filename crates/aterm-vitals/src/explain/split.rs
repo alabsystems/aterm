@@ -102,19 +102,25 @@ pub fn split(i: &SplitIn) -> CoalSplit {
 
     let mut tabs = vec![0u64; i.tabs.len()];
     let mut own_ns = 0u64;
+    // Whether every member of aterm's coalitions swept now is in a live
+    // figure ([`CoalSplit::skew_mc`]).
+    let mut all_live = true;
     let mut moved: IdMap<u64, u64> = IdMap::default();
     for ((p, m), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
+        let ours = p.coalition.is_some_and(|c| part_of(c) == Part::Aterm);
         let (Some(ns), Some(&(start, before))) = (p.cpu_ns, i.base.procs.get(&p.pid)) else {
+            all_live &= !ours;
             continue;
         };
         if start.is_none() || start != p.start || p.uid != Some(i.self_uid) {
+            all_live &= !ours;
             continue;
         }
         let work = ns.saturating_sub(before);
         match m.tab.and_then(|t| tabs.get_mut(t)) {
             Some(tab) => add(tab, work),
             None if m.aterm => add(&mut own_ns, work),
-            None => {}
+            None => all_live &= !ours,
         }
         if let Some(c) = p
             .coalition
@@ -137,6 +143,11 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     }
 
     let (mut aterm_ns, mut delegated_ns, mut others_ns, mut services_ns) = (0, 0, 0, 0);
+    // Whether none of aterm's coalitions made or reaped a member between the
+    // window's two reads, each read at both ends with the same task
+    // counters, and the sweep found each one's every live member
+    // ([`CoalSplit::skew_mc`]).
+    let mut kept_members = true;
     let mut rows = Vec::with_capacity(i.now.coalitions.len());
     let mut rows_ns = Vec::with_capacity(i.now.coalitions.len());
     for u in i.now.coalitions.values() {
@@ -155,6 +166,12 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         };
         let named = i.names.get(&u.id);
         let part = named.map_or(Part::Services, |n| n.part);
+        if part == Part::Aterm {
+            let swept = u64::from(i.live.get(&u.id).copied().unwrap_or(0));
+            kept_members &= measured
+                && (before.tasks_started, before.tasks_exited) == (u.tasks_started, u.tasks_exited)
+                && u.tasks_started.checked_sub(u.tasks_exited) == Some(swept);
+        }
         let cpu_ns = u.cpu_ns - before.cpu_ns;
         let delegated = moved.get(&u.id).map_or(0, |d| (*d).min(cpu_ns));
         match part {
@@ -188,9 +205,19 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         });
     }
     let live_ns = tabs.iter().fold(own_ns, |sum, ns| sum.saturating_add(*ns));
-    let unattributed_mc = mc(aterm_ns
+    let past_ns = aterm_ns
         .saturating_add(delegated_ns)
-        .saturating_sub(live_ns));
+        .saturating_sub(live_ns);
+    // With no member made or reaped and every member swept and in a live
+    // figure, aterm's counters held only live figures' work: what they ran
+    // past the live figures is the counters' skew against their members'
+    // times, never finished work (RD §3.5).
+    let (unattributed_ns, skew_ns) = if kept_members && all_live {
+        (0, past_ns)
+    } else {
+        (past_ns, 0)
+    };
+    let unattributed_mc = mc(unattributed_ns);
     let (aterm_mc, delegated_mc, others_mc) = (mc(aterm_ns), mc(delegated_ns), mc(others_ns));
     let services_mc = mc(services_ns);
     as_a_set(
@@ -220,6 +247,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             .collect(),
         own_mc: mc(own_ns),
         unattributed_mc,
+        skew_mc: mc(skew_ns),
         rows,
     }
 }
@@ -316,6 +344,7 @@ impl CoalSplit {
             tabs,
             own_mc,
             unattributed_mc: (aterm_mc - own_mc - in_tabs).max(0),
+            skew_mc: 0,
             rows: Vec::new(),
         }
     }

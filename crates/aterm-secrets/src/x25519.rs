@@ -30,6 +30,19 @@ pub fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
     x25519(scalar, &BASEPOINT)
 }
 
+/// Whether the little-endian u-coordinate is below 2^255 - 19. X25519 accepts
+/// other encodings too, but identity bindings must not treat those as new keys.
+/// This checks encoding only, not whether a point has low order.
+pub(crate) fn canonical_u(point: &[u8; 32]) -> bool {
+    const MODULUS: [u8; 32] = {
+        let mut p = [0xff; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        p
+    };
+    point.iter().rev().cmp(MODULUS.iter().rev()).is_lt()
+}
+
 #[inline]
 fn car25519(o: &mut Gf) {
     for i in 0..16 {

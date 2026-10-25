@@ -32,6 +32,13 @@ pub struct SetupAnswer {
     pub chosen: bool,
     /// A Join: the plan names the vault the person typed, which moves the Mac.
     pub vault_typed: bool,
+    /// The settings of the groups the person changed on the page since it last took the plan
+    /// in force (a group pressed and pressed back counts): the worker applies only these, as
+    /// the plan sets them, onto the plan in force as it admits it, so a page left open while
+    /// a Restore or another window changed the plan never undoes that change (design §3.3).
+    /// Empty: the plan in force as it stands (Set up now). `None`: the plan as sent (the
+    /// first-run offer's answer).
+    pub changed: Option<Selection>,
 }
 
 impl From<WorkstationSetupDecision> for SetupAnswer {
@@ -42,6 +49,7 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
             receipt: None,
             chosen: false,
             vault_typed: false,
+            changed: None,
         }
     }
 }

@@ -194,6 +194,8 @@ pub enum Verb {
     /// `aterm secrets` — the credentials vault, its keyless server and `~/.secrets`
     /// (docs/DESIGN-secrets-2026-10-20.md).
     Secrets,
+    /// `aterm db` — embedded replicated application databases, offline and LAN.
+    Db,
     /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
     Harness,
     /// `aterm keeper` — the PTY keeper (`start | stop | status | serve`).
@@ -231,6 +233,7 @@ impl Verb {
         Verb::Machines,
         Verb::Init,
         Verb::Secrets,
+        Verb::Db,
         Verb::Harness,
         Verb::Keeper,
         Verb::Caffeine,
@@ -260,6 +263,7 @@ impl Verb {
             Verb::Machines => "machines",
             Verb::Init => "init",
             Verb::Secrets => "secrets",
+            Verb::Db => "db",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
             Verb::Caffeine => "caffeine",
@@ -292,6 +296,7 @@ impl Verb {
             | Verb::Machines
             | Verb::Init
             | Verb::Secrets
+            | Verb::Db
             | Verb::Harness
             | Verb::Keeper
             | Verb::Caffeine
@@ -324,6 +329,7 @@ impl Verb {
             | Verb::Machines
             | Verb::Init
             | Verb::Secrets
+            | Verb::Db
             | Verb::Harness
             | Verb::Keeper
             | Verb::Caffeine
@@ -353,6 +359,7 @@ impl Verb {
                 "aterm init [--plan|--check] [--json] [--develop|--no-develop] [--only <items>]"
             }
             Verb::Secrets => "aterm secrets [<cmd>]",
+            Verb::Db => "aterm db <cmd> --dir <database>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
             Verb::Caffeine => "aterm caffeine [<cmd>]",
@@ -446,6 +453,12 @@ impl Verb {
                 "vault, its server and ~/.secrets (status | join |",
                 "sync | edit | approve | serve …); `status` is the",
                 "default. Unix only.",
+            ],
+            Verb::Db => &[
+                "Encrypted embedded application databases, local",
+                "and replicated directly between LAN peers",
+                "(init | request | invite | join | get | put |",
+                "scan | stop | budget-create | spend | sync | serve).",
             ],
             Verb::Harness => &[
                 "Claude Code's spend, limits and accounts, the",
@@ -2085,9 +2098,9 @@ const FRONT_DOOR: aterm_ctl::census::FrontDoor<'static> = aterm_ctl::census::Fro
     verb: &front_door_verb,
 };
 
-/// What the front door does under argv[0]'s file name `name` with argv[1] `first`
+/// What the front door does under `argv[0]`'s file name `name` with `argv[1]` `first`
 /// ([`alias_route`]), for the census: a window alias is a window, any other alias another
-/// program, and its own names (`AliasRoute::FrontDoor`) route by argv[1].
+/// program, and its own names (`AliasRoute::FrontDoor`) route by `argv[1]`.
 fn front_door_alias(name: &str, first: &str) -> Option<aterm_ctl::census::Verb> {
     use aterm_ctl::census::Verb as Census;
     match alias_route(name, first) {
@@ -2107,7 +2120,7 @@ fn front_door_alias(name: &str, first: &str) -> Option<aterm_ctl::census::Verb> 
     }
 }
 
-/// What the front door does with `word` as argv[1], for the census: a verb, `hook`, or a word
+/// What the front door does with `word` as `argv[1]`, for the census: a verb, `hook`, or a word
 /// or flag it answers before it routes a window ([`mode_free`], [`asks_completions`]).
 fn front_door_verb(word: &str) -> Option<aterm_ctl::census::Verb> {
     use aterm_ctl::census::Verb as Census;

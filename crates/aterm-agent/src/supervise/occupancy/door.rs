@@ -249,7 +249,8 @@ pub enum PaceGrant {
     Room(OccupancyReading),
     /// Held by the machine-wide hourly pace.
     Machine,
-    /// Held because no free slot remains.
+    /// Held because no free slot is left for this line: others hold them, or an older hold waits
+    /// for one.
     Reserved,
     /// Held because a slot rule's figures could not be re-read fresh.
     Stale,

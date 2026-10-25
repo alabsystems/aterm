@@ -178,7 +178,7 @@ fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u3
     term.rebase_colors(&base);
 }
 
-/// The GPU half of the terminal, populated by [`AtermGpuTerminal::init`].
+/// The GPU half of the terminal, populated by `AtermGpuTerminal::init`.
 struct GpuState {
     renderer: GpuRenderer,
     surface: GpuSurface,
@@ -938,7 +938,7 @@ impl AtermGpuTerminal {
         self.cpu.cell_size().1
     }
 
-    /// True once [`AtermGpuTerminal::init`] has acquired a GPU + surface.
+    /// True once `AtermGpuTerminal::init` has acquired a GPU + surface.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub const fn gpu_ready(&self) -> bool {
         self.gpu.is_some()

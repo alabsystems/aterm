@@ -50,13 +50,29 @@ pub struct AppIdentity {
 }
 
 /// Per-window cache of the focused pane's raw program claim, keyed by `(session, block id, block state, commandline present)` so a commandline is parsed only on a transition.
-#[derive(Default)]
 pub struct ProgramClaim {
     key: Option<(u64, u64, BlockState, bool)>,
     identity: Option<AppIdentity>,
 }
 
+impl Default for ProgramClaim {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProgramClaim {
+    /// Construct an empty program-claim cache.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            key: None,
+            identity: None,
+        }
+    }
+
     /// `session`'s raw program claim from its current shell block, re-derived only when the key moves.
     #[inline]
     pub fn resolve(&mut self, session: u64, block: Option<&OutputBlock>) -> Option<&AppIdentity> {
@@ -88,7 +104,6 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
 }
 
 /// The tenure gate: turns the focused pane's raw, flapping program claim into the slow one the cat wears.
-#[derive(Default)]
 pub struct KittyTenure {
     worn: Option<AppIdentity>,
     candidate: Option<(Option<AppIdentity>, Instant)>,
@@ -102,7 +117,27 @@ pub struct KittyTenure {
     arrival: PetArrival,
 }
 
+impl Default for KittyTenure {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KittyTenure {
+    /// Construct a fresh tenure gate on the base cat with an empty homecoming roster.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            worn: None,
+            candidate: None,
+            roster: [const { None }; HOMECOMING_SLOTS],
+            last_hello: None,
+            arrival: PetArrival::Quiet,
+        }
+    }
+
     /// Feed this frame's raw claim; returns the claim on glass.
     #[inline]
     pub fn observe(&mut self, raw: Option<&AppIdentity>, now: Instant) -> Option<&AppIdentity> {
@@ -301,15 +336,22 @@ impl Default for LookPolicy {
     /// A fresh window wears the launch kitty floor until a verdict resolves.
     #[inline]
     fn default() -> Self {
-        Self {
-            claim: ProgramClaim::default(),
-            tenure: KittyTenure::default(),
-            rung: CompanionRung::Launch,
-        }
+        Self::new()
     }
 }
 
 impl LookPolicy {
+    /// A fresh window wears the launch kitty floor until a verdict resolves.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            claim: ProgramClaim::new(),
+            tenure: KittyTenure::new(),
+            rung: CompanionRung::Launch,
+        }
+    }
+
     /// Refresh the focused pane's cached raw program claim from `block` (the pane's current block, else its last) without cloning it.
     #[inline]
     pub fn resolve_claim(

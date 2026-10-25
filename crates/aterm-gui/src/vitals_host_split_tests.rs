@@ -263,7 +263,7 @@ fn the_coalitions_are_read_on_split_ticks_only() {
         ..bars()
     });
     assert_eq!(reads(), (0, 0), "the Fleet Monitor tab's");
-    let _ = pull(&mut reader, &bars(), Some(Instant::now()));
+    let _ = pull(&mut reader, &mut bars(), Some(Instant::now()));
     assert_eq!(reads(), (0, 0), "an unarmed pull");
     reader.read(&bars());
     assert_eq!(reads(), (1, 1), "the bars' first reading");
@@ -284,7 +284,7 @@ fn the_coalitions_are_read_on_split_ticks_only() {
     {
         let _armed = armed.arm();
         assert!(!reader.split_cold(), "the last split tick is fresh");
-        let _ = pull(&mut reader, &bars(), Some(Instant::now()));
+        let _ = pull(&mut reader, &mut bars(), Some(Instant::now()));
     }
     assert_eq!(reads(), (2, 2), "a warm pull while armed");
 }
@@ -333,7 +333,7 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     let arming = armed.arm();
     READS.take();
     assert!(reader.split_cold(), "no split tick yet");
-    let snap = pull(&mut reader, &bars(), None);
+    let snap = pull(&mut reader, &mut bars(), None);
     assert_eq!(
         READS.take().coalitions,
         2,
@@ -346,14 +346,14 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     reader.epoch = reader.epoch.checked_sub(gap).expect("a minute since boot");
     reader.split.last = stale();
     assert!(reader.split_cold(), "a base too old for a window");
-    let snap = pull(&mut reader, &bars(), Some(Instant::now()));
+    let snap = pull(&mut reader, &mut bars(), Some(Instant::now()));
     assert_eq!(READS.take().coalitions, 2, "cold for the split alone");
     assert_window(&snap);
 
     drop(arming);
     reader.split.last = stale();
     assert!(!reader.split_cold(), "no `sys why` arms the split");
-    let _ = pull(&mut reader, &bars(), Some(Instant::now()));
+    let _ = pull(&mut reader, &mut bars(), Some(Instant::now()));
     assert_eq!(READS.take().coalitions, 0);
 }
 
@@ -387,7 +387,7 @@ fn a_pull_cold_for_the_split_alone_keeps_the_floor() {
             taken: Vec::new(),
         };
         let last = Instant::now();
-        let _ = pull(&mut source, &bars(), Some(last));
+        let _ = pull(&mut source, &mut bars(), Some(last));
         assert_eq!(source.taken.len(), readings, "cold: {cold}");
         assert!(
             source.taken[0].saturating_duration_since(last) >= MIN_WINDOW,
@@ -653,7 +653,7 @@ fn a_misread_turns_the_hosts_lane_off_for_good() {
     let _armed = armed.arm();
     reader.split.last = None;
     let _ = reader.read(&bars());
-    let _ = pull(&mut reader, &bars(), Some(Instant::now()));
+    let _ = pull(&mut reader, &mut bars(), Some(Instant::now()));
     assert_eq!(READS.take().coalitions, 0, "never again");
 }
 

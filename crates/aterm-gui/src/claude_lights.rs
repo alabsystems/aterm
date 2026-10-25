@@ -3763,7 +3763,7 @@ impl App {
         wake_after(session, settle);
     }
 
-    /// Flip `light` of `session` with Claude's own input (see the module header).
+    /// Flip `light` of `session` with Claude's own input.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(

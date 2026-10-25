@@ -645,6 +645,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         form,
         contrast: false,
         locale: MAC,
+        needs: Vec::new(),
     }
 }
 
@@ -661,7 +662,7 @@ fn input_of(sc: Scene, snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
 }
 
 fn deck_pt(form: DeckForm, s: f64) -> f64 {
-    deck_px(StatsBars::Deck, form, s, (14.0 * s) as usize) as f64 / s
+    deck_px(StatsBars::Deck, DeckStyle::V2, form, s, (14.0 * s) as usize) as f64 / s
 }
 
 fn geom(w: f64, s: f64, form: DeckForm) -> DeckGeom {
@@ -1842,9 +1843,10 @@ fn under_mockup(file: &str, ours: &[u8], w: usize) -> (Vec<u8>, usize) {
     (out, h)
 }
 
-/// The merged deck's scenes as the window's deck draws them (v2 until the merged painter lands),
-/// on each ground at each of [`MERGED_SIZES`], each printed with its blocks' x-edges and its word
-/// count; at a mockup's size, also `<name>_vs_mockup.png`, the mockup's band above the render.
+/// The merged deck's scenes as its painter draws them ([`crate::stats_merged::merged_paint`]) at
+/// the mockups' three 17 pt rows, on each ground at each of [`MERGED_SIZES`], each printed with
+/// its blocks' x-edges and its word count; at a mockup's size, also `<name>_vs_mockup.png`, the
+/// mockup's band above the render.
 #[test]
 #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn merged_gallery() {
@@ -1862,8 +1864,17 @@ fn merged_gallery() {
             for (ground, inks) in [("dark", super::tests::dark_inks()), ("light", light_inks())] {
                 let mut input = input_of(sc, &snap, DeckForm::Full);
                 input.inks = inks;
-                let g = geom(w, s, DeckForm::Full);
-                let (prims, hits) = deck_paint(&g, &input);
+                let g = DeckGeom {
+                    h: deck_px(
+                        StatsBars::Deck,
+                        DeckStyle::Merged,
+                        DeckForm::Full,
+                        s,
+                        (17.0 * s) as usize,
+                    ) as f32,
+                    ..geom(w, s, DeckForm::Full)
+                };
+                let (prims, hits) = crate::stats_merged::merged_paint(&g, &input);
                 let [r, gr, b] = inks.ground;
                 let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
                     &prims,

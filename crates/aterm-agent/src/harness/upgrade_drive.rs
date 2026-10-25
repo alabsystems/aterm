@@ -1952,10 +1952,17 @@ pub(super) fn composer_empty(c: &mut Client, sid: &str, scr: &Screen) -> bool {
 }
 
 pub(super) fn dim_placeholder(c: &mut Client, sid: &str, scr: &Screen) -> bool {
-    dim_cell(scr).is_some_and(|at| {
-        c.request_line(&format!("@{sid} cell {at} 2"))
-            .is_ok_and(|line| cell_is_dim(&line))
+    dim_cell(scr).is_some_and(|at| dim_at(c, sid, at))
+}
+
+/// Whether the composer's text on screen row `row` is drawn dim: the cell of its first glyph, or
+/// of the glyph after it where the program draws its caret over the first (the loop's read,
+/// [`crate::supervise::screen::composer_glyph_cell`]).
+fn dim_at(c: &mut Client, tab: &str, row: usize) -> bool {
+    crate::supervise::screen::composer_glyph_cell(|col| {
+        c.request_line(&format!("@{tab} cell {row} {col}")).ok()
     })
+    .is_some_and(|line| cell_is_dim(&line))
 }
 
 pub(super) fn continuation_composer_empty(
@@ -2643,7 +2650,19 @@ pub(super) fn tap_settings(
 /// week share, so the footer never promises a restart the relaunch's line would not tap.
 #[must_use]
 pub fn tap_settings_admit(home: &Path, argv: &[String], cwd: &str) -> bool {
-    super::tap::settings_admit(&tap_settings_under(home, argv, cwd))
+    let user = tap_user_settings(home);
+    super::tap::settings_admit(&tap_settings_under(home, argv, cwd), Some(&user))
+}
+
+/// The name [`tap_settings`] gives the user's own `settings.json` under the user home `home`
+/// (`<home>/.claude/settings.json`, as `claude_settings::sources_under` names it), the one
+/// document whose statusLine the tap carries ([`super::tap::settings_line`]).
+#[must_use]
+pub fn tap_user_settings(home: &Path) -> String {
+    home.join(".claude")
+        .join("settings.json")
+        .display()
+        .to_string()
 }
 
 /// [`tap_settings`] under the user home `home`.
@@ -10088,12 +10107,10 @@ fn typing_fence_read(c: &mut Client, tab: &str) -> Result<(Option<String>, Scree
     let Some(first) = screen(c, tab) else {
         return Err("screen-unreadable");
     };
-    let Some(dim_at) = dim_cell(&first) else {
+    let Some(dim_at_row) = dim_cell(&first) else {
         return fence_verdict(&first, false).map(|generation| (generation, first));
     };
-    let dim = c
-        .request_line(&format!("@{tab} cell {dim_at} 2"))
-        .is_ok_and(|line| cell_is_dim(&line));
+    let dim = dim_at(c, tab, dim_at_row);
     let Some(scr) = screen(c, tab) else {
         return Err("screen-unreadable");
     };

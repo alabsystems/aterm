@@ -1794,6 +1794,8 @@ pub(crate) struct SessionTimeline {
     task: Option<crate::task_record::TaskRecord>,
     worker_launch: Option<(std::time::Instant, String)>,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
+    codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
+    program_shown: Option<ShownProgram>,
     claude_side: Option<(i32, std::sync::Arc<crate::claude_footer::FactSide>)>,
     claude_footer_read: Option<(i32, std::time::Instant)>,
     gauges: AgentGauges,
@@ -1954,14 +1956,41 @@ pub(crate) struct AgentPublication {
     pub(crate) text_moves: u64,
     pub(crate) grid: Option<GridRead>,
     pub(crate) screen_moves: u64,
-    pub(crate) busy_entries: u64,
+}
+
+/// What the program in front last said about itself ([`SessionTimeline::note_program_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShownProgram {
+    pub(crate) state: aterm_core::terminal::program_state::ProgramState,
+    since: std::time::Instant,
+    since_continuous_ms: Option<u64>,
+}
+
+impl ShownProgram {
+    fn now(state: aterm_core::terminal::program_state::ProgramState) -> Self {
+        Self {
+            state,
+            since: std::time::Instant::now(),
+            since_continuous_ms: aterm_uds::process::continuous_ms(),
+        }
+    }
+
+    /// How long it has said so, counted through sleep, as the survey reports it.
+    pub(crate) fn age_ms(&self) -> u64 {
+        match (
+            self.since_continuous_ms,
+            aterm_uds::process::continuous_ms(),
+        ) {
+            (Some(at), Some(now)) => now.saturating_sub(at),
+            _ => u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 /// What a proven self-claim's landing was recorded over (Autopilot Land).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LandingMark {
     pub(crate) program_turns: u64,
-    pub(crate) busy_entries: u64,
 }
 
 /// How long after the first read that finds a session's grid resized a text change counts as
@@ -2013,7 +2042,6 @@ impl Default for AgentPublication {
             text_moves: 0,
             grid: None,
             screen_moves: 0,
-            busy_entries: 0,
         }
     }
 }
@@ -2128,8 +2156,8 @@ impl SessionTimeline {
         self.landing_mark
     }
 
-    /// Record a turn-starting act typed by a proven self-claim holder: the program's turns and
-    /// the screen's busy entries it stood at, when it came with the program at rest.
+    /// Record a turn-starting act typed by a proven self-claim holder: the program's turns it
+    /// stood at, when it came with the program at rest.
     pub(crate) const fn note_typed_act(&mut self, at_rest: Option<LandingMark>) {
         self.typed_turn = at_rest;
     }
@@ -2164,6 +2192,7 @@ impl SessionTimeline {
         &mut self,
         shown: Option<aterm_core::terminal::program_state::ProgramState>,
     ) {
+        self.program_shown = shown.map(ShownProgram::now);
         let at = self.slog.now();
         self.slog.observe_program(shown, at);
         self.record(PROGRAM_STATE);
@@ -2702,9 +2731,6 @@ impl SessionTimeline {
         self.note_text(stamp, regrid);
         let reader_changed = self.agent.reader != reader;
         let old_word = self.agent.word;
-        if word == "busy" && self.agent.screen_word != "busy" && !regrid {
-            self.agent.busy_entries = self.agent.busy_entries.wrapping_add(1);
-        }
         self.set_agent_reader(reader);
         self.agent.screen_word = word;
         self.agent.screen_detail = detail;
@@ -3401,6 +3427,39 @@ impl SessionTimeline {
             .as_ref()
             .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
             .map(|(_, excerpts)| excerpts)
+    }
+
+    /// What the program in front last said about itself (OSC 7501), and since when.
+    pub(crate) const fn program_shown(&self) -> Option<ShownProgram> {
+        self.program_shown
+    }
+
+    /// The rollout tap's facts for the codex process in group `pgid` ([`crate::codex_rollout_tap`]),
+    /// taken only while that group is in front: whether they were.
+    pub(crate) fn set_codex_survey(
+        &mut self,
+        pgid: i32,
+        survey: crate::survey::CodexSurvey,
+    ) -> bool {
+        if self.agent.program_pgid != pgid {
+            return false;
+        }
+        self.codex_survey = Some((pgid, survey));
+        true
+    }
+
+    /// Forget the rollout tap's facts: its tap went.
+    pub(crate) fn clear_codex_survey(&mut self) {
+        self.codex_survey = None;
+    }
+
+    /// The codex facts the survey shows, or `None` when the program in front is not the one they
+    /// were read for.
+    pub(crate) fn codex_survey(&self) -> Option<&crate::survey::CodexSurvey> {
+        self.codex_survey
+            .as_ref()
+            .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
+            .map(|(_, survey)| survey)
     }
 
     /// The footer resolver's side for `pgid`, applied only while that group is in front.

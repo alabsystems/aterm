@@ -375,7 +375,12 @@ pub fn scope_balance_model() -> Model {
     }
 }
 
-/// THE EXPLANATION'S HONESTY. `lost`: the split's unaccounted residual
+/// THE EXPLANATION'S HONESTY. `live` and `bound`: the caller tab's role
+/// at its live figure, and with the work no live process held added (none
+/// over a window in which aterm's coalitions made or reaped no member and
+/// the sweep found every member in a live figure: the counters' skew,
+/// RD §3.5);
+/// `lost`: the split's unaccounted residual
 /// (work no coalition held) is at least a core and over the floor;
 /// `settled`: pressure and the thermal state are read, neither holds, and no
 /// covering cause but a named activity holds, the residual aside; `none`:

@@ -25,6 +25,7 @@ pub const CODEX_MEASURED_BUILDS: &[&str] = &[
     "0.164.0-dev.12479+g07a25d86a",
     "0.164.0-dev.12672+g089291d37",
     "0.164.0-dev.13172+g32a73bca2",
+    "0.165.0-dev.13594+g870dabaa6",
 ];
 
 /// The build `build` as the log says it (`ver=`).

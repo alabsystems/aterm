@@ -79,8 +79,10 @@ pub fn long_reply_ms(text: &str) -> i64 {
 
 const LAND_KEY: &str = "Autopilot is Land:";
 const NUDGE_KEY: &str = "Still landing:";
-const CHECK_KEY: &str = "done is never the end";
-const CONTINUE_KEY: &str = "Autopilot is Cruise: keep going";
+/// The words of the done check the stub's rules answer (`continue-done-check@v1`).
+pub const CHECK_KEY: &str = "done is never the end";
+/// The words of Cruise's continuation the stub's rules answer (`continue@v1`).
+pub const CONTINUE_KEY: &str = "Autopilot is Cruise: keep going";
 
 const OPEN_SUFFIX: &str = "Your report still names open work";
 const REPO_SUFFIX: &str = "Your repository still holds work";
@@ -834,6 +836,10 @@ pub enum Chain {
     RelaunchWall,
     /// W10 (`--mode wall-bucket`, [`crate::stub::gemini::BUCKET_CLAIM`]).
     BucketWall,
+    /// HL (Land: one defense to every act over an untracked file, held at its second answer).
+    SameLand,
+    /// HC (Cruise: one reply to every done check, held at its second answer).
+    SameCruise,
 }
 
 /// The scenarios, by the names the report and the record use.
@@ -906,6 +912,11 @@ pub enum Scenario {
     F3,
     /// The back-off ladder doubled to its cap, each act at its due (scaled).
     Ladder,
+    /// One defense to every act under Land, over an untracked file: held at its second answer
+    /// (ruling F), and the hold said ([`held`](surfaces::held)).
+    HL,
+    /// One reply to every done check under Cruise: held at its second answer, and said.
+    HC,
 }
 
 impl Scenario {
@@ -960,6 +971,8 @@ impl Scenario {
             Scenario::Scrolled => "F1S",
             Scenario::F3 => "F3",
             Scenario::Ladder => "LADDER",
+            Scenario::HL => "HL",
+            Scenario::HC => "HC",
         }
     }
 
@@ -1035,6 +1048,8 @@ impl Scenario {
             }
             Scenario::F3 => "a first turn ended on a tool's row after a launch: judged",
             Scenario::Ladder => "the back-off ladder doubled to its cap, each act at its due",
+            Scenario::HL => "one defense to every Land act: held at its second answer, and said so",
+            Scenario::HC => "one reply to every done check: held at its second answer, and said so",
         }
     }
 }
@@ -1056,7 +1071,7 @@ pub enum Opening {
 impl Chain {
     /// The measured pass's chains (`--mode both`), with P4's instant ones and the window's three
     /// (L16, L17, N1–N4).
-    pub const ALL: [Chain; 16] = [
+    pub const ALL: [Chain; 18] = [
         Chain::LandA,
         Chain::LandB,
         Chain::LandC,
@@ -1073,6 +1088,8 @@ impl Chain {
         Chain::LandJ,
         Chain::LandK,
         Chain::CruiseN,
+        Chain::SameLand,
+        Chain::SameCruise,
     ];
 
     /// The coverage chains (`--mode cover`): what the measured pass left unobserved, and the Off
@@ -1390,6 +1407,8 @@ impl Chain {
             Chain::CruiseWall => "cruise-wall",
             Chain::RelaunchWall => "relaunch-wall",
             Chain::BucketWall => "bucket-wall",
+            Chain::SameLand => "same-land",
+            Chain::SameCruise => "same-cruise",
         }
     }
 
@@ -1413,7 +1432,8 @@ impl Chain {
             | Chain::TallScroll
             | Chain::Ladder
             | Chain::CruiseO
-            | Chain::CruiseWall => "cruise",
+            | Chain::CruiseWall
+            | Chain::SameCruise => "cruise",
             Chain::Off | Chain::Mgr => "off",
             _ => "land",
         }
@@ -1463,6 +1483,8 @@ impl Chain {
             Chain::CruiseWall => &[Scenario::W8],
             Chain::RelaunchWall => &[Scenario::W9],
             Chain::BucketWall => &[Scenario::W10],
+            Chain::SameLand => &[Scenario::HL],
+            Chain::SameCruise => &[Scenario::HC],
         }
     }
 
@@ -1475,6 +1497,7 @@ impl Chain {
             Chain::LandG => Repo::Stashed,
             Chain::LandH => Repo::Unpushed,
             Chain::LandI => Repo::Unlanded,
+            Chain::SameLand => Repo::Untracked,
             _ => Repo::Clean,
         }
     }
@@ -1524,6 +1547,32 @@ impl Chain {
                 | Chain::SameWords
                 | Chain::TallScroll
                 | Chain::ToolEnd
+        )
+    }
+
+    /// Its script answers the acts it meets before its watch ends with one canned reply, so under
+    /// ruling F (`4cefe18775`) aterm stops typing into it at that reply's second answer (the
+    /// same-reply hold, `EXCEPTION … kind=stalled`): land@v1 and the nudge answered alike (land-b
+    /// to land-i; land-e lands at the first), each done check answered alike (`cruise`, and
+    /// `wrote-c`'s `W_CHECKED`), and the two chains made for the hold. Each such chain is watched past its hold and wants the hold
+    /// said ([`surfaces::held`]); any other chain of the measured pass or the coverage chains
+    /// fails at a `kind=stalled` ([`surfaces::held::stall_fault`]).
+    #[must_use]
+    pub const fn same_reply(self) -> bool {
+        matches!(
+            self,
+            Chain::LandB
+                | Chain::LandC
+                | Chain::LandD
+                | Chain::LandE
+                | Chain::LandF
+                | Chain::LandG
+                | Chain::LandH
+                | Chain::LandI
+                | Chain::Cruise
+                | Chain::WroteC
+                | Chain::SameLand
+                | Chain::SameCruise
         )
     }
 
@@ -1726,6 +1775,8 @@ impl Chain {
                 rule("", TOOL_AFTER),
             ],
             Chain::Ladder => vec![rule("", WORK)],
+            Chain::SameLand => vec![rule(MARK, CLEAN), rule("", WORK)],
+            Chain::SameCruise => vec![rule(MARK, CLEAN), rule("", DONE_CLAIM)],
         }
     }
 
@@ -1920,6 +1971,10 @@ pub struct Seen {
     /// The stub's witness (L5, L7: after the landing; Off: the whole conversation); `None` where it
     /// was never read.
     pub stub: Option<StubSeen>,
+    /// A same-reply chain's hold lifted before its next act ([`surfaces::held::lift_of`]): how
+    /// many requests of its conversation the stub read between the hold and the lift, read once
+    /// the watch is over ([`lift_witness`]); `None` where it was not lifted.
+    pub lift_stub: Option<usize>,
     /// What the coverage chains' run did and read beside the records.
     pub cover: Cover,
     /// What the window showed of the tab ([`surfaces`]).
@@ -2164,6 +2219,9 @@ fn idle_words(line: &str) -> Option<&str> {
 struct Yield<'a> {
     event: Option<&'a (i64, String)>,
     waiting: Option<&'a (i64, String)>,
+    /// The same-reply hold decided for that point in place of a `WAITING` (its `EXCEPTION …
+    /// kind=stalled`, under the event's `seq=`): aterm types nothing more at it.
+    held: Option<&'a (i64, String)>,
 }
 
 impl Seen {
@@ -2218,13 +2276,19 @@ impl Seen {
                     !w.is_empty() && w != "-" && holding.is_none_or(|h| w.contains(h))
                 })
         });
-        let waiting = event.and_then(|(et, el)| {
-            let seq = word(el, "seq");
-            self.journal.iter().find(|(at, l)| {
-                *at >= *et && before(*at) && l.starts_with("WAITING ") && word(l, "seq") == seq
+        let decided = |what: fn(&str) -> bool| {
+            event.and_then(|(et, el)| {
+                let seq = word(el, "seq");
+                self.journal
+                    .iter()
+                    .find(|(at, l)| *at >= *et && before(*at) && what(l) && word(l, "seq") == seq)
             })
-        });
-        Yield { event, waiting }
+        };
+        Yield {
+            event,
+            waiting: decided(|l| l.starts_with("WAITING ")),
+            held: decided(surfaces::held::is_stall),
+        }
     }
 
     fn needs_seen(&self) -> Option<String> {
@@ -2396,10 +2460,13 @@ pub fn quiet_after_landed_ms(seen: &Seen, t: i64, managed: bool) -> i64 {
 /// The judge of one chain's records `seen` (`program`: the reader's word the needs entry names),
 /// `t0` the first prompt's time: each of its scenarios' verdict, in order. Every one is a `FAIL`
 /// where the chain's records hold a fault of their own ([`chain_faults`]: an act before its due,
-/// an act typed twice, a point before the first prompt), its own judge's words kept.
+/// an act typed twice, a point before the first prompt; [`surfaces::held::stall_fault`]: a hold in
+/// a chain whose script makes none), its own judge's words kept. A same-reply chain's last
+/// scenario also carries the hold's wants ([`surfaces::held::with_held`]).
 #[must_use]
 pub fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
-    let faults = chain_faults(seen, t0);
+    let mut faults = chain_faults(seen, t0);
+    faults.extend(surfaces::held::stall_fault(chain, seen, t0));
     let verdicts = judge_scenarios(chain, seen, program, t0);
     if faults.is_empty() {
         return verdicts;
@@ -2483,9 +2550,11 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::SameWords => cover::judge_same_words(seen, t0),
             Scenario::F3 => cover::judge_tool_end(seen, land, t0),
             Scenario::Ladder => cover::judge_ladder(seen, LADDER_SCALE, t0),
+            Scenario::HL | Scenario::HC => surfaces::held::judge_hold(chain, seen, t0),
         };
         let cx = surfaces::Ctx { chain, program, t0 };
-        out.push((s, surfaces::with_window(s, seen, &cx, v)));
+        let v = surfaces::with_window(s, seen, &cx, v);
+        out.push((s, surfaces::held::with_held(s, seen, &cx, v)));
     }
     out
 }
@@ -2650,6 +2719,7 @@ fn judge_nudge<'a>(
         Yield {
             event: Some((te, el)),
             waiting: Some((tw, wl)),
+            ..
         } => Verdict::Pass(format!(
             "{said}; its yield read at +{} ({}), +{} {}",
             at(t0, *te),
@@ -2660,6 +2730,18 @@ fn judge_nudge<'a>(
         Yield {
             event: Some((te, el)),
             waiting: None,
+            held: Some((th, hl)),
+        } => Verdict::Pass(format!(
+            "{said}; its yield read at +{} ({}), +{} HELD {}",
+            at(t0, *te),
+            crate::util::one_line(el, 80),
+            at(t0, *th),
+            crate::util::one_line(hl, 100)
+        )),
+        Yield {
+            event: Some((te, el)),
+            waiting: None,
+            held: None,
         } => Verdict::Fail(format!(
             "{said}; its yield read at +{} ({}) but no WAITING decided for that point within {}",
             at(t0, *te),
@@ -3953,23 +4035,35 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
-    let home = run.w.join("home");
     let dir = Path::new(&run.proj).join(chain.name());
     let bare = Path::new(&run.sockdir).join(format!("origin-{}.git", chain.name()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    std::fs::create_dir_all(&bare).map_err(|e| format!("{}: {e}", bare.display()))?;
+    lay_repo_at(run, &dir, &bare, &chain.token(), chain.repo())
+}
+
+/// A chain's repository laid in `dir` ([`lay_repo`]'s, `token` its README's word): `main`
+/// committed and pushed to `bare`, its `origin`, with `repo` beside it. The corpus's Land scenes
+/// lay theirs in the lab's own project ([`crate::autopilot_scenes`]).
+/// # Errors
+/// A folder that cannot be made, or a git step that fails.
+pub fn lay_repo_at(
+    run: &Run,
+    dir: &Path,
+    bare: &Path,
+    token: &str,
+    repo: Repo,
+) -> Result<PathBuf, String> {
+    let home = run.w.join("home");
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::create_dir_all(bare).map_err(|e| format!("{}: {e}", bare.display()))?;
     let put = |name: &str, text: &str| {
         std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"))
     };
-    let g = |args: &[&str]| git(&home, &dir, args);
-    git(&home, &bare, &["init", "-q", "--bare", "-b", "main"])?;
+    let g = |args: &[&str]| git(&home, dir, args);
+    git(&home, bare, &["init", "-q", "--bare", "-b", "main"])?;
     g(&["init", "-q", "-b", "main"])?;
     put(
         "README.md",
-        &format!(
-            "# {}\n\nThe forever lab's scratch project.\n",
-            chain.token()
-        ),
+        &format!("# {token}\n\nThe forever lab's scratch project.\n"),
     )?;
     g(&["add", "README.md"])?;
     g(&["commit", "-q", "-m", "lab: the scratch project"])?;
@@ -3977,7 +4071,7 @@ fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
     g(&["push", "-q", "-u", "origin", "main"])?;
     g(&["remote", "set-head", "origin", "main"])?;
     let readme_changed = "# The forever lab\n\nA change nobody committed.\n";
-    match chain.repo() {
+    match repo {
         Repo::Clean => {}
         Repo::Untracked => put("wip-notes.txt", "work nobody committed\n")?,
         Repo::Changed => put("README.md", readme_changed)?,
@@ -3989,12 +4083,12 @@ fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
             put("parser.txt", "the parser, committed here only\n")?;
             g(&["add", "parser.txt"])?;
             g(&["commit", "-q", "-m", "lab: the parser"])?;
-            if chain.repo() == Repo::Unlanded {
+            if repo == Repo::Unlanded {
                 g(&["push", "-q", "origin", "main:wip"])?;
             }
         }
     }
-    std::fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))
+    std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
@@ -5190,6 +5284,22 @@ impl StubSeen {
     }
 }
 
+/// THE LIFT'S WITNESS ([`Seen::lift_stub`]): the requests of a same-reply chain's conversation the
+/// stub read after its hold and by the hold's lift ([`surfaces::held::lift_of`]); `None` where it
+/// was not lifted.
+fn lift_witness(run: &Run, tab: &Tab) -> Option<usize> {
+    if !tab.chain.same_reply() {
+        return None;
+    }
+    let (ts, _) = surfaces::held::stall_of(&tab.seen, tab.t0)?;
+    let (tl, _) = surfaces::held::lift_of(&tab.seen, *ts)?;
+    Some(surfaces::held::requests_between(
+        &dumps_of(run, &tab.chain.token()),
+        *ts,
+        *tl,
+    ))
+}
+
 fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
     let token = tab.chain.token();
     let typed_by = |t: i64| {
@@ -6145,6 +6255,10 @@ fn ask_due(s: &Seen, now: i64) -> bool {
     decided.is_some_and(|(tw, _)| now - *tw >= 5000) && s.all_acts().iter().all(|(t, _)| *t <= t1)
 }
 
+/// Whether `tab`'s watch is over: a landing chain quiet past the ladder's next step, a same-reply
+/// chain [`PAST_NEXT_STEP_MS`] past its last act's point (past its hold, so what it says of it is
+/// read: [`surfaces::held::watched_past`]), each other chain at what it waits for, every one at its
+/// hang detector ([`Chain::limit_ms`]).
 fn finished(tab: &Tab, now: i64) -> bool {
     let s = &tab.seen;
     let done = s.first_after("DONE ", tab.t0).map(|(t, _)| *t);
@@ -6192,14 +6306,18 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::LandP => done_since(20_000),
         Chain::Cap => cover::cap_watched(s, now) || done_since(20_000),
         Chain::InstantLand => s.all_acts().is_empty() && now - tab.t0 > 300_000,
-        Chain::LandB | Chain::LandC | Chain::LandF | Chain::LandG | Chain::LandH | Chain::LandI => {
-            nudge.is_some_and(|n| {
-                s.yield_after(n, None, None)
-                    .waiting
-                    .is_some_and(|(w, _)| now - w >= 3000)
-            }) || done_since(20_000)
+        Chain::LandB
+        | Chain::LandC
+        | Chain::LandD
+        | Chain::LandF
+        | Chain::LandG
+        | Chain::LandH
+        | Chain::LandI => {
+            (nudge.is_some() && surfaces::held::watched_past(s, now)) || done_since(20_000)
         }
-        Chain::LandD => nudge.is_some_and(|n| now - n >= 10_000) || done_since(20_000),
+        Chain::SameLand | Chain::SameCruise => {
+            (s.all_acts().len() >= 2 && surfaces::held::watched_past(s, now)) || done_since(20_000)
+        }
         Chain::InstantCruise => {
             let head: String = ASK_REPLY.chars().take(24).collect();
             let judged = s.asked_ms.and_then(|a| {
@@ -6236,7 +6354,9 @@ fn finished(tab: &Tab, now: i64) -> bool {
         }
         Chain::Cruise | Chain::WroteC => {
             let check = first(turn_end::RULE_DONE_CHECK);
-            check.is_some_and(|c| s.all_acts().iter().any(|(t, _)| *t > c)) || done_since(20_000)
+            (check.is_some_and(|c| s.all_acts().iter().any(|(t, _)| *t > c))
+                && surfaces::held::watched_past(s, now))
+                || done_since(20_000)
         }
         Chain::CruiseO => {
             first(turn_end::RULE_CONTINUE).is_some_and(|c| {
@@ -6617,6 +6737,7 @@ fn run_check(
                         crate::util::one_line(&v, 240)
                     );
                 }
+                surfaces::held::look_step(&door, tab, front_label.as_deref());
             }
             if let Some(ask) = tab.chain.asks()
                 && !tab.ask_tried
@@ -6688,6 +6809,13 @@ fn run_check(
             if finished(tab, now) {
                 tab.over = true;
                 tab.seen.stub = stub_witness(&run, tab);
+                tab.seen.lift_stub = lift_witness(&run, tab);
+                if let Some(n) = tab.seen.lift_stub {
+                    println!(
+                        "  [{}] stub    its hold was lifted; the stub read {n} request(s) of its conversation between",
+                        tab.chain.name()
+                    );
+                }
                 tab.seen.cover.window_stub = window_witness(&run, tab);
                 tab.seen.cover.went_on_ms = went_on_witness(&run, tab);
                 tab.seen.cover.owner_texts = owner_witness(&run, tab);

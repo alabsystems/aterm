@@ -97,6 +97,8 @@ pub enum FleetOp {
     Join,
     /// Drive sessions on a listener configured with `[fleet] allow = "drive"`.
     Drive,
+    /// Replicate a separate application database; never grants terminal survey or drive.
+    Database,
 }
 
 impl FleetOp {
@@ -109,6 +111,7 @@ impl FleetOp {
             Self::Book => "book",
             Self::Join => "join",
             Self::Drive => "drive",
+            Self::Database => "database",
         }
     }
 
@@ -116,9 +119,15 @@ impl FleetOp {
     #[inline]
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
-        [Self::Survey, Self::Book, Self::Join, Self::Drive]
-            .into_iter()
-            .find(|op| op.word() == word)
+        [
+            Self::Survey,
+            Self::Book,
+            Self::Join,
+            Self::Drive,
+            Self::Database,
+        ]
+        .into_iter()
+        .find(|op| op.word() == word)
     }
 }
 

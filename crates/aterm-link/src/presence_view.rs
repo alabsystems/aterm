@@ -623,23 +623,25 @@ mod tests {
                 other => panic!("the view sends no {other:?}"),
             }
         }
-        send(
-            &mut c,
-            &Response::Gap(astream_broker::Gap {
+        // One write: the reader hangs up once it reads the gap, so a frame
+        // written after that could meet a closed socket.
+        let mut after = Vec::new();
+        for r in [
+            Response::Gap(astream_broker::Gap {
                 from: 5,
                 to: 8,
                 records: Some(2),
             }),
-        );
-        send(&mut c, &mark(9, 10));
-        send(
-            &mut c,
-            &Response::Delivery {
+            mark(9, 10),
+            Response::Delivery {
                 offset: 9,
                 subject: row("n-a", "s-a"),
                 body: LIVE.to_vec(),
             },
-        );
+        ] {
+            write_frame(&mut after, &encode_response(&r)).expect("encode");
+        }
+        std::io::Write::write_all(&mut c, &after).expect("write");
         assert!(
             view.wait_for(aterm_spec::wait::MUST_HAPPEN, |phase, reached| {
                 phase == Phase::Dead || reached > 9

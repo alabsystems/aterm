@@ -3,7 +3,7 @@
 
 //! System State's access steps: the Local Network trigger's target, the menu
 //! line, the step gating and a Needs-you row's press. Nothing reaches a LAN, a
-//! state directory or System Settings. The dialog-ownership regressions use
+//! person's state directory or System Settings. The dialog-ownership regressions use
 //! the real process-wide guard, without raising a dialog.
 
 use std::cell::RefCell;
@@ -116,6 +116,7 @@ fn observed(subject: Subject, standing: Standing, note: Option<&str>) -> Observa
         subject,
         standing,
         now: None,
+        after_login: None,
         wanted: subject.wanted().to_string(),
         note: note.map(str::to_string),
         detail: None,
@@ -492,6 +493,7 @@ fn stepping() -> StepsReach {
         },
         record: |revision, access, outcome| {
             RECORDS.with(|r| r.borrow_mut().push((revision, access, outcome)));
+            Ok(())
         },
         recorded: |_, _| None,
         frontmost: |_| true,
@@ -571,6 +573,213 @@ fn the_local_network_step_runs_first_and_once_per_approved_revision() {
     assert_eq!(triggers(), fired + 2, "a new revision asks again");
 }
 
+/// Once macOS's step started, a failed record write is still owed after the disk recovers:
+/// normal turns save that same outcome without starting another macOS step.
+#[test]
+fn a_local_network_step_recovers_its_record_without_triggering_again() {
+    use aterm_types::macos_setup::access_record;
+
+    struct Writes {
+        dir: std::path::PathBuf,
+        attempted: usize,
+        failed: usize,
+    }
+    thread_local! {
+        static WRITES: RefCell<Option<Writes>> = const { RefCell::new(None) };
+    }
+    let root = aterm_tempfile::tempdir().expect("scratch access record");
+    let revision = 8_210;
+    access_record::append(
+        root.path(),
+        revision - 1,
+        Access::LocalNetwork,
+        AccessOutcome::Triggered,
+    )
+    .unwrap();
+    access_record::append(
+        root.path(),
+        revision,
+        Access::DeveloperTools,
+        AccessOutcome::Granted,
+    )
+    .unwrap();
+    let record = root.path().join(access_record::FILE);
+    let retained = root.path().join("retained-access-record");
+    std::fs::rename(&record, &retained).unwrap();
+    std::fs::create_dir(&record).unwrap();
+    WRITES.with(|writes| {
+        *writes.borrow_mut() = Some(Writes {
+            dir: root.path().to_owned(),
+            attempted: 0,
+            failed: 0,
+        });
+    });
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        record: |revision, access, outcome| {
+            let dir = WRITES.with(|writes| writes.borrow().as_ref().unwrap().dir.clone());
+            let saved = access_record::append(&dir, revision, access, outcome);
+            WRITES.with(|writes| {
+                let mut writes = writes.borrow_mut();
+                let writes = writes.as_mut().unwrap();
+                writes.attempted += 1;
+                writes.failed += usize::from(saved.is_err());
+            });
+            saved
+        },
+        recorded: |revision, access| {
+            let dir = WRITES.with(|writes| writes.borrow().as_ref().unwrap().dir.clone());
+            access_record::latest(&dir, revision, access)
+        },
+        ..stepping()
+    });
+    let now = Instant::now();
+    let fired = triggers();
+    approve(&mut app, revision);
+    app.tick_local_network_step(now);
+    assert_eq!(triggers(), fired + 1);
+    WRITES.with(|writes| {
+        let writes = writes.borrow();
+        let writes = writes.as_ref().unwrap();
+        assert_eq!((writes.attempted, writes.failed), (1, 1));
+    });
+    assert_eq!(
+        access_record::latest(root.path(), revision, Access::LocalNetwork),
+        None
+    );
+    std::fs::remove_dir(&record).unwrap();
+    std::fs::rename(&retained, &record).unwrap();
+
+    let later = now + LOCAL_NETWORK_ALERT_HOLD + super::LOCAL_NETWORK_RETRY;
+    app.tick_local_network_step(later);
+    app.settle_access_steps(later);
+    app.tick_local_network_step(later + super::LOCAL_NETWORK_RETRY);
+    app.settle_access_steps(later + super::LOCAL_NETWORK_RETRY);
+    assert_eq!(triggers(), fired + 1, "only the record is retried");
+    assert_eq!(
+        access_record::latest(root.path(), revision, Access::LocalNetwork),
+        Some(AccessOutcome::Triggered)
+    );
+    assert_eq!(
+        access_record::read(root.path(), revision),
+        [
+            (Access::DeveloperTools, AccessOutcome::Granted),
+            (Access::LocalNetwork, AccessOutcome::Triggered),
+        ]
+    );
+    assert_eq!(
+        access_record::read(root.path(), revision - 1),
+        [(Access::LocalNetwork, AccessOutcome::Triggered)]
+    );
+    WRITES.with(|writes| *writes.borrow_mut() = None);
+}
+
+/// A completed debugger change is not repeated while its outcome waits for
+/// writable history, including after its page closes and Permissions is held.
+#[test]
+fn a_completed_debugger_step_recovers_its_record_after_the_page_closes() {
+    use crate::debugger_access::{DebuggerStepQueue, Outcome};
+    use aterm_containment::consent::DebuggerChange;
+    use aterm_types::macos_setup::access_record;
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let revision = 8_220;
+    access_record::append(
+        root.path(),
+        revision - 1,
+        Access::Debugger,
+        AccessOutcome::Granted,
+    )
+    .unwrap();
+    access_record::append(
+        root.path(),
+        revision,
+        Access::LocalNetwork,
+        AccessOutcome::Triggered,
+    )
+    .unwrap();
+    access_record::append(
+        root.path(),
+        revision,
+        Access::Debugger,
+        AccessOutcome::Handed,
+    )
+    .unwrap();
+    let earlier = access_record::read(root.path(), revision - 1);
+    let record = root.path().join(access_record::FILE);
+    let retained = root.path().join("retained-access-record");
+    std::fs::rename(&record, &retained).unwrap();
+    std::fs::create_dir(&record).unwrap();
+
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach::INERT);
+    app.debugger_launch = DebuggerStepQueue::queued_for_test(|| Some("MAC-RECORD-RETRY"))
+        .recording_in(Some(root.path().to_owned()));
+    approve(&mut app, revision);
+    assert!(app.open_system_state_tab());
+    let wid = app.frontmost_window.unwrap();
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.debugger_launch.note_started(revision);
+    app.debugger_launch.end();
+    app.debugger_launch.record(revision, AccessOutcome::Handed);
+    app.debugger_launch.record_written_for_test();
+    app.note_system_state_debugger_outcome(Outcome::NotChanged(DebuggerChange::On));
+    app.debugger_launch.record_written_for_test();
+    assert_eq!(app.debugger_launch.started(), None);
+    assert!(!app.debugger_launch.queued());
+    assert_eq!(
+        access_record::latest(root.path(), revision, Access::Debugger),
+        None,
+        "the completed outcome could not be saved"
+    );
+
+    std::fs::remove_dir(&record).unwrap();
+    std::fs::rename(&retained, &record).unwrap();
+    assert_eq!(
+        access_record::latest(root.path(), revision, Access::Debugger),
+        Some(AccessOutcome::Handed)
+    );
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.view_state(view).is_none());
+    app.hold_initial_setup_permissions();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        enabled: Some(false),
+        ..Default::default()
+    });
+    assert_eq!(app.access_revision(), None);
+    let mut now = Instant::now();
+    assert!(
+        app.next_access_step_deadline(now).is_some(),
+        "the completed outcome keeps its save deadline without a page or permission effects"
+    );
+    for _ in 0..3 {
+        let Some(deadline) = app.next_access_step_deadline(now) else {
+            break;
+        };
+        now = deadline;
+        app.settle_access_steps(now);
+        app.debugger_launch.record_written_for_test();
+    }
+    assert_eq!(
+        access_record::latest(root.path(), revision, Access::Debugger),
+        Some(AccessOutcome::Declined),
+        "normal settlement saves the completed change without another macOS step"
+    );
+    assert_eq!(
+        access_record::latest(root.path(), revision, Access::LocalNetwork),
+        Some(AccessOutcome::Triggered)
+    );
+    assert_eq!(access_record::read(root.path(), revision - 1), earlier);
+    assert!(!app.debugger_launch.queued());
+    assert_eq!(app.debugger_launch.started(), None);
+    let saved = access_record::read(root.path(), revision);
+    app.note_system_state_debugger_outcome(Outcome::NotChanged(DebuggerChange::On));
+    app.settle_access_steps(now + super::ACCESS_RECORD_RETRY);
+    app.debugger_launch.record_written_for_test();
+    assert_eq!(access_record::read(root.path(), revision), saved);
+    assert_eq!(app.next_access_step_deadline(now), None);
+}
+
 /// The worker cannot acquire the shared dialog slot in either the trigger or
 /// its record's wake. The slot stays owned for the alert hold, a failed trigger
 /// releases it for the next step, and an inert headless lane never takes it.
@@ -590,7 +799,10 @@ fn the_local_network_trigger_and_record_own_the_dialog_slot() {
             note_dialog_available();
             true
         },
-        record: |_, _, _| note_dialog_available(),
+        record: |_, _, _| {
+            note_dialog_available();
+            Ok(())
+        },
         dialog_up: macos_dialog_up,
         holds_dialog: true,
         ..stepping()
@@ -686,7 +898,10 @@ fn check_handoff_dialog_slot(page: crate::devtools_helper::Page) {
         fda.open_pane = open;
         let mut app = new_mac(reach, fda);
         app.access_steps.set_reach(StepsReach {
-            record: |_, _, _| note_dialog_available(),
+            record: |_, _, _| {
+                note_dialog_available();
+                Ok(())
+            },
             dialog_up: macos_dialog_up,
             holds_dialog: true,
             ..stepping()
@@ -849,7 +1064,10 @@ fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
     app.access_steps.set_reach(StepsReach {
-        record: |_, _, _| note_dialog_available(),
+        record: |_, _, _| {
+            note_dialog_available();
+            Ok(())
+        },
         holds_dialog: true,
         ..stepping()
     });
@@ -1145,8 +1363,8 @@ fn the_local_network_step_waits_for_its_moment_and_honours_the_opt_outs() {
     assert_eq!(triggers(), fired, "another macOS dialog is up");
 }
 
-/// Outcomes are recorded under the approved revision only, one line each per
-/// process.
+/// Outcomes are recorded under the approved revision only; an unchanged
+/// reading is recorded once.
 #[test]
 fn an_outcome_is_recorded_once_under_the_approved_revision() {
     let mut app = App::headless_for_test();
@@ -1165,6 +1383,249 @@ fn an_outcome_is_recorded_once_under_the_approved_revision() {
             (9, Access::DeveloperTools, AccessOutcome::Handed),
         ]
     );
+}
+
+/// Pending writes keep only the latest outcome of their own row and revision. They have a
+/// backoff and keep waking after the page closes or Permissions is held; retrying a history
+/// write starts no macOS step.
+#[test]
+fn pending_access_records_keep_the_latest_outcome_and_retry_while_the_page_is_closed() {
+    thread_local! {
+        static WRITABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        static ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        record: |revision, access, outcome| {
+            ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+            if !WRITABLE.with(std::cell::Cell::get) {
+                return Err(std::io::Error::other(
+                    "injected access record write failure",
+                ));
+            }
+            RECORDS.with(|records| records.borrow_mut().push((revision, access, outcome)));
+            Ok(())
+        },
+        ..stepping()
+    });
+    let before = records().len();
+    let fired = triggers();
+    app.record_access_at(70, Access::Debugger, AccessOutcome::Granted);
+    approve(&mut app, 71);
+    assert!(app.open_system_state_tab());
+    let wid = app.frontmost_window.unwrap();
+    let (_, view) = app.active_native_view(wid).unwrap();
+
+    WRITABLE.with(|writable| writable.set(false));
+    app.record_access_at(71, Access::FullDiskAccess, AccessOutcome::Declined);
+    app.record_access_at(72, Access::DeveloperTools, AccessOutcome::Declined);
+    let failed = ATTEMPTS.with(std::cell::Cell::get);
+    let due = app
+        .next_access_step_deadline(Instant::now())
+        .expect("a failed history write has its own wake");
+    app.record_access_at(71, Access::FullDiskAccess, AccessOutcome::Declined);
+    app.settle_access_steps(due - Duration::from_nanos(1));
+    assert_eq!(
+        ATTEMPTS.with(std::cell::Cell::get),
+        failed,
+        "unchanged callbacks and early turns respect the write backoff"
+    );
+
+    WRITABLE.with(|writable| writable.set(true));
+    app.record_access_at(71, Access::FullDiskAccess, AccessOutcome::Granted);
+    app.hold_initial_setup_permissions();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        enabled: Some(false),
+        ..Default::default()
+    });
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.view_state(view).is_none());
+    assert_eq!(app.access_revision(), None);
+    let due = app
+        .next_access_step_deadline(Instant::now())
+        .expect("closing the page and holding Permissions do not discard its history");
+    let attempts = ATTEMPTS.with(std::cell::Cell::get);
+    app.settle_access_steps(due - Duration::from_nanos(1));
+    assert_eq!(ATTEMPTS.with(std::cell::Cell::get), attempts);
+    app.settle_access_steps(due);
+    let recovered = records();
+    assert_eq!(
+        recovered[before..],
+        [
+            (70, Access::Debugger, AccessOutcome::Granted),
+            (71, Access::FullDiskAccess, AccessOutcome::Granted),
+            (72, Access::DeveloperTools, AccessOutcome::Declined),
+        ]
+    );
+    assert_eq!(app.next_access_step_deadline(due), None);
+    app.settle_access_steps(due + super::ACCESS_RECORD_RETRY);
+    assert_eq!(records(), recovered, "saved outcomes are not replayed");
+    assert_eq!(triggers(), fired, "history repair starts no macOS step");
+}
+
+/// A later Not now wins over a grant in the same approval. The helper's real
+/// answer and grant callback reach the record port; unchanged callbacks, other
+/// rows and an earlier approval cannot replace that latest answer.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_access_panels_second_decline_after_a_grant_is_the_current_outcome() {
+    use crate::devtools_helper::{Page, PanelEvent, test_arms};
+    use crate::native_app::{ActionInvocation, AppEvent, NativeApp};
+    use crate::native_ui::ActionId;
+    use aterm_containment::DevToolGrant;
+
+    let now = Instant::now();
+    let access = Access::DeveloperTools;
+    let subject = Subject::Access(access);
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    test_arms::stand_in(&mut app, test_arms::opening());
+    app.access_steps.set_reach(stepping());
+    set_front(true);
+    assert!(app.open_system_state_tab());
+    let wid = app.frontmost_window.unwrap();
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    let before = records().len();
+    let latest = |revision, row| {
+        records()[before..]
+            .iter()
+            .rev()
+            .find_map(|(at, access, outcome)| {
+                (*at == revision && *access == row).then_some(*outcome)
+            })
+    };
+    let decline = |app: &mut App| {
+        // A current read is off after a grant was revoked. The real row offers
+        // Open again, and the person's press takes the same reducer/host path.
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            now,
+        );
+        let _ = app.devtools_watch.observe(DevToolGrant::NotGranted, true);
+        app.publish_system_state(status(
+            Selection::all(),
+            vec![observed(subject, Standing::NeedsYou, None)],
+        ));
+        assert!(matches!(app.native_runtime.app(instance),
+            Some(NativeApp::SystemState(page)) if page.can_open_access(access)));
+        // Retire earlier control-key counts before this independent person press.
+        let _ = app.take_system_state_press();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/row/developer-tools/open"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            app.devtools_helper.panel().unwrap().page(),
+            Page::DeveloperTools
+        );
+        app.devtools_helper.press_for_test(PanelEvent::NotNow);
+        app.tick_devtools_hand_over(now);
+        assert!(app.devtools_helper.panel().is_none());
+        app.settle_access_steps(now);
+    };
+    let grant = |app: &mut App| {
+        // The same callback as a completed list reading and the helper's
+        // granted result: the watcher owes this transition's refresh once.
+        let step = app.devtools_watch.observe(DevToolGrant::Granted, true);
+        assert!(!app.apply_devtools_step(step));
+        app.publish_system_state(status(
+            Selection::all(),
+            vec![observed(subject, Standing::InPlace, None)],
+        ));
+        let after = records();
+        let step = app.devtools_watch.observe(DevToolGrant::Granted, true);
+        assert!(!app.apply_devtools_step(step));
+        app.settle_access_steps(now);
+        assert_eq!(records(), after, "an unchanged grant is not recorded twice");
+    };
+
+    decline(&mut app);
+    assert_eq!(latest(1, access), Some(AccessOutcome::Declined));
+    let declined = records();
+    app.settle_access_steps(now);
+    assert_eq!(records(), declined, "a helper answer is taken once");
+    grant(&mut app);
+    assert_eq!(latest(1, access), Some(AccessOutcome::Granted));
+
+    approve(&mut app, 2);
+    decline(&mut app);
+    assert_eq!(latest(2, access), Some(AccessOutcome::Declined));
+    assert_eq!(latest(1, access), Some(AccessOutcome::Granted));
+    grant(&mut app);
+    assert_eq!(latest(2, access), Some(AccessOutcome::Granted));
+
+    app.tick_local_network_step(now);
+    assert_eq!(
+        latest(2, Access::LocalNetwork),
+        Some(AccessOutcome::Triggered)
+    );
+    let independent = records();
+    app.tick_local_network_step(now);
+    assert_eq!(
+        records(),
+        independent,
+        "the independent trigger is taken once"
+    );
+
+    decline(&mut app);
+    assert_eq!(
+        latest(2, access),
+        Some(AccessOutcome::Declined),
+        "the latest Not now must replace the earlier grant in this approval"
+    );
+    assert_eq!(latest(1, access), Some(AccessOutcome::Granted));
+    assert_eq!(
+        latest(2, Access::LocalNetwork),
+        Some(AccessOutcome::Triggered)
+    );
+    let declined = records();
+    app.settle_access_steps(now);
+    assert_eq!(records(), declined, "the new helper answer is taken once");
+
+    // The same real helper answer remains owed if its record write fails.
+    // Keep the earlier successful-history controls above, then fail only this
+    // new same-approval decline after another grant.
+    thread_local! {
+        static FAIL_DECLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        static FAILED_DECLINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    grant(&mut app);
+    app.access_steps.set_reach(StepsReach {
+        record: |revision, access, outcome| {
+            if outcome == AccessOutcome::Declined && FAIL_DECLINE.with(std::cell::Cell::get) {
+                FAILED_DECLINES.with(|failed| failed.set(failed.get() + 1));
+                return Err(std::io::Error::other("injected decline write failure"));
+            }
+            RECORDS.with(|records| records.borrow_mut().push((revision, access, outcome)));
+            Ok(())
+        },
+        ..stepping()
+    });
+    decline(&mut app);
+    assert_eq!(FAILED_DECLINES.with(std::cell::Cell::get), 1);
+    assert_eq!(latest(2, access), Some(AccessOutcome::Handed));
+    assert!(app.devtools_helper.panel().is_none());
+    let opened = test_arms::opens();
+    let fired = triggers();
+    let due = app
+        .next_access_step_deadline(Instant::now())
+        .expect("the taken helper answer still needs its record");
+    FAIL_DECLINE.with(|fail| fail.set(false));
+    app.settle_access_steps(due);
+    assert_eq!(latest(2, access), Some(AccessOutcome::Declined));
+    assert_eq!(latest(1, access), Some(AccessOutcome::Granted));
+    assert_eq!(
+        latest(2, Access::LocalNetwork),
+        Some(AccessOutcome::Triggered)
+    );
+    let recovered = records();
+    app.settle_access_steps(due + super::ACCESS_RECORD_RETRY);
+    assert_eq!(records(), recovered);
+    assert_eq!(test_arms::opens(), opened, "no new helper page");
+    assert_eq!(triggers(), fired, "no new Local Network step");
 }
 
 /// The marker words bind to the approved revision; with none they keep the

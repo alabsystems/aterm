@@ -7941,6 +7941,108 @@ fn a_four_tab_question_is_answered_tab_by_tab_and_submitted() {
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
+/// The 2026-10-24 hold, end to end under Land: the incident's dialog (no option marked
+/// (Recommended), `reset` in option 1's description, nothing irreversible asked) was escalated and
+/// waited 44 minutes for the person. The loop answers it itself: focus down to option 2, Enter,
+/// and no attention raised.
+#[test]
+fn the_reset_in_a_description_question_is_answered_under_land_without_the_person() {
+    use aterm_phase::prompt::fixtures as f;
+    let (ldir, ledger) = ledger_file("reset-in-description");
+    let (jdir, journal) = journal_file("reset-in-description");
+    let incident = q(f::QUESTION_RESET_IN_DESCRIPTION_2_1_310);
+    let mut m = questioned(vec![
+        incident.clone(),
+        focused_on(&incident, "2. Split"),
+        idle_screen(),
+    ]);
+    let mut s = session(&mut m, None);
+    s.set_approval_env(owner_env());
+    s.set_approval_ledger(Some(ledger.clone()));
+    let mut opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..answering(30)
+    };
+    opts.policy.autopilot = crate::supervise::config::Autopilot::Land;
+    let (out, code) = s.supervise(&opts).expect("supervise");
+    assert_eq!(code, 0, "{out}");
+    let presses = m.presses();
+    assert_eq!(presses.len(), 2, "{:?}", m.requests);
+    assert!(
+        presses[0].ends_with(" down") && presses[1].ends_with(" enter"),
+        "{presses:?}"
+    );
+    for (p, row) in presses.iter().zip([
+        "❯ 1. Esc fix goes in codex-alab",
+        "❯ 2. Split = codex-alab first",
+    ]) {
+        assert!(p.contains(&format!(" if={} ", guarded(row))), "{p}");
+    }
+    assert!(
+        !m.requests
+            .iter()
+            .any(|r| r.starts_with("meta set attention")),
+        "nothing is put on the person: {:?}",
+        m.requests
+    );
+    let rows = ledger_rows(&ledger);
+    assert!(
+        rows.iter().any(|r| r.contains("\"decision\":\"approved\"")
+            && r.contains("\"rule_id\":\"answer-recommended@v1\"")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("\"decision\":\"escalated\"")),
+        "{rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ldir);
+    let _ = std::fs::remove_dir_all(&jdir);
+}
+
+/// A person's input 30 s before a question dialog, under the default 120 s grace: the question
+/// waits at most `QUESTION_PERSON_GRACE` of their quiet, never their whole grace (a grace the
+/// owner may set to an hour), so the loop answers it with no hold. A person's keystroke inside
+/// that bound still holds it (`a_dialog_a_person_keyed_after_the_loop_is_not_told_as_its_choice`).
+#[test]
+fn a_question_waits_a_short_fixed_quiet_for_a_person_never_their_whole_grace() {
+    use aterm_phase::prompt::fixtures as f;
+    const TYPED_30_S_AGO: &str = "30000";
+    let (jdir, journal) = journal_file("question-grace-capped");
+    let mut m = questioned(vec![q(f::QUESTION_ONE), idle_screen()]);
+    m.human = vec![TYPED_30_S_AGO];
+    m.human_ms = Some(stamp_ms(TYPED_30_S_AGO));
+    let mut s = session(&mut m, None);
+    s.set_approval_env(owner_env());
+    s.set_person_hold_wait(Duration::ZERO);
+    let mut opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..answering(30)
+    };
+    opts.policy.human_grace_s = PERSON_GRACE_S;
+    assert!(
+        Duration::from_millis(stamp_ms(TYPED_30_S_AGO))
+            < Duration::from_secs(u64::from(PERSON_GRACE_S))
+            && Duration::from_millis(stamp_ms(TYPED_30_S_AGO))
+                > super::approval_loop::QUESTION_PERSON_GRACE,
+        "PRECONDITION: the input is inside the person's grace and past the question's bound"
+    );
+    let (out, code) = s.supervise(&opts).expect("supervise");
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&jdir);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.line.starts_with("HELD ") || r.line.contains("waits for")),
+        "no hold for input older than the question's bound: {records:#?}"
+    );
+    let presses = m.presses();
+    assert_eq!(presses.len(), 1, "{:?}", m.requests);
+    assert!(presses[0].ends_with(" enter"), "{presses:?}");
+}
+
 #[test]
 fn a_question_on_a_host_without_the_generation_fence_is_handed_over() {
     use aterm_phase::prompt::fixtures as f;
@@ -13079,6 +13181,7 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
                 since_ms,
             }),
             said: Default::default(),
+            said_reset_ms: None,
         };
         let body = Row {
             rule_id: RULE_POINT,

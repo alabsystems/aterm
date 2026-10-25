@@ -666,6 +666,7 @@ mod tests {
                 .iter()
                 .map(|&k| TabView {
                     key: k,
+                    tab: k,
                     label: format!("Tab {k}"),
                     program: String::new(),
                     shell_pid: 0,
@@ -720,6 +721,7 @@ mod tests {
         let mut d = Detector::default();
         let tab = |k: u64| TabView {
             key: k,
+            tab: k,
             label: format!("Tab {k}"),
             program: String::new(),
             shell_pid: 0,

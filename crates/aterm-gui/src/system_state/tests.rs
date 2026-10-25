@@ -9,6 +9,7 @@ use crate::native_app::{
     ActionInvocation, AppViewState, NativeApp, NativeRuntime, ViewId, ViewMotionCx,
 };
 use crate::native_ui::{CompiledUi, LogicalRect};
+use aterm_types::macos_setup::{PutBack, RestoreOutcome};
 
 fn runtime_with_app(
     app: SystemStateApp,
@@ -76,6 +77,7 @@ fn reading(subject: Subject, standing: Standing, now: Option<&str>) -> Observati
         subject,
         standing,
         now: now.map(str::to_owned),
+        after_login: None,
         wanted: subject.wanted().to_owned(),
         note: None,
         detail: None,
@@ -120,13 +122,14 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
     assert_eq!(row.label, "Natural scrolling: On, left as is");
     assert!(!row.managed);
 
-    // In place: one value and the check; a login-time change reads in place.
-    let caps = Subject::Setting(Setting::CapsLock);
+    // In place: one value and the check; a login-time change reads in place, and its note
+    // says when it is all in effect.
+    let trackpad = Subject::Setting(Setting::TrackpadScrolling);
     let status = with_readings(
         Selection::all(),
         vec![
             reading(natural, Standing::InPlace, Some("Off")),
-            reading(caps, Standing::AtLogin, Some("Caps Lock")),
+            reading(trackpad, Standing::AtLogin, Some("All on")),
         ],
     );
     let row = row_view(natural, &status, Selection::all());
@@ -135,9 +138,16 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
         (RowValue::One("Off".into()), Some(Chip::InPlace))
     );
     assert_eq!(row.label, "Natural scrolling: Off, in place");
-    let row = row_view(caps, &status, Selection::all());
-    assert_eq!(row.value, RowValue::One("Control · at login".into()));
-    assert_eq!(row.chip, Some(Chip::InPlace));
+    let row = row_view(trackpad, &status, Selection::all());
+    assert_eq!(
+        (row.value, row.chip, row.note.as_deref(), row.label.as_str()),
+        (
+            RowValue::One("All on".into()),
+            Some(Chip::InPlace),
+            Some(AT_LOGIN_NOTE),
+            "Trackpad scrolling: All on, in place"
+        )
+    );
 
     // A row read as wanted with no value read shows `—` beside the check,
     // never the wanted value as if it had been read.
@@ -547,17 +557,44 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
             .standing,
         Standing::InPlace
     );
-    assert!(crate::system_state_access::menu_line(&status, false).is_some());
+    // The failure names Restore and its row, never setup in general (§3.4): the headline
+    // shows the row, the note says why, and the menu line says the same.
+    let plan = status.plan.clone().unwrap();
+    let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert_eq!(
+        (head.text.as_str(), head.show),
+        (
+            "Restore previous settings failed: Widgets",
+            Some(Subject::Setting(Setting::Widgets))
+        )
+    );
+    assert_eq!(
+        status.notes(&plan),
+        [
+            "Natural scrolling and the Dock are as they were. Caps Lock key and Trackpad \
+             scrolling come back at your next login. The Desktop stayed as it is: macOS hid its \
+             earlier value.",
+            "Widgets could not be put back as they were.",
+        ]
+    );
+    assert_eq!(
+        crate::system_state_access::menu_line(&status, false).map(|line| line.label),
+        Some("System State: Restore failed for Widgets".to_owned())
+    );
 }
 
-/// After a Restore, the Caps Lock key and a scroll direction the Mac had never set are back as
-/// saved but load only at the next login: the Restore's rows read `login`. The page says so in
-/// one calm line, and nothing failed: no menu line, no attention mark.
+/// Right after a Restore of the whole profile (§3.4): the page says what it did in one calm line,
+/// in its own row names, with the settings that load at the next login folded into it; the groups
+/// it put back are left as is, so nothing is a change to make; the Caps Lock key and the scroll
+/// direction read their live values until that login, and Trackpad scrolling its saved one; and
+/// nothing failed: no menu line, no attention mark, no preference key anywhere.
 #[test]
-fn a_setting_back_at_the_next_login_is_one_calm_note_and_no_failure() {
+fn a_restore_is_one_calm_line_in_row_names_and_no_failure() {
     let status = status_of("restore-at-login");
     let plan = status.plan.clone().unwrap();
-    const LINE: &str = "Natural scrolling and Caps Lock key come back at your next login.";
+    const LINE: &str = "Restore previous settings finished. The Desktop, Widgets and the Dock are \
+                        as they were. Caps Lock key, Natural scrolling and Trackpad scrolling come \
+                        back at your next login.";
     assert_eq!(status.notes(&plan), [LINE]);
     let mut app = SystemStateApp::new(plan.clone());
     app.publish(status.clone());
@@ -567,20 +604,326 @@ fn a_setting_back_at_the_next_login_is_one_calm_note_and_no_failure() {
         compiled
             .semantics
             .iter()
-            .all(|node| !node.label.contains("failed")),
-        "no failure framing"
+            .all(|node| !node.label.contains("failed") && !node.label.contains("com.apple")),
+        "no failure framing and no preference key"
     );
     assert!(!app.needs_attention());
     assert_eq!(status.failed_steps(Some(&plan)).count(), 0);
     assert!(crate::system_state_access::menu_line(&status, false).is_none());
-    // One of them alone is named alone.
+    // The groups Restore put back are left as is, and so are no change to make.
+    for group in [Group::Input, Group::Desktop] {
+        for setting in group.settings() {
+            assert!(!plan.selection.contains(*setting), "{setting:?}");
+        }
+    }
+    let all = rows(&status, plan.selection);
+    let line = headline(&status, &all, Some(&plan)).text;
+    assert!(!line.contains("change"), "{line}");
+    // A value live only until the next login reads as itself, marked; a screen reader hears it.
+    let caps = row_view(Subject::Setting(Setting::CapsLock), &status, plan.selection);
+    assert_eq!(
+        (caps.value, caps.chip, caps.label.as_str()),
+        (
+            RowValue::Muted("Control · until login".into()),
+            Some(Chip::LeftAsIs),
+            "Caps Lock key: Control until login, left as is"
+        )
+    );
+    let natural = row_view(
+        Subject::Setting(Setting::NaturalScrolling),
+        &status,
+        plan.selection,
+    );
+    assert_eq!(natural.value, RowValue::Muted("Off · until login".into()));
+    let trackpad = row_view(
+        Subject::Setting(Setting::TrackpadScrolling),
+        &status,
+        plan.selection,
+    );
+    assert_eq!(trackpad.value, RowValue::Muted("Some off".into()));
+    // One setting back at the next login alone is named alone.
     let one = SetupStatus {
-        rows: status.rows[1..].to_vec(),
+        rows: restore_rows(&RestoreOutcome::of([(
+            Some(Setting::CapsLock),
+            PutBack::AtLogin,
+        )])),
         ..status
     };
     assert_eq!(
         one.notes(&plan),
-        ["Caps Lock key comes back at your next login."]
+        ["Restore previous settings finished. Caps Lock key comes back at your next login."]
+    );
+}
+
+/// A Restore's rows name System State's rows, never a preference key: one calm line for what came
+/// back, what comes back at the next login, what stayed as it is because macOS hid its earlier
+/// value, and what is put back once aterm has Full Disk Access (nobody can act on any of those);
+/// and a failure, named as Restore's and its row's, for each setting it could not put back, after
+/// which the line no longer says Restore finished.
+#[test]
+fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
+    let of = |rows: &[(Option<Setting>, PutBack)]| restore_rows(&RestoreOutcome::of(rows.to_vec()));
+    let words = |rows: Vec<SetupStatusRow>| -> Vec<(String, String, String)> {
+        rows.into_iter()
+            .map(|row| (row.name, row.status, row.detail))
+            .collect()
+    };
+    let row = |name: &str, status: &str, detail: &str| {
+        (name.to_owned(), status.to_owned(), detail.to_owned())
+    };
+    let calm = |detail: &str| row("Restore previous settings", "restored", detail);
+    assert_eq!(
+        words(of(&[(Some(Setting::Dock), PutBack::Back)])),
+        [calm(
+            "Restore previous settings finished. The Dock is as it was."
+        )]
+    );
+    assert_eq!(
+        words(of(&[(Some(Setting::Widgets), PutBack::Back)])),
+        [calm(
+            "Restore previous settings finished. Widgets are as they were."
+        )]
+    );
+    assert_eq!(
+        words(of(&[])),
+        [calm(
+            "Restore previous settings finished. There was nothing to put back."
+        )]
+    );
+    assert_eq!(
+        words(of(&[
+            (Some(Setting::Widgets), PutBack::Unknown),
+            (Some(Setting::Dock), PutBack::Waits),
+        ])),
+        [calm(
+            "Restore previous settings finished. Widgets stayed as they are: macOS hid their \
+             earlier value. The Dock is put back once aterm has Full Disk Access."
+        )]
+    );
+    assert_eq!(
+        words(of(&[
+            (Some(Setting::Desktop), PutBack::Unknown),
+            (Some(Setting::Widgets), PutBack::Unknown),
+        ])),
+        [calm(
+            "Restore previous settings finished. The Desktop and Widgets stayed as they are: \
+             macOS hid their earlier values."
+        )]
+    );
+    // Each key of a row counts once, and its worst outcome speaks for it.
+    assert_eq!(
+        words(of(&[
+            (Some(Setting::Desktop), PutBack::Back),
+            (Some(Setting::Desktop), PutBack::Failed),
+            (Some(Setting::Dock), PutBack::Back),
+            (None, PutBack::Failed),
+        ])),
+        [
+            calm("The Dock is as it was."),
+            row(
+                "Restore: Desktop",
+                "failed",
+                "The Desktop could not be put back as it was."
+            ),
+            row(
+                "Restore: another Mac setting",
+                "failed",
+                "Another Mac setting could not be put back as it was."
+            ),
+        ]
+    );
+    assert_eq!(
+        words(of(&[(Some(Setting::Widgets), PutBack::Failed)])),
+        [row(
+            "Restore: Widgets",
+            "failed",
+            "Widgets could not be put back as they were."
+        )]
+    );
+    let mut refused = RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)]);
+    refused.journal_refused = true;
+    assert_eq!(
+        words(restore_rows(&refused))[1],
+        row(
+            "Change journal",
+            "error",
+            "It did not record every change Restore made; the changes went ahead."
+        )
+    );
+}
+
+/// What a Restore could not change is no failure (§3.4): a value macOS hid stays as it is, and
+/// one in another app's container is put back once aterm has Full Disk Access. Each is part of
+/// the calm line, and nothing says setup needs attention: no headline, no menu line, no mark.
+#[test]
+fn a_value_restore_could_not_reach_is_part_of_the_calm_line_and_no_failure() {
+    let mut status = status_of("restore-at-login");
+    let plan = status.plan.clone().unwrap();
+    status.rows = restore_rows(&RestoreOutcome::of([
+        (Some(Setting::Dock), PutBack::Back),
+        (Some(Setting::Widgets), PutBack::Unknown),
+        (Some(Setting::Desktop), PutBack::Waits),
+    ]));
+    assert_eq!(
+        status.notes(&plan),
+        [
+            "Restore previous settings finished. The Dock is as it was. Widgets stayed as they \
+             are: macOS hid their earlier value. The Desktop is put back once aterm has Full \
+             Disk Access."
+        ]
+    );
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan)).text;
+    assert!(
+        !line.contains("fail") && line != "Setup needs attention",
+        "{line}"
+    );
+    assert_eq!(status.failed_steps(Some(&plan)).count(), 0);
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+    let mut app = SystemStateApp::new(plan);
+    app.publish(status);
+    assert!(!app.needs_attention());
+}
+
+/// A setup pass says what its readings cannot in row names (§3.6): a change that did not take
+/// is its row's failure, which the headline names and shows; one it could not confirm is said
+/// calmly; and what its rollback put back is one calm line in a Restore's words, never a
+/// preference key.
+#[test]
+fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
+    let mut rolled = RestoreOutcome::of([
+        (Some(Setting::Dock), PutBack::Back),
+        (Some(Setting::Widgets), PutBack::Failed),
+        (Some(Setting::NaturalScrolling), PutBack::AtLogin),
+    ]);
+    rolled.journal_refused = true;
+    let outcome = PassOutcome {
+        rolled_back: Some(rolled),
+        unfinished: vec![
+            (Setting::Widgets, Unfinished::Failed),
+            (Setting::Dock, Unfinished::Failed),
+            (Setting::Spotlight, Unfinished::Unconfirmed),
+        ],
+    };
+    let mut status = status_of("set-up");
+    status.rows = pass_rows(&outcome);
+    let plan = status.plan.clone().unwrap();
+    assert_eq!(
+        status.notes(&plan),
+        [
+            "Widgets failed. The change did not take, and aterm could not put back its value \
+             from before.",
+            "Dock failed. The change did not take.",
+            "Rust in Spotlight could not be confirmed.",
+            "aterm put back what it could not finish. The Dock is as it was. Natural scrolling \
+             comes back at your next login.",
+            "Change journal failed. It did not record every change aterm made; the changes went \
+             ahead.",
+        ]
+    );
+    let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert_eq!(
+        (head.text.as_str(), head.show),
+        (
+            "2 steps failed: Widgets, Dock",
+            Some(Subject::Setting(Setting::Widgets))
+        )
+    );
+    assert_eq!(
+        crate::system_state_access::menu_line(&status, false).map(|line| line.label),
+        Some("System State: 3 failed".to_owned())
+    );
+}
+
+/// A row the run set for the next login reads in place, with a note saying when it is all in
+/// effect; a value live only until that login is marked so only on a row that is not changing.
+/// A row that will change shows what the Mac reads after the login as its from-side: one row
+/// never reads "until login" and then "at login", nor `Control → Control`.
+#[test]
+fn a_row_marks_until_login_only_while_it_does_not_change_and_at_login_in_its_note() {
+    let caps = Subject::Setting(Setting::CapsLock);
+    let live = Observation {
+        now: Some(aterm_types::macos_setup::until_login("Control")),
+        after_login: Some("Caps Lock".into()),
+        ..reading(caps, Standing::Differs, None)
+    };
+    let status = with_readings(Selection::all(), vec![live.clone()]);
+    let row = row_view(caps, &status, Selection::all());
+    assert_eq!(
+        (row.value, row.label.as_str()),
+        (
+            RowValue::Change {
+                now: "Caps Lock".into(),
+                wanted: "Control".into()
+            },
+            "Caps Lock key: Caps Lock, will change to Control"
+        )
+    );
+    // Left as is, the row is not changing: its live value, marked.
+    let left = row_view(caps, &status, Selection::none());
+    assert_eq!(left.value, RowValue::Muted("Control · until login".into()));
+    // Nothing read of the next login: no from-side, never the marked value.
+    let status = with_readings(
+        Selection::all(),
+        vec![Observation {
+            after_login: None,
+            ..live
+        }],
+    );
+    let row = row_view(caps, &status, Selection::all());
+    assert_eq!(
+        row.value,
+        RowValue::Change {
+            now: "—".into(),
+            wanted: "Control".into()
+        }
+    );
+    assert_eq!(row.label, "Caps Lock key: not read, will change to Control");
+    // Once set for the next login: the value with the check, and the note.
+    let status = with_readings(
+        Selection::all(),
+        vec![reading(caps, Standing::AtLogin, Some("Control"))],
+    );
+    let row = row_view(caps, &status, Selection::all());
+    assert_eq!(
+        (row.value, row.chip, row.note.as_deref()),
+        (
+            RowValue::One("Control".into()),
+            Some(Chip::InPlace),
+            Some("Fully in effect after your next login")
+        )
+    );
+    assert_eq!(row.label, "Caps Lock key: Control, in place");
+}
+
+/// A reading that ended without an answer (its reader unwound) is no check under way: the
+/// headline names the row it could not read and shows it, and the row says to Check again.
+#[test]
+fn an_unwound_reading_neither_claims_a_check_nor_hides_its_words() {
+    let mut status = status_of("set-up");
+    let plan = status.plan.clone().unwrap();
+    let dock = Subject::Setting(Setting::Dock);
+    let unwound = Observation {
+        note: Some("This reading did not finish. Check again.".into()),
+        ..Observation::unknown(dock)
+    };
+    match status.observed.iter_mut().find(|row| row.subject == dock) {
+        Some(row) => *row = unwound,
+        None => status.observed.push(unwound),
+    }
+    assert!(!status.busy);
+    let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert_eq!(
+        (head.text.as_str(), head.show),
+        ("1 row could not be read: Dock", Some(dock))
+    );
+    let row = row_view(dock, &status, plan.selection);
+    assert_eq!(
+        (row.value, row.note.as_deref(), row.label.as_str()),
+        (
+            RowValue::One("—".into()),
+            Some("This reading did not finish. Check again."),
+            "Dock: not read"
+        )
     );
 }
 
@@ -685,6 +1028,7 @@ fn headlines_say_the_state_in_the_designs_words() {
     let failed = line(&status_of("failed"));
     assert_eq!(failed.text, "1 step failed: GitHub repositories");
     assert_eq!(failed.show, Some(Subject::Setting(Setting::Repositories)));
+    assert!(failed.start, "its note names Set up now");
     assert_eq!(line(&status_of("set-up")).text, "This Mac is set up");
     assert_eq!(line(&status_of("non-alab")).text, "Permissions are set up");
     let mixed = line(&status_of("mixed"));
@@ -1009,6 +1353,7 @@ fn check_result_subject_is_counted_once_with_its_observed_failure() {
     assert_eq!(
         status
             .failed_steps(status.plan.as_ref())
+            .map(|failure| failure.row)
             .collect::<Vec<_>>(),
         [Some(repository)]
     );
@@ -1041,6 +1386,7 @@ fn check_result_without_a_subject_still_signals_its_failure() {
     assert_eq!(
         status
             .failed_steps(status.plan.as_ref())
+            .map(|failure| failure.row)
             .collect::<Vec<_>>(),
         [None]
     );
@@ -1903,13 +2249,13 @@ fn open_buttons_carry_whose_press_it_was() {
             app.take_action(),
             Some(SystemStateAction::OpenAccess { access: Access::FullDiskAccess, by_person: by }) if by == by_person
         ));
-        act(&mut app, "system-state/headline/open");
+        act(&mut app, "system-state/headline/open/full-disk-access");
         assert!(matches!(
             app.take_action(),
             Some(SystemStateAction::OpenAccess {
                 access: Access::FullDiskAccess,
-                ..
-            })
+                by_person: by,
+            }) if by == by_person
         ));
         // A row that does not need a person has no Open to press.
         act(&mut app, "system-state/row/debugger/open");
@@ -2142,8 +2488,9 @@ fn a_vault_that_needs_you_is_shown_from_the_headline() {
     assert_eq!(label(&compiled, HEADLINE), "Needs you: Secrets vault");
     assert!(
         compiled
-            .semantic(&UiKey::new("system-state/headline/open"))
-            .is_none(),
+            .semantics
+            .iter()
+            .all(|node| !node.key.as_str().starts_with("system-state/headline/open")),
         "macOS has no pane for the vault"
     );
     assert!(compiled.semantic(&join).is_some_and(|node| node.offscreen));
@@ -3669,4 +4016,105 @@ fn the_caret_covers_the_kittys_haunch_as_the_brand_image_draws_it() {
             assert_eq!(over_words, None, "{at}: the kitty inks the words");
         }
     }
+}
+
+/// While Restore previous settings runs, no group takes a press (design §3.4): the page shows
+/// the plan the Restore is changing, so a choice made from it could set a group the Restore
+/// puts back again. Once the Restore is done, the groups take a press again.
+#[test]
+fn a_group_takes_no_press_while_restore_runs() {
+    let in_force = || SetupStatus {
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    };
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(in_force());
+    app.gesture(true);
+    act(&mut app, "system-state/restore");
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Restore)
+    ));
+    // The worker's read while the Restore runs (the window fills `operation`).
+    app.publish(SetupStatus {
+        busy: true,
+        operation: Some(SetupOperation::Restore),
+        ..in_force()
+    });
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
+    let segment = compiled
+        .semantic(&UiKey::new("system-state/group/3/leave"))
+        .and_then(|node| node.state)
+        .expect("the group's choice shows");
+    assert!(
+        !segment.enabled,
+        "no group takes a press while Restore runs"
+    );
+    act(&mut app, "system-state/group/3/leave");
+    assert!(app.take_action().is_none());
+    assert_eq!(app.plan, Plan::default(), "the page shows no choice taken");
+    app.publish(in_force());
+    act(&mut app, "system-state/group/3/leave");
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Apply(..))
+    ));
+}
+
+/// A choice names the groups the person changed since the page last took the plan in force
+/// (design §3.3), and the worker takes only those onto the plan in force: a page shown before
+/// a Restore or another window's change never sets again a group someone else left as is.
+/// Presses made while an earlier choice waits add up, a group pressed back included, so the
+/// worker keeps the person's own press whichever earlier choice it admitted; once the page
+/// takes the plan in force they start again. Set up now names none.
+#[test]
+fn a_choice_names_the_groups_changed_since_the_plan_in_force() {
+    fn sent(action: Option<SystemStateAction>) -> (Plan, Option<Selection>) {
+        let Some(SystemStateAction::Apply(answer, _)) = action else {
+            panic!("a plan was submitted");
+        };
+        let WorkstationSetupDecision::Begin(plan) = answer.decision else {
+            panic!("the plan begins");
+        };
+        (plan, answer.changed)
+    }
+    fn groups(groups: &[Group]) -> Option<Selection> {
+        let mut changed = Selection::none();
+        for setting in groups.iter().flat_map(|group| group.settings()) {
+            changed.set(*setting, true);
+        }
+        Some(changed)
+    }
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(SetupStatus {
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    });
+    act(&mut app, "system-state/group/3/leave");
+    let (first, changed) = sent(app.take_action());
+    assert_eq!(changed, groups(&[Group::Accounts]));
+    act(&mut app, "system-state/group/2/leave");
+    let (second, changed) = sent(app.take_action());
+    assert_eq!(changed, groups(&[Group::Accounts, Group::Desktop]));
+    // Pressed back while the earlier choices wait: still the person's own.
+    act(&mut app, "system-state/group/3/set-up");
+    let (third, changed) = sent(app.take_action());
+    assert_eq!(changed, groups(&[Group::Accounts, Group::Desktop]));
+    for plan in [first, second, third] {
+        app.apply_accepted(plan);
+    }
+    assert!(app.awaiting.is_none());
+    act(&mut app, "system-state/group/1/leave");
+    let (input_left, changed) = sent(app.take_action());
+    assert_eq!(changed, groups(&[Group::Input]));
+    app.apply_accepted(input_left);
+    // Its run done, with rows that differ from the plan, Set up now runs it as it stands.
+    app.publish(status_of("mixed"));
+    act(&mut app, "system-state/headline/start");
+    let (_, changed) = sent(app.take_action());
+    assert_eq!(
+        changed,
+        Some(Selection::none()),
+        "Set up now changes no group"
+    );
 }

@@ -3,7 +3,7 @@
 
 //! `Mount`: the `aterm` virtiofs share at [`AT`], and its directories bound read-only at
 //! their host paths. The plan is read from `/proc/self/mountinfo` and is pure; the Linux
-//! arm carries it out ([`crate::linux`]).
+//! arm carries it out (`crate::linux`).
 
 use std::path::{Component, Path, PathBuf};
 

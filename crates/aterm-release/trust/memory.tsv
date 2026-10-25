@@ -27,7 +27,7 @@ astream-cap	16.0	48	6.0	0.4	=	2026-10-15
 astream-cap	16.0	128	16.0	1.3	=	2026-10-19
 astream-digest	-	128	16.0	4.2	=	2026-10-18
 astream-effects	16.0	-	-	-	-	-
-astream-sys	16.0	-	-	-	-	-
+astream-sys	-	-	-	-	-	-
 astream-term	16.0	128	16.0	1.7	=	2026-10-18
 astream-wire	4.5	24	3.0	1.8	=	2026-09-29: m101 (24 GiB), its real ceiling
 astream-wire	4.5	36	4.5	1.6	=	2026-10-20

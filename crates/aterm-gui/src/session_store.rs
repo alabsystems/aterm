@@ -267,12 +267,12 @@ where
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum Carry {
-        Read(crate::fabric::FabricCarry),
+        Read(Box<crate::fabric::FabricCarry>),
         Unreadable(serde::de::IgnoredAny),
     }
     Ok(
         match <Carry as serde::Deserialize>::deserialize(deserializer)? {
-            Carry::Read(carry) => carry,
+            Carry::Read(carry) => *carry,
             Carry::Unreadable(_) => crate::fabric::FabricCarry::default(),
         },
     )

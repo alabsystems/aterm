@@ -649,11 +649,12 @@ type Golden = (
 
 /// The goldens written for measured builds. A golden is an extra: every measured build is held to its
 /// rollout's own account whether one is written or not.
-const GOLDENS: [Golden; 4] = [
+const GOLDENS: [Golden; 5] = [
     (ALAB, &ALAB_LEGS, true),
     (ALAB_MANAGED, &ALAB_LEGS, false),
     (FOREVER, &FOREVER_LEGS, true),
     (EXCHANGE, &EXCHANGE_LEGS, true),
+    (V165, &V165_LEGS, true),
 ];
 
 const ALAB_LEGS: [(&str, &[&str]); 6] = [
@@ -894,6 +895,96 @@ const EXCHANGE_LEGS: [(&str, &[&str]); 6] = [
             "end 14 1 1",
             "prompt 00000000-0000-4000-8000-000000000018",
             "end 14 1 1",
+        ],
+    ),
+];
+
+/// The first 0.165 build, the one this Mac's `codex` ran when it was measured (codex-alab `870dabaa6`).
+const V165: &str = "0.165.0-dev.13594+g870dabaa6";
+
+const V165_LEGS: [(&str, &[&str]); 6] = [
+    (
+        "first",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.165.0-dev.13594",
+            "end 51 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 14 1 1",
+            "prompt 00000000-0000-4000-8000-000000000010",
+            "end 27 1 1",
+        ],
+    ),
+    (
+        "continue",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.165.0-dev.13594",
+            "end 43 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 30 1 1",
+            "prompt 00000000-0000-4000-8000-000000000010",
+            "end 14 1 1",
+        ],
+    ),
+    (
+        "approval",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.165.0-dev.13594",
+            "call call_r0010 exec_command shell",
+            "result call_r0010",
+            "end 5104 2 2",
+            "prompt 00000000-0000-4000-8000-00000000000f",
+            "end 41 1 1",
+            "prompt 00000000-0000-4000-8000-000000000014",
+            "end 12 1 1",
+        ],
+    ),
+    (
+        "question",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.165.0-dev.13594",
+            "call call_r0010 request_user_input other",
+            "result call_r0010",
+            "end 5077 2 2",
+            "prompt 00000000-0000-4000-8000-00000000000f",
+            "end 33 1 1",
+            "prompt 00000000-0000-4000-8000-000000000014",
+            "end 15 1 1",
+        ],
+    ),
+    (
+        "usage",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.165.0-dev.13594",
+            "end 32 0 0",
+            "wall UsageSession",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 24 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000e",
+            "end 24 1 1",
+            "prompt 00000000-0000-4000-8000-000000000013",
+            "end 14 1 1",
+            "prompt 00000000-0000-4000-8000-000000000018",
+            "end 18 1 1",
+        ],
+    ),
+    (
+        "carry",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.165.0-dev.13594",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 37 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000e",
+            "end 14 1 1",
+            "prompt 00000000-0000-4000-8000-000000000013",
+            "end 15 1 1",
+            "prompt 00000000-0000-4000-8000-000000000018",
+            "end 13 1 1",
         ],
     ),
 ];

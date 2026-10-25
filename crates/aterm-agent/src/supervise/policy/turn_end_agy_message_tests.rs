@@ -125,10 +125,13 @@ fn agys_drawing_is_held_to_its_measured_screens() {
         .map(|r| r.trim())
         .collect::<Vec<_>>()
         .join(" ");
-    // The screen was measured on 2026-10-21, with the words before the no-repository sentence.
+    // The screen was measured on 2026-10-21, before the no-repository sentence
+    // and the restart instruction in the needs acknowledgement.
+    let ack_before = "Your NEEDS YOU line is on the person's screen now. Do not wait for \
+                      it: carry on with everything else.";
     let land = act_words(
         LAND_REMOTE_MAIN_BEFORE,
-        &[reversible_clause(false), ack_clause(true)],
+        &[reversible_clause(false), ack_before],
         None,
     );
     let first = format!("{task}\n\n{fact}");

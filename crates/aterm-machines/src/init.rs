@@ -1622,6 +1622,53 @@ mod tests {
         );
     }
 
+    /// The row a preference key belongs to is read off the keys the items write: every key an
+    /// item of a full-profile pass would change names the row that item reports to, so a
+    /// Restore can say what it put back in System State's row names.
+    #[test]
+    fn every_key_an_item_changes_names_the_row_it_reports_to() {
+        let who = user("alice", 501);
+        let mut context = ctx(&[who]);
+        context.facts.full_disk_access = Some(true);
+        context.facts.arch = "arm64".into();
+        let sys = Fake::root();
+        crate::init_preferences::tests::installed_dock_apps(&sys, &context.users[0]);
+        sys.simulate(|_, cmd| {
+            let line = cmd.display();
+            (line.contains("/usr/bin/defaults") && line.contains(" export "))
+                .then(|| export("<dict/>"))
+        });
+        let items =
+            workstation_items_selected(&context, WorkstationGroup::Preferences, Selection::all())
+                .unwrap();
+        let mut named = Vec::new();
+        for (setting, item) in &items {
+            for (target, _) in item.preference_changes(&sys, &context).unwrap() {
+                assert_eq!(
+                    crate::init_preferences::setting_of_preference(&target.domain, &target.key),
+                    Some(*setting),
+                    "{}",
+                    target.describe()
+                );
+                named.push(*setting);
+            }
+        }
+        for setting in [
+            Setting::CapsLock,
+            Setting::NaturalScrolling,
+            Setting::TrackpadScrolling,
+            Setting::Desktop,
+            Setting::Widgets,
+            Setting::Dock,
+        ] {
+            assert!(named.contains(&setting), "no key of {setting:?} was read");
+        }
+        assert_eq!(
+            crate::init_preferences::setting_of_preference("com.apple.dock", "no-such-key"),
+            None
+        );
+    }
+
     #[test]
     fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
         let who = user("alice", 501);

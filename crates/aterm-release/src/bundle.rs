@@ -58,7 +58,7 @@ pub fn stamp_info_plist(
 
 /// Replace or insert one `<key>K</key><string>V</string>` pair, textually: the committed template is trusted, tab-indented XML, and a plist parser would be a dependency for no gain.
 pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<String, String> {
-    let value = xml_escape(value);
+    let value = aterm_codec::xml::escape(value);
     let key_tag = format!("<key>{key}</key>");
     if let Some(kpos) = plist.find(&key_tag) {
         let after = kpos + key_tag.len();
@@ -86,14 +86,6 @@ pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<St
             &plist[dict_end..]
         ))
     }
-}
-
-/// Minimal XML escaping for plist string content (versions, hashes and reverse-DNS ids):
-/// belt and braces.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// The name of the staging directory for claim `build`: `cut-<build>.noindex`.

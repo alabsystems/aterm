@@ -841,6 +841,47 @@ fn kept_string(text: &CStr) -> Option<CFTypeRef> {
     })
 }
 
+/// The power manager's root domain and its `System Capabilities` key, kept for the process.
+struct RootDomain {
+    service: io_service_t,
+    key: CFTypeRef,
+}
+
+// SAFETY: `service` is a Mach port name and `key` an immutable CFString the process keeps; IOKit
+// and CoreFoundation take both from any thread.
+unsafe impl Send for RootDomain {}
+// SAFETY: As for `Send`: neither is written after it is made.
+unsafe impl Sync for RootDomain {}
+
+/// [`crate::power::wake`] on macOS: the `System Capabilities` the kernel's `IOPMrootDomain`
+/// publishes in the registry now (its `IOPMSystemCapabilities` bits: CPU 0x1, graphics 0x2),
+/// read through the public registry calls. `None` where the entry or the key is missing.
+pub(crate) fn system_capabilities() -> Option<u32> {
+    static ROOT: OnceLock<Option<RootDomain>> = OnceLock::new();
+    let root = ROOT
+        .get_or_init(|| {
+            // SAFETY: A NUL-terminated class name; the dictionary is +1 and consumed by
+            // `IOServiceGetMatchingService`, whose service is kept for the process.
+            let service = unsafe {
+                let matching = iokit::IOServiceMatching(c"IOPMrootDomain".as_ptr());
+                if matching.is_null() {
+                    return None;
+                }
+                iokit::IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching.cast_const())
+            };
+            if service == 0 {
+                return None;
+            }
+            Some(RootDomain {
+                service,
+                key: kept_string(c"System Capabilities")?,
+            })
+        })
+        .as_ref()?;
+    let value = Cf::property(root.service, root.key)?;
+    cf_u64(value.0).and_then(|n| u32::try_from(n).ok())
+}
+
 fn accel() -> Option<&'static Accel> {
     static ACCEL: OnceLock<Option<Accel>> = OnceLock::new();
     ACCEL

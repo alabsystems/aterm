@@ -27,7 +27,7 @@ pub enum CaptureMode {
 }
 
 /// The frame's grid: cell metrics, extent and origin.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct FrameGeom {
     pub rows: u16,
     pub cols: u16,
@@ -35,6 +35,24 @@ pub struct FrameGeom {
     pub cell_h: u16,
     /// Grid origin in FRAME px (effects origin, + pane origin when composed).
     pub origin_px: (i32, i32),
+}
+
+impl FrameGeom {
+    /// Zeroed frame geometry before any frame is prepared.
+    pub const EMPTY: Self = Self {
+        rows: 0,
+        cols: 0,
+        cell_w: 0,
+        cell_h: 0,
+        origin_px: (0, 0),
+    };
+}
+
+impl Default for FrameGeom {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Everything a host tells the engine for one frame.
@@ -179,12 +197,27 @@ fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
 }
 
 /// The sing-along input to the custody law (which companion owns the frame): the host's verdicts over the pipeline's `KittySing` and `CursorCat`, resolved on each route that ticks the pet.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SingFacts {
     /// The sing drive `0..=1` — the armed hold plus the whole wind-down.
     pub drive: f32,
     /// The flying head's presentation alpha as the host resolved it (already gated by its own owner and momentum), `0` when there is no head.
     pub flying_alpha: u8,
+}
+
+impl SingFacts {
+    /// Inactive sing-along facts with zero drive and zero flying alpha.
+    pub const EMPTY: Self = Self {
+        drive: 0.0,
+        flying_alpha: 0,
+    };
+}
+
+impl Default for SingFacts {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// What a left press did.

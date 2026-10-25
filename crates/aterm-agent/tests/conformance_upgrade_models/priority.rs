@@ -72,11 +72,11 @@ fn with_list(s: &Vars, ids: &[String]) -> Vars {
 }
 
 fn reachable(model: &Model) -> Vec<Vars> {
-    let mut seen: BTreeSet<Vec<(&'static str, i64)>> = BTreeSet::new();
+    let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut out = Vec::new();
     let mut q = VecDeque::from([model.init_state()]);
     while let Some(s) = q.pop_front() {
-        if !seen.insert(s.iter().map(|(k, v)| (*k, *v)).collect()) {
+        if !seen.insert(crate::common::key(model, &s)) {
             continue;
         }
         for a in &model.actions {

@@ -14,7 +14,7 @@ pub const TYPED_SUMMON_COOLDOWN: Duration = Duration::from_secs(30);
 pub const DOG_SUMMON_KEYS: u64 = 500;
 
 /// Everything one keystroke (or one IME commit char) produced: four independent flags.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TypedHit {
     /// A feline word completed.
     pub feline: bool,
@@ -26,7 +26,22 @@ pub struct TypedHit {
     pub canine: bool,
 }
 
+impl Default for TypedHit {
+    #[inline]
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 impl TypedHit {
+    /// No lexicon hit on any axis.
+    pub const NONE: Self = Self {
+        feline: false,
+        records: false,
+        profanity: false,
+        canine: false,
+    };
+
     /// Fold a second outcome in, keeping the strongest of each independent axis.
     #[inline]
     #[must_use]
@@ -52,7 +67,6 @@ pub const FAVOURITE_IDENT_TAG: u64 = 0x6661_764B_6974_7479;
 pub const DOG_SUMMON_IDENT_TAG: u64 = 0x7479_7065_6444_6f67;
 
 /// Per-window detector state holding the rolling keystroke buffer, cooldown, and scan scratch.
-#[derive(Default)]
 pub struct TypedKittySummon {
     /// Rolling window of recent printed keystrokes (≤ [`BUF_CAP`] chars), stored raw: the
     /// lexicon owns folding, and pre-folding would defeat its morphology handling.
@@ -73,7 +87,29 @@ pub struct TypedKittySummon {
     keys_typed: u64,
 }
 
+impl Default for TypedKittySummon {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypedKittySummon {
+    /// Construct a fresh per-window detector with empty rolling buffers.
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buf: String::new(),
+            session: None,
+            last_summon: None,
+            chars: Vec::new(),
+            matches: Vec::new(),
+            scratch: ScanScratch::default(),
+            keys_typed: 0,
+        }
+    }
+
     /// Bind the window to `session`, clearing it on a switch.
     #[inline]
     fn rekey(&mut self, session: u64) {
@@ -116,7 +152,7 @@ impl TypedKittySummon {
         self.buf.push(ch);
         self.trim();
         if !(aterm_lexicon::is_token_char(ch) || aterm_lexicon::is_no_space_script(ch)) {
-            return TypedHit::default();
+            return TypedHit::NONE;
         }
         let start = Self::trailing_scan_start(&self.buf, ch);
         let Self {
@@ -137,13 +173,13 @@ impl TypedKittySummon {
             hit = Some(m.class);
         }
         let Some(class) = hit else {
-            return TypedHit::default();
+            return TypedHit::NONE;
         };
         self.buf.clear();
         match class {
             Class::Profanity => TypedHit {
                 profanity: true,
-                ..TypedHit::default()
+                ..TypedHit::NONE
             },
             Class::Feline => {
                 let records = !self
@@ -155,14 +191,14 @@ impl TypedKittySummon {
                 TypedHit {
                     feline: true,
                     records,
-                    ..TypedHit::default()
+                    ..TypedHit::NONE
                 }
             }
             Class::Canine => TypedHit {
                 canine: self.keys_typed >= DOG_SUMMON_KEYS,
-                ..TypedHit::default()
+                ..TypedHit::NONE
             },
-            _ => TypedHit::default(),
+            _ => TypedHit::NONE,
         }
     }
 

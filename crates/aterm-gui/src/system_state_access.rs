@@ -50,6 +50,9 @@ pub(crate) const LOCAL_NETWORK_ALERT_HOLD: Duration = Duration::from_secs(30);
 /// looks again (the Wi-Fi may join after launch).
 const LOCAL_NETWORK_RETRY: Duration = Duration::from_secs(60);
 
+/// A failed access-record save retries independently of the step that ended.
+const ACCESS_RECORD_RETRY: Duration = Duration::from_secs(1);
+
 /// How long a System Settings pane aterm opened with no panel of its own beside it (Local
 /// Network, Accessibility) counts as up: macOS says nothing when it closes.
 const PANE_HOLD: Duration = Duration::from_secs(30);
@@ -103,8 +106,8 @@ pub(crate) struct StepsReach {
     pub(crate) trigger_local_network: fn() -> bool,
     /// Open a named access pane; injected so headless fixtures reach no OS API.
     pub(crate) open_pane: fn(&App, Access) -> bool,
-    /// Append one step's outcome to the record.
-    pub(crate) record: fn(u64, Access, AccessOutcome),
+    /// Append one step's outcome, reporting any failure to the retry owner.
+    pub(crate) record: fn(u64, Access, AccessOutcome) -> std::io::Result<()>,
     /// The latest outcome recorded for a row in a revision.
     pub(crate) recorded: fn(u64, Access) -> Option<AccessOutcome>,
     /// Whether System State is the visible view of a focused window.
@@ -132,7 +135,7 @@ impl StepsReach {
     pub(crate) const INERT: Self = Self {
         trigger_local_network: || false,
         open_pane: |_, _| false,
-        record: |_, _, _| {},
+        record: |_, _, _| Ok(()),
         recorded: |_, _| None,
         frontmost: |_| false,
         quiet: |_, _| false,
@@ -189,8 +192,9 @@ pub(crate) struct AccessSteps {
     dialog: Option<MacosDialog>,
     /// The menu line as last composed.
     line: Option<SystemStateLine>,
-    /// Outcomes this process recorded, so a repeated reading writes one line.
-    recorded: Vec<(u64, Access, AccessOutcome)>,
+    /// The latest completed outcome for each revision and row, including a
+    /// failed save owed another try. A later outcome replaces the earlier one.
+    recorded: Vec<RecordedAccess>,
     /// The retired digest keys were ended since this process launched, or since
     /// it adopted its parent's entries at Commit ([`App::rearm_retired_keys`]).
     retired: bool,
@@ -207,6 +211,35 @@ pub(crate) struct AccessSteps {
     /// ([`App::note_fda_unverified_here`]): a new approval brings the window's
     /// own page back.
     fda_unverified_here: bool,
+}
+
+struct RecordedAccess {
+    revision: u64,
+    access: Access,
+    outcome: AccessOutcome,
+    retry_at: Option<Instant>,
+}
+
+impl RecordedAccess {
+    fn save(
+        &mut self,
+        record: fn(u64, Access, AccessOutcome) -> std::io::Result<()>,
+        now: Instant,
+    ) {
+        match record(self.revision, self.access, self.outcome) {
+            Ok(()) => self.retry_at = None,
+            Err(error) => {
+                if self.retry_at.is_none() {
+                    aterm_log::warn!(
+                        "system state: the {} access record for revision {} was not written: {error}",
+                        self.access.name(),
+                        self.revision
+                    );
+                }
+                self.retry_at = Some(now + ACCESS_RECORD_RETRY);
+            }
+        }
+    }
 }
 
 impl AccessSteps {
@@ -318,7 +351,8 @@ fn managed(subject: Subject, selection: Selection) -> bool {
 /// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
 /// or a step the last run could not finish, reads `System State: <row> failed` (`1 step
 /// failed`) once the run no longer retries it by itself (§3.5); several are counted
-/// (`2 need you`, `1 needs you, 1 failed`). The note is the Secrets row's while it needs you
+/// (`2 need you`, `1 needs you, 1 failed`). A row Restore could not put back, alone, reads
+/// `System State: Restore failed for <row>`. The note is the Secrets row's while it needs you
 /// (a waiting vault approval code, or a move to Applications). `None` when nothing does.
 pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
     let selection = status
@@ -347,13 +381,26 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
     let mut failed: Vec<Option<Subject>> = failed.into_iter().map(Some).collect();
     // A step the last run could not finish is a failure too, though no reading says so (a join
     // the vault refused reads Not joined): one a row names counts as that row, any other is
-    // counted but not named, since the page's note names it.
-    for row in status.failed_steps(status.plan.as_ref()) {
-        match row {
+    // counted but not named, since the page's note names it. A row Restore could not put back
+    // is said as Restore's (§3.4).
+    let mut restore: Vec<Option<Subject>> = Vec::new();
+    for step in status.failed_steps(status.plan.as_ref()) {
+        match step.row {
+            _ if step.restore => restore.push(step.row),
             Some(row) if needs.contains(&row) || failed.contains(&Some(row)) => {}
             row => failed.push(row),
         }
     }
+    if needs.is_empty() && failed.is_empty() {
+        let label = match restore.as_slice() {
+            [] => return None,
+            [Some(row)] => format!("System State: Restore failed for {}", row.name()),
+            [None] => "System State: Restore failed".to_owned(),
+            rows => format!("System State: Restore failed for {} settings", rows.len()),
+        };
+        return Some(SystemStateLine { label, note: None });
+    }
+    failed.extend(restore);
     let label = match (needs.as_slice(), failed.as_slice()) {
         ([], []) => return None,
         ([one], []) => format!("System State: {} needs you", one.name()),
@@ -642,6 +689,10 @@ impl App {
             self.record_access_at(revision, access, AccessOutcome::Declined);
         }
         self.spend_card_not_now();
+        // Drain new outcomes first: a later answer replaces a failed save,
+        // never the other way around. Saving a completed step raises no prompt.
+        self.retry_access_records(now);
+        self.debugger_launch.retry_records(now);
         self.rearm_access_steps(now);
         if !self.access_steps.retired {
             self.access_steps.retired = true;
@@ -756,11 +807,21 @@ impl App {
             && self.any_os_window_focused();
         let look = (focused && waits).then(|| now + devtools_helper::RECHECK_EVERY);
         let retry = retry.filter(|_| focused).map(|(_, at)| at.max(now));
-        hold.chain(look).chain(retry).min()
+        let saves = self
+            .access_steps
+            .recorded
+            .iter()
+            .filter_map(|record| record.retry_at)
+            .map(|at| at.max(now));
+        hold.chain(look)
+            .chain(retry)
+            .chain(saves)
+            .chain(self.debugger_launch.record_deadline(now))
+            .min()
     }
 
     /// Record `outcome` for `access` under the approved revision; nothing
-    /// without one, and one line per outcome per process.
+    /// without one, and no repeated line while that row's outcome is unchanged.
     pub(crate) fn record_access_step(&mut self, access: Access, outcome: AccessOutcome) {
         if let Some(revision) = self.access_revision() {
             self.record_access_at(revision, access, outcome);
@@ -768,14 +829,40 @@ impl App {
     }
 
     fn record_access_at(&mut self, revision: u64, access: Access, outcome: AccessOutcome) {
-        let line = (revision, access, outcome);
-        if self.access_steps.recorded.contains(&line) {
-            return;
-        }
-        self.access_steps.recorded.push(line);
-        (self.access_steps.reach.record)(revision, access, outcome);
+        let index = self
+            .access_steps
+            .recorded
+            .iter()
+            .position(|record| record.revision == revision && record.access == access);
+        let index = if let Some(index) = index {
+            let last = &mut self.access_steps.recorded[index];
+            if last.outcome == outcome {
+                return;
+            }
+            last.outcome = outcome;
+            last.retry_at = None;
+            index
+        } else {
+            let index = self.access_steps.recorded.len();
+            self.access_steps.recorded.push(RecordedAccess {
+                revision,
+                access,
+                outcome,
+                retry_at: None,
+            });
+            index
+        };
+        self.access_steps.recorded[index].save(self.access_steps.reach.record, Instant::now());
         if (access, outcome) == (Access::FullDiskAccess, AccessOutcome::Declined) {
             self.fda_decline_noted();
+        }
+    }
+
+    fn retry_access_records(&mut self, now: Instant) {
+        for record in &mut self.access_steps.recorded {
+            if record.retry_at.is_some_and(|retry| retry <= now) {
+                record.save(self.access_steps.reach.record, now);
+            }
         }
     }
 
@@ -1336,15 +1423,14 @@ fn interface_addresses() -> Vec<LanInterface> {
     out
 }
 
-fn live_record(revision: u64, access: Access, outcome: AccessOutcome) {
-    let Some(state) = aterm_types::dirs::state_dir() else {
-        return;
-    };
-    if let Err(error) =
-        aterm_types::macos_setup::access_record::append(&state, revision, access, outcome)
-    {
-        aterm_log::warn!("system state: the access record was not written: {error}");
-    }
+fn live_record(revision: u64, access: Access, outcome: AccessOutcome) -> std::io::Result<()> {
+    let state = aterm_types::dirs::state_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "aterm's state directory is unavailable",
+        )
+    })?;
+    aterm_types::macos_setup::access_record::append(&state, revision, access, outcome)
 }
 
 fn live_recorded(revision: u64, access: Access) -> Option<AccessOutcome> {

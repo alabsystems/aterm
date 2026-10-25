@@ -8132,12 +8132,22 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
             Cli::Grok,
             [
                 ("GROK_AUTH_PATH", "/logins/work/auth.json"),
-                ("XAI_API_KEY", "k"),
+                ("GROK_AUTH", "t"),
             ],
         ),
     ] {
         assert_eq!(judged_label(&roster, &outside), None, "{outside:?}");
     }
+    // `XAI_API_KEY` is grok's fallback behind the stored login, which a pooled line keeps: it
+    // judges nothing, so a session that line moved is judged on its row.
+    let behind = ProcessLogin::of_env_for(
+        Cli::Grok,
+        [
+            ("GROK_AUTH_PATH", "/logins/work/auth.json"),
+            ("XAI_API_KEY", "k"),
+        ],
+    );
+    assert_eq!(judged_label(&roster, &behind), Some("work"), "{behind:?}");
     let apart = ProcessLogin::of_env_for(
         Cli::Grok,
         [
@@ -8153,6 +8163,20 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         "an overlay home is the seam, not another home"
     );
     assert_eq!(judged_label(&codex, &overlay), Some("work"));
+    let shared_key = ProcessLogin::of_env_for(
+        Cli::Codex,
+        [("CODEX_HOME", "/logins/work"), ("OPENAI_API_KEY", "k")],
+    );
+    assert_eq!(
+        judged_label(&codex, &shared_key),
+        Some("work"),
+        "OPENAI_API_KEY is no Codex login: {shared_key:?}"
+    );
+    for own in ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        let keyed =
+            ProcessLogin::of_env_for(Cli::Codex, [("CODEX_HOME", "/logins/work"), (own, "k")]);
+        assert_eq!(judged_label(&codex, &keyed), None, "{own}: {keyed:?}");
+    }
     let claude = [("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/logins/work")];
     assert_eq!(
         ProcessLogin::of_env_for(Cli::Claude, claude),
@@ -8163,6 +8187,58 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         None,
         "another CLI's seam names no grok login"
     );
+}
+
+/// A KIMI CODE PROCESS IS JUDGED OFF ITS ROW BY WHAT KIMI 2.3.1 READS IN PLACE OF THE HOME'S
+/// LOGIN, AND BY NOTHING ELSE (`docs/measured/kimi-credentials-2026-10-24.md`): an environment
+/// model (`KIMI_MODEL_NAME`, `KIMI_MODEL_API_KEY`) or a `KIMI_CODE_CUSTOM_HEADERS` line judges no
+/// row, the variables a pooled line removes ([`super::relaunch::ahead_env`]). A key with no
+/// name is never read, but judges no row all the same, which holds a move rather than makes one.
+/// NEGATIVE: `KIMI_API_KEY` (which kimi reads from no environment), `KIMI_BASE_URL`,
+/// `KIMI_MODEL_BASE_URL` and the managed login's endpoint overrides judge nothing, and the
+/// overlay home the seam names is the row's.
+#[test]
+fn a_kimi_process_is_judged_off_its_row_by_an_environment_model_or_header_alone() {
+    let roster = Roster::parse_for(Cli::Kimi, POOL_ROWS).expect("roster");
+    let on = |extra: (&'static str, &'static str)| {
+        ProcessLogin::of_env_for(Cli::Kimi, [("KIMI_CODE_HOME", "/logins/work"), extra])
+    };
+    let row = ProcessLogin::of_env_for(Cli::Kimi, [("KIMI_CODE_HOME", "/logins/work")]);
+    assert!(row.default_home, "the overlay home is the seam");
+    assert_eq!(judged_label(&roster, &row), Some("work"));
+    assert_eq!(
+        judged_label(
+            &roster,
+            &ProcessLogin::of_env_for(Cli::Kimi, [("PATH", "/usr/bin")])
+        ),
+        Some("main")
+    );
+    for ahead in [
+        ("KIMI_MODEL_NAME", "kimi-k2"),
+        ("KIMI_MODEL_API_KEY", "k"),
+        ("KIMI_CODE_CUSTOM_HEADERS", "Authorization: Bearer k"),
+    ] {
+        let who = on(ahead);
+        assert!(!who.stored_login, "{ahead:?}");
+        assert_eq!(judged_label(&roster, &who), None, "{ahead:?}");
+    }
+    for beside in [
+        ("KIMI_API_KEY", "k"),
+        ("KIMI_BASE_URL", "http://127.0.0.1:1/v1"),
+        ("KIMI_MODEL_BASE_URL", "http://127.0.0.1:1/v1"),
+        ("KIMI_MODEL_PROVIDER_TYPE", "openai"),
+        ("KIMI_CODE_BASE_URL", "http://127.0.0.1:1/v1"),
+        ("KIMI_CODE_OAUTH_HOST", "http://127.0.0.1:1"),
+        ("KIMI_OAUTH_HOST", "http://127.0.0.1:1"),
+        ("KIMI_MODEL_NAME", ""),
+    ] {
+        let who = on(beside);
+        assert_eq!(
+            judged_label(&roster, &who),
+            Some("work"),
+            "{beside:?}: {who:?}"
+        );
+    }
 }
 
 #[test]
@@ -8183,14 +8259,25 @@ fn an_unmeasured_seam_holds_a_due_move_and_a_measured_one_makes_it() {
             NOW,
         )
     };
-    assert_eq!(ask(Cli::Kimi), Advice::Stay(StayWhy::Unmeasured));
-    assert_eq!(StayWhy::Unmeasured.as_str(), "unmeasured");
     let moves = Advice::Move {
         to: "work".into(),
         ahead: true,
         rotates: true,
         takes_canary: false,
     };
+    // No pooled CLI is unmeasured now, so the hold is tested on `held_unless_measured` itself.
+    assert_eq!(
+        held_unless_measured(moves.clone(), false),
+        Advice::Stay(StayWhy::Unmeasured)
+    );
+    assert_eq!(held_unless_measured(moves.clone(), true), moves);
+    assert_eq!(
+        held_unless_measured(Advice::Stay(StayWhy::NothingDue), false),
+        Advice::Stay(StayWhy::NothingDue),
+        "a stay is no move to hold"
+    );
+    assert_eq!(StayWhy::Unmeasured.as_str(), "unmeasured");
+    assert_eq!(ask(Cli::Kimi), moves);
     assert_eq!(ask(Cli::Codex), moves);
     assert_eq!(
         ask(Cli::Claude),

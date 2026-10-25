@@ -1069,7 +1069,7 @@ impl VideoTap {
         }
     }
 
-    /// Metal harvest (status-polled twin of [`Self::harvest_ready`]).
+    /// Metal harvest (status-polled twin of `Self::harvest_ready`).
     #[cfg(target_os = "macos")]
     fn metal_harvest_ready(&mut self, block: bool) {
         self.adopt_converted();
@@ -1129,7 +1129,8 @@ impl VideoTap {
         self.adopt_converted();
     }
 
-    /// Metal twin of [`Self::convert_or_dispatch`] reading raw padded bytes from the slot's shared buffer.
+    /// Metal twin of `Self::convert_or_dispatch` reading raw padded bytes from the slot's
+    /// shared buffer.
     #[cfg(target_os = "macos")]
     fn metal_convert_or_dispatch(
         &mut self,
@@ -1577,7 +1578,7 @@ impl VideoTap {
         self.slots.first().is_some_and(|s| !s.buffer.is_wgpu())
     }
 
-    /// [`Self::after_present`] for a Metal ring.
+    /// `Self::after_present` for a Metal ring.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_after_present(&mut self, t_us: u64) {
         for slot in self.slots.iter_mut() {
@@ -2739,7 +2740,7 @@ impl PresentedFrameTap {
         !self.buffer.is_wgpu()
     }
 
-    /// [`Self::after_present`] with no wgpu device to poll.
+    /// `Self::after_present` with no wgpu device to poll.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_after_present(&mut self, t_us: u64) -> Result<(), String> {
         match self.state {
@@ -2759,7 +2760,7 @@ impl PresentedFrameTap {
         self.result_status()
     }
 
-    /// [`Self::finish`] for a Metal one-shot.
+    /// `Self::finish` for a Metal one-shot.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_finish(&mut self) -> Result<(), String> {
         match self.state {

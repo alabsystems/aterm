@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use aterm_secrets::SecretBytes;
-use aterm_types::macos_setup::{Access, Plan};
+use aterm_types::macos_setup::{Access, Plan, Selection};
 
 use crate::native_app::{AppKind, NativeApp};
 use crate::system_state::{
@@ -37,6 +37,7 @@ pub struct InitialSetupHandlers {
     /// Start one read-only, prompt-free observation of every row for `plan`
     /// (managed rows decide which network reads run). Its result arrives in
     /// a later `status()`. Never holds the setup slot.
+    /// Returns whether the worker accepted the observation.
     pub observe: fn(Plan) -> bool,
     /// Stop was pressed: the pass going now stops at its next stage boundary,
     /// and so does the run of every plan sent before the press that is still
@@ -87,16 +88,22 @@ pub struct InitialSetupApplyReceipt {
     answer: Option<Sender<bool>>,
     admission: Admission,
     chosen: bool,
+    changed: Option<Selection>,
 }
 
 impl InitialSetupApplyReceipt {
-    fn new(admission: Admission, chosen: bool) -> (Self, Receiver<bool>) {
+    fn new(
+        admission: Admission,
+        chosen: bool,
+        changed: Option<Selection>,
+    ) -> (Self, Receiver<bool>) {
         let (answer, receiver) = mpsc::channel();
         (
             Self {
                 answer: Some(answer),
                 admission,
                 chosen,
+                changed,
             },
             receiver,
         )
@@ -106,7 +113,13 @@ impl InitialSetupApplyReceipt {
     /// points, and the answer it sends ([`Self::accept`], or `false` dropped).
     #[cfg(any(test, debug_assertions))]
     pub fn detached(chosen: bool) -> (Self, Receiver<bool>) {
-        Self::new(Admission::Person, chosen)
+        Self::new(Admission::Person, chosen, None)
+    }
+
+    /// The settings the page changed since it last took the plan in force, which the worker
+    /// applies onto that plan as it admits this one ([`crate::SetupAnswer::changed`]).
+    pub fn changed(&self) -> Option<Selection> {
+        self.changed
     }
 
     /// Whether the plan is a group choice (or a Join) made on the page, which
@@ -147,6 +160,7 @@ impl Drop for InitialSetupApplyReceipt {
 
 struct PendingApply {
     instance: crate::native_app::AppInstanceId,
+    admission: Admission,
     plan: Plan,
     answer: Receiver<bool>,
     /// Stop may keep this admission's answer while withdrawing its right to
@@ -173,6 +187,17 @@ pub fn publish_initial_setup_status(status: SetupStatus) {
 /// setup worker (`crate::system_state::fixture_status`): its actions are inert.
 const FIXTURE_SEAM: &str = "ATERM_DEV_SYSTEM_STATE_FIXTURE";
 
+/// How a request to read the shown page's rows went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observe {
+    /// The reading started (or there is nothing to read: a scenario, no worker).
+    Started,
+    /// The worker did not start it: it is tried again a second later.
+    Refused,
+    /// The page waits for the plan in force (§3.5): read at the first tick that knows it.
+    NoPlan,
+}
+
 #[derive(Default)]
 pub(crate) struct Host {
     pending: Option<Request>,
@@ -193,6 +218,12 @@ pub(crate) struct Host {
     /// A System State view was visible at the last tick: showing it again
     /// asks for a fresh observation (§3.5).
     shown: bool,
+    /// A refused observation start is tried again on the page's tick,
+    /// no sooner than this deadline.
+    observe_retry: Option<Instant>,
+    /// The plan in force when the shown page's rows were last read: a status
+    /// that names another (a Restore in a terminal) has them read again.
+    observed_plan: Option<Plan>,
     action_refusal: Option<SetupStatusRow>,
     latest_status: SetupStatus,
     /// The access step last published with the status.
@@ -571,6 +602,7 @@ impl App {
             }
             self.system_state_host.next_tick = None;
             self.system_state_host.shown = false;
+            self.system_state_host.observe_retry = None;
             self.poll_system_state_status(now);
             return;
         };
@@ -584,8 +616,37 @@ impl App {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
         let shown = self.system_state_shown_views(instance);
-        self.system_state_host.shown = !shown.is_empty()
-            && (self.system_state_host.shown || self.observe_system_state(instance));
+        // A plan changed outside the page (`aterm doctor --restore` in a terminal, another
+        // record's change) reaches it only as a status naming that plan: the rows it shows
+        // were read for another, so they are read again, as when the page is shown.
+        let host = &mut self.system_state_host;
+        if host.shown
+            && host.latest_status.plan.is_some()
+            && host.observed_plan.is_some()
+            && host.observed_plan != host.latest_status.plan
+        {
+            host.shown = false;
+        }
+        if shown.is_empty() {
+            self.system_state_host.shown = false;
+            self.system_state_host.observe_retry = None;
+        } else if !self.system_state_host.shown
+            && self
+                .system_state_host
+                .observe_retry
+                .is_none_or(|retry| retry <= now)
+        {
+            // A page waiting for the plan reads at the first tick that knows it; only a
+            // refused start waits a second before it is tried again.
+            let observe = self.observe_system_state(instance);
+            let host = &mut self.system_state_host;
+            host.shown = observe == Observe::Started;
+            host.observe_retry =
+                (observe == Observe::Refused).then_some(now + Duration::from_secs(1));
+            if observe == Observe::Started {
+                host.observed_plan = host.latest_status.plan.clone();
+            }
+        }
         if self.system_state_access_step() != self.system_state_host.access_step {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
@@ -738,7 +799,7 @@ impl App {
     /// plan in force (§3.5) when the page is shown: its managed rows decide
     /// which network reads run, so a page that does not know the plan yet
     /// waits for it. `false` while it waits.
-    fn observe_system_state(&mut self, instance: crate::native_app::AppInstanceId) -> bool {
+    fn observe_system_state(&mut self, instance: crate::native_app::AppInstanceId) -> Observe {
         let handlers = self.system_state_handlers();
         self.observe_system_state_with(instance, handlers)
     }
@@ -747,25 +808,27 @@ impl App {
         &mut self,
         instance: crate::native_app::AppInstanceId,
         handlers: Option<InitialSetupHandlers>,
-    ) -> bool {
+    ) -> Observe {
         if self.system_state_host.fixture().is_some() {
-            return true;
+            return Observe::Started;
         }
         let Some(handlers) = handlers else {
-            return true;
+            return Observe::Started;
         };
         let plan = match self.native_runtime.app(instance) {
             Some(NativeApp::SystemState(state)) if state.plan_known() => state.reviewed_plan(),
             Some(NativeApp::SystemState(_)) => match &self.system_state_host.latest_status.plan {
                 Some(plan) => plan.clone(),
-                None => return false,
+                None => return Observe::NoPlan,
             },
-            _ => return true,
+            _ => return Observe::Started,
         };
-        if !(handlers.observe)(plan) {
+        if (handlers.observe)(plan) {
+            Observe::Started
+        } else {
             aterm_log::info!("system state: the observation did not start");
+            Observe::Refused
         }
-        true
     }
 
     fn poll_system_state_status(&mut self, now: Instant) {
@@ -825,6 +888,13 @@ impl App {
         instance: crate::native_app::AppInstanceId,
         scope: crate::native_app::CloseScope,
     ) {
+        if matches!(
+            self.native_runtime.app(instance),
+            Some(NativeApp::SystemState(_))
+        ) {
+            self.system_state_host.shown = false;
+            self.system_state_host.observe_retry = None;
+        }
         self.native_runtime
             .finish_system_state_close(instance, scope);
     }
@@ -881,13 +951,15 @@ impl App {
                 // this one at its next step (§3.3): the worker does that as it
                 // takes the plan, so the window never sends a Stop that could
                 // reach this plan's own run.
-                self.begin_system_state_action(true);
+                self.begin_system_state_action(true, true);
                 self.note_system_state_apply(admission);
                 self.system_state_host.operation = None;
                 aterm_log::info!("system state: submitting a plan ({admission:?})");
-                let (receipt, receiver) = InitialSetupApplyReceipt::new(admission, answer.chosen);
+                let (receipt, receiver) =
+                    InitialSetupApplyReceipt::new(admission, answer.chosen, answer.changed);
                 self.system_state_host.pending_apply = Some(PendingApply {
                     instance,
+                    admission,
                     plan: plan.clone(),
                     answer: receiver,
                     release_permissions: true,
@@ -906,15 +978,15 @@ impl App {
                     // the review.
                     self.publish_system_state(self.system_state_host.latest_status.clone());
                 } else {
-                    self.system_state_host.pending_apply = None;
-                    self.native_runtime.refuse_system_state_apply();
+                    let pending = self.system_state_host.pending_apply.take().unwrap();
+                    self.refuse_system_state_apply(pending);
                 }
                 self.finish_system_state_action(started, "Setup");
             }
             SystemStateAction::Check(plan) => {
                 let _ = self.take_system_state_press();
                 // A read-only Check cannot revoke its durable permission decision.
-                self.begin_system_state_action(false);
+                self.begin_system_state_action(false, false);
                 let started = handlers.map_or_else(CheckStarted::default, |handlers| {
                     let started = (handlers.check)(plan.clone());
                     // Check again is a check and a forced observation (§3.4).
@@ -931,9 +1003,13 @@ impl App {
             }
             SystemStateAction::Restore => {
                 let _ = self.take_system_state_press();
-                self.begin_system_state_action(true);
+                // A Restore puts back Mac preferences and never withdraws aterm's own
+                // permissions (§3.4): the access steps go on as they were.
+                self.begin_system_state_action(true, false);
                 if let Some(request) = self.system_state_host.pending.take() {
                     request.finish(WorkstationSetupDecision::Unavailable);
+                    // The offer's hold goes with it: a fresh read of the records decides.
+                    self.recheck_initial_setup_permissions();
                     self.native_runtime.tick_system_state(false, false, &[]);
                     self.refresh_system_state_tab_indicators();
                 }
@@ -944,16 +1020,19 @@ impl App {
         }
     }
 
-    /// What every Apply, Check and Restore does first: a `mutating` one retires the review,
-    /// holds the permission gate and forgets any pending Apply; each clears a refused action's
-    /// note and starts a new status generation.
-    fn begin_system_state_action(&mut self, mutating: bool) {
+    /// What every Apply, Check and Restore does first: a `mutating` one retires the review and
+    /// forgets any pending Apply, and one that `holds_access` (an Apply, whose plan may change
+    /// the Permissions group) holds the permission gate until its plan's fresh status; each
+    /// clears a refused action's note and starts a new status generation.
+    fn begin_system_state_action(&mut self, mutating: bool, holds_access: bool) {
         if mutating {
             if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState) {
                 self.retire_native_review(instance);
             }
-            self.hold_initial_setup_permissions();
             self.system_state_host.pending_apply = None;
+        }
+        if holds_access {
+            self.hold_initial_setup_permissions();
         }
         self.system_state_host.action_refusal = None;
         self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
@@ -971,6 +1050,15 @@ impl App {
         }
         self.system_state_host.next_status = Some(Instant::now());
         self.request_redraw_all_windows();
+    }
+
+    /// A failed automatic offer releases its temporary hold after a fresh
+    /// status. A local choice or Stop keeps its hold.
+    fn refuse_system_state_apply(&mut self, pending: PendingApply) {
+        if pending.admission == Admission::Automatic && pending.release_permissions {
+            self.recheck_initial_setup_permissions();
+        }
+        self.native_runtime.refuse_system_state_apply();
     }
 
     pub(crate) fn resolve_system_state_apply(&mut self) {
@@ -999,7 +1087,7 @@ impl App {
                 self.refresh_system_state_tab_indicators();
             }
         } else {
-            self.native_runtime.refuse_system_state_apply();
+            self.refuse_system_state_apply(pending);
         }
         self.finish_system_state_action(accepted, "Setup");
         if accepted {

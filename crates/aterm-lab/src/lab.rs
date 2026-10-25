@@ -978,7 +978,8 @@ pub(crate) fn instance_argv(
     prog
 }
 
-/// The private headless instance (jailed) ([`instance_vars`], [`instance_argv`]).
+/// The private instance (jailed), headless unless the run asks for a window ([`instance_vars`],
+/// [`instance_argv`]).
 pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result<(), String> {
     let aterm = run.need_aterm()?.to_string_lossy().into_owned();
     let vars = instance_vars(run, &paths().user)?;

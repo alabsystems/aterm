@@ -110,14 +110,12 @@ pub(crate) fn native_termination_is_current(generation: u64) -> bool {
     with_native_terminate(|state| state.is_current(generation))
 }
 
-/// A `terminate:` from AppKit, admitted.
+/// A `terminate:` from AppKit that `asker` asked for, admitted.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn admit_native_terminate(systems: bool) -> NativeTerminateDecision {
+pub(crate) fn admit_native_terminate(asker: crate::system_quit::Asker) -> NativeTerminateDecision {
     with_native_terminate(|state| {
         let decision = state.request();
-        if systems {
-            crate::system_quit::note(decision.generation());
-        }
+        crate::system_quit::note(decision.generation(), asker);
         decision
     })
 }
@@ -1284,8 +1282,8 @@ impl MenuAction {
             }
             MenuAction::StatsBarsOff => "Hide the stats bars; saved in aterm.toml.",
             MenuAction::DeckSizeAuto => {
-                "Show each window's stats deck Full when the window is tall and Folded when it \
-                 is short; saved in aterm.toml."
+                "Show each window's stats deck Folded, however tall the window is; saved in \
+                 aterm.toml."
             }
             MenuAction::DeckSizeFull => {
                 "Show the stats deck Full, a row per resource, in every window; saved in \
@@ -3071,42 +3069,66 @@ mod macos {
         }
     }
 
-    fn terminate_is_the_systems() -> bool {
+    /// Who asked for the `terminate:` AppKit is deciding, by the sender and the quit reason of
+    /// the Apple event it answers ([`crate::system_quit::asker_of`]); with no event, a person.
+    fn terminate_asker() -> crate::system_quit::Asker {
         // SAFETY: Foundation sends on the main thread inside
         // `applicationShouldTerminate:`. `+sharedAppleEventManager` and
         // `-currentAppleEvent` return BORROWED objects (nil outside an event);
         // `-attributeDescriptorForKeyword:` takes an `AEKeyword` (a 32-bit
         // `FourCharCode`, passed in a full register) and returns a borrowed
-        // descriptor or nil; `-enumCodeValue` returns an `OSType`, the low
-        // 32 bits of the return register.
-        autoreleasepool(|_| unsafe {
+        // descriptor or nil; `-enumCodeValue` returns an `OSType` and
+        // `-int32Value` an `SInt32`, each the low 32 bits of the return register.
+        let read = autoreleasepool(|_| unsafe {
             let manager = appkit::send_id(
                 class(c"NSAppleEventManager").as_id(),
                 sel!(sharedAppleEventManager),
             );
             if manager.is_null() {
-                return false;
+                return None;
             }
             let event = appkit::send_id(manager, sel!(currentAppleEvent));
             if event.is_null() {
-                return false;
+                return None;
             }
-            let reason = appkit::send_id_usize(
-                event,
-                sel!(attributeDescriptorForKeyword:),
-                crate::system_quit::KEY_QUIT_REASON as usize,
-            );
-            if reason.is_null() {
-                return false;
-            }
-            let code = (appkit::send_usize(reason, sel!(enumCodeValue)) & 0xFFFF_FFFF) as u32;
-            crate::system_quit::reason_is_the_systems(code)
-        })
+            let attribute = |keyword: u32| {
+                let descriptor = appkit::send_id_usize(
+                    event,
+                    sel!(attributeDescriptorForKeyword:),
+                    keyword as usize,
+                );
+                (!descriptor.is_null()).then_some(descriptor)
+            };
+            let reason = attribute(crate::system_quit::KEY_QUIT_REASON).map(|descriptor| {
+                (appkit::send_usize(descriptor, sel!(enumCodeValue)) & 0xFFFF_FFFF) as u32
+            });
+            let sender = attribute(crate::quit_reopen::KEY_SENDER_PID)
+                .map(|descriptor| appkit::send_i32(descriptor, sel!(int32Value)));
+            Some((reason, sender))
+        });
+        let Some((reason, pid)) = read else {
+            return crate::system_quit::Asker::Person;
+        };
+        let sender = pid
+            .filter(|pid| *pid > 0)
+            .and_then(aterm_uds::process::read_process_path);
+        let asker = crate::system_quit::asker_of(reason, sender.as_deref());
+        aterm_log::info!(
+            "a quit Apple event from pid {pid:?} ({}), reason {}: {asker:?}",
+            sender
+                .as_deref()
+                .map_or_else(|| "no path".into(), std::path::Path::to_string_lossy),
+            reason.map_or_else(
+                || "none".to_owned(),
+                |code| String::from_utf8_lossy(&code.to_be_bytes()).into_owned()
+            ),
+        );
+        asker
     }
 
     /// AppKit's synchronous `applicationShouldTerminate:` hook.
     pub(crate) fn defer_quit_for_terminate() -> bool {
-        let decision = super::admit_native_terminate(terminate_is_the_systems());
+        let decision = super::admit_native_terminate(terminate_asker());
         match decision {
             NativeTerminateDecision::AllowExit(_) => true,
             NativeTerminateDecision::DeferExisting(_) => false,
@@ -4409,7 +4431,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn a_dropped_candidate_terminate_frees_the_arbiter() {
         let _serial = super::terminate_test_serial();
-        let super::NativeTerminateDecision::Dispatch(logout) = super::admit_native_terminate(true)
+        let super::NativeTerminateDecision::Dispatch(logout) =
+            super::admit_native_terminate(crate::system_quit::Asker::System)
         else {
             panic!("a first request dispatches");
         };
@@ -4430,7 +4453,7 @@ mod tests {
             !crate::system_quit::asked(),
             "a cancelled logout marks no later quit"
         );
-        let next = super::admit_native_terminate(false);
+        let next = super::admit_native_terminate(crate::system_quit::Asker::Person);
         assert!(
             matches!(next, super::NativeTerminateDecision::Dispatch(g) if g != logout),
             "the next logout reaches the event loop: {next:?}"

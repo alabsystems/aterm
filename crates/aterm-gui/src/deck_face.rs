@@ -392,7 +392,7 @@ pub(crate) enum BoxKind {
     Core,
 }
 
-/// The boxes a deck painter records while a test asks for them ([`Boxes::record`]): outside
+/// The boxes a deck painter records while a test asks for them (`Boxes::record`): outside
 /// tests it holds and records nothing.
 #[derive(Default)]
 pub(crate) struct Boxes {

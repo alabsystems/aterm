@@ -9,7 +9,9 @@
 //! The words come from a typed [`Reading`] the item took in its own probe and hands over as its
 //! row's `detail`, not from the human `from` line `aterm doctor` and `aterm init` print. The
 //! exceptions are two settings whose shared items take no reading: Caps Lock reads the keyboard
-//! items' rendered mapping and Trackpad scrolling the defaults items' rendered value.
+//! items' rendered mapping and Trackpad scrolling the defaults items' rendered value. Caps Lock
+//! also reads, from its items' outcomes and effects, a live mapping that lasts until the next
+//! login ([`until_login`]).
 
 use crate::model::{Effect, ItemReport, Outcome};
 use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
@@ -22,6 +24,9 @@ pub enum Reading {
     CapsLock,
     /// Natural scrolling is on in System Settings.
     NaturalOn,
+    /// The wanted value is live now, while the saved preference macOS loads at the next login
+    /// differs: the row reads the live value until then ([`until_login`]).
+    UntilLogin,
     /// Desktop icons are hidden.
     IconsHidden,
     /// A click on the wallpaper reveals the desktop.
@@ -154,6 +159,7 @@ impl Reading {
         let body = match self {
             Self::CapsLock => "caps-lock".to_owned(),
             Self::NaturalOn => "natural-on".to_owned(),
+            Self::UntilLogin => "until-login".to_owned(),
             Self::IconsHidden => "icons-hidden".to_owned(),
             Self::ClickReveals => "click-reveals".to_owned(),
             Self::WidgetsShown => "widgets-shown".to_owned(),
@@ -188,6 +194,7 @@ impl Reading {
         let reading = match kind {
             "caps-lock" => Self::CapsLock,
             "natural-on" => Self::NaturalOn,
+            "until-login" => Self::UntilLogin,
             "icons-hidden" => Self::IconsHidden,
             "click-reveals" => Self::ClickReveals,
             "widgets-shown" => Self::WidgetsShown,
@@ -261,8 +268,12 @@ impl Reading {
                 signed_in: false, ..
             } => "Needs sign-in".to_owned(),
             // A probe that could not go on read no value, and the person's own
-            // project folders are no value of the row's.
-            Self::Repositories { .. } | Self::Waits(_) | Self::KeptOut { .. } => {
+            // project folders are no value of the row's. A value live until the next login
+            // is the row's wanted one, which its observation marks ([`until_login`]).
+            Self::Repositories { .. }
+            | Self::Waits(_)
+            | Self::KeptOut { .. }
+            | Self::UntilLogin => {
                 return None;
             }
         })
@@ -339,12 +350,21 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
         return Observation::unknown(subject);
     };
     let wanted = wanted(setting, rows);
+    let marked = standing == Standing::Differs && until_login(setting, rows);
     let now = match standing {
         Standing::InPlace | Standing::AtLogin => Some(wanted.clone()),
         Standing::NotNeeded | Standing::Unknown => None,
+        Standing::Differs if marked => Some(aterm_types::macos_setup::until_login(&wanted)),
         Standing::Differs | Standing::Waiting | Standing::NeedsYou | Standing::Failed => {
             now(setting, rows)
         }
+    };
+    // A value live until the next login: what the Mac reads after it, which a row that will
+    // change shows as its from-side (design §3.3).
+    let after_login = if marked {
+        after_login(setting, rows)
+    } else {
+        None
     };
     // A row that differs has no reasons to give: the planned parts' lines are the engine's.
     let detail = if standing == Standing::Differs {
@@ -400,6 +420,7 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
         subject,
         standing,
         now,
+        after_login,
         wanted,
         note,
         detail: (!detail.is_empty()).then(|| detail.join("; ")),
@@ -437,6 +458,61 @@ fn wanted(setting: Setting, rows: &[&ItemReport]) -> String {
         return format!("All {count}");
     }
     setting.wanted().to_owned()
+}
+
+/// Whether a row that differs reads its wanted value live, while the saved preference macOS
+/// loads at the next login differs (design §3.3): the row then stands as the Mac will after
+/// that login, and its value is the live one, marked "until login". Its item says so
+/// ([`Reading::UntilLogin`]), or, for the Caps Lock key, whose saved mappings and live
+/// mappings are separate items, every part that differs is a saved mapping (an item whose
+/// change takes effect at login) while every live part (one that takes effect now) is in place.
+fn until_login(setting: Setting, rows: &[&ItemReport]) -> bool {
+    let differing: Vec<&ItemReport> = rows
+        .iter()
+        .copied()
+        .filter(|row| standing(row) == Standing::Differs)
+        .collect();
+    if differing.is_empty() {
+        return false;
+    }
+    if differing
+        .iter()
+        .all(|row| Reading::of(row) == Some(Reading::UntilLogin))
+    {
+        return true;
+    }
+    differing.iter().all(|row| row.effect == Effect::Login) && live_in_place(setting, rows)
+}
+
+/// Whether the part of `setting` that takes effect now reads in place: the Caps Lock key's
+/// live mappings, which its items read apart from the saved ones macOS loads at the next login
+/// ([`until_login`]). A run that set both left nothing for that login, so its row is in place
+/// now, never "at login"; a setting with no live part of its own (Trackpad scrolling's keys are
+/// all saved preferences) has none in place.
+#[must_use]
+pub fn live_in_place(setting: Setting, rows: &[&ItemReport]) -> bool {
+    let live: Vec<&ItemReport> = rows
+        .iter()
+        .copied()
+        .filter(|row| row.effect == Effect::Now)
+        .collect();
+    setting == Setting::CapsLock
+        && !live.is_empty()
+        && live.iter().all(|row| row.outcome == Outcome::Ok)
+}
+
+/// What a row whose wanted value is live only until the next login reads after it, in its
+/// words: the saved part that differs. Natural scrolling's one item reads both, and says it
+/// is off now while the saved direction is not ([`Reading::UntilLogin`]), so macOS scrolls
+/// naturally again after the login.
+fn after_login(setting: Setting, rows: &[&ItemReport]) -> Option<String> {
+    if rows
+        .iter()
+        .any(|row| Reading::of(row) == Some(Reading::UntilLogin))
+    {
+        return (setting == Setting::NaturalScrolling).then(|| "On".to_owned());
+    }
+    now(setting, rows)
 }
 
 /// The current value of a row that differs, in its exact words, when every part of
@@ -551,6 +627,7 @@ mod tests {
         let readings = [
             Reading::CapsLock,
             Reading::NaturalOn,
+            Reading::UntilLogin,
             Reading::IconsHidden,
             Reading::ClickReveals,
             Reading::WidgetsShown,
@@ -633,6 +710,71 @@ mod tests {
         ] {
             assert_eq!(standing(&row(outcome, None, None)), want, "{outcome:?}");
         }
+    }
+
+    /// A Restore puts back a saved preference macOS loads only at the next login, while the
+    /// value aterm set stays live until then: the row stands as the Mac will after that login
+    /// (it differs from what aterm wants) and reads the live value, marked.
+    #[test]
+    fn a_value_live_until_the_next_login_reads_as_itself_marked() {
+        let at_login = |from: &str| ItemReport {
+            effect: Effect::Login,
+            ..planned(from)
+        };
+        let live = row(Outcome::Ok, None, Some("Caps Lock acts as Control"));
+        let saved = at_login("no remap");
+        let read = observation(Setting::CapsLock, &[&saved, &live]);
+        assert_eq!(read.standing, Standing::Differs);
+        assert_eq!(read.now.as_deref(), Some("Control · until login"));
+        // What the Mac reads after that login, which a row that will change shows as its
+        // from-side: the saved mapping's word, unmarked.
+        assert_eq!(read.after_login.as_deref(), Some("Caps Lock"));
+        assert_eq!(read.wanted, "Control");
+        // Live not as wanted, or not read at all: the saved mapping's word, and nothing else
+        // after the login.
+        let unmapped = read_as(Reading::CapsLock);
+        for rows in [vec![&saved, &unmapped], vec![&saved]] {
+            let read = observation(Setting::CapsLock, &rows);
+            assert_eq!(read.now.as_deref(), Some("Caps Lock"), "{rows:?}");
+            assert_eq!(read.after_login, None, "{rows:?}");
+        }
+        // A live part that could not be read proves nothing either.
+        let unread = row(Outcome::Unknown, None, None);
+        assert_ne!(
+            observation(Setting::CapsLock, &[&saved, &live, &unread])
+                .now
+                .as_deref(),
+            Some("Control · until login")
+        );
+        // Natural scrolling's one item reads both, and says so itself.
+        let read = observation(Setting::NaturalScrolling, &[&read_as(Reading::UntilLogin)]);
+        assert_eq!(read.standing, Standing::Differs);
+        assert_eq!(read.now.as_deref(), Some("Off · until login"));
+        assert_eq!(read.after_login.as_deref(), Some("On"));
+        // Trackpad scrolling's keys are all saved preferences: one in place says nothing live.
+        let gesture = at_login("false");
+        let read = observation(Setting::TrackpadScrolling, &[&gesture, &live]);
+        assert_eq!(read.now.as_deref(), Some("Some off"));
+        assert_eq!(read.after_login, None);
+    }
+
+    /// A run that set the Caps Lock key's live mappings with its saved ones left nothing for
+    /// the next login: its live part reads in place. Trackpad scrolling has no live part, and a
+    /// live part not read, or not as wanted, is none in place.
+    #[test]
+    fn only_a_live_mapping_read_in_place_puts_a_row_in_effect_now() {
+        let saved = ItemReport {
+            effect: Effect::Login,
+            ..row(Outcome::Ok, None, Some("Caps Lock→Left Control"))
+        };
+        let live = row(Outcome::Ok, None, Some("Caps Lock acts as Control"));
+        assert!(live_in_place(Setting::CapsLock, &[&saved, &live]));
+        assert!(!live_in_place(Setting::CapsLock, &[&saved]));
+        for other in [Outcome::Unknown, Outcome::Planned] {
+            let other = row(other, None, None);
+            assert!(!live_in_place(Setting::CapsLock, &[&saved, &live, &other]));
+        }
+        assert!(!live_in_place(Setting::TrackpadScrolling, &[&saved, &live]));
     }
 
     #[test]

@@ -673,8 +673,9 @@ fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
                     host.live() == [WORKER]
                 }),
                 (Some(_), Some((sid, ..))) => {
+                    // Its worker is live before its body has run: wait for both.
                     until(&format!("{case}: {sid} carried beside it"), || {
-                        host.live() == [sid]
+                        host.live() == [sid] && world.runs.load(Ordering::SeqCst) == 1
                     });
                     world.passes();
                     assert_eq!(host.live(), [sid], "{case}: no worker for {WORKER}");

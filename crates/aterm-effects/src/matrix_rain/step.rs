@@ -12,7 +12,7 @@ use aterm_time::Instant;
 use super::{EffectGeom, MatrixRain, RainCell, RainSignal, RainTickInput, RainVisibility};
 
 /// Per-surface rain latches keyed by session.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RainLatches {
     /// `(session, completed_command_seq)` of the last completion observed.
     pub last_cmd: Option<(u64, u64)>,
@@ -20,7 +20,19 @@ pub struct RainLatches {
     pub shell_executing: Option<(u64, bool)>,
 }
 
+impl Default for RainLatches {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl RainLatches {
+    /// Unbaselined rain latches before any session frame is observed.
+    pub const EMPTY: Self = Self {
+        last_cmd: None,
+        shell_executing: None,
+    };
     /// Record the shell's Execute state for `session` and return whether this is its rising edge.
     #[inline]
     pub const fn note_shell_executing(&mut self, session: u64, executing: bool) -> bool {

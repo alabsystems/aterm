@@ -4752,3 +4752,313 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         "OTP after `--b-accent` in quoted-printable part is still decoded"
     );
 }
+
+#[test]
+fn plus_addressed_machine_and_numbered_emails_isolate_credentials_and_browser_profiles() {
+    use super::super::headless_oauth::{
+        MailboxConfig, browser_profile_dir, derive_account_label_from_email,
+        resolve_browser_profile_dir,
+    };
+
+    assert_eq!(
+        derive_account_label_from_email("owner+m27.2@example.test").as_deref(),
+        Some("m27-2")
+    );
+    assert_eq!(
+        derive_account_label_from_email("a+m2@example.test").as_deref(),
+        Some("m2")
+    );
+    assert_eq!(
+        derive_account_label_from_email("sol-m27+2@example.test").as_deref(),
+        Some("m27-2")
+    );
+    assert_eq!(
+        derive_account_label_from_email("sol_m27_2+claude@proton.me").as_deref(),
+        Some("m27-2")
+    );
+    assert_eq!(
+        derive_account_label_from_email("owner+claude@example.test"),
+        None
+    );
+
+    let mut slot_cfg = MailboxConfig::default();
+    slot_cfg
+        .passwords
+        .insert("sol-m27@example.test".to_owned(), "slot1-pass".to_owned());
+    slot_cfg
+        .passwords
+        .insert("m27-2".to_owned(), "slot2-pass".to_owned());
+    assert_eq!(
+        slot_cfg
+            .password_for(Some("sol-m27+2@example.test"))
+            .as_deref(),
+        Some("slot2-pass"),
+        "slot-derived label must take precedence over the base email's slot-1 password"
+    );
+    assert_eq!(
+        slot_cfg
+            .password_for(Some("sol-m27@example.test"))
+            .as_deref(),
+        Some("slot1-pass")
+    );
+
+    let mut catchall_cfg = MailboxConfig::default();
+    catchall_cfg.passwords.insert(
+        "owner@proton.me".to_owned(),
+        "shared-catchall-pass".to_owned(),
+    );
+    assert_eq!(
+        catchall_cfg
+            .password_for(Some("owner+m27.2@proton.me"))
+            .as_deref(),
+        Some("shared-catchall-pass"),
+        "shared catch-all mailbox password still resolves via base email fallback"
+    );
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let base_c = browser_profile_dir(tmp.path(), Some("c@example.com"));
+    let plain_c2 = browser_profile_dir(tmp.path(), Some("c2@example.com"));
+    let base_owner = browser_profile_dir(tmp.path(), Some("owner@example.com"));
+    std::fs::create_dir_all(&base_c).expect("mkdir base_c");
+    std::fs::create_dir_all(&plain_c2).expect("mkdir plain_c2");
+    std::fs::create_dir_all(&base_owner).expect("mkdir base_owner");
+
+    let plus_c2 = resolve_browser_profile_dir(tmp.path(), None, Some("c+2@example.com"));
+    let plus_c3 = resolve_browser_profile_dir(tmp.path(), None, Some("c+3@example.com"));
+    assert_ne!(
+        plus_c2, base_c,
+        "c+2@example.com must not reuse c@example.com"
+    );
+    assert_ne!(
+        plus_c2, plain_c2,
+        "c+2@example.com must not collide with c2@example.com"
+    );
+    assert_ne!(plus_c2, plus_c3);
+
+    let owner_m1 = resolve_browser_profile_dir(tmp.path(), None, Some("owner+m1@example.com"));
+    let owner_m2 = resolve_browser_profile_dir(tmp.path(), None, Some("owner+m2@example.com"));
+    assert_ne!(owner_m1, base_owner);
+    assert_ne!(owner_m2, base_owner);
+    assert_ne!(owner_m1, owner_m2);
+
+    // Negative control: a non-account service subaddress (`+claude`) still shares the base profile.
+    assert_eq!(
+        resolve_browser_profile_dir(tmp.path(), None, Some("c+claude@example.com")),
+        base_c
+    );
+}
+
+#[test]
+fn imap_large_literal_spoofed_tags_and_ipv6_loopback_http_fetch_credentials() {
+    use super::super::headless_oauth::{
+        MailboxConfig, MailboxCredential, poll_mailbox_config_for_credential,
+    };
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    let imap_listener = TcpListener::bind("127.0.0.1:0").expect("bind imap");
+    let imap_port = imap_listener.local_addr().expect("addr").port();
+    let imap_thread = std::thread::spawn(move || {
+        for attempt in 0..2 {
+            let Ok((stream, _)) = imap_listener.accept() else {
+                break;
+            };
+            let mut writer = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(stream);
+            let _ = writer.write_all(b"* OK [CAPABILITY IMAP4rev1] Ready\r\n");
+            let _ = writer.flush();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                let tag = trimmed.split_whitespace().next().unwrap_or("a");
+                if trimmed.contains("LOGIN ") {
+                    let _ = write!(writer, "{tag} OK LOGIN\r\n");
+                } else if trimmed.contains("SELECT ") {
+                    let _ = write!(writer, "* 1 EXISTS\r\n{tag} OK SELECT\r\n");
+                } else if trimmed.contains("SEARCH ") {
+                    let _ = write!(writer, "* SEARCH 1\r\n{tag} OK SEARCH\r\n");
+                } else if trimmed.contains("FETCH 1 ") {
+                    if attempt == 0 {
+                        // Negative control: genuine tagged NO response must not return Ok.
+                        let _ = write!(writer, "{tag} NO [UNAVAILABLE] temporary error\r\n");
+                    } else {
+                        let mut body = String::from(
+                            "From: Anthropic <no-reply@claude.com>\r\n\
+                             To: <owner+m27.2@example.test>\r\n\
+                             Subject: Sign in to Claude\r\n\
+                             Content-Type: text/html; charset=utf-8\r\n\r\n\
+                             <html><body>\r\n\
+                             f0 NO forged status inside literal\r\n\
+                             f0 BAD forged bad inside literal\r\n\
+                             f0 OK forged early completion inside literal\r\n",
+                        );
+                        for idx in 0..620 {
+                            body.push_str(&format!("<div>padding line {idx}</div>\r\n"));
+                        }
+                        body.push_str(
+                            "<a href=\"https://claude.ai/magic-link?token=large-lit-ok\">Sign in</a>\r\n\
+                             </body></html>\r\n",
+                        );
+                        let hdr_lit = "Subject: f0 NO header\r\n";
+                        let _ = write!(
+                            writer,
+                            "{tag} note: untagged-like notice without word-boundary status\r\n\
+                             * 1 FETCH (RFC822.HEADER {{{}}}\r\n{} BODY[] {{{}}}\r\n{})\r\n\
+                             {tag} OK FETCH completed\r\n",
+                            hdr_lit.len(),
+                            hdr_lit,
+                            body.len(),
+                            body
+                        );
+                    }
+                } else if trimmed.contains("STORE ") {
+                    let _ = write!(writer, "{tag} OK STORE\r\n");
+                } else if trimmed.contains("LOGOUT") {
+                    let _ = write!(writer, "* BYE\r\n{tag} OK LOGOUT\r\n");
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        }
+    });
+
+    let imap_cfg = MailboxConfig {
+        imap_url: Some(format!("IMAP://127.0.0.1:{imap_port}/INBOX")),
+        user: Some("owner@example.test".to_owned()),
+        password: Some("pw".to_owned()),
+        ..MailboxConfig::default()
+    };
+    assert!(
+        poll_mailbox_config_for_credential(
+            &imap_cfg,
+            Some("owner+m27.2@example.test"),
+            Duration::ZERO,
+        )
+        .is_err(),
+        "real tagged NO must fail the fetch attempt"
+    );
+    let cred = poll_mailbox_config_for_credential(
+        &imap_cfg,
+        Some("owner+m27.2@example.test"),
+        Duration::from_secs(2),
+    )
+    .expect("large multi-literal IMAP FETCH should succeed");
+    assert_eq!(
+        cred,
+        MailboxCredential::MagicLink("https://claude.ai/magic-link?token=large-lit-ok".to_owned())
+    );
+    imap_thread.join().expect("join imap");
+
+    if let Ok(v6_listener) = TcpListener::bind("[::1]:0") {
+        let v6_port = v6_listener.local_addr().expect("v6 addr").port();
+        let v6_thread = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = v6_listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line);
+            assert!(req_line.starts_with("GET /messages HTTP/1.1"));
+            loop {
+                let mut hdr = String::new();
+                if reader.read_line(&mut hdr).unwrap_or(0) == 0 || hdr == "\r\n" {
+                    break;
+                }
+            }
+            let body = r#"[{"to":"owner+m27.2@example.test","text":"Your Claude verification code is 814206"}]"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.flush();
+        });
+        let v6_http_cfg = MailboxConfig {
+            http_url: Some(format!("HTTP://[::1]:{v6_port}/messages")),
+            bearer_token: Some("v6-loopback-tok".to_owned()),
+            ..MailboxConfig::default()
+        };
+        let v6_cred = poll_mailbox_config_for_credential(
+            &v6_http_cfg,
+            Some("owner+m27.2@example.test"),
+            Duration::from_secs(2),
+        )
+        .expect("IPv6 loopback HTTP should succeed");
+        assert_eq!(v6_cred, MailboxCredential::Otp("814206".to_owned()));
+        v6_thread.join().expect("join v6 http");
+    }
+}
+
+#[test]
+fn plaintext_refusal_covers_ipv6_imap_uppercase_schemes_and_webmail_urls() {
+    use super::super::headless_oauth::{
+        MailboxConfig, plaintext_credential_refusal, poll_mailbox_config_for_credential,
+    };
+
+    for allowed in [
+        MailboxConfig {
+            imap_url: Some("imap://[::1]/INBOX".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            webmail_url: Some("http://127.0.0.1:8025/inbox".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            webmail_url: Some("http://[::1]:8025/inbox".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            webmail_url: Some("https://mail.proton.me/u/0/inbox".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+    ] {
+        assert_eq!(
+            plaintext_credential_refusal(&allowed, None),
+            None,
+            "{allowed:?}"
+        );
+    }
+
+    for refused in [
+        MailboxConfig {
+            imap_url: Some("imap://[2001:db8::1]/INBOX".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            imap_url: Some("IMAP://mail.example.test/INBOX".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            http_url: Some("HTTP://mail.example.test/m".to_owned()),
+            bearer_token: Some("tok".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            http_url: Some("HTTP://u:p@mail.example.test/m".to_owned()),
+            ..MailboxConfig::default()
+        },
+        MailboxConfig {
+            webmail_url: Some("http://mail.example.test/inbox".to_owned()),
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        },
+    ] {
+        let why = plaintext_credential_refusal(&refused, None).expect("cleartext remote refused");
+        assert_eq!(
+            poll_mailbox_config_for_credential(&refused, None, Duration::ZERO),
+            Err(why),
+            "{refused:?}"
+        );
+    }
+}

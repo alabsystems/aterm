@@ -186,15 +186,14 @@ pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
 }
 
 fn kind_of(question: &str) -> SurveyKind {
-    use crate::anchors::anchor_text as a;
-    if question.contains(a("survey.question")) {
+    if question.contains(crate::anchor!("survey.question")) {
         SurveyKind::Session
-    } else if question.starts_with(a("survey.long_context")) {
+    } else if question.starts_with(crate::anchor!("survey.long_context")) {
         SurveyKind::LongContext
-    } else if question.starts_with(a("survey.plugin")) {
+    } else if question.starts_with(crate::anchor!("survey.plugin")) {
         SurveyKind::Plugin
-    } else if question.starts_with(a("survey.memory"))
-        || question.starts_with(a("survey.memory_plain"))
+    } else if question.starts_with(crate::anchor!("survey.memory"))
+        || question.starts_with(crate::anchor!("survey.memory_plain"))
     {
         SurveyKind::Memory
     } else {

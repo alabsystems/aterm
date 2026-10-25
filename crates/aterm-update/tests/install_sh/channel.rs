@@ -188,32 +188,50 @@ fn a_download_is_held_to_the_named_size() {
 /// and the curl web_curl runs sends that group the Ctrl-C and dies of it. Under
 /// bash 3.2 web_curl's subshell then exited 130, the run went on, said the
 /// download failed and exited 1. The download runs in a subshell, as
-/// linux_verifier_ready's does, which starts with the run's INT trap reset.
+/// linux_verifier_ready's does, which starts with the run's traps reset. A
+/// Ctrl-\ (SIGQUIT) ends it by exit 131 once its EXIT trap has run. The curl
+/// stand-in sends that one to the run's shell alone and exits 131 as curl
+/// would die: sent to the group, it killed the subshells and head too, each a
+/// death by a core-dump signal, for which macOS writes a crash report. So the
+/// subshell lives on to say the download failed, which one the terminal's
+/// Ctrl-\ reached would not.
 #[test]
 fn a_ctrl_c_during_a_download_ends_the_run() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
     lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\nkill -s INT 0\\nexec /bin/sleep 30\\n' >\"$TMPDIR/bin/curl\" && \
+        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\n[ \"$SIG\" != QUIT ] || { kill -s \"$SIG\" \"$RUN\"; exit 131; }\\nkill -s \"$SIG\" 0\\nexec /bin/sleep 30\\n' >\"$TMPDIR/bin/curl\" && \
          chmod +x \"$TMPDIR/bin/curl\" && cat >\"$TMPDIR/download.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 PATH=\"$TMPDIR/bin:$PATH\" REPO_SLUG=example/aterm
-trap 'echo cleaned >\"$TMPDIR/cleaned\"' EXIT
+export SIG=$1 RUN=$$
+trap 'echo cleaned >\"$TMPDIR/cleaned-$SIG\"' EXIT
 ( download_release_asset v0.92.0 aterm-appcast.toml 3 \"$TMPDIR/got\" ) || echo \"went on ($?)\"
 EOF",
     );
-    let call = lib.call(
-        format!(
-            "echo \"$({}) $(cat \"$TMPDIR/cleaned\" 2>/dev/null)\"",
-            group_run("\"$TMPDIR/download.bash\"")
-        ),
-        &[],
-    );
+    let calls: Vec<usize> = ["INT", "QUIT"]
+        .iter()
+        .map(|sig| {
+            lib.call(
+                format!(
+                    "echo \"$({}) $(cat \"$TMPDIR/cleaned-{sig}\" 2>/dev/null)\"",
+                    group_run(&format!("\"$TMPDIR/download.bash\" {sig}"))
+                ),
+                &[],
+            )
+        })
+        .collect();
     let recs = lib.run(&scratch);
-    assert_eq!(recs[call].out, "signal 2 cleaned", "{}", recs[call].err);
-    assert!(!recs[call].err.contains("failed"), "{}", recs[call].err);
+    for (call, want) in calls.iter().zip(["signal 2 cleaned", "exit 131 cleaned"]) {
+        assert_eq!(recs[*call].out, want, "{}", recs[*call].err);
+    }
+    assert!(
+        !recs[calls[0]].err.contains("failed"),
+        "{}",
+        recs[calls[0]].err
+    );
 }
 
 /// The download meter ends with the run: a run a Ctrl-C ends under bash 5 never

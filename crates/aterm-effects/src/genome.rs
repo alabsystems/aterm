@@ -38,10 +38,22 @@ const FORM_WEIGHT: i32 = 3;
 /// The vote accumulator, newtyped so the owning struct can derive `Default`.
 pub struct VoteScratch(pub [i32; 64]);
 
+impl VoteScratch {
+    /// Zeroed 64-bin hue tally.
+    pub const ZERO: Self = Self([0; 64]);
+
+    /// Construct a zeroed 64-bin hue tally.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::ZERO
+    }
+}
+
 impl Default for VoteScratch {
     #[inline]
     fn default() -> Self {
-        Self([0; 64])
+        Self::ZERO
     }
 }
 
@@ -241,10 +253,25 @@ fn token_left(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
 pub const SIMHASH_SLOT_WEIGHTS: [i32; 9] = [FORM_WEIGHT, 4, 2, 2, 1, 4, 2, 2, 1];
 
 /// A collected voter set: slot `i`'s token hash and a presence mask (bit `i` set means slot `i` votes at `SIMHASH_SLOT_WEIGHTS[i]`).
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct VoterSet {
     pub hash: [u64; 9],
     pub present: u16,
+}
+
+impl VoterSet {
+    /// Empty voter set with no populated slots.
+    pub const EMPTY: Self = Self {
+        hash: [0; 9],
+        present: 0,
+    };
+}
+
+impl Default for VoterSet {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Reference majority over a [`VoterSet`]: the `cast_vote` + signed-majority fold of [`simhash_ctx_reference`], factored so the battery compares both kernels on identical inputs.

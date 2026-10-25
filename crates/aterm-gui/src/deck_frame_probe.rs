@@ -3,14 +3,20 @@
 
 //! The deck's frame, timed stage by stage ([`deck_frame_cost`], `benches/deck_frame_cost.rs`)
 //! over the merged deck's busy and calm scenes ([`aterm_vitals::fixtures`]) at the mockups'
-//! widths: a measurement for a person, never a gate.
+//! widths, and the merged deck's marks alone ([`specimen`]): a measurement for a person, never a
+//! gate.
 
 use std::time::Instant;
 
 use aterm_vitals::fixtures::{self, DeckScene};
 
+use crate::merged_marks::specimen;
 use crate::stats_deck::deck_fixtures::DeckContext;
-use crate::stats_deck::{DeckGeom, StatsBars, deck_paint, deck_px, fold_cards, prims_fp};
+use crate::stats_deck::{
+    DeckGeom, DeckStyle, StatsBars, deck_paint, deck_px, fold_cards, prims_fp,
+};
+use crate::stats_merged::merged_paint;
+use crate::stats_paint::Painter;
 use crate::stats_plan::DeckForm;
 
 /// The window widths timed, in points, and their scales: the mockups' 2238, 1100 and 700
@@ -30,7 +36,9 @@ pub(crate) struct StageCost {
 /// at each of [`WIDTHS`] on the mockups' dark ground: the layout and paint (`deck_paint`), the
 /// prims' fingerprint (`prims_fp`), the card's raster (`rasterize_tray`), the deck card's share
 /// of the fold (`fold`: its composite onto the fold's surface; an open lens or a top card adds
-/// its own), and the four in turn (`frame`), a reading's whole cost with a lens open.
+/// its own), and the four in turn (`frame`), a reading's whole cost with a lens open; then the
+/// merged deck's paint (`merged_paint`) and its four in turn (`merged frame`), three rows of the
+/// same cell. Then the merged marks' [`specimen`] at 2× and 1×: its paint and its raster.
 pub(crate) fn deck_frame_cost(frames: usize) -> Vec<StageCost> {
     crate::tray_raster::set_chrome_fonts(None, None, None);
     let inks =
@@ -40,7 +48,13 @@ pub(crate) fn deck_frame_cost(frames: usize) -> Vec<StageCost> {
         let snap = fixtures::snapshot(scene);
         let input = DeckContext::of(scene).input(Some(&snap), DeckForm::Full, inks);
         for (w, s) in WIDTHS {
-            let h = deck_px(StatsBars::Deck, DeckForm::Full, s, (14.0 * s) as usize);
+            let h = deck_px(
+                StatsBars::Deck,
+                DeckStyle::V2,
+                DeckForm::Full,
+                s,
+                (14.0 * s) as usize,
+            );
             let g = DeckGeom {
                 w: (w * s) as f32,
                 h: h as f32,
@@ -82,7 +96,67 @@ pub(crate) fn deck_frame_cost(frames: usize) -> Vec<StageCost> {
                 let card = card_of(raster(&prims), fp);
                 std::hint::black_box(fold_cards(&[&card], fp));
             });
+            let mg = DeckGeom {
+                h: deck_px(
+                    StatsBars::Deck,
+                    DeckStyle::Merged,
+                    DeckForm::Full,
+                    s,
+                    (14.0 * s) as usize,
+                ) as f32,
+                ..g
+            };
+            let (merged, _) = merged_paint(&mg, &input);
+            let mraster = |prims: &[crate::widget::DrawPrim]| {
+                crate::tray_raster::rasterize_tray(prims, mg.w as u32, mg.h as u32, 1.0, [0; 4])
+            };
+            let mut stage = |name: &str, run: &mut dyn FnMut()| {
+                let (p50_us, p90_us, p99_us) = timed(frames, run);
+                out.push(StageCost {
+                    what: format!("{case} {name}"),
+                    prims: merged.len(),
+                    p50_us,
+                    p90_us,
+                    p99_us,
+                });
+            };
+            stage("merged_paint", &mut || {
+                std::hint::black_box(merged_paint(&mg, &input));
+            });
+            stage("merged frame", &mut || {
+                let (prims, _) = merged_paint(&mg, &input);
+                let fp = prims_fp(&prims);
+                let card = card_of(mraster(&prims), fp);
+                std::hint::black_box(fold_cards(&[&card], fp));
+            });
         }
+    }
+    let metrics = crate::deck_face::deck_metrics();
+    for s in [2.0_f32, 1.0] {
+        let paint = || {
+            let mut p = Painter::new(&inks, s, 13.0 * s, false);
+            let (w, h) = specimen(&mut p, 0.0, &metrics);
+            (p.prims, w as u32, h as u32)
+        };
+        let (prims, w, h) = paint();
+        let mut stage = |name: &str, run: &mut dyn FnMut()| {
+            let (p50_us, p90_us, p99_us) = timed(frames, run);
+            out.push(StageCost {
+                what: format!("marks specimen {w} px {s}× {name}"),
+                prims: prims.len(),
+                p50_us,
+                p90_us,
+                p99_us,
+            });
+        };
+        stage("paint", &mut || {
+            std::hint::black_box(paint());
+        });
+        stage("rasterize_tray", &mut || {
+            std::hint::black_box(crate::tray_raster::rasterize_tray(
+                &prims, w, h, 1.0, [0; 4],
+            ));
+        });
     }
     out
 }

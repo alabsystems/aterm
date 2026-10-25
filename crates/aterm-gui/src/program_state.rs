@@ -156,6 +156,20 @@ pub(crate) const fn row_word(state: ProgramState) -> &'static str {
     }
 }
 
+/// The survey's agent word for a shown report, when the screen's reader names no phase
+/// (`agent=unknown`): `working` is `busy`; `blocked` is `question` on a question, `wall:auth` on a
+/// login and `prompt` otherwise; `idle`, `done` and `error` (a turn that ended) are `idle`.
+pub(crate) const fn survey_word(state: ProgramState) -> &'static str {
+    use aterm_core::terminal::program_state::{ProgramBlockedKind as K, ProgramStateWord as W};
+    match (state.state, state.kind) {
+        (W::Working, _) => "busy",
+        (W::Blocked, Some(K::Question)) => "question",
+        (W::Blocked, Some(K::Auth)) => "wall:auth",
+        (W::Blocked, Some(K::Permission) | None) => "prompt",
+        (W::Idle | W::Done | W::Error, _) => "idle",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

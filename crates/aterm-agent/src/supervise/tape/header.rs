@@ -689,7 +689,7 @@ impl Reader {
     }
 }
 
-/// [module docs](self).
+/// A tape's header: what recorded it, where, and under which settings.
 #[derive(Debug, Clone)]
 pub struct Header {
     /// The tape's own id.

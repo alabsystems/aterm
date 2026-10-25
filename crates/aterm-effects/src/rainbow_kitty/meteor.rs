@@ -626,8 +626,9 @@ pub const BURST_QUAD_CAP: usize = 1_280;
 
 #[inline]
 #[must_use]
-fn burst_step(ch: f32, share: f32, floor: usize) -> usize {
-    ((ch * share).round() as usize).max(floor)
+const fn burst_step(ch: f32, share: f32, floor: usize) -> usize {
+    let s = (ch * share).round() as usize;
+    if s > floor { s } else { floor }
 }
 
 /// The largest spike count for a landing of `cells`.
@@ -975,7 +976,7 @@ pub struct Fan {
 }
 
 /// One spark's throw, hashed at the arrival edge.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Spark {
     /// Birth velocity along the row, px/ms.
     pub vx: f32,
@@ -987,20 +988,47 @@ pub struct Spark {
     pub arm: u8,
 }
 
+impl Spark {
+    /// An unthrown spark slot.
+    pub const EMPTY: Self = Self {
+        vx: 0.0,
+        vy: 0.0,
+        life: 0.0,
+        arm: 0,
+    };
+}
+
+impl Default for Spark {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// What the sky's probe said about the landing-row cells the flash and jets may light.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SkyMask {
     /// Blank cells of the landing row, `2·JET_PROBE_CELLS + 1` bits centred on the caret's column.
     pub row: u32,
 }
 
+impl Default for SkyMask {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl SkyMask {
+    /// An empty mask (no probed blank cells).
+    pub const EMPTY: Self = Self { row: 0 };
+
     #[inline]
     #[must_use]
     fn probe(x: f32, y: f32, probe: &GlyphProbe, geom: Geom) -> Self {
         let cw = (geom.cw as f32).max(1.0);
         let py = y.round() as i32;
-        let mut mask = Self::default();
+        let mut mask = Self::EMPTY;
         for k in -JET_PROBE_CELLS..=JET_PROBE_CELLS {
             let px = (x + k as f32 * cw).round() as i32;
             if probe.at_px(px, py, geom) == Some(false) {
@@ -1099,7 +1127,7 @@ impl Landing {
             x: at_px.0,
             y: at_px.1,
             sparks: 0,
-            spark: [Spark::default(); SPARK_N_MAX],
+            spark: [Spark::EMPTY; SPARK_N_MAX],
             sky: None,
         }
     }
@@ -1222,6 +1250,7 @@ pub struct Meteors {
 }
 
 impl Default for Meteors {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -1239,7 +1268,7 @@ impl Meteors {
             ord: 0,
             reduced: false,
             hand_floor: None,
-            keep_out: KeepOut::default(),
+            keep_out: KeepOut::EMPTY,
             #[cfg(test)]
             ends_square: false,
             #[cfg(test)]
@@ -1763,7 +1792,9 @@ const DARK_TRAIN_CLEAN_SHARE: f32 = 1.0;
 /// light and narrows by `k / clean` instead, and once narrower than
 /// [`DARK_TAPER_THREAD_PX`] it keeps that width and fades with its coverage
 /// (a thread any thinner lands between pixel rows and flickers).
-fn dark_clean_taper(k: f32, half: f32, clean: f32) -> (f32, f32) {
+#[inline]
+#[must_use]
+const fn dark_clean_taper(k: f32, half: f32, clean: f32) -> (f32, f32) {
     if k >= clean {
         return (k, half);
     }
@@ -1783,7 +1814,9 @@ fn dark_clean_taper(k: f32, half: f32, clean: f32) -> (f32, f32) {
 /// `room` px of its spine ([`Behind::room`]): narrowed to it at its level,
 /// and narrower than [`DARK_TAPER_THREAD_PX`] faded with its coverage, as
 /// [`dark_clean_taper`] lays a thread.
-fn fit_room(k: f32, half: f32, room: f32) -> (f32, f32) {
+#[inline]
+#[must_use]
+const fn fit_room(k: f32, half: f32, room: f32) -> (f32, f32) {
     if half <= room {
         return (k, half);
     }
@@ -1833,7 +1866,9 @@ const WHITE_PRINTED_SHARE: f32 = 0.25;
 const WHITE_PRINTED_NEAR: f32 = 0.25;
 const WHITE_PRINTED_FAR: f32 = 0.85;
 
-fn white_printed_share(dy: f32, rows_off: f32, ch: f32) -> f32 {
+#[inline]
+#[must_use]
+const fn white_printed_share(dy: f32, rows_off: f32, ch: f32) -> f32 {
     if rows_off < 0.5 * ch {
         return 1.0;
     }
@@ -1979,7 +2014,8 @@ impl<'a> Behind<'a> {
 
     /// How much of a light at `(x, y)` shows in front of the letters.
     #[inline]
-    fn at(self, x: f32, y: f32) -> f32 {
+    #[must_use]
+    const fn at(self, x: f32, y: f32) -> f32 {
         if self.on {
             self.keep
                 .behind_text((x, y), self.band, self.pad, TRAIN_TEXT_FEATHER_PX)
@@ -2001,7 +2037,8 @@ impl<'a> Behind<'a> {
         let (band0, band1) = self.band;
         let mut zone: Option<(i32, i32)> = None;
         for &(rx0, rx1, ry0, ry1) in self.keep.rows() {
-            if x1 <= rx0 - pad || x0 >= rx1 + pad {
+            if x1 <= rx0 - pad || x0 >= rx1 + pad || y1 <= ry0 - pad_reach || y0 >= ry1 + pad_reach
+            {
                 continue;
             }
             let ch = (ry1 - ry0) as f32;
@@ -2020,7 +2057,7 @@ impl<'a> Behind<'a> {
     /// rows in a band's reach are laid a pixel row at a time at the light
     /// [`Self::at`] leaves them (none inside, eased at the edges).
     fn cut_quads(self, quads: &mut Vec<GlowQuad>, from: usize) {
-        if !self.on || self.keep.rows().is_empty() {
+        if !self.on || self.keep.rows().is_empty() || from >= quads.len() {
             return;
         }
         let scale = |q: &mut GlowQuad, k: f32| {
@@ -2081,7 +2118,7 @@ impl<'a> Behind<'a> {
     /// [`Self::cut_quads`] for the head's lights: a halo's rect splits
     /// losslessly, its falloff held by its centre and radii.
     fn cut_halos(self, halos: &mut Vec<RainHalo>, from: usize) {
-        if !self.on || self.keep.rows().is_empty() {
+        if !self.on || self.keep.rows().is_empty() || from >= halos.len() {
             return;
         }
         let n0 = halos.len();
@@ -2178,11 +2215,15 @@ impl Flight {
             let a = REDUCED_MOTION_ALPHA * clamp01((life - age) / REDUCED_MOTION_FADE_MS.max(1.0));
             (1.0, a, a)
         } else {
-            (
-                clamp01(age / t_ms),
-                (-after / TRAIN_WHITE_TAU_MS).exp(),
-                (-after / TRAIN_COLOUR_TAU_MS).exp(),
-            )
+            let (alpha_w, alpha_c) = if after <= 0.0 {
+                (1.0, 1.0)
+            } else {
+                (
+                    (-after / TRAIN_WHITE_TAU_MS).exp(),
+                    (-after / TRAIN_COLOUR_TAU_MS).exp(),
+                )
+            };
+            (clamp01(age / t_ms), alpha_w, alpha_c)
         };
         let retire = m.retire_alpha(ctx.now);
         let (u, p, root) = if reduced {
@@ -2255,7 +2296,11 @@ impl Flight {
             white_shoulder,
             white_fall,
             white_closed: close >= 1.0,
-            stretch: 1.0 + NUCLEUS_STRETCH_GAIN * (1.0 - u).powf(FLIGHT_ENTER_EXP - 1.0),
+            stretch: if u >= 1.0 {
+                1.0
+            } else {
+                1.0 + NUCLEUS_STRETCH_GAIN * (1.0 - u).powf(FLIGHT_ENTER_EXP - 1.0)
+            },
             flash: if reduced { 1.0 } else { flash_scale(after) },
             stride: (l / STATIONS_MAX as f32).max(STATION_STRIDE_MIN_PX),
             axis: Axis::of(dx, dy),
@@ -2265,13 +2310,21 @@ impl Flight {
     }
 
     #[inline]
-    fn step(&self) -> usize {
-        (self.stride.round().max(1.0) as usize).max(1)
+    const fn step(&self) -> usize {
+        let s = self.stride.round().max(1.0) as usize;
+        if s > 1 { s } else { 1 }
     }
 
     #[inline]
-    fn stations(&self, span: f32) -> usize {
-        (((span / self.stride).ceil() as usize) + 1).clamp(2, STATIONS_MAX)
+    const fn stations(&self, span: f32) -> usize {
+        let s = ((span / self.stride).ceil() as usize) + 1;
+        if s < 2 {
+            2
+        } else if s > STATIONS_MAX {
+            STATIONS_MAX
+        } else {
+            s
+        }
     }
 
     #[inline]
@@ -2281,6 +2334,9 @@ impl Flight {
 
     #[inline]
     fn width_at(&self, s: f32) -> f32 {
+        if s <= 0.0 {
+            return self.w;
+        }
         self.w
             * (WIDTH_FLOOR_SHARE + WIDTH_SPAN_SHARE * (-s / (WIDTH_FALLOFF_SHARE * self.l)).exp())
     }
@@ -2464,7 +2520,12 @@ fn build_stations(
                     // The dark train's fades along it and in time narrow it
                     // at a clean level rather than dimming its hue toward
                     // brown (looks6 N6); its eased ends keep their ease.
-                    let k = (-s * inv_colour_fall).exp() * alpha * shows;
+                    let exp_fall = if s <= 0.0 {
+                        1.0
+                    } else {
+                        (-s * inv_colour_fall).exp()
+                    };
+                    let k = exp_fall * alpha * shows;
                     let half = f.width_at(s) * 0.5;
                     let (k, half) = if square || !clean {
                         (k, half)
@@ -2505,7 +2566,12 @@ fn build_stations(
                 // On a dark page dimmed white heat is a grey smudge (looks6
                 // N6): off the printed line, along its tail and in time it
                 // narrows at its own white to nothing instead.
-                let fade = (-tail * inv_white_fall).exp() * alpha * shows;
+                let exp_tail = if tail <= 0.0 {
+                    1.0
+                } else {
+                    (-tail * inv_white_fall).exp()
+                };
+                let fade = exp_tail * alpha * shows;
                 let (k, half) = if light || square || !clean {
                     (fade * printed, half)
                 } else {
@@ -2683,13 +2749,22 @@ fn flash_scale(after_ms: f32) -> f32 {
 }
 
 fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
-    if ctx.cfg.reduced_motion {
+    // On paper the pin would land on the caret's block itself, its arms
+    // reading as a strike-through and a tick; the landing's flash marks it.
+    if ctx.cfg.reduced_motion || !ctx.cfg.dark_theme {
         return;
     }
     let u = clamp01(ms_since(l.pin.at, ctx.now) / PIN_MS);
     let ch = ctx.geom.ch as f32;
     let close = smoothstep01((u - PIN_ARM_HOLD_U) / (1.0 - PIN_ARM_HOLD_U));
-    let arm = PIN_ARM_CH * ch * (1.0 - close).powf(PIN_ARM_EXP);
+    let arm_scale = if close <= 0.0 {
+        1.0
+    } else if close >= 1.0 {
+        0.0
+    } else {
+        (1.0 - close).powf(PIN_ARM_EXP)
+    };
+    let arm = PIN_ARM_CH * ch * arm_scale;
     let alpha = if u <= PIN_ALPHA_HOLD_U {
         1.0
     } else {
@@ -2697,11 +2772,6 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     };
     let cov = TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
     if cov < 1.0 {
-        return;
-    }
-    // On paper the pin would land on the caret's block itself, its arms
-    // reading as a strike-through and a tick; the landing's flash marks it.
-    if !ctx.cfg.dark_theme {
         return;
     }
     let arms_rgb = spectrum_snap(l.pin.t);
@@ -2967,11 +3037,18 @@ fn burst_jet(
             let d = s0 + seg * share;
             let dx = dir.0 * d;
             let cell = (dx / cw).round() as i32;
+            if !sky.row_blank(cell) {
+                if !light && !frame.beams.is_empty() {
+                    comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+                    frame.beams.clear();
+                }
+                continue;
+            }
             let t_all = ((d - root) / span).clamp(0.0, 1.0);
             let fade = 1.0 - smoothstep01((t_all - JET_FEATHER_SHARE) / (1.0 - JET_FEATHER_SHARE));
             let c = (cov * fade * ink_gain).min(alpha_cap);
-            if !sky.row_blank(cell) || c < 1.0 {
-                if !light {
+            if c < 1.0 {
+                if !light && !frame.beams.is_empty() {
                     comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
                     frame.beams.clear();
                 }
@@ -3288,7 +3365,7 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> La
         ((SPARK_N_BASE + m.cells / SPARK_CELLS_PER).round() as usize).min(SPARK_N_MAX)
     };
     let seed = mix32(m.seed ^ 0xFA5E);
-    let mut spark = [Spark::default(); SPARK_N_MAX];
+    let mut spark = [Spark::EMPTY; SPARK_N_MAX];
     for (k, sp) in spark.iter_mut().enumerate().take(sparks) {
         *sp = mint_spark(seed, k, ch);
     }
@@ -3376,18 +3453,19 @@ fn point_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 }
 
 #[inline]
-fn segments_cross(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> bool {
-    let cross = |o: (f32, f32), p: (f32, f32), q: (f32, f32)| {
+const fn segments_cross(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> bool {
+    #[inline]
+    const fn cross(o: (f32, f32), p: (f32, f32), q: (f32, f32)) -> f32 {
         (p.0 - o.0) * (q.1 - o.1) - (p.1 - o.1) * (q.0 - o.0)
-    };
+    }
     let (d1, d2) = (cross(b0, b1, a0), cross(b0, b1, a1));
     let (d3, d4) = (cross(a0, a1, b0), cross(a0, a1, b1));
     (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
 }
 
 #[inline]
-fn seed_of(row: u16, col: u16, ord: u32) -> u32 {
-    mix32(u32::from(row) << 20 ^ u32::from(col) << 8 ^ ord.wrapping_mul(0x9E37_79B9))
+const fn seed_of(row: u16, col: u16, ord: u32) -> u32 {
+    mix32((row as u32) << 20 ^ (col as u32) << 8 ^ ord.wrapping_mul(0x9E37_79B9))
 }
 
 #[inline]

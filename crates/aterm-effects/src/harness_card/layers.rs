@@ -217,7 +217,7 @@ impl KeptFrame {
 }
 
 /// One card's frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CardFrames {
     kept: Option<KeptFrame>,
     ring: [Option<(Arc<FxContent>, Arc<FxContent>)>; RING],
@@ -225,7 +225,25 @@ pub struct CardFrames {
     arts: Option<Arc<CardArts>>,
 }
 
+impl Default for CardFrames {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CardFrames {
+    /// Construct an empty card frame cache.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            kept: None,
+            ring: [const { None }; RING],
+            next: 0,
+            arts: None,
+        }
+    }
     /// The frame kept, if any: the settled frame or a flow step.
     #[inline]
     #[must_use]

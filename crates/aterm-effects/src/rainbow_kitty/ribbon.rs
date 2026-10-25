@@ -168,7 +168,7 @@ pub const RAIL_GAP_CH: f32 = 0.06;
 /// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, at least one.
 #[inline]
 #[must_use]
-pub fn rail_gap_px(ch: f32) -> f32 {
+pub const fn rail_gap_px(ch: f32) -> f32 {
     (RAIL_GAP_CH * ch).round().max(1.0)
 }
 
@@ -717,6 +717,13 @@ struct WalkPos {
     d: f32,
 }
 
+impl Default for WalkPos {
+    #[inline]
+    fn default() -> Self {
+        Self::COLD
+    }
+}
+
 impl WalkPos {
     const COLD: Self = Self { t: 0.0, d: 0.0 };
 
@@ -750,7 +757,7 @@ impl Phase {
         let reach_end = retract_start_s(grace);
         let retract_end = reach_end + RETRACT_DUR_S;
         if idle_s.is_nan() || idle_s <= 0.0 {
-            // NaN-refusing spelling: a non-finite idle takes the laying arm, which draws the mark rather than dropping it.
+            // NaN-refusing spelling: a NaN idle takes the laying arm too, which draws the mark rather than dropping it.
             return Some(Self::Laying);
         }
         if idle_s < grace {
@@ -811,14 +818,27 @@ pub struct BodyProfile {
     pub shoulder: f32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct FieldLane {
     row: u16,
     t: Vec<f32>,
     touched: Vec<u16>,
 }
 
+impl Default for FieldLane {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl FieldLane {
+    const EMPTY: Self = Self {
+        row: 0,
+        t: Vec::new(),
+        touched: Vec::new(),
+    };
+
     #[inline]
     fn clear(&mut self) {
         for &col in &self.touched {
@@ -838,20 +858,51 @@ impl FieldLane {
 }
 
 /// The field index.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FieldIndex {
     lanes: Vec<FieldLane>,
     spare: Vec<FieldLane>,
     cols: u16,
 }
 
+impl Default for FieldIndex {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl FieldIndex {
+    /// Empty field index.
+    pub const EMPTY: Self = Self {
+        lanes: Vec::new(),
+        spare: Vec::new(),
+        cols: 0,
+    };
+
     /// The field at a cell, or `None` where no ribbon light is laid.
     #[inline]
     #[must_use]
-    pub fn at(&self, row: u16, col: u16) -> Option<f32> {
-        let lane = self.lanes.iter().rfind(|l| l.row == row)?;
-        let t = *lane.t.get(usize::from(col))?;
+    pub const fn at(&self, row: u16, col: u16) -> Option<f32> {
+        let lanes = self.lanes.as_slice();
+        let mut i = lanes.len();
+        let mut found = None;
+        while i > 0 {
+            i -= 1;
+            if lanes[i].row == row {
+                found = Some(&lanes[i]);
+                break;
+            }
+        }
+        let Some(lane) = found else {
+            return None;
+        };
+        let ts = lane.t.as_slice();
+        let idx = col as usize;
+        if idx >= ts.len() {
+            return None;
+        }
+        let t = ts[idx];
         if t.is_nan() { None } else { Some(t) }
     }
 
@@ -894,7 +945,7 @@ impl FieldIndex {
             self.lanes.swap(i, last);
             return &mut self.lanes[last];
         }
-        let mut lane = self.spare.pop().unwrap_or_default();
+        let mut lane = self.spare.pop().unwrap_or(FieldLane::EMPTY);
         lane.row = row;
         if lane.t.len() != usize::from(self.cols) {
             lane.resize(self.cols);
@@ -963,18 +1014,22 @@ pub fn bed_luma_budget(theme_fg: u32) -> f32 {
 }
 
 #[inline]
-fn scale_rgb(rgb: u32, k: f32) -> u32 {
-    let ch = |sh: u32| ((((rgb >> sh) & 0xff) as f32 * k) + 0.5).clamp(0.0, 255.0) as u32;
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+const fn scale_rgb(rgb: u32, k: f32) -> u32 {
+    let r = ((((rgb >> 16) & 0xff) as f32 * k) + 0.5).clamp(0.0, 255.0) as u32;
+    let g = ((((rgb >> 8) & 0xff) as f32 * k) + 0.5).clamp(0.0, 255.0) as u32;
+    let b = (((rgb & 0xff) as f32 * k) + 0.5).clamp(0.0, 255.0) as u32;
+    (r << 16) | (g << 8) | b
 }
 
 #[inline]
-fn toward_white(rgb: u32, w: f32) -> u32 {
-    let ch = |sh: u32| {
-        let c = ((rgb >> sh) & 0xff) as f32;
-        ((c + w * (255.0 - c)) + 0.5).clamp(0.0, 255.0) as u32
-    };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+const fn toward_white(rgb: u32, w: f32) -> u32 {
+    let r0 = ((rgb >> 16) & 0xff) as f32;
+    let g0 = ((rgb >> 8) & 0xff) as f32;
+    let b0 = (rgb & 0xff) as f32;
+    let r = ((r0 + w * (255.0 - r0)) + 0.5).clamp(0.0, 255.0) as u32;
+    let g = ((g0 + w * (255.0 - g0)) + 0.5).clamp(0.0, 255.0) as u32;
+    let b = ((b0 + w * (255.0 - b0)) + 0.5).clamp(0.0, 255.0) as u32;
+    (r << 16) | (g << 8) | b
 }
 
 #[inline]
@@ -1098,12 +1153,17 @@ fn dark_hue_bent(rgb: u32) -> u32 {
     if v <= 0.0 || s <= 0.0 || !(0.0..90.0).contains(&h) {
         return rgb;
     }
-    let bent = DARK_HUE_BEND
-        .windows(2)
-        .find(|k| (k[0].0..k[1].0).contains(&h))
-        .map_or(h, |k| {
-            k[0].1 + (k[1].1 - k[0].1) * (h - k[0].0) / (k[1].0 - k[0].0)
-        });
+    let mut bent = h;
+    let mut i = 0;
+    while i + 1 < DARK_HUE_BEND.len() {
+        let (x0, y0) = DARK_HUE_BEND[i];
+        let (x1, y1) = DARK_HUE_BEND[i + 1];
+        if h >= x0 && h < x1 {
+            bent = y0 + (y1 - y0) * (h - x0) / (x1 - x0);
+            break;
+        }
+        i += 1;
+    }
     if bent == h { rgb } else { hsv2rgb(bent, s, v) }
 }
 
@@ -1238,8 +1298,8 @@ fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
 }
 
 #[inline]
-fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
-    let (a, b) = (linear[usize::from(a)], linear[usize::from(b)]);
+const fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
+    let (a, b) = (linear[a as usize], linear[b as usize]);
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
     (hi + 0.05) / (lo + 0.05)
 }
@@ -1258,16 +1318,23 @@ pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
 
 #[inline]
 #[must_use]
-pub(crate) fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
-    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as u8;
-    let (r, g, b) = (ch(rgb, 16), ch(rgb, 8), ch(rgb, 0));
-    let spread = f32::from(r.max(g).max(b) - r.min(g).min(b));
+pub(crate) const fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
+    let (r, g, b) = (
+        ((rgb >> 16) & 0xff) as u8,
+        ((rgb >> 8) & 0xff) as u8,
+        (rgb & 0xff) as u8,
+    );
+    let mx = if r > g { r } else { g };
+    let mx = if mx > b { mx } else { b };
+    let mn = if r < g { r } else { g };
+    let mn = if mn < b { mn } else { b };
+    let spread = (mx - mn) as f32;
     if spread < SEEN_SPREAD {
         return false;
     }
-    let stand = channel_contrast(linear, r, ch(bg, 16))
-        .max(channel_contrast(linear, g, ch(bg, 8)))
-        .max(channel_contrast(linear, b, ch(bg, 0)));
+    let stand = channel_contrast(linear, r, ((bg >> 16) & 0xff) as u8)
+        .max(channel_contrast(linear, g, ((bg >> 8) & 0xff) as u8))
+        .max(channel_contrast(linear, b, (bg & 0xff) as u8));
     stand >= SEEN_CONTRAST
 }
 
@@ -1285,7 +1352,7 @@ fn seen_floor(ink: u32, bg: u32) -> f32 {
 /// The crisp edge's reach, priced at birth.
 #[inline]
 #[must_use]
-pub fn edge_cells(surge: f32, heat: f32) -> f32 {
+pub const fn edge_cells(surge: f32, heat: f32) -> f32 {
     let stretch = clamp01(surge).max(clamp01(heat));
     HOT_EDGE_CELLS + (HOT_EDGE_CELLS_MAX - HOT_EDGE_CELLS) * stretch
 }
@@ -1344,7 +1411,7 @@ const fn cov_cap(cfg: &Config) -> f32 {
 }
 
 #[inline]
-fn walk_arc_at(i: usize) -> u32 {
+const fn walk_arc_at(i: usize) -> u32 {
     spectrum(walk_pace(i as f32 / (BED_INK_LUT_LEN - 1) as f32))
 }
 
@@ -1406,15 +1473,18 @@ pub struct BedInkLut {
 impl Default for BedInkLut {
     #[inline]
     fn default() -> Self {
-        Self {
-            key: None,
-            lut: [0; BED_INK_LUT_LEN],
-            seen: [0.0; BED_INK_LUT_LEN],
-        }
+        Self::EMPTY
     }
 }
 
 impl BedInkLut {
+    /// Unsynced bed ink lookup table.
+    pub const EMPTY: Self = Self {
+        key: None,
+        lut: [0; BED_INK_LUT_LEN],
+        seen: [0.0; BED_INK_LUT_LEN],
+    };
+
     fn sync(&mut self, cfg: &Config) {
         let key = (cfg.theme_fg, cfg.theme_bg, cfg.dark_theme, cfg.ribbon_tall);
         if self.key == Some(key) {
@@ -1581,7 +1651,9 @@ pub fn expiry_melt(u: f32) -> f32 {
         return 1.0;
     }
     let taper = smoothstep01(rem / EXPIRY_MELT_SHARE);
-    if taper >= 1.0 {
+    if taper <= 0.0 {
+        0.0
+    } else if taper >= 1.0 {
         1.0
     } else {
         taper.powf(EXPIRY_MELT_GAMMA)
@@ -1664,7 +1736,7 @@ struct HeadFeather {
 impl HeadFeather {
     /// The share of its light a boundary at window x `x` keeps: nothing at the head end, easing to all of it [`HEAD_FEATHER_CELLS`] back.
     #[inline]
-    fn at(self, x: f32) -> f32 {
+    const fn at(self, x: f32) -> f32 {
         if self.width <= 0.0 {
             return 1.0;
         }
@@ -1823,7 +1895,7 @@ struct RewrapStart {
 }
 
 /// The ribbon producer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Ribbon {
     /// Test-only: leave a run the hand has left square-cut at its head end (no [`Ribbon::head_feather`]), the negative control of the feather's test.
     #[cfg(test)]
@@ -2049,7 +2121,7 @@ enum RetractX {
 
 impl RetractX {
     #[inline]
-    fn at(self, x: f32) -> f32 {
+    const fn at(self, x: f32) -> f32 {
         match self {
             Self::Identity => x,
             Self::SuckIn { caret_x, keep } => caret_x + (x - caret_x) * keep,
@@ -2071,12 +2143,92 @@ impl RetractX {
     }
 }
 
+impl Default for Ribbon {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ribbon {
     /// A ribbon with nothing laid.
     #[inline]
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            head_square: false,
+            #[cfg(test)]
+            hot_edge_left_lit: false,
+            #[cfg(test)]
+            feather_coarse: false,
+            #[cfg(test)]
+            tail_stair: false,
+            #[cfg(test)]
+            hot_edge_on_bar: false,
+            #[cfg(test)]
+            hold_steps: false,
+            #[cfg(test)]
+            rail_flush: false,
+            #[cfg(test)]
+            paper_alike: false,
+            #[cfg(test)]
+            holds_left_behind: false,
+            holds: Vec::new(),
+            holds_next: Vec::new(),
+            carried_holds: Vec::new(),
+            cells: Vec::new(),
+            cohorts: Vec::new(),
+            plan: Vec::new(),
+            index: FieldIndex::EMPTY,
+            slabs: 0,
+            next_cohort: 0,
+            caret: None,
+            runs: Vec::new(),
+            sorted: Vec::new(),
+            verts: Vec::new(),
+            released_cohorts: Vec::new(),
+            ink: BedInkLut::EMPTY,
+            ground: 0,
+            ink_quads: 0,
+            ember_at: None,
+            rearm: None,
+            translated_at: None,
+            reduced: false,
+            pane: None,
+            pane_rows: None,
+            attach: None,
+            attach_floor: None,
+            cell_h: 0.0,
+            wedge_px: 0.0,
+            scroll_followed: false,
+            followed_now: Vec::new(),
+            short_reanchor: None,
+            shifted_now: Vec::new(),
+            pending_erase: 0,
+            pen: None,
+            last_space: None,
+            arrived: None,
+            prev_space: None,
+            relocate: None,
+            soft_wrap: None,
+            carry: None,
+            reflow: None,
+            lift: None,
+            rewrap_start: None,
+            revive: None,
+            split_off: None,
+            last_walk: None,
+            fresh_line: None,
+            seam: None,
+            ioi_ms: 0.0,
+            last_key_at: None,
+            phrase_open: None,
+            next_phrase: 0,
+            curtain: None,
+            hand_floor: None,
+            keep_out: KeepOut::EMPTY,
+        }
     }
 
     /// The host has queued the licensed move of the exact held park whose source row's content followed.
@@ -2510,7 +2662,7 @@ impl Ribbon {
     /// The phrase rest in force, seconds.
     #[inline]
     #[must_use]
-    pub fn rest_s(&self) -> f32 {
+    pub const fn rest_s(&self) -> f32 {
         let ioi = if self.ioi_ms > 0.0 {
             self.ioi_ms
         } else {
@@ -3070,7 +3222,7 @@ impl Ribbon {
 
     /// The content witness says the text this typed rewrap relays starts at `start` on its landing row.
     #[inline]
-    pub(super) fn note_rewrap_start(
+    pub(super) const fn note_rewrap_start(
         &mut self,
         from: (u16, u16),
         to: (u16, u16),
@@ -3079,10 +3231,7 @@ impl Ribbon {
         space: Option<u16>,
     ) {
         // The follow pass may also sample an earlier buffered move.
-        if width.is_none()
-            && self
-                .rewrap_start
-                .is_some_and(|rewrap| rewrap.width.is_some())
+        if width.is_none() && matches!(self.rewrap_start, Some(RewrapStart { width: Some(_), .. }))
         {
             return;
         }
@@ -3096,45 +3245,56 @@ impl Ribbon {
     }
 
     #[inline]
-    fn take_rewrap_start(&mut self, from: (u16, u16), to: (u16, u16)) -> Option<RewrapStart> {
-        let rewrap = self
-            .rewrap_start
-            .filter(|rewrap| rewrap.from == from && rewrap.to == to)?;
+    const fn take_rewrap_start(&mut self, from: (u16, u16), to: (u16, u16)) -> Option<RewrapStart> {
+        let Some(rewrap) = self.rewrap_start else {
+            return None;
+        };
+        if rewrap.from.0 != from.0
+            || rewrap.from.1 != from.1
+            || rewrap.to.0 != to.0
+            || rewrap.to.1 != to.1
+        {
+            return None;
+        }
         self.rewrap_start = None;
         Some(rewrap)
     }
 
     /// Correct a Space's cell from an exact ordered key batch and its licensed same-row sweep.
     #[inline]
-    pub(super) fn observe_space_cell(&mut self, row: u16, col: u16) {
+    pub(super) const fn observe_space_cell(&mut self, row: u16, col: u16) {
         self.note_space((row, col));
     }
 
     #[inline]
-    fn note_space(&mut self, cell: (u16, u16)) {
-        if self.last_space != Some(cell) {
-            self.prev_space = self.last_space;
+    const fn note_space(&mut self, cell: (u16, u16)) {
+        if let Some((r, c)) = self.last_space {
+            if r != cell.0 || c != cell.1 {
+                self.prev_space = self.last_space;
+            }
+        } else {
+            self.prev_space = None;
         }
         self.last_space = Some(cell);
     }
 
     #[inline]
-    fn word_space(&self, from: (u16, u16)) -> Option<(u16, u16)> {
+    const fn word_space(&self, from: (u16, u16)) -> Option<(u16, u16)> {
         match self.last_space {
-            Some(cell) if cell == from => self.prev_space,
+            Some(cell) if cell.0 == from.0 && cell.1 == from.1 => self.prev_space,
             other => other,
         }
     }
 
     #[inline]
-    fn space_held_after_the_wrap(&self, from: (u16, u16)) -> bool {
-        self.last_space == Some(from)
+    const fn space_held_after_the_wrap(&self, from: (u16, u16)) -> bool {
+        matches!(self.last_space, Some((r, c)) if r == from.0 && c == from.1)
     }
 
     #[inline]
-    fn reseat_spaces(&mut self, held_after: bool, to: (u16, u16)) {
+    const fn reseat_spaces(&mut self, held_after: bool, to: (u16, u16)) {
         self.prev_space = None;
-        self.last_space = held_after.then_some(to);
+        self.last_space = if held_after { Some(to) } else { None };
     }
 
     /// Replay the `Move` the seam judged a soft-wrapped caret ([`SoftWrap`]).
@@ -3960,13 +4120,21 @@ impl Ribbon {
     }
 
     #[inline]
-    fn stands(&self, coh: &Cohort) -> bool {
-        self.cells.iter().any(|c| {
-            c.cohort == coh.id
+    const fn stands(&self, coh: &Cohort) -> bool {
+        let cells = self.cells.as_slice();
+        let mut i = 0;
+        while i < cells.len() {
+            let c = &cells[i];
+            if c.cohort == coh.id
                 && c.row == coh.row
                 && c.retire_at.is_none()
                 && (c.retract_at.is_none() || !coh.line_killed)
-        })
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
@@ -4764,7 +4932,7 @@ impl Ribbon {
     }
 
     #[inline]
-    fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
+    const fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
         let prof = Self::body_profile(ctx.cfg);
         let ch = ctx.geom.ch as f32;
         let body = ((prof.up_ch + DN_TOP_CH) * ch).ceil().max(1.0) + 2.0;
@@ -4777,7 +4945,14 @@ impl Ribbon {
         let cells = cells + 1;
         let per_slab = (cells as f32 * rows).max(1.0);
         let fit = (RIBBON_QUAD_BUDGET as f32 / per_slab).floor();
-        (fit.max(1.0) as usize).clamp(1, SLABS_PER_CELL)
+        let n = fit.max(1.0) as usize;
+        if n < 1 {
+            1
+        } else if n > SLABS_PER_CELL {
+            SLABS_PER_CELL
+        } else {
+            n
+        }
     }
 
     fn build_runs(
@@ -4898,21 +5073,41 @@ impl Ribbon {
         strongest
     }
 
+    #[inline]
     fn strongest_hold(
         a: Option<(f32, Instant)>,
         b: Option<(f32, Instant)>,
     ) -> Option<(f32, Instant)> {
-        a.into_iter()
-            .chain(b)
-            .max_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).is_gt() {
+                a
+            } else {
+                b
+            }),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
     }
 
-    fn cohort_hold(&self, cohort: u32, row: u16) -> Option<(f32, Instant)> {
-        self.carried_holds
-            .iter()
-            .find(|h| h.0 == cohort)
-            .map(|h| h.1)
-            .unwrap_or_else(|| self.holds.iter().find(|h| h.0 == row).map(|h| (h.1, h.2)))
+    #[inline]
+    const fn cohort_hold(&self, cohort: u32, row: u16) -> Option<(f32, Instant)> {
+        let carried = self.carried_holds.as_slice();
+        let mut i = 0;
+        while i < carried.len() {
+            if carried[i].0 == cohort {
+                return carried[i].1;
+            }
+            i += 1;
+        }
+        let holds = self.holds.as_slice();
+        let mut j = 0;
+        while j < holds.len() {
+            if holds[j].0 == row {
+                return Some((holds[j].1, holds[j].2));
+            }
+            j += 1;
+        }
+        None
     }
 
     fn stage_hold(&mut self, cohort: u32, previous: Option<(f32, Instant)>) {
@@ -4981,45 +5176,111 @@ impl Ribbon {
     /// Does `probe` know ink on the row below `row`, under `col0..=col1` or a
     /// column either side? `Some(false)` when it knows every one of them
     /// blank, `None` when it knows no ink there and not all of them.
-    fn inked_below(
+    #[inline]
+    const fn inked_below(
         probe: &GlyphProbe,
         ctx: &Ctx<'_>,
         row: u16,
         col0: u16,
         col1: u16,
     ) -> Option<bool> {
-        let below = i32::from(row) + 1;
+        let below = row as i32 + 1;
         let mut known = true;
-        for col in col0.saturating_sub(1)..=col1.saturating_add(1) {
+        let mut col = col0.saturating_sub(1);
+        let end = col1.saturating_add(1);
+        loop {
             match probe.at(below, col, ctx.geom.rows) {
                 Some(true) => return Some(true),
                 Some(false) => {}
                 None => known = false,
             }
+            if col == end {
+                break;
+            }
+            col += 1;
         }
-        known.then_some(false)
+        if known { Some(false) } else { None }
     }
+}
 
-    fn sample(
+#[derive(Clone, Copy)]
+struct RunSample {
+    chf: f32,
+    prof: BodyProfile,
+    reduced: bool,
+    disp: f32,
+    room: f32,
+    span: f32,
+    row_bot: f32,
+    dn_floor: f32,
+    settle: f32,
+    settle_scale: f32,
+    breath_scale: f32,
+    comet: bool,
+    fx_top: f32,
+    pane_bot: f32,
+    hold: f32,
+}
+
+impl Ribbon {
+    #[inline]
+    fn run_sample(
         &self,
         ctx: &Ctx<'_>,
-        cell: &Cell,
+        row: u16,
         coh: Option<&Cohort>,
-        sp: f32,
         hold: f32,
         (settle, breath): (f32, f32),
-    ) -> (f32, f32, f32, f32) {
+    ) -> RunSample {
         let chf = ctx.geom.ch as f32;
         let prof = Self::body_profile(ctx.cfg);
         let reduced = ctx.cfg.reduced_motion;
         let disp = clamp01(ctx.disp);
         let room = (DN_TOP_CH - DN_FLOOR_CH) * chf;
-        let amp = if reduced {
+        let span = coh.map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0));
+        let row_bot = f32::from(ctx.geom.origin_y) + (f32::from(row) + 1.0) * chf;
+        let dn_floor = DN_FLOOR_CH * chf;
+        let settle_scale = 1.0 - FLOW_SETTLE_SHARE * settle;
+        let breath_scale = 1.0 - breath;
+        let comet = Self::comet(ctx.cfg);
+        let fx_top = ctx.geom.fx_top() as f32;
+        let pane_bot = self.pane_bot(ctx, chf);
+        RunSample {
+            chf,
+            prof,
+            reduced,
+            disp,
+            room,
+            span,
+            row_bot,
+            dn_floor,
+            settle,
+            settle_scale,
+            breath_scale,
+            comet,
+            fx_top,
+            pane_bot,
+            hold,
+        }
+    }
+
+    fn sample_with(
+        &self,
+        ctx: &Ctx<'_>,
+        cell: &Cell,
+        coh: Option<&Cohort>,
+        sp: f32,
+        rs: &RunSample,
+    ) -> (f32, f32, f32, f32) {
+        let chf = rs.chf;
+        let prof = rs.prof;
+        let disp = rs.disp;
+        let amp = if rs.reduced || disp <= 0.0 || rs.settle >= 1.0 || sp <= 0.0 {
             0.0
         } else {
-            (WAVE_AMP_CELLS * chf * disp).min(room)
+            (WAVE_AMP_CELLS * chf * disp).min(rs.room)
                 * smoothstep01(sp / WAVE_HEAD_PIN)
-                * (1.0 - settle)
+                * (1.0 - rs.settle)
         };
         let wave = if amp == 0.0 {
             0.0
@@ -5027,18 +5288,28 @@ impl Ribbon {
             ((sp * std::f32::consts::TAU * WAVE_CYCLES) - ctx.phase * std::f32::consts::TAU).sin()
                 * amp
         };
-        let span = coh.map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0));
-        let behind = sp * span;
-        let bloom = clamp01(disp * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS)));
-        let row_bot = f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf;
-        let dn_floor = DN_FLOOR_CH * chf;
-        let settle_scale = 1.0 - FLOW_SETTLE_SHARE * settle;
-        let breath_scale = 1.0 - breath;
-        let comet = Self::comet(ctx.cfg);
-        let fx_top = ctx.geom.fx_top() as f32;
+        let behind = sp * rs.span;
+        let bloom = if disp <= 0.0 || behind >= BLOOM_REACH_CELLS {
+            0.0
+        } else {
+            clamp01(disp * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS)))
+        };
+        let row_bot = rs.row_bot;
+        let dn_floor = rs.dn_floor;
+        let settle_scale = rs.settle_scale;
+        let breath_scale = rs.breath_scale;
+        let fx_top = rs.fx_top;
         let wave_pos = wave.max(0.0);
         let wave_neg = wave.min(0.0);
         let spine_raw = row_bot + wave;
+        let comet_up_ch = if rs.comet {
+            prof.up_ch
+                * (1.0
+                    - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
+                        * smoothstep01(behind / COMET_TAPER_CELLS))
+        } else {
+            prof.up_ch
+        };
         // The body over a floor at `pane_bot`: a held row's floor is its own
         // bottom, where it is laid as a last row is.
         let shape = |pane_bot: f32| -> (f32, f32, f32) {
@@ -5048,19 +5319,13 @@ impl Ribbon {
             let dn_open = chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * bloom);
             let dn = (dn_open - wave_pos).max(dn_floor);
             let dn = (dn_floor + (dn - dn_floor) * settle_scale) * breath_scale;
-            let up_ch = if comet && !last_row {
-                prof.up_ch
-                    * (1.0
-                        - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
-                            * smoothstep01(behind / COMET_TAPER_CELLS))
-            } else {
-                prof.up_ch
-            };
+            let up_ch = if last_row { prof.up_ch } else { comet_up_ch };
             let up = (up_ch * chf + wave_neg).max(0.0) * settle_scale * breath_scale;
             let spine = spine_raw.min(pane_bot - dn).max(fx_top);
             (spine, up, dn)
         };
-        let pane_bot = self.pane_bot(ctx, chf);
+        let pane_bot = rs.pane_bot;
+        let hold = rs.hold;
         let (spine, up, dn) = if hold <= 0.0 || pane_bot <= row_bot {
             shape(pane_bot)
         } else if hold >= 1.0 {
@@ -5400,6 +5665,7 @@ impl Ribbon {
                     )
                 })
         };
+        let rs = self.run_sample(ctx, row, coh, hold, flow_settle);
         for boundary in u32::from(col0)..=u32::from(col1) + 1 {
             let left = boundary
                 .checked_sub(1)
@@ -5417,12 +5683,11 @@ impl Ribbon {
             };
             let sp = |c: &Cell| f32::from(head_col.abs_diff(c.col)) / span;
             debug_assert_eq!(left_sample.is_some(), left.is_some());
-            let sa =
-                left_sample.unwrap_or_else(|| self.sample(ctx, a, coh, sp(a), hold, flow_settle));
+            let sa = left_sample.unwrap_or_else(|| self.sample_with(ctx, a, coh, sp(a), &rs));
             let sb = if a.col == b.col {
                 sa
             } else {
-                self.sample(ctx, b, coh, sp(b), hold, flow_settle)
+                self.sample_with(ctx, b, coh, sp(b), &rs)
             };
             left_sample = right.map(|_| sb);
             let mid = |u: f32, v: f32| (u + v) * 0.5;
@@ -5612,7 +5877,7 @@ impl Ribbon {
         let rail_gap = rail_gap_px(chf);
         let plan = &self.plan;
         let ink = &self.ink;
-        let kept_up = |x: f32, spine: f32, up: f32, row: u16| self.kept_up(ctx, x, spine, up, row);
+        let keep_out_ease = KEEP_OUT_EASE_CELLS * ctx.geom.cw as f32;
         let head_feather = |run: &Run| self.head_feather(ctx, run);
         // The flat ribbon on paper lies flatter than the pet's comet body:
         // lower, its plateau carried near its top.
@@ -5695,13 +5960,20 @@ impl Ribbon {
                         });
                     });
                 } else {
+                    let row_top = f32::from(ctx.geom.origin_y) + f32::from(run.row) * chf;
+                    let has_ceiling = self.keep_out.has_ceiling_at(row_top);
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
                         if i == head_rel {
                             head_rev = verts.len();
                         }
                         let cov = seg.cov * feather(seg.x);
                         let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
-                        let up = kept_up(seg.x, seg.spine, seg.up, run.row);
+                        let up = self.kept_up(
+                            (seg.x, seg.spine, seg.up),
+                            row_top,
+                            keep_out_ease,
+                            has_ceiling,
+                        );
                         let (up, core) = if flat_paper {
                             let up = up * FLAT_PAPER_UP_SHARE;
                             (up, up * FLAT_PAPER_CORE_SHARE)
@@ -5778,52 +6050,66 @@ impl Ribbon {
         self.verts = verts;
         self.emit_hot_edge(ctx, frame);
         let bg = ctx.cfg.theme_bg;
+        let mut last_ink: Option<(u32, u8, bool)> = None;
         self.ink_quads = frame.under[ink_from..]
             .iter()
-            .filter(|q| reads_as_ink(over_premul(bg, q.color, q.alpha)))
+            .filter(|q| {
+                if let Some((prev_c, prev_a, res)) = last_ink
+                    && prev_c == q.color
+                    && prev_a == q.alpha
+                {
+                    return res;
+                }
+                let res = reads_as_ink(over_premul(bg, q.color, q.alpha));
+                last_ink = Some((q.color, q.alpha, res));
+                res
+            })
             .count();
     }
 
     /// The reach `up` of a body boundary at window x `x` standing on
     /// `spine` in `row`, cut so its top (and the feather it wears there)
     /// stays in its own row under a [`KeepOut`] box standing on the row.
-    #[inline]
-    fn kept_up(&self, ctx: &Ctx<'_>, x: f32, spine: f32, up: f32, row: u16) -> f32 {
-        self.kept_up_inset(ctx, (x, spine, up, row), 0.0)
-    }
-
+    ///
     /// [`Self::kept_up`] with the top held `inset` px inside the row under
     /// a box: a line drawn centred on the top (the hot edge) keeps its
     /// whole thickness off the box.
     #[inline]
-    fn kept_up_inset(
+    const fn kept_up(
         &self,
-        ctx: &Ctx<'_>,
-        (x, spine, up, row): (f32, f32, f32, u16),
-        inset: f32,
+        (x, spine, up): (f32, f32, f32),
+        row_top: f32,
+        ease: f32,
+        has_ceiling: bool,
     ) -> f32 {
-        if self.keep_out.boxes().is_empty() {
+        if !has_ceiling {
             return up;
         }
-        let chf = ctx.geom.ch as f32;
-        let row_top = f32::from(ctx.geom.origin_y) + f32::from(row) * chf + inset;
         let top = spine - up;
         if top >= row_top {
             return up;
         }
-        let ease = KEEP_OUT_EASE_CELLS * ctx.geom.cw as f32;
         let ceiling = self.keep_out.ceiling(x, row_top, top, ease);
         (spine - ceiling.max(top)).max(0.0)
     }
 
-    fn head_feather(&self, ctx: &Ctx<'_>, run: &Run) -> HeadFeather {
-        let head_x = self.plan.get(run.head).map_or(0.0, |seg| seg.x);
+    #[inline]
+    const fn head_feather(&self, ctx: &Ctx<'_>, run: &Run) -> HeadFeather {
+        let plan = self.plan.as_slice();
+        let head_x = if run.head < plan.len() {
+            plan[run.head].x
+        } else {
+            0.0
+        };
         let past = if run.stream_dir < 0 {
             run.head_col.checked_add(1)
         } else {
             run.head_col.checked_sub(1)
         };
-        let meets = past.is_some_and(|col| self.index.at(run.row, col).is_some());
+        let meets = match past {
+            Some(col) => self.index.at(run.row, col).is_some(),
+            None => false,
+        };
         let at_end = (run.head == run.lo || run.head + 1 == run.hi) && !meets;
         let at_end = at_end && self.curtain.is_none();
         #[cfg(test)]
@@ -5956,6 +6242,10 @@ impl Ribbon {
         let inset = 0.5 * HOT_EDGE_THICKNESS;
         let inv_reach = 1.0 / reach;
         let neg_dir = -dir;
+        let row_top =
+            f32::from(ctx.geom.origin_y) + f32::from(run.row) * (ctx.geom.ch as f32) + inset;
+        let keep_out_ease = KEEP_OUT_EASE_CELLS * cw;
+        let has_ceiling = self.keep_out.has_ceiling_at(row_top);
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
@@ -5975,7 +6265,13 @@ impl Ribbon {
                 .clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
                 x: seg.x,
-                y: seg.spine - self.kept_up_inset(ctx, (seg.x, seg.spine, seg.up, run.row), inset),
+                y: seg.spine
+                    - self.kept_up(
+                        (seg.x, seg.spine, seg.up),
+                        row_top,
+                        keep_out_ease,
+                        has_ceiling,
+                    ),
                 color: self.ink.hot_at(seg.t),
                 cov: cov as u8,
             });
@@ -5998,21 +6294,38 @@ impl Ribbon {
     /// The field at a cell, or `None`.
     #[inline]
     #[must_use]
-    pub fn field_at(&self, row: u16, col: u16) -> Option<f32> {
+    pub const fn field_at(&self, row: u16, col: u16) -> Option<f32> {
         self.index.at(row, col)
     }
 
     /// The walk at a cell.
     #[inline]
     #[must_use]
-    pub fn walk_origin_at(&self, row: u16, col: u16) -> Option<(f32, f32)> {
-        let owner = self
-            .cells
-            .iter()
-            .rev()
-            .find(|c| c.row == row && c.col == col)?;
-        let cohort = self.cohorts.iter().find(|c| c.id == owner.cohort)?;
-        Some((cohort.walk_d(col), cohort.walk_zero()))
+    pub const fn walk_origin_at(&self, row: u16, col: u16) -> Option<(f32, f32)> {
+        let cells = self.cells.as_slice();
+        let mut i = cells.len();
+        let mut owner_cohort = None;
+        while i > 0 {
+            i -= 1;
+            let c = &cells[i];
+            if c.row == row && c.col == col {
+                owner_cohort = Some(c.cohort);
+                break;
+            }
+        }
+        let Some(cohort_id) = owner_cohort else {
+            return None;
+        };
+        let cohorts = self.cohorts.as_slice();
+        let mut j = 0;
+        while j < cohorts.len() {
+            let c = &cohorts[j];
+            if c.id == cohort_id {
+                return Some((c.walk_d(col), c.walk_zero()));
+            }
+            j += 1;
+        }
+        None
     }
 
     /// The caret's position in the field (seam point 4).
@@ -6053,14 +6366,30 @@ impl Ribbon {
     /// The body's vertical extent at a cell, or `None` where no cell is laid (§4.2, §5.4, D16).
     #[inline]
     #[must_use]
-    pub fn band(&self, row: u16, col: u16) -> Option<Band> {
-        let run = self
-            .runs
-            .iter()
-            .find(|r| r.row == row && (r.col0..=r.col1).contains(&col))?;
+    pub const fn band(&self, row: u16, col: u16) -> Option<Band> {
+        let runs = self.runs.as_slice();
+        let mut i = 0;
+        let mut found = None;
+        while i < runs.len() {
+            let r = &runs[i];
+            if r.row == row && r.col0 <= col && col <= r.col1 {
+                found = Some(r);
+                break;
+            }
+            i += 1;
+        }
+        let Some(run) = found else {
+            return None;
+        };
         let slabs = self.slabs_per_cell();
-        let idx = run.lo + usize::from(col - run.col0) * slabs + slabs / 2;
-        let seg = self.plan.get(idx.min(run.hi.saturating_sub(1)))?;
+        let idx = run.lo + (col - run.col0) as usize * slabs + slabs / 2;
+        let cap = run.hi.saturating_sub(1);
+        let target = if idx < cap { idx } else { cap };
+        let plan = self.plan.as_slice();
+        if target >= plan.len() {
+            return None;
+        }
+        let seg = &plan[target];
         Some(Band {
             top: seg.spine - seg.up,
             spine: seg.spine,
@@ -6079,6 +6408,22 @@ impl Ribbon {
     #[inline]
     pub fn lit_segments(&self) -> impl Iterator<Item = &Segment> {
         self.plan.iter().filter(|s| s.cov >= STATUS_LIT_COV)
+    }
+
+    /// Count of planned boundaries lit on the last frame, at or over [`STATUS_LIT_COV`].
+    #[inline]
+    #[must_use]
+    pub const fn lit_segment_count(&self) -> usize {
+        let plan = self.plan.as_slice();
+        let mut count = 0;
+        let mut i = 0;
+        while i < plan.len() {
+            if plan[i].cov >= STATUS_LIT_COV {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
     }
 
     /// What is on the glass, by plan.
@@ -6134,7 +6479,7 @@ impl Ribbon {
     /// Seconds until the mark's settle under a falling spine moves a pixel.
     #[inline]
     #[must_use]
-    pub fn settle_step_s(&self, disp: f32) -> Option<f32> {
+    pub const fn settle_step_s(&self, disp: f32) -> Option<f32> {
         if self.cells.is_empty() || !disp.is_finite() || disp <= 0.0 {
             return None;
         }

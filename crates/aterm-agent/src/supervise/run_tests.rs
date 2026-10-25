@@ -300,6 +300,9 @@ struct Mock {
     /// and `"gen"`, in place of `1.<seq>` at the mock's seq: a grid entered since (an
     /// alternate screen, a reset), whose own seq restarted.
     screen_gens: BTreeMap<usize, (u64, u64)>,
+    /// The Mac sleeps this many seconds as the script's screen `i` is first served (the clock
+    /// [`Self::run_on`] set: its wall clock jumps, its monotonic one stands).
+    sleeps_at: BTreeMap<usize, i64>,
     cursor_row: Option<usize>,
     tail_replies: VecDeque<String>,
     agent_zone: Option<usize>,
@@ -1038,6 +1041,7 @@ impl Mock {
             lease_times: Vec::new(),
             idle_latch_behind: false,
             screen_gens: BTreeMap::new(),
+            sleeps_at: BTreeMap::new(),
             cursor_row: None,
             tail_replies: VecDeque::new(),
             agent_zone: None,
@@ -1476,6 +1480,11 @@ impl Mock {
             self.seq += 1;
             i
         };
+        if let Some(secs) = self.sleeps_at.remove(&i)
+            && let Some(clock) = &self.waits
+        {
+            clock.slept(secs);
+        }
         if survey_open(&self.screens[i]) {
             let now = run_now(self.waits.as_deref());
             self.card_first_served.get_or_insert(now);
@@ -6581,6 +6590,209 @@ fn the_context_watch_is_inclusive_and_needs_the_frame() {
         .expect("said");
         assert_eq!(said, want, "read {seq}");
     }
+}
+
+/// The watch and `aterm drive phase` on recorded screens of Claude Code 2.1.310
+/// (`aterm_phase::phase::context_fixtures`), its indicator at the mode row's end: `EVENT context`
+/// once at the threshold, nothing while the `/` and `@` menus, the shortcuts, shell mode, a
+/// narrowed pane or the effort notice stand where the indicator was. An agent-menu description
+/// cannot warn or re-arm the watch; a real percentage rise or the empty slot after `/compact`
+/// can, and the watch warns and re-arms again at 44 columns.
+/// `aterm drive phase` on a session whose program is Claude Code reads `context <n>%` at any
+/// width and in shell mode.
+#[test]
+fn the_watch_reads_claude_codes_mode_row_and_its_compaction() {
+    use aterm_phase::phase::context_fixtures as f;
+    let screen = aterm_phase::prompt::fixtures::screen;
+    let low_menu = f::menu_description(7);
+    let high_menu = f::menu_description(50);
+    let high_context = f::MODE_ROW_7.replace(" 7% until auto-compact", "50% until auto-compact");
+    let reads: Vec<(&str, &[&str])> = vec![
+        (&low_menu, &[]),
+        (f::MODE_ROW_14, &[]),
+        (
+            f::MODE_ROW_7,
+            &["EVENT context seq=3 7% until auto-compact"],
+        ),
+        (&high_menu, &[]),
+        (&high_context, &["EVENT compacted seq=5"]),
+        (
+            f::MODE_ROW_7,
+            &["EVENT context seq=6 7% until auto-compact"],
+        ),
+        (f::SLASH_MENU, &[]),
+        (f::AT_MENU, &[]),
+        (f::SHORTCUTS, &[]),
+        (f::SHELL_MODE, &[]),
+        (f::MODE_ROW_60COL, &[]),
+        (f::MODE_ROW_44COL, &[]),
+        (f::COMPACTED_EFFORT, &[]),
+        (f::COMPACTED, &["EVENT compacted seq=14"]),
+        (f::MODE_ROW_14, &[]),
+        (
+            f::MODE_ROW_7,
+            &["EVENT context seq=16 7% until auto-compact"],
+        ),
+        (f::MODE_ROW_44COL, &[]),
+        (f::COMPACTED_44COL, &["EVENT compacted seq=18"]),
+    ];
+    let mut m = Mock::new(vec![]);
+    let mut s = session(&mut m, None);
+    s.context_warn = 10;
+    for (k, (text, want)) in reads.into_iter().enumerate() {
+        let seq = k as u64 + 1;
+        let screen = Screen {
+            rows: screen(text),
+            seq,
+            ..Screen::default()
+        };
+        let mut said: Vec<String> = Vec::new();
+        let reader = s.reader(&screen.rows);
+        s.watch_context(&screen, reader, &mut |line| {
+            said.push(line.to_string());
+            Ok(())
+        })
+        .expect("said");
+        assert_eq!(said, want, "read {seq}");
+    }
+    for (text, last) in [
+        (f::MODE_ROW_7, "context 7%"),
+        (f::MODE_ROW_44COL, "context 7%"),
+        (f::SHELL_MODE, "context 7%"),
+        (f::SLASH_MENU, "idle"),
+        (&low_menu, "idle"),
+        (&high_menu, "idle"),
+        (f::COMPACTED, "idle"),
+    ] {
+        let rows = screen(text);
+        let turn = Turn {
+            phase: worker_phase(&rows),
+            screen: Screen {
+                rows,
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        let claude = aterm_phase::Program::Claude.reader();
+        let phase = render_phase_and_survey(&turn, claude, &[]);
+        assert_eq!(phase.lines().last(), Some(last), "{phase}");
+    }
+}
+
+/// What the watch says, collected.
+#[derive(Default)]
+struct Said(Vec<String>);
+
+impl Review for Said {
+    fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
+        self.0.push(line.to_string());
+        Ok(())
+    }
+    fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
+    }
+    fn unattended(&self) -> bool {
+        false
+    }
+}
+
+/// The loop at rest reads the screen each time it moves (`moved_under_verdict`), and the watch
+/// reads those reads too: at rest is where the `/` and `@` menus and the shortcuts open (none is a
+/// compaction), and where a `/compact` whose turn ended under Claude Code's effort notice
+/// (2.1.310 at 120 columns) leaves the slot empty a few seconds later (`EVENT compacted`).
+#[test]
+fn the_watch_reads_the_screen_at_rest() {
+    use aterm_phase::phase::context_fixtures as f;
+    let screen = aterm_phase::prompt::fixtures::screen;
+    let high_menu = f::menu_description(50);
+    let at_rest = [
+        (f::SLASH_MENU, false),
+        (f::AT_MENU, false),
+        (high_menu.as_str(), false),
+        (f::SHORTCUTS, false),
+        (f::MODE_ROW_7, false),
+        (f::COMPACTED_EFFORT, false),
+        (f::COMPACTED, true),
+    ];
+    let mut screens = vec![screen(f::MODE_ROW_7)];
+    screens.extend(at_rest.iter().map(|(text, _)| screen(text)));
+    let mut m = Mock::new(screens);
+    let mut s = session(&mut m, None);
+    s.context_warn = 10;
+    let mut said = Said::default();
+    let first = s.screen().expect("the turn's end");
+    let reader = s.reader(&first.rows);
+    s.watch_context(&first, reader, &mut |line| said.say(line))
+        .expect("said");
+    assert_eq!(
+        said.0,
+        [format!(
+            "EVENT context seq={} 7% until auto-compact",
+            first.seq
+        )]
+    );
+    let seen = s.turn_of(first);
+    let mut seen_key = None;
+    let mut seq = seen.screen.seq;
+    for (k, (_, compacted)) in at_rest.into_iter().enumerate() {
+        said.0.clear();
+        s.ctl.seq += 1;
+        s.moved_under_verdict(&seen, &mut seen_key, &mut seq, &mut said)
+            .expect("the read at rest");
+        let read = s.last.as_ref().map(|l| l.seq);
+        assert_eq!(read, Some(seq), "read {k} at rest");
+        let want: &[String] = if compacted {
+            &[format!("EVENT compacted seq={seq}")]
+        } else {
+            &[]
+        };
+        assert_eq!(said.0, want, "read {k} at rest");
+    }
+}
+
+/// Another read of the loop's (a stall's, a file request's) can leave a newer screen in
+/// `self.last` than the read at rest last saw, and the screen then stop moving: the read at rest
+/// watches that screen before it waits, so a `/compact` whose empty slot only that read took is
+/// still `EVENT compacted`.
+#[test]
+fn the_watch_reads_the_screen_another_read_left_at_rest() {
+    use aterm_phase::phase::context_fixtures as f;
+    let screen = aterm_phase::prompt::fixtures::screen;
+    let mut m = Mock::new(vec![screen(f::MODE_ROW_7), screen(f::COMPACTED)]);
+    let mut s = session(&mut m, None);
+    s.context_warn = 10;
+    let mut said = Said::default();
+    let first = s.screen().expect("the turn's end");
+    let reader = s.reader(&first.rows);
+    s.watch_context(&first, reader, &mut |line| said.say(line))
+        .expect("said");
+    assert_eq!(
+        said.0,
+        [format!(
+            "EVENT context seq={} 7% until auto-compact",
+            first.seq
+        )]
+    );
+    said.0.clear();
+    let seen = s.turn_of(first);
+    let mut seq = seen.screen.seq;
+    let other = s
+        .screen()
+        .expect("another read, which the watch did not see")
+        .seq;
+    assert!(other > seq, "the other read is the newer screen");
+    let mut seen_key = None;
+    s.moved_under_verdict(&seen, &mut seen_key, &mut seq, &mut said)
+        .expect("the read at rest");
+    assert_eq!(seq, other, "the read at rest took the other read's screen");
+    assert_eq!(said.0, [format!("EVENT compacted seq={other}")]);
 }
 
 fn quick(m: &mut Mock, window: Duration) -> Session<'_, Mock> {

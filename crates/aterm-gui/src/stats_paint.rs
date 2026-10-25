@@ -526,10 +526,6 @@ impl<'a> Painter<'a> {
     /// no height: `width` px thick, dashes `on` px long and `off` px apart,
     /// one prim however long ([`DrawPrim::Dashed`]). Walls, hollow buckets,
     /// the free-space outline, projections and missing days.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the merged deck's marks are its first painters")
-    )]
     pub(crate) fn dashed(&mut self, r: Rect, width: f32, (on, off): (f32, f32), c: Rgba) {
         let (x, y, w, h) = r;
         self.prims.push(DrawPrim::Dashed {

@@ -6,6 +6,25 @@ use aterm_phase::prompt::fixtures as f;
 const TYPED_BEFORE_MS: u64 = 22_000;
 const GRACE_S: u32 = 120;
 
+/// A person's input inside a question dialog's bound (`QUESTION_PERSON_GRACE`): they are answering
+/// now, so the question is held through it as a box is through the person's whole grace. Input
+/// older than the bound holds no question
+/// (`a_question_waits_a_short_fixed_quiet_for_a_person_never_their_whole_grace`).
+const QUESTION_TYPED_BEFORE_MS: u64 = 5_000;
+const QUESTION_TYPED_BEFORE: &str = "5000";
+
+#[test]
+fn the_question_input_is_inside_the_questions_bound_and_the_box_input_past_it() {
+    use super::approval_loop::QUESTION_PERSON_GRACE;
+    assert_eq!(
+        QUESTION_TYPED_BEFORE.parse::<u64>().ok(),
+        Some(QUESTION_TYPED_BEFORE_MS)
+    );
+    assert!(Duration::from_millis(QUESTION_TYPED_BEFORE_MS) < QUESTION_PERSON_GRACE);
+    assert!(Duration::from_millis(TYPED_BEFORE_MS) > QUESTION_PERSON_GRACE);
+    assert!(Duration::from_millis(TYPED_BEFORE_MS) < Duration::from_secs(u64::from(GRACE_S)));
+}
+
 fn swapped(rows: &[String], edits: &[(&str, &[&str])]) -> Vec<String> {
     let mut out = rows.to_vec();
     for (from, to) in edits {
@@ -1326,8 +1345,8 @@ fn a_question_dialog_s_tabs_are_one_episode() {
         if lease {
             m.hand = "lease:operator";
         } else {
-            m.human = vec!["22000"];
-            m.human_ms = Some(TYPED_BEFORE_MS);
+            m.human = vec![QUESTION_TYPED_BEFORE];
+            m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
         }
         m.human_seq = Some(0);
         if counted {
@@ -1706,8 +1725,8 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(14)));
     let keys = |screens: Vec<Vec<String>>, build: Build, counted: bool| {
         let mut m = questioned(screens);
-        m.human = vec!["22000"];
-        m.human_ms = Some(TYPED_BEFORE_MS);
+        m.human = vec![QUESTION_TYPED_BEFORE];
+        m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
         m.human_seq = Some(0);
         m.vanish_after = Some(0);
         if counted {
@@ -1806,8 +1825,8 @@ fn a_gesture_counted_inside_the_answer_past_the_hold_stops_it() {
     ]);
     let (jdir, journal) = journal_file("box-hold-answer");
     let mut m = questioned(screens);
-    m.human = vec!["22000"];
-    m.human_ms = Some(TYPED_BEFORE_MS);
+    m.human = vec![QUESTION_TYPED_BEFORE];
+    m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
     m.human_seq = Some(0);
     m.human_seq_from.insert(4, 1);
     m.vanish_after = Some(0);
@@ -2154,8 +2173,8 @@ fn the_first_key_after_a_ticking_dialogs_wait_is_fenced_on_a_read_after_it() {
     let mut m = questioned(screens);
     m.tick_ms = Some(1000);
     m.redraws_move_gen = true;
-    m.human = vec!["22000"];
-    m.human_ms = Some(TYPED_BEFORE_MS);
+    m.human = vec![QUESTION_TYPED_BEFORE];
+    m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
     m.human_seq = Some(0);
     m.vanish_after = Some(0);
     let mut opts = answering(30);
@@ -2257,8 +2276,8 @@ fn a_lease_taken_during_the_first_key_wait_stops_the_answer() {
         let mut m = questioned(screens);
         m.tick_ms = Some(1000);
         m.redraws_move_gen = true;
-        m.human = vec!["22000"];
-        m.human_ms = Some(TYPED_BEFORE_MS);
+        m.human = vec![QUESTION_TYPED_BEFORE];
+        m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
         m.human_seq = Some(0);
         m.vanish_after = Some(0);
         if lease {

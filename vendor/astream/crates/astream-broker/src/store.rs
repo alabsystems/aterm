@@ -54,6 +54,33 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// A content-checked publish refused a conflicting idempotency key or failed I/O.
+#[derive(Debug)]
+pub enum CheckedPublishError {
+    /// The retained key already names different bytes. The original is preserved.
+    Conflict(Arc<BrokerRecord>),
+    /// A normal publish/storage refusal.
+    Io(io::Error),
+}
+impl fmt::Display for CheckedPublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict(record) => write!(
+                f,
+                "publish key conflicts with retained offset {}",
+                record.seq.0
+            ),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for CheckedPublishError {}
+impl From<io::Error> for CheckedPublishError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 #[cfg(clean_islands)]
 #[path = "store_island.rs"]
 mod store_island;
@@ -5004,6 +5031,43 @@ impl BrokerLog {
         Ok((seq, false))
     }
 
+    /// Publish while requiring a retained idempotency key to name identical bytes.
+    /// Unlike `publish`, a conflicting `(subject, body)` returns the original record
+    /// as evidence. No bytes are appended and no successful acknowledgement is given.
+    ///
+    /// This checks the RETAINED dedup window. Retention removes old keys; callers
+    /// needing lifetime deduplication must retain them in their own durable history.
+    /// Distributed writers must preserve BOTH signed forks under distinct local keys,
+    /// rather than use an actor sequence as this local ingestion key.
+    /// # Errors
+    /// A conflicting retained key, or any refusal/error from `publish`.
+    pub fn publish_checked(
+        &mut self,
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    ) -> Result<(Offset, bool), CheckedPublishError> {
+        self.check_poisoned()?;
+        if let Some(offset) = self.dedup.get(&(producer_id, producer_seq)).copied() {
+            let record = self
+                .read_range(offset, 1)
+                .into_iter()
+                .next()
+                .filter(|r| r.seq == offset)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "dedup key has no retained record",
+                    )
+                })?;
+            if record.subject != subject || record.body != body {
+                return Err(CheckedPublishError::Conflict(record));
+            }
+        }
+        Ok(self.publish(producer_id, producer_seq, subject, body)?)
+    }
+
     /// The offset a consumer group resumes from: `committed_upto + 1`, or
     /// `Offset::ZERO` if the group has never committed — counting no commit a held batch
     /// carries: one takes effect when the full flush that releases it succeeds (see
@@ -8494,6 +8558,46 @@ pub(crate) fn scan_from(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checked_ingest_refuses_different_bytes_at_a_retained_key_after_restart() {
+        let root = crate::test_scratch::Scratch::new("checked-publish");
+        let path = root.path().join("log");
+        let original = {
+            let mut log = super::BrokerLog::open_with(&path, super::Durability::Relaxed).unwrap();
+            log.publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
+                .unwrap()
+                .0
+        };
+        let mut log = super::BrokerLog::open_with(&path, super::Durability::Relaxed).unwrap();
+        assert_eq!(
+            log.publish_checked(9, 1, "db/tx".into(), b"original".to_vec())
+                .unwrap(),
+            (original, true)
+        );
+        let before = log.stats().head;
+        for (subject, body) in [
+            ("db/tx", b"fork".as_slice()),
+            ("db/other", b"original".as_slice()),
+        ] {
+            match log
+                .publish_checked(9, 1, subject.into(), body.to_vec())
+                .unwrap_err()
+            {
+                super::CheckedPublishError::Conflict(record) => {
+                    assert_eq!(record.seq, original);
+                    assert_eq!(record.body, b"original");
+                }
+                other => panic!("unexpected refusal: {other}"),
+            }
+        }
+        assert_eq!(log.stats().head, before);
+        assert!(
+            !log.publish_checked(9, 2, "db/tx".into(), b"fork".to_vec())
+                .unwrap()
+                .1,
+            "separate local keys retain both distributed branches"
+        );
+    }
     use super::*;
     use crate::brecord::BREC_VERSION;
     use std::io::{Read, Seek, SeekFrom};

@@ -951,6 +951,9 @@ pub enum Plan {
     /// THE OCCUPANCY DOOR at a workflow's break, under `occupancy = "prompt"`
     /// ([`crate::occupancy_break`]).
     OccupancyBreak,
+    /// Land or Cruise played to the act or hold the corpus keeps
+    /// ([`crate::autopilot_scenes`]).
+    Autopilot(crate::autopilot_scenes::Scene),
 }
 
 #[derive(Clone, Debug)]
@@ -1132,6 +1135,14 @@ pub fn scenarios() -> Vec<Scenario> {
     add("c2-question".into(), "", none, Plan::CorpusQuestion);
     add("c3-wall".into(), "", none, Plan::CorpusWall);
     add("c4-read".into(), "", none, Plan::CorpusRead);
+    for scene in crate::autopilot_scenes::Scene::ALL {
+        add(
+            scene.name().into(),
+            scene.harness_keys(),
+            scene.lab_kw(),
+            Plan::Autopilot(scene),
+        );
+    }
     add(
         crate::occupancy_break::NAME.into(),
         crate::occupancy_break::HARNESS_KEYS,
@@ -2303,6 +2314,7 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             60.0,
         )?,
         Plan::OccupancyBreak => crate::occupancy_break::play(ctx)?,
+        Plan::Autopilot(scene) => crate::autopilot_scenes::play(ctx, scene)?,
     }
     Ok(())
 }
@@ -2370,6 +2382,7 @@ pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
                 args: vec!["--permission-mode".into(), "manual".into()],
                 ..Launch::default()
             },
+            Plan::Autopilot(scene) => crate::autopilot_scenes::prepare(&ctx, scene)?,
             _ => Launch::default(),
         };
         ctx.launch(60.0, launch)?;

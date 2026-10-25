@@ -3522,12 +3522,10 @@ pub(super) fn cmd_meta_harness_act_with_clock(
                 if face == Some(aterm_agent::harness::acts::TaskFace::Landed) {
                     mark = crate::harness_task::landing_mark(mark, typed_at);
                     aterm_log::info!(
-                        "task: @{}: landing marked at program turns {}, busy entries {} (counted {}, {}; the typed turn's {typed_at:?}; at rest {})",
+                        "task: @{}: landing marked at program turns {} (counted {}; the typed turn's {typed_at:?}; at rest {})",
                         ctx.self_id.as_str(),
                         mark.program_turns,
-                        mark.busy_entries,
                         point.mark.program_turns,
-                        point.mark.busy_entries,
                         point.left_at_rest
                     );
                 }

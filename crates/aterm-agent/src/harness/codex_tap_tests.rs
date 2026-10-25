@@ -299,6 +299,50 @@ fn history_below_the_floor_or_the_watermark_is_never_queued() {
     );
 }
 
+/// A codex-alab package of its own version line (codex-alab Decision 8, 2026-10-24) runs a
+/// build whose manifest says `0.1.0-dev.<count>+g<sha9>` while its rollouts say the client
+/// version: the tap is armed with what the package's marker names as the build
+/// (`codex_alab::alab_build`, as `aterm-gui`'s `running_build` arms it) and binds.
+#[test]
+fn a_codex_alab_own_line_package_is_tapped_at_its_client_version() {
+    use crate::harness::codex_alab::{ALAB_BUILD_JSON, PACKAGE_JSON, alab_build};
+    let own = ALAB.replacen("0.164.0", "0.1.0", 1);
+    let pkg = scratch_home("own-line-package");
+    let root = pkg.path().join(&own);
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe is never run");
+    std::fs::write(
+        root.join(PACKAGE_JSON),
+        format!(r#"{{"layoutVersion":1,"version":"{own}","entrypoint":"bin/codex"}}"#),
+    )
+    .expect("manifest");
+    std::fs::write(
+        root.join(ALAB_BUILD_JSON),
+        format!(r#"{{"source":"3d3eb12d8","version":"{own}","client_version":"{ALAB}"}}"#),
+    )
+    .expect("marker");
+    let home = scratch_home("own-line");
+    let path = rollout_in(home.path(), DAY, THREAD);
+    append(
+        &path,
+        &[opening(THREAD, ALAB), ctx(T0 + 1000, "turn-1")].concat(),
+    );
+    let running = alab_build(&exe);
+    let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
+    tap.arm(0, None, running.as_deref());
+    assert!(
+        tap.read(FOLD_BUDGET).is_some_and(|r| r.complete),
+        "running {running:?}, refused {:?}",
+        tap.refused()
+    );
+    assert!(tap.is_bound() && tap.refused().is_none());
+    assert_eq!(
+        words(&said(&mut tap)),
+        ["bind 0", "prompt turn-1", "model gpt-5.5 0.164.0-dev.12521"]
+    );
+}
+
 #[test]
 fn a_claimant_running_an_unmeasured_build_binds_nothing() {
     let home = scratch_home("running");

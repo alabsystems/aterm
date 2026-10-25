@@ -349,7 +349,6 @@ fn bounded_harness_acts_prepare_and_publish_through_real_meta_dispatch() {
     assert!(h.ctx.timeline.lock().unwrap().last_act().is_none());
     let mark = crate::session_timeline::LandingMark {
         program_turns: crate::term_lock(&h.term).program_state().turns,
-        busy_entries: h.ctx.timeline.lock().unwrap().agent().busy_entries,
     };
     let (reply, wakes) = serve(
         &format!("set harness_act left-to-person@v1 until_us={deadline}"),
@@ -397,10 +396,7 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
     let clock = Cell::new(base);
     let now = || clock.get();
     let holder = format!("codex-alab@{}", std::process::id());
-    let mark = crate::session_timeline::LandingMark {
-        program_turns: 7,
-        busy_entries: 9,
-    };
+    let mark = crate::session_timeline::LandingMark { program_turns: 7 };
     let proof = |_: &str| Some(running());
     let no_proof = |_: &str| None;
     let serve = |rest: &str, conn, prove: &dyn Fn(&str) -> Option<Proven>| {
@@ -800,10 +796,7 @@ fn only_a_proven_claims_holder_records_an_act() {
             "{rest}"
         );
     }
-    let landing = |program_turns, busy_entries| crate::session_timeline::LandingMark {
-        program_turns,
-        busy_entries,
-    };
+    let landing = |program_turns| crate::session_timeline::LandingMark { program_turns };
     let snapshot = |mark| HarnessActSnapshot {
         mark,
         left_at_rest: true,
@@ -814,7 +807,7 @@ fn only_a_proven_claims_holder_records_an_act() {
             .unwrap_or_else(PoisonError::into_inner)
             .landing_mark()
     };
-    for (conn, next) in [(2, landing(3, 5)), (3, landing(4, 6))] {
+    for (conn, next) in [(2, landing(3)), (3, landing(4))] {
         assert_eq!(
             cmd_meta_harness_act(
                 ctx,
@@ -832,7 +825,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
-            Some(snapshot(landing(8, 9))),
+            Some(snapshot(landing(8))),
             Some(2),
             aterm_slog::Actor::Ctl,
             &proof,
@@ -840,16 +833,12 @@ fn only_a_proven_claims_holder_records_an_act() {
         ),
         ok
     );
-    assert_eq!(
-        mark(),
-        Some(landing(4, 6)),
-        "an ordinary act marks no landing"
-    );
+    assert_eq!(mark(), Some(landing(4)), "an ordinary act marks no landing");
     let before = acts(ctx);
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
-            Some(snapshot(landing(8, 9))),
+            Some(snapshot(landing(8))),
             Some(3),
             aterm_slog::Actor::Ctl,
             &no_proof,
@@ -858,11 +847,7 @@ fn only_a_proven_claims_holder_records_an_act() {
         denied
     );
     assert_eq!(acts(ctx), before, "a refused landing records nothing");
-    assert_eq!(
-        mark(),
-        Some(landing(4, 6)),
-        "nor replaces the admitted mark"
-    );
+    assert_eq!(mark(), Some(landing(4)), "nor replaces the admitted mark");
 
     let _ = ctx.timeline.lock().unwrap().take_self_tasks();
     let before = acts(ctx);
@@ -881,7 +866,7 @@ fn only_a_proven_claims_holder_records_an_act() {
         Some((format!("OK until_us={until} lease_ms=5000\n"), false))
     );
     assert_eq!(acts(ctx), before);
-    assert_eq!(mark(), Some(landing(4, 6)));
+    assert_eq!(mark(), Some(landing(4)));
     assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
 
     let request = format!("set harness_act left-to-person@v1 until_us={until}");
@@ -899,7 +884,7 @@ fn only_a_proven_claims_holder_records_an_act() {
         assert_eq!(
             cmd_meta_harness_act_with_clock(
                 ctx,
-                Some(snapshot(landing(7, 9))),
+                Some(snapshot(landing(7))),
                 Some(2),
                 aterm_slog::Actor::Ctl,
                 &no_proof,
@@ -909,7 +894,7 @@ fn only_a_proven_claims_holder_records_an_act() {
             ok
         );
         assert!(guarded_read.get(), "deadline read under both commit guards");
-        assert_eq!(mark(), Some(landing(7, 9)));
+        assert_eq!(mark(), Some(landing(7)));
         assert_eq!(
             ctx.timeline.lock().unwrap().take_self_tasks(),
             std::collections::VecDeque::from([aterm_agent::harness::acts::TaskFace::Theirs])
@@ -926,7 +911,7 @@ fn only_a_proven_claims_holder_records_an_act() {
         assert_eq!(
             cmd_meta_harness_act_with_clock(
                 ctx,
-                Some(snapshot(landing(20, 30))),
+                Some(snapshot(landing(20))),
                 Some(3),
                 aterm_slog::Actor::Ctl,
                 &delayed_proof,
@@ -940,11 +925,7 @@ fn only_a_proven_claims_holder_records_an_act() {
             "expiry checked under both commit guards"
         );
         assert_eq!(acts(ctx), before, "an expired act records no row");
-        assert_eq!(
-            mark(),
-            Some(landing(7, 9)),
-            "nor replaces the captured mark"
-        );
+        assert_eq!(mark(), Some(landing(7)), "nor replaces the captured mark");
         assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
     }
     assert_eq!(

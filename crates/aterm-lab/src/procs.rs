@@ -218,28 +218,52 @@ pub fn start_time(pid: i32) -> String {
         .unwrap_or_default()
 }
 
+/// A composite path read, retaining named paths even when another component was unreadable.
+#[derive(Debug)]
+pub struct OpenPaths {
+    /// The known working directory, executable, then descriptor paths in descriptor order.
+    pub paths: Vec<PathBuf>,
+    /// The descriptor table read and both the working directory and executable were named.
+    pub complete: bool,
+}
+
 /// The paths `pid` uses that `lsof -p <pid> -Fn` names, read in this process with no reference
 /// taken on any socket or kqueue of it: its working directory, its executable, then each file
 /// it holds open through a descriptor, in descriptor order ([`aterm_uds::holders::open_files`];
-/// a PTY master reads as `/dev/ptmx`). The rest lsof names (the libraries and other files it
-/// maps, its sockets' addresses) are not read.
+/// a PTY master reads as `/dev/ptmx`). An unnamed working directory or executable makes the
+/// read incomplete. The rest lsof names (the libraries and other files it maps, its sockets'
+/// addresses) are not read.
 ///
 /// # Errors
 /// [`aterm_uds::holders::open_files`]'s: `NotFound` once `pid` has exited, `PermissionDenied`
 /// for a table this user may not read.
-pub fn open_paths(pid: i32) -> std::io::Result<Vec<PathBuf>> {
+pub fn open_paths(pid: i32) -> std::io::Result<OpenPaths> {
     let pid = u32::try_from(pid).map_err(|_| std::io::ErrorKind::InvalidInput)?;
-    let files = aterm_uds::holders::open_files(pid)?;
-    let exe = match aterm_uds::holders::exe_of(pid) {
+    open_paths_with(
+        pid,
+        aterm_uds::holders::open_files,
+        aterm_sysprobe::process_cwd,
+        aterm_uds::holders::exe_of,
+    )
+}
+
+fn open_paths_with(
+    pid: u32,
+    files: impl FnOnce(u32) -> std::io::Result<Vec<PathBuf>>,
+    cwd: impl FnOnce(u32) -> Option<PathBuf>,
+    exe: impl FnOnce(u32) -> aterm_uds::holders::Exe,
+) -> std::io::Result<OpenPaths> {
+    let files = files(pid)?;
+    let exe = match exe(pid) {
         aterm_uds::holders::Exe::At(path) => Some(path),
         aterm_uds::holders::Exe::Unnamed => None,
         aterm_uds::holders::Exe::Exited => return Err(std::io::ErrorKind::NotFound.into()),
     };
-    Ok(aterm_sysprobe::process_cwd(pid)
-        .into_iter()
-        .chain(exe)
-        .chain(files)
-        .collect())
+    let cwd = cwd(pid);
+    Ok(OpenPaths {
+        complete: cwd.is_some() && exe.is_some(),
+        paths: cwd.into_iter().chain(exe).chain(files).collect(),
+    })
 }
 
 /// Returns the path to `<run_dir>/jailed.pids`.
@@ -480,7 +504,7 @@ mod tests {
 
     /// A child's paths ([`open_paths`]) are its working directory, its executable and each file
     /// it holds through a descriptor, in descriptor order, a PTY master as `/dev/ptmx`; its table
-    /// counts those descriptors ([`crate::sys::fd_count`]). Once it is reaped neither reads.
+    /// counts those descriptors ([`crate::sys::fd_count`]).
     #[test]
     fn a_childs_paths_and_descriptors_are_read_in_process() {
         let dir = std::env::temp_dir()
@@ -517,14 +541,103 @@ mod tests {
         ]
         .map(Path::to_path_buf)
         .into();
-        assert_eq!(paths.expect("its paths"), want);
-        assert_eq!(count, Some(3), "stdin, stdout and stderr");
-        assert_eq!(
-            open_paths(pid).map_err(|e| e.kind()).err(),
-            Some(std::io::ErrorKind::NotFound),
-            "reaped"
+        let paths = paths.expect("its paths");
+        assert!(paths.complete);
+        assert_eq!(paths.paths, want);
+        assert!(
+            count.is_some_and(|count| count >= 3),
+            "stdin, stdout and stderr are counted; the child can open more"
         );
-        assert_eq!(crate::sys::fd_count(pid), None, "reaped");
+    }
+
+    #[test]
+    fn only_complete_process_paths_can_report_an_absence() {
+        use crate::codex_proof::Verdict;
+        use aterm_uds::holders::Exe;
+        use std::io::ErrorKind;
+
+        let home = ["/Users//owner".to_owned()];
+        let report = |read| {
+            let seen = crate::selftest::open_files_report(7, read);
+            crate::selftest::strays_verdict(
+                &crate::selftest::owner_strays(&seen.text, &home, &[]),
+                &[7],
+                seen.complete,
+            )
+        };
+        let read = |file: &str, cwd: Option<&str>, exe| {
+            open_paths_with(
+                7,
+                |_| Ok(vec![PathBuf::from(file)]),
+                |_| cwd.map(PathBuf::from),
+                |_| exe,
+            )
+        };
+        let scratch = "/private/tmp/owned";
+        let executable = || Exe::At(PathBuf::from("/bin/sleep"));
+        let complete = read(scratch, Some(scratch), executable()).expect("all paths read");
+        assert!(complete.complete);
+        assert_eq!(
+            complete.paths,
+            [
+                PathBuf::from(scratch),
+                PathBuf::from("/bin/sleep"),
+                PathBuf::from(scratch)
+            ]
+        );
+        assert_eq!(report(Ok(complete)), Verdict::Ok);
+        for (file, cwd, exe) in [
+            ("/Users//owner/file", scratch, executable()),
+            (scratch, "/Users//owner", executable()),
+            (
+                scratch,
+                scratch,
+                Exe::At(PathBuf::from("/Users//owner/program")),
+            ),
+        ] {
+            assert_eq!(report(read(file, Some(cwd), exe)), Verdict::Fail);
+        }
+        for file in [scratch, "/Users//owner/file"] {
+            for (cwd, exe) in [(None, executable()), (Some(scratch), Exe::Unnamed)] {
+                let partial = read(file, cwd, exe).expect("the descriptors read");
+                assert!(!partial.complete);
+                assert!(partial.paths.contains(&PathBuf::from(file)));
+                assert_eq!(
+                    report(Ok(partial)),
+                    if file == scratch {
+                        Verdict::Unproven
+                    } else {
+                        Verdict::Fail
+                    }
+                );
+            }
+        }
+        let exited = read(scratch, Some(scratch), Exe::Exited)
+            .expect_err("the executable read found an exited process");
+        assert_eq!(exited.kind(), ErrorKind::NotFound);
+        assert_eq!(report(Err(exited)), Verdict::Unproven);
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let error = open_paths_with(
+                7,
+                |_| Err(std::io::Error::new(kind, "descriptor read failed")),
+                |_| panic!("no cwd read after the descriptor error"),
+                |_| panic!("no executable read after the descriptor error"),
+            )
+            .expect_err("the descriptor error is preserved");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "descriptor read failed");
+            assert_eq!(report(Err(error)), Verdict::Unproven);
+        }
+        assert_eq!(
+            open_paths(-1)
+                .expect_err("invalid pid before any read")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
     }
 
     #[test]

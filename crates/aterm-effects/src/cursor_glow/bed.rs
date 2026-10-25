@@ -274,7 +274,6 @@ pub(crate) fn dim_budget(budget: f32, page: u32, dim: f32) -> f32 {
 }
 
 /// The dark bed's reusable working buffers.
-#[derive(Default)]
 pub(crate) struct BedScratch {
     /// The bed's ink per sample ([`lay_dark_bed`]).
     pub(crate) inks: Vec<u32>,
@@ -288,6 +287,25 @@ pub(crate) struct BedScratch {
     pub(crate) wedges: Vec<f32>,
     /// Caret cell `(row, col)` when laying the bed around a live caret.
     pub(crate) caret: Option<(i32, i32)>,
+}
+
+impl BedScratch {
+    pub(crate) const EMPTY: Self = Self {
+        inks: Vec::new(),
+        rails: Vec::new(),
+        verts: Vec::new(),
+        tube: Vec::new(),
+        taper: Vec::new(),
+        wedges: Vec::new(),
+        caret: None,
+    };
+}
+
+impl Default for BedScratch {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 /// Lay the dark bed under `runs` into `under` in `scratch.inks` ([`dark_bed_ink`]).
@@ -562,12 +580,15 @@ pub(crate) fn lay_dark_bed(
                         color: if k < 0.5 { a.color } else { b.color },
                         cov,
                     };
-                    let layer_cov = |a: u8| {
-                        let a = f32::from(a) / 255.0;
-                        let layer = 1.0 - (1.0 - a).powf(1.0 / LEAP_LAYERS as f32);
-                        (layer * 255.0).round().clamp(0.0, 255.0) as u8
-                    };
-                    let (ca, cb) = (layer_cov(a.cov), layer_cov(b.cov));
+                    static LAYER_COV: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
+                    let lut = LAYER_COV.get_or_init(|| {
+                        std::array::from_fn(|a| {
+                            let a = a as f32 / 255.0;
+                            let layer = 1.0 - (1.0 - a).powf(1.0 / LEAP_LAYERS as f32);
+                            (layer * 255.0).round().clamp(0.0, 255.0) as u8
+                        })
+                    });
+                    let (ca, cb) = (lut[usize::from(a.cov)], lut[usize::from(b.cov)]);
                     tube.clear();
                     tube.extend([at(0.0, 0), at(f, ca), at(1.0 - f, cb), at(1.0, 0)]);
                     for k in 0..LEAP_LAYERS {
@@ -982,19 +1003,23 @@ impl CursorGlow {
     }
 
     /// The caret row's glyph column span `first..end`.
-    pub(crate) fn caret_row_glyphs(&self, (row, col): (u16, u16)) -> Option<(i32, i32)> {
-        let row = i32::from(row);
+    #[inline]
+    #[must_use]
+    pub(crate) const fn caret_row_glyphs(&self, (row, col): (u16, u16)) -> Option<(i32, i32)> {
+        let row = row as i32;
         let view = self.text_view();
         if view.spans.reads_row(row) {
-            return view
-                .spans
-                .lines()
-                .find(|line| line.0 == row)
-                .map(|(_, first, end)| (first, end));
+            return view.spans.line_at(row);
         }
         match view.frame_line(row) {
             Some(span) => span,
-            None => (col > 0).then_some((0, i32::from(col))),
+            None => {
+                if col > 0 {
+                    Some((0, col as i32))
+                } else {
+                    None
+                }
+            }
         }
     }
 }

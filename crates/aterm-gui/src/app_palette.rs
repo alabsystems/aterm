@@ -1832,6 +1832,46 @@ mod tests {
         assert_eq!(card.scrim, None, "Choose Theme… previews undimmed");
     }
 
+    /// A Retina window paints the palette as wide in points as a 1x window and hit-tests the card it
+    /// painted: both take the window's backing scale for the card's width cap.
+    #[test]
+    fn a_retina_window_paints_and_hit_tests_the_card_at_its_width_in_points() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cols = 400;
+            ws.input_scratch.cells = vec![Vec::new(); 50];
+        }
+        app.palette_enter();
+        let at = |app: &mut App, scale: f64| -> (f32, f32) {
+            app.windows.get_mut(&wid).unwrap().scale = scale;
+            app.splice_settings_panel(wid);
+            let painted = app.windows[&wid]
+                .settings_card
+                .as_ref()
+                .expect("an open palette rasterizes a card")
+                .pw as f32;
+            let hit = app
+                .overlay_coordinate_transform(wid)
+                .expect("the open palette's hit geometry");
+            let palette = app.windows[&wid].palette().expect("open palette");
+            let (_, _, row_w, _) =
+                crate::palette::palette_row_rect(palette, &hit.geom, 0).expect("a row");
+            (painted, row_w)
+        };
+        let (paint1, row1) = at(&mut app, 1.0);
+        let (paint2, row2) = at(&mut app, 2.0);
+        assert!(
+            paint2 > paint1 * 1.5,
+            "the cap is points: {paint1} px at 1x, {paint2} px at 2x with the same cells"
+        );
+        assert!(
+            ((paint2 - row2) - (paint1 - row1)).abs() <= 2.0,
+            "the hit rows span the painted card at both scales: paint {paint1}/{paint2}, rows {row1}/{row2}"
+        );
+    }
+
     #[test]
     fn open_palette_card_re_rasterizes_on_a_live_theme_swap() {
         let mut app = App::headless_for_test();

@@ -123,12 +123,12 @@ pub fn bash() -> PathBuf {
 }
 
 /// A shell command running `bash <args>` in a process group of its own, as a
-/// terminal runs a foreground job, SIGINT at its default; it prints how bash ended,
-/// `signal <n>` or `exit <n>`, which `$?` cannot tell apart. The group's leader,
-/// bash's `$PPID`, ignores the signals sent to the group.
+/// terminal runs a foreground job, SIGINT and SIGQUIT at their defaults; it prints
+/// how bash ended, `signal <n>` or `exit <n>`, which `$?` cannot tell apart. The
+/// group's leader, bash's `$PPID`, ignores the signals sent to the group.
 pub fn group_run(args: &str) -> String {
     format!(
-        "/usr/bin/perl -e 'setpgrp(0, 0); $SIG{{INT}} = \"IGNORE\"; my $p = fork // die; if (!$p) {{ $SIG{{INT}} = \"DEFAULT\"; exec @ARGV or die }} \
+        "/usr/bin/perl -e 'setpgrp(0, 0); $SIG{{INT}} = $SIG{{QUIT}} = \"IGNORE\"; my $p = fork // die; if (!$p) {{ $SIG{{INT}} = $SIG{{QUIT}} = \"DEFAULT\"; exec @ARGV or die }} \
          waitpid($p, 0); print $? & 127 ? \"signal \" . ($? & 127) : \"exit \" . ($? >> 8)' {} {args}",
         q(s(&bash()))
     )

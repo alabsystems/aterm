@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The `System` port: everything the agent asks of the guest's OS. The Linux arm
-//! ([`crate::linux::Guest`]) asks systemd and the kernel; tests answer with
+//! (`crate::linux::Guest`) asks systemd and the kernel; tests answer with
 //! [`crate::fake::Fake`]; the macOS seam bin with [`crate::seam::Seam`].
 
 use crate::wire::Share;

@@ -36,12 +36,17 @@ aterm-durable = { workspace = true }
 aterm-http = { workspace = true }
 # source.toml and state.toml, read as a value tree (no derive in this library).
 aterm-toml = { workspace = true }
+# Content-addressed causal control records and their strict local journal.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+aterm-db-core.workspace = true
+aterm-spec-anchor.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW / O_NONBLOCK for admitted reads.
 libc = { workspace = true }
 # Exclusive private edit directories; unfinished drafts are explicitly kept.
 aterm-tempfile = { workspace = true }
+astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 
 [dev-dependencies]
 # The differential oracle for x25519.rs: ring's own X25519 (ephemeral keys from its
@@ -49,6 +54,8 @@ aterm-tempfile = { workspace = true }
 ring = { workspace = true, features = ["default"] }
 # The C2SP CCTV vectors that ship zlib-compressed.
 aterm-codec = { workspace = true }
+aterm-models-db.workspace = true
+aterm-spec.workspace = true
 
 [lints]
 workspace = true

@@ -103,6 +103,19 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
         reply(Chain::CruiseO, &[owner.as_str(), DONE_CHECK]).as_deref(),
         Some(CLEAN)
     );
+    assert_eq!(reply(Chain::SameLand, &[]).as_deref(), Some(WORK));
+    assert_eq!(reply(Chain::SameCruise, &[]).as_deref(), Some(DONE_CLAIM));
+    for c in [Chain::SameLand, Chain::SameCruise] {
+        for acts in [
+            &[LAND][..],
+            &[LAND, LAND_NUDGE][..],
+            &[DONE_CHECK][..],
+            &[DONE_CHECK, DONE_CHECK][..],
+            &[DONE_CHECK, CONTINUE_TEXT][..],
+        ] {
+            assert_eq!(reply(c, acts).as_deref(), Some(CLEAN), "{c:?} {acts:?}");
+        }
+    }
     assert_eq!(scripted_reply(&spec(&Chain::ALL), &users(&["hi"])), None);
 }
 
@@ -681,7 +694,7 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 42);
+    assert_eq!(Chain::every().len(), 44);
     assert!(
         Chain::every()
             .iter()
@@ -824,12 +837,13 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             Off,
             InstantLand,
             LandJ,
-            LandK
+            LandK,
+            SameLand
         ]
     );
     assert_eq!(
         Chain::of_mode(Mode::Cruise),
-        [Cruise, Off, InstantCruise, CruiseN]
+        [Cruise, Off, InstantCruise, CruiseN, SameCruise]
     );
     let front = |cs: &[Chain]| surfaces::front_of(cs).map(|i| cs[i]);
     assert_eq!(front(&Chain::ALL), Some(CruiseN));
@@ -846,8 +860,21 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             .into_iter()
             .filter(|c| surfaces::holds_at_end(*c))
             .collect::<Vec<_>>(),
-        [LandB, LandC, LandD, LandF, LandG, LandH, LandI]
+        [LandB, LandC, LandD, LandF, LandG, LandH, LandI, SameLand]
     );
+    assert_eq!(
+        Chain::every()
+            .into_iter()
+            .filter(|c| c.same_reply())
+            .collect::<Vec<_>>(),
+        [
+            LandB, LandC, LandD, LandE, LandF, LandG, LandH, LandI, Cruise, SameLand, SameCruise,
+            WroteC
+        ]
+    );
+    assert!(SameLand.repo() == Repo::Untracked && SameCruise.repo() == Repo::Clean);
+    assert!(SameLand.autopilot() == "land" && SameCruise.autopilot() == "cruise");
+    assert!(!SameLand.lands() && !SameCruise.lands());
     assert_eq!(CruiseN.limit_ms(), CRUISE_N_LIMIT_MS);
     assert!(!LandJ.lands() && !LandK.lands() && !LandJ.tasked());
     assert_eq!(Chain::of_mode(Mode::Both), Chain::ALL);
@@ -1963,6 +1990,7 @@ fn instant_landed() -> Seen {
             read: 1,
             new_turns: 0,
         }),
+        lift_stub: None,
     }
 }
 
@@ -7317,4 +7345,346 @@ fn the_chains_whose_state_line_is_judged_open_on_the_pages_one_screen() {
     let both = Chain::of_mode(Mode::Both);
     assert_eq!(both[opening_order(&both, true)[0]], Chain::CruiseN);
     assert_eq!(opening_order(&both, false)[0], 0);
+}
+
+/// A tab of `chain` whose records are `seen`, its first prompt at [`T0`].
+fn tab_of(chain: Chain, seen: Seen) -> Tab {
+    Tab {
+        chain,
+        sid: "s-0da5bd87e9794fc8722d".into(),
+        dir: PathBuf::new(),
+        seen,
+        t0: T0,
+        ask_tried: false,
+        over: false,
+    }
+}
+
+/// The cruise chain's records as main's forever lab read them on `b42ae72fc3` (the strict lens's
+/// run, `s-0da5bd87e9794fc8722d`): the done claim, a done check at +124.5 s answered with the
+/// defense, the same check again at +368.7 s, where main's watch ended (+369.4 s).
+fn cruise_on_main() -> Seen {
+    Seen {
+        journal: vec![
+            j(
+                3_800,
+                "EVENT idle seq=899 ⏺ Merged the parser and pushed it to origin/main. All done.",
+            ),
+            j(
+                3_800,
+                "WAITING seq=899 until=x 1 short turn(s) in a row: 2 min back-off",
+            ),
+            j(
+                124_500,
+                "CONTINUED seq=901 rule=continue-done-check@v1 [aterm harness] Autopilot is Cruise: done is never the end.",
+            ),
+            j(
+                128_100,
+                "EVENT idle seq=1750 ⏺ Nothing left: the parser is committed and pushed to origin/main.",
+            ),
+            j(
+                128_100,
+                "WAITING seq=1750 until=x 2 short turn(s) in a row: 4 min back-off",
+            ),
+            j(
+                368_700,
+                "CONTINUED seq=1750 rule=continue-done-check@v1 [aterm harness] Autopilot is Cruise: done is never the end.",
+            ),
+        ],
+        ledger: vec![
+            point(3_800, 1),
+            typed(124_500, "continue-done-check@v1", DONE_CHECK),
+            point(128_100, 2),
+            typed(368_700, "continue-done-check@v1", DONE_CHECK),
+        ],
+        status: vec![status(4_000, "open", "cruise")],
+        meta: vec![no_meta(4_000)],
+        end_ms: T0 + 369_400,
+        ..Seen::default()
+    }
+}
+
+/// The same chain watched past its hold: the session's journal recorded it at +372.3 s
+/// (`s-0da5bd87e9794fc8722d.journal.jsonl`, 3 s after main's watch ended), brought in front at
+/// +382.4 s and +412.4 s, its chip reading `line`.
+fn cruise_held(line: &str) -> Seen {
+    let mut s = cruise_on_main();
+    s.journal.extend([
+        j(
+            372_300,
+            "EVENT idle seq=2616 ⏺ Nothing left: the parser is committed and pushed to origin/main.",
+        ),
+        j(
+            372_300,
+            "EXCEPTION seq=2616 kind=stalled when=later Its program answers aterm's acts with the same reply and no work, so aterm types nothing more. => Open the tab and do what its last reply asks.",
+        ),
+        j(372_300, "HOLD seq=2616 point nothing why=policy"),
+    ]);
+    s.window = surfaces::Window {
+        read: true,
+        label: "cruise".into(),
+        held: vec![j(382_400, line), j(412_400, line)],
+        ..surfaces::Window::default()
+    };
+    s.end_ms = T0 + 432_300;
+    s
+}
+
+/// Its chip in front on `b42ae72fc3` past a done check (the run's `cruise-n` chip at +368.9 s,
+/// title and all): the mode's own promise, no stop word.
+const CRUISE_ON_MAIN: &str = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=\"Last: kept going at 11:48.\" title=\"autopilot: cruise — keeps going for ever, finding more to do · last: ↻ kept going 11:48, ↻ kept going 11:44 · click: land · right-click: more\"";
+
+/// The same chip as §14.3 words it once 3a says the stop.
+const CRUISE_SAID: &str = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\" description=\"Stopped typing: the same reply twice, with no work. It types again at your turn, or once the agent works.\" title=\"autopilot: cruise — stopped typing: the same reply twice, no work; types again at your turn or once the agent works · click: land · right-click: more\"";
+
+/// 2a's negative control first (§14.2's Proof): main's watch ended the cruise chain at its second
+/// done check, before the hold, and C2 passed while aterm had stopped typing for good. Watched a
+/// minute past the hold, the chip that still says the mode's promise fails C2 as held, not said.
+#[test]
+fn the_cruise_chain_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
+    let main = cruise_on_main();
+    assert_eq!(
+        verdicts(Chain::Cruise, &main, "claude"),
+        [("C1", "PASS"), ("C2", "PASS")]
+    );
+    assert!(
+        !finished(&tab_of(Chain::Cruise, main), T0 + 369_400),
+        "the watch no longer ends at the act after the check"
+    );
+    let held = cruise_held(CRUISE_ON_MAIN);
+    assert!(!finished(
+        &tab_of(Chain::Cruise, held.clone()),
+        T0 + 432_299
+    ));
+    assert!(finished(&tab_of(Chain::Cruise, held.clone()), T0 + 432_300));
+    let (w, why) = one(Chain::Cruise, &held, "claude", Scenario::C2);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("HELD, NOT SAID") && why.contains("held at +372.3 s"),
+        "{why}"
+    );
+    assert!(
+        why.contains("the title \"autopilot: cruise — keeps going for ever"),
+        "{why}"
+    );
+    let (w, why) = one(
+        Chain::Cruise,
+        &cruise_held(CRUISE_SAID),
+        "claude",
+        Scenario::C2,
+    );
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(
+        !why.contains("HELD, NOT SAID") && why.contains("SKIPPED until 3a is on main"),
+        "{why}"
+    );
+}
+
+/// [`nudged`]'s records with the nudge's yield held (`b42ae72fc3`'s shape) in place of a
+/// `WAITING`.
+fn nudged_held(suffix: &str) -> Seen {
+    let mut s = nudged(suffix);
+    s.journal.pop();
+    s.journal.extend([
+        j(
+            373_600,
+            "EXCEPTION seq=3 kind=stalled when=later Its program answers aterm's acts with the same reply and no work, so aterm types nothing more. => Open the tab and do what its last reply asks.",
+        ),
+        j(373_600, "HOLD seq=3 point nothing why=policy"),
+    ]);
+    s.end_ms = T0 + 433_600;
+    s
+}
+
+/// A land chain's nudge whose yield was held passes its records' want (the nudge named what is
+/// left; the hold is the decision), and the hold's wants follow: under `--no-surfaces` a named
+/// skip, and 3a's fields UNOBSERVED. Its watch ends a minute past the hold, or past the `WAITING`
+/// where none came, where main's ended 3 s past that `WAITING` and never past a hold.
+#[test]
+fn a_held_nudge_is_its_points_decision_and_the_watch_runs_past_it() {
+    for (c, id) in REPO_CHAINS.into_iter().chain([(Chain::LandB, "L2")]) {
+        let suffix = if c == Chain::LandB {
+            open_suffix()
+        } else {
+            repo_suffix(c.repo())
+        };
+        let (w, why) = one(c, &nudged_held(&suffix), "claude", c.scenarios()[0]);
+        assert_eq!(w, "UNOBSERVED", "{id}: {why}");
+        assert!(
+            why.contains("+373.6 s HELD EXCEPTION seq=3 kind=stalled")
+                && why.contains("SKIPPED (--no-surfaces)")
+                && why.contains("SKIPPED until 3a is on main"),
+            "{id}: {why}"
+        );
+        assert!(!why.contains("no WAITING decided"), "{id}: {why}");
+        assert!(!finished(&tab_of(c, nudged_held(&suffix)), T0 + 433_599));
+        assert!(finished(&tab_of(c, nudged_held(&suffix)), T0 + 433_600));
+        assert!(!finished(&tab_of(c, nudged(&suffix)), T0 + 376_600));
+        assert!(finished(&tab_of(c, nudged(&suffix)), T0 + 433_600));
+    }
+    let mut undecided = nudged_held(&repo_suffix(Repo::Untracked));
+    undecided.journal.truncate(5);
+    let (w, why) = one(Chain::LandC, &undecided, "claude", Scenario::L4);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("no WAITING decided for that point"), "{why}");
+    assert!(!finished(&tab_of(Chain::LandC, undecided), T0 + 900_000));
+}
+
+/// A hold in a chain whose script makes none fails every scenario of it as the chain's records'
+/// fault, whatever its own judges say.
+#[test]
+fn a_hold_fails_every_scenario_of_a_chain_that_scripts_no_same_reply() {
+    let mut s = landed_a();
+    s.journal.insert(
+        6,
+        j(
+            131_000,
+            "EXCEPTION seq=2 kind=stalled when=later Its program answers aterm's acts with the same reply and no work, so aterm types nothing more. => x",
+        ),
+    );
+    assert_eq!(
+        verdicts(Chain::LandA, &s, "gemini"),
+        [("L1", "FAIL"), ("L3", "FAIL"), ("L5", "FAIL")]
+    );
+    let (_, why) = one(Chain::LandA, &s, "gemini", Scenario::L5);
+    assert!(
+        why.starts_with("THE CHAIN'S RECORDS: aterm stopped typing into it at +131.0 s"),
+        "{why}"
+    );
+    assert!(why.contains("(its own judge: PASS"), "{why}");
+}
+
+/// HL and HC run in the measured pass, each to a minute past its second act's point.
+#[test]
+fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
+    let mut s = nudged_held(&repo_suffix(Repo::Untracked));
+    assert!(!finished(&tab_of(Chain::SameLand, s.clone()), T0 + 433_599));
+    assert!(finished(&tab_of(Chain::SameLand, s.clone()), T0 + 433_600));
+    s.journal.truncate(2);
+    assert!(!finished(&tab_of(Chain::SameLand, s), T0 + 900_000));
+    let (w, why) = one(
+        Chain::SameLand,
+        &nudged_held(&repo_suffix(Repo::Untracked)),
+        "claude",
+        Scenario::HL,
+    );
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("held at +373.6 s") && why.contains("one `Stopped typing` row"));
+    let (w, why) = one(
+        Chain::SameCruise,
+        &cruise_held(CRUISE_ON_MAIN),
+        "muse",
+        Scenario::HC,
+    );
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("HELD, NOT SAID"), "{why}");
+    assert!(why.contains("no `Stopped typing` row"), "{why}");
+    assert!(Chain::of_mode(Mode::Both).contains(&Chain::SameLand));
+    assert!(surfaces::TITLED.contains(&Chain::SameCruise));
+}
+
+/// wrote-c's records on `b42ae72fc3` (the review's `--mode cover` run on Claude Code,
+/// `s-b516666902207f4d2f97`): its "Wrote …" claim, a done check at +124.7 s answered with
+/// `W_CHECKED`, the same check at +369.3 s, where the watch before 2a's review ended (+370.5 s).
+fn wrote_c_on_main() -> Seen {
+    Seen {
+        journal: vec![
+            j(
+                3_800,
+                "EVENT idle seq=896 ⏺ Wrote the parser and pushed it to origin/main. All done.",
+            ),
+            j(
+                3_800,
+                "WAITING seq=896 until=x 1 short turn(s) in a row: 2 min back-off",
+            ),
+            j(
+                124_700,
+                "CONTINUED seq=896 rule=continue-done-check@v1 [aterm harness] Autopilot is Cruise: done is never the end.",
+            ),
+            j(
+                128_600,
+                "EVENT idle seq=2064 Nothing left: the parser is committed and pushed to origin/main.",
+            ),
+            j(
+                128_600,
+                "WAITING seq=2064 until=x 2 short turn(s) in a row: 4 min back-off",
+            ),
+            j(
+                369_300,
+                "CONTINUED seq=2064 rule=continue-done-check@v1 [aterm harness] Autopilot is Cruise: done is never the end.",
+            ),
+        ],
+        ledger: vec![
+            point(3_800, 1),
+            typed(124_700, "continue-done-check@v1", DONE_CHECK),
+            point(128_600, 2),
+            typed(369_300, "continue-done-check@v1", DONE_CHECK),
+        ],
+        status: vec![status(4_000, "open", "cruise")],
+        meta: vec![no_meta(4_000)],
+        end_ms: T0 + 370_500,
+        ..Seen::default()
+    }
+}
+
+/// The same chain watched past its hold, journaled at +372.8 s, 2.3 s after that watch ended;
+/// brought in front at +382.9 s and +412.9 s, its chip reading `line`.
+fn wrote_c_held(line: &str) -> Seen {
+    let mut s = wrote_c_on_main();
+    s.journal.extend([
+        j(
+            372_800,
+            "EVENT idle seq=3231 Nothing left: the parser is committed and pushed to origin/main.",
+        ),
+        j(
+            372_800,
+            "EXCEPTION seq=3231 kind=stalled when=later Its program answers aterm's acts with the same reply and no work, so aterm types nothing more. => Open the tab and do what its last reply asks.",
+        ),
+        j(372_800, "HOLD seq=3231 point nothing why=policy"),
+    ]);
+    s.window = surfaces::Window {
+        read: true,
+        label: "wrote-c".into(),
+        held: vec![j(382_900, line), j(412_900, line)],
+        ..surfaces::Window::default()
+    };
+    s.end_ms = T0 + 432_800;
+    s
+}
+
+/// wrote-c answers each done check with `W_CHECKED`, so it is a same-reply chain: its watch runs a
+/// minute past its hold, where the watch before ended at the act after its check and C3 passed
+/// while aterm had stopped typing, and its hold fails C3 as held, not said, never as a chain that
+/// scripts no same reply.
+#[test]
+fn wrote_c_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
+    assert!(
+        !finished(&tab_of(Chain::WroteC, wrote_c_on_main()), T0 + 370_500),
+        "the watch no longer ends at the act after the check"
+    );
+    let held = wrote_c_held(CRUISE_ON_MAIN);
+    assert!(!finished(
+        &tab_of(Chain::WroteC, held.clone()),
+        T0 + 432_799
+    ));
+    assert!(finished(&tab_of(Chain::WroteC, held.clone()), T0 + 432_800));
+    let (w, why) = one(Chain::WroteC, &held, "claude", Scenario::C3);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("HELD, NOT SAID") && why.contains("held at +372.8 s"),
+        "{why}"
+    );
+    assert!(!why.contains("THE CHAIN'S RECORDS"), "{why}");
+    let (w, why) = one(
+        Chain::WroteC,
+        &wrote_c_held(CRUISE_SAID),
+        "claude",
+        Scenario::C3,
+    );
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(
+        !why.contains("HELD, NOT SAID") && why.contains("SKIPPED until 3a is on main"),
+        "{why}"
+    );
+    assert!(Chain::WroteC.same_reply());
 }
