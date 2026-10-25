@@ -477,7 +477,7 @@ fn a_dangling_stamp_does_not_hold_the_enter_open_for_a_keyless_plus_one() {
     );
     assert_eq!(glow.typed_credits_within(echo), 0, "all three spent");
     assert!(
-        glow.type_hint.any_fresh(echo, CursorGlow::TYPE_HINT_FRESH),
+        glow.type_hint.any_fresh(echo, TYPE_HINT_FRESH_DUR),
         "a stamp dangles"
     );
     glow.note_return(echo + ms(10));
@@ -538,7 +538,7 @@ fn a_keyless_wide_hop_under_a_one_shot_licence_lights_no_landing_on_a_dangling_s
             "{name}: all three spent"
         );
         assert!(
-            glow.type_hint.any_fresh(echo, CursorGlow::TYPE_HINT_FRESH),
+            glow.type_hint.any_fresh(echo, TYPE_HINT_FRESH_DUR),
             "{name}: a stamp dangles"
         );
         one_shot(&mut glow, echo + ms(10));
@@ -621,10 +621,7 @@ fn a_glyph_typed_before_a_one_shots_move_lands_keeps_its_credit_and_its_cell() {
             last_row(&glow)
         );
         assert!(
-            !paired
-                || glow
-                    .type_hint
-                    .any_fresh(landed, CursorGlow::TYPE_HINT_FRESH),
+            !paired || glow.type_hint.any_fresh(landed, TYPE_HINT_FRESH_DUR),
             "{label}: the glyph's stamp is left for its own echo"
         );
         let echo = landed + ms(20);
@@ -1293,7 +1290,7 @@ fn a_stamp_banks_split_and_merge_match_one_by_one_banking_at_every_fill() {
             for spent in [0usize, 1, n_before] {
                 let mut merged = bank;
                 for _ in 0..spent {
-                    merged.take_fresh(at(n), f32::MAX);
+                    merged.take_fresh(at(n), Duration::MAX);
                 }
                 let mut reference = merged;
                 for t in taken.iter().copied() {

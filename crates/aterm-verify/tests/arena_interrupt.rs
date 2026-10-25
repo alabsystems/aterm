@@ -93,6 +93,9 @@ fn interrupted_by(signal: &str, signo: i32) {
         "1",
         "--timeout-s",
         "600",
+        // The stand-in times nothing: start the lane at once, not on a quiet machine.
+        "--admit",
+        "now",
         "--binary",
     ])
     .arg(&stub)

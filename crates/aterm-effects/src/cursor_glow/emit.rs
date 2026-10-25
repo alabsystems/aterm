@@ -159,16 +159,14 @@ impl CursorGlow {
         let oy = f32::from(geom.origin_y);
         let budgeted = !self.streak_unbudgeted();
         let steam_share = if fire && budgeted {
-            let live: f32 = self
-                .vapor
-                .iter()
-                .filter(|v| v.kind == VaporKind::Steam)
-                .map(|v| {
+            let mut live = 0.0f32;
+            for v in &self.vapor {
+                if v.kind == VaporKind::Steam {
                     let t = (now.saturating_duration_since(v.born).as_secs_f32() / v.life)
                         .clamp(0.0, 1.0);
-                    (1.0 - t) * (1.0 - t)
-                })
-                .sum();
+                    live += (1.0 - t) * (1.0 - t);
+                }
+            }
             (Self::STEAM_STACK / live.max(f32::EPSILON)).min(1.0)
         } else {
             1.0
@@ -851,7 +849,12 @@ impl CursorGlow {
                 (Some((_, dir)), Some(&head)) if caret.is_some_and(|c| c != cell_of(&head)) => {
                     let from = head.x + dir * cwf * (0.5 - bed::DARK_BED_HEAD_FEATHER_CELLS);
                     band_run.clear();
-                    band_run.extend(run.iter().copied().take_while(|s| (s.x - from) * dir < 0.0));
+                    for &s in run {
+                        if (s.x - from) * dir >= 0.0 {
+                            break;
+                        }
+                        band_run.push(s);
+                    }
                     const LIGHT_BAND_HEAD_FEATHER: [(f32, f32);
                         CursorGlow::LIGHT_BAND_HEAD_KNOTS + 1] = {
                         let knots = CursorGlow::LIGHT_BAND_HEAD_KNOTS;
@@ -866,11 +869,13 @@ impl CursorGlow {
                     };
                     let head_cov = f32::from(head.cov);
                     let feather_span = dir * cwf * bed::DARK_BED_HEAD_FEATHER_CELLS;
-                    band_run.extend(LIGHT_BAND_HEAD_FEATHER.iter().map(|&(u, w)| CometSample {
-                        x: from + feather_span * u,
-                        cov: (head_cov * w).round() as u8,
-                        ..head
-                    }));
+                    for &(u, w) in &LIGHT_BAND_HEAD_FEATHER {
+                        band_run.push(CometSample {
+                            x: from + feather_span * u,
+                            cov: (head_cov * w).round() as u8,
+                            ..head
+                        });
+                    }
                     &band_run[..]
                 }
                 _ => run,
@@ -1199,17 +1204,17 @@ impl CursorGlow {
                 if u < 0.30 {
                     1.0
                 } else {
-                    0.5 * (1.0 + (std::f32::consts::PI * (u - 0.30) / 0.70).cos())
+                    0.5 * (1.0 + (std::f32::consts::PI * (u - 0.30) * (1.0 / 0.70)).cos())
                 }
             } else if s.typing {
                 const EMBER: f32 = 0.38;
                 if u < 0.10 {
                     1.0
                 } else if u < 0.40 {
-                    let k = (u - 0.10) / 0.30;
+                    let k = (u - 0.10) * (1.0 / 0.30);
                     EMBER + (1.0 - EMBER) * 0.5 * (1.0 + (std::f32::consts::PI * k).cos())
                 } else {
-                    EMBER * 0.5 * (1.0 + (std::f32::consts::PI * (u - 0.40) / 0.60).cos())
+                    EMBER * 0.5 * (1.0 + (std::f32::consts::PI * (u - 0.40) * (1.0 / 0.60)).cos())
                 }
             } else {
                 1.0 - u
@@ -1238,7 +1243,7 @@ impl CursorGlow {
             return;
         }
         for (rank, c) in cells[..n_cells].iter_mut().enumerate().skip(12) {
-            c.2 *= ((16 - rank.min(16)) as f32 / (16 - 11) as f32).min(1.0);
+            c.2 *= ((16 - rank.min(16)) as f32 * (1.0 / (16 - 11) as f32)).min(1.0);
         }
         let cells = &cells[..n_cells];
         if !cfg.dark_theme {
@@ -1283,8 +1288,11 @@ impl CursorGlow {
                 |col: i32| air && !rise_free && self.flame_cell_inked(&text, page, row_i - 1, col);
             let mut burning = [(0u16, 0u16, 0.0f32); 16];
             let mut n_burning = 0usize;
-            for (c, &typed) in cells.iter().zip(&typed_cell).filter(|(c, _)| c.0 == row) {
-                if !typed && inked_above(i32::from(c.1)) {
+            for (i, c) in cells.iter().enumerate() {
+                if c.0 != row {
+                    continue;
+                }
+                if !typed_cell[i] && inked_above(i32::from(c.1)) {
                     continue;
                 }
                 burning[n_burning] = *c;
@@ -1339,9 +1347,13 @@ impl CursorGlow {
                 }
             }
             let burning = &burning[..n_burning];
-            let (cmin, cmax) = burning.iter().fold((i32::MAX, i32::MIN), |(lo, hi), c| {
-                (lo.min(i32::from(c.1)), hi.max(i32::from(c.1)))
-            });
+            let mut cmin = i32::MAX;
+            let mut cmax = i32::MIN;
+            for c in burning {
+                let col = i32::from(c.1);
+                cmin = cmin.min(col);
+                cmax = cmax.max(col);
+            }
             let air_temp = (t.max(Self::FIRE_DARK_AIR_TEMP) * 255.0) as u8;
             let gap_temp = ((Self::FIRE_DARK_AIR_TEMP
                 + (1.0 - Self::FIRE_DARK_AIR_TEMP) * t.clamp(0.0, 1.0))
@@ -1422,7 +1434,7 @@ impl CursorGlow {
                     }
                     let hash01 = |i: i32, salt: u32| {
                         let h = aterm_render::fire_field::fire_hash(i as u32, salt, 0x7F4A_7C15);
-                        (h >> 8) as f32 / (1u32 << 24) as f32
+                        (h >> 8) as f32 * (1.0 / (1u32 << 24) as f32)
                     };
                     for col in (cmin - 1)..=(cmax + 1) {
                         if col < 0
@@ -1584,16 +1596,19 @@ impl CursorGlow {
                         match letter_memo {
                             Some((prev, cached)) if prev == key => cached,
                             _ => {
-                                let solved = std::array::from_fn(|level| {
-                                    flame_dark_letter_cap(
+                                let mut solved = [0.0f32; LEVELS];
+                                let mut level = 0;
+                                while level < LEVELS {
+                                    solved[level] = flame_dark_letter_cap(
                                         flame_level_light(level),
                                         ink,
                                         ground,
                                         lift,
                                         Self::FIRE_DARK_ROW_BAR,
                                     )
-                                    .min(air_cap)
-                                });
+                                    .min(air_cap);
+                                    level += 1;
+                                }
                                 letter_memo = Some((key, solved));
                                 solved
                             }
@@ -1605,6 +1620,7 @@ impl CursorGlow {
             }
             let used_levels = std::cell::Cell::new(0u32);
             let ease = Self::FIRE_DARK_ROW_EASE;
+            const INV_EASE: f32 = 1.0 / CursorGlow::FIRE_DARK_ROW_EASE;
             let held_at = |u: f32, low: bool, level: usize| -> f32 {
                 let level = level.min(LEVELS - 1);
                 let cells_held = &held[..span];
@@ -1627,17 +1643,23 @@ impl CursorGlow {
                         continue;
                     }
                     let d = (c as f32 - u).max(u - (c + 1) as f32).max(0.0);
-                    cap = cap.min(h + (air_cap - h) * smooth(d / ease));
+                    cap = cap.min(h + (air_cap - h) * smooth(d * INV_EASE));
                 }
                 cap
             };
             let row_foot = (ch * Self::FIRE_DARK_ROW_FOOT).max(4.0);
             let row_fade = (ch * Self::FIRE_DARK_ROW_TOP_FADE).max(1.0);
-            let sub_f = sub as f32;
+            let inv_row_foot = 1.0 / row_foot;
+            let inv_row_fade = 1.0 / row_fade;
+            let inv_foot = 1.0 / foot;
+            let inv_shoulder = 1.0 / shoulder;
+            let inv_cwi = 1.0 / cwi as f32;
+            let inv_ch = 1.0 / ch;
+            const INV_SUB: f32 = 1.0 / CursorGlow::FIRE_SUBCOLS as f32;
             for col in (cmin - 1).max(0)..=(cmax + 1).min(geom.cols as i32 - 1) {
                 let col_f = col as f32;
                 for k in 0..sub {
-                    let u = col_f + (k as f32 + 0.5) / sub_f;
+                    let u = col_f + (k as f32 + 0.5) * INV_SUB;
                     let (rise_px, side, kept, row_heat) = column(u);
                     if rise_px < 1.5 {
                         continue;
@@ -1666,7 +1688,7 @@ impl CursorGlow {
                         self.air_floor_lift(ch, tongues, u)
                     };
                     let base_y = base_y - (ch * curl * (1.0 - side) + lift) as i32;
-                    let scallop = if air { smooth(side / 0.5) } else { 1.0 };
+                    let scallop = if air { smooth(side * 2.0) } else { 1.0 };
                     // Rise ceiling: the grid top relaxed by the head band. A
                     // crest kept in its row stands to the row's top, where
                     // the ceiling fades it: cut at the envelope, every crest
@@ -1696,7 +1718,7 @@ impl CursorGlow {
                     let (ca, cb) = ((x0 - ox).div_euclid(cwi), (x1 - 1 - ox).div_euclid(cwi));
                     let on_text =
                         |b: i32| b >= 0 && (text.over_text(b, ca) || text.over_text(b, cb));
-                    let u_mid = ((x0 + x1) as f32 * 0.5 - ox as f32) / cwi as f32;
+                    let u_mid = ((x0 + x1) as f32 * 0.5 - ox as f32) * inv_cwi;
                     let peak_h = (rise_px
                         * if kept {
                             Self::FIRE_DARK_ROW_FIELD_REACH
@@ -1735,10 +1757,10 @@ impl CursorGlow {
                     let hard = self.fire_kept_cap_hard;
                     #[cfg(not(test))]
                     let hard = false;
-                    let cap_ease = if hard {
-                        (0.5 * (base_y as f32 - low_top)).max(1.0)
+                    let inv_cap_ease = if hard {
+                        1.0 / (0.5 * (base_y as f32 - low_top)).max(1.0)
                     } else {
-                        Self::FIRE_DARK_CAP_EASE_PX
+                        1.0 / Self::FIRE_DARK_CAP_EASE_PX
                     };
                     let mut over_memo = [f32::NAN; LEVELS];
                     let mut under_memo = [f32::NAN; LEVELS];
@@ -1750,10 +1772,12 @@ impl CursorGlow {
                             // stand in bands as the level stepped.
                             let idx = if crest {
                                 let py = mid.floor() as i32;
-                                (py - 1..=py + 1)
-                                    .map(|y| aterm_render::fire_field::fire_add_index_at(&field, y))
-                                    .max()
-                                    .unwrap_or(0)
+                                let y0 =
+                                    aterm_render::fire_field::fire_add_index_at(&field, py - 1);
+                                let y1 = aterm_render::fire_field::fire_add_index_at(&field, py);
+                                let y2 =
+                                    aterm_render::fire_field::fire_add_index_at(&field, py + 1);
+                                y0.max(y1).max(y2)
                             } else {
                                 1 << 16
                             };
@@ -1773,16 +1797,16 @@ impl CursorGlow {
                                 } else {
                                     under_memo[level]
                                 };
-                                over + (under - over) * smooth((mid - low_top) / cap_ease)
+                                over + (under - over) * smooth((mid - low_top) * inv_cap_ease)
                             } else {
                                 over
                             };
                             return low
-                                * smooth((base_y as f32 - mid) / row_foot)
-                                * smooth((mid - row_top as f32) / row_fade);
+                                * smooth((base_y as f32 - mid) * inv_row_foot)
+                                * smooth((mid - row_top as f32) * inv_row_fade);
                         }
                         let foot_in = if air {
-                            smooth((base_y as f32 - mid) / foot)
+                            smooth((base_y as f32 - mid) * inv_foot)
                         } else {
                             1.0
                         };
@@ -1795,10 +1819,10 @@ impl CursorGlow {
                                 && !(air && band + 1 == row_i)
                                 && on_text(band + 1)
                             {
-                                k = k.min((top + ch - mid) / shoulder);
+                                k = k.min((top + ch - mid) * inv_shoulder);
                             }
                             if on_text(band - 1) {
-                                k = k.min((mid - top) / shoulder);
+                                k = k.min((mid - top) * inv_shoulder);
                             }
                             (cov_cap + (air_cap - cov_cap) * smooth(k)) * foot_in
                         }
@@ -1807,7 +1831,7 @@ impl CursorGlow {
                     let w_u = (x1 - x0) as u16;
                     let base_y_u = base_y as u16;
                     let cell_h = geom.ch as u16;
-                    let rise_denom = rise_px.max(1.0);
+                    let inv_rise_denom = 1.0 / rise_px.max(1.0);
                     let col_u = col as u16;
                     let mut yy = top_y;
                     while yy < flame_end {
@@ -1823,7 +1847,7 @@ impl CursorGlow {
                         let end = if steep { yy + 1 } else { coarse };
                         if band < geom.rows as i32 {
                             let mid = 0.5 * (yy + end) as f32;
-                            let rise = ((base_y as f32 - mid) / rise_denom).clamp(0.0, 1.0);
+                            let rise = ((base_y as f32 - mid) * inv_rise_denom).clamp(0.0, 1.0);
                             let ceiling = if end == yy + 1 {
                                 c_start
                             } else {
@@ -1855,11 +1879,11 @@ impl CursorGlow {
                             // held to the letters' bar, and a ring would
                             // outline each letter dark in its glow.
                             if band >= 0 && !(kept && !crest) {
-                                let frac = (end - yy) as f32 / ch;
+                                let frac = (end - yy) as f32 * inv_ch;
                                 let rise_frac = 1.0
-                                    - ((base_y - end) as f32 / rise_denom).clamp(0.0, 1.0) * 0.55;
-                                let wgt =
-                                    strength * frac * rise_frac * (0.35 + 0.55 * t) / sub as f32;
+                                    - ((base_y - end) as f32 * inv_rise_denom).clamp(0.0, 1.0)
+                                        * 0.55;
+                                let wgt = strength * frac * rise_frac * (0.35 + 0.55 * t) * INV_SUB;
                                 let key = (band as u16, col_u);
                                 match engulf.iter_mut().find(|e| (e.0, e.1) == key) {
                                     Some(e) => e.2 += wgt,
@@ -2094,6 +2118,7 @@ impl CursorGlow {
         inked_above: &dyn Fn(i32) -> bool,
     ) -> DarkTongues {
         let spacing = Self::FIRE_DARK_SPACING;
+        const INV_SPACING: f32 = 1.0 / CursorGlow::FIRE_DARK_SPACING;
         let phase = self.flame_phase;
         let hash01 = |i: i32, salt: u32| {
             let h = aterm_render::fire_field::fire_hash(i as u32, salt, 0x3C6E_F372);
@@ -2101,7 +2126,7 @@ impl CursorGlow {
         };
         let (u_lo, u_hi) = (cmin as f32 - 0.8, cmax as f32 + 1.8);
         let mut out = DarkTongues::default();
-        for i in (u_lo / spacing).floor() as i32..=(u_hi / spacing).ceil() as i32 {
+        for i in (u_lo * INV_SPACING).floor() as i32..=(u_hi * INV_SPACING).ceil() as i32 {
             if out.n == out.buf.len() {
                 break;
             }
@@ -2143,6 +2168,7 @@ impl CursorGlow {
     ) {
         const MAX_CORES: usize = 48;
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+        let inv_cwf = 1.0 / cwf;
         let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
         let row_i = i32::from(row);
         let low_top = oyf + (f32::from(row) + Self::FIRE_DARK_LOW_BAND) * chf;
@@ -2165,7 +2191,7 @@ impl CursorGlow {
             if hard {
                 f32::from(u8::from(y >= low_top))
             } else {
-                smooth((y - low_top) / Self::FIRE_DARK_CAP_EASE_PX)
+                smooth((y - low_top) * (1.0 / Self::FIRE_DARK_CAP_EASE_PX))
             }
         };
         let glyph_cap = |g: FlameGlyph, letter_y: f32| -> f32 {
@@ -2176,7 +2202,7 @@ impl CursorGlow {
             }
         };
         let ease_x = cwf * 0.20;
-        let col_of = |px: f32| ((px - oxf) / cwf).floor() as i32;
+        let col_of = |px: f32| ((px - oxf) * inv_cwf).floor() as i32;
         let lean = -cwf * 0.30 * t;
         let (fx_l, fx_r) = (geom.fx_left() as f32, geom.fx_right() as f32);
         let knot = Self::FIRE_LIGHT_KNOT_PX;
@@ -2188,6 +2214,11 @@ impl CursorGlow {
         for kept in [false, true] {
             let mut cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
             let mut n = 0usize;
+            let mut peak_h = 0.0f32;
+            let mut x_lo = f32::INFINITY;
+            let mut x_hi = f32::NEG_INFINITY;
+            let lean_min = lean.min(0.0);
+            let lean_max = lean.max(0.0);
             let base = if kept { kept_base } else { air_base } as f32;
             // A core in the air feathers in over its tongue's own foot: over
             // a fixed five pixels its gold heart would stand on a floor the
@@ -2212,7 +2243,10 @@ impl CursorGlow {
             } else {
                 Self::FIRE_DARK_AIR_CORE_TAPER
             };
-            for tg in tongues.iter().filter(|tg| tg.kept == kept) {
+            for tg in tongues {
+                if tg.kept != kept {
+                    continue;
+                }
                 if n == MAX_CORES {
                     break;
                 }
@@ -2237,9 +2271,14 @@ impl CursorGlow {
                 // shortened, narrowed or set off their tongues, the cores burn
                 // as a tan curtain over the flames' thin edges.
                 let lift = self.air_root_lift(chf, tg, kept || columns);
+                let xc = oxf + tg.u * cwf + over;
+                let half = tg.half * cwf * wide;
+                peak_h = peak_h.max(h + lift);
+                x_lo = x_lo.min(xc - half + lean_min);
+                x_hi = x_hi.max(xc + half + lean_max);
                 cores[n] = (
-                    oxf + tg.u * cwf + over,
-                    tg.half * cwf * wide,
+                    xc,
+                    half,
                     h,
                     if kept {
                         Self::FIRE_DARK_KEPT_CORE_COV
@@ -2257,17 +2296,8 @@ impl CursorGlow {
             if cores.is_empty() {
                 continue;
             }
-            let peak_h = cores.iter().map(|c| c.2 + c.4).fold(0.0f32, f32::max);
-            let x_lo = cores
-                .iter()
-                .map(|c| c.0 - c.1 + lean.min(0.0))
-                .fold(f32::INFINITY, f32::min)
-                .max(fx_l);
-            let x_hi = cores
-                .iter()
-                .map(|c| c.0 + c.1 + lean.max(0.0))
-                .fold(f32::NEG_INFINITY, f32::max)
-                .min(fx_r);
+            let x_lo = x_lo.max(fx_l);
+            let x_hi = x_hi.min(fx_r);
             if x_hi <= x_lo {
                 continue;
             }
@@ -2314,6 +2344,8 @@ impl CursorGlow {
             };
             let mut slab_cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
             let root_hue_px = root_px.min(Self::FIRE_DARK_CORE_ROOT_PX);
+            let inv_root_px = 1.0 / root_px;
+            let inv_root_hue_px = 1.0 / root_hue_px;
             let mut y = (base - foot - peak_h).floor().max(geom.fx_top() as f32);
             while y < base {
                 if under.len() >= Self::MAX_QUADS {
@@ -2341,11 +2373,11 @@ impl CursorGlow {
                     if rise >= 1.0 || ym >= floor {
                         continue;
                     }
-                    let root_in = smooth((floor - ym) / root_px);
-                    let hue_in = smooth((floor - ym) / root_hue_px);
+                    let root_in = smooth((floor - ym) * inv_root_px);
+                    let hue_in = smooth((floor - ym) * inv_root_hue_px);
                     let rise = rise.max(0.0);
                     let xc = xc + lean * rise * rise;
-                    let k = (rise / 0.2).clamp(0.0, 1.0);
+                    let k = (rise * 5.0).clamp(0.0, 1.0);
                     let hw =
                         half * (0.62 + 0.38 * k * k * (3.0 - 2.0 * k)) * (1.0 - rise).powf(taper);
                     if hw < 0.3 {
@@ -2363,7 +2395,7 @@ impl CursorGlow {
                     };
                     #[cfg(not(test))]
                     let rise_base = rise.max(1.0 - hue_in);
-                    slab_cores[n_slab] = (xc, hw, peak_ym, rise_base);
+                    slab_cores[n_slab] = (xc, 1.0 / hw, peak_ym, rise_base);
                     n_slab += 1;
                 }
                 let active_cores = &slab_cores[..n_slab];
@@ -2381,11 +2413,11 @@ impl CursorGlow {
                 };
                 let at = |x: f32| -> (u32, u32) {
                     let mut best = (0.0f32, 0.0f32);
-                    for &(xc, hw, peak_ym, rise_base) in active_cores {
+                    for &(xc, inv_hw, peak_ym, rise_base) in active_cores {
                         if peak_ym <= best.0 {
                             continue;
                         }
-                        let d = ((x - xc) / hw).abs();
+                        let d = ((x - xc) * inv_hw).abs();
                         if d >= 1.0 {
                             continue;
                         }
@@ -2432,7 +2464,8 @@ impl CursorGlow {
                         return (0, 0);
                     }
                     let cov = cov.min(255.0);
-                    let thin = Self::FIRE_DARK_CORE_AMBER * smooth((yellow_cov - cov) / 38.0);
+                    let thin =
+                        Self::FIRE_DARK_CORE_AMBER * smooth((yellow_cov - cov) * (1.0 / 38.0));
                     #[cfg(test)]
                     let thin = if self.fire_core_uncooled { 0.0 } else { thin };
                     (cov as u32, flame_core_ramp(best.1.max(thin)))
@@ -2497,6 +2530,7 @@ impl CursorGlow {
         let paints = FLAME_LIGHT_PAINT_BOUNDS;
         let tall = chf * (Self::FIRE_LIGHT_RISE_COLD + Self::FIRE_LIGHT_RISE_HOT * t);
         let spacing = Self::FIRE_LIGHT_SPACING;
+        const INV_SPACING: f32 = 1.0 / CursorGlow::FIRE_LIGHT_SPACING;
         let lean = -cwf * 0.35 * t;
         let phase = self.flame_phase;
         let hash01 = |i: i32, salt: u32| {
@@ -2531,8 +2565,9 @@ impl CursorGlow {
             let (u_lo, u_hi) = (cmin as f32 - 0.8, cmax as f32 + 1.8);
             let mut tongues = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_TONGUES];
             let mut n = 0usize;
-            let first = (u_lo / spacing).floor() as i32;
-            let last = (u_hi / spacing).ceil() as i32;
+            let mut peak_h = 0.0f32;
+            let first = (u_lo * INV_SPACING).floor() as i32;
+            let last = (u_hi * INV_SPACING).ceil() as i32;
             for i in first..=last {
                 if n == MAX_TONGUES {
                     break;
@@ -2551,7 +2586,7 @@ impl CursorGlow {
                     &text,
                     &filled_above,
                     row,
-                    (u, half / cwf),
+                    (u, half * inv_cw),
                     root,
                     (chf, oyf),
                 ));
@@ -2567,7 +2602,7 @@ impl CursorGlow {
                     (half, 1.0)
                 } else {
                     let k = ((h - Self::FIRE_LIGHT_TONGUE_MIN_PX)
-                        / Self::FIRE_LIGHT_TONGUE_EASE_PX)
+                        * (1.0 / Self::FIRE_LIGHT_TONGUE_EASE_PX))
                         .clamp(0.0, 1.0);
                     (
                         half.min(h * Self::FIRE_LIGHT_TONGUE_ASPECT),
@@ -2577,6 +2612,7 @@ impl CursorGlow {
                 if fade <= 0.0 {
                     continue;
                 }
+                peak_h = peak_h.max(h);
                 tongues[n] = (oxf + u * cwf, h, half, fade);
                 n += 1;
             }
@@ -2584,8 +2620,7 @@ impl CursorGlow {
             if tongues.is_empty() {
                 continue;
             }
-            let peak_h = tongues.iter().map(|tg| tg.1).fold(0.0f32, f32::max);
-            let rows_up = ((peak_h - (root - (oyf + f32::from(row) * chf))) / chf)
+            let rows_up = ((peak_h - (root - (oyf + f32::from(row) * chf))) * inv_ch)
                 .ceil()
                 .max(0.0) as i32;
             let (c_lo, c_hi) = (u_lo.floor() as i32 - 1, u_hi.ceil() as i32 + 1);
@@ -2620,7 +2655,8 @@ impl CursorGlow {
             let x_lo = (oxf + u_lo * cwf).max(geom.fx_left() as f32);
             let x_hi = (oxf + u_hi * cwf).min(geom.fx_right() as f32);
             let knot = Self::FIRE_LIGHT_KNOT_PX;
-            let knots = (((x_hi - x_lo) / knot).ceil() as usize).max(1);
+            const INV_KNOT: f32 = 1.0 / CursorGlow::FIRE_LIGHT_KNOT_PX;
+            let knots = (((x_hi - x_lo) * INV_KNOT).ceil() as usize).max(1);
             let slab = Self::FIRE_LIGHT_SLAB_PX;
             let mut slab_tongues = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, [0.0f32; 3]); MAX_TONGUES];
             #[cfg(test)]
@@ -2660,7 +2696,7 @@ impl CursorGlow {
                     }
                     let xc = xc + lean * rise * rise;
                     let base = {
-                        let k = (rise / 0.2).clamp(0.0, 1.0);
+                        let k = (rise * 5.0).clamp(0.0, 1.0);
                         0.62 + 0.38 * k * k * (3.0 - 2.0 * k)
                     };
                     let hw = half * base * (1.0 - rise).powf(0.7);
@@ -2681,7 +2717,7 @@ impl CursorGlow {
                         ((c >> 8) & 0xff) as f32,
                         (c & 0xff) as f32,
                     ];
-                    slab_tongues[n_slab] = (xc, hw, root_in, tip, c_rgb);
+                    slab_tongues[n_slab] = (xc, 1.0 / hw, root_in, tip, c_rgb);
                     n_slab += 1;
                 }
                 let active_tongues = &slab_tongues[..n_slab];
@@ -2703,8 +2739,8 @@ impl CursorGlow {
                 };
                 let at = |x: f32| -> (u8, u32) {
                     let (mut a, mut sum, mut rgb) = (0.0f32, 0.0f32, [0.0f32; 3]);
-                    for &(xc, hw, root_in, tip, c_rgb) in active_tongues {
-                        let d = ((x - xc) / hw).abs();
+                    for &(xc, inv_hw, root_in, tip, c_rgb) in active_tongues {
+                        let d = ((x - xc) * inv_hw).abs();
                         if d >= 1.0 {
                             continue;
                         }
@@ -2797,12 +2833,14 @@ impl CursorGlow {
         }
         let table = crate::color_math::relative_luminance_table();
         let hold = |ink: u32, ground: u32, bar: f32| -> f32 {
-            let ink_luma = crate::color_math::relative_luminance(ink);
-            let ground_luma = crate::color_math::relative_luminance(ground);
+            let ink_luma = crate::color_math::relative_luminance_with(table, ink);
+            let ground_luma = crate::color_math::relative_luminance_with(table, ground);
+            let ink_luma_p = ink_luma + 0.05;
             let orig_ratio =
                 (ink_luma.max(ground_luma) + 0.05) / (ink_luma.min(ground_luma) + 0.05);
             let bar = bar.min(orig_ratio);
             let dark_ink = ink_luma <= ground_luma;
+            let bar_ink_luma_p = bar * ink_luma_p;
             let paint_end = if dark_ink { paints.0 } else { paints.1 };
             let holds = |a: f32| {
                 if a < 1.0 {
@@ -2825,9 +2863,9 @@ impl CursorGlow {
                 let luma =
                     crate::color_math::relative_luminance_rgb(table, bound(16), bound(8), bound(0));
                 if dark_ink {
-                    luma + 0.05 >= bar * (ink_luma + 0.05)
+                    luma + 0.05 >= bar_ink_luma_p
                 } else {
-                    ink_luma + 0.05 >= bar * (luma + 0.05)
+                    ink_luma_p >= bar * (luma + 0.05)
                 }
             };
             if holds(Self::FIRE_LIGHT_ALPHA) {
@@ -2936,18 +2974,18 @@ impl CursorGlow {
             seed ^= seed >> 15;
             seed = seed.wrapping_mul(0x846C_A68B);
             seed ^= seed >> 16;
-            let jitter = f32::from((seed >> 8) as u8) / 255.0;
+            let jitter = f32::from((seed >> 8) as u8) * (1.0 / 255.0);
             let drip_start = 0.20 + 0.18 * jitter;
             let drip_t = ((u - drip_start) / (1.0 - drip_start)).clamp(0.0, 1.0);
             let transfer = if s.typing {
                 0.0
             } else {
-                smoothstep01((u - drip_start) / 0.28)
+                smoothstep01((u - drip_start) * (1.0 / 0.28))
             };
             let surface_cov = (base_cov * (1.0 - 0.88 * transfer)) as u8;
             let drip_on = !s.typing && seed.is_multiple_of(3);
             let drip_cov = if drip_on && drip_t > 0.0 {
-                let arrive = smoothstep01(drip_t / 0.16);
+                let arrive = smoothstep01(drip_t * (1.0 / 0.16));
                 (base_cov * 0.54 * arrive * (1.0 - 0.20 * drip_t)) as u8
             } else {
                 0
@@ -2963,7 +3001,7 @@ impl CursorGlow {
             let wave = phase.sin() * amp;
             let (sx, sy) = geom.cell_center(s.row, s.col);
             let line_y = sy + line_dy_px;
-            let drift = (f32::from((seed >> 24) as u8) / 255.0 - 0.5) * drift_scale;
+            let drift = (f32::from((seed >> 24) as u8) * (1.0 / 255.0) - 0.5) * drift_scale;
             let sample = WaterSample {
                 surface: BeamVertex {
                     x: sx,
@@ -3190,9 +3228,10 @@ impl CursorGlow {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let ink = InkRole::Leading;
         let ground = self.light_ground(cfg);
+        const WATER_LIGHT_OPACITY_SCALE: f32 =
+            CursorGlow::LIGHT_WATER_ALPHA_CAP / CursorGlow::WATER_WAKE_COV_CAP;
         let opacity = |cov: u8| -> u8 {
-            (f32::from(cov) * Self::LIGHT_WATER_ALPHA_CAP / Self::WATER_WAKE_COV_CAP)
-                .min(Self::LIGHT_WATER_ALPHA_CAP) as u8
+            (f32::from(cov) * WATER_LIGHT_OPACITY_SCALE).min(Self::LIGHT_WATER_ALPHA_CAP) as u8
         };
         let undertow_ink = ground.body_ink(water_ramp(0.34));
         if self.water_samples.len() == 1 && self.water_samples[0].surface.cov > 0 {
@@ -3248,7 +3287,7 @@ impl CursorGlow {
             if out.len() >= Self::MAX_QUADS {
                 break;
             }
-            let a = opacity((f32::from(sample.drip_cov) / 0.54).min(255.0) as u8);
+            let a = opacity((f32::from(sample.drip_cov) * (1.0 / 0.54)).min(255.0) as u8);
             push_paper_bead(
                 out,
                 geom,
@@ -3344,7 +3383,8 @@ impl CursorGlow {
                 return;
             }
             let len = len_sq.sqrt();
-            let feather = (Self::FIRE_METEOR_FEATHER * geom.cw as f32 / len).min(0.15);
+            let inv_len = 1.0 / len;
+            let feather = (Self::FIRE_METEOR_FEATHER * geom.cw as f32 * inv_len).min(0.15);
             let snap_joins = true;
             #[cfg(test)]
             let (snap_joins, feather) = if self.fire_meteor_joined {
@@ -3357,14 +3397,19 @@ impl CursorGlow {
             } else {
                 (tx, dx)
             };
+            let inv_dm = if snap_joins && dm.abs() >= 1.0 {
+                1.0 / dm
+            } else {
+                0.0
+            };
             let join = |t: f32| -> f32 {
-                if !snap_joins || t <= 0.0 || t >= 1.0 || dm.abs() < 1.0 {
+                if inv_dm == 0.0 || t <= 0.0 || t >= 1.0 {
                     return t;
                 }
-                (((m0 + dm * t).round() - m0) / dm).clamp(0.0, 1.0)
+                (((m0 + dm * t).round() - m0) * inv_dm).clamp(0.0, 1.0)
             };
             let head_from = if snap_joins {
-                (1.0 - feather - Self::FIRE_METEOR_HEAD_EASE * geom.cw as f32 / len)
+                (1.0 - feather - Self::FIRE_METEOR_HEAD_EASE * geom.cw as f32 * inv_len)
                     .clamp(SEG[1].0 + 0.05, SEG[2].0)
             } else {
                 SEG[2].0
@@ -3400,11 +3445,12 @@ impl CursorGlow {
                 } else {
                     1
                 };
+                let inv_steps = 1.0 / steps as f32;
                 let cov_at = |f: f32| (f32::from(c0) + (f32::from(c1) - f32::from(c0)) * f) as u8;
                 let mut a = 0.0_f32;
                 let mut ta = join(t0);
                 for k in 0..steps {
-                    let b = (k + 1) as f32 / steps as f32;
+                    let b = (k + 1) as f32 * inv_steps;
                     let tb = join(t0 + (end - t0) * b);
                     if tb > ta {
                         let width = w0 + (w1 - w0) * 0.5 * (a + b);
@@ -3656,7 +3702,8 @@ impl CursorGlow {
         let cx = geom.origin_x as i32 + cc as i32 * cw;
         let cy = geom.origin_y as i32 + cr as i32 * ch;
         let (ccx, ccy) = (cx as f32 + cw as f32 * 0.5, cy as f32 - ch as f32 * 0.10);
-        let tn = ((temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP)).clamp(0.0, 1.0);
+        let tn =
+            ((temp - Self::FORGE_MIN_TEMP) * (1.0 / (1.0 - Self::FORGE_MIN_TEMP))).clamp(0.0, 1.0);
         let phase = self.flame_phase;
         // Over a lettered or filled row above (a prompt's powerline
         // segment), the forge's light stays in the caret's own row, so its
@@ -3836,7 +3883,7 @@ impl CursorGlow {
             };
             ripple(t, cov, color);
             if t > 0.30 {
-                let t2 = (t - 0.30) / 0.70;
+                let t2 = (t - 0.30) * (1.0 / 0.70);
                 ripple(
                     t2,
                     (150.0 * (1.0 - t2) * cfg.intensity) as u8,
@@ -3920,9 +3967,10 @@ impl CursorGlow {
     /// and leave the theme's text `fg` [`Self::LIGHT_VEIL_BAR`] over it on
     /// the page `bg` (or the theme's own contrast, if less: no veil).
     pub(crate) const fn dark_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
+        let table = crate::color_math::relative_luminance_table();
         let (fg, bg) = (fg & 0x00FF_FFFF, bg & 0x00FF_FFFF);
-        let lum_fg = crate::color_math::relative_luminance(fg);
-        let lum_bg = crate::color_math::relative_luminance(bg);
+        let lum_fg = crate::color_math::relative_luminance_with(table, fg);
+        let lum_bg = crate::color_math::relative_luminance_with(table, bg);
         #[inline]
         const fn contrast(lum_fg: f32, l: f32) -> f32 {
             (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05)
@@ -3932,6 +3980,7 @@ impl CursorGlow {
         let v_rgb = ((veil >> 16) & 0xff, (veil >> 8) & 0xff, veil & 0xff);
         #[inline]
         const fn holds(
+            table: &crate::color_math::RelativeLuminanceTable,
             lum_fg: f32,
             bar: f32,
             (bg_r, bg_g, bg_b): (u32, u32, u32),
@@ -3944,22 +3993,21 @@ impl CursorGlow {
             let r = if r < 255 { r as usize } else { 255 };
             let g = if g < 255 { g as usize } else { 255 };
             let b = if b < 255 { b as usize } else { 255 };
-            let table = crate::color_math::relative_luminance_table();
             contrast(
                 lum_fg,
                 crate::color_math::relative_luminance_rgb(table, r, g, b),
             ) >= bar
         }
         let (mut lo, mut hi) = (0u32, 255u32);
-        if holds(lum_fg, bar, bg_rgb, v_rgb, hi) {
+        if holds(table, lum_fg, bar, bg_rgb, v_rgb, hi) {
             return 255;
         }
-        if !holds(lum_fg, bar, bg_rgb, v_rgb, 1) {
+        if !holds(table, lum_fg, bar, bg_rgb, v_rgb, 1) {
             return 0;
         }
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
-            if holds(lum_fg, bar, bg_rgb, v_rgb, mid) {
+            if holds(table, lum_fg, bar, bg_rgb, v_rgb, mid) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -4029,7 +4077,7 @@ impl CursorGlow {
             };
             ripple(t, cov, color);
             if t > 0.30 {
-                let t2 = (t - 0.30) / 0.70;
+                let t2 = (t - 0.30) * (1.0 / 0.70);
                 ripple(
                     t2,
                     (150.0 * (1.0 - t2) * cfg.intensity) as u8,
@@ -4243,7 +4291,7 @@ impl CursorGlow {
                     if seat >= Self::COMET_DARK_DUST_SHARE {
                         continue;
                     }
-                    let k = seat / Self::COMET_DARK_DUST_SHARE;
+                    let k = seat * (1.0 / Self::COMET_DARK_DUST_SHARE);
                     let jitter = ((p.hue * 4513.0).fract() - 0.5) * Self::COMET_DARK_DUST_JITTER;
                     top + ch
                         * (jitter
@@ -4443,14 +4491,14 @@ impl CursorGlow {
                     if ccov_f < 1.0 {
                         continue;
                     }
-                    let cell = geom.ch as f32;
+                    let cell = ch;
                     let base = (cell * (Self::FIRE_EMBER_R + Self::FIRE_EMBER_R_HOT * p.hue))
                         .max(1.2)
                         * (0.6 + 0.4 * fade);
                     let vx = p.vx;
                     let vy = p.vy + p.gy * age;
-                    let rx = base * (1.0 + (vx.abs() / cell).min(1.4) * 0.6);
-                    let ry = base * (1.0 + (vy.abs() / cell).min(1.4) * 0.6);
+                    let rx = base * (1.0 + (vx.abs() * inv_ch).min(1.4) * 0.6);
+                    let ry = base * (1.0 + (vy.abs() * inv_ch).min(1.4) * 0.6);
                     let core_color = fire_ramp((0.42 + 0.30 * fade + 0.18 * p.hue).min(0.92));
                     let (centre, radii) = ((x + waft, y), (rx * 1.6, ry * 1.6));
                     let reach = radii.0.max(radii.1);
@@ -4498,7 +4546,7 @@ impl CursorGlow {
                         (1.0, 1.0)
                     };
                     let cov = (f32::from(cov) * lift).min(255.0) as u8;
-                    match seed % 8 {
+                    match seed & 7 {
                         0 if star_accent(seed) => {
                             let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                             let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
@@ -4659,7 +4707,7 @@ impl CursorGlow {
                     let (w, h) = if water {
                         let base = (ch * (0.055 + 0.065 * p.hue)).max(1.0);
                         let v_down = p.vy + p.gy * age;
-                        let stretch = (v_down / ch).clamp(0.0, 1.6);
+                        let stretch = (v_down * inv_ch).clamp(0.0, 1.6);
                         (
                             base.round() as i32,
                             (base * (1.0 + stretch)).round().max(1.0) as i32,
@@ -4788,23 +4836,34 @@ impl CursorGlow {
                 (rgb & 0xff) as f32,
             ]
         }
+        let table = crate::color_math::relative_luminance_table();
         let ref_ink = unpack(Self::STREAK_REF_INK);
         let ref_ground = unpack(Self::STREAK_REF_GROUND);
         #[inline]
-        const fn lifted(lift: [f32; 3], base: [f32; 3], cov: f32) -> f32 {
+        const fn lifted(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lift: [f32; 3],
+            base: [f32; 3],
+            cov: f32,
+        ) -> f32 {
             let r = (base[0] + cov * lift[0]).min(255.0) as usize;
             let g = (base[1] + cov * lift[1]).min(255.0) as usize;
             let b = (base[2] + cov * lift[2]).min(255.0) as usize;
-            let table = crate::color_math::relative_luminance_table();
             crate::color_math::relative_luminance_rgb(table, r, g, b)
         }
         #[inline]
-        const fn holds(lift: [f32; 3], ref_ink: [f32; 3], ref_ground: [f32; 3], cov: f32) -> bool {
-            let ink = lifted(lift, ref_ink, cov);
-            let ground = lifted(lift, ref_ground, cov);
+        const fn holds(
+            table: &crate::color_math::RelativeLuminanceTable,
+            lift: [f32; 3],
+            ref_ink: [f32; 3],
+            ref_ground: [f32; 3],
+            cov: f32,
+        ) -> bool {
+            let ink = lifted(table, lift, ref_ink, cov);
+            let ground = lifted(table, lift, ref_ground, cov);
             ink.max(ground) + 0.05 >= CursorGlow::STREAK_INK_FLOOR * (ink.min(ground) + 0.05)
         }
-        if holds(lift, ref_ink, ref_ground, 255.0) {
+        if holds(table, lift, ref_ink, ref_ground, 255.0) {
             return 255.0;
         }
         let (mut lo, mut hi) = (0.0f32, 255.0f32);
@@ -4812,7 +4871,7 @@ impl CursorGlow {
         while step < 10 {
             step += 1;
             let mid = 0.5 * (lo + hi);
-            if holds(lift, ref_ink, ref_ground, mid) {
+            if holds(table, lift, ref_ink, ref_ground, mid) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -5035,12 +5094,18 @@ const FLAME_CORE_STOPS: [(f32, u32); 4] = [
     (1.0, 0x00F0_6010),
 ];
 
+const FLAME_CORE_INV_SPANS: [f32; 3] = [
+    1.0 / (FLAME_CORE_STOPS[1].0 - FLAME_CORE_STOPS[0].0),
+    1.0 / (FLAME_CORE_STOPS[2].0 - FLAME_CORE_STOPS[1].0),
+    1.0 / (FLAME_CORE_STOPS[3].0 - FLAME_CORE_STOPS[2].0),
+];
+
 #[inline]
 const fn flame_core_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
     let i = (rise >= FLAME_CORE_STOPS[1].0) as usize + (rise >= FLAME_CORE_STOPS[2].0) as usize;
     let (a, b) = (FLAME_CORE_STOPS[i], FLAME_CORE_STOPS[i + 1]);
-    lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
+    lerp_rgb(a.1, b.1, (rise - a.0) * FLAME_CORE_INV_SPANS[i])
 }
 
 #[inline]
@@ -5062,16 +5127,22 @@ const fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], 
         let i = t as u32;
         if (i as f32) < t { i + 1 } else { i }
     }
+    let table = crate::color_math::relative_luminance_table();
     let lift = [ceil_u32(lift[0]), ceil_u32(lift[1]), ceil_u32(lift[2])];
     #[inline]
-    const fn lifted(hot: u32, lift: [u32; 3], base: u32, cov: u32) -> f32 {
+    const fn lifted(
+        table: &crate::color_math::RelativeLuminanceTable,
+        hot: u32,
+        lift: [u32; 3],
+        base: u32,
+        cov: u32,
+    ) -> f32 {
         #[inline]
         const fn ch(base: u32, hot: u32, cov: u32, lift_c: u32, sh: u32) -> usize {
             let b = ((base >> sh) & 0xff) + lift_c;
             let v = b + (((hot >> sh) & 0xff) * cov + 127) / 255;
             if v < 255 { v as usize } else { 255 }
         }
-        let table = crate::color_math::relative_luminance_table();
         crate::color_math::relative_luminance_rgb(
             table,
             ch(base, hot, cov, lift[0], 16),
@@ -5079,33 +5150,40 @@ const fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], 
             ch(base, hot, cov, lift[2], 0),
         )
     }
-    let ink_l = lifted(hot, lift, ink, 0);
+    let ink_l = lifted(table, hot, lift, ink, 0);
     #[inline]
-    const fn reads(hot: u32, lift: [u32; 3], ground: u32, ink_l: f32, cov: u32) -> Option<f32> {
-        let g = lifted(hot, lift, ground, cov);
+    const fn reads(
+        table: &crate::color_math::RelativeLuminanceTable,
+        hot: u32,
+        lift: [u32; 3],
+        ground: u32,
+        ink_l: f32,
+        cov: u32,
+    ) -> Option<f32> {
+        let g = lifted(table, hot, lift, ground, cov);
         if g < ink_l {
             Some((ink_l + 0.05) / (g + 0.05))
         } else {
             None
         }
     }
-    let Some(own) = reads(hot, lift, ground, ink_l, 0) else {
+    let Some(own) = reads(table, hot, lift, ground, ink_l, 0) else {
         return 255.0;
     };
     let bar = bar.min(own);
-    if let Some(c) = reads(hot, lift, ground, ink_l, 255)
+    if let Some(c) = reads(table, hot, lift, ground, ink_l, 255)
         && c >= bar
     {
         return 255.0;
     }
-    match reads(hot, lift, ground, ink_l, 1) {
+    match reads(table, hot, lift, ground, ink_l, 1) {
         Some(c) if c >= bar => {}
         _ => return 0.0,
     }
     let (mut lo, mut hi) = (0u32, 256u32);
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if let Some(c) = reads(hot, lift, ground, ink_l, mid)
+        if let Some(c) = reads(table, hot, lift, ground, ink_l, mid)
             && c >= bar
         {
             lo = mid;
@@ -5160,7 +5238,7 @@ const fn flame_tip_fade(rise: f32) -> f32 {
     if rise <= HOLD {
         1.0
     } else {
-        let k = ((rise - HOLD) / (1.0 - HOLD)).clamp(0.0, 1.0);
+        let k = ((rise - HOLD) * (1.0 / (1.0 - HOLD))).clamp(0.0, 1.0);
         (1.0 - k) * (1.0 - 0.25 * k)
     }
 }
@@ -5170,6 +5248,12 @@ const FLAME_LIGHT_STOPS: [(f32, u32); 4] = [
     (0.32, 0x00FF_8C14),
     (0.62, 0x00FF_A820),
     (1.0, 0x00FF_C848),
+];
+
+const FLAME_LIGHT_INV_SPANS: [f32; 3] = [
+    1.0 / (FLAME_LIGHT_STOPS[1].0 - FLAME_LIGHT_STOPS[0].0),
+    1.0 / (FLAME_LIGHT_STOPS[2].0 - FLAME_LIGHT_STOPS[1].0),
+    1.0 / (FLAME_LIGHT_STOPS[3].0 - FLAME_LIGHT_STOPS[2].0),
 ];
 
 const FLAME_LIGHT_PAINT_BOUNDS: (u32, u32) = flame_light_paint_bounds();
@@ -5193,7 +5277,7 @@ const fn flame_light_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
     let i = (rise >= FLAME_LIGHT_STOPS[1].0) as usize + (rise >= FLAME_LIGHT_STOPS[2].0) as usize;
     let (a, b) = (FLAME_LIGHT_STOPS[i], FLAME_LIGHT_STOPS[i + 1]);
-    lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
+    lerp_rgb(a.1, b.1, (rise - a.0) * FLAME_LIGHT_INV_SPANS[i])
 }
 
 fn fire_band_lifts(
@@ -5203,18 +5287,24 @@ fn fire_band_lifts(
     core: f32,
     ch: f32,
 ) -> BandLifts {
-    let reaches: [f32; InkLedger::BANDS] =
-        std::array::from_fn(|band| InkLedger::band_reach(ch, band));
+    let mut reaches = [0.0f32; InkLedger::BANDS];
+    let mut b = 0;
+    while b < InkLedger::BANDS {
+        reaches[b] = InkLedger::band_reach(ch, b);
+        b += 1;
+    }
     let mut lifts = [[0.0f32; 3]; InkLedger::BANDS];
     for layer in stack {
         let reach_max = 0.5 * layer.0 * core + 1.0;
         let one = layer_stack_lift(std::slice::from_ref(layer), color, pos);
-        for (band, lift) in lifts.iter_mut().enumerate() {
+        let mut band = 0;
+        while band < InkLedger::BANDS {
             if reach_max >= reaches[band] {
-                lift[0] += one[0];
-                lift[1] += one[1];
-                lift[2] += one[2];
+                lifts[band][0] += one[0];
+                lifts[band][1] += one[1];
+                lifts[band][2] += one[2];
             }
+            band += 1;
         }
     }
     lifts

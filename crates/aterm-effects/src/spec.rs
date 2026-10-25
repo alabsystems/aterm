@@ -952,36 +952,64 @@ fn validate_text(label: &str, value: &str, max: usize, diagnostics: &mut Vec<Str
     }
 }
 
-fn valid_id(value: &str, max: usize, namespaced: bool) -> bool {
+const fn valid_id(value: &str, max: usize, namespaced: bool) -> bool {
     let bytes = value.as_bytes();
-    let edge_ok = bytes
-        .first()
-        .zip(bytes.last())
-        .is_some_and(|(&first, &last)| {
-            first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric()
-        });
-    edge_ok
-        && bytes.len() <= max
-        && (!namespaced || value.contains('.'))
-        && !value.contains("..")
-        && bytes.iter().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b'.' | b'_' | b'-')
-        })
+    let len = bytes.len();
+    if len == 0
+        || len > max
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes[len - 1].is_ascii_alphanumeric()
+    {
+        return false;
+    }
+    let mut has_dot = false;
+    let mut prev_dot = false;
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if b == b'.' {
+            if prev_dot {
+                return false;
+            }
+            has_dot = true;
+            prev_dot = true;
+        } else if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' {
+            prev_dot = false;
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    !namespaced || has_dot
 }
 
-fn valid_lang(value: &str) -> bool {
+const fn valid_lang(value: &str) -> bool {
     let bytes = value.as_bytes();
-    (2..=MAX_LANG_BYTES).contains(&bytes.len())
-        && bytes
-            .first()
-            .zip(bytes.last())
-            .is_some_and(|(&first, &last)| {
-                first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric()
-            })
-        && !value.contains("--")
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+    let len = bytes.len();
+    if len < 2
+        || len > MAX_LANG_BYTES
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes[len - 1].is_ascii_alphanumeric()
+    {
+        return false;
+    }
+    let mut prev_dash = false;
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if b == b'-' {
+            if prev_dash {
+                return false;
+            }
+            prev_dash = true;
+        } else if b.is_ascii_alphanumeric() {
+            prev_dash = false;
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn validate_toy_word(word: &str, label: &str, diagnostics: &mut Vec<String>) -> bool {

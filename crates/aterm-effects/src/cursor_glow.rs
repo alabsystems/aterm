@@ -1253,8 +1253,6 @@ impl CursorGlow {
         const POOF_FALLBACK_GRACE_DUR: Duration = Duration::from_nanos(
             (CursorGlow::POOF_FALLBACK_GRACE as f64 * 1_000_000_000.0).round() as u64,
         );
-        const IN_FLIGHT_PATIENCE_DUR: Duration =
-            Duration::from_nanos((IN_FLIGHT_PATIENCE_S as f64 * 1_000_000_000.0).round() as u64);
         const TORN_REST_DUR: Duration =
             Duration::from_nanos((CursorGlow::TORN_REST_S as f64 * 1_000_000_000.0).round() as u64);
         let v1_due = if self.needs_frame_cadence() {
@@ -1291,10 +1289,16 @@ impl CursorGlow {
         let torn_due = self
             .torn_lay
             .map(|l| (l.moved_at + TORN_REST_DUR + rk::ARM_MIN).max(now + rk::ARM_MIN));
-        [v1_due, v2_due, park_due, torn_due]
-            .into_iter()
-            .flatten()
-            .min()
+        let cands = [v1_due, v2_due, park_due, torn_due];
+        let mut earliest: Option<Instant> = None;
+        let mut i = 0;
+        while i < cands.len() {
+            if let Some(d) = cands[i] {
+                earliest = Some(earliest.map_or(d, |e| e.min(d)));
+            }
+            i += 1;
+        }
+        earliest
     }
 
     #[inline]
@@ -1654,14 +1658,14 @@ impl CursorGlow {
                     * (1.0 - Self::QUENCH_DAMP * self.quench);
                 let rise = target - self.disp_t;
                 if rise != 0.0 {
-                    let ease = if rise > 0.5 {
-                        Self::DISP_SLAM_S
+                    let inv_ease = if rise > 0.5 {
+                        1.0 / Self::DISP_SLAM_S
                     } else if rise > 0.0 {
-                        Self::DISP_ATTACK_S
+                        1.0 / Self::DISP_ATTACK_S
                     } else {
-                        Self::DISP_RELEASE_TAU / (1.0 + 2.0 * self.quench)
+                        (1.0 + 2.0 * self.quench) * (1.0 / Self::DISP_RELEASE_TAU)
                     };
-                    self.disp_t += rise * (1.0 - (-dt / ease).exp());
+                    self.disp_t += rise * (1.0 - (-dt * inv_ease).exp());
                     if self.disp_t < 0.005 {
                         self.disp_t = 0.0;
                     }
@@ -1674,12 +1678,12 @@ impl CursorGlow {
                 if matches!(cfg.style, GlowStyle::Fire) {
                     let diff = self.disp_t - self.cursor_temp;
                     if diff != 0.0 {
-                        let temp_tau = if diff > 0.0 {
-                            Self::TEMP_ATTACK_TAU
+                        let inv_temp_tau = if diff > 0.0 {
+                            1.0 / Self::TEMP_ATTACK_TAU
                         } else {
-                            Self::TEMP_RELEASE_TAU / (1.0 + self.quench)
+                            (1.0 + self.quench) * (1.0 / Self::TEMP_RELEASE_TAU)
                         };
-                        self.cursor_temp += diff * (1.0 - (-dt / temp_tau).exp());
+                        self.cursor_temp += diff * (1.0 - (-dt * inv_temp_tau).exp());
                         if self.cursor_temp < 0.005 {
                             self.cursor_temp = 0.0;
                         }

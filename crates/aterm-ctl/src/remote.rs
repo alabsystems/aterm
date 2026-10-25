@@ -193,32 +193,37 @@ pub(crate) fn run(
 }
 
 /// Why a `hold <sid> off` cannot be sent to `host` by this machine, out of the fleet now or
-/// holding a book that names no such Mac ([`Left`]), and what lifts a hold it took there before:
-/// a join again of that fleet only where it left as a member, since an issuer's fleet went with
-/// its leave; and, after the dial's own refusal `why`, if that Mac is one the book records no
-/// more, the book's record of it again.
+/// holding a book that names no such Mac ([`Left`]): the dial's own refusal `why`, then, as a
+/// condition this machine cannot check, what lifts a hold it took there ([`lifts_there`]) and
+/// when the same `hold off` from here works.
 fn left_holding(host: &str, sid: &str, left: &Left, why: &str) -> String {
     let (host, sid) = (
         aterm_codec::tty::one_line(host, 80),
         aterm_codec::tty::one_line(sid, 40),
     );
-    match left {
-        Left::Fleet(node) => format!(
-            "this machine is in no fleet now, so it reaches {host} no more to hand {sid} back: \
-             a hold it took there before it left stands until that Mac's person takes the tab \
-             (Take Over) or runs `aterm fleet peers rm {}` there; if this machine left a fleet \
-             it joined, `aterm ctl --host {host} hold {sid} off` hands it back once it joins \
-             that fleet again (a fleet it issued went with its leave)",
-            node.get(..8).unwrap_or(node)
+    let (node, again) = match left {
+        Left::Fleet(node) => (
+            node,
+            " is in that fleet again (a fleet it issued went with its leave)",
         ),
-        Left::Book(node) => format!(
-            "{why}; if this machine took {sid} on a Mac its book records no more (it joined \
-             another fleet since, or a `peers rm` took that Mac out), that Mac's person lifts \
-             the hold (Take Over, or `aterm fleet peers rm {}` there), and so does `aterm ctl \
-             --host {host} hold {sid} off` once this machine's book records that Mac again",
-            node.get(..8).unwrap_or(node)
-        ),
-    }
+        Left::Book(node) => (node, "'s book records that Mac again"),
+    };
+    format!(
+        "{why}; if this machine took {sid} on {host}, {}, and `aterm ctl --host {host} hold {sid} \
+         off` from here works once this machine{again}",
+        lifts_there(node)
+    )
+}
+
+/// What lifts, on another Mac, a hold this machine (`node`) took there: each ends the grant the
+/// hold stands on, or takes the tab.
+#[must_use]
+pub fn lifts_there(node: &str) -> String {
+    format!(
+        "that Mac lifts the hold when its person takes the tab (Take Over), runs `aterm fleet \
+         peers rm {}` there, or lowers `aterm fleet allow` there (to content or facts)",
+        node.get(..8).unwrap_or(node)
+    )
 }
 
 /// Refuse a leading selector that names a session of THIS Mac, or none by

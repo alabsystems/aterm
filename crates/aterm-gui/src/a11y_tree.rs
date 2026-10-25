@@ -16,6 +16,8 @@ const GRID: NodeId = NodeId(1);
 const TAB_LIST: NodeId = NodeId(2);
 const FIND: NodeId = NodeId(3);
 const FIND_RUN: NodeId = NodeId(4);
+/// The focused rewound pane's slider ([`GridRewind`]).
+pub(crate) const REWIND: NodeId = NodeId(5);
 const MESSAGE_BASE: u64 = 1 << 20;
 const MENU_BASE: u64 = 1 << 29;
 const MENU_ROWS: u64 = 64;
@@ -795,6 +797,34 @@ fn push_stats_lens(nodes: &mut Vec<(NodeId, Node)>, lens: &StatsLens) -> (NodeId
     (group_id, focus)
 }
 
+/// The focused pane's open Rewind view, published as a slider over its recorded instants.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GridRewind {
+    /// The shown instant's 1-based place among the instants, and their count.
+    pub(crate) state: (usize, usize),
+    /// What the band says of it: the time, how long ago, and whether it is faithful.
+    pub(crate) words: String,
+    /// The band's rows in physical px.
+    pub(crate) bounds: Option<Rect>,
+}
+
+fn push_rewind(nodes: &mut Vec<(NodeId, Node)>, rewind: &GridRewind) {
+    let mut node = Node::new(Role::Slider);
+    node.set_label("Rewind");
+    node.set_numeric_value(rewind.state.0 as f64);
+    node.set_min_numeric_value(1.0);
+    node.set_max_numeric_value(rewind.state.1.max(1) as f64);
+    node.set_numeric_value_step(1.0);
+    node.set_description(rewind.words.clone());
+    node.add_action(Action::Increment);
+    node.add_action(Action::Decrement);
+    node.add_action(Action::Focus);
+    if let Some(b) = rewind.bounds {
+        node.set_bounds(b);
+    }
+    nodes.push((REWIND, node));
+}
+
 /// Frame state projected alongside the visible grid snapshot by [`grid_tree`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GridFrame<'a> {
@@ -814,6 +844,8 @@ pub(crate) struct GridFrame<'a> {
     pub(crate) menu: Option<&'a GridMenu>,
     /// The stats bars, while the window shows them (the Deck or the sill).
     pub(crate) stats: Option<&'a GridStats>,
+    /// The focused pane's open Rewind view.
+    pub(crate) rewind: Option<&'a GridRewind>,
     /// Canonical window title (`WindowState::current_title`), falling back to the app name.
     pub(crate) window_title: &'a str,
 }
@@ -1143,6 +1175,11 @@ pub(crate) fn grid_tree(
     if let Some(find) = frame.find {
         push_find_field(&mut nodes, find);
         root_children.push(FIND);
+    }
+
+    if let Some(rewind) = frame.rewind {
+        push_rewind(&mut nodes, rewind);
+        root_children.push(REWIND);
     }
 
     root_children.extend(push_chips(&mut nodes, frame.chips, geom));

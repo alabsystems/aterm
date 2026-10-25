@@ -10779,6 +10779,35 @@ impl TurnEndReading {
             && (!self.pending_input || stale_input)
     }
 
+    /// A LOST LOGIN DRAWN WITH NO COMPOSER, read idle and authoritative, and no `/login` dialog:
+    /// agy's or Muse Code's sign-in menu in place of the composer. No point
+    /// ([`Self::at_point`]): nothing is typed into it. Claude Code's measured `/login` dialog
+    /// (its browser hand-off, error and success states) has no composer either; it is
+    /// [`super::login::dialog_act`]'s, and no sign-in menu. Claude Code reads so only where its
+    /// lost login's row stands with no composer frame drawn under it (its launch card and the
+    /// row, say), which no measured screen of it shows.
+    const fn at_sign_in_menu(&self) -> bool {
+        matches!(self.wall, Some(WallKind::Auth))
+            && matches!(self.composer, Composer::Absent)
+            && matches!(self.phase, Phase::Idle)
+            && self.authoritative
+            && self.login_screen.is_none()
+    }
+
+    /// Whether `rows`, read as `program` draws them (`None`: as the screen names its program),
+    /// are a sign-in menu as the supervisor reads one (`Self::at_sign_in_menu`): the screen an
+    /// account move's relaunch is made over in place of an empty composer
+    /// (`crate::harness::relaunch`), since nothing typed stands there to lose.
+    #[must_use]
+    pub fn sign_in_menu_drawn(
+        program: Option<&str>,
+        rows: &[String],
+        cursor_col: Option<usize>,
+    ) -> bool {
+        let read = aterm_phase::read(program, rows, cursor_col);
+        Self::of(&read, rows, false, None, None, None).at_sign_in_menu()
+    }
+
     const fn answered_point(&self) -> bool {
         matches!(self.phase, Phase::Idle | Phase::Question)
             && self.authoritative
@@ -13550,12 +13579,20 @@ impl TurnEndState {
         (n, oldest)
     }
 
-    /// What this point says of the account move not answered yet.
+    /// What this point says of the account move not answered yet. A sign-in menu drawn in place
+    /// of the composer (`TurnEndReading::at_sign_in_menu`) is no point, but it answers the move
+    /// all the same: no transcript stands there, so its lost login is the moved-to process's own
+    /// ([`AccountBad::SignedOut`]), unless an act is still awaited.
     #[must_use]
     pub fn account_answer(&self, reading: &TurnEndReading) -> Option<AccountAnswer> {
         self.account.as_ref()?;
         if !reading.at_point(self.stale_input) {
-            return None;
+            return (reading.at_sign_in_menu()
+                && moves_accounts(reading.program)
+                && !reading.survey
+                && !self.account_told
+                && !(self.awaiting.is_some() && reading.worked.is_none()))
+            .then_some(AccountAnswer::Bad(AccountBad::SignedOut));
         }
         if self.account_told {
             let worked = reading.worked.is_some() || self.limit_went_on(reading, None);
@@ -13597,9 +13634,14 @@ impl TurnEndState {
         }
     }
 
+    /// THE LOST LOGIN A MOVE MADE AT A WALL LEFT: the resumed transcript still shows the wall the
+    /// session moved off, until the moved-to process is asked a turn or the move's answer is told.
+    /// Never at a sign-in menu ([`TurnEndReading::at_sign_in_menu`]): no transcript is drawn
+    /// there, so its lost login is the moved-to process's own.
     #[must_use]
     pub(super) fn login_left(&self, reading: &TurnEndReading) -> bool {
         reading.wall == Some(WallKind::Auth)
+            && !reading.at_sign_in_menu()
             && self.account.as_ref().is_some_and(|m| m.wall)
             && !self.account_asked
             && !self.account_told
@@ -13705,14 +13747,17 @@ impl TurnEndState {
     /// [`AccountPoint::LoginEnded`] though no relaunch reaches the tab, a draft stands, the tab
     /// has no task or its task is done, so the host marks the row signed out and aterm's sign-in
     /// ladder signs it in (`crate::harness::accounts_sync`'s tier 0) — the one route that asks no
-    /// person. Not over a move whose wall the session left, an answer still awaited, a login back
-    /// in another tab, or an upgrade's restart.
+    /// person. At a point, and at a sign-in menu drawn in place of the composer
+    /// ([`TurnEndReading::at_sign_in_menu`]), which is no point. Not over a move whose wall the
+    /// session left, an answer still awaited, a login back in another tab, or an upgrade's
+    /// restart.
     fn login_end_told(&self, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
         cfg.logins
             && reading.login_label.is_some()
             && moves_accounts(reading.program)
             && reading.wall == Some(WallKind::Auth)
-            && reading.at_point(self.stale_input)
+            && (reading.at_point(self.stale_input)
+                || (reading.at_sign_in_menu() && !reading.survey))
             && !reading.upgrading
             && !self.login_left(reading)
             && !self.account_answer_awaited(reading)
@@ -16608,28 +16653,22 @@ fn decide_unridden(
         }
         return ended_at(trace, "login-dialog", act);
     }
-    if reading.wall == Some(WallKind::Auth)
-        && reading.composer == Composer::Absent
-        && reading.phase == Phase::Idle
-        && reading.authoritative
-    {
-        return ended_at(
-            trace,
-            "sign-in-menu",
-            TurnEndAction::Escalate {
-                reason: format!(
-                    "the login is gone: {}",
-                    sign_in_how(reading.program, &reading.wall_message)
-                ),
-            },
-        );
-    }
     let back_elsewhere = !state.landed()
         && state.login_track().is_some()
         && (login_back_elsewhere(state, reading) || login_left_renewed(state, reading));
     let rests = state.task_done()
         && !(reading.autopilot == Autopilot::Cruise && state.landed)
         && !back_elsewhere;
+    if reading.at_sign_in_menu() {
+        let act = sign_in_menu_waits(state, reading, cfg, now, reading.taskless || rests)
+            .unwrap_or_else(|| TurnEndAction::Escalate {
+                reason: format!(
+                    "the login is gone: {}",
+                    sign_in_how(reading.program, &reading.wall_message)
+                ),
+            });
+        return ended_at(trace, "sign-in-menu", act);
+    }
     if !reading.at_point(state.stale_input) || reading.taskless || rests {
         return ended_at(trace, "no-task", TurnEndAction::Nothing);
     }
@@ -17829,7 +17868,8 @@ fn login_left_renewed(state: &TurnEndState, reading: &TurnEndReading) -> bool {
 /// the tab the wait is the move's, and where nothing moves the tab yet (no relaunch reaches it, a
 /// restart onto the row was not made, or a draft stands before the row is renewed) the wait is
 /// the row's own sign-in's, its reason naming what holds the move ([`move_held`]) — the record
-/// that stands where no route can finish. A renewed row's draft is [`renewed_draft_holds`]'s; a
+/// that stands where no route can finish. The same wait stands at a sign-in menu drawn in place
+/// of the composer ([`sign_in_menu_waits`]). A renewed row's draft is [`renewed_draft_holds`]'s; a
 /// login back in another tab, no renewal behind it, is continued from as that tab's, and a
 /// person's own `/login` left at the wall is theirs (`TurnEndState::login_cancelled`), told as
 /// before.
@@ -17916,6 +17956,53 @@ pub(super) fn login_wall_waits(
         ),
     };
     Some(wait(until, why))
+}
+
+/// A ROSTER ROW'S LOST LOGIN AT A SIGN-IN MENU ([`TurnEndReading::at_sign_in_menu`]): the row is
+/// aterm's sign-in ladder's to sign in, as at the composer's wall, so the menu asks no person. The
+/// tab waits on the row's own sign-in ([`login_wall_waits`], its reason naming what holds the
+/// move) and is relaunched onto the login the renewal made ([`login_wall_moves`]), a person's
+/// keys at the menu holding the relaunch ([`person_hold`]); a tab with no task, or one whose task
+/// is done (`idle`), is left alone, as at the composer's wall. Either way the host is told the
+/// row's login ended ([`TurnEndState::account_point`]); a menu drawn after a move is the moved-to
+/// login's own, told as the move's answer ([`TurnEndState::account_answer`]), never the wall the
+/// session left ([`TurnEndState::login_left`]). `None`, and the menu is escalated with how the
+/// agent signs in, where the login is no roster row's, `logins` is off, the agent moves no
+/// accounts (agy's and Muse Code's menus), or, for a tab with a task, [`login_wall_waits`] waits
+/// on no sign-in there (a person's own `/login` left, one typed, the login back in another tab
+/// with no renewal behind it).
+fn sign_in_menu_waits(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+    idle: bool,
+) -> Option<TurnEndAction> {
+    if !(cfg.logins && reading.login_label.is_some() && moves_accounts(reading.program)) {
+        return None;
+    }
+    if idle {
+        return Some(TurnEndAction::Nothing);
+    }
+    let wait = login_wall_waits(state, reading, cfg, now)?;
+    if let Some((until, why)) = person_hold(state, reading, cfg, now) {
+        return Some(TurnEndAction::WaitUntil {
+            until,
+            why: why.to_string(),
+            wait: WaitKind::Other,
+        });
+    }
+    Some(match login_wall_moves(state, reading, cfg, now) {
+        Some(to) => TurnEndAction::Restart {
+            why: Restart::Account {
+                to: to.to_string(),
+                at: AccountAt::Wall,
+            },
+            rule_id: RULE_ACCOUNT,
+            otherwise: Box::new(wait),
+        },
+        None => wait,
+    })
 }
 
 /// WHAT HOLDS A TAB'S MOVE ONTO ITS ROSTER ROW'S LOGIN, where something does: `relaunch` or

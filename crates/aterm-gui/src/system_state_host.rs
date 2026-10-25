@@ -12,7 +12,7 @@ use aterm_types::macos_setup::{Access, Plan, Selection};
 
 use crate::native_app::{AppKind, NativeApp};
 use crate::system_state::{
-    Admission, SetupOperation, SetupStatus, SetupStatusRow, SystemStateAction,
+    Admission, PasswordAcceptance, SetupOperation, SetupStatus, SetupStatusRow, SystemStateAction,
 };
 use crate::workstation_setup::{Request, WorkstationSetupDecision};
 use crate::{App, Wake};
@@ -94,6 +94,7 @@ pub struct InitialSetupApplyReceipt {
     admission: Admission,
     chosen: bool,
     changed: Option<Selection>,
+    password: Option<PasswordAcceptance>,
 }
 
 impl InitialSetupApplyReceipt {
@@ -101,6 +102,7 @@ impl InitialSetupApplyReceipt {
         admission: Admission,
         chosen: bool,
         changed: Option<Selection>,
+        password: Option<PasswordAcceptance>,
     ) -> (Self, Receiver<bool>) {
         let (answer, receiver) = mpsc::channel();
         (
@@ -109,6 +111,7 @@ impl InitialSetupApplyReceipt {
                 admission,
                 chosen,
                 changed,
+                password,
             },
             receiver,
         )
@@ -118,7 +121,7 @@ impl InitialSetupApplyReceipt {
     /// points, and the answer it sends ([`Self::accept`], or `false` dropped).
     #[cfg(any(test, debug_assertions))]
     pub fn detached(chosen: bool) -> (Self, Receiver<bool>) {
-        Self::new(Admission::Person, chosen, None)
+        Self::new(Admission::Person, chosen, None, None)
     }
 
     /// The settings the page changed since it last took the plan in force, which the worker
@@ -151,6 +154,9 @@ impl InitialSetupApplyReceipt {
 
     fn finish(&mut self, accepted: bool) {
         if let Some(answer) = self.answer.take() {
+            if accepted && let Some(password) = &self.password {
+                password.accept();
+            }
             let _ = answer.send(accepted);
             crate::workstation_setup::send_setup_wake(Wake::InitialSetupApplyResolved);
         }
@@ -201,6 +207,12 @@ const CHANGING_REREAD: Duration = Duration::from_millis(100);
 /// named a plan all the same, since a read that met a write says nothing of one.
 const CHANGING_READS: u8 = 10;
 
+/// How long a shown page goes before it reads its rows again by itself while the GitHub
+/// repositories need a person ([`SetupStatus::github_needs_person`]): their remedy is the
+/// vault's (a token renewed there and synced here), which tells the page nothing, so it looks
+/// again on this slow clock, as it does whenever its window regains focus (§3.6).
+pub(crate) const PERSON_REREAD: Duration = Duration::from_secs(60);
+
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observe {
@@ -238,6 +250,8 @@ pub(crate) struct Host {
     /// A refused observation start is tried again on the page's tick,
     /// no sooner than this deadline.
     observe_retry: Option<Instant>,
+    /// When the shown page's rows were last read ([`PERSON_REREAD`]).
+    observed_at: Option<Instant>,
     /// The plan in force when the shown page's rows were last read: a status
     /// that names another (a Restore in a terminal) has them read again.
     observed_plan: Option<Plan>,
@@ -502,8 +516,15 @@ impl App {
         {
             status.busy = true;
         }
+        // A dev scenario keeps the operation it names (a Restore waiting for another setup), as
+        // its actions are inert and the window asks for none.
+        let named = if self.system_state_host.showing_fixture() {
+            status.operation
+        } else {
+            None
+        };
         status.operation = if status.busy && status.running.is_empty() {
-            self.system_state_host.operation
+            self.system_state_host.operation.or(named)
         } else {
             None
         };
@@ -628,7 +649,29 @@ impl App {
         });
         if ours {
             let by_person = !self.person_gesture_refused();
-            self.native_runtime.system_state_gesture(by_person);
+            if self.native_runtime.system_state_gesture(by_person) {
+                // Stopping changes only the stable-width Apply label. Dirty
+                // every copy, retaining its presented target through release.
+                let views = self
+                    .view_store
+                    .iter()
+                    .filter_map(|(view, link)| {
+                        matches!(link, crate::tab_model::View::Native(native)
+                            if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_))))
+                        .then_some(view)
+                    })
+                    .collect::<Vec<_>>();
+                for view in views {
+                    if let Ok((wid, _)) = self.locate_native_view(view) {
+                        self.invalidate_native_view_cache(
+                            wid,
+                            view,
+                            crate::native_app::DamageRegion::All,
+                        );
+                    }
+                }
+                self.request_redraw_system_state_windows();
+            }
             // The permission gate's own evidence of whose gesture this is.
             self.note_system_state_touch();
         }
@@ -696,6 +739,14 @@ impl App {
         {
             host.shown = false;
         }
+        if host.shown
+            && host
+                .observed_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= PERSON_REREAD)
+            && host.latest_status.github_needs_person()
+        {
+            host.shown = false;
+        }
         if shown.is_empty() {
             self.system_state_host.shown = false;
             self.system_state_host.observe_retry = None;
@@ -713,6 +764,7 @@ impl App {
             host.observe_retry =
                 (observe == Observe::Refused).then_some(now + Duration::from_secs(1));
             if observe == Observe::Started {
+                host.observed_at = Some(now);
                 host.observed_plan = host.latest_status.plan.clone();
                 if !host.latest_status.changing
                     && let Some(policy) = host.latest_status.permissions
@@ -728,9 +780,9 @@ impl App {
         // The village walks only on a page someone can see, and only where a
         // view someone sees draws it.
         let seen = self.system_state_seen_views(instance);
-        let changed = self
-            .native_runtime
-            .tick_system_state(active, !shown.is_empty(), &seen);
+        let changed =
+            self.native_runtime
+                .tick_system_state_at(now, active, !shown.is_empty(), &seen);
         self.drain_system_state_actions();
         if !self.system_state_host.status_in_flight {
             self.system_state_host.next_status.get_or_insert(now);
@@ -770,8 +822,12 @@ impl App {
     /// Publish visibility before another event or worker step can use it.
     /// Closing a passive copy keeps the visible page's authority; losing the
     /// last front page withdraws it even while a hidden controller survives.
-    pub(crate) fn publish_system_state_front(&self) {
-        aterm_types::macos_setup::set_system_state_front(self.system_state_frontmost());
+    pub(crate) fn publish_system_state_front(&mut self) {
+        let front = self.system_state_frontmost();
+        if !front {
+            self.native_runtime.pause_system_state_review();
+        }
+        aterm_types::macos_setup::set_system_state_front(front);
     }
 
     /// Whether a System State view is the visible, active view of a focused,
@@ -868,7 +924,7 @@ impl App {
     }
 
     /// Whether the page has been presented in a focused window and is still
-    /// in front there: the moment the first-run offer applies (§3.5).
+    /// in front there: only then can the first-launch countdown advance.
     fn system_state_presented_active(
         &mut self,
         instance: crate::native_app::AppInstanceId,
@@ -999,9 +1055,12 @@ impl App {
         ) {
             self.system_state_host.shown = false;
             self.system_state_host.observe_retry = None;
+            self.native_runtime
+                .finish_system_state_close(instance, scope);
+            // Retire the ended offer before a reopened page can submit a new
+            // intent; that intent belongs to its manual handler, not this request.
+            self.resolve_withdrawn_system_state_offer(Instant::now());
         }
-        self.native_runtime
-            .finish_system_state_close(instance, scope);
     }
 
     fn run_system_state_action_with_handlers(
@@ -1010,6 +1069,16 @@ impl App {
         handlers: Option<InitialSetupHandlers>,
     ) {
         match action {
+            SystemStateAction::CancelReview => {
+                let _ = self.take_system_state_press();
+                if let Some(request) = self.system_state_host.pending.take() {
+                    request.finish(WorkstationSetupDecision::Cancelled);
+                }
+                self.begin_system_state_action(false, false);
+                self.recheck_initial_setup_permissions();
+                self.finish_system_state_action(true, "Setup");
+                self.refresh_system_state_tab_indicators();
+            }
             // Stop changes no plan or status generation. It withdraws future
             // automatic gestures locally even when the durable run already
             // finished, and the worker keeps its ordinary durable Stop.
@@ -1060,8 +1129,20 @@ impl App {
                 self.note_system_state_apply(admission);
                 self.system_state_host.operation = None;
                 aterm_log::info!("system state: submitting a plan ({admission:?})");
-                let (receipt, receiver) =
-                    InitialSetupApplyReceipt::new(admission, answer.chosen, answer.changed);
+                let password = answer.password.as_ref().and_then(|_| {
+                    match self.native_runtime.app(instance) {
+                        Some(NativeApp::SystemState(state)) => {
+                            state.pending_password_acceptance(&plan)
+                        }
+                        _ => None,
+                    }
+                });
+                let (receipt, receiver) = InitialSetupApplyReceipt::new(
+                    admission,
+                    answer.chosen,
+                    answer.changed,
+                    password,
+                );
                 self.system_state_host.pending_apply = Some(PendingApply {
                     instance,
                     admission,
@@ -1102,8 +1183,16 @@ impl App {
                 });
                 // Only its own check is labelled one: a pass that held the
                 // worker is a run, with its Stop and meter (§3.2). Its forced
-                // reading ran all the same, so Check again did start.
-                self.system_state_host.operation = started.check.then_some(SetupOperation::Check);
+                // reading ran all the same, so Check again did start. A Restore
+                // waiting for another setup holds the worker, and stays the
+                // Restore it is (§3.4).
+                self.system_state_host.operation = if started.check {
+                    Some(SetupOperation::Check)
+                } else {
+                    self.system_state_host
+                        .operation
+                        .filter(|operation| *operation == SetupOperation::Restore)
+                };
                 self.finish_system_state_action(started.reading || started.check, "Check again");
             }
             SystemStateAction::Restore => {
@@ -1167,6 +1256,11 @@ impl App {
     }
 
     pub(crate) fn resolve_system_state_apply(&mut self) {
+        // A superseded Join can still be accepted. Consume only its exact
+        // password, never its old plan or permission decision.
+        if self.native_runtime.forget_accepted_system_state_password() {
+            self.request_redraw_system_state_windows();
+        }
         let Some(pending) = self.system_state_host.pending_apply.as_ref() else {
             return;
         };

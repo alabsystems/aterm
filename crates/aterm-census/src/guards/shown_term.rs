@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! shown-term: render code fetches a session's terminal as shown, never `Session.term` direct.
+//! shown-term: render and find code fetch a session's terminal as shown, never `Session.term` direct.
 
 use super::rules::test_path;
 use super::{Bound, Finding, Rule, Tree, hits, is_word};
 
 const RENDER: &[&str] = &[
     "crates/aterm-gui/src/app_render.rs",
+    "crates/aterm-gui/src/app_search.rs",
     "crates/aterm-gui/src/pane_chrome.rs",
 ];
 
@@ -17,10 +18,11 @@ const SHOWN: &[&str] = &["front_terminal", "st", "glide"];
 pub(super) const SHOWN_TERM: Rule = Rule {
     id: "shown-term",
     why: "a rewound pane shows the past screen its Rewind view replayed \
-          (docs/DESIGN-aos-hosted-execution-2026-10-21.md §14.4.2), so render code that reads \
-          `Session.term`, or takes `front_terminal_mirror`, draws the live screen over it: \
-          fetch through `SessionPool::shown_term`, `SessionPool::shown` or `App::shown_front`, \
-          and name `Session::live_term` where the live terminal is meant (a resize, a report)",
+          (docs/DESIGN-aos-hosted-execution-2026-10-21.md §14.4.2), so render or find code that \
+          reads `Session.term`, or takes `front_terminal_mirror`, draws or counts the live screen \
+          over it: fetch through `SessionPool::shown_term`, `SessionPool::shown`, \
+          `App::shown_front` or `App::front_shown`, and name `Session::live_term` where the live \
+          terminal is meant (a resize, a report)",
     scope: RENDER,
     check: shown_term,
 };
@@ -121,13 +123,14 @@ mod tests {
             &SHOWN_TERM,
             &[
                 ("crates/aterm-gui/src/app_render.rs", planted),
+                ("crates/aterm-gui/src/app_search.rs", planted),
                 ("crates/aterm-gui/src/pane_chrome.rs", planted),
                 ("crates/aterm-gui/src/app_input.rs", planted),
             ],
         );
         let lines = [1, 2, 3, 8];
         let mut want: Vec<String> = Vec::new();
-        for file in ["app_render.rs", "pane_chrome.rs"] {
+        for file in ["app_render.rs", "app_search.rs", "pane_chrome.rs"] {
             want.extend(
                 lines
                     .iter()

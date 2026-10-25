@@ -633,11 +633,7 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
                 false,
             ),
         ];
-        out.push((
-            "sprites",
-            input,
-            vec![S::FxLinearUnder, S::GlyphKnock, S::FxLinearOver],
-        ));
+        out.push(("sprites", input, vec![S::FxKnockUnder, S::FxLinearOver]));
     }
 
     for (name, frac) in [("scroll", 1i32), ("scroll_down", -1)] {

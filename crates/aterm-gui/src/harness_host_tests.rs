@@ -12180,6 +12180,9 @@ fn a_claim_whose_transaction_failed_after_its_save_is_ended() {
     let a = Accts::new();
     walled(&a, sid, ACCT_TALK_A, LONG_WALL);
     walled(&a, other_sid, ACCT_TALK_B, LONG_WALL);
+    // A missing snapshot beside a ledger is unknown. Start from readable state
+    // so the ledger directory fails the append after the claim was saved.
+    a.store().save(&a.state()).unwrap();
     std::fs::create_dir_all(a.store().ledger_path()).unwrap();
     let idle = a.worker(sid, &resetting());
     assert_eq!(idle.reset_claimed(&ask, &mut None), Err(NoReset::State));
@@ -32913,11 +32916,15 @@ fn the_disk_free_line_goes_only_to_the_tab_it_is_owed_at_its_turn_break_and_keep
         tabs.iter().all(|sid| disk_ask_owed(&BOARD, sid).is_none()),
         "typed or released, nothing stays owed"
     );
+    let own = |why| crate::disk_board::Unfit {
+        own: Some(why),
+        theirs: None,
+    };
     assert_eq!(
         BOARD.board_lock().unfit,
         BTreeMap::from([
-            ("s-df-finished".to_string(), "finished"),
-            ("s-df-taskless".to_string(), "taskless"),
+            ("s-df-finished".to_string(), own("finished")),
+            ("s-df-taskless".to_string(), own("taskless")),
         ]),
         "every turn break tells the look's seats which tabs may not be asked, owed or not"
     );
@@ -32972,7 +32979,13 @@ fn the_disk_free_line_waits_out_a_persons_grace_and_is_released_from_a_session_t
             );
         });
     };
-    let unfit = || BOARD.board_lock().unfit.get("s-df-held").copied();
+    let unfit = || {
+        BOARD
+            .board_lock()
+            .unfit
+            .get("s-df-held")
+            .and_then(|found| found.bars(false))
+    };
     let point = |held: Option<Guard>, theirs: Option<Guard>| IdlePoint {
         held,
         theirs,
@@ -33030,6 +33043,75 @@ fn the_disk_free_line_waits_out_a_persons_grace_and_is_released_from_a_session_t
         "the act is told what holds each turn break"
     );
     assert!(disk_ask_owed(&BOARD, "s-df-held").is_none());
+}
+
+/// The loop tells the worker of every decided turn break before it asks whether the worker wants a
+/// step there ([`IdleHost::turn_break`]), and the worker writes what it finds of the session there
+/// to the board every disk look seats sessions by, though it owes the session no line and wants no
+/// step: a tab whose task finished is found unfit, the same tab given a task again is found fit,
+/// and one a manager waits on is theirs. A finding made only where a line was owed went stale
+/// once the session was fit again, so a later episode never nominated it, and a session never
+/// owed a line was never found unfit. The tab's first busy read drops what it found of the session
+/// itself (it was given something to do) and keeps whose it is.
+#[test]
+fn every_turn_break_finds_the_tab_fit_or_unfit_though_it_is_owed_no_disk_free_line() {
+    use aterm_agent::supervise::IdleHost;
+    static BOARD: Shelf = Shelf::new();
+    let world = Arc::new(World::default());
+    let finished = Arc::new(AtomicBool::new(true));
+    let f = Arc::clone(&finished);
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_free: Arc::new(|sid, _, _, _| panic!("{sid}: no line is owed, so none is stepped")),
+        finished: Arc::new(move |_, _, _| Some(f.load(Ordering::SeqCst))),
+        tasked: Arc::new(|_, _, _| Some(true)),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let mut idle = idle_of(
+        hooks,
+        Program::Claude,
+        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+    );
+    idle.sid = "s-df-break".to_string();
+    idle.park.store(false, Ordering::SeqCst);
+    let found = || BOARD.board_lock().unfit.get("s-df-break").copied();
+    let own = |why| {
+        Some(crate::disk_board::Unfit {
+            own: Some(why),
+            theirs: None,
+        })
+    };
+    assert!(!idle.wants(), "owed nothing, the worker wants no step");
+    idle.turn_break(None);
+    assert_eq!(found(), own("finished"), "its task finished");
+    idle.busy_tap();
+    assert_eq!(
+        found(),
+        None,
+        "it works again: someone gave it something to do"
+    );
+    idle.turn_break(None);
+    assert_eq!(
+        found(),
+        own("finished"),
+        "its next turn break finds it again"
+    );
+    finished.store(false, Ordering::SeqCst);
+    idle.turn_break(None);
+    assert_eq!(found(), None, "given a task again, it may be asked again");
+    idle.turn_break(Some(Guard::Managed));
+    let managed = Some(crate::disk_board::Unfit {
+        own: None,
+        theirs: Some("managed"),
+    });
+    assert_eq!(found(), managed, "a manager waits on it");
+    idle.busy_tap();
+    assert_eq!(found(), managed, "the manager's for as long as it keeps it");
+    idle.turn_break(None);
+    assert_eq!(found(), None, "and the manager let it go");
+    assert!(!idle.wants(), "still owed nothing");
 }
 
 /// The disk resume is a carry-on, so it is typed into no turn break the loop holds for a person:

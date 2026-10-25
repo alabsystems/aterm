@@ -1142,6 +1142,73 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     assert_eq!(app.windows[&wid].pane_overlay.hover, None);
 }
 
+/// A track click or a thumb press on a rewound pane's bar is withheld: the live view stays at the bottom and no drag begins.
+#[test]
+fn a_scrollbar_press_on_a_rewound_pane_moves_no_live_view() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.config.scrollbar = Some(true);
+    app.windows.get_mut(&wid).expect("window").metrics.pad = 12;
+    let session = app.front_terminal(wid).expect("front").session;
+    assert_eq!(session, 0, "fixture: the recording helpers drive session 0");
+    crate::rewind::tests::start_recording(&app);
+    let lines: String = (0..400).map(|i| format!("line {i}\r\n")).collect();
+    let _ = crate::rewind::tests::slice(&app, lines.as_bytes());
+    let now = Instant::now();
+    let refresh = |app: &mut App| {
+        let plan = app.active_visible_leaf_plan(wid).expect("plan");
+        app.refresh_pane_overlay_for_capture(wid, &plan, now);
+    };
+    let live = app.pool.get(session).expect("session").live_term().clone();
+    let offset = || crate::term_lock(&live).grid().display_offset();
+    let press = |app: &mut App, gy: u32| {
+        refresh(app);
+        let facts = app.windows[&wid].pane_overlay.facts()[0];
+        assert!(
+            facts.history > 0 && facts.offset == 0,
+            "fixture: history to scroll"
+        );
+        let inputs = app.pane_overlay_inputs(wid, false).expect("inputs");
+        let (cw, ch) = inputs.cell;
+        let m = Metrics::for_cell(cw as u32, ch as u32);
+        let lane = scrollbar::lane(
+            (0, 0, facts.rect.rows, facts.rect.cols),
+            inputs.win_cols,
+            inputs.cell,
+            inputs.pad,
+            m,
+        )
+        .expect("lane");
+        let (top, len) =
+            scrollbar::thumb(lane, facts.rect.rows as u32, facts.history, 0, m).expect("thumb");
+        let y = if gy == 0 { lane.top + 1 } else { top + len / 2 };
+        let (wx, wy) = window_px(app, wid, f64::from(lane.right) - 3.0, f64::from(y));
+        app.windows.get_mut(&wid).expect("window").last_cursor_px = (wx, wy);
+        app.scrollbar_press(wid)
+    };
+    app.rewind_open(session, crate::rewind::Target::Latest, None)
+        .expect("open");
+    assert!(press(&mut app, 0), "the bar takes the track click");
+    assert_eq!(offset(), 0, "the live view stays at the bottom");
+    assert!(
+        app.messages
+            .live_by_key("session.rewind-read-only.0")
+            .is_some(),
+        "the click is withheld in words"
+    );
+    assert!(press(&mut app, 1), "the bar takes the thumb press");
+    assert!(
+        app.windows[&wid].pane_overlay.drag.is_none(),
+        "no drag begins"
+    );
+    assert!(app.rewind_close(session));
+    assert!(press(&mut app, 0));
+    assert!(
+        offset() > 0,
+        "negative control: live, the track click pages the view"
+    );
+}
+
 #[test]
 fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
     let mut app = App::headless_for_test();

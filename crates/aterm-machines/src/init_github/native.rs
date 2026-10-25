@@ -11,11 +11,16 @@ use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
 use crate::port::{GithubError, GithubFailure, Secret, System};
 use aterm_converge::{Class, Layer, Remedy, Requires};
+use aterm_types::macos_setup::FailureKind;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
 const ACCESSIBLE: &str = "/user/repos?visibility=all&per_page=30&sort=full_name&direction=asc";
+
+/// The step a person takes for the GitHub sign-in or settings a repository needs, as the
+/// engine names it beside their remedy.
+const GITHUB_STEP: &str = "github.sign-in";
 
 pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemReport>, String> {
     run_with(sys, ctx, mode, None)
@@ -174,7 +179,7 @@ impl Item for NativeRepositories {
                 from: format!("{missing} of {count} repositories missing, or native GitHub credentials need setup"),
                 to: "configure native GitHub credentials and clone missing repositories; preserve existing worktrees".into(),
             },
-            Err(block) => Probe::Blocked { why: block.why },
+            Err(block) => block.probe(),
         }
     }
 
@@ -226,6 +231,19 @@ struct Block {
 }
 
 impl Block {
+    /// The probe's answer for this block (System State design §3.6): a person's step where only
+    /// their act ends the wait ([`Wait::kind`]), so its row needs them and no pass retries it,
+    /// else a wait that ends by itself.
+    fn probe(self) -> Probe {
+        match self.wait {
+            Some(wait) if wait.kind() == FailureKind::NeedsPerson => Probe::Person {
+                step: GITHUB_STEP.into(),
+                how: self.why,
+            },
+            _ => Probe::Blocked { why: self.why },
+        }
+    }
+
     /// A step that stopped for `wait`, with its line.
     fn of(wait: Wait) -> impl FnOnce(String) -> Self {
         move |why| Self {
@@ -490,7 +508,8 @@ mod tests {
         );
         let rows = run_captured(&sys, &ctx, Mode::Plan, captured, Box::new(|| Ok(true))).unwrap();
         assert_eq!(Reading::of(&rows[0]), Some(Reading::Waits(Wait::Token)));
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Blocked);
+        // The vault this Mac reads holds no GitHub token: only a person puts one there.
+        assert_eq!(rows[0].outcome, crate::model::Outcome::Person);
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
@@ -669,7 +688,9 @@ mod tests {
     }
 
     /// Every blocked step's reason is decided where it stopped, never from the engine's line, and
-    /// the Repositories row's note is its words; a step that decides none gives no note.
+    /// the Repositories row's note is its words; a step that decides none gives no note. Where
+    /// only a person ends it (a sign-in, aterm's GitHub settings, a folder in the way, Apple's
+    /// Command Line Tools), the step is theirs and the row needs them, with their remedy.
     #[test]
     fn every_blocked_step_says_why_in_system_states_words() {
         use crate::init_observe::observation;
@@ -801,14 +822,22 @@ mod tests {
             // The pass System State's reading runs: a plan.
             let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
             let rows = run(&sys, &context, Mode::Plan).unwrap();
-            assert_eq!(rows[0].outcome, crate::model::Outcome::Blocked, "{case}");
+            // Only a person ends a wait for their sign-in, settings or folder: their step, which
+            // parks a run (design §3.6); GitHub not answering ends by itself.
+            let person = wait.is_some_and(|wait| wait.kind() == FailureKind::NeedsPerson);
+            let (outcome, standing) = if person {
+                (crate::model::Outcome::Person, Standing::NeedsYou)
+            } else {
+                (crate::model::Outcome::Blocked, Standing::Waiting)
+            };
+            assert_eq!(rows[0].outcome, outcome, "{case}");
             assert_eq!(
                 Reading::of(&rows[0]),
                 wait.map(Reading::Waits),
                 "{case}: {rows:?}"
             );
             let seen = observation(Setting::Repositories, &[&rows[0]]);
-            assert_eq!(seen.standing, Standing::Waiting, "{case}");
+            assert_eq!(seen.standing, standing, "{case}");
             assert_eq!(seen.note.as_deref(), wait.map(Wait::note), "{case}");
             let line = rows[0].why.as_deref().unwrap();
             assert!(

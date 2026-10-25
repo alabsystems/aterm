@@ -18,24 +18,26 @@ pub use initial::{
     BroughtForward, InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
     InitialSetupSnapshotError, InitialSetupUpgrade, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
-    SetupUpgrade, StageEvent, alab_mac, apply_initial_setup, apply_initial_setup_observed,
-    automatic_plan, bring_forward_restored_setup, bring_forward_restored_setup_observing,
-    check_initial_setup, check_initial_setup_observed, forget_set_aside_setup,
-    initial_setup_access_revision, initial_setup_access_step, initial_setup_admission,
-    initial_setup_finished, initial_setup_keeps_vault_sync, initial_setup_observation,
-    initial_setup_park_mark, initial_setup_review_revision, initial_setup_revision,
-    initial_setup_snapshot, observe_initial_setup, probe_local_network_again,
-    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
-    restart_initial_setup, restart_initial_setup_observed, run_initial_setup_pass,
-    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, upgrade_provisional_setup,
-    validate_initial_setup_plan, with_initial_setup_vault_sync,
+    SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, alab_mac, apply_initial_setup,
+    apply_initial_setup_observed, automatic_plan, bring_forward_restored_setup,
+    bring_forward_restored_setup_observing, check_initial_setup, check_initial_setup_observed,
+    forget_set_aside_setup, initial_setup_access_revision, initial_setup_access_step,
+    initial_setup_admission, initial_setup_finished, initial_setup_keeps_vault_sync,
+    initial_setup_observation, initial_setup_park_mark, initial_setup_review_revision,
+    initial_setup_revision, initial_setup_snapshot, observe_initial_setup,
+    probe_local_network_again, provisional_setup_widens, put_back_held_initial_setup,
+    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
+    run_initial_setup_pass, set_aside_unreadable_setup, set_aside_unreadable_setup_observing,
+    setup_is_newer, setup_records_held, upgrade_provisional_setup, validate_initial_setup_plan,
+    vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
     InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, ProvisionalSetupWatchTest,
     initial_setup_observation_at, initial_setup_snapshot_at, set_aside_unreadable_setup_at,
-    set_aside_unreadable_setup_at_observing, set_aside_unreadable_setup_at_observing_done_error,
-    with_initial_setup_vault_sync_at,
+    set_aside_unreadable_setup_at_observing,
+    set_aside_unreadable_setup_at_observing_before_checkpoint,
+    set_aside_unreadable_setup_at_observing_done_error, with_initial_setup_vault_sync_at,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -138,13 +140,20 @@ impl Report {
             .map(|row| row.detail.as_str())
     }
 
-    /// Whether a setting or account remains out of policy, blocked, unverified or failed.
+    /// Whether a setting or account remains out of policy, blocked, unverified or failed, for
+    /// now or for good.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         self.rows.iter().any(|r| {
             matches!(
                 r.status.as_str(),
-                "drift" | "error" | "blocked" | "waiting" | "unreached" | "unverified"
+                "drift"
+                    | "error"
+                    | "blocked"
+                    | "waiting"
+                    | "unreached"
+                    | "unverified"
+                    | aterm_types::macos_setup::FAILED_FOR_GOOD
             )
         })
     }
@@ -222,6 +231,45 @@ pub fn run_observed(action: Action) -> InitialSetupObserved<Report> {
     })
 }
 
+/// System State's Restore previous settings, as [`run_observed`] runs a Restore, saying `waits`
+/// the moment its own attempt finds the profile lock another setup holds, so the page shows it
+/// waiting from then (design §3.4), and asking `holding` once it holds the lock, before its
+/// first write: the page shows it restoring from then, and `false` (a group press overtook it
+/// meanwhile) lets it go having changed nothing, `Ok(None)`.
+pub fn restore_observed(
+    waits: impl FnMut(),
+    holding: impl FnOnce() -> bool,
+) -> InitialSetupObserved<Option<Report>> {
+    initial::observe_person(|root, before| {
+        restore_at(
+            &mut NativeHost::new(),
+            root,
+            before,
+            initial::choice_lock_wait(),
+            waits,
+            holding,
+        )
+    })
+}
+
+/// [`restore_observed`] at `root`, `wait` waiting for the profile lock another holds as a
+/// choice does ([`mutation_observed`]).
+fn restore_at(
+    host: &mut dyn Host,
+    root: &Path,
+    before: Option<InitialSetupObservation>,
+    wait: impl FnMut() -> bool,
+    waits: impl FnMut(),
+    holding: impl FnOnce() -> bool,
+) -> InitialSetupObserved<Option<Report>> {
+    initial::observe_choice_at(root, before, initial::noting_first(waits, wait), |root| {
+        if !holding() {
+            return Ok(None);
+        }
+        run_mutation(host, root, Action::Restore).map(Some)
+    })
+}
+
 /// [`run_observed`]'s Apply or Restore at `root`, under the profile lock. A Restore is a
 /// person's press, as a choice is: it waits for the lock another holds for one short write (the
 /// ALab watch widening a plan, a Stop's fold), asking again while `wait` says so, and is refused
@@ -293,18 +341,18 @@ fn authorize_automatic_setup_at(root: &Path, selected: Selection) -> Result<(), 
     save_automatic_plan(root, selected)?;
     write_json(
         &root.join("first-run.json"),
-        &if selected.is_empty() {
+        &initial::stamped(if selected.is_empty() {
             json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true })
         } else {
             json!({ "profile": PROFILE, "state": "pending" })
-        },
+        }),
     )
 }
 
 fn save_automatic_plan(root: &Path, selected: Selection) -> Result<(), String> {
     write_json(
         &root.join("automatic-plan.json"),
-        &json!({ "profile": PROFILE, "selection": selected.bits() }),
+        &initial::stamped(json!({ "profile": PROFILE, "selection": selected.bits() })),
     )
 }
 
@@ -326,12 +374,9 @@ fn authorized_selection_with_flush(
     if plan["profile"].as_str() != Some(PROFILE) {
         return Err("unrecognized automatic setup profile".into());
     }
-    let bits = plan["selection"]
-        .as_u64()
-        .and_then(|bits| u16::try_from(bits).ok());
-    let selected = bits
-        .and_then(Selection::from_bits)
-        .ok_or("unrecognized automatic setup selection")?;
+    initial::known_format(&plan)?;
+    let selected =
+        initial::known_selection(&plan["selection"], "unrecognized automatic setup selection")?;
     flush_record_with(&path, flush)?;
     Ok(Some(selected))
 }
@@ -4038,6 +4083,65 @@ mod tests {
         let _holder = HeldLock::take(root.path()).unwrap();
         let refused = mutation_observed(&mut host, root.path(), None, Action::Restore, || false);
         assert_eq!(refused.result.unwrap_err(), SETUP_BUSY);
+    }
+
+    /// System State's Restore says the moment its own attempt finds the profile lock another
+    /// setup holds, so the page shows it waiting from then, not only once a later look finds
+    /// the records held; and once it holds the lock, before its first write, it asks whether a
+    /// group press overtook it while it waited: one that did lets it go having changed nothing
+    /// (design §3.4), and otherwise it puts the saved settings back.
+    #[test]
+    fn restore_says_when_it_waits_and_asks_before_its_first_write() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let target = Target::new("com.apple.AppleMultitouchTrackpad", "TrackpadScroll");
+        save_backup(
+            &root.path().join("original-preferences.json"),
+            &[Saved {
+                target: target.clone(),
+                value: Some(PValue::Bool(false)),
+                granted: true,
+            }],
+        )
+        .unwrap();
+        let mut host = Fake::default();
+        host.values.insert(target.clone(), PValue::Bool(true));
+        let holder = HeldLock::take(root.path()).unwrap();
+        let mut waited = 0;
+        let refused = restore_at(
+            &mut host,
+            root.path(),
+            None,
+            || false,
+            || waited += 1,
+            || panic!("it never held the records"),
+        );
+        assert_eq!(refused.result.unwrap_err(), SETUP_BUSY);
+        assert_eq!(waited, 1, "said once, as it found the lock held");
+        drop(holder);
+        let overtaken = restore_at(
+            &mut host,
+            root.path(),
+            None,
+            || false,
+            || panic!("the lock was free"),
+            || false,
+        );
+        assert!(overtaken.result.unwrap().is_none(), "let go");
+        assert_eq!(
+            host.read(&target).unwrap(),
+            Some(PValue::Bool(true)),
+            "it changed nothing"
+        );
+        let restored = restore_at(
+            &mut host,
+            root.path(),
+            None,
+            || false,
+            || panic!("the lock was free"),
+            || true,
+        );
+        assert!(restored.result.unwrap().is_some());
+        assert_eq!(host.read(&target).unwrap(), Some(PValue::Bool(false)));
     }
 
     #[test]

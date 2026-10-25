@@ -266,6 +266,7 @@ struct Seen {
 
 /// How long a copy must stand beside a line, seen on every sampled frame between, to be its twin ([`Seen::pending`]).
 pub const TWIN_MIN: Duration = Duration::from_millis(40);
+const TWIN_MIN_MS: u32 = TWIN_MIN.as_millis() as u32;
 
 /// The follow pass's row offsets, nearest first: one row up, one row down, then two.
 pub(super) const FOLLOW_DRS: [i16; 4] = [-1, 1, -2, 2];
@@ -327,7 +328,7 @@ impl Seen {
             } else if self.pending & bit == 0 {
                 self.pending |= bit;
                 self.pend_ms[k] = age;
-            } else if u128::from(age.saturating_sub(self.pend_ms[k])) >= TWIN_MIN.as_millis() {
+            } else if age.saturating_sub(self.pend_ms[k]) >= TWIN_MIN_MS {
                 self.twin |= bit;
             }
         }
@@ -580,6 +581,10 @@ impl Witness {
         let mut sample_row: Option<(u16, bool)> = None;
         for cell in cells {
             if !cell.leaving() {
+                let run = (cell.row, cell.cohort);
+                if self.follow_runs.last() == Some(&run) {
+                    continue;
+                }
                 let sampled = match sample_row {
                     Some((r, ok)) if r == cell.row => ok,
                     _ => {
@@ -589,7 +594,7 @@ impl Witness {
                     }
                 };
                 if sampled {
-                    self.follow_runs.push((cell.row, cell.cohort));
+                    self.follow_runs.push(run);
                 }
             }
         }
@@ -620,25 +625,34 @@ impl Witness {
         rode_to: Option<u16>,
     ) -> Option<FollowRun> {
         let last = hand.1.checked_sub(1)?;
-        let cohort = cells
-            .iter()
-            .filter(|c| !c.leaving() && c.typing && c.row == hand.0 && c.col == last)
-            .max_by_key(|c| c.born)?
-            .cohort;
-        let glyph = cells
-            .iter()
-            .filter(|c| {
-                !c.leaving()
-                    && c.typing
-                    && c.row == hand.0
-                    && c.cohort == cohort
-                    && c.col <= last
-                    && self
-                        .find(c.row, c.col, c.born)
-                        .is_some_and(|i| !self.seen[i].released)
-            })
-            .map(|c| c.col)
-            .max()?;
+        let mut best_cell: Option<(Instant, u32)> = None;
+        for c in cells {
+            if !c.leaving()
+                && c.typing
+                && c.row == hand.0
+                && c.col == last
+                && best_cell.is_none_or(|(b, _)| c.born >= b)
+            {
+                best_cell = Some((c.born, c.cohort));
+            }
+        }
+        let cohort = best_cell?.1;
+        let mut glyph: Option<u16> = None;
+        for c in cells {
+            if !c.leaving()
+                && c.typing
+                && c.row == hand.0
+                && c.cohort == cohort
+                && c.col <= last
+                && glyph.is_none_or(|g| c.col > g)
+                && self
+                    .find(c.row, c.col, c.born)
+                    .is_some_and(|i| !self.seen[i].released)
+            {
+                glyph = Some(c.col);
+            }
+        }
+        let glyph = glyph?;
         let sole = rode_to.map_or(SoleArrival::Refused, |to| SoleArrival::Hand { glyph, to });
         self.judge_follow(cells, rows, (hand.0, cohort), true, sole)
             .0
@@ -682,7 +696,12 @@ impl Witness {
         self.follow_armed.sort_unstable_by_key(|a| a.0);
         self.follow_armed.dedup_by_key(|a| a.0);
         let armed = self.follow_armed.len();
-        let gone = self.follow_armed.iter().filter(|a| a.2).count();
+        let mut gone = 0usize;
+        for a in &self.follow_armed {
+            if a.2 {
+                gone += 1;
+            }
+        }
         let floor = if matches!(sole, SoleArrival::Hand { .. }) {
             1
         } else {
@@ -693,13 +712,25 @@ impl Witness {
         }
         let relaid = Self::relaid_suffix(&self.follow_armed, own.cols);
         let mut evidence = false;
-        let back = i16::try_from(carry).ok().filter(|&dr| dr > 0);
-        let offsets = back
-            .map(|dr| (RETURN_K, dr))
-            .into_iter()
-            .chain((caret_carry != 0).then_some((CARRY_K, caret_carry)))
-            .chain(FOLLOW_DRS.into_iter().enumerate());
-        for (k, dr) in offsets {
+        let mut offsets = [(0usize, 0i16); 6];
+        let mut n_off = 0usize;
+        if let Ok(dr) = i16::try_from(carry)
+            && dr > 0
+        {
+            offsets[n_off] = (RETURN_K, dr);
+            n_off += 1;
+        }
+        if caret_carry != 0 {
+            offsets[n_off] = (CARRY_K, caret_carry);
+            n_off += 1;
+        }
+        let mut fi = 0usize;
+        while fi < FOLLOW_DRS.len() {
+            offsets[n_off] = (fi, FOLLOW_DRS[fi]);
+            n_off += 1;
+            fi += 1;
+        }
+        for &(k, dr) in &offsets[..n_off] {
             let Some(target) = row.checked_add_signed(dr) else {
                 continue;
             };
@@ -748,17 +779,29 @@ impl Witness {
                     .ok()
                     .map(|i| self.follow_armed[i])
             };
-            let beyond_hi = self
-                .follow_armed
-                .iter()
-                .rev()
-                .take_while(|a| a.0 > hi)
-                .any(|a| !neutral(a.0, a.1, a.3));
-            let beyond_lo = self
-                .follow_armed
-                .iter()
-                .take_while(|a| a.0 < lo)
-                .any(|a| !neutral(a.0, a.1, a.3));
+            let mut beyond_hi = false;
+            let mut idx_hi = self.follow_armed.len();
+            while idx_hi > 0 {
+                idx_hi -= 1;
+                let a = self.follow_armed[idx_hi];
+                if a.0 <= hi {
+                    break;
+                }
+                if !neutral(a.0, a.1, a.3) {
+                    beyond_hi = true;
+                    break;
+                }
+            }
+            let mut beyond_lo = false;
+            for &a in &self.follow_armed {
+                if a.0 >= lo {
+                    break;
+                }
+                if !neutral(a.0, a.1, a.3) {
+                    beyond_lo = true;
+                    break;
+                }
+            }
             while let Some(next) = hi.checked_add(1) {
                 let grows = match armed_at(next) {
                     Some(a) => neutral(a.0, a.1, a.3),
@@ -912,6 +955,10 @@ impl Witness {
             if cell.leaving() {
                 continue;
             }
+            let run = (cell.row, cell.cohort);
+            if self.follow_runs.last() == Some(&run) {
+                continue;
+            }
             let own = match sample_row {
                 Some((r, s)) if r == cell.row => s,
                 _ => {
@@ -927,7 +974,7 @@ impl Witness {
                 .find(cell.row, cell.col, cell.born)
                 .is_some_and(|i| unit_at(own.cols, cell.col) != self.seen[i].unit);
             if gone {
-                self.follow_runs.push((cell.row, cell.cohort));
+                self.follow_runs.push(run);
             }
         }
         if self.follow_runs.is_empty() {
@@ -1419,11 +1466,16 @@ impl Witness {
         let mut i = 0;
         while i < self.blanked.len() {
             let run = (self.blanked[i].row, self.blanked[i].cohort);
-            let end = i + self.blanked[i..]
-                .iter()
-                .take_while(|b| (b.row, b.cohort) == run)
-                .count();
-            let fresh_end = i + self.blanked[i..end].iter().take_while(|b| !b.held).count();
+            let mut end = i + 1;
+            while end < self.blanked.len()
+                && (self.blanked[end].row, self.blanked[end].cohort) == run
+            {
+                end += 1;
+            }
+            let mut fresh_end = i;
+            while fresh_end < end && !self.blanked[fresh_end].held {
+                fresh_end += 1;
+            }
             let fast = self.retired_runs.contains(&run)
                 || (self.standing_glyphs_of(run).is_empty()
                     && Self::moved(&self.blanked[i..fresh_end], rows));
@@ -1465,14 +1517,12 @@ impl Witness {
                 self.seen[i].counted = true;
             }
         }
-        let recounted = if self.counted_names.is_empty() {
-            0
-        } else {
-            self.counted_names
-                .iter()
-                .filter(|id| retire.contains(id) || release.contains(id))
-                .count()
-        };
+        let mut recounted = 0usize;
+        for id in &self.counted_names {
+            if retire.contains(id) || release.contains(id) {
+                recounted += 1;
+            }
+        }
         self.find_standing_runs(cells, retire);
         self.released_runs.sort_unstable();
         if !self.retired_runs.is_empty() || !self.released_runs.is_empty() {
@@ -1699,13 +1749,24 @@ impl Witness {
         let mut k = 0;
         while k < self.blind_changed.len() {
             let run = (self.blind_changed[k].row, self.blind_changed[k].cohort);
-            let end = k + self.blind_changed[k..]
-                .iter()
-                .take_while(|b| (b.row, b.cohort) == run)
-                .count();
+            let mut end = k + 1;
+            while end < self.blind_changed.len()
+                && (self.blind_changed[end].row, self.blind_changed[end].cohort) == run
+            {
+                end += 1;
+            }
             let records = &self.blind_changed[k..end];
-            let changed = records.iter().filter(|b| b.changed).count();
-            if changed >= 2 && changed * 2 >= records.len() && !records.iter().any(|b| b.deferred) {
+            let mut changed = 0usize;
+            let mut any_deferred = false;
+            for b in records {
+                if b.changed {
+                    changed += 1;
+                }
+                if b.deferred {
+                    any_deferred = true;
+                }
+            }
+            if !any_deferred && changed >= 2 && changed * 2 >= records.len() {
                 self.deferred_runs.push(run);
             }
             k = end;
@@ -1761,11 +1822,12 @@ impl Witness {
             if self.run_ids.is_empty() || !standing || lo_n <= lo_r || hi_n >= hi_r {
                 continue;
             }
-            let inside = self
-                .retired_cells
-                .iter()
-                .filter(|&&(_, col, _)| (lo_n..=hi_n).contains(&col))
-                .count();
+            let mut inside = 0usize;
+            for &(_, col, _) in &self.retired_cells {
+                if (lo_n..=hi_n).contains(&col) {
+                    inside += 1;
+                }
+            }
             if inside * 2 > recorded {
                 let (a, b) = if lo_n - lo_r <= hi_r - hi_n {
                     (lo_r, hi_n)
@@ -1991,10 +2053,20 @@ impl Witness {
                         let start = self
                             .seen
                             .partition_point(|s| (s.row, s.col) < (cell.row, cell.col));
-                        !self.seen[start..]
-                            .iter()
-                            .take_while(|s| (s.row, s.col) == (cell.row, cell.col))
-                            .any(|s| s.released)
+                        let mut any_rel = false;
+                        let mut k = start;
+                        while k < self.seen.len() {
+                            let s = &self.seen[k];
+                            if (s.row, s.col) != (cell.row, cell.col) {
+                                break;
+                            }
+                            if s.released {
+                                any_rel = true;
+                                break;
+                            }
+                            k += 1;
+                        }
+                        !any_rel
                     };
                     run.returned_ink |= seen.released && !seen.unit.is_blank();
                 }
@@ -2002,12 +2074,11 @@ impl Witness {
                 _ => run.exact = false,
             }
         }
-        out.extend(
-            self.restore_runs
-                .iter()
-                .filter(|r| r.exact && r.returned_ink)
-                .map(|r| (r.cohort, r.stamp)),
-        );
+        for r in &self.restore_runs {
+            if r.exact && r.returned_ink {
+                out.push((r.cohort, r.stamp));
+            }
+        }
     }
 
     /// Clear release custody once the ribbon accepted restoration.

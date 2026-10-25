@@ -11246,15 +11246,9 @@ fn composer_turn_on(
                 echoed.fetch_max(k, Ordering::SeqCst);
             }
         });
-        let key = |_: InputEvent| {
-            sent_at.borrow_mut().push(Instant::now());
-            let k = keys.borrow().len() + 1;
-            if drawn.load(Ordering::SeqCst) + 1 < k {
-                ahead.borrow_mut().push(k);
-            }
-            let g = &graphemes[k - 1];
-            keys.borrow_mut().push(g.clone());
-            c.push(g);
+        // The program draws the composer once the first `k` graphemes are written: late
+        // (`Composer::lag`), held back (`Composer::hold`), or at once with any held before.
+        let echo = |k: usize| {
             let frame = c.frame("");
             match (c.lag.take(), c.hold.take()) {
                 (Some(lag), _) => tx.send((frame, k, lag)).expect("the echo thread"),
@@ -11273,9 +11267,26 @@ fn composer_turn_on(
             for (bytes, delay) in c.later.take() {
                 tx.send((bytes, 0, delay)).expect("the echo thread");
             }
+        };
+        let key = |_: InputEvent| {
+            sent_at.borrow_mut().push(Instant::now());
+            let k = keys.borrow().len() + 1;
+            if drawn.load(Ordering::SeqCst) + 1 < k {
+                ahead.borrow_mut().push(k);
+            }
+            let g = &graphemes[k - 1];
+            keys.borrow_mut().push(g.clone());
+            c.push(g);
+            echo(k);
             true
         };
-        let paste = |_: &str| true;
+        let paste = |rest: &str| {
+            for g in rest.graphemes() {
+                c.push(g);
+            }
+            echo(keys.borrow().len() + rest.graphemes().count());
+            true
+        };
         let press = |_: &str| {
             enters.set(enters.get() + 1);
             h.term.lock().unwrap().process(b"\r\nresponse-line\r\n");
@@ -11619,6 +11630,307 @@ fn a_digit_waits_for_the_program_to_read_every_key_before_it() {
     );
     aterm_pty::close_fd(slave);
     aterm_pty::close_fd(master);
+}
+
+/// The test's hand at a typed turn's typing hold, as a starved program: each frame
+/// [`Starved::held_back`] hands it is drawn only once the hold waits for it, at the wait's second
+/// look, and each look while it is pending takes `lag / 2`, so one wait spans several looks as a
+/// starved program's spans many ticks (`draws`); or the program never draws and each look finds
+/// `lag` more gone (`!draws`); `drew` counts the frames it drew.
+struct Starved {
+    pending: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    drew: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Starved {
+    fn at(h: &SessionHandle, lag: std::time::Duration, draws: bool) -> Self {
+        use std::time::{Duration, Instant};
+        let pending = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let drew = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let offset = std::cell::Cell::new(Duration::ZERO);
+        let aged = std::cell::Cell::new(false);
+        let (term, frame, count) = (
+            Arc::clone(&h.term),
+            std::rc::Rc::clone(&pending),
+            std::rc::Rc::clone(&drew),
+        );
+        super::control_session::set_hold_wait_for_test(Some(Box::new(move || {
+            let at = Instant::now() + offset.get();
+            if !draws {
+                offset.set(offset.get() + lag);
+            } else if frame.borrow().is_some() {
+                if aged.replace(!aged.get()) {
+                    let bytes = frame.borrow_mut().take().expect("pending");
+                    term.lock().unwrap().process(bytes.as_bytes());
+                    count.set(count.get() + 1);
+                }
+                offset.set(offset.get() + lag / 2);
+            }
+            at
+        })));
+        Self { pending, drew }
+    }
+
+    /// Hands the program the frame of the key whose echo [`Composer::hold`] held back.
+    fn held_back(&self, c: &Composer) {
+        if let Some((frame, _)) = c.held.take() {
+            *self.pending.borrow_mut() = Some(frame);
+        }
+    }
+}
+
+impl Drop for Starved {
+    fn drop(&mut self) {
+        super::control_session::set_hold_wait_for_test(None);
+    }
+}
+
+/// A program the machine starves draws each digit's key before it late, and the lags add up
+/// past `timeout=`: each wait ends held and gives its time back to the deadline, so the text is
+/// typed whole and submitted, never cut part-way where its words stay in the prompt for a person
+/// to clear (an upgrade notice at load 66, 2026-10-24). The control: an echo that never comes
+/// still meets the deadline at that digit.
+#[test]
+fn a_starved_programs_late_echoes_are_given_back_to_the_turns_deadline() {
+    let timeout = aterm_spec::wait::MUST_HAPPEN;
+    let lag = timeout * 3 / 4;
+    let opts = format!("timeout={}", timeout.as_millis());
+    let text = "version 2.1.291 is in";
+    let before_digit: Vec<bool> = text.chars().skip(1).map(|ch| ch.is_ascii_digit()).collect();
+    let digits = before_digit.iter().filter(|&&d| d).count();
+    let starved = std::cell::RefCell::new(None::<Starved>);
+    let starve = |draws: bool| {
+        let starved = &starved;
+        let before_digit = &before_digit;
+        move |k: usize, c: &Composer, h: &SessionHandle| {
+            if k == 0 {
+                *starved.borrow_mut() = Some(Starved::at(h, lag, draws));
+            }
+            if let Some(s) = starved.borrow().as_ref() {
+                s.held_back(c);
+            }
+            if before_digit.get(k).copied().unwrap_or(false) {
+                c.hold.set(true);
+            }
+        }
+    };
+    let t = composer_turn_with(&composer_rule(), 76, &opts, text, &starve(true));
+    let drew = starved.take().map_or(0, |s| s.drew.get());
+    assert!(
+        t.verdict.contains(" submitted=1 ") && t.verdict.ends_with(" typed=21 pasted=0"),
+        "{}",
+        t.verdict
+    );
+    assert_eq!((t.keys.concat().as_str(), t.enters), (text, 1));
+    assert_eq!(drew, digits, "every digit waited for the echo before it");
+    assert!(
+        lag * u32::try_from(drew).expect("few") > timeout,
+        "the lags add up past the timeout"
+    );
+    let t = composer_turn_with(&composer_rule(), 76, &opts, text, &starve(false));
+    drop(starved.take());
+    assert!(
+        t.verdict
+            .starts_with("OK 0 turn skipped reason=deadline typed=8 pasted=0 submitted=0"),
+        "{}",
+        t.verdict
+    );
+    assert_eq!((t.keys.concat().as_str(), t.enters), ("version ", 0));
+}
+
+/// A guarded submit judges the tail the program drew: the turn waits, as a digit does, for the
+/// program to read and draw its last key before the echo settles, so an agent that draws it
+/// later than any settle gets its Enter, never `reason=guard` with the text left typed. The
+/// control: a last key the program never draws meets the deadline and presses no Enter.
+#[test]
+#[cfg(unix)]
+fn a_guarded_submit_waits_for_the_program_to_draw_the_last_key() {
+    use std::os::fd::FromRawFd;
+    let text = "hello world";
+    let opts = format!(
+        "timeout={} submit_window=100 presses=1 submit=guarded:\u{276f}.hello.world",
+        aterm_spec::wait::MUST_HAPPEN.as_millis()
+    );
+    let starved = std::cell::RefCell::new(None::<Starved>);
+    let starve = |draws: bool| {
+        let starved = &starved;
+        move |k: usize, c: &Composer, h: &SessionHandle| {
+            if k == 0 {
+                h.ctx.sink.note_master_nonblocking(true);
+                let lag = aterm_spec::wait::MUST_HAPPEN;
+                *starved.borrow_mut() = Some(Starved::at(h, lag, draws));
+            }
+            if let Some(s) = starved.borrow().as_ref() {
+                s.held_back(c);
+            }
+            if k + 1 == text.len() {
+                c.hold.set(true);
+            }
+        }
+    };
+    for draws in [true, false] {
+        let (rd, wr) = cloexec_pipe();
+        // SAFETY: `cloexec_pipe` returned these two new descriptors; each is owned here once,
+        // and the session's sink only borrows the write end until this iteration ends.
+        let (rx, _write_end) = unsafe {
+            (
+                std::fs::File::from_raw_fd(rd),
+                std::os::fd::OwnedFd::from_raw_fd(wr),
+            )
+        };
+        aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
+        let t = composer_turn_on(wr, &composer_rule(), 76, &opts, text, &starve(draws));
+        let drew = starved.take().map_or(0, |s| s.drew.get());
+        assert_eq!(t.keys.concat(), text);
+        if draws {
+            assert!(
+                !t.verdict.contains("skipped") && t.verdict.contains(" pressed=1"),
+                "{}",
+                t.verdict
+            );
+            assert_eq!(drew, 1, "the last key's echo was waited for");
+            assert_eq!(drain_pipe(&rx), b"\r", "exactly one Enter");
+        } else {
+            assert!(
+                t.verdict
+                    .starts_with("OK 0 turn skipped reason=deadline typed=11 pasted=0 submitted=0"),
+                "{}",
+                t.verdict
+            );
+            assert!(drain_pipe(&rx).is_empty(), "no Enter reached the PTY");
+        }
+    }
+}
+
+/// A program may draw the last key and leave the caret where it was: the guarded submit's wait
+/// for the tail then ends on the cursor row already matching the guard, and the Enter goes as it
+/// went before that wait, never held to the deadline with the text left typed. The control: a
+/// tail the guard does not match, the caret left in place, is waited on to the deadline and
+/// gets no Enter.
+#[test]
+#[cfg(unix)]
+fn a_guarded_submit_takes_a_last_key_drawn_with_the_caret_left_in_place() {
+    use std::os::fd::FromRawFd;
+    let text = "hello world";
+    for (guard, matches) in [("hello.world", true), ("hello.worlds", false)] {
+        let opts = format!(
+            "timeout={} submit_window=100 presses=1 submit=guarded:\u{276f}.{guard}",
+            aterm_spec::wait::MUST_HAPPEN.as_millis()
+        );
+        let starved = std::cell::RefCell::new(None::<Starved>);
+        let before_last = std::cell::Cell::new(None::<aterm_core::grid::Cursor>);
+        let caret_stays = |k: usize, _: &Composer, h: &SessionHandle| {
+            if k == 0 {
+                h.ctx.sink.note_master_nonblocking(true);
+                let lag = aterm_spec::wait::MUST_HAPPEN;
+                *starved.borrow_mut() = Some(Starved::at(h, lag, false));
+            }
+            if k + 1 == text.len() {
+                before_last.set(Some(h.term.lock().unwrap().cursor()));
+            }
+            if k == text.len()
+                && let Some(at) = before_last.get()
+            {
+                let back = format!("\x1b[{};{}H", at.row + 1, at.col + 1);
+                h.term.lock().unwrap().process(back.as_bytes());
+            }
+        };
+        let (rd, wr) = cloexec_pipe();
+        // SAFETY: `cloexec_pipe` returned these two new descriptors; each is owned here once,
+        // and the session's sink only borrows the write end until this iteration ends.
+        let (rx, _write_end) = unsafe {
+            (
+                std::fs::File::from_raw_fd(rd),
+                std::os::fd::OwnedFd::from_raw_fd(wr),
+            )
+        };
+        aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
+        let t = composer_turn_on(wr, &composer_rule(), 76, &opts, text, &caret_stays);
+        drop(starved.take());
+        assert_eq!(t.keys.concat(), text);
+        if matches {
+            assert!(
+                !t.verdict.contains("skipped") && t.verdict.contains(" pressed=1"),
+                "{}",
+                t.verdict
+            );
+            assert_eq!(drain_pipe(&rx), b"\r", "exactly one Enter");
+        } else {
+            assert!(
+                t.verdict
+                    .starts_with("OK 0 turn skipped reason=deadline typed=11 pasted=0 submitted=0"),
+                "{}",
+                t.verdict
+            );
+            assert!(drain_pipe(&rx).is_empty(), "no Enter reached the PTY");
+        }
+    }
+}
+
+/// A guarded submit after the paste past the cap waits, as after a last key, for the program to
+/// read and draw that paste before it judges the guard, so a starved program's late paste still
+/// gets its Enter. The control: a paste the program never draws meets the deadline and presses
+/// no Enter.
+#[test]
+#[cfg(unix)]
+fn a_guarded_submit_waits_for_the_program_to_draw_the_paste_past_the_cap() {
+    use std::os::fd::FromRawFd;
+    let (text, cap) = ("hello world", 5);
+    let opts = format!(
+        "timeout={} submit_window=100 presses=1 cap={cap} submit=guarded:\u{276f}.hello.world",
+        aterm_spec::wait::MUST_HAPPEN.as_millis()
+    );
+    let starved = std::cell::RefCell::new(None::<Starved>);
+    let starve = |draws: bool| {
+        let starved = &starved;
+        move |k: usize, c: &Composer, h: &SessionHandle| {
+            if k == 0 {
+                h.ctx.sink.note_master_nonblocking(true);
+                let lag = aterm_spec::wait::MUST_HAPPEN;
+                *starved.borrow_mut() = Some(Starved::at(h, lag, draws));
+            }
+            if let Some(s) = starved.borrow().as_ref() {
+                s.held_back(c);
+            }
+            if k == cap {
+                c.hold.set(true);
+            }
+        }
+    };
+    for draws in [true, false] {
+        let (rd, wr) = cloexec_pipe();
+        // SAFETY: `cloexec_pipe` returned these two new descriptors; each is owned here once,
+        // and the session's sink only borrows the write end until this iteration ends.
+        let (rx, _write_end) = unsafe {
+            (
+                std::fs::File::from_raw_fd(rd),
+                std::os::fd::OwnedFd::from_raw_fd(wr),
+            )
+        };
+        aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
+        let t = composer_turn_on(wr, &composer_rule(), 76, &opts, text, &starve(draws));
+        let drew = starved.take().map_or(0, |s| s.drew.get());
+        assert_eq!(t.keys.concat(), &text[..cap]);
+        if draws {
+            assert!(
+                !t.verdict.contains("skipped")
+                    && t.verdict.contains(" typed=5 pasted=6")
+                    && t.verdict.contains(" pressed=1"),
+                "{}",
+                t.verdict
+            );
+            assert_eq!(drew, 1, "the paste's echo was waited for");
+            assert_eq!(drain_pipe(&rx), b"\r", "exactly one Enter");
+        } else {
+            assert!(
+                t.verdict
+                    .starts_with("OK 0 turn skipped reason=deadline typed=5 pasted=6 submitted=0"),
+                "{}",
+                t.verdict
+            );
+            assert!(drain_pipe(&rx).is_empty(), "no Enter reached the PTY");
+        }
+    }
 }
 
 #[test]
@@ -12578,6 +12890,29 @@ fn turn_submit_verification_rows() {
             )),
         },
         Row {
+            label: "a shell with no integration takes the line: its echo moves the cursor down",
+            seed: b"$ ".to_vec(),
+            paints: &[b"\r\n"],
+            options: "idle=50 timeout=60000 submit_window=120 presses=3 sleep 23; echo long",
+            verdict: "submitted=1 status=settled",
+            presses: 1,
+            why: "the cursor left the typed row: no second Enter into the running command",
+            control: Some((
+                |before, after| after.content_seq == before.content_seq,
+                "the echo moved no content: a check of seq alone never sees it",
+            )),
+        },
+        Row {
+            label: "a program with no integration that shows no press names the Enters it pressed",
+            seed: b"$ ".to_vec(),
+            paints: &[b""],
+            options: "idle=50 timeout=60000 submit_window=60 presses=2 quiet",
+            verdict: " pressed=2",
+            presses: 2,
+            why: "no evidence at all: the press budget retries, and the verdict says how many went",
+            control: None,
+        },
+        Row {
             label: "submit_verify=block ignores an ambient repaint",
             seed: PROMPT.to_vec(),
             paints: &[b"\x1b[2K spinner-tick ", b"echo\x1b]133;C\x07\r\ndone"],
@@ -12841,6 +13176,66 @@ fn a_hard_lease_holds_every_other_connection_and_its_own_types_through() {
     );
     assert!(cmd_lease(&h.ctx, "acquire holder=fresh").starts_with("OK lease acquired"));
     SERVING_CONNECTION.with(|s| s.set(None));
+}
+
+/// The holder's own turn holds the slot in its hand's place, and the hand's connection, waiting
+/// on that turn, cannot renew it meanwhile: the hand comes back with the time it had left when the
+/// turn took it, never lapsed by a turn longer than its TTL (a pressed notice a starved agent
+/// draws late outlasts the harness's minute-long hand). The control: a turn the lease refuses
+/// holds nothing and moves the expiry not at all.
+#[test]
+fn a_hard_lease_comes_back_from_its_own_turn_with_the_time_it_had_left() {
+    use std::time::Duration;
+    const HELD: Duration = Duration::from_millis(50);
+    struct Serving;
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            SERVING_CONNECTION.with(|s| s.set(None));
+        }
+    }
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
+    let _serving = Serving;
+    on(7);
+    let got = cmd_lease(&h.ctx, "acquire holder=aterm-harness@1 ttl=60000 hard");
+    assert!(got.ends_with(" hard=1\n"), "{got}");
+    let expires = || match h.ctx.turn_lease.lock().unwrap().as_ref() {
+        Some(crate::Lease::Drive {
+            expires_us,
+            conn: Some(7),
+            hard: true,
+            ..
+        }) => *expires_us,
+        other => panic!("the hand, held over connection 7: {other:?}"),
+    };
+    let paste = |_: &str| {
+        std::thread::sleep(HELD);
+        true
+    };
+    let press = |_: &str| true;
+    let io = TurnIo {
+        paste: &paste,
+        press: &press,
+        ..TurnIo::paste_only()
+    };
+    let turn = || cmd_turn(&h.term, &store, 0, "timeout=300 idle=1 hi", &h.ctx, &io);
+    let before = expires();
+    on(8);
+    assert_eq!(turn(), "ERR busy lease=aterm-harness@1\n", "another's turn");
+    assert_eq!(expires(), before, "a refused turn held nothing");
+    on(7);
+    let from = crate::metrics::now_us();
+    let own = turn();
+    let took = crate::metrics::now_us() - from;
+    assert!(!own.starts_with("ERR"), "the holder's own turn: {own}");
+    let added = expires() - before;
+    let held = u64::try_from(HELD.as_micros()).expect("µs");
+    assert!(
+        (held..=took).contains(&added),
+        "{added} µs added: the turn took {took} µs and held the slot through a {held} µs paste"
+    );
 }
 
 #[test]

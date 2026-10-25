@@ -1206,6 +1206,7 @@ pub fn build_machine_roster(
             class: acct.class,
             dir,
             email: Some(acct.email.clone()),
+            identity_email: None,
             browser,
             was: Vec::new(),
             vendor: Default::default(),
@@ -3758,9 +3759,9 @@ fn sync_accounts_for_init_with(
         .unwrap_or_default();
     let store = accounts::Store::at(state_dir);
     let raw = Roster::load(roster_path)?;
-    let bound = store.bound(&raw, now).unwrap_or(raw);
+    let bound = store.bound(&raw, now)?;
     let enrolled = accounts::enrolled(&bound);
-    let state = store.load(now).map(|(s, _)| s).unwrap_or_default();
+    let state = store.load(now)?.0;
     let enrolled_count = bound
         .rows
         .iter()
@@ -4093,6 +4094,10 @@ fn sync_cli_with(
             row.email
                 .as_deref()
                 .is_some_and(|email| accounts::email_matches(email, &acct.email))
+                || (cli == Cli::Codex
+                    && row
+                        .expected_identity_email()
+                        .is_some_and(|email| accounts::email_matches(email, &acct.email)))
         };
         match (
             existing.row(&acct.label),
@@ -4112,6 +4117,7 @@ fn sync_cli_with(
                     class: acct.class,
                     dir: Some(dir),
                     email: Some(acct.email.clone()),
+                    identity_email: None,
                     browser: acct.browser.clone(),
                     was: Vec::new(),
                     vendor: acct.vendor,
@@ -4147,7 +4153,13 @@ fn sync_cli_with(
     }
     drop(lock);
     let recovered = Roster::load_for(cli, &write_to).is_ok_and(|roster| {
-        recover_interrupted_staging_renewals_for(cli, &store, &roster, &AUTO_RENEW_GUARD, now)
+        recover_interrupted_staging_renewals_for(
+            cli,
+            &store,
+            (&roster, Some(&write_to)),
+            &AUTO_RENEW_GUARD,
+            now,
+        )
     });
     // A sync that added nothing wrote nothing, and wakes no watcher.
     if !added.is_empty() || recovered {
@@ -4350,11 +4362,11 @@ pub struct CliPool {
     pub cli: Cli,
     /// Its roster beside `aterm.toml`.
     pub roster: PathBuf,
-    /// Its rows, bound to the logins its renewals made, or why the roster is refused.
+    /// Its rows, bound to local logins, or why the roster, bindings or state is refused.
     pub rows: Result<Roster, String>,
     /// The labels whose logins are made on this machine ([`accounts::enrolled_for`]).
     pub enrolled: BTreeSet<String>,
-    /// Its store's state, for each row's condition.
+    /// Its store's state, for each row's condition. Use only when the rows field is Ok.
     pub state: accounts::State,
 }
 
@@ -4370,13 +4382,16 @@ pub fn cli_pools(config: &Path, state_dir: &Path, home: &Path, now: i64) -> Vec<
                 return None;
             }
             let store = accounts::Store::at_for(state_dir, cli, home);
-            let rows =
-                Roster::load_for(cli, &roster).map(|raw| store.bound(&raw, now).unwrap_or(raw));
+            let mut state = accounts::State::default();
+            let rows = Roster::load_for(cli, &roster).and_then(|raw| {
+                let bound = store.bound(&raw, now)?;
+                state = store.load(now)?.0;
+                Ok(bound)
+            });
             let enrolled = rows
                 .as_ref()
                 .map(|bound| accounts::enrolled_for(cli, bound))
                 .unwrap_or_default();
-            let state = store.load(now).map(|(s, _)| s).unwrap_or_default();
             Some(CliPool {
                 cli,
                 roster,
@@ -4470,8 +4485,13 @@ fn renew_pool_due(
         return false;
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
-    let recovered =
-        recover_interrupted_staging_renewals_for(cli, &store, &file_roster, fx.renew_guard, now);
+    let recovered = recover_interrupted_staging_renewals_for(
+        cli,
+        &store,
+        (&file_roster, Some(roster_path)),
+        fx.renew_guard,
+        now,
+    );
     let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
         return recovered;
     };
@@ -4480,6 +4500,7 @@ fn renew_pool_due(
             cli,
             home,
             state_dir,
+            roster_path,
             file_roster.clone(),
             &logins,
             row,
@@ -5282,13 +5303,19 @@ fn recover_interrupted_staging_renewals(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
 ) -> bool {
-    recover_interrupted_staging_renewals_for(Cli::Claude, store, file_roster, renew_guard, now)
+    recover_interrupted_staging_renewals_for(
+        Cli::Claude,
+        store,
+        (file_roster, None),
+        renew_guard,
+        now,
+    )
 }
 
 fn recover_interrupted_staging_renewals_for(
     cli: Cli,
     store: &accounts::Store,
-    file_roster: &Roster,
+    (file_roster, roster_path): (&Roster, Option<&Path>),
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
 ) -> bool {
@@ -5383,6 +5410,16 @@ fn recover_interrupted_staging_renewals_for(
         let mut note = None;
         if store
             .transact_logins(now, &mut note, |state, logins| {
+                // A checkpoint can outlive the configuration read by upkeep.
+                // Resolve Codex's identity policy again under its writer lock.
+                let current = if cli == Cli::Codex {
+                    let path =
+                        roster_path.ok_or("Codex recovery requires the current roster path")?;
+                    Some(Roster::load_for(cli, path)?)
+                } else {
+                    None
+                };
+                let file_roster = current.as_ref().unwrap_or(file_roster);
                 let referenced = file_roster
                     .rows
                     .iter()
@@ -5405,9 +5442,15 @@ fn recover_interrupted_staging_renewals_for(
                 let bound = accounts::bound(file_roster, logins);
                 let enrolled = accounts::enrolled_for(cli, &bound);
                 let Some(row) = bound.row(&proof.label).filter(|r| {
-                    r.email
-                        .as_deref()
-                        .is_some_and(|em| accounts::email_matches(em, &proof.email))
+                    if cli == Cli::Codex && proof.proved_by != Some(accounts::Proof::Status) {
+                        return false;
+                    }
+                    let expected = if cli == Cli::Codex {
+                        r.expected_identity_email()
+                    } else {
+                        r.email.as_deref()
+                    };
+                    expected.is_some_and(|em| accounts::email_matches(em, &proof.email))
                 }) else {
                     return Ok(Vec::new());
                 };
@@ -5450,7 +5493,7 @@ fn recover_interrupted_staging_renewals_for(
                 if !events.is_empty()
                     && let Some(proved_by) = proof.proved_by
                 {
-                    accounts::note_proof(logins, &row.label, proved_by);
+                    accounts::note_identity(logins, &row.label, proved_by, Some(&proof.email));
                 }
                 Ok(events)
             })
@@ -5517,6 +5560,7 @@ fn auto_renew_next_account(
             accounts::Cli::Claude,
             home,
             state_dir,
+            roster_path,
             file_roster.clone(),
             &logins,
             next_row,
@@ -5580,10 +5624,16 @@ fn unclaimed_emails(
 pub(super) fn recover_staging_renewals_for(
     cli: Cli,
     store: &accounts::Store,
-    file_roster: &Roster,
+    (file_roster, roster_path): (&Roster, &Path),
     now: i64,
 ) -> bool {
-    recover_interrupted_staging_renewals_for(cli, store, file_roster, &AUTO_RENEW_GUARD, now)
+    recover_interrupted_staging_renewals_for(
+        cli,
+        store,
+        (file_roster, Some(roster_path)),
+        &AUTO_RENEW_GUARD,
+        now,
+    )
 }
 
 pub(super) fn recover_staging_renewals(
@@ -5591,7 +5641,7 @@ pub(super) fn recover_staging_renewals(
     file_roster: &Roster,
     now: i64,
 ) -> bool {
-    recover_staging_renewals_for(Cli::Claude, store, file_roster, now)
+    recover_interrupted_staging_renewals(store, file_roster, &AUTO_RENEW_GUARD, now)
 }
 
 /// Start an interactive non-blocking staging login for the next un-enrolled successor at a wall.
@@ -5623,8 +5673,13 @@ pub fn auto_renew_next_account_interactive_for(
         return false;
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
-    let recovered =
-        recover_interrupted_staging_renewals_for(cli, &store, &file_roster, &AUTO_RENEW_GUARD, now);
+    let recovered = recover_interrupted_staging_renewals_for(
+        cli,
+        &store,
+        (&file_roster, Some(roster_path)),
+        &AUTO_RENEW_GUARD,
+        now,
+    );
     let Ok((state, _)) = store.load(now) else {
         return recovered;
     };
@@ -5640,6 +5695,7 @@ pub fn auto_renew_next_account_interactive_for(
             cli,
             home,
             state_dir,
+            roster_path,
             file_roster.clone(),
             &logins,
             next_row,
@@ -5794,7 +5850,13 @@ fn renew_requested_pin_for(
         Ok(_) => return RenewalDispatch::Superseded,
         Err(_) => return RenewalDispatch::Failed,
     }
-    recover_interrupted_staging_renewals_for(cli, &store, &file_roster, renew_guard, now);
+    recover_interrupted_staging_renewals_for(
+        cli,
+        &store,
+        (&file_roster, Some(roster_path)),
+        renew_guard,
+        now,
+    );
     let mut disposition = RenewalDispatch::Superseded;
     let mut target = None;
     if store
@@ -5830,6 +5892,7 @@ fn renew_requested_pin_for(
         cli,
         home,
         state_dir,
+        roster_path,
         file_roster,
         &logins,
         next_row,
@@ -6097,6 +6160,7 @@ fn spawn_row_renewal(
     cli: accounts::Cli,
     home: &Path,
     state_dir: &Path,
+    roster_path: &Path,
     file_roster: Roster,
     logins: &accounts::Logins,
     next_row: accounts::Row,
@@ -6111,6 +6175,7 @@ fn spawn_row_renewal(
             cli,
             home,
             state_dir,
+            roster_path,
             file_roster,
             logins,
             next_row,
@@ -6121,6 +6186,9 @@ fn spawn_row_renewal(
         );
     }
     let store = accounts::Store::at(state_dir);
+    if store.check_signin_state(now).is_err() {
+        return RenewalDispatch::Failed;
+    }
     if next_row.email.is_none() {
         return RenewalDispatch::Failed;
     }
@@ -6324,6 +6392,9 @@ fn spawn_row_renewal(
                 )
             };
             let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| {
+                if store.check_signin_state(now).is_err() {
+                    return Renewal::Failed;
+                }
                 exited.set(None);
                 match &run_seam {
                     Some(run) => run(browser, force_headless),
@@ -6333,6 +6404,7 @@ fn spawn_row_renewal(
             let how = |renewal: Renewal| super::sign_in_ladder::how_it_ended(renewal, exited.get());
             let _signin = signin;
             let ran = (|| -> Result<(), String> {
+                store.check_signin_state(now)?;
                 let opener = resolve_opener_link(&home_owned, &store);
                 // Unattended, nothing that opens a window is ever a fallback: neither the row's
                 // desk browser profile nor the system's default browser.
@@ -6447,6 +6519,7 @@ fn spawn_vendor_renewal(
     cli: accounts::Cli,
     home: &Path,
     state_dir: &Path,
+    roster_path: &Path,
     file_roster: &Roster,
     logins: &accounts::Logins,
     next_row: accounts::Row,
@@ -6458,6 +6531,7 @@ fn spawn_vendor_renewal(
         cli,
         home,
         state_dir,
+        roster_path,
         file_roster.clone(),
         logins,
         next_row,
@@ -6482,6 +6556,7 @@ fn spawn_vendor_renewal_with(
     cli: accounts::Cli,
     home: &Path,
     state_dir: &Path,
+    roster_path: &Path,
     file_roster: Roster,
     logins: &accounts::Logins,
     next_row: accounts::Row,
@@ -6490,6 +6565,10 @@ fn spawn_vendor_renewal_with(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
+    let store = accounts::Store::at_for(state_dir, cli, home);
+    if store.check_signin_state(now).is_err() {
+        return RenewalDispatch::Failed;
+    }
     if next_row.email.is_none()
         || cli.accounts().signin.as_ref().is_none()
         || super::headless_oauth::find_headless_browser(Some(home)).is_none()
@@ -6509,7 +6588,6 @@ fn spawn_vendor_renewal_with(
             return RenewalDispatch::Held;
         }
     }
-    let store = accounts::Store::at_for(state_dir, cli, home);
     let existing_binding = logins.get(&next_row.label);
     let browser_token = match existing_binding.and_then(|b| b.sign_in_task) {
         Some(task) => {
@@ -6567,6 +6645,7 @@ fn spawn_vendor_renewal_with(
     };
     permit.wake_pending = Some(state_dir.to_path_buf());
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
+    let roster_path = roster_path.to_path_buf();
     let parker = std::sync::Arc::clone(renew_guard);
     start_auto_renew(
         permit,
@@ -6576,7 +6655,7 @@ fn spawn_vendor_renewal_with(
                 now,
                 &super::cli::LiveAccounts,
                 &store,
-                &next_row,
+                (&next_row, &roster_path),
                 own_dir.as_deref(),
                 &mut io::sink(),
                 &mut io::sink(),
@@ -7014,17 +7093,32 @@ fn render_dashboard_html(
         &mut report_out,
         &mut report_err,
     );
-    let report_text = String::from_utf8_lossy(&report_out);
-    let raw_roster = env
-        .accounts_roster()
-        .and_then(|p| Roster::load(&p).ok())
-        .unwrap_or_default();
+    let report_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&report_out),
+        String::from_utf8_lossy(&report_err)
+    );
     let store = env.accounts_store();
-    let roster = store.bound(&raw_roster, env.now).unwrap_or(raw_roster);
+    let pool = (|| {
+        let path = env.accounts_roster().ok_or("no account roster path")?;
+        let raw = Roster::load(&path)?;
+        let roster = store.bound(&raw, env.now)?;
+        let (state, _) = store.load(env.now)?;
+        Ok::<_, String>((roster, state))
+    })();
+    let (roster, state, mut rows_html) = match pool {
+        Ok((roster, state)) => (roster, state, String::new()),
+        Err(why) => (
+            Roster::default(),
+            accounts::State::default(),
+            format!(
+                "<tr><td colspan=\"6\">Pool state is unknown: {}</td></tr>",
+                html_escape(&why)
+            ),
+        ),
+    };
     let enrolled = accounts::enrolled(&roster);
-    let (state, _) = store.load(env.now).unwrap_or_default();
 
-    let mut rows_html = String::new();
     for row in &roster.rows {
         let here = row.dir.is_none() || enrolled.contains(&row.label);
         let cond = match accounts::condition(row, &state, here, env.now) {
@@ -7117,7 +7211,7 @@ fn pools_html(pools: &[CliPool], now: i64) -> String {
         let id = pool.cli.id();
         let roster = html_escape(&pool.roster.display().to_string());
         let rows = match &pool.rows {
-            Err(why) => format!("<p>The roster is refused: {}</p>", html_escape(why)),
+            Err(why) => format!("<p>The pool is refused: {}</p>", html_escape(why)),
             Ok(rows) if rows.rows.is_empty() => format!(
                 "<p>No accounts listed: <code>aterm harness accounts add &lt;label&gt; --cli \
                  {id}</code></p>"
@@ -9605,6 +9699,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 was: Vec::new(),
                 vendor: Default::default(),
                 email: Some("sol-m27@example.test".into()),
+                identity_email: None,
                 browser: None,
             };
             let roster = Roster { rows: vec![row] };
@@ -9724,6 +9819,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some(email.into()),
+                    identity_email: None,
                     browser: None,
                 })
                 .collect(),
@@ -9818,6 +9914,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some("sol-m27@example.test".to_owned()),
+                    identity_email: None,
                     browser: None,
                 },
                 Row {
@@ -9833,6 +9930,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some("sun.m27.2@example.test".to_owned()),
+                    identity_email: None,
                     browser: None,
                 },
             ],
@@ -10125,6 +10223,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 accounts::Cli::Claude,
                 &w.home,
                 &w.state,
+                &w.roster(),
                 roster.clone(),
                 &accounts::Logins::default(),
                 roster.rows[1].clone(),
@@ -10273,6 +10372,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 was: Vec::new(),
                 vendor: Default::default(),
                 email: Some(email.into()),
+                identity_email: None,
                 browser: None,
             })
             .collect(),
@@ -10610,6 +10710,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         for case in [
             "checkpoint",
             "ledger",
+            "missing-snapshot",
             "wrong-account",
             "signed-out",
             "interrupted-status",
@@ -10634,6 +10735,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             if case == "checkpoint" {
                 fs::write(&checkpoint, b"unrecognized private work").unwrap();
             } else if case == "ledger" {
+                store.save(&accounts::State::default()).unwrap();
+                fs::create_dir(store.ledger_path()).unwrap();
+            } else if case == "missing-snapshot" {
                 fs::create_dir(store.ledger_path()).unwrap();
             }
             let status = super::super::align::Captured {
@@ -10666,7 +10770,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 UPKEEP_NOW,
             );
             match case {
-                "checkpoint" | "ledger" => {
+                "checkpoint" | "ledger" | "missing-snapshot" => {
                     assert_eq!(outcome, Renewal::Failed);
                     assert!(!outcome.can_retry_authentication());
                     assert_eq!(fs::read(staging.join(".claude.json")).unwrap(), profile);
@@ -10674,6 +10778,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                         assert_eq!(fs::read(&checkpoint).unwrap(), b"unrecognized private work");
                         assert!(!store.logins_file().exists() && !store.state_file().exists());
                         assert!(store.tail(10).unwrap().is_empty());
+                    } else if case == "missing-snapshot" {
+                        assert!(!store.logins_file().exists() && !store.state_file().exists());
+                        assert!(store.ledger_path().is_dir());
                     } else {
                         let binding = store.load_logins(UPKEEP_NOW).unwrap().0;
                         assert_eq!(
@@ -10742,6 +10849,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some("sol-m27@example.test".to_owned()),
+                    identity_email: None,
                     browser: None,
                 },
                 Row {
@@ -10757,6 +10865,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some("sun.m27.2@example.test".to_owned()),
+                    identity_email: None,
                     browser: None,
                 },
                 Row {
@@ -10772,6 +10881,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some("star.m27.3@example.test".to_owned()),
+                    identity_email: None,
                     browser: Some("Claude m27-3".to_owned()),
                 },
             ],

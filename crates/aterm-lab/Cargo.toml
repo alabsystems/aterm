@@ -116,6 +116,12 @@ aterm-vz = { workspace = true }
 # The guest agent's ports and wire codec (`COMMAND_PORT`, `Exit`). Already in the
 # graph through aterm-vz.
 aterm-vz-agent = { workspace = true }
+# A lane VM's admission (`vm_admit`): the guest's memory and vCPUs claimed in the
+# machine's capacity ledger before it boots, and the cores granted for its jobs;
+# and the quiet machine a windowed instance and the Linux lane's GUI rows start on
+# (`admission`, QUIET-ADMIT). Not a new edge in the build graph: atpkg above
+# already depends on it.
+aterm-capacity = { workspace = true }
 
 [dev-dependencies]
 # `trail-gallery burst`'s key schedule is checked against the flying kitty's

@@ -128,7 +128,13 @@ impl PermissionGate {
     }
 
     pub(super) fn hold(&mut self) {
-        self.hold = PermissionHold::Decision;
+        // An unanswered offer or refused intent cannot withdraw the earlier
+        // Stop. The new decision also keeps a person's row override held.
+        self.hold = if ::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
+            PermissionHold::Stopped { person: false }
+        } else {
+            PermissionHold::Decision
+        };
         // A newer mutating intent supersedes the window's own admission until
         // its own acceptance (if it is the window's) names a revision again.
         self.own = None;
@@ -149,11 +155,15 @@ impl PermissionGate {
         // The receipt establishes durable admission, but the cached snapshot
         // can still describe the previous plan. Only a new read releases it.
         self.accepted_by = self.apply_by.take();
-        self.await_fresh_status();
+        // The host's post-Stop receipt fence admits this new choice; an
+        // ordinary refresh never releases the earlier Stop by itself.
+        self.hold = PermissionHold::FreshStatus;
     }
 
     pub(super) fn await_fresh_status(&mut self) {
-        self.hold = PermissionHold::FreshStatus;
+        if !::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
+            self.hold = PermissionHold::FreshStatus;
+        }
     }
 
     /// Take a newer status. `true` when it establishes the window's own

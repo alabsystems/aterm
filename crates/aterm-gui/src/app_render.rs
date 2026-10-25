@@ -2932,7 +2932,7 @@ fn narrow_clip_below_band(
     (narrowed.row_start < narrowed.row_end).then_some(narrowed)
 }
 
-fn claim_chrome_rows(ws: &mut crate::WindowState, band: std::ops::Range<usize>) {
+pub(crate) fn claim_chrome_rows(ws: &mut crate::WindowState, band: std::ops::Range<usize>) {
     let strip = ws
         .input_scratch
         .cells
@@ -3068,7 +3068,7 @@ pub(crate) fn splice_find_row_span(
     }
 }
 
-fn scrub_overlay_row_band(
+pub(crate) fn scrub_overlay_row_band(
     input: &mut RenderInput,
     rows: std::ops::Range<usize>,
     bands: aterm_render::RowBands,
@@ -10309,6 +10309,7 @@ impl App {
             &mut self.present_observer,
             capture_forced,
         );
+        self.rewind_presented(id);
 
         #[cfg(windows)]
         {
@@ -10817,6 +10818,14 @@ impl App {
                 ws.pane_overlay.clear();
             }
         }
+        self.pay_restore_regrid_if_due(id, frame_started);
+        if self.windows.get(&id).is_some_and(|ws| ws.panes_stale) {
+            let site = crate::resize_ledger::Site::caller(
+                crate::resize_ledger::Cause::Redraw,
+                std::panic::Location::caller(),
+            );
+            self.resize_panes_scoped_with_active_plan(id, true, Some(plan), site);
+        }
         let multi_pane = match route {
             crate::VisibleContentRoute::Terminal { composed } => {
                 if let Some(window) = self.windows.get_mut(&id) {
@@ -10840,13 +10849,6 @@ impl App {
         let Some(front_terminal) = self.shown_front(id) else {
             return;
         };
-        if self.windows.get(&id).is_some_and(|ws| ws.panes_stale) {
-            let site = crate::resize_ledger::Site::caller(
-                crate::resize_ledger::Cause::Redraw,
-                std::panic::Location::caller(),
-            );
-            self.resize_panes_scoped_with_active_plan(id, true, Some(plan), site);
-        }
         let Some(ws0) = self.windows.get(&id) else {
             return;
         };
@@ -11139,7 +11141,7 @@ impl App {
                 ws.fx.rain(),
                 epoch,
             );
-            if !(deco_rescan || rain_refresh)
+            let pet_fill = if !(deco_rescan || rain_refresh)
                 && strip_rows_n == 0
                 && effect_only_snapshot_reusable(
                     uncontended,
@@ -11148,13 +11150,15 @@ impl App {
                     epoch,
                     rows,
                     cols,
-                )
-            {
+                ) {
                 metrics::note_frame_refill_skipped();
+                aterm_effects::pet_world::PetFill::Consumed
             } else {
+                let prior = ws.input_scratch.extract_gen;
                 let refill = term.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
                 metrics::note_frame_refill(refill);
-            }
+                aterm_effects::pet_world::PetFill::after_refill(prior, refill)
+            };
             let ambiguous_cjk = term.modes().ambiguous_width_double;
             let pet_world_facts = pet_console_owned.then(|| {
                 aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
@@ -11397,8 +11401,11 @@ impl App {
                     ws.pet_chrome.held(),
                     ws.pet_chrome.held_overlays(),
                 );
-                let observed = ws.fx.companion_mut().observe_console_reserved(
+                // Refilled above by a damage-consuming fill (a chrome-row
+                // window's every frame), or the snapshot reused.
+                let observed = ws.fx.companion_mut().observe_console_filled(
                     &ws.input_scratch,
+                    pet_fill,
                     facts,
                     aterm_effects::pet_world::PetPane::full(&ws.input_scratch),
                     exclusions.reserve(),
@@ -14499,6 +14506,7 @@ impl App {
         let mut focus_blank = divider_cell(grid);
         let mut focus_title_sample: Arc<str> = Arc::default();
         let mut focus_snapshot_valid = false;
+        let mut focus_pet_fill = aterm_effects::pet_world::PetFill::Consumed;
         let mut focus_world_facts = None;
         let mut focus_ambiguous_cjk = false;
         let mut focus_probe: Option<(u16, u16, aterm_effects::cursor_glow::ProbeTrust)> = None;
@@ -14662,12 +14670,14 @@ impl App {
                 focus_title_sample = term.title_arc();
                 focus_ambiguous_cjk = term.modes().ambiguous_width_double;
                 if let Some(ws) = self.windows.get_mut(&wid) {
+                    let prior = ws.composed_focus_scratch.extract_gen;
                     let refill = term.cell_frame_damage_scoped_into(
                         &mut ws.composed_focus_scratch,
                         usize::from(r.rows),
                         usize::from(r.cols),
                     );
                     metrics::note_frame_refill(refill);
+                    focus_pet_fill = aterm_effects::pet_world::PetFill::after_refill(prior, refill);
                     focus_snapshot_valid = true;
                     focus_world_facts = pet_console_owned
                         .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, focus));
@@ -14969,8 +14979,11 @@ impl App {
                 ws.pet_chrome.held(),
                 ws.pet_chrome.held_overlays(),
             );
-            let observed = ws.fx.companion_mut().observe_console_reserved(
+            // Refilled this frame by a damage-consuming fill; one that
+            // re-extracted no row keeps the reading.
+            let observed = ws.fx.companion_mut().observe_console_filled(
                 &ws.composed_focus_scratch,
+                focus_pet_fill,
                 facts,
                 aterm_effects::pet_world::PetPane::full(&ws.composed_focus_scratch),
                 exclusions.reserve(),
@@ -17516,6 +17529,20 @@ impl App {
         }
         crate::metrics::note_grid_committed();
         self.resize_panes(wid);
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.restore_regrid_owed)
+            .is_some_and(|owed| {
+                if owed.fullscreen {
+                    !self.carried_fullscreen_owed(wid)
+                } else {
+                    !self.restore_size_unlanded(wid)
+                }
+            })
+        {
+            self.settle_restore_regrid(wid);
+        }
         if let Some(scroll_state) = self
             .focused_session_id(wid)
             .and_then(|id| self.session_by_id(id))

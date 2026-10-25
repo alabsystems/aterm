@@ -4,10 +4,11 @@
 //! ADMISSION: a [`Waiter`] enters the ledger, and each [`Waiter::poll`] reads the machine and
 //! the claims ahead of it and either admits it (a [`Claim`]) or names what it is short of
 //! ([`Shortfall`]). [`admit_with`] polls until it is admitted, saying once a minute what it
-//! waits for; it never gives up, because the need fits once the holders end. A need that can
-//! never fit ([`never`]) is refused before it enters.
+//! waits for; it never gives up, because the need fits once the holders end, though its caller
+//! can stop it ([`admit_until`]). A need that can never fit ([`never`]) is refused before it
+//! enters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::floor::GIB;
 use crate::ledger::{Held, Laid, Ledger, Record};
-use crate::reading::{Machine, Reading, TreeUse, Volume};
+use crate::reading::{Machine, Procs, Reading, TreeUse, Volume};
 use crate::{Admit, Need};
 
 /// A claim's own work reaches the 5-minute load within about this long: until then the cores it was granted count against later grants ([`Claim::cores`]).
@@ -23,6 +24,9 @@ pub const LOAD5_REACH: Duration = Duration::from_secs(300);
 
 /// How soon a waiter looks again when another waiter held the admissions' lock: that lock is held only while one waiter reads the ledger, so this is no wait for capacity, and says a line only once one holder has kept it a whole [`Pace::line_every`] (stopped, say, while it decides).
 const TURN_GAP: Duration = Duration::from_millis(20);
+
+/// The most processes one claim is credited with ([`Claim::credit`]).
+pub const CREDIT_MAX: usize = 16;
 
 /// What a need that can never fit names the machine as.
 const HOST: &str = if cfg!(target_os = "macos") {
@@ -77,16 +81,16 @@ fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)
 }
 
-/// Why `need` can never be admitted on the machine `reading` reads: more memory than the Mac has, or more disk than its volume holds above the floor. `None` when it can.
+/// Why `need` can never be admitted on the machine `reading` reads: all the memory the Mac has or more, its margin included (what is available, free, inactive and purgeable pages, never holds the kernel's wired pages, so it is always less than all of it), or more disk than its volume holds above the floor. `None` when it can.
 #[must_use]
 pub fn never(need: &Need, reading: &Reading) -> Option<String> {
     if let Some(physical) = reading.physical
-        && need.mem > physical
+        && need.mem.saturating_add(need.margin) >= physical
     {
         return Some(format!(
             "{}: needs {}, {HOST} has {} of memory",
             need.what,
-            gib(need.mem),
+            mem_and_margin(need.mem, need.margin),
             gib(physical)
         ));
     }
@@ -106,13 +110,24 @@ pub fn never(need: &Need, reading: &Reading) -> Option<String> {
     None
 }
 
+/// `16 GiB`, or with a margin `8 GiB and 8 GiB spare beside it`.
+fn mem_and_margin(mem: u64, margin: u64) -> String {
+    if margin == 0 {
+        gib(mem)
+    } else {
+        format!("{} and {} spare beside it", gib(mem), gib(margin))
+    }
+}
+
 /// One thing a waiter is short of.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Short {
-    /// Memory: it needs `need`; `available` is free now, and the claims ahead reserve `reserved` of it.
+    /// Memory: it needs `need`, with `margin` spare beside it; `available` is free now, and the claims ahead reserve `reserved` of it.
     Memory {
         /// Its peak.
         need: u64,
+        /// What must stay available beside it, unreserved ([`Need::margin`]).
+        margin: u64,
         /// Available now.
         available: u64,
         /// What the claims ahead still reserve.
@@ -171,6 +186,7 @@ impl fmt::Display for Short {
         match self {
             Short::Memory {
                 need,
+                margin,
                 available,
                 reserved,
             } => {
@@ -178,8 +194,8 @@ impl fmt::Display for Short {
                 write!(
                     f,
                     "memory short by {}: needs {}, {} available less {} reserved",
-                    gib(need.saturating_sub(room)),
-                    gib(*need),
+                    gib(need.saturating_add(*margin).saturating_sub(room)),
+                    mem_and_margin(*need, *margin),
                     gib(*available),
                     gib(*reserved)
                 )
@@ -308,17 +324,23 @@ impl fmt::Display for Shortfall {
     }
 }
 
-/// A claim in the ledger and what its holder's process tree uses now.
+/// A claim in the ledger and what its holder's process tree, and the processes it is credited with, use now.
 pub(crate) struct Other<'a> {
     pub(crate) record: &'a Record,
     /// The holder's tree ([`crate::Procs::trees`]): the same for every claim one process holds, and credited once among them ([`reservations`]).
     pub(crate) used: TreeUse,
+    /// The trees of the processes this claim alone is credited with ([`Record::credit`]).
+    pub(crate) credited: TreeUse,
 }
 
-/// What each claim of `ahead` still reserves, `(memory, disk on volume)`, in `ahead`'s order. A
-/// holder's tree use is credited once across its claims (those held first, then those waiting,
-/// each oldest first), each taking what it can of its peak: one process holding several claims
-/// is never credited with its whole tree for each.
+/// What each claim of `ahead` still reserves, `(memory, disk on volume)`, in `ahead`'s order.
+/// A claim first takes what it can of its peak from the processes it alone is credited with (a
+/// VM's, outside its holder's tree); then a holder's tree use is credited once across its claims
+/// (those held first, then those waiting, each oldest first), each taking what it can of what
+/// is left: one process holding several claims is never credited with its whole tree for each.
+/// A claim whose holder measures its own writes ([`Record::wrote`]) is credited those instead of
+/// any tree's bytes written, which miss the writes of children that have ended (a build's
+/// compilers) and count bytes written over.
 fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<(u64, u64)> {
     let mut credit: HashMap<u32, TreeUse> = HashMap::new();
     for o in ahead {
@@ -329,18 +351,65 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<(u64, u64)
     let mut out = vec![(0, 0); ahead.len()];
     for i in order {
         let record = ahead[i].record;
-        let left = credit.entry(record.pid).or_default();
         let disk = match (volume, record.need.path.as_deref()) {
             (Some(v), Some(mount)) if mount == v.mount => record.need.disk,
             _ => 0,
         };
-        let mem_taken = record.need.mem.min(left.footprint);
-        let disk_taken = disk.min(left.written);
+        let own = ahead[i].credited;
+        let mem = record.need.mem - record.need.mem.min(own.footprint);
+        let left = credit.entry(record.pid).or_default();
+        let mem_taken = mem.min(left.footprint);
         left.footprint -= mem_taken;
-        left.written -= disk_taken;
-        out[i] = (record.need.mem - mem_taken, disk - disk_taken);
+        let disk_left = match record.wrote {
+            Some(wrote) => disk - disk.min(wrote),
+            None => {
+                let disk = disk - disk.min(own.written);
+                let taken = disk.min(left.written);
+                left.written -= taken;
+                disk - taken
+            }
+        };
+        out[i] = (mem - mem_taken, disk_left);
     }
     out
+}
+
+/// Whether a quiet claim held by `pid` itself or by one of its ancestors in `procs` covers a quiet
+/// need of `pid`: work a quiet claim's holder starts runs under that claim (verify's measuring
+/// child, a drive's second window), so it never waits behind its own holder, nor behind a quiet
+/// claim that waits for that holder to end.
+pub(crate) fn covered(pid: u32, records: &[&Record], procs: Option<&Procs>) -> bool {
+    let holders: Vec<u32> = records
+        .iter()
+        .filter(|r| r.held.is_some() && r.need.quiet.is_some())
+        .map(|r| r.pid)
+        .collect();
+    holders.contains(&pid)
+        || procs.is_some_and(|p| p.ancestors(pid).iter().any(|a| holders.contains(a)))
+}
+
+/// The claims a waiter of the process `pid` is held to: every other claim but those its
+/// ancestors hold or wait for. A waiter whose ancestor holds a claim is that admitted work going
+/// on (verify's run starting the lab's VM boot, which claims the VM's disk for itself), so it is
+/// held only to the other HELD claims: never to its ancestors', which end only once it has run,
+/// nor to any waiter, which waits for that work in turn. Held to either, it would wait for what
+/// waits for it, with no end. Its need is then checked beside the other held claims alone: what
+/// its ancestors have yet to write may overrun the room by up to their reservation, into the
+/// floor, which is what the floor is kept for. Without a process sweep no ancestor is known,
+/// and every claim counts.
+pub(crate) fn counted<'r>(
+    records: Vec<&'r Record>,
+    pid: u32,
+    procs: Option<&crate::Procs>,
+) -> Vec<&'r Record> {
+    let ancestors = procs.map(|p| p.ancestors(pid)).unwrap_or_default();
+    let inside = records
+        .iter()
+        .any(|r| r.held.is_some() && ancestors.contains(&r.pid));
+    records
+        .into_iter()
+        .filter(|r| !ancestors.contains(&r.pid) && (!inside || r.held.is_some()))
+        .collect()
 }
 
 /// Whether `need` fits now beside every claim ahead of the waiter at `mine` (held, or waiting since earlier): `Ok(cores granted)`, or what it is short of.
@@ -363,10 +432,11 @@ pub(crate) fn decide(
         && let Some(available) = reading.available.or(reading.physical)
     {
         let reserved: u64 = reserves.iter().map(|r| r.0).sum();
-        if available.saturating_sub(reserved) < need.mem {
+        if available.saturating_sub(reserved) < need.mem.saturating_add(need.margin) {
             want_mem = true;
             shorts.push(Short::Memory {
                 need: need.mem,
+                margin: need.margin,
                 available,
                 reserved,
             });
@@ -449,6 +519,8 @@ pub struct Claim {
     laid: Laid,
     record: Record,
     waited: Duration,
+    /// Where its measured writes lie in its file, once written ([`Self::wrote`]).
+    wrote_at: Option<u64>,
 }
 
 impl Claim {
@@ -474,6 +546,41 @@ impl Claim {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.laid.path()
+    }
+
+    /// Credit it with `pids`, processes outside its holder's tree that run its work (a VM the
+    /// system parents to launchd, not to the run that booted it): their trees' use counts
+    /// against its reservation alone, so memory they already hold is not reserved again. Each
+    /// call names the whole set, at most [`CREDIT_MAX`]; pids 0 and 1 and this process (whose
+    /// tree is the holder's already) are left out.
+    ///
+    /// # Errors
+    /// The record could not be written; it keeps the credit it had.
+    pub fn credit(&mut self, pids: &[u32]) -> io::Result<()> {
+        let me = std::process::id();
+        let mut pids: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|p| *p > 1 && *p != me)
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids.truncate(CREDIT_MAX);
+        self.laid.append(&Record::credit_line(&pids))?;
+        self.record.credit = pids;
+        Ok(())
+    }
+
+    /// Say that its work has written `bytes` toward its disk need since it was admitted, as its
+    /// holder measured them (the growth of the directories it writes): the volume's free space
+    /// has lost them already, so a waiter counts only the rest of the need as reserved.
+    ///
+    /// # Errors
+    /// The claim file could not be written; the figure it held before stands.
+    pub fn wrote(&mut self, bytes: u64) -> io::Result<()> {
+        self.laid.wrote(&mut self.wrote_at, bytes)?;
+        self.record.wrote = Some(bytes);
+        Ok(())
     }
 }
 
@@ -551,22 +658,41 @@ impl Waiter {
         let records = self.ledger.scan(true)?;
         let mine = self.record.order();
         let records: Vec<&Record> = records.iter().filter(|r| r.order() != mine).collect();
-        let procs = records
-            .iter()
-            .any(|r| r.need.mem > 0 || r.need.disk > 0)
-            .then(|| machine.procs())
-            .flatten();
+        let procs = (!records.is_empty()).then(|| machine.procs()).flatten();
+        // Coverage reads the claims before `counted` leaves out the ancestors': an ancestor's held
+        // quiet claim is what covers this one.
+        let mut need = self.record.need.clone();
+        if need.quiet.is_some() && covered(self.record.pid, &records, procs.as_ref()) {
+            need.quiet = None;
+        }
+        let records = counted(records, self.record.pid, procs.as_ref());
         let mut claimants: Vec<u32> = records.iter().map(|r| r.pid).collect();
         claimants.push(self.record.pid);
-        let trees = procs.map(|p| p.trees(&claimants)).unwrap_or_default();
+        let mut roots = claimants.clone();
+        roots.extend(records.iter().flat_map(|r| r.credit.iter().copied()));
+        let trees = procs.map(|p| p.trees(&roots)).unwrap_or_default();
+        let mut taken: HashSet<u32> = claimants.into_iter().collect();
         let others: Vec<Other<'_>> = records
             .iter()
-            .map(|r| Other {
-                record: r,
-                used: trees.get(&r.pid).copied().unwrap_or_default(),
+            .map(|r| {
+                let mut credited = TreeUse::default();
+                for pid in &r.credit {
+                    if *pid > 1
+                        && taken.insert(*pid)
+                        && let Some(u) = trees.get(pid)
+                    {
+                        credited.footprint = credited.footprint.saturating_add(u.footprint);
+                        credited.written = credited.written.saturating_add(u.written);
+                    }
+                }
+                Other {
+                    record: r,
+                    used: trees.get(&r.pid).copied().unwrap_or_default(),
+                    credited,
+                }
             })
             .collect();
-        Ok(decide(&self.record.need, mine, &reading, &others, now_ms()))
+        Ok(decide(&need, mine, &reading, &others, now_ms()))
     }
 
     /// Mark it admitted with `cores` granted.
@@ -587,6 +713,7 @@ impl Waiter {
                 laid,
                 record,
                 waited: since.elapsed(),
+                wrote_at: None,
             }),
             Err(e) => Polled::Waiting(
                 Waiter {
@@ -640,6 +767,9 @@ pub enum Error {
     Never(String),
     /// The ledger could not be used.
     Ledger(io::Error),
+    /// The caller stopped the wait ([`admit_until`]), short at its last look of what this names
+    /// (`None`: it never looked). The claim has left the queue.
+    Stopped(Option<Shortfall>),
 }
 
 impl fmt::Display for Error {
@@ -647,6 +777,8 @@ impl fmt::Display for Error {
         match self {
             Error::Never(why) => write!(f, "{why}; it can never be admitted here"),
             Error::Ledger(e) => write!(f, "the capacity ledger could not be used: {e}"),
+            Error::Stopped(Some(short)) => write!(f, "stopped while it waited: {short}"),
+            Error::Stopped(None) => f.write_str("stopped before it was admitted"),
         }
     }
 }
@@ -657,7 +789,9 @@ impl std::error::Error for Error {}
 ///
 /// A process that already holds claims and needs another enters a [`Waiter`] and polls it
 /// instead, ending held work while it waits: this call counts the caller's own held claims
-/// against the new one, and they are let go only after it returns.
+/// against the new one, and they are let go only after it returns. A process its ancestor's
+/// held claim started is not held to that claim (`counted`): a tool that holds a claim may
+/// start another that claims for itself.
 ///
 /// # Errors
 /// [`Error::Never`] for a need that can never fit; [`Error::Ledger`] when there is no home or the ledger cannot be written.
@@ -681,6 +815,30 @@ pub fn admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     )
 }
 
+/// What a waiter can do about a shortfall besides wait: free what it can before it says it waits
+/// ([`Self::relieve`]), and name what holds the rest beyond the claims a wait line names
+/// ([`Self::holders`]). [`admit_relieved`] calls it; [`admit_with`] has none.
+pub trait Relief {
+    /// Called once, at the first look that finds the need short of something a claim can hold,
+    /// before any wait line: free what can be freed toward it, saying through `say` what was
+    /// done. The next look follows at once, so a need the relief met is admitted with no wait.
+    fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str));
+
+    /// Words a wait line ends with: what holds the rest (the largest users of a short volume).
+    fn holders(&mut self, short: &Shortfall) -> Option<String>;
+}
+
+/// [`admit_with`]'s relief: none.
+struct NoRelief;
+
+impl Relief for NoRelief {
+    fn relieve(&mut self, _short: &Shortfall, _say: &mut dyn FnMut(&str)) {}
+
+    fn holders(&mut self, _short: &Shortfall) -> Option<String> {
+        None
+    }
+}
+
 /// Admit `need` in `ledger` on `machine`: refused at once when it can never fit (`--admit wait` only), admitted at once under `--admit now` (saying what it would have waited for), else waiting with no deadline and saying through `say` what it is short of and who holds it, at the first look and every [`Pace::line_every`] after. A wait only for the ledger's lock is said once one holder has kept it a whole [`Pace::line_every`], naming that holder.
 ///
 /// # Errors
@@ -692,6 +850,78 @@ pub fn admit_with(
     mode: Admit,
     pace: Pace,
     say: &mut dyn FnMut(&str),
+) -> Result<Claim, Error> {
+    admit_waiting(
+        ledger,
+        machine,
+        need,
+        mode,
+        pace,
+        &mut NoRelief,
+        say,
+        &|| false,
+    )
+}
+
+/// [`admit_with`], with `relief` asked to free what it can at the first look that waits, before
+/// any wait line, and to name the rest's holders on each line after.
+///
+/// # Errors
+/// As [`admit`].
+pub fn admit_relieved(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    need: Need,
+    mode: Admit,
+    pace: Pace,
+    relief: &mut dyn Relief,
+    say: &mut dyn FnMut(&str),
+) -> Result<Claim, Error> {
+    admit_waiting(ledger, machine, need, mode, pace, relief, say, &|| false)
+}
+
+/// [`admit_with`], its wait ended by `stopped` (an interrupt its caller caught), which it asks
+/// before each look: the claim then leaves the queue, and [`Error::Stopped`] names what it was
+/// short of.
+///
+/// # Errors
+/// As [`admit`], and [`Error::Stopped`].
+pub fn admit_until(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    need: Need,
+    mode: Admit,
+    pace: Pace,
+    say: &mut dyn FnMut(&str),
+    stopped: &dyn Fn() -> bool,
+) -> Result<Claim, Error> {
+    admit_waiting(
+        ledger,
+        machine,
+        need,
+        mode,
+        pace,
+        &mut NoRelief,
+        say,
+        stopped,
+    )
+}
+
+/// The one admission [`admit_with`], [`admit_relieved`] and [`admit_until`] run: `relief` asked
+/// at the first look that waits, and `stopped` before each look.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admission's six, the relief that frees room and the interrupt that ends its wait"
+)]
+fn admit_waiting(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    need: Need,
+    mode: Admit,
+    pace: Pace,
+    relief: &mut dyn Relief,
+    say: &mut dyn FnMut(&str),
+    stopped: &dyn Fn() -> bool,
 ) -> Result<Claim, Error> {
     let at = need.path.clone().or_else(|| std::env::current_dir().ok());
     let reading = machine.read(at.as_deref());
@@ -722,7 +952,13 @@ pub fn admit_with(
     }
     let mut said: Option<Instant> = None;
     let mut turn_since: Option<Instant> = None;
+    let mut last: Option<Shortfall> = None;
+    let mut relieved = false;
     loop {
+        if stopped() {
+            drop(waiter);
+            return Err(Error::Stopped(last));
+        }
         match waiter.poll(machine) {
             Polled::Admitted(claim) => {
                 if said.is_some() {
@@ -746,15 +982,31 @@ pub fn admit_with(
                     said = Some(Instant::now());
                 }
                 waiter = w;
+                if last.is_none() {
+                    last = Some(short);
+                }
                 std::thread::sleep(pace.poll.min(TURN_GAP));
+            }
+            Polled::Waiting(w, short)
+                if !relieved && short.shorts.iter().any(Short::held_by_claims) =>
+            {
+                relieved = true;
+                relief.relieve(&short, say);
+                waiter = w;
+                last = Some(short);
             }
             Polled::Waiting(w, short) => {
                 turn_since = None;
                 if said.is_none_or(|t| t.elapsed() >= pace.line_every) {
-                    say(&w.line(&short));
+                    let line = w.line(&short);
+                    match relief.holders(&short) {
+                        Some(more) => say(&format!("{line}; {more}")),
+                        None => say(&line),
+                    }
                     said = Some(Instant::now());
                 }
                 waiter = w;
+                last = Some(short);
                 std::thread::sleep(pace.poll);
             }
         }

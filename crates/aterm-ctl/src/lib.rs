@@ -37,7 +37,7 @@ pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
 mod remote;
-pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left};
+pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, lifts_there};
 mod survey;
 pub use survey::{
     DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,

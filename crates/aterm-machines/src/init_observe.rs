@@ -14,7 +14,7 @@
 //! login ([`until_login`]).
 
 use crate::model::{Effect, ItemReport, Outcome};
-use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
+use aterm_types::macos_setup::{FailureKind, Observation, Setting, Standing, Subject};
 use std::sync::{Mutex, PoisonError};
 
 /// What an init item's probe read, in System State's terms (design §3.3).
@@ -131,21 +131,46 @@ impl Wait {
         }
     }
 
-    /// What a waiting row's note says (design §3.3): one short line in a person's words,
-    /// with no item id, file mode or command.
+    /// What ends this wait (design §3.6): GitHub answering again, by itself
+    /// ([`FailureKind::Transient`]), or a person's act for every other reason, which no pass
+    /// retries: the token the vault syncs is refused, missing, unusable or another account's,
+    /// aterm's GitHub settings cannot be used, a folder is in a repository's place, or Apple's
+    /// Command Line Tools are not installed ([`FailureKind::NeedsPerson`]).
+    #[must_use]
+    pub const fn kind(self) -> FailureKind {
+        match self {
+            Self::Unreached | Self::GitHub => FailureKind::Transient,
+            Self::CommandLineTools
+            | Self::Settings
+            | Self::Token
+            | Self::TokenUnusable
+            | Self::TokenRefused
+            | Self::OtherAccount
+            | Self::InTheWay => FailureKind::NeedsPerson,
+        }
+    }
+
+    /// What the row's note says (design §3.3): one short line in a person's words, with no
+    /// item id, file mode or command. A wait that ends by itself says what it waits on; one
+    /// only a person ends ([`Self::kind`]) says their remedy.
     #[must_use]
     pub const fn note(self) -> &'static str {
         match self {
-            Self::CommandLineTools => "Needs Apple's Command Line Tools",
-            Self::Settings => "aterm's GitHub settings file can't be used",
-            Self::Token => "Waits for your GitHub token from the Secrets vault",
-            Self::TokenUnusable => "Your GitHub token file can't be used",
+            Self::CommandLineTools => "Install Apple's Command Line Tools",
+            Self::Settings => "Fix aterm's GitHub settings; aterm doctor says how",
+            Self::Token => "Add your GitHub token to the Secrets vault",
+            Self::TokenUnusable => "Fix your GitHub token file; aterm doctor says how",
             Self::Unreached => "GitHub can't be reached",
-            Self::TokenRefused => "GitHub doesn't accept your token",
-            Self::OtherAccount => "Your GitHub token is for another account",
+            Self::TokenRefused => "GitHub refuses your token: renew it in the vault",
+            Self::OtherAccount => "Your GitHub token is for another account; replace it",
             Self::GitHub => "Can't read your repositories from GitHub",
-            Self::InTheWay => "A folder is in the way of a repository",
+            Self::InTheWay => "A folder blocks a repository; aterm doctor names it",
         }
+    }
+
+    /// Whether the wait is for a GitHub sign-in that works: the row reads `Needs sign-in`.
+    const fn signs_in(self) -> bool {
+        matches!(self, Self::Token | Self::TokenRefused | Self::OtherAccount)
     }
 }
 
@@ -267,6 +292,9 @@ impl Reading {
             Self::Repositories {
                 signed_in: false, ..
             } => "Needs sign-in".to_owned(),
+            // A sign-in only a person gives: the token is missing, refused or another
+            // account's.
+            Self::Waits(wait) if wait.signs_in() => "Needs sign-in".to_owned(),
             // A probe that could not go on read no value, and the person's own
             // project folders are no value of the row's. A value live until the next login
             // is the row's wanted one, which its observation marks ([`until_login`]).
@@ -338,7 +366,8 @@ const fn rank(standing: Standing) -> u8 {
 /// One setting's row from the rows its items reported; no rows is an unknown row. Its
 /// description (`detail`) is its worst parts' reasons (`why`), and a row that differs has none
 /// (§3.3). A waiting row's note is the [`Reading::Waits`] reason of the first waiting part that
-/// gives one, never the engine's line.
+/// gives one, and a row that needs a person the remedy of the first such part that gives one
+/// ([`Wait::note`]), never the engine's line.
 #[must_use]
 pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
     let subject = Subject::Setting(setting);
@@ -382,9 +411,11 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
             .map(|counts| (counts, *row))
     });
     let note = match standing {
-        Standing::Waiting => rows
+        // What a waiting row waits on, or the remedy of a row only a person moves, as the
+        // item decided it ([`Wait::kind`]).
+        Standing::Waiting | Standing::NeedsYou => rows
             .iter()
-            .filter(|row| self::standing(row) == Standing::Waiting)
+            .filter(|row| self::standing(row) == standing)
             .find_map(|row| match Reading::of(row) {
                 Some(Reading::Waits(wait)) => Some(wait.note().to_owned()),
                 _ => None,
@@ -981,10 +1012,11 @@ mod tests {
         assert_eq!(read.detail.as_deref(), Some("offline"));
     }
 
-    /// A waiting row's note is the reason of the first waiting part whose item decided one, never
-    /// the engine's line; a row with no such part, or one that does not wait, gives no note.
+    /// A waiting row's note is the reason of the first waiting part whose item decided one, and a
+    /// row only a person moves says their remedy (design §3.6), never the engine's line; a row
+    /// with no such part, or one that neither waits nor needs a person, gives no note.
     #[test]
-    fn a_waiting_row_notes_the_reason_its_item_decided_and_never_the_engine_line() {
+    fn a_row_notes_the_reason_or_remedy_its_item_decided_and_never_the_engine_line() {
         let blocked = |wait: Option<Wait>, why: &str| ItemReport {
             why: Some(why.to_owned()),
             detail: wait.map(|wait| Reading::Waits(wait).token()),
@@ -993,10 +1025,28 @@ mod tests {
         let line = "GitHub token source must be an owned private regular file (0600), without \
                     links, at most 64 KiB";
         for wait in Wait::ALL {
-            let read = observation(Setting::Repositories, &[&blocked(Some(wait), line)]);
-            assert_eq!(read.standing, Standing::Waiting, "{wait:?}");
+            // As the item reports it: a wait that ends by itself is blocked, one only a person
+            // ends is theirs.
+            let person = wait.kind() == FailureKind::NeedsPerson;
+            let mut part = blocked(Some(wait), line);
+            if person {
+                part.outcome = Outcome::Person;
+            }
+            let read = observation(Setting::Repositories, &[&part]);
+            let standing = if person {
+                Standing::NeedsYou
+            } else {
+                Standing::Waiting
+            };
+            assert_eq!(read.standing, standing, "{wait:?}");
             assert_eq!(read.note.as_deref(), Some(wait.note()), "{wait:?}");
-            assert_eq!((read.now, read.wanted.as_str()), (None, "All"), "{wait:?}");
+            let now = matches!(wait, Wait::Token | Wait::TokenRefused | Wait::OtherAccount)
+                .then_some("Needs sign-in");
+            assert_eq!(
+                (read.now.as_deref(), read.wanted.as_str()),
+                (now, "All"),
+                "{wait:?}"
+            );
             // The engine's line stays the description, for `aterm init` and the doctor.
             assert_eq!(read.detail.as_deref(), Some(line), "{wait:?}");
             // Short, and a person's words: no item id, path, file mode or flag.
@@ -1016,9 +1066,9 @@ mod tests {
         });
         let read = observation(
             Setting::Repositories,
-            &[&planned, &silent, &blocked(Some(Wait::Token), line)],
+            &[&planned, &silent, &blocked(Some(Wait::Unreached), line)],
         );
-        assert_eq!(read.note.as_deref(), Some(Wait::Token.note()));
+        assert_eq!(read.note.as_deref(), Some(Wait::Unreached.note()));
         let read = observation(Setting::Repositories, &[&planned, &silent]);
         assert_eq!((read.standing, read.note), (Standing::Waiting, None));
         // A row that does not wait has no note, whatever its parts read.

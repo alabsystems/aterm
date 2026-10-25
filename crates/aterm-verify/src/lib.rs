@@ -13,6 +13,9 @@ pub mod cells;
 pub mod changed;
 pub mod checks;
 pub mod cli;
+/// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
+#[cfg(unix)]
+pub mod disk;
 pub mod docdriver;
 pub mod docscan;
 pub mod exec;
@@ -47,8 +50,10 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use aterm_capacity::Machine as _;
 
 pub use checks::Check;
 pub use ladder::{Outcome, Report, Severity};
@@ -271,8 +276,11 @@ pub struct Ctx {
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]) and rustdoc ([`docdriver`]).
     pub test_recorder: Option<PathBuf>,
-    /// The machine-wide lock the timing stages hold while they run ([`plan::TIMED`]).
-    pub timing_lock: Option<PathBuf>,
+    /// How the timing stages ([`plan::TIMED`]) take the quiet machine: the run waits in the
+    /// per-user capacity ledger for one quiet claim before its first (`Some(Wait)`), or takes it
+    /// at once (`Some(Now)`, `--admit now`), and holds it until its last ends; `None` runs them
+    /// with no claim.
+    pub quiet: Option<aterm_capacity::Admit>,
     /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
 }
@@ -309,12 +317,6 @@ pub fn run_toolchain(env: &EnvSnapshot, root: &Path) -> Toolchain {
         &env.path,
         toolchain::pinned_channel(root).as_deref(),
     )
-}
-
-/// Where the machine-wide timing lock lives.
-#[must_use]
-pub fn default_timing_lock() -> PathBuf {
-    std::env::temp_dir().join("aterm-verify-timing.lock")
 }
 
 impl Ctx {
@@ -378,7 +380,7 @@ impl Ctx {
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: pinned_threads,
             test_recorder: std::env::current_exe().ok(),
-            timing_lock: None,
+            quiet: None,
             runs: None,
         }
     }
@@ -517,10 +519,10 @@ impl Ctx {
         self
     }
 
-    /// Take the timing lock at `path` around the timing stages.
+    /// Take the quiet machine around the timing stages, admitted as `mode` says ([`Ctx::quiet`]).
     #[must_use]
-    pub fn with_timing_lock(mut self, path: Option<PathBuf>) -> Self {
-        self.timing_lock = path;
+    pub const fn with_quiet(mut self, mode: Option<aterm_capacity::Admit>) -> Self {
+        self.quiet = mode;
         self
     }
 
@@ -571,59 +573,135 @@ impl Ctx {
     }
 }
 
-struct TimingLock(std::fs::File);
+/// The run's quiet machine ([`Ctx::quiet`]): one claim, admitted before the run's first timed
+/// stage and let go when its last ends, so another run's timed stages wait for all of this run's
+/// rather than taking turns with them.
+struct Quiet {
+    /// The claim, once admitted.
+    claim: Option<aterm_capacity::Claim>,
+    /// The run's timed stages still to end ([`takes_quiet`]).
+    left: usize,
+}
 
-impl TimingLock {
-    fn take(path: &Path) -> Option<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .ok()?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the take of TimingLock, whose Drop releases by LOCK_UN"
-        )]
-        let tried = file.try_lock();
-        match tried {
-            Ok(()) => Some(Self(file)),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                eprintln!(
-                    "verify: waiting for another run's timing check to finish ({})",
-                    path.display()
-                );
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "the take of TimingLock, whose Drop releases by LOCK_UN"
-                )]
-                let waited = file.lock();
-                waited.ok().map(|()| Self(file))
-            }
-            Err(std::fs::TryLockError::Error(_)) => None,
+impl Quiet {
+    /// Room for the timed stages of `stages` that `ctx` runs.
+    fn of(ctx: &Ctx, stages: &[plan::StageSpec]) -> Mutex<Quiet> {
+        Mutex::new(Quiet {
+            claim: None,
+            left: stages.iter().filter(|s| takes_quiet(ctx, s.id)).count(),
+        })
+    }
+}
+
+/// What the run's quiet claim did for a timed stage, for its time line: `first` when the stage's
+/// admission made it.
+fn admission(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit, first: bool) -> String {
+    let bound = claim.record().need.quiet.unwrap_or_default();
+    match mode {
+        aterm_capacity::Admit::Now => {
+            format!("admitted by --admit now (quiet is load <= {bound:.1})")
         }
+        aterm_capacity::Admit::Wait if !first => {
+            format!("still on the run's quiet machine (load <= {bound:.1})")
+        }
+        aterm_capacity::Admit::Wait if claim.waited() >= Duration::from_secs(1) => format!(
+            "waited {} for a quiet machine (load <= {bound:.1})",
+            aterm_capacity::span(claim.waited())
+        ),
+        aterm_capacity::Admit::Wait => format!("a quiet machine (load <= {bound:.1})"),
     }
 }
 
-impl Drop for TimingLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
+/// Run a timed stage on the run's quiet machine ([`Quiet`]): the first one's claim is admitted
+/// before it starts, waiting with no deadline and saying once a minute what it waits for, and let
+/// go when the last one's `f` returns. A ledger that cannot be used is said, and the stage runs
+/// unadmitted, as a run with no claim does. Also what the claim did, for the stage's time line.
+fn quietly<T>(
+    ctx: &Ctx,
+    quiet: &Mutex<Quiet>,
+    title: &str,
+    f: impl FnOnce() -> T,
+) -> (T, Option<String>) {
+    let Some(mode) = ctx.quiet else {
+        return (f(), None);
+    };
+    let said = {
+        let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
+        match &q.claim {
+            Some(claim) => admission(claim, mode, false),
+            None => match aterm_capacity::admit(
+                aterm_capacity::Need::timing(format!("verify {title}")),
+                mode,
+            ) {
+                Ok(claim) => {
+                    let said = admission(&claim, mode, true);
+                    q.claim = Some(claim);
+                    said
+                }
+                Err(e) => {
+                    eprintln!("verify: {e}; {title} runs unadmitted");
+                    format!("unadmitted: {e}")
+                }
+            },
+        }
+    };
+    let out = f();
+    let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
+    q.left = q.left.saturating_sub(1);
+    if q.left == 0 {
+        q.claim = None;
     }
+    (out, Some(said))
 }
 
-fn with_timing_lock<T>(ctx: &Ctx, f: impl FnOnce() -> T) -> T {
-    let _held = ctx.timing_lock.as_deref().and_then(TimingLock::take);
-    f()
-}
-
-/// The ` time ` line under a stage in the log.
+/// The ` time ` line under a stage in the log: how long it ran, when it started, and `machine`,
+/// what the machine did meanwhile ([`aterm_capacity::between`]) and how a timed stage was admitted.
 #[must_use]
-pub fn time_line(begun: Duration, ran: Duration) -> String {
-    format!(
-        "  time  {:.1}s (started +{:.1}s)\n",
+pub fn time_line(begun: Duration, ran: Duration, machine: &str) -> String {
+    let mut line = format!(
+        "  time  {:.1}s (started +{:.1}s)",
         ran.as_secs_f64(),
         begun.as_secs_f64()
-    )
+    );
+    if !machine.is_empty() {
+        line.push_str("; ");
+        line.push_str(machine);
+    }
+    line.push('\n');
+    line
+}
+
+/// Whether stage `id` runs on the quiet machine: a timed stage ([`plan::TIMED`]) that runs, not
+/// one that is a named skip before it starts anything (a windowed stage under `--no-windows`, a
+/// measuring one with no `--app`).
+fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
+    let needs_app = matches!(id, plan::StageId::MeasuringTests | plan::StageId::GuiSmoke);
+    id.timed()
+        && !(ctx.no_windows && id.no_windows_skip().is_some())
+        && !(needs_app && ctx.measure_artifact.is_none())
+}
+
+/// One stage, run on the run's quiet machine when it is timed ([`quietly`]), with the machine
+/// read as it starts and as it ends: the report, when it started (after any admission wait) and
+/// what the machine did meanwhile.
+fn staged(ctx: &Ctx, quiet: &Mutex<Quiet>, spec: &plan::StageSpec) -> (Report, Instant, String) {
+    let run = || {
+        let begun = Instant::now();
+        let from = aterm_capacity::Live.read(None);
+        let report = stages::run_stage(ctx, spec);
+        let to = aterm_capacity::Live.read(None);
+        (report, begun, aterm_capacity::between(&from, &to))
+    };
+    let ((report, begun, mut machine), admitted) = if takes_quiet(ctx, spec.id) {
+        quietly(ctx, quiet, &spec.title, run)
+    } else {
+        (run(), None)
+    };
+    if let Some(said) = admitted {
+        machine.push_str("; ");
+        machine.push_str(&said);
+    }
+    (report, begun, machine)
 }
 
 /// The one header line.
@@ -664,7 +742,7 @@ pub fn selection(ctx: &Ctx, cone: Option<&str>) -> String {
     }
 }
 
-type Clock = (Duration, Duration);
+type Clock = (Duration, Duration, String);
 
 struct Progress {
     /// Stages still to finish, and the first start and last end seen.
@@ -723,6 +801,7 @@ pub fn run(
     let out = Mutex::new(out);
     let t0 = Instant::now();
     let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; stages.len()]);
+    let quiet = Quiet::of(ctx, &stages);
     let mut log_err = None;
 
     sched::run_stages(
@@ -733,19 +812,18 @@ pub fn run(
                 .position(|s| std::ptr::eq(s, spec))
                 .unwrap_or_default();
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
-            let begun_at = Instant::now();
+            let (report, begun_at, machine) = staged(ctx, &quiet, spec);
             if let Some(k) = owner
                 && let Ok(mut p) = progress[k].lock()
             {
-                p.started.get_or_insert(begun_at);
+                p.started = Some(p.started.map_or(begun_at, |s| s.min(begun_at)));
             }
-            let report = if spec.id.timed() {
-                with_timing_lock(ctx, || stages::run_stage(ctx, spec))
-            } else {
-                stages::run_stage(ctx, spec)
-            };
             if let Ok(mut c) = clocks.lock() {
-                c[i] = Some((begun_at.saturating_duration_since(t0), begun_at.elapsed()));
+                c[i] = Some((
+                    begun_at.saturating_duration_since(t0),
+                    begun_at.elapsed(),
+                    machine,
+                ));
             }
             if let Some(k) = owner
                 && let Ok(mut p) = progress[k].lock()
@@ -778,10 +856,10 @@ pub fn run(
             report
         },
         |i, report| {
-            let clock = clocks.lock().ok().and_then(|c| c.get(i).copied().flatten());
+            let clock = clocks.lock().ok().and_then(|c| c.get(i).cloned().flatten());
             let mut text = report.render();
-            if let Some((begun, ran)) = clock {
-                text.push_str(&time_line(begun, ran));
+            if let Some((begun, ran, machine)) = clock {
+                text.push_str(&time_line(begun, ran, &machine));
             }
             if log_err.is_none()
                 && let Err(e) = log.write_all(text.as_bytes())
@@ -1101,7 +1179,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_test_jobs(parsed.test_jobs)
         .with_test_threads(parsed.test_threads)
-        .with_timing_lock(Some(default_timing_lock()))
+        .with_quiet(Some(parsed.admit))
         .with_toolchain_lease(lease_said);
     let ctx = match runs_dir
         .as_deref()
@@ -1109,6 +1187,11 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     {
         Some(record) => ctx.with_runs(record),
         None => ctx,
+    };
+    #[cfg(unix)]
+    let disk = match disk::admit(&ctx, parsed.admit) {
+        Ok(held) => held,
+        Err(why) => return could_not_run(why),
     };
     let log = open_log(parsed.log.as_deref(), cwd, &ctx);
     let log_shown = log
@@ -1132,6 +1215,17 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             exit::COULD_NOT_RUN
         }
     };
+    #[cfg(unix)]
+    if let Some(held) = disk {
+        let claimed = held.estimate;
+        let took = held.finish();
+        let line = format!(
+            "disk: claimed {claimed}; this run grew its directories by {} (they held {} at most)",
+            atpkg::admit_disk::size(took.grew),
+            atpkg::admit_disk::size(took.peak)
+        );
+        let _ = log_file.as_mut().map(|f| writeln!(f, "{line}"));
+    }
     if let Some(record) = &ctx.runs {
         record.finish(&runs::LiveKernel);
     }

@@ -4605,7 +4605,8 @@ pub(crate) const ACCOUNTS_NONE_SOON_KEY: &str = "harness.accounts.none-soon";
 
 pub(crate) const ACCOUNTS_WRONG_KEY: &str = "harness.accounts.wrong-account";
 
-/// The read of another CLI's pool ([`accounts_due_entry_for`]), its `--cli` added.
+/// The read of another CLI's pool ([`accounts_due_entry_for`], [`accounts_wrong_entry_for`]),
+/// its `--cli` added.
 const ACCOUNTS_READ: &str = "Run aterm harness accounts";
 
 /// The reason of the Claude Code renewal entries: the upkeep renews each due login by itself
@@ -4746,9 +4747,14 @@ pub(crate) fn accounts_due_entry_for(
     )))
 }
 
-/// The exceptions digest entry when a renewal of `cli`'s signed in an account other than its
-/// row's ([`accounts_wrong_entry`] for Claude Code's, word for word): another CLI's names its
-/// product, says nothing live changed, and names the sign-in by hand.
+/// The fact for later that a renewal of `cli`'s signed in an account other than its row's
+/// ([`accounts_wrong_entry`] for Claude Code's, word for word): the window's upkeep threw that
+/// sign-in away, kept the login the row had, and signs the row in again by itself
+/// (`accounts_sync`'s `renew_pool_due`: a row that still needs its sign-in stays a candidate,
+/// tried again once the wrong account's hold and the renewal cooldown have passed, sooner where
+/// the mailbox's configuration changed), so it asks no one to; it names its product and steps to
+/// the read of its pool (`--cli`). A renewal that stops for a person is its sign-in task's entry
+/// ([`accounts_sign_in_entry_for`]).
 pub(crate) fn accounts_wrong_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     labels: &[String],
@@ -4762,20 +4768,18 @@ pub(crate) fn accounts_wrong_entry_for(
         cli.id(),
         "wrong-account",
         &format!("{} signed in another account", title_word(cli)),
-        Why::OnlyYou(Reason::new(
-            "Its sign-in named another account, so aterm kept the login it had",
-        )),
-        Then::step(format!(
-            "Run aterm harness accounts login {first} --cli {}",
-            cli.id()
-        )),
+        Why::Spent {
+            tried: Reason::new("threw away a sign-in that named another account"),
+            reason: Reason::new("the row's login is unchanged until it signs in as its own"),
+        },
+        Then::step(format!("{ACCOUNTS_READ} --cli {}", cli.id())),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
     .restated_at_once()
     .more(format!(
         "The {} sign-in for {first} signed in an account other than its row's email; \
-         nothing live changed. Approve its page as the row's account.",
+         nothing live changed, and aterm signs the row in again by itself.",
         cli.connector().product
     ));
     for line in labels_lines("Wrong account: ", labels, NOTICE_LABEL_LINES) {

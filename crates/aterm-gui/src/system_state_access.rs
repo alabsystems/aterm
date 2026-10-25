@@ -344,8 +344,9 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
 /// Check only reads and pressing it again is its remedy ([`SetupStatus::failed_steps`]).
 /// Several are counted (`2 need you`, `1 needs you, 1 failed`). A row Restore could not put
 /// back, alone, reads `System State: Restore failed for <row>`. The note is the Secrets row's
-/// while it needs you (a waiting vault approval code, or a move to Applications). `None` when
-/// nothing does.
+/// while it needs you (a waiting vault approval code, or a move to Applications), else the
+/// GitHub repositories row's while it needs you (its token's remedy, in the page's words).
+/// `None` when nothing does.
 pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
     let selection = status
         .plan
@@ -408,15 +409,18 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
             failed.len()
         ),
     };
-    let note = status
-        .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
-        .find(|observation| {
-            observation.subject == Subject::Setting(Setting::Secrets)
-                && observation.standing == Standing::NeedsYou
-                && selection.contains(Setting::Secrets)
-        })
-        .and_then(|observation| observation.note.clone())
-        .filter(|note| !note.trim().is_empty());
+    let note_of = |setting: Setting| {
+        status
+            .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
+            .find(|observation| {
+                observation.subject == Subject::Setting(setting)
+                    && observation.standing == Standing::NeedsYou
+                    && selection.contains(setting)
+            })
+            .and_then(|observation| observation.note.clone())
+            .filter(|note| !note.trim().is_empty())
+    };
+    let note = note_of(Setting::Secrets).or_else(|| note_of(Setting::Repositories));
     Some(SystemStateLine { label, note })
 }
 

@@ -184,9 +184,12 @@ impl CursorGlow {
         if self.keyed_clicks == 0 {
             return false;
         }
-        let fresh = self.keyed_click_at.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() <= Self::KEYED_CLICK_FRESH
-        });
+        const KEYED_CLICK_FRESH_DUR: Duration = Duration::from_nanos(
+            (CursorGlow::KEYED_CLICK_FRESH as f64 * 1_000_000_000.0).round() as u64,
+        );
+        let fresh = self
+            .keyed_click_at
+            .is_some_and(|t| now.saturating_duration_since(t) <= KEYED_CLICK_FRESH_DUR);
         if !fresh {
             self.keyed_clicks = 0;
             self.keyed_click_at = None;

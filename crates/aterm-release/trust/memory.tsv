@@ -1,7 +1,12 @@
-# What each library's verification needs in memory. `targo trust` gives a verified
-# library a ceiling of RAM / 8; a function that needs more is UNKNOWN, so a floor set
-# at a larger ceiling is not reproducible on a smaller host (trust_facts.rs: `row_for`,
-# `fits`, `memory_refusal`). One row per library and RAM it was measured on:
+# What each library's verification needs in memory. Under a prover whose `trustc -Z help`
+# lists trust-verify-memory-ceiling-bytes (321aaeda7, store build 9192), `targo trust`
+# gives a verified library a ceiling of RAM / 8; a function that needs more is UNKNOWN, so
+# a floor set at a larger ceiling is not reproducible on a smaller host (trust_facts.rs:
+# `row_for`, `fits`, `memory_refusal`). Under a prover with no ceiling (20565c325, store
+# build 15698) these rows refuse nothing: a library is refused up front only when its
+# recorded peak RSS (trust/costs.tsv, or the clone's newer history) with the margin its
+# check claims is not below the RAM (`peak_seen`). One row per library and RAM it was
+# measured on:
 #
 #   floor ceiling  GiB of the run that set its floors.tsv floor (one per library), or -
 #                  (also when that run's log named none, as a seal from trust main's)

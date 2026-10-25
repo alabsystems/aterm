@@ -295,13 +295,15 @@ pub use devtools_helper_drive::run_devtools_helper_drive;
 pub use quit_reopen::{REOPEN_VERB, run_reopen_after};
 pub use system_state::{
     Admission as InitialSetupAdmission, CHECK_FAILED_NOTE, InitialSetupPermissionPolicy,
-    RESTORE_BACKUP_UNREAD_NOTE, RESTORE_FAILED_NOTE, SETUP_ROW, STARTUP_RETRY_NOTE,
-    STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus, SetupStatusRow, calm_setup_row,
-    journal_refused_entry, pass_rows, restore_rows, setup_not_started_entry, setup_set_aside_entry,
+    NEWER_SETUP_NOTE, RESTORE_BACKUP_UNREAD_NOTE, RESTORE_FAILED_NOTE, SETUP_ROW,
+    STARTUP_RETRY_NOTE, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus, SetupStatusRow,
+    VAULT_NOT_JOINED_NOTE, VAULT_UNREAD_NOTE, calm_setup_row, journal_refused_entry, pass_rows,
+    restore_rows, setup_not_started_entry, setup_set_aside_entry,
 };
 #[cfg(unix)]
 pub use system_state::{
-    clear_setup_not_started, note_journal_refused, note_setup_not_started, note_setup_set_aside,
+    clear_setup_not_started, clear_setup_set_aside, note_journal_refused, note_setup_not_started,
+    note_setup_set_aside,
 };
 /// Mend this Mac's vault subscriber off the event loop, at once and every
 /// `secrets_join::MEND_EVERY` (`secrets_join::spawn_mend_lane`): for a windowed launch whose
@@ -719,6 +721,7 @@ mod split_regrid_hold;
 #[cfg(target_os = "linux")]
 mod startup_token;
 mod stats_deck;
+mod stats_gauge;
 mod stats_lens;
 mod stats_live;
 mod stats_paint;
@@ -3218,8 +3221,8 @@ enum Wake {
         asked: rewind_verb::Asked,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
-    /// A Rewind fold finished off the main thread ([`rewind_worker`]).
-    RewindFolded(Box<rewind_worker::Folded>),
+    /// A Rewind fold, verdict or cell search finished off the main thread ([`rewind_worker`]).
+    RewindDone(Box<rewind_worker::Done>),
     /// A host worker's prepare or judgements for the `aos` verb's glow.
     AosWorked(Box<aos_host::Worked>),
     AosExport {
@@ -3517,6 +3520,13 @@ enum Wake {
         sid: String,
         to: String,
         word: aterm_messages::UpgradeWord,
+    },
+    /// A tab menu's timeline row: open Rewind on that tab at the instant `at_ms` (`turn_ledger::now_ms`'s clock).
+    #[cfg(target_os = "macos")]
+    TabMenuRewind {
+        window: WindowId,
+        tab: tab_model::TabId,
+        at_ms: u64,
     },
     #[cfg(target_os = "macos")]
     BeginSessionRename {
@@ -6830,9 +6840,11 @@ struct WindowState {
     #[cfg(any(target_os = "linux", test))]
     initial_frame_settle: Option<InitialFrameSettle>,
     panes_stale: bool,
-    /// The restore asked the OS to maximize this window or put it in full screen
+    /// The restore asked the OS to maximize this window once it was made (`App::restore_window`).
+    restore_maximize_asked: bool,
+    /// The re-grid a restore's close left for a size the OS had still to bring
     /// (`App::regrid_restored_windows`).
-    restore_show_awaited: bool,
+    restore_regrid_owed: Option<app_restore::RestoreRegridOwed>,
     last_visible_views: Vec<tab_model::ViewId>,
     win_px: Option<PhysicalSize<u32>>,
     carried_inner_px: Option<PhysicalSize<u32>>,
@@ -7816,7 +7828,8 @@ impl WindowState {
             #[cfg(any(target_os = "linux", test))]
             initial_frame_settle: None,
             panes_stale: false,
-            restore_show_awaited: false,
+            restore_maximize_asked: false,
+            restore_regrid_owed: None,
             last_visible_views: Vec::new(),
             win_px: None,
             carried_inner_px: None,
@@ -15697,7 +15710,12 @@ impl App {
     }
 
     fn deliver_paste(&mut self, wid: WindowId, session: Option<u64>, text: String, source: Source) {
-        let target = session.or_else(|| self.front_terminal(wid).map(|t| t.session));
+        let overlay = self.windows.get(&wid).is_some_and(|w| w.overlay_open());
+        let target = session.or_else(|| {
+            (!overlay)
+                .then(|| self.front_terminal(wid).map(|t| t.session))
+                .flatten()
+        });
         if let Some(rewound) =
             target.filter(|s| matches!(source, Source::Human) && self.pool.is_rewound(*s))
         {
@@ -18524,6 +18542,10 @@ impl App {
                 word,
             } => self.dispatch_tab_menu_upgrade(window, tab, sid, to, word),
             #[cfg(target_os = "macos")]
+            Wake::TabMenuRewind { window, tab, at_ms } => {
+                self.dispatch_tab_menu_rewind(window, tab, at_ms);
+            }
+            #[cfg(target_os = "macos")]
             Wake::BeginSessionRename { window, tab } => {
                 self.clear_tab_surface_move_license(Some(window));
                 self.begin_session_rename(window, tab);
@@ -18867,7 +18889,7 @@ impl App {
                 asked,
                 reply,
             } => self.control_rewind(session, asked, reply),
-            Wake::RewindFolded(folded) => self.rewind_folded(*folded),
+            Wake::RewindDone(done) => self.rewind_done(*done),
             Wake::PersonStandIn { asked, reply } => {
                 let _ = reply.send(self.person_stand_in(asked));
             }
@@ -27434,6 +27456,10 @@ mod aos_repair_tests;
 #[cfg(test)]
 #[path = "lib_aos_r2_tests.rs"]
 mod aos_r2_tests;
+
+#[cfg(test)]
+#[path = "lib_aos_r2_review_tests.rs"]
+mod aos_r2_review_tests;
 
 /// An admitted schedule plan published over the front window's glow on the host path (design §10.6); only a debug build publishes plans.
 #[cfg(all(test, debug_assertions))]

@@ -294,7 +294,8 @@ pub struct Look<'a> {
     /// look (their task is done or exited, their worker found them unfit at their last turn
     /// break, their agent is no longer Claude Code, or their directory is on another volume):
     /// an elected one among them is released ([`Miss::Released`]), so it costs no election,
-    /// whether or not it is still supervised.
+    /// whether or not it is still supervised, and whether it was this host's pick or that of a
+    /// host this one replaced (a seamless update's successor adopts it first).
     pub barred: &'a [String],
     /// Every live session of this host: an asked one that leaves them hands the ask on.
     pub live: &'a [String],
@@ -761,7 +762,17 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             orphan_ms,
             ..
         } => {
-            let pick = adopt(entry, pick, look, look.supervised);
+            // Adopted where this host supervises the session or its seat rule bars it: a pick
+            // whose agent exited around a seamless update has left the successor's supervised
+            // roster, and the successor releases it below at no election's cost.
+            let held: &[&[String]] = &[look.supervised, look.barred];
+            #[cfg(any(test, debug_assertions))]
+            let held = if fault::armed(fault::Fault::AdoptSupervisedOnly) {
+                &held[..1]
+            } else {
+                held
+            };
+            let pick = adopt(entry, pick, look, held);
             let here = pick.host == *look.host;
             let barred = here && look.barred.contains(&pick.sid);
             #[cfg(any(test, debug_assertions))]
@@ -803,7 +814,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             free_at,
             best_free,
         } => {
-            let pick = adopt(entry, pick, look, look.live);
+            let pick = adopt(entry, pick, look, &[look.live]);
             let best = best_free.max(look.free);
             let rose = best.saturating_sub(free_at);
             if rose >= FREED_MIN {
@@ -848,13 +859,16 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
 }
 
 /// `pick`, moved to this look's host when its own host ended and this host has its session among
-/// `held` (its supervised sessions while the line is owed, its live ones once it went): a
-/// seamless update's successor adopts its sessions under the same sids as a new [`HostId`], so the
-/// pick moves to it, in the phase and in [`Entry::picks`], and its line is typed or its answer
-/// judged there, instead of the ask being handed on as though its session had gone and the
-/// session kept out of the episode.
-fn adopt(entry: &mut Entry, pick: Pick, look: &Look<'_>, held: &[String]) -> Pick {
-    if pick.host == *look.host || !held.contains(&pick.sid) || (look.alive)(&pick.host) {
+/// `held` (its supervised sessions and those its seat rule bars while the line is owed, its live
+/// ones once it went): a seamless update's successor adopts its sessions under the same sids as a
+/// new [`HostId`], so the pick moves to it, in the phase and in [`Entry::picks`], and its line is
+/// typed, its release made or its answer judged there, instead of the ask being handed on as
+/// though its session had gone and the session kept out of the episode.
+fn adopt(entry: &mut Entry, pick: Pick, look: &Look<'_>, held: &[&[String]]) -> Pick {
+    if pick.host == *look.host
+        || !held.iter().any(|sids| sids.contains(&pick.sid))
+        || (look.alive)(&pick.host)
+    {
         return pick;
     }
     #[cfg(any(test, debug_assertions))]
@@ -1222,6 +1236,26 @@ pub fn typed_unrecorded(
     }
     typed(lease, key, host, sid, at_ms, free);
     true
+}
+
+/// Whether a host's look that reads volume `key` clear of its floor leaves `lease` as it is, its
+/// lock untaken: no episode is open there, and the last line this host typed on the volume (at
+/// `typed_ms`), if any, needs no record ([`typed_unrecorded`] would not record it). A line whose
+/// record was lost (a full disk) is so recorded at the host's next look even when another host
+/// has ended its episode since, so its cooldown starts and no host opens a new episode, and asks
+/// another session, within it.
+#[must_use]
+pub fn rests(lease: &Lease, key: &str, typed_ms: Option<i64>) -> bool {
+    let entry = lease.entry(key);
+    let open = entry.is_some_and(|e| e.episode_ms.is_some());
+    let unrecorded = typed_ms.is_some_and(|at| {
+        entry
+            .and_then(|e| e.last_ask_ms)
+            .is_none_or(|last| last < at)
+    });
+    #[cfg(any(test, debug_assertions))]
+    let unrecorded = unrecorded && !fault::armed(fault::Fault::RestUnrecorded);
+    !open && !unrecorded
 }
 
 /// Host `host` found at its turn break that session `sid` may not be asked: the lease hands the
@@ -1840,6 +1874,16 @@ pub mod fault {
         /// owed when that count reaches [`super::MAX_ASKS`], as before such picks were
         /// withdrawn: the later pick takes a line past the bound.
         OwedPastTwo,
+        /// [`super::rests`] lets a look that reads the volume clear rest with its host's line
+        /// unrecorded, as the window's look did before it recorded such a line first: where
+        /// another host ended the episode before that look, the line's cooldown never started,
+        /// and a new episode asked another session within it.
+        RestUnrecorded,
+        /// [`super::step`] adopts an ended host's owed pick only where the looking host
+        /// supervises its session, as before it adopted one its seat rule bars: a pick whose
+        /// agent exited around a seamless update was left owed by its successor, which bars it,
+        /// and handed off as undelivered once [`super::ADOPT_MS`] was over, spending an election.
+        AdoptSupervisedOnly,
     }
 
     thread_local! {

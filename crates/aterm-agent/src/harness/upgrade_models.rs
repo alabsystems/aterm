@@ -234,9 +234,34 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 /// The directory could not be made or the write, the mode or the rename failed.
 pub fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
     use std::io::Write as _;
-    write_atomic_using(path, text, mode, Flush::Durable, |file, bytes| {
-        file.write_all(bytes)
-    })
+    write_atomic_using(
+        path,
+        text,
+        mode,
+        Flush::Durable,
+        |file, bytes| file.write_all(bytes),
+        || Ok(()),
+    )
+}
+
+/// Prepares and durably flushes a private replacement, then calls `before_publish` before
+/// its rename. The caller can retain evidence without doing so for a failed preparation.
+/// # Errors
+/// As [`write_atomic`], or the callback failed. A callback error leaves the destination intact.
+pub(super) fn write_atomic_before_publish(
+    path: &Path,
+    text: &str,
+    before_publish: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    write_atomic_using(
+        path,
+        text,
+        None,
+        Flush::Durable,
+        |file, bytes| file.write_all(bytes),
+        before_publish,
+    )
 }
 
 /// [`write_atomic`] with the stage finished by [`aterm_durable::ordered`] instead of a full flush.
@@ -244,9 +269,14 @@ pub fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> std::io:
 /// As [`write_atomic`].
 pub fn write_atomic_ordered(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
-    write_atomic_using(path, text, None, Flush::Ordered, |file, bytes| {
-        file.write_all(bytes)
-    })
+    write_atomic_using(
+        path,
+        text,
+        None,
+        Flush::Ordered,
+        |file, bytes| file.write_all(bytes),
+        || Ok(()),
+    )
 }
 
 fn write_atomic_using(
@@ -255,6 +285,7 @@ fn write_atomic_using(
     mode: Option<u32>,
     flush: Flush,
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    before_publish: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let dir = path
         .parent()
@@ -283,6 +314,7 @@ fn write_atomic_using(
     write(&mut file, text.as_bytes())?;
     crate::durable::finish(&file, flush)?;
     drop(file);
+    before_publish()?;
     std::fs::rename(&staged, path)
 }
 
@@ -2554,12 +2586,23 @@ mod atomic_write_tests {
         let unrelated = dir.path().join("notes");
         std::fs::write(&dest, "old good snapshot").expect("destination");
         std::fs::write(&unrelated, "keep me").expect("unrelated");
-        let result =
-            write_atomic_using(&dest, "replacement", None, Flush::Durable, |file, bytes| {
+        let mut published = false;
+        let result = write_atomic_using(
+            &dest,
+            "replacement",
+            None,
+            Flush::Durable,
+            |file, bytes| {
                 file.write_all(&bytes[..1])?;
                 Err(std::io::Error::other("injected owned-stage write failure"))
-            });
+            },
+            || {
+                published = true;
+                Ok(())
+            },
+        );
         assert!(result.is_err());
+        assert!(!published, "a failed preparation cannot publish evidence");
         assert_eq!(
             std::fs::read_to_string(&dest).expect("destination"),
             "old good snapshot"
@@ -2580,6 +2623,23 @@ mod atomic_write_tests {
                 std::ffi::OsString::from("record.json")
             ]
         );
+    }
+
+    #[test]
+    fn the_publication_barrier_sees_a_flushed_stage_and_keeps_the_old_destination_on_error() {
+        use aterm_durable::{Flush, seam::Recording};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let dest = dir.path().join("state.json");
+        std::fs::write(&dest, "old state").unwrap();
+        let recording = Recording::start();
+        let result = write_atomic_before_publish(&dest, "replacement", || {
+            assert_eq!(recording.take(), [Flush::Durable]);
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old state");
+            Err(std::io::Error::other("injected barrier refusal"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old state");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

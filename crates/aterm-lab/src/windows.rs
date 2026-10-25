@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use aterm_toolchain::named_lock::Wait;
 use aterm_uds::spawnfd::Stdio;
+use atpkg::admit_disk::Admit;
 
 use crate::linux::{LaneLock, Out};
 use crate::paths::paths;
@@ -61,9 +62,16 @@ const BOOT_KEYS_FOR: Duration = Duration::from_secs(12);
 
 /// The verbs, as `windows help` prints them.
 pub const USAGE: &str = "\
-targo --unverified lab windows [--no-wait] <verb> — the Windows runtime lane: a QEMU VM (hvf, Windows 11 arm64, Prism
-for x86_64). One run holds the VM at a time: a verb that finds it held waits for that run to end, naming it (pid, verb,
-checkout, since when) as the wait starts and once a minute; --no-wait answers NOT RUN at once instead, naming it
+targo --unverified lab windows [--no-wait] [--admit wait|now] <verb> — the Windows runtime lane: a QEMU VM (hvf, Windows
+11 arm64, Prism for x86_64). One run holds the VM at a time: a verb that finds it held waits for that run to end, naming it
+(pid, verb, checkout, since when) as the wait starts and once a minute; --no-wait answers NOT RUN at once instead, naming
+it. A verb that boots the VM first claims the disk its boots write (what the last ones wrote, else 35 GiB less what the
+VM's directory holds) and waits for room before it waits for the lane, a line a minute naming the need and the holders;
+once it holds the lane, the boot claims the guest's 8 GiB and 6 vCPUs in this Mac's capacity ledger (`aterm pkg capacity`)
+and waits while they do not fit with 8 GiB to spare beside them, naming the claims that hold the room once a minute (NOT
+RUN at once only on a Mac too small for them); --admit now boots at once, saying what it lacks or would have waited for.
+The guest's builds run as many jobs as cores the claim was granted (CARGO_BUILD_JOBS). A VM still running after the
+one-shot run that booted it died is stopped as `down` stops it, and booted afresh; one an `up` left is adopted
   up [--vnc]               make the VM on first use (fetch Windows 11's arm64 ISO from Microsoft and virtio-win,
                            install unattended, provision Git, Visual Studio Build Tools and Rust {rust}, snapshot),
                            boot the snapshot; leaves it running. --vnc: a VNC server on 127.0.0.1 (debugging only)
@@ -76,7 +84,7 @@ checkout, since when) as the wait starts and once a minute; --no-wait answers NO
                            as the standard user lane: over SSH (session 0, sshd's Redirection Guard), or with --desktop in
                            lane's desktop session (WinSta0, a Task Scheduler task); a one-shot exec (it booted the VM)
                            shuts it down and reverts the disk when CMD ends. Interrupted, CMD goes on in the guest and a
-                           VM the exec booted keeps running: `down` stops it
+                           VM the exec booted keeps running until `down` or the next run stops it
   smoke [--arch aarch64|x86_64]...
                            the lane's acceptance per arch (both unless named): aterm, aterm-gui and aterm-ctl built,
                            `aterm --version` printing this checkout's build number, and one aterm-gui --headless driven over
@@ -96,28 +104,37 @@ checkout, since when) as the wait starts and once a minute; --no-wait answers NO
   destroy                  stop the VM and delete it (disk, firmware variables, TPM, key); the images stay cached
 ";
 
-/// `args` past the lane's own `--no-wait` (before the verb; one after it is the verb's), and
-/// whether a held lane is waited for.
-fn lane_flags(args: &[String]) -> (&[String], Wait) {
+/// `args` past the lane's own `--no-wait` and `--admit <wait|now>` (before the verb; one after
+/// it is the verb's), whether a held lane is waited for, and how a boot's disk is admitted: `run`,
+/// the run's `--admit` ([`crate::admission::mode`]), where the lane names none.
+/// # Errors
+/// A usage error: `--admit` with no value or another than `wait` or `now`.
+fn lane_flags(args: &[String], run: Admit) -> Result<(&[String], Wait, Admit), Fail> {
     let mut args = args;
-    let mut wait = Wait::Block;
-    while let [flag, rest @ ..] = args
-        && flag == "--no-wait"
-    {
-        wait = Wait::No;
-        args = rest;
+    let (mut wait, mut admit) = (Wait::Block, run);
+    loop {
+        if let Some((mode, used)) = crate::linux::admit_flag("windows", args)? {
+            admit = mode;
+            args = &args[used..];
+        } else if let [flag, rest @ ..] = args
+            && flag == "--no-wait"
+        {
+            wait = Wait::No;
+            args = rest;
+        } else {
+            return Ok((args, wait, admit));
+        }
     }
-    (args, wait)
 }
 
 /// `windows <verb> …`.
 /// # Errors
 /// A usage error, or a step that failed.
 pub fn cmd_windows(args: &[String]) -> Res {
-    let (args, wait) = lane_flags(args);
+    let (args, wait, admit) = lane_flags(args, crate::admission::mode())?;
     let verb = args.first().map_or("help", String::as_str);
     let rest = args.get(1..).unwrap_or_default();
-    crate::linux::name_run(format!("lab windows {verb}"), wait);
+    crate::linux::name_run(format!("lab windows {verb}"), wait, admit);
     match verb {
         "up" => cmd_up(rest),
         "down" => cmd_down(),
@@ -259,6 +276,11 @@ impl Layout {
     #[must_use]
     pub fn screen(&self) -> PathBuf {
         self.run().join("screen.png")
+    }
+    /// The run that booted the VM ([`crate::vm_admit::Booter`]).
+    #[must_use]
+    pub fn booter(&self) -> PathBuf {
+        self.run().join("booter")
     }
 }
 
@@ -1735,17 +1757,95 @@ pub struct Up {
     pub booted_here: bool,
     /// What it took, in order.
     pub timings: Vec<(String, f64)>,
+    /// This run's claim on the VM ([`crate::vm_admit`]), held until the run ends, and
+    /// `CARGO_BUILD_JOBS` for the guest's builds ([`Up::cargo_env`]).
+    admitted: crate::vm_admit::Admitted,
+    /// The booter record of the VM this run booted, which its end settles.
+    booter: Option<PathBuf>,
 }
 
 impl Up {
+    /// The environment the guest's `cargo` gets for `arch` ([`guest::cargo_env`]), its job count
+    /// the cores this run was admitted (`CARGO_BUILD_JOBS`).
+    #[must_use]
+    pub fn cargo_env(&self, arch: Arch) -> Vec<(String, String)> {
+        let mut env = guest::cargo_env(arch);
+        env.push(("CARGO_BUILD_JOBS".into(), self.admitted.jobs.to_string()));
+        env
+    }
+
     /// Shut down and revert the VM when this run booted it.
     pub fn release(self) -> Result<(), String> {
         if self.booted_here {
-            shut_and_revert(&self.layout, &self.tools, Some(&self.admin))?;
+            let stopped = shut_and_revert(&self.layout, &self.tools, Some(&self.admin));
+            crate::vm_admit::settle(self.booter.as_deref(), false, stopped.is_ok());
+            stopped?;
             println!("windows: VM stopped and reverted to its snapshot (this run booted it)");
         }
         Ok(())
     }
+
+    /// `up`'s end: the VM left running for later runs, which adopt it.
+    pub fn keep(self) {
+        crate::vm_admit::settle(self.booter.as_deref(), true, false);
+    }
+}
+
+/// `down` on a running VM: Windows shut down (over SSH as its administrator where the VM
+/// recorded its port, else ACPI's power button through QMP) and the disk put back to its
+/// snapshot; its booter record goes once it has stopped.
+/// # Errors
+/// The VM did not stop, or the disk did not revert.
+fn down(l: &Layout, t: &Tools) -> Result<(), String> {
+    let ssh = read_port(l).map(|p| Ssh::new(l, p));
+    shut_and_revert(l, t, ssh.as_ref())?;
+    crate::vm_admit::clear(&l.booter());
+    Ok(())
+}
+
+/// The running VM a run adopts, if any (its QEMU's pid). One whose one-shot booter has died is
+/// that run's leftover ([`crate::vm_admit::leftover`]): it is stopped here, as `down` stops it,
+/// and `None` comes back, so this run boots afresh.
+/// # Errors
+/// NOT RUN: the VM's state could not be read, or a leftover did not stop.
+fn adopted(l: &Layout, t: &Tools, say: &mut dyn FnMut(&str)) -> Result<Option<i32>, Fail> {
+    let Some(pid) = running(l).map_err(not_run)? else {
+        return Ok(None);
+    };
+    let Some(gone) = crate::vm_admit::leftover(&l.booter()) else {
+        return Ok(Some(pid));
+    };
+    say(&format!(
+        "stopping {VM} left by dead run {} (QEMU pid {pid})",
+        gone.describe()
+    ));
+    down(l, t).map_err(|e| {
+        not_run(format!(
+            "{VM}, left by dead run pid {}, did not stop: {e}",
+            gone.pid
+        ))
+    })?;
+    say(&format!("{VM} stopped and reverted to its snapshot"));
+    Ok(None)
+}
+
+/// What a Windows VM boot claims of its volume where no boot was measured: 35 GiB, less what
+/// the VM's directory holds already (`aterm_capacity::Footprints::need`), so a VM on disk
+/// claims nothing until a boot is measured. MEASURED 2026-10-25 on the Mac the lane was made on:
+/// its directory holds 35 GiB (`du -sh`), the install (2026-10-20), the snapshot and every run
+/// since included, and a qcow2 only grows, so a fresh install writes no more than that.
+pub const BOOT_COLD_DISK: u64 = 35 << 30;
+
+/// [`crate::linux::boot_run`] for the Windows lane: the VM's directory, with what the last boots
+/// wrote kept in it.
+fn windows_boot_run(l: &Layout) -> atpkg::admit_disk::Run {
+    crate::linux::boot_run(
+        "windows",
+        &l.home,
+        l.home.clone(),
+        l.home.join(".boot-footprint.json"),
+        BOOT_COLD_DISK,
+    )
 }
 
 fn shut_and_revert(l: &Layout, t: &Tools, ssh: Option<&Ssh>) -> Result<(), String> {
@@ -1813,7 +1913,8 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
     let tools = Tools::find()?;
     let l = Layout::find()?;
     let mut timings = Vec::new();
-    if let Some(pid) = running(&l).map_err(not_run)? {
+    if let Some(pid) = adopted(&l, &tools, &mut |line| println!("windows: {line}"))? {
+        let admitted = crate::vm_admit::admit(&crate::vm_admit::WINDOWS, false)?;
         let port = read_port(&l).ok_or_else(|| not_run("the running VM recorded no SSH port"))?;
         let admin = Ssh::new(&l, port);
         let ssh = admin.runner();
@@ -1831,8 +1932,12 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
             admin,
             booted_here: false,
             timings,
+            admitted,
+            booter: None,
         });
     }
+    let mut admitted = crate::vm_admit::admit(&crate::vm_admit::WINDOWS, true)?;
+    let booter = crate::vm_admit::record_boot("windows", &l.booter());
     stop_swtpm(&l).map_err(not_run)?;
     let want = guest::fingerprint(&guest::provision_steps());
     if snapshot_plan(&l).as_deref() != Some(want.as_str()) {
@@ -1841,6 +1946,7 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
         } else {
             install(&l, &tools, &mut timings)?
         };
+        admitted.credit("windows", &vm_procs(&l));
         match provision(&l, &ssh) {
             Ok(Some(secs)) => timings.push(("provision".into(), secs)),
             Ok(None) => {}
@@ -1857,6 +1963,8 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
         timings.push(("snapshot".into(), t0.elapsed().as_secs_f64()));
     }
     let admin = boot(&l, &tools, vnc, &mut timings)?;
+    admitted.credit("windows", &vm_procs(&l));
+    crate::vm_admit::record_vm(booter.as_deref(), qemu(&l));
     let ssh = admin.runner();
     if !answers(&ssh) {
         let _ = shut_and_revert(&l, &tools, Some(&admin));
@@ -1873,7 +1981,38 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
         admin,
         booted_here: true,
         timings,
+        admitted,
+        booter,
     })
+}
+
+/// The running VM's QEMU, if any.
+fn qemu(l: &Layout) -> Option<u32> {
+    running(l)
+        .ok()
+        .flatten()
+        .and_then(|p| u32::try_from(p).ok())
+}
+
+/// The running VM's processes ([`crate::vm_admit::vm_procs`]): its QEMU, which daemonizes away
+/// from this run, and whatever holds its disk.
+fn vm_procs(l: &Layout) -> Vec<u32> {
+    crate::vm_admit::vm_procs(&l.disk(), qemu(l).as_slice())
+}
+
+/// [`lane_lock`] for a run that boots the VM: QEMU and swtpm found, then the boot's disk claimed
+/// ([`crate::linux::claim_boot_disk`]) before the lane is waited for, so no run holds the lane
+/// while it waits for disk. The claim is held, and the VM's directory measured, until the lock
+/// is let go at the run's end.
+/// # Errors
+/// A tool missing, the claim's NOT RUN, or [`lane_lock`]'s.
+pub fn boot_lane(l: &Layout) -> Result<LaneLock, Fail> {
+    Tools::find()?;
+    LaneLock::boot_with(
+        "windows",
+        || crate::linux::claim_boot_disk("windows", windows_boot_run(l)),
+        || lane_lock(l),
+    )
 }
 
 /// The one lane run of this Mac, waiting for the run that holds it ([`LaneLock::at`]).
@@ -2131,8 +2270,11 @@ fn cmd_up(args: &[String]) -> Res {
         }
     };
     let l = Layout::find()?;
-    let _lock = lane_lock(&l)?;
-    if vnc && running(&l).map_err(Fail::die)?.is_some() {
+    let _lock = boot_lane(&l)?;
+    if vnc
+        && running(&l).map_err(Fail::die)?.is_some()
+        && crate::vm_admit::leftover(&l.booter()).is_none()
+    {
         return Err(Fail::usage(
             "windows up --vnc: the VM is already running without VNC; `windows down` first",
         ));
@@ -2145,6 +2287,7 @@ fn cmd_up(args: &[String]) -> Res {
         "windows: {VM} is up (SSH on 127.0.0.1:{}); `{LAB} windows exec -- CMD` runs in it, `{LAB} windows down` stops it",
         up.ssh.port
     );
+    up.keep();
     Ok(0)
 }
 
@@ -2157,8 +2300,7 @@ fn cmd_down() -> Res {
         println!("windows: {VM} is not running");
         return Ok(0);
     }
-    let ssh = read_port(&l).map(|p| Ssh::new(&l, p));
-    shut_and_revert(&l, &tools, ssh.as_ref()).map_err(Fail::die)?;
+    down(&l, &tools).map_err(Fail::die)?;
     println!("windows: {VM} stopped and reverted to its snapshot");
     Ok(0)
 }
@@ -2217,13 +2359,19 @@ fn cmd_status() -> Res {
         println!("vm        none (`{LAB} windows up` makes it)");
         return Ok(0);
     }
+    let qemu = running(&l).map_err(Fail::die)?;
     println!(
         "vm        {VM} {} — {CPUS} CPUs, {MEMORY_GIB} GiB, disk <= {DISK_GIB} GiB",
-        running(&l).map_err(Fail::die)?.map_or_else(
+        qemu.map_or_else(
             || "stopped".to_string(),
             |pid| format!("running (QEMU pid {pid})")
         )
     );
+    if qemu.is_some()
+        && let Some(line) = crate::vm_admit::status_line(&l.booter())
+    {
+        println!("run       {line}");
+    }
     println!(
         "snapshot  {}",
         match snapshot_plan(&l) {
@@ -2376,7 +2524,7 @@ pub fn task_name(what: &str) -> String {
 fn cmd_exec(args: &[String]) -> Res {
     let ask = parse_exec(args)?;
     let l = Layout::find()?;
-    let _lock = lane_lock(&l)?;
+    let _lock = boot_lane(&l)?;
     let up = bring_up(false)?;
     let repo = crate::paths::physical(&paths().repo);
     let t0 = Instant::now();
@@ -2393,7 +2541,7 @@ fn cmd_exec(args: &[String]) -> Res {
             return Err(not_run(format!("the checkout did not copy: {e}")));
         }
     }
-    let mut env = guest::cargo_env(ask.arch);
+    let mut env = up.cargo_env(ask.arch);
     env.extend(build_facts(&repo));
     println!(
         "windows: {} ({}, {}) in {}, {}: {}",
@@ -2433,20 +2581,60 @@ pub fn released(code: i32, cleanup: Result<(), String>) -> Res {
 mod tests {
     use super::*;
 
+    /// `--no-wait` and `--admit` before the verb are the lane's, in either order; after it they
+    /// are the verb's own words. Negative control: `--admit` with another word than `wait` or
+    /// `now` is a usage error naming it.
     #[test]
     fn the_lane_waits_unless_no_wait_comes_before_the_verb() {
         let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         let asked = words(&["--no-wait", "exec", "--", "cargo", "test"]);
         assert_eq!(
-            lane_flags(&asked),
-            (&asked[1..], Wait::No),
+            lane_flags(&asked, Admit::Wait).expect("flags"),
+            (&asked[1..], Wait::No, Admit::Wait),
             "--no-wait before the verb is the lane's"
         );
-        let asked = words(&["exec", "--", "x", "--no-wait"]);
+        let asked = words(&["exec", "--", "x", "--no-wait", "--admit", "now"]);
         assert_eq!(
-            lane_flags(&asked),
-            (&asked[..], Wait::Block),
+            lane_flags(&asked, Admit::Wait).expect("flags"),
+            (&asked[..], Wait::Block, Admit::Wait),
             "after the verb it is the verb's own word"
+        );
+        let asked = words(&["--admit", "now", "--no-wait", "smoke"]);
+        assert_eq!(
+            lane_flags(&asked, Admit::Wait).expect("flags"),
+            (&asked[3..], Wait::No, Admit::Now)
+        );
+        let refused =
+            lane_flags(&words(&["--admit", "later", "smoke"]), Admit::Wait).expect_err("usage");
+        assert_eq!(refused.code, 2);
+        assert!(
+            refused
+                .msg
+                .as_deref()
+                .is_some_and(|m| m.contains("'later'")),
+            "{:?}",
+            refused.msg
+        );
+    }
+
+    /// The lab takes a run's `--admit` out of its words before the lane reads them
+    /// (`admission::take`), so the lane's boot is admitted as the run is: `lab windows --admit now
+    /// smoke` boots at once. Negative control: read without the run's mode, the same words would
+    /// wait for disk.
+    #[test]
+    fn the_runs_admit_is_the_lanes_boot_claim() {
+        let mut asked: Vec<String> = ["--admit", "now", "--no-wait", "smoke"]
+            .map(String::from)
+            .to_vec();
+        let run = crate::admission::strip(&mut asked).expect("the run's mode");
+        assert_eq!(
+            lane_flags(&asked, run).expect("flags"),
+            (&asked[1..], Wait::No, Admit::Now)
+        );
+        assert_eq!(
+            lane_flags(&asked, Admit::Wait).expect("flags").2,
+            Admit::Wait,
+            "the lane alone no longer sees the flag"
         );
     }
 
@@ -2707,6 +2895,250 @@ mod tests {
             captured_daemon(&l, Daemon::Tpm, 124, Some(birth), &ta, Some(later)),
             None
         );
+    }
+
+    /// The stand-in QEMU ([`a_qemu_stand_in`]).
+    const QEMU_STAND_IN: &str = "windows::tests::a_qemu_stand_in";
+    /// Set for the stand-in QEMU.
+    const QEMU_ENV: &str = "ATERM_LAB_TEST_QEMU";
+    /// The stand-in booter ([`a_booter_stand_in`]).
+    const BOOTER_STAND_IN: &str = "windows::tests::a_booter_stand_in";
+    /// The stand-in booter's layout home, verb and whether it records its boot, tabs between.
+    const BOOTER_ENV: &str = "ATERM_LAB_TEST_WINDOWS_BOOTER";
+    /// What the stand-in booter says, with its QEMU's pid, once the VM is up.
+    const BOOTED: &str = "the stand-in booted QEMU pid";
+
+    /// Not a test alone: run as [`QEMU_STAND_IN`] with `argv[0]` a `qemu-system-aarch64` and the
+    /// lane's own QEMU words ([`qemu_args`]) after libtest's `--`, it is the VM's QEMU as the
+    /// lane identifies one ([`daemon_words`]): its pid in `-pidfile`, QMP on `-qmp`'s socket,
+    /// gone with its pid file at `system_powerdown` or `quit`. Its one-minute hang detector
+    /// ends it when nobody stops it.
+    #[test]
+    fn a_qemu_stand_in() {
+        if std::env::var_os(QEMU_ENV).is_none() {
+            return;
+        }
+        let words: Vec<String> = std::env::args().collect();
+        let after = |key: &str| {
+            words
+                .windows(2)
+                .find(|w| w[0] == key)
+                .map(|w| w[1].clone())
+                .unwrap_or_else(|| panic!("{key} in {words:?}"))
+        };
+        let pid_file = after("-pidfile");
+        let qmp = after("-qmp");
+        let qmp = qmp
+            .strip_prefix("unix:")
+            .and_then(|q| q.split(',').next())
+            .expect("a unix QMP socket")
+            .to_owned();
+        let listener = std::os::unix::net::UnixListener::bind(&qmp).expect("QMP's socket");
+        listener.set_nonblocking(true).expect("nonblocking");
+        std::fs::write(&pid_file, format!("{}\n", std::process::id())).expect("the pid file");
+        let end = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < end {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(e) => panic!("QMP accept: {e}"),
+            };
+            stream.set_nonblocking(false).expect("blocking");
+            let mut reply = stream.try_clone().expect("a writer");
+            let _ = reply.write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n");
+            let mut stopped = false;
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let _ = reply.write_all(b"{\"return\": {}}\n");
+                if line.contains("system_powerdown") || line.contains("\"quit\"") {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(&qmp);
+    }
+
+    /// Not a test alone: run as [`BOOTER_STAND_IN`], it boots the VM of the layout under
+    /// [`BOOTER_ENV`]'s home as a lane run of its verb does: the boot recorded beside the VM
+    /// ([`crate::vm_admit::Booter`]), then [`a_qemu_stand_in`] started with the lane's own QEMU
+    /// words, left to run on its own, and once it is up its pid recorded as the boot's VM
+    /// process ([`crate::vm_admit::record_vm`]). Told not to record, it boots as a lab that
+    /// keeps no records does. It says [`BOOTED`] with QEMU's pid; then a one-shot run dies by its
+    /// own `SIGKILL`, and `up` ends as `up` ends ([`Up::keep`]: the VM kept).
+    #[test]
+    fn a_booter_stand_in() {
+        let Ok(spec) = std::env::var(BOOTER_ENV) else {
+            return;
+        };
+        let mut words = spec.split('\t');
+        let (home, verb) = words.next().zip(words.next()).expect("a home and a verb");
+        let records = words.next() != Some("unrecorded");
+        let l = Layout::under(Path::new(home));
+        if records {
+            crate::vm_admit::Booter::me(verb, Path::new("/checkouts/booter"))
+                .record(&l.booter())
+                .expect("the boot recorded");
+        }
+        std::fs::create_dir_all(l.run()).expect("the run directory");
+        let words = qemu_args(
+            &l,
+            &tools(),
+            &Boot {
+                install: None,
+                port: 1,
+                vnc: None,
+            },
+        );
+        let _qemu = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test"))
+            .arg0(&tools().qemu)
+            .args([
+                "--exact",
+                QEMU_STAND_IN,
+                "--nocapture",
+                "--test-threads=1",
+                "--",
+            ])
+            .args(&words)
+            .env(QEMU_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the stand-in QEMU starts");
+        let pid = i32::try_from(_qemu.id()).expect("a pid");
+        // The one-minute hang detector: the stand-in writes its pid file and opens QMP at once.
+        let end = Instant::now() + Duration::from_secs(60);
+        while !(running(&l) == Ok(Some(pid)) && l.qmp().exists()) {
+            assert!(Instant::now() < end, "the stand-in QEMU did not come up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if records {
+            crate::vm_admit::record_vm(Some(&l.booter()), qemu(&l));
+        }
+        println!("{BOOTED} {pid}");
+        let _ = std::io::stdout().flush();
+        if verb.ends_with(" up") {
+            if records {
+                crate::vm_admit::settle(Some(&l.booter()), true, false);
+            }
+            return;
+        }
+        aterm_uds::process::kill_self_now()
+    }
+
+    /// Boot the VM of the layout under `home` by [`a_booter_stand_in`] running `verb`, recording
+    /// the boot when `records`: its pid, how it ended, and its QEMU's pid.
+    fn boot_by(home: &Path, verb: &str, records: bool) -> (u32, std::process::ExitStatus, i32) {
+        let mut booter = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test"))
+            .args([
+                "--exact",
+                BOOTER_STAND_IN,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                BOOTER_ENV,
+                format!(
+                    "{}\t{verb}\t{}",
+                    home.display(),
+                    if records { "recorded" } else { "unrecorded" }
+                ),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the stand-in booter starts");
+        let pid = booter.id();
+        // Read to its end, so the booter never writes into a closed pipe.
+        let said: Vec<String> = BufReader::new(booter.stdout.take().expect("its stdout"))
+            .lines()
+            .map_while(Result::ok)
+            .collect();
+        let status = booter.wait().expect("the booter is reaped");
+        let qemu = said
+            .iter()
+            .find_map(|l| {
+                l.split_once(BOOTED)
+                    .and_then(|(_, p)| p.split_whitespace().next()?.parse().ok())
+            })
+            .unwrap_or_else(|| panic!("the booter's QEMU ({status}): {said:?}"));
+        (pid, status, qemu)
+    }
+
+    /// A VM a one-shot run booted and left as it died (killed by its own `SIGKILL` after the
+    /// boot, QEMU still running) is stopped by the next run's bring-up through `down`'s own path
+    /// (QMP's power button here: no SSH port was recorded), which names the dead run; when it
+    /// ends, that QEMU is gone, and so is its record. Negative controls: once such a VM was
+    /// stopped as a lab that keeps no records stops it (its record left behind) and booted
+    /// again by one, the record describes a boot that is over, and the VM is adopted; and a VM
+    /// `up` left is adopted with its QEMU running, until `down` stops it.
+    #[test]
+    fn a_vm_a_dead_one_shot_run_left_is_stopped_and_one_up_left_is_adopted() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Under /tmp: QMP's socket path must fit a sockaddr_un.
+        let home = aterm_tempfile::Builder::new()
+            .prefix("w")
+            .tempdir_in("/tmp")
+            .expect("a scratch home");
+        let l = Layout::under(home.path());
+        assert!(lossy(&l.qmp()).len() < 104, "{}", l.qmp().display());
+        let gone = |pid: i32| aterm_uds::process::read_process_birth(pid).is_none();
+
+        let (booter, status, qemu) = boot_by(home.path(), "lab windows smoke", true);
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
+        assert_eq!(running(&l), Ok(Some(qemu)), "the dead run's QEMU runs on");
+        let mut said = Vec::new();
+        let adopted_pid =
+            adopted(&l, &tools(), &mut |line| said.push(line.to_owned())).map_err(|f| f.msg);
+        assert_eq!(adopted_pid, Ok(None), "{said:?}");
+        assert!(
+            said.first().is_some_and(|line| line.starts_with(&format!(
+                "stopping aterm-windows left by dead run pid {booter} (lab windows smoke, \
+                 /checkouts/booter, since "
+            )) && line.ends_with(&format!("(QEMU pid {qemu})"))),
+            "{said:?}"
+        );
+        assert!(gone(qemu), "QEMU pid {qemu} is gone when the stop ends");
+        assert_eq!(running(&l), Ok(None));
+        assert!(!l.booter().exists(), "the stopped VM's record went with it");
+
+        let (_, status, qemu) = boot_by(home.path(), "lab windows smoke", true);
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
+        stop(&l, None).expect("stopped as a lab that keeps no records stops it");
+        assert!(gone(qemu), "QEMU pid {qemu} stopped");
+        assert!(l.booter().exists(), "the dead run's record is left behind");
+        let (_, status, qemu) = boot_by(home.path(), "lab windows up", false);
+        assert!(status.success(), "{status}");
+        let mut said = Vec::new();
+        let adopted_pid =
+            adopted(&l, &tools(), &mut |line| said.push(line.to_owned())).map_err(|f| f.msg);
+        assert_eq!(
+            adopted_pid,
+            Ok(Some(qemu)),
+            "a VM booted since outside the records is not the dead run's: {said:?}"
+        );
+        assert!(said.is_empty(), "{said:?}");
+        down(&l, &tools()).expect("down stops it");
+        assert!(gone(qemu), "down stopped QEMU pid {qemu}");
+
+        let (_, status, qemu) = boot_by(home.path(), "lab windows up", true);
+        assert!(status.success(), "{status}");
+        let mut said = Vec::new();
+        let adopted_pid =
+            adopted(&l, &tools(), &mut |line| said.push(line.to_owned())).map_err(|f| f.msg);
+        assert_eq!(adopted_pid, Ok(Some(qemu)), "{said:?}");
+        assert!(said.is_empty(), "{said:?}");
+        assert!(!gone(qemu), "the VM up left runs on");
+        down(&l, &tools()).expect("down stops it");
+        assert!(gone(qemu), "down stopped QEMU pid {qemu}");
     }
 
     #[test]

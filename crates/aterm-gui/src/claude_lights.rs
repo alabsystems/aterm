@@ -3840,6 +3840,12 @@ impl App {
             }
             return;
         }
+        if self.pool.is_rewound(session) {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                refuse(ws, Refusal::NotShown);
+            }
+            return;
+        }
         let screen = self.claude_screen_now(session);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;

@@ -18,7 +18,10 @@ fn run_at(
     config: &Path,
 ) -> Result<Value> {
     // Parse all arguments before consulting or creating local custody.
-    let descriptor = if matches!(command, "commons-tables" | "commons-status") {
+    let descriptor = if matches!(
+        command,
+        "commons-tables" | "commons-status" | "commons-authority"
+    ) {
         None
     } else {
         let application = options
@@ -45,6 +48,9 @@ fn run_at(
     }
     if command == "commons-status" {
         return readiness(paths, config);
+    }
+    if command == "commons-authority" {
+        return authority(paths);
     }
     let bootstrap = Bootstrap::required(paths).map_err(crate::table::failure)?;
     let session = Session::open(&bootstrap)?;
@@ -82,6 +88,39 @@ fn run_at(
         "catalog":aterm_codec::hex::encode_lower(&directory.catalog_scope().digest()),
         "tables":entries, "inert":snapshot.inert}),
     )
+}
+
+fn authority(paths: &Paths) -> Result<Value> {
+    let admin = match aterm_secrets::client::admin_cached(paths) {
+        Ok(admin) => admin,
+        Err(_) => {
+            return Ok(json!({
+                "kind": "commons-authority", "scope": "locally-applied-vault",
+                "authority_available": false,
+                "detail": "cached administrator state could not be authenticated or opened",
+                "can_initialize_network": false,
+            }));
+        }
+    };
+    let inspection = admin
+        .inspect_commons_control()
+        .map_err(crate::table::failure)?;
+    let descriptor = inspection.descriptor.map(|trust| {
+        json!({
+            "network_id": aterm_codec::hex::encode_lower(&trust.network),
+            "authority": aterm_codec::hex::encode_lower(&trust.authority),
+            "genesis": aterm_codec::hex::encode_lower(&trust.genesis),
+        })
+    });
+    Ok(json!({
+        "kind": "commons-authority", "scope": "locally-applied-vault",
+        "authority_available": true, "vault_version": inspection.vault_version,
+        "authority": aterm_codec::hex::encode_lower(&inspection.authority),
+        "lifetime_bound": inspection.lifetime_bound,
+        "control": if inspection.descriptor.is_some() { "typed-descriptor" }
+            else if inspection.entry_present { "opaque-entry" } else { "absent" },
+        "descriptor": descriptor, "can_initialize_network": false,
+    }))
 }
 
 fn readiness(paths: &Paths, config: &Path) -> Result<Value> {
@@ -163,6 +202,61 @@ fn readiness(paths: &Paths, config: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authority_inspection_never_initializes_an_absent_control_record() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("owner"));
+        let config = root.path().join("config");
+        let read = || run_at("commons-authority", &mut BTreeMap::new(), &paths, &config).unwrap();
+        assert_eq!(read()["authority_available"].as_bool(), Some(false));
+        assert!(!paths.home.exists());
+        let source = root.path().join("vault");
+        aterm_secrets::client::test_create_unbound(
+            &paths,
+            source.to_str().unwrap(),
+            None,
+            Some("m1"),
+        )
+        .unwrap();
+        let before = std::fs::read(&source).unwrap();
+        let observed = read();
+        assert_eq!(observed["authority_available"].as_bool(), Some(true));
+        assert_eq!(observed["control"].as_str(), Some("absent"));
+        assert_eq!(observed["can_initialize_network"].as_bool(), Some(false));
+        assert!(!paths.dir.join("commons").exists());
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+    }
+
+    #[test]
+    fn authority_inspection_requires_cached_admin_and_reports_only_public_metadata() {
+        use aterm_secrets::commons::roster::Role;
+        let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Reader]);
+        let read = |index: usize| {
+            run_at(
+                "commons-authority",
+                &mut BTreeMap::new(),
+                &lab.paths[index],
+                &lab.paths[index].home.join("config"),
+            )
+            .unwrap()
+        };
+        let owner = read(0);
+        assert_eq!(owner["control"].as_str(), Some("typed-descriptor"));
+        assert_eq!(owner["descriptor"]["authority"], owner["authority"]);
+        assert_eq!(owner["can_initialize_network"].as_bool(), Some(false));
+        let member = read(1);
+        assert_eq!(member["authority_available"].as_bool(), Some(false));
+        assert!(member.get("authority").is_none());
+        assert!(member.get("descriptor").is_none());
+        let invalid = run_at(
+            "commons-authority",
+            &mut BTreeMap::from([("--application", "ignored")]),
+            &lab.paths[0],
+            &lab.paths[0].home.join("config"),
+        );
+        assert!(invalid.is_err());
+    }
+
     fn status(paths: &Paths) -> Value {
         run_at(
             "commons-status",

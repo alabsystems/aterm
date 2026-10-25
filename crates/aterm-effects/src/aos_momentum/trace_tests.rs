@@ -9,10 +9,12 @@ use aterm_aos::replay::empty_chain;
 use aterm_aos::wire::WireFault;
 use aterm_time::Instant;
 
-use super::test_fixtures::{BUILD, LANE, attached, burst, cfg, hosted, ms, run_lane};
+use super::test_fixtures::{
+    BUILD, Glow, LANE, attached, attached_for_lane, burst, cfg, draw, geom, hosted, ms, run_lane,
+};
 use super::{
-    EventCounts, MomentumCode, MomentumEvent, MomentumHost, MomentumSchema, MomentumTrace,
-    TRACE_FILE_MAGIC, TraceFault,
+    EventCounts, MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_TRACE_MAX_BYTES, MomentumCode, MomentumEvent,
+    MomentumHost, MomentumSchema, MomentumTrace, Sched, TRACE_FILE_MAGIC, TraceFault,
 };
 
 fn typed(t0: Instant) -> MomentumHost {
@@ -260,4 +262,55 @@ fn right_after_a_commit_the_trace_is_the_new_checkpoint_with_the_empty_chain() {
         hosted(&host).boundary.log().map(|l| l.inputs()),
         Some([MomentumEvent::Query { .. }])
     ));
+}
+
+/// A key on `host` at `t0`, then frames 8 ms apart (its largest input), until its live log holds `len` inputs.
+fn frames_until(host: &mut MomentumHost, t0: Instant, len: usize) {
+    let c = super::MomentumGlowConfig {
+        glyph_span: Some((10, 11)),
+        ..cfg(false)
+    };
+    let mut k = 0u64;
+    while host.aos_status().log_len < len {
+        let at = t0 + ms(8 * k);
+        if k == 0 {
+            host.key(at, super::test_fixtures::TAU);
+        } else {
+            let _ = draw(host, Some((4, 10)), at, geom(), &c, 0);
+        }
+        k += 1;
+        assert_eq!(host.aos_retired_waiting(), 0, "fixture: one log epoch");
+    }
+}
+
+#[test]
+fn a_check_refuses_a_log_longer_than_one_host_epoch_before_it_replays() {
+    let t0 = Instant::now();
+    let mut host = attached_for_lane(t0, Sched::Prebuilt(MomentumCode::Shipped));
+    frames_until(&mut host, t0 + ms(5), MOMENTUM_HOST_MAX_EVENTS + 1);
+    let long = host.aos_trace().expect("exports");
+    assert_eq!(
+        long.check(t0, BUILD).err(),
+        Some(TraceFault::Log(LogFault::TooManyEvents {
+            limit: MOMENTUM_HOST_MAX_EVENTS
+        }))
+    );
+    assert!(
+        long.replay(t0, BUILD).is_ok(),
+        "negative control: the plain replay keeps its wider limit"
+    );
+}
+
+#[test]
+fn the_largest_trace_a_window_exports_fits_twice_under_the_check_bound() {
+    let t0 = Instant::now();
+    let mut host = attached(t0, MomentumCode::Shipped);
+    frames_until(&mut host, t0 + ms(5), MOMENTUM_HOST_MAX_EVENTS);
+    let full = host.aos_trace().expect("exports");
+    let bytes = full.encode().len();
+    assert!(
+        bytes * 2 <= MOMENTUM_TRACE_MAX_BYTES,
+        "a full host epoch is {bytes} bytes"
+    );
+    assert!(full.check(t0, BUILD).is_ok(), "a full host epoch checks");
 }

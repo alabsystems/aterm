@@ -31,6 +31,8 @@ pub mod network;
 #[cfg(unix)]
 pub mod replica;
 #[cfg(unix)]
+pub mod resources;
+#[cfg(unix)]
 pub mod runtime;
 #[cfg(unix)]
 pub mod table;

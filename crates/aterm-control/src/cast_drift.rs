@@ -2170,11 +2170,8 @@ mod tests {
             fold_rest(fork.expect("forks"), events, k + 1, Some(&mask), engine)
         };
         assert_eq!(at(first - 1), stable, "forked at the anchor");
-        let (_, past) = fold(header, events, false, None, engine, true, Some(first + 1));
-        assert!(
-            past.is_none(),
-            "no fork past a resize whose hand-back stands"
-        );
+        // Negative control: a fork past the first masked resize carries it (and its hand-back) into a variant that skips it.
+        assert_ne!(at(first + 1), stable, "forked past a masked resize");
     }
 
     #[test]

@@ -126,7 +126,7 @@ pub(crate) fn ellipsize(s: &str, max: usize) -> String {
 fn entry_text(entry: &TabMenuEntry) -> &str {
     match entry {
         TabMenuEntry::Header(t) => t.as_str(),
-        TabMenuEntry::Event { words, .. } => words,
+        TabMenuEntry::Event { words, .. } | TabMenuEntry::RewindTo { words, .. } => words,
         TabMenuEntry::Separator => "",
         TabMenuEntry::Action { label, .. } => label,
         TabMenuEntry::ConnectionAction { label, .. } => label,
@@ -142,6 +142,7 @@ pub(crate) const fn is_selectable(entry: &TabMenuEntry) -> bool {
         TabMenuEntry::Action { enabled: true, .. }
             | TabMenuEntry::ConnectionAction { enabled: true, .. }
             | TabMenuEntry::Upgrade { .. }
+            | TabMenuEntry::RewindTo { .. }
     )
 }
 
@@ -405,13 +406,15 @@ pub(crate) fn paint(
             TabMenuEntry::Action { .. }
             | TabMenuEntry::ConnectionAction { .. }
             | TabMenuEntry::Upgrade { .. }
+            | TabMenuEntry::RewindTo { .. }
                 if selected =>
             {
                 (c.sel_fg, true)
             }
             TabMenuEntry::Action { .. }
             | TabMenuEntry::ConnectionAction { .. }
-            | TabMenuEntry::Upgrade { .. } => (c.band.value, false),
+            | TabMenuEntry::Upgrade { .. }
+            | TabMenuEntry::RewindTo { .. } => (c.band.value, false),
             TabMenuEntry::Separator => unreachable!("handled above"),
         };
         let mut row = vec![chrome_band::cell(' ', fg, bg, false, false); w];
@@ -463,6 +466,7 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
         match e {
             TabMenuEntry::Header(t) => (0u8, t.as_str()).hash(&mut h),
             TabMenuEntry::Event { words, at_ms } => (5u8, words.as_str(), *at_ms).hash(&mut h),
+            TabMenuEntry::RewindTo { words, at_ms } => (6u8, words.as_str(), *at_ms).hash(&mut h),
             TabMenuEntry::Separator => 1u8.hash(&mut h),
             TabMenuEntry::Action { label, enabled, .. } => {
                 (2u8, label.as_str(), *enabled).hash(&mut h);

@@ -3,10 +3,15 @@
 
 //! Typing momentum spine and display follower for Rainbow Kitty.
 
-use aterm_time::Instant;
+use aterm_time::{Duration, Instant};
 
 use super::timing::smoothstep01;
 use crate::typing_momentum::TypingMomentum;
+
+#[inline]
+const fn dur_from_secs_f32(secs: f32) -> Duration {
+    Duration::from_nanos((secs as f64 * 1_000_000_000.0).round() as u64)
+}
 
 /// The gain the follower puts on the canonical metric.
 pub const METRIC_GAIN: f32 = 1.23;
@@ -65,6 +70,9 @@ pub const FLOW_OPEN_EASE_KEYS: u32 = 4;
 
 /// How long one [`Spine::drive`] freezes the combo, seconds.
 pub const FLOW_FREEZE_S: f32 = 0.25;
+
+const FLOW_FREEZE_DUR: Duration = dur_from_secs_f32(FLOW_FREEZE_S);
+const VERDICT_WINDOW_DUR: Duration = dur_from_secs_f32(VERDICT_WINDOW_S);
 
 /// Minimum birth-price rise over the previous key required for [`Spine::surge`].
 pub const SURGE_MIN_RISE: f32 = 0.15;
@@ -218,7 +226,7 @@ impl Spine {
         self.verdict = None;
         if self
             .driven_at
-            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() < FLOW_FREEZE_S)
+            .is_some_and(|t| now.saturating_duration_since(t) < FLOW_FREEZE_DUR)
         {
             return;
         }
@@ -300,7 +308,7 @@ impl Spine {
         // session that goes dark re-earns its price.
         if self
             .verdict
-            .is_some_and(|at| now.saturating_duration_since(at).as_secs_f32() > VERDICT_WINDOW_S)
+            .is_some_and(|at| now.saturating_duration_since(at) > VERDICT_WINDOW_DUR)
         {
             self.verdict = None;
         }
@@ -406,7 +414,7 @@ impl Spine {
     #[cfg(test)]
     pub fn verdict_open(&self, now: Instant) -> bool {
         self.verdict
-            .is_some_and(|at| now.saturating_duration_since(at).as_secs_f32() <= VERDICT_WINDOW_S)
+            .is_some_and(|at| now.saturating_duration_since(at) <= VERDICT_WINDOW_DUR)
     }
 
     /// The pending [`EraseMark`], live or stale (diagnostic; nothing is armed on it).

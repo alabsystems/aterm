@@ -14,6 +14,8 @@ pub use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, Ink
 use aterm_core::render::{EffectStreamDamage, LineSizeSpan};
 use aterm_core::render::{FxBlend, FxInk, FxSlot};
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
+use fx_raster::Knock;
+use std::sync::Arc;
 
 #[cfg(trust_verify)]
 macro_rules! trust_contract_fn {
@@ -106,8 +108,8 @@ pub use apron::ApronScratch;
 pub use fx_damage::RowBands;
 /// The fx engine's one slicer and its bloom source (`fx_raster`), shared with the GPU renderer so the band gate, the clips and the occluders are one statement on every backend.
 pub use fx_raster::{
-    FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, SpriteCols, for_each_drawn_sprite,
-    fx_bloom_quads, knock_rects, slice_layers,
+    FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, KnockRect, SpriteCols,
+    for_each_drawn_sprite, fx_bloom_quads, knock_rects, slice_layers,
 };
 pub use spill::SpillBand;
 
@@ -1314,7 +1316,7 @@ pub struct Renderer {
     curl_scratch: Vec<(usize, usize, usize, usize, usize, usize, u32)>,
     ligature_break_scratch: Vec<usize>,
     /// The frame's knock-layer bodies' boxes ([`knock_rects`]), resident.
-    knock_scratch: Vec<[i32; 4]>,
+    knock_cut: KnockCut,
     /// [`Renderer::set_knock_out`]: a test's negative control.
     #[cfg(any(test, debug_assertions))]
     knock_off: bool,
@@ -4051,6 +4053,9 @@ struct CachedGlyph {
     img: GlyphImage,
     ink: Option<(usize, i32)>,
     used: std::cell::Cell<u64>,
+    /// The knock-out's ring of a mono raster ([`knock_ring`]), built the first time the glyph
+    /// lies on a companion's body and dropped with the entry.
+    ring: std::cell::OnceCell<Box<[u8]>>,
 }
 
 impl CachedGlyph {
@@ -4060,6 +4065,128 @@ impl CachedGlyph {
             img,
             ink,
             used: std::cell::Cell::new(0),
+            ring: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+/// The knock-out's ring of a `width × height` mono coverage (`bytes`): its coverage stamped at
+/// each of [`KNOCK_DILATE_OFFSETS`], composed as each stamp's [`blend`] toward white composes
+/// (the shares left uncovered multiply), over a raster [`KNOCK_REACH`] pixels larger on every
+/// side. One blit of it cuts a body as the 21 stamps one after another do, a 21st of the work.
+fn knock_ring(width: usize, height: usize, bytes: &[u8]) -> Box<[u8]> {
+    let reach = KNOCK_REACH as usize;
+    let (rw, rh) = (width + 2 * reach, height + 2 * reach);
+    let mut left = vec![255u32; rw * rh];
+    for &(dx, dy) in &KNOCK_DILATE_OFFSETS {
+        let (ox, oy) = ((reach as i32 + dx) as usize, (reach as i32 + dy) as usize);
+        for (j, row) in bytes.chunks_exact(width).take(height).enumerate() {
+            let out = &mut left[(j + oy) * rw + ox..(j + oy) * rw + ox + width];
+            for (l, &cov) in out.iter_mut().zip(row) {
+                if cov != 0 {
+                    *l = (*l * (255 - u32::from(cov)) + 127) / 255;
+                }
+            }
+        }
+    }
+    left.into_iter().map(|l| (255 - l) as u8).collect()
+}
+
+#[cfg(test)]
+mod knock_ring_tests {
+    use super::{KNOCK_DILATE_OFFSETS, KNOCK_REACH, blend, blit_mono_with, knock_ring};
+
+    /// THE RING CUTS AS ITS STAMPS DO. One blit of a glyph's ring leaves the mask as the 21
+    /// stamps of its coverage one after another leave it, to within the rounding of the
+    /// stamps' own steps, on a bare mask and on one another glyph's ring already cut into.
+    #[test]
+    fn one_ring_blit_cuts_as_the_stamps_do() {
+        let (w, h) = (7usize, 9usize);
+        let glyph: Vec<u8> = (0..w * h)
+            .map(|i| match (i % w, i / w) {
+                (3, _) | (_, 4) => 255,
+                (2 | 4, _) => 96,
+                (x, y) if (x + y) % 5 == 0 => 30,
+                _ => 0,
+            })
+            .collect();
+        let reach = KNOCK_REACH as usize;
+        let (mw, mh) = (w + 2 * reach + 4, h + 2 * reach + 4);
+        let everywhere = ((0, mh as i32), (0, mw as i32));
+        for under in [0u32, 0x0040_4040] {
+            let mut stamped = vec![under; mw * mh];
+            for &(dx, dy) in &KNOCK_DILATE_OFFSETS {
+                let (x, y) = (2 + reach as i32 + dx, 2 + reach as i32 + dy);
+                blit_mono_with(
+                    &mut stamped,
+                    mw,
+                    x,
+                    y,
+                    w,
+                    h,
+                    &glyph,
+                    0x00FF_FFFF,
+                    255,
+                    1,
+                    1,
+                    everywhere.0,
+                    everywhere.1,
+                    blend,
+                );
+            }
+            let ring = knock_ring(w, h, &glyph);
+            let mut rung = vec![under; mw * mh];
+            blit_mono_with(
+                &mut rung,
+                mw,
+                2,
+                2,
+                w + 2 * reach,
+                h + 2 * reach,
+                &ring,
+                0x00FF_FFFF,
+                255,
+                1,
+                1,
+                everywhere.0,
+                everywhere.1,
+                blend,
+            );
+            let worst = stamped
+                .iter()
+                .zip(&rung)
+                .map(|(a, b)| ((a & 0xff) as i32 - (b & 0xff) as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst <= 2,
+                "under {under:#x}: the ring is {worst} levels off its stamps"
+            );
+            // Negative control: the bare coverage, undilated, misses the ring's rim.
+            let mut bare = vec![under; mw * mh];
+            blit_mono_with(
+                &mut bare,
+                mw,
+                2 + reach as i32,
+                2 + reach as i32,
+                w,
+                h,
+                &glyph,
+                0x00FF_FFFF,
+                255,
+                1,
+                1,
+                everywhere.0,
+                everywhere.1,
+                blend,
+            );
+            assert!(
+                stamped
+                    .iter()
+                    .zip(&bare)
+                    .any(|(a, b)| ((a & 0xff) as i32 - (b & 0xff) as i32).abs() > 2),
+                "control: the stamps reach past the bare coverage"
+            );
         }
     }
 }
@@ -6247,7 +6374,7 @@ impl Renderer {
             ligature_break_scratch: Vec::new(),
             // Resident from the start: a first body under the text knocks
             // its letters out without allocating (`free_sprite_alloc`).
-            knock_scratch: Vec::with_capacity(KNOCK_SCRATCH_RESIDENT),
+            knock_cut: KnockCut::default(),
             #[cfg(any(test, debug_assertions))]
             knock_off: false,
             color_chain: Vec::new(),
@@ -11400,7 +11527,7 @@ impl Renderer {
             &mut cache.pixels,
             w,
             h,
-            input.rows,
+            input,
             dirty
                 .iter()
                 .enumerate()
@@ -11556,7 +11683,7 @@ impl Renderer {
         self.draw_rain_add(&mut pixels, w, h, input, None);
         self.draw_decorations(&mut pixels, w, h, input, None);
         #[cfg(any(test, debug_assertions))]
-        self.stamp_legacy_sprites(&mut pixels, w, h, input.rows, 0..rows, false);
+        self.stamp_legacy_sprites(&mut pixels, w, h, input, 0..rows, false);
         self.draw_fx(
             &mut pixels,
             w,
@@ -11784,15 +11911,41 @@ impl Renderer {
         let rows = dirty.len().min(cur.rows);
         let stamped = row_stamps_usable(prev, cur, rows);
         let mut memo = ImageEqMemo::default();
+        // A letter's knock-out ring reaches [`KNOCK_REACH`] pixels over its row: a body lying
+        // there is cut by the row's letters (`Self::cut_knock_layers`), so their change repaints
+        // the row above it too.
+        let mut bodies = std::mem::take(&mut self.knock_cut.spans);
+        bodies.clear();
+        let top = self.grid_top() as i64;
+        for l in prev
+            .fx_layers
+            .iter()
+            .chain(&cur.fx_layers)
+            .filter(|l| l.knock)
+        {
+            let e = l.extent();
+            let dy = match l.space {
+                aterm_core::render::FxSpace::Window => 0,
+                aterm_core::render::FxSpace::Grid => top,
+            };
+            bodies.push((i64::from(e.y0) + dy, i64::from(e.y1) + dy));
+        }
+        let ch = self.cell_h as i64;
+        let reach = i64::from(KNOCK_REACH);
         for r in 1..rows {
             if dirty[r]
                 && !dirty[r - 1]
                 && row_glyph_ink_may_differ(prev, cur, r, stamped, &mut memo)
-                && (self.row_may_ink_above(prev, r) || self.row_may_ink_above(cur, r))
+                && (bodies.iter().any(|&(y0, y1)| {
+                    let edge = top + r as i64 * ch;
+                    y0 < edge && y1 > edge - reach
+                }) || self.row_may_ink_above(prev, r)
+                    || self.row_may_ink_above(cur, r))
             {
                 dirty[r - 1] = true;
             }
         }
+        self.knock_cut.spans = bodies;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11848,14 +12001,26 @@ impl Renderer {
             self.fill_chrome_raster(pixels, w, h, input, r);
             self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
         }
-        self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Linear, dirty);
-        #[cfg(any(test, debug_assertions))]
-        self.stamp_legacy_sprites(pixels, w, h, input.rows, rows.clone(), true);
-        self.knock_out_under_text(pixels, w, h, input, rows.clone(), base.is_some(), dirty);
+        // The rain's rows lie on the backgrounds, under the light; the companions' bodies
+        // (the knock layers) stand on the light, under the ink, cut where their letters lie
+        // (`Self::cut_knock_layers`): drawn before the light, a cat whose head reached into
+        // the typed row wore the rainbow ribbon's colours (`FxLinearUnder` then
+        // `FxKnockUnder` on the GPU).
+        self.draw_picked_fx(
+            pixels,
+            w,
+            h,
+            input,
+            (FxSlot::Under, FxBlend::Linear, Knock::Not),
+            dirty,
+        );
         self.draw_trail(pixels, w, h, input, dirty);
         self.draw_glow_under(pixels, w, h, input, dirty);
         self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Exact, dirty);
         self.draw_fire_patch(pixels, w, h, input, dirty);
+        self.draw_knock_layers(pixels, w, h, input, dirty);
+        #[cfg(any(test, debug_assertions))]
+        self.stamp_legacy_sprites(pixels, w, h, input, rows.clone(), true);
         for r in rows {
             let ctx = self.row_ctx(input, r, sel);
             if dirty.is_some_and(|d| r > 0 && !d[r - 1]) {
@@ -11866,87 +12031,151 @@ impl Renderer {
         }
     }
 
-    /// The knock-out: letters on a companion's body read against the page. Under every
-    /// glyph that lies on a body of a knock layer ([`aterm_core::render::FxLayer::knock`]:
-    /// the pet, its departures, the idle cat), the glyph's coverage dilated by two pixels
-    /// ([`KNOCK_DILATE_OFFSETS`]) is stamped over the body, before any trail draws, in the
-    /// colour the background pass painted under the cell; where no body lies, the stamp
-    /// lays the page on the page. The ink then reads against a ring of page whatever the
-    /// coat, for as long as the body is there. A cell the background pass left to a
-    /// wallpaper has no page colour here and keeps its body. The GPU builds the same
-    /// stamps (`aterm-gpu`'s glyph-knock stream). The stamp sets the page's colour
-    /// only: each pixel keeps its transmittance ([`knock_blend`]), since a stamp in the
-    /// opaque page would outline every letter the body's box touched on a translucent
-    /// window, even under an all-transparent body.
-    #[allow(clippy::too_many_arguments)]
-    fn knock_out_under_text<I>(
+    /// The companions' bodies (the knock layers), drawn over the under-glyph light and cut
+    /// where their letters lie ([`Self::cut_knock_layers`]).
+    fn draw_knock_layers(
         &mut self,
         pixels: &mut [u32],
         w: usize,
         h: usize,
         input: &RenderInput,
-        rows: I,
-        wallpaper: bool,
         dirty: Option<&[bool]>,
-    ) where
-        I: Iterator<Item = usize>,
-    {
-        #[cfg(any(test, debug_assertions))]
-        if self.knock_off {
+    ) {
+        let pick = (FxSlot::Under, FxBlend::Linear, Knock::Only);
+        if !self.cut_knock_layers(input, w, h) {
+            self.draw_picked_fx(pixels, w, h, input, pick, dirty);
             return;
         }
-        let mut knocks = std::mem::take(&mut self.knock_scratch);
-        knocks.clear();
+        let layers = std::mem::take(&mut self.knock_cut.layers);
         let frame = self.fx_frame(w, h, input.rows);
-        knock_rects(
+        fx_raster::draw_picked_layers(
+            pixels,
             &frame,
-            &input.fx_layers,
+            &layers,
             &input.fx_occluders,
-            self.fx_scratch.slicer(),
-            &mut knocks,
+            pick,
+            dirty,
+            &mut self.fx_scratch,
         );
-        #[cfg(any(test, debug_assertions))]
-        if let Some(l) = &self.legacy_sprites {
-            knocks.extend(l.knock_rects(self.pad as i32, self.grid_top() as i32));
-        }
-        if !knocks.is_empty() {
-            let sel = self.selection_palette(input);
-            for r in rows {
-                let ctx = self.row_ctx(input, r, sel);
-                let ch = self.cell_h as i32;
-                // Never into a band this composite does not repaint: its
-                // ink is already drawn and a stamp there would erase it.
-                let clip = (
-                    if dirty.is_some_and(|d| r > 0 && !d[r - 1]) {
-                        ctx.y0 as i32
-                    } else {
-                        i32::MIN
-                    },
-                    if dirty.is_some_and(|d| d.get(r + 1).is_some_and(|&n| !n)) {
-                        ctx.y0 as i32 + ch
-                    } else {
-                        i32::MAX
-                    },
-                );
-                self.render_row_knock(pixels, w, input, &ctx, &knocks, clip, wallpaper);
-            }
-        }
-        self.knock_scratch = knocks;
+        self.knock_cut.layers = layers;
     }
 
-    /// One row of [`Self::knock_out_under_text`]: each glyph cell within a
-    /// pixel of a knock rect (`[x0, y0, x1, y1)`, frame pixels) stamps its
-    /// dilated coverage in the cell's painted background.
-    #[allow(clippy::too_many_arguments)]
-    fn render_row_knock(
+    /// THE KNOCK-OUT: each companion's body (a knock layer, [`FxLayer::knock`]: the pet, its
+    /// departures, the word-cats, the idle cat) is cut where its letters lie, under every
+    /// glyph on it, the glyph's coverage dilated by two pixels ([`KNOCK_DILATE_OFFSETS`]), so
+    /// the ink reads against what lies under the body there (the page, the trail's bed and
+    /// light, a selection, a wallpaper, the glass) and not against the coat. The bodies stand
+    /// on the under-glyph light: a page laid round the letters on a body instead met the bed
+    /// and light beside it in a hard edge across the letter. Returns whether any body was
+    /// cut; the frame's fx layers with the cut bodies are then `self.knock_cut.layers`, each
+    /// cut body one straight-RGBA sprite drawn 1:1 over its drawn box, its alpha taken away
+    /// under the rings. A cut that did not change since the last frame keeps its content
+    /// (`Arc`), so a body resting on letters repaints nothing. The GPU renderer draws the
+    /// same layers.
+    pub fn cut_knock_layers(&mut self, input: &RenderInput, w: usize, h: usize) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        if self.knock_off {
+            return false;
+        }
+        if !input.fx_layers.iter().any(|l| l.knock) {
+            return false;
+        }
+        // A glyph plan kept from another frame (the GPU's twin renders no rows) is stale.
+        self.glyph_plan_row = None;
+        let frame = self.fx_frame(w, h, input.rows);
+        let mut cut = std::mem::take(&mut self.knock_cut);
+        cut.next.clear();
+        cut.layers.clear();
+        let mut any = false;
+        for layer in &input.fx_layers {
+            let Some((o, area, sp)) = fx_raster::knock_sprite_area(&frame, layer) else {
+                cut.layers.push(layer.clone());
+                continue;
+            };
+            let n = ((area[2] - area[0]) as usize) * ((area[3] - area[1]) as usize);
+            cut.mask.clear();
+            cut.mask.resize(n, 0);
+            if !self.knock_ring_mask(input, area, &mut cut.mask) {
+                cut.layers.push(layer.clone());
+                continue;
+            }
+            let key = knock_cut_key(layer, sp, o, area, &cut.mask);
+            let content = match cut.held.iter().find(|(k, _)| *k == key) {
+                Some((_, c)) => Arc::clone(c),
+                None => {
+                    let Some(art) =
+                        fx_raster::cut_sprite_art(o, area, sp, &cut.mask, &mut cut.texels)
+                    else {
+                        cut.layers.push(layer.clone());
+                        continue;
+                    };
+                    let ink = layer.content.palette()[sp.ink as usize];
+                    Arc::new(aterm_core::render::FxContent::new(
+                        vec![aterm_core::render::FxItem::Sprite(
+                            aterm_core::render::FxSprite {
+                                x: 0,
+                                y: 0,
+                                dw: art.w(),
+                                dh: art.h(),
+                                flip_x: false,
+                                art: Arc::new(art),
+                                ink: 0,
+                                clip: aterm_core::render::PxRect::EVERYWHERE,
+                            },
+                        )],
+                        vec![ink],
+                    ))
+                }
+            };
+            cut.next.push((key, Arc::clone(&content)));
+            let (gx, gy) = match layer.space {
+                aterm_core::render::FxSpace::Window => (0, 0),
+                aterm_core::render::FxSpace::Grid => (frame.pad as i32, frame.grid_top as i32),
+            };
+            let mut cut_layer = layer.clone();
+            cut_layer.content = content;
+            cut_layer.offset = (area[0] - gx, area[1] - gy);
+            cut.layers.push(cut_layer);
+            any = true;
+        }
+        std::mem::swap(&mut cut.held, &mut cut.next);
+        self.knock_cut = cut;
+        any
+    }
+
+    /// The frame's fx layers with the cut bodies, after [`Self::cut_knock_layers`] returned
+    /// true.
+    #[must_use]
+    pub fn cut_layers(&self) -> &[aterm_core::render::FxLayer] {
+        &self.knock_cut.layers
+    }
+
+    /// The knock-out's rings over `area` (`[x0, y0, x1, y1)`, frame pixels) into `mask` (one
+    /// word a pixel, row-major, each channel the share of the pixel cut): every glyph within
+    /// [`KNOCK_REACH`] of the area stamps its coverage at each of [`KNOCK_DILATE_OFFSETS`],
+    /// cut to its row's band ([`Self::cut_knock_layers`]). Returns whether any pixel was cut.
+    fn knock_ring_mask(&mut self, input: &RenderInput, area: [i32; 4], mask: &mut [u32]) -> bool {
+        let ch = self.cell_h as i32;
+        let reach = KNOCK_REACH;
+        let sel = self.selection_palette(input);
+        for r in 0..input.rows {
+            let ctx = self.row_ctx(input, r, sel);
+            let y0 = ctx.y0 as i32;
+            if y0 - reach >= area[3] || y0 + ch + reach <= area[1] {
+                continue;
+            }
+            self.knock_row_ring(input, &ctx, area, mask);
+        }
+        mask.iter().any(|&m| m != 0)
+    }
+
+    /// One row of [`Self::knock_ring_mask`].
+    fn knock_row_ring(
         &mut self,
-        pixels: &mut [u32],
-        w: usize,
         input: &RenderInput,
         ctx: &RowCtx<'_>,
-        knocks: &[[i32; 4]],
-        clip_y: (i32, i32),
-        wallpaper: bool,
+        area: [i32; 4],
+        mask: &mut [u32],
     ) {
         let RowCtx {
             cells,
@@ -11956,24 +12185,9 @@ impl Renderer {
             scale,
             anchor_y,
             uniform,
-            sel,
             ..
         } = *ctx;
-        let ch = self.cell_h as i32;
-        let (band0, band1) = (y0 as i32 - 1, y0 as i32 + ch + 1);
-        let mut kx_min = i32::MAX;
-        let mut kx_max = i32::MIN;
-        let mut row_knock_count = 0usize;
-        for k in knocks {
-            if k[1] < band1 && k[3] > band0 {
-                kx_min = kx_min.min(k[0]);
-                kx_max = kx_max.max(k[2]);
-                row_knock_count += 1;
-            }
-        }
-        if row_knock_count == 0 {
-            return;
-        }
+        let reach = KNOCK_REACH;
         let cols = input.cols;
         let pad_x = self.pad;
         let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
@@ -11981,7 +12195,6 @@ impl Renderer {
         let row_clusters = input.clusters.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let has_clusters = !row_clusters.is_empty();
         let row_raster = input.chrome_raster(r);
-        let may_have_sel = input.any_selection();
         let mut plan = std::mem::take(&mut self.glyph_plan_scratch);
         for (c, cell) in cells.iter().take(cols).enumerate() {
             if (has_images && image_covers(row_images, c))
@@ -11997,31 +12210,9 @@ impl Renderer {
                 let p = self.mixed_cell_place(input, r, c, y0);
                 (p.x, p.w, p.scale, p.anchor_y)
             };
-            let (x0, x1) = (x as i32 - 1, (x + cell_w) as i32 + 1);
-            if x1 <= kx_min
-                || x0 >= kx_max
-                || (row_knock_count > 1
-                    && !knocks
-                        .iter()
-                        .any(|k| k[0] < x1 && k[2] > x0 && k[1] < band1 && k[3] > band0))
-            {
+            if (x + cell_w) as i32 + reach <= area[0] || x as i32 - reach >= area[2] {
                 continue;
             }
-            let hit = if may_have_sel {
-                input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide)
-            } else {
-                None
-            };
-            let under = match hit {
-                Some(_) => sel.at_hit(hit).bg,
-                None => {
-                    let cell_bg = rgb_to_u32(cell.bg);
-                    if wallpaper && cell_bg == self.cell_default_bg(input, ctx, c) {
-                        continue;
-                    }
-                    cell_bg
-                }
-            };
             if self.glyph_plan_row != Some(r) {
                 let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
                 ligature_break_cols_into(input, r, &self.shaping, &mut break_cols);
@@ -12045,28 +12236,21 @@ impl Renderer {
             };
             let key = self.chrome_icon_key(row_raster, cells, c).unwrap_or(key);
             let key = shade_phase_key(key, x, y0);
-            let scale = Scale {
-                clip_y0: scale.clip_y0.max(clip_y.0),
-                clip_y1: scale.clip_y1.min(clip_y.1),
-                ..scale
-            };
-            self.blit_glyph_knock(pixels, w, x as i32, anchor_y, key, scale, under);
+            self.blit_glyph_ring(mask, area, x as i32, anchor_y, key, scale);
         }
         self.glyph_plan_scratch = plan;
     }
 
-    /// Stamp `key`'s coverage at each of [`KNOCK_DILATE_OFFSETS`] in `page`
-    /// at full alpha ([`Self::knock_out_under_text`]).
-    #[allow(clippy::too_many_arguments)]
-    fn blit_glyph_knock(
+    /// Stamp `key`'s coverage at each of [`KNOCK_DILATE_OFFSETS`] into `mask` over `area`, cut
+    /// to `scale`'s clip ([`Self::knock_ring_mask`]).
+    fn blit_glyph_ring(
         &mut self,
-        px: &mut [u32],
-        stride: usize,
+        mask: &mut [u32],
+        area: [i32; 4],
         cell_x: i32,
         cell_y: i32,
         key: GlyphKey,
         scale: Scale,
-        page: u32,
     ) {
         let baseline = self.baseline;
         let entry = self.cached_glyph(key);
@@ -12085,25 +12269,70 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
+        let ring = &entry.ring;
         let (xs, ys) = (scale.xs.max(1), scale.ys.max(1));
         let gx0 = cell_x + xmin * xs as i32;
         let gy0 = cell_y + ys as i32 * (baseline - height as i32 - ymin);
+        let (gw, gh) = ((width * xs) as i32, (height * ys) as i32);
+        let reach = KNOCK_REACH;
+        if gx0 + gw + reach <= area[0]
+            || gx0 - reach >= area[2]
+            || gy0 + gh + reach <= area[1]
+            || gy0 - reach >= area[3]
+        {
+            return;
+        }
+        let stride = (area[2] - area[0]) as usize;
+        let clip_y = (
+            scale.clip_y0.max(area[1]) - area[1],
+            scale.clip_y1.min(area[3]) - area[1],
+        );
+        let clip_x = (
+            scale.clip_x0.max(area[0]) - area[0],
+            scale.clip_x1.min(area[2]) - area[0],
+        );
+        if clip_y.0 >= clip_y.1 || clip_x.0 >= clip_x.1 {
+            return;
+        }
+        if xs == 1 && ys == 1 {
+            // One blit of the glyph's ring ([`knock_ring`]), built once per glyph.
+            let ring = ring.get_or_init(|| knock_ring(width, height, bytes));
+            blit_mono_with(
+                mask,
+                stride,
+                gx0 - reach - area[0],
+                gy0 - reach - area[1],
+                width + 2 * reach as usize,
+                height + 2 * reach as usize,
+                ring,
+                0x00FF_FFFF,
+                255,
+                1,
+                1,
+                clip_y,
+                clip_x,
+                blend,
+            );
+            return;
+        }
+        // A line drawn at twice the size scales the raster as it blits: the offsets are
+        // frame pixels, so each is stamped.
         for &(dx, dy) in &KNOCK_DILATE_OFFSETS {
             blit_mono_with(
-                px,
+                mask,
                 stride,
-                gx0 + dx,
-                gy0 + dy,
+                gx0 + dx - area[0],
+                gy0 + dy - area[1],
                 width,
                 height,
                 bytes,
-                page,
+                0x00FF_FFFF,
                 255,
                 xs,
                 ys,
-                (scale.clip_y0, scale.clip_y1),
-                (scale.clip_x0, scale.clip_x1),
-                knock_blend,
+                clip_y,
+                clip_x,
+                blend,
             );
         }
     }
@@ -12118,34 +12347,49 @@ impl Renderer {
 
     #[cfg(any(test, debug_assertions))]
     fn stamp_legacy_sprites(
-        &self,
+        &mut self,
         pixels: &mut [u32],
         w: usize,
         h: usize,
-        grid_rows: usize,
-        rows: impl Iterator<Item = usize>,
+        input: &RenderInput,
+        rows: impl Iterator<Item = usize> + Clone,
         under: bool,
     ) {
-        let Some(l) = &self.legacy_sprites else {
+        let Some(l) = self.legacy_sprites.take() else {
             return;
         };
-        for r in rows {
-            let (y_lo, y_hi) = self.row_pixel_band(r, grid_rows, h);
-            for s in l.sprites.iter().filter(|s| s.under == under) {
-                legacy_sprite_oracle::stamp(pixels, w, h, self.pad, self.grid_top(), s, y_lo, y_hi);
+        let (pad, top) = (self.pad, self.grid_top());
+        let mut mask = Vec::new();
+        for s in l.sprites.iter().filter(|s| s.under == under) {
+            // The old path's knock-out, as the layers' ([`Self::cut_knock_layers`]): the
+            // under-text sprite cut where its letters lie.
+            let area = legacy_sprite_oracle::frame_box(s, pad, top, w, h);
+            let cut = match area {
+                Some(area) if under && !self.knock_off => {
+                    mask.clear();
+                    mask.resize(((area[2] - area[0]) * (area[3] - area[1])) as usize, 0);
+                    self.knock_ring_mask(input, area, &mut mask)
+                        .then_some((area, mask.as_slice()))
+                }
+                _ => None,
+            };
+            for r in rows.clone() {
+                let (y_lo, y_hi) = self.row_pixel_band(r, input.rows, h);
+                legacy_sprite_oracle::stamp(pixels, w, h, pad, top, s, y_lo, y_hi, cut);
             }
         }
+        self.legacy_sprites = Some(l);
     }
 
     /// A test's negative control: draw companions under the text without
-    /// the knock-out ([`Self::knock_out_under_text`]).
+    /// the knock-out ([`Self::cut_knock_layers`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub fn set_knock_out(&mut self, on: bool) {
         self.knock_off = !on;
     }
 
-    /// Whether the knock-out draws ([`Self::knock_out_under_text`]); off
+    /// Whether the knock-out draws ([`Self::cut_knock_layers`]); off
     /// only for a test's negative control ([`Self::set_knock_out`]). The GPU
     /// renderer reads it to build the same stamps.
     #[inline]
@@ -13202,17 +13446,29 @@ impl Renderer {
         blend: FxBlend,
         dirty: Option<&[bool]>,
     ) {
+        self.draw_picked_fx(pixels, w, h, input, (slot, blend, Knock::Any), dirty);
+    }
+
+    /// [`Self::draw_fx`] of the layers `pick` takes ([`Knock`]).
+    fn draw_picked_fx(
+        &mut self,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        input: &RenderInput,
+        pick: (FxSlot, FxBlend, Knock),
+        dirty: Option<&[bool]>,
+    ) {
         if input.fx_layers.is_empty() {
             return;
         }
         let frame = self.fx_frame(w, h, input.rows);
-        fx_raster::draw_layers(
+        fx_raster::draw_picked_layers(
             pixels,
             &frame,
             &input.fx_layers,
             &input.fx_occluders,
-            slot,
-            blend,
+            pick,
             dirty,
             &mut self.fx_scratch,
         );
@@ -14249,15 +14505,11 @@ pub const HALO_DILATE_OFFSETS: [(i32, i32); 14] = [
     (3, 0),
 ];
 
-/// Under-text bodies a frame knocks out before the scratch list grows: the
-/// pet, a departure or two and the idle cat.
-const KNOCK_SCRATCH_RESIDENT: usize = 8;
-
-/// The knock-out's dilation ([`Renderer::knock_out_under_text`]): the
+/// The knock-out's dilation ([`Renderer::cut_knock_layers`]): the
 /// glyph's coverage stamped at every offset within two pixels (a disc, the
-/// corners off). An anti-aliased edge pixel stamps only its own share of
-/// page, so it takes two pixels to put a whole pixel of page beyond the
-/// ink's last soft pixel.
+/// corners off). An anti-aliased edge pixel cuts only its own share of the
+/// body, so it takes two pixels to cut a whole pixel beyond the ink's last
+/// soft pixel.
 pub const KNOCK_DILATE_OFFSETS: [(i32, i32); 21] = [
     (0, 0),
     (-1, -1),
@@ -14281,6 +14533,61 @@ pub const KNOCK_DILATE_OFFSETS: [(i32, i32); 21] = [
     (2, -1),
     (2, 1),
 ];
+
+/// How far [`KNOCK_DILATE_OFFSETS`] reach from the glyph, on either axis: a ring meets only the
+/// bodies within this many pixels of the glyph's box.
+pub const KNOCK_REACH: i32 = {
+    let mut reach = 0;
+    let mut i = 0;
+    while i < KNOCK_DILATE_OFFSETS.len() {
+        let (dx, dy) = KNOCK_DILATE_OFFSETS[i];
+        reach = max_i32(max_i32(reach, dx.abs()), dy.abs());
+        i += 1;
+    }
+    reach
+};
+
+const fn max_i32(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
+}
+
+/// The knock-out's resident state ([`Renderer::cut_knock_layers`]): the frame's layers with
+/// the cut bodies, last frame's cuts by key (kept while unchanged) and this frame's, and the
+/// mask and texel scratch.
+#[derive(Debug, Default)]
+struct KnockCut {
+    layers: Vec<aterm_core::render::FxLayer>,
+    held: Vec<(u64, Arc<aterm_core::render::FxContent>)>,
+    next: Vec<(u64, Arc<aterm_core::render::FxContent>)>,
+    mask: Vec<u32>,
+    texels: Vec<u8>,
+    /// The bodies' pixel rows a damage pass reads (`Renderer::mark_overshoot_rows`).
+    spans: Vec<(i64, i64)>,
+}
+
+/// A cut body's key: its layer, its art's content address and its ink, where it lands and its
+/// rings.
+fn knock_cut_key(
+    layer: &aterm_core::render::FxLayer,
+    sp: &aterm_core::render::FxSprite,
+    o: (i64, i64),
+    area: [i32; 4],
+    mask: &[u32],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = aterm_hash::FxHasher::default();
+    layer.id.hash(&mut h);
+    sp.art.id().hash(&mut h);
+    layer
+        .content
+        .palette()
+        .get(sp.ink as usize)
+        .map(|k| (k.color, k.alpha))
+        .hash(&mut h);
+    (sp.dw, sp.dh, sp.flip_x, o, area).hash(&mut h);
+    mask.hash(&mut h);
+    h.finish()
+}
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -14413,18 +14720,6 @@ fn blit_mono_with(
             }
         }
     }
-}
-
-/// The knock-out's stamp ([`Renderer::knock_out_under_text`]): `bg`'s
-/// colour taken toward the page `page` by `t` in linear light, as [`blend`]
-/// does, its transmittance kept: the stamp lays the page's colour, never
-/// its opacity, so a pixel that already shows the page is left as it is.
-#[inline]
-fn knock_blend(bg: u32, page: u32, t: u8) -> u32 {
-    if t == 0 || (bg ^ page) & 0x00ff_ffff == 0 {
-        return bg;
-    }
-    (bg & 0xff00_0000) | (blend(bg, page, t) & 0x00ff_ffff)
 }
 
 #[allow(clippy::too_many_arguments)]

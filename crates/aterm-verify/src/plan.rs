@@ -93,7 +93,8 @@ pub const WINDOWED: [(StageId, &str); 3] = [
 /// Stages that run under `--no-windows` and emit named skips for their windowed rows.
 pub const WINDOWED_ROWS: [StageId; 1] = [StageId::BrowserLane];
 
-/// Stages whose verdicts depend on host timing and acquire [`crate::default_timing_lock`].
+/// Stages whose verdicts depend on host timing: each runs on the quiet machine, a claim in the
+/// per-user capacity ledger (`docs/DESIGN-adaptive-build-2026-10-24.md`, QUIET-ADMIT).
 pub const TIMED: [StageId; 4] = [
     StageId::MeasuringTests,
     StageId::GuiSmoke,
@@ -289,12 +290,12 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::MeasurePrebuild,
-            "measuring rows' compile (paint, spin and aos, --no-run)",
+            "measuring rows' compile (paint, spin, aos and rewind, --no-run)",
             Lane::MainTarget,
         ),
         exclusive(
             StageId::MeasuringTests,
-            "measuring tests (paint, spin and aos over the handed bundle; run alone)",
+            "measuring tests (paint, spin, aos and rewind over the handed bundle; run alone)",
             Lane::MainTarget,
         ),
         exclusive(StageId::GuiSmoke, "gui typing-pacing smoke", Lane::Pure),

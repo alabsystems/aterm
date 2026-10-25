@@ -564,3 +564,84 @@ fn admission_stop_handoff_no_stop_and_untouched_refusals_owe_no_save() {
         assert!(script().runs.is_empty());
     }
 }
+
+/// The first-launch offer answered with a typed Join while this Mac's vault configuration
+/// cannot be read (a root-owned `source.toml`): the real startup review admits the answer at
+/// once, as the person's choice of groups without the Join, so aterm's own permissions (Full
+/// Disk Access, the debugger, Local Network) get their run with no other press. Nothing is
+/// tried again, nothing is reported failed, and the window learns the vault was not joined.
+#[test]
+fn a_startup_join_over_an_unreadable_vault_is_admitted_at_once_without_the_join() {
+    struct JoinHost<'a, 'root> {
+        setup: &'a mut InitialSetupAdmissionStopTest<'root>,
+        tries: usize,
+        not_joined: bool,
+        failures: Vec<String>,
+    }
+    impl SetupStartup for JoinHost<'_, '_> {
+        type Claim = ();
+        fn bind_authorization(&mut self) -> Result<u64, String> {
+            panic!("the scratch ticket was bound before its answer")
+        }
+        fn revision(&mut self) -> Result<u64, String> {
+            panic!("an answered offer does not reload its baseline")
+        }
+        fn claim(&mut self) -> Result<Option<()>, String> {
+            Ok(Some(()))
+        }
+        fn finished(&mut self) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
+            panic!("an answered offer keeps its own ticket")
+        }
+        fn initial(&mut self) -> Result<Plan, String> {
+            panic!("the answer is already given")
+        }
+        fn offer(&mut self, _: Plan) -> aterm_gui::WorkstationSetupDecision {
+            panic!("an answered offer is not offered again")
+        }
+        fn authorize(&mut self, _: &Plan) -> Result<Option<u64>, String> {
+            self.tries += 1;
+            let (result, not_joined) = self
+                .setup
+                .persist_join_over_unread_vault("https://typed.example/v1/typed");
+            self.not_joined = not_joined;
+            result
+        }
+        fn authorization_pending(&self) -> bool {
+            self.setup.pending()
+        }
+        /// Bounds the old retry loop, so the test ends to say it looped.
+        fn stopped(&self) -> bool {
+            self.tries >= 3
+        }
+        fn wait_holding_claim(&mut self) -> bool {
+            false
+        }
+        fn backoff(&mut self) {}
+        fn report_failure(&mut self, why: &str) {
+            self.failures.push(why.to_owned());
+        }
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut setup = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
+    let plan = setup.plan();
+    let mut host = JoinHost {
+        setup: &mut setup,
+        tries: 0,
+        not_joined: false,
+        failures: Vec::new(),
+    };
+    let prepared = finish_setup_choice(&mut host, (), plan);
+    assert!(
+        matches!(prepared, PreparedSetup::Authorized { .. }),
+        "tries {}, failures {:?}: aterm's permissions wait",
+        host.tries,
+        host.failures
+    );
+    assert_eq!((host.tries, host.failures.len()), (1, 0));
+    assert!(host.not_joined, "the page says the vault was not joined");
+    let snapshot = setup.snapshot().unwrap();
+    assert!(snapshot.permissions_allowed && !snapshot.finished);
+}

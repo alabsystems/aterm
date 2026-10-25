@@ -177,7 +177,17 @@ pub fn motion_print_anchor(term: &Terminal) -> (Option<(u16, u16, u64)>, Option<
 fn cursor_row_empty(term: &Terminal) -> bool {
     let grid = term.grid();
     let row = term.cursor().row;
-    (0..grid.cols()).all(|col| grid.cell(row, col).is_none_or(|cell| !draws_ink(cell)))
+    let cols = grid.cols();
+    let mut col = 0;
+    while col < cols {
+        if let Some(cell) = grid.cell(row, col)
+            && draws_ink(cell)
+        {
+            return false;
+        }
+        col += 1;
+    }
+    true
 }
 
 /// Whether `cell` puts anything on the glass: a glyph, a background, or a

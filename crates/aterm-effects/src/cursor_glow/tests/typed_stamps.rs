@@ -126,7 +126,7 @@ fn user_gesture_keeps_banked_typed_stamps_for_in_flight_echoes() {
     glow.note_user_gesture(k1 + Duration::from_millis(8));
     assert!(
         glow.type_hint
-            .any_fresh(k1 + Duration::from_millis(9), CursorGlow::TYPE_HINT_FRESH),
+            .any_fresh(k1 + Duration::from_millis(9), TYPE_HINT_FRESH_DUR),
         "arming the gesture class must not destroy banked typed stamps"
     );
     let e1 = k1 + Duration::from_millis(20);
@@ -160,7 +160,7 @@ fn hidden_boundary_spares_fresh_typed_stamps_and_retires_stale() {
     glow.tick(Some((2, 2)), k + Duration::from_millis(10), &c, g, &mut out);
     assert!(
         glow.type_hint
-            .any_fresh(k + Duration::from_millis(11), CursorGlow::TYPE_HINT_FRESH),
+            .any_fresh(k + Duration::from_millis(11), TYPE_HINT_FRESH_DUR),
         "fresh typed stamps must survive the hidden→visible boundary"
     );
     glow.tick(Some((2, 3)), k + Duration::from_millis(20), &c, g, &mut out);

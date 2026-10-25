@@ -25,8 +25,9 @@ pub const RECORD_MAX: u64 = 16 * 1024;
 const TEXT_MAX: usize = 512;
 
 // A record's three texts at their longest, each character escaped to JSON's six bytes, and its
-// figures and admission line, still lie before RECORD_MAX: no live claim reads back cut short.
-const _: () = assert!(3 * 6 * TEXT_MAX + 1024 <= RECORD_MAX as usize);
+// figures, admission line and measured writes, still lie before RECORD_MAX: no live claim reads
+// back cut short.
+const _: () = assert!(3 * 6 * TEXT_MAX + 1024 + WROTE_LINE <= RECORD_MAX as usize);
 
 /// A waiting claim's suffix.
 const WAIT: &str = ".wait";
@@ -36,6 +37,9 @@ const CLAIM: &str = ".claim";
 const TAKING: &str = ".taking";
 /// The admissions' lock.
 const LOCK: &str = "ledger.lock";
+
+/// The length of the line a holder's measured writes take ([`Record::wrote`]): the figure padded to `u64`'s widest.
+const WROTE_LINE: usize = "{\"wrote\":}\n".len() + 20;
 
 /// The ledger's directory under the per-user cache: `~/Library/Caches/aterm/capacity` on macOS, `~/.cache/aterm/capacity` on Linux, `%LOCALAPPDATA%\aterm\capacity` on Windows; `None` with no home. On Unix `~` is the account database's home, whatever `$HOME` or `$XDG_CACHE_HOME` says, so a tool run under a scratch home (the lab, the release buildplan, verify's smoke stages) claims in the one ledger every session of this user reads.
 #[must_use]
@@ -70,12 +74,20 @@ pub struct Record {
     pub start_ms: u64,
     /// The holder's own count of its claims, which orders two made in one millisecond.
     pub seq: u64,
-    /// The checkout the holder ran in (its working directory's enclosing git checkout).
+    /// The checkout the holder runs for: its need's ([`Need::checkout`]), else its working directory's enclosing git checkout.
     pub checkout: String,
     /// What it needs; its `path` is the mount of the volume its disk need is on.
     pub need: Need,
     /// Its grant, once admitted.
     pub held: Option<Held>,
+    /// Processes outside its holder's tree whose use is its own ([`crate::Claim::credit`]): a
+    /// VM's, which the system parents to launchd, not to the run that booted it. Their trees'
+    /// use is credited against this claim alone, before its holder's.
+    pub credit: Vec<u32>,
+    /// What its holder has measured itself writing toward its disk need since it was admitted
+    /// ([`crate::Claim::wrote`]): the free space a waiter reads has already lost it, so its
+    /// disk reservation is the need less this. `None` where its holder measures nothing.
+    pub wrote: Option<u64>,
 }
 
 impl Record {
@@ -100,6 +112,7 @@ impl Record {
         o.insert("checkout".to_owned(), Value::from(cut(&self.checkout)));
         o.insert("what".to_owned(), Value::from(cut(&self.need.what)));
         o.insert("mem".to_owned(), Value::from(self.need.mem));
+        o.insert("margin".to_owned(), Value::from(self.need.margin));
         o.insert("cores".to_owned(), Value::from(self.need.cores));
         o.insert("disk".to_owned(), Value::from(self.need.disk));
         o.insert("quiet".to_owned(), Value::from(self.need.quiet));
@@ -118,6 +131,24 @@ impl Record {
         line_of(o)
     }
 
+    /// The line a credit adds ([`crate::Claim::credit`]): the latest one read whole stands.
+    pub(crate) fn credit_line(pids: &[u32]) -> String {
+        let mut o = Map::new();
+        o.insert(
+            "credit".to_owned(),
+            Value::Array(pids.iter().map(|p| Value::from(*p)).collect()),
+        );
+        line_of(o)
+    }
+
+    /// The line its holder's measured writes take ([`Self::wrote`]), always [`WROTE_LINE`] bytes, so
+    /// a later figure is written over it in place and a reader never finds the record cut short.
+    fn wrote_line(bytes: u64) -> String {
+        let line = format!("{{\"wrote\":{bytes:<20}}}\n");
+        debug_assert_eq!(line.len(), WROTE_LINE);
+        line
+    }
+
     /// A record read back from a claim file's text; `held` says the file is admitted (`.claim`).
     #[must_use]
     pub fn decode(text: &str, held: bool) -> Option<Record> {
@@ -131,6 +162,7 @@ impl Record {
         let need = Need {
             what: head.get("what").and_then(Value::as_str)?.to_owned(),
             mem: num(&head, "mem")?,
+            margin: num(&head, "margin").unwrap_or(0),
             cores: u32::try_from(num(&head, "cores")?).ok()?,
             disk: num(&head, "disk")?,
             quiet: head.get("quiet").and_then(Value::as_f64),
@@ -138,6 +170,7 @@ impl Record {
                 .get("volume")
                 .and_then(Value::as_str)
                 .map(PathBuf::from),
+            checkout: None,
         };
         let held = held.then(|| {
             lines
@@ -154,6 +187,23 @@ impl Record {
                     cores: need.cores,
                 })
         });
+        // The lines after the admission, in the order they were added: the measured writes'
+        // (written over in place) and each credit, whichever came first.
+        let after: Vec<Value> = lines
+            .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+            .collect();
+        let credit = after
+            .iter()
+            .filter_map(|v| {
+                v.get("credit")?
+                    .as_array()?
+                    .iter()
+                    .map(|p| p.as_u64().and_then(|p| u32::try_from(p).ok()))
+                    .collect::<Option<Vec<u32>>>()
+            })
+            .next_back()
+            .unwrap_or_default();
+        let wrote = held.and_then(|_| after.iter().find_map(|v| num(v, "wrote")));
         Some(Record {
             pid: u32::try_from(num(&head, "pid")?).ok()?,
             start_ms,
@@ -165,6 +215,8 @@ impl Record {
                 .to_owned(),
             need,
             held,
+            credit,
+            wrote,
         })
     }
 }
@@ -202,6 +254,33 @@ impl Laid {
     /// The claim file.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Add `line` to the record, refused where it would reach into the room kept for the
+    /// measured writes' line ([`Self::wrote`]) before [`RECORD_MAX`], which no reader passes.
+    pub(crate) fn append(&mut self, line: &str) -> io::Result<()> {
+        let end = self.lock.seek(SeekFrom::End(0))?;
+        let room = RECORD_MAX - WROTE_LINE as u64;
+        if end.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)) > room {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("the record would pass {room} bytes"),
+            ));
+        }
+        self.lock.write_all(line.as_bytes())
+    }
+
+    /// Write `bytes` as the admitted claim's measured writes ([`Record::wrote`]): the line appended
+    /// the first time, at the offset kept in `at`, and written over in place after, at one length.
+    pub(crate) fn wrote(&mut self, at: &mut Option<u64>, bytes: u64) -> io::Result<()> {
+        let offset = match *at {
+            Some(offset) => offset,
+            None => self.lock.seek(SeekFrom::End(0))?,
+        };
+        self.lock.seek(SeekFrom::Start(offset))?;
+        self.lock.write_all(Record::wrote_line(bytes).as_bytes())?;
+        *at = Some(offset);
+        Ok(())
     }
 }
 
@@ -301,13 +380,16 @@ impl Ledger {
     /// A claim for `need` in the queue: the record laid under a name no reader looks at, locked, then named a waiter.
     pub(crate) fn lay(&self, need: &Need, start_ms: u64) -> io::Result<(Record, Laid)> {
         ensure_dir(&self.dir)?;
+        let mut need = need.clone();
         let record = Record {
             pid: std::process::id(),
             start_ms,
             seq: next_seq(),
-            checkout: checkout_of_cwd(),
-            need: need.clone(),
+            checkout: need.checkout.take().unwrap_or_else(checkout_of_cwd),
+            need,
             held: None,
+            credit: Vec::new(),
+            wrote: None,
         };
         let stem = record.stem();
         let taking = self.dir.join(format!("{stem}{TAKING}"));

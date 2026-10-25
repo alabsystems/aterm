@@ -630,10 +630,9 @@ pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16
 impl App {
     /// `(row geometry died, content moved)` for the open find, `None` without one.
     fn search_stamp_mismatch(&self, wid: crate::WindowId) -> Option<(bool, bool)> {
-        let ws = self.windows.get(&wid)?;
-        let search = ws.search.as_ref()?;
-        let terminal = ws.front_terminal()?;
-        let term = term_lock(&terminal.term);
+        let search = self.windows.get(&wid)?.search.as_ref()?;
+        let (term, _) = self.front_shown(wid)?;
+        let term = term_lock(&term);
         Some((
             term.absolute_row_revision() != search.match_absolute_row_revision
                 || term.grid().history_renumber_epoch() != search.match_history_renumber_epoch,
@@ -642,11 +641,7 @@ impl App {
     }
 
     fn invalidate_search_results(&mut self, wid: crate::WindowId, revision_stale: bool) {
-        let term = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.front_terminal())
-            .map(|terminal| terminal.term.clone());
+        let term = self.front_shown(wid).map(|(term, _)| term);
         if let Some(ws) = self.windows.get_mut(&wid)
             && let Some(search) = ws.search.as_mut()
         {
@@ -779,10 +774,7 @@ impl App {
         forward: bool,
         legacy_from_start: bool,
     ) {
-        let Some((term, session)) = self
-            .front_terminal(wid)
-            .map(|terminal| (terminal.term.clone(), terminal.session))
-        else {
+        let Some((term, session)) = self.front_shown(wid) else {
             if let Some(window) = self.windows.get_mut(&wid) {
                 window.search = None;
                 window.find_bar_hit = None;
@@ -915,10 +907,7 @@ impl App {
     }
 
     fn search_recompute_from_anchor_in(&mut self, wid: crate::WindowId, strict: bool) {
-        let Some((term, session)) = self
-            .front_terminal(wid)
-            .map(|terminal| (terminal.term.clone(), terminal.session))
-        else {
+        let Some((term, session)) = self.front_shown(wid) else {
             return;
         };
         let rewrapping = self.rewrap_in_flight(session);
@@ -1101,13 +1090,13 @@ impl App {
         else {
             return;
         };
-        let Some(terminal) = self.front_terminal(wid) else {
+        let Some((term, front)) = self.front_shown(wid) else {
             return;
         };
-        if terminal.session != session {
+        if front != session {
             return;
         }
-        let Ok(term) = terminal.term.try_lock() else {
+        let Ok(term) = term.try_lock() else {
             return;
         };
         let revision_stale = term.absolute_row_revision() != expected_revision
@@ -1122,10 +1111,10 @@ impl App {
     /// Highlight the current match through the text selection, scroll it into view,
     /// and show the find state in the window title.
     fn search_apply_current_in(&mut self, wid: crate::WindowId) {
-        let Some(ws) = self.windows.get(&wid) else {
+        let Some((shown, _)) = self.front_shown(wid) else {
             return;
         };
-        let Some(terminal) = ws.front_terminal() else {
+        let Some(ws) = self.windows.get(&wid) else {
             return;
         };
         let rows = ws.rows;
@@ -1143,7 +1132,7 @@ impl App {
                 None => return,
             };
         {
-            let mut term = term_lock(&terminal.term);
+            let mut term = term_lock(&shown);
             if dirty
                 || term.absolute_row_revision() != match_revision
                 || term.grid().history_renumber_epoch() != match_epoch
@@ -1204,10 +1193,7 @@ impl App {
     }
 
     fn search_step_truncated_in(&mut self, wid: crate::WindowId, forward: bool) {
-        let Some(term) = self
-            .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
-        else {
+        let Some(term) = self.front_shown(wid).map(|(term, _)| term) else {
             return;
         };
         let Some((query, case_sensitive, is_regex, anchor_row, anchor_col)) = self
@@ -1368,10 +1354,10 @@ impl App {
         }
 
         let query = self.search_last_query.clone();
-        let session_identity = self.front_terminal(wid).map(|terminal| {
-            let term = term_lock(&terminal.term);
+        let session_identity = self.front_shown(wid).map(|(term, session)| {
+            let term = term_lock(&term);
             (
-                terminal.session,
+                session,
                 term.absolute_row_revision(),
                 term.grid().history_renumber_epoch(),
             )
@@ -1603,10 +1589,7 @@ impl App {
 
     /// Window-targeted ⎋/^G, bound to its press episode's window like [`Self::search_accept_in`].
     pub(crate) fn search_cancel_in(&mut self, wid: crate::WindowId) {
-        if let Some((term, session)) = self
-            .front_terminal(wid)
-            .map(|terminal| (terminal.term.clone(), terminal.session))
-        {
+        if let Some((term, session)) = self.front_shown(wid) {
             // Removed whether or not the restore applies: ⎋ ends this find, and a
             // stale entry would be inherited by the next ⌘F on this terminal.
             if let Some(origin) = self.find_origins.remove(&(session, wid)) {
@@ -1642,9 +1625,7 @@ impl App {
 
     /// Shared find-close core: drop the overlay state (+ its clickable-indicator geometry), optionally clear the selection highlight (accept keeps it on the match), and restore the newest title owned by the remaining authority.
     pub(crate) fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
-        let term = self
-            .front_terminal(wid)
-            .map(|terminal| terminal.term.clone());
+        let term = self.front_shown(wid).map(|(term, _)| term);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };

@@ -16052,6 +16052,329 @@ fn a_renewed_login_is_followed_and_a_renewable_one_signed_in() {
     }
 }
 
+/// A ROSTER ROW'S LOST LOGIN AT A SIGN-IN MENU, drawn in place of the composer (no point): the
+/// menu asks no person. The host is told the row's login ended all the same; the tab waits on the
+/// row's own sign-in, the wait naming the row and what holds the move where something does; once
+/// the row is renewed the tab is relaunched onto it, a person's keys at the menu holding that; a
+/// tab with no task is left alone. No measured Claude Code screen reads so (its `/login` dialog is
+/// the dialog's), so the reading is built. CONTROL: the menu on no roster row, with `logins` off,
+/// and agy's measured menu on a roster row are escalated with how the agent signs in, and the
+/// host is asked nothing; a roster move's own wall is no point at the menu.
+#[test]
+fn a_roster_rows_sign_in_menu_waits_on_its_own_sign_in() {
+    use super::super::exception::exception_for;
+    let t = t0();
+    let menu = TurnEndReading {
+        composer: Composer::Absent,
+        ..walled(
+            WallKind::Auth,
+            "Not logged in · Please run /login",
+            Some(Duration::from_secs(2)),
+        )
+    };
+    let ended = renewable(&menu, "m7-a");
+    let asks_a_sign_in = |text: &str| {
+        let lower = text.to_lowercase();
+        ["/login", "accounts login", "accounts renew", "sign in with"]
+            .iter()
+            .any(|ask| lower.contains(ask))
+    };
+    let mut no_logins = cfg();
+    no_logins.logins = false;
+    let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::agy::fixtures::SIGNED_OUT);
+    let agy = renewable(
+        &TurnEndReading::of(
+            &aterm_phase::read(Some("agy"), &rows, None),
+            &rows,
+            false,
+            None,
+            None,
+            None,
+        ),
+        "m7-a",
+    );
+    let taskless_menu = TurnEndReading {
+        taskless: true,
+        ..menu.clone()
+    };
+    for (shown, under, what) in [
+        (&menu, cfg(), "no roster row"),
+        (&taskless_menu, cfg(), "no roster row, no task"),
+        (&ended, no_logins.clone(), "logins off"),
+        (&agy, cfg(), "agy moves no accounts"),
+    ] {
+        let mut st = TurnEndState::default();
+        let a = at_under(&mut st, shown, t + MIN, &under);
+        assert!(is_escalate(&a, "the login is gone"), "{what}: {a:?}");
+        assert_eq!(st.account_point(shown, &under), None, "{what}");
+    }
+    let mut moved = TurnEndState::default();
+    moved.seed_account(
+        "work-2".to_string(),
+        AccountAt::Wall,
+        90 * MIN,
+        false,
+        true,
+        true,
+        t,
+    );
+    moved.observe(&menu, t + MIN);
+    assert_eq!(
+        moved.account_point(&menu, &cfg()),
+        None,
+        "the control: the menu is no point for a move's wall"
+    );
+
+    let [relaunch_off, resume_off, cannot_restart, not_made] = MOVE_HELD_WHYS;
+    let mut no_relaunch = cfg();
+    no_relaunch.relaunch = false;
+    let mut no_resume = cfg();
+    no_resume.resume_limits = false;
+    let unrestartable = TurnEndReading {
+        restartable: false,
+        ..ended.clone()
+    };
+    let start = |held: Option<&str>| {
+        let mut st = TurnEndState::default();
+        if held == Some(not_made) {
+            st.seed_account_unmade(Unmade::Again, None);
+        }
+        st
+    };
+    for (shown, under, held) in [
+        (&ended, cfg(), None),
+        (&ended, no_relaunch, Some(relaunch_off)),
+        (&ended, no_resume, Some(resume_off)),
+        (&unrestartable, cfg(), Some(cannot_restart)),
+        (&ended, cfg(), Some(not_made)),
+    ] {
+        let mut st = start(held);
+        let a = at_under(&mut st, shown, t + MIN, &under);
+        assert!(
+            matches!(&a, TurnEndAction::WaitUntil { why, .. }
+                if why.contains("m7-a")
+                    && held.is_none_or(|held| why.contains(held))
+                    && !asks_a_sign_in(why)),
+            "{held:?}: {a:?}"
+        );
+        assert_eq!(
+            st.account_point(shown, &under),
+            Some(AccountPoint::LoginEnded),
+            "the host is told the row's login ended: {held:?}"
+        );
+        assert_eq!(
+            exception_for(&st, shown, &under, t + MIN),
+            None,
+            "no one is asked to sign in: {held:?}"
+        );
+        let renewed = advised(
+            &TurnEndReading {
+                login_superseded: true,
+                ..shown.clone()
+            },
+            "m7-a",
+        );
+        let a = at_under(&mut st, &renewed, t + 2 * MIN, &under);
+        match held {
+            None => assert!(
+                restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT),
+                "the tab is relaunched onto the renewed row: {a:?}"
+            ),
+            Some(held) => assert!(
+                matches!(&a, TurnEndAction::WaitUntil { why, .. }
+                    if why.contains("m7-a") && why.contains(held) && !asks_a_sign_in(why)),
+                "{held}: {a:?}"
+            ),
+        }
+        assert_eq!(exception_for(&st, &renewed, &under, t + 2 * MIN), None);
+    }
+
+    let renewed = advised(
+        &TurnEndReading {
+            login_superseded: true,
+            ..ended.clone()
+        },
+        "m7-a",
+    );
+    let keyed = TurnEndReading {
+        person: Some(Duration::from_secs(1)),
+        ..renewed.clone()
+    };
+    let a = at(&mut TurnEndState::default(), &keyed, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if !asks_a_sign_in(why)),
+        "a person's keys at the menu hold the relaunch: {a:?}"
+    );
+    let taskless = TurnEndReading {
+        taskless: true,
+        ..renewed
+    };
+    let mut st = TurnEndState::default();
+    assert_eq!(at(&mut st, &taskless, t + MIN), TurnEndAction::Nothing);
+    assert_eq!(
+        st.account_point(&taskless, &cfg()),
+        Some(AccountPoint::LoginEnded),
+        "a taskless tab's row is told all the same"
+    );
+    assert_eq!(exception_for(&st, &taskless, &cfg(), t + MIN), None);
+}
+
+/// A SIGN-IN MENU DRAWN AFTER A MOVE ONTO A ROSTER ROW is the moved-to login's own, never the wall
+/// the session left (no transcript is drawn there): the move is answered signed out at the menu,
+/// so the host strikes the row, is told its login ended, and the tab waits on the row's sign-in,
+/// asking no one, at every later look, with `resume_limits` on (the move's resume owed) and off,
+/// and so before the answer is told. Once renewed the tab
+/// is relaunched onto the row, the move cap bounding the relaunches. A tab with no task at a
+/// roster row's menu is left alone whatever its wait. CONTROL: after the same move the wall at
+/// the composer is the one the session left (no answer, nothing told), and a menu on no roster
+/// row is escalated as before.
+#[test]
+fn a_sign_in_menu_after_a_move_is_the_moved_to_logins_own() {
+    use super::super::exception::exception_for;
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "Not logged in · Please run /login",
+        Some(Duration::from_secs(2)),
+    );
+    let left = renewable(&gone, "m7-a");
+    let menu = TurnEndReading {
+        composer: Composer::Absent,
+        ..left.clone()
+    };
+    let asks_a_sign_in = |text: &str| {
+        let lower = text.to_lowercase();
+        ["/login", "accounts login", "accounts renew", "sign in with"]
+            .iter()
+            .any(|ask| lower.contains(ask))
+    };
+    let moved = || {
+        let mut st = TurnEndState::default();
+        st.restarted(&to_account("m7-a", AccountAt::Wall), true, &left, t);
+        st
+    };
+    let mut no_resume = cfg();
+    no_resume.resume_limits = false;
+    for (under, what) in [
+        (cfg(), "resume_limits on"),
+        (no_resume.clone(), "resume_limits off"),
+    ] {
+        let mut st = moved();
+        let answer = st.account_answer(&menu);
+        assert_eq!(
+            answer,
+            Some(AccountAnswer::Bad(AccountBad::SignedOut)),
+            "{what}: the menu answers the move"
+        );
+        st.account_told(answer.expect("the answer"));
+        for later in [MIN, 30 * MIN, 90 * MIN] {
+            let a = at_under(&mut st, &menu, t + later, &under);
+            assert!(
+                matches!(&a, TurnEndAction::WaitUntil { why, .. } if !asks_a_sign_in(why)),
+                "{what} +{later:?}: {a:?}"
+            );
+            assert_eq!(
+                st.account_point(&menu, &under),
+                Some(AccountPoint::LoginEnded),
+                "{what} +{later:?}: the host is told the row's login ended"
+            );
+            assert_eq!(
+                exception_for(&st, &menu, &under, t + later),
+                None,
+                "{what} +{later:?}: no one is asked to sign in"
+            );
+        }
+    }
+    for (under, what) in [
+        (cfg(), "resume_limits on"),
+        (no_resume.clone(), "resume_limits off"),
+    ] {
+        let mut untold = moved();
+        for later in [MIN, 30 * MIN] {
+            let a = at_under(&mut untold, &menu, t + later, &under);
+            assert!(
+                matches!(&a, TurnEndAction::WaitUntil { why, .. } if !asks_a_sign_in(why)),
+                "{what}, the answer not told yet, +{later:?}: {a:?}"
+            );
+            assert_eq!(
+                untold.account_point(&menu, &under),
+                Some(AccountPoint::LoginEnded),
+                "{what}, the answer not told yet, +{later:?}"
+            );
+            assert_eq!(exception_for(&untold, &menu, &under, t + later), None);
+        }
+    }
+
+    let renewed = advised(
+        &TurnEndReading {
+            login_superseded: true,
+            ..menu.clone()
+        },
+        "m7-a",
+    );
+    let mut st = moved();
+    st.account_told(st.account_answer(&menu).expect("the answer"));
+    let mut relaunches = 1;
+    for i in 1..=ACCOUNT_MOVES_PER_WINDOW {
+        let now = t + Duration::from_secs(60 * u64::try_from(i).expect("small"));
+        let a = at(&mut st, &renewed, now);
+        if !restarts(&a, &to_account("m7-a", AccountAt::Wall), RULE_ACCOUNT) {
+            assert!(
+                matches!(&a, TurnEndAction::WaitUntil { why, .. } if !asks_a_sign_in(why)),
+                "the cap's wait: {a:?}"
+            );
+            break;
+        }
+        relaunches += 1;
+        st.restarted(&to_account("m7-a", AccountAt::Wall), true, &renewed, now);
+        st.account_told(st.account_answer(&menu).expect("the menu again"));
+    }
+    assert_eq!(
+        relaunches, ACCOUNT_MOVES_PER_WINDOW,
+        "relaunched onto the renewed row up to the move cap"
+    );
+
+    let back = TurnEndReading {
+        login_shared: Some(LoginShared::Back {
+            by: "@2".to_string(),
+        }),
+        ..menu.clone()
+    };
+    let taskless = TurnEndReading {
+        taskless: true,
+        ..back.clone()
+    };
+    assert_eq!(
+        at(&mut TurnEndState::default(), &taskless, t + MIN),
+        TurnEndAction::Nothing,
+        "a roster row's taskless menu is left alone, whatever its wait"
+    );
+    assert!(
+        is_escalate(
+            &at(&mut TurnEndState::default(), &back, t + MIN),
+            "the login is gone"
+        ),
+        "PRECONDITION: no wait stands on that menu with a task"
+    );
+
+    let mut control = moved();
+    assert_eq!(
+        control.account_answer(&left),
+        None,
+        "CONTROL: the composer's wall is the one the session left"
+    );
+    let a = at(&mut control, &left, t + MIN);
+    assert!(!matches!(a, TurnEndAction::Escalate { .. }), "{a:?}");
+    assert_eq!(control.account_point(&left, &cfg()), None, "nothing told");
+    let unrostered = TurnEndReading {
+        login_label: None,
+        ..menu.clone()
+    };
+    let mut control = moved();
+    let a = at(&mut control, &unrostered, t + MIN);
+    assert!(is_escalate(&a, "the login is gone"), "CONTROL: {a:?}");
+}
+
 /// A TASKLESS TAB, OR ONE WHOSE TASK IS DONE, ON A ROSTER ROW WHOSE LOGIN ENDED: nothing is typed
 /// into it, but the host is still told the row's login ended, so the row is marked signed out and
 /// aterm's sign-in ladder signs it in. CONTROL: on no roster row, or with `logins` off, the host is

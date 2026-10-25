@@ -273,14 +273,14 @@ fn delayed_single_exact_key_skips_only_a_prior_stale_credit() {
     keys.bank(t0, 1, Some(' '));
     keys.bank(t0 + ms(600), 1, Some('a'));
     let selected = keys
-        .exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_S)
+        .exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_DUR)
         .expect("the delayed exact key follows a stale, already-probed space");
     assert!(
         keys.exact_unpaid_run(now, prior_probe, &['a']).is_none(),
         "the moving-prefix lane retains its short tail window"
     );
     assert!(
-        keys.exact_unpaid_run_with_tail_window(now, prior_probe, &['x'], IN_FLIGHT_PATIENCE_S)
+        keys.exact_unpaid_run_with_tail_window(now, prior_probe, &['x'], IN_FLIGHT_PATIENCE_DUR)
             .is_none(),
         "an ambient other glyph cannot spend the key"
     );
@@ -288,7 +288,7 @@ fn delayed_single_exact_key_skips_only_a_prior_stale_credit() {
     assert_eq!(keys.cells_within(now), 1, "the older space was retired");
     assert_eq!(keys.spend_counting(now, 1), 1);
     assert!(
-        keys.exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_S)
+        keys.exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_DUR)
             .is_none(),
         "a keyless repaint cannot reuse the spent key"
     );
@@ -298,7 +298,7 @@ fn delayed_single_exact_key_skips_only_a_prior_stale_credit() {
     unproven_prefix.bank(t0 + ms(600), 1, Some('a'));
     assert!(
         unproven_prefix
-            .exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_S,)
+            .exact_unpaid_run_with_tail_window(now, prior_probe, &['a'], IN_FLIGHT_PATIENCE_DUR)
             .is_none(),
         "a credit newer than the prior probe cannot be skipped"
     );
@@ -308,7 +308,7 @@ fn delayed_single_exact_key_skips_only_a_prior_stale_credit() {
                 t0 + ms(10_601),
                 prior_probe,
                 &['a'],
-                IN_FLIGHT_PATIENCE_S,
+                IN_FLIGHT_PATIENCE_DUR,
             )
             .is_none(),
         "the exact key is bounded by the in-flight patience"

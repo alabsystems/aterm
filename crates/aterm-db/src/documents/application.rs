@@ -13,7 +13,7 @@ use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 pub(crate) fn with_store<T>(
     paths: &Paths,
     create: bool,
-    descriptor: fn(&Bootstrap) -> Result<Descriptor>,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
 ) -> Result<T> {
     let bootstrap = Bootstrap::required(paths).map_err(crate::table::failure)?;

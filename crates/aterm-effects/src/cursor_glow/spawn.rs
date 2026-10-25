@@ -428,14 +428,18 @@ impl CursorGlow {
         if self.bolts_unlimited {
             return true;
         }
-        let age = |t: Instant| now.saturating_duration_since(t).as_secs_f32();
+        const ONE_SEC: Duration = Duration::from_secs(1);
         let n = Self::BOLT_FLASHES_PER_S;
         let oldest = self.bolt_onsets[self.bolt_onset_next];
-        if oldest.is_some_and(|t| age(t) <= 1.0) {
+        if oldest.is_some_and(|t| now.saturating_duration_since(t) <= ONE_SEC) {
             return false;
         }
         let last = self.bolt_onsets[(self.bolt_onset_next + n - 1) % n];
-        if crackle && last.is_some_and(|t| age(t) < Self::CRACKLE_REFRACTORY_S) {
+        if crackle
+            && last.is_some_and(|t| {
+                now.saturating_duration_since(t).as_secs_f32() < Self::CRACKLE_REFRACTORY_S
+            })
+        {
             return false;
         }
         self.bolt_onsets[self.bolt_onset_next] = Some(now);
@@ -909,12 +913,12 @@ impl CursorGlow {
             for w in pts.windows(2) {
                 let (a, b) = (w[0], w[1]);
                 let (sx, sy) = (b.0 - a.0, b.1 - a.1);
-                let sl = (sx * sx + sy * sy).sqrt().max(1e-3);
-                let kick = (self.frand() - 0.5) * 2.0 * amp;
+                let inv_sl = 1.0 / (sx * sx + sy * sy).sqrt().max(1e-3);
+                let kick_sl = (self.frand() - 0.5) * 2.0 * amp * inv_sl;
                 next.push(a);
                 next.push((
-                    (a.0 + b.0) * 0.5 - sy / sl * kick,
-                    (a.1 + b.1) * 0.5 + sx / sl * kick,
+                    (a.0 + b.0) * 0.5 - sy * kick_sl,
+                    (a.1 + b.1) * 0.5 + sx * kick_sl,
                 ));
             }
             next.push(*pts.last().expect("bolt polyline is never empty"));
@@ -928,10 +932,10 @@ impl CursorGlow {
                 let root = pts[i];
                 let prevp = pts[i - 1];
                 let (tx, ty) = (root.0 - prevp.0, root.1 - prevp.1);
-                let tl = (tx * tx + ty * ty).sqrt().max(1e-3);
+                let inv_tl = 1.0 / (tx * tx + ty * ty).sqrt().max(1e-3);
                 let bend = (self.frand() - 0.5) * 1.9;
                 let (bs, bc) = bend.sin_cos();
-                let (ux, uy) = (tx / tl, ty / tl);
+                let (ux, uy) = (tx * inv_tl, ty * inv_tl);
                 let (bx, by) = (ux * bc - uy * bs, ux * bs + uy * bc);
                 let blen = (len * (0.14 + self.frand() * 0.22)).max(cell);
                 let tip = (root.0 + bx * blen, root.1 + by * blen);
@@ -1044,6 +1048,8 @@ impl CursorGlow {
             PoofVoice::Swoosh
         };
         let mut poofed = false;
+        const POOF_PROBE_STALE_DUR: Duration =
+            Duration::from_secs(CursorGlow::POOF_PROBE_STALE as u64);
         if fresh_kill
             && gap_ok
             && let (Some(prev), Some(cur)) = (self.row_prev_meta, self.row_cur_meta)
@@ -1051,34 +1057,29 @@ impl CursorGlow {
             && cur.trust == ProbeTrust::Full
             && prev.row == cur.row
             && cur.fill < prev.fill
-            && now.saturating_duration_since(prev.at).as_secs_f32() <= Self::POOF_PROBE_STALE
+            && now.saturating_duration_since(prev.at) <= POOF_PROBE_STALE_DUR
         {
             let cur_fill = cur.fill as usize;
             let prev_fill = prev.fill as usize;
-            let p = self
-                .row_prev
-                .iter()
-                .zip(self.row_cur.iter())
-                .take(cur_fill)
-                .take_while(|(a, b)| a == b)
-                .count();
-            let s = self.row_prev[..prev_fill.min(self.row_prev.len())]
-                .iter()
-                .rev()
-                .zip(
-                    self.row_cur[..cur_fill.min(self.row_cur.len())]
-                        .iter()
-                        .rev(),
-                )
-                .take(cur_fill)
-                .take_while(|(a, b)| a == b)
-                .count();
+            let prev_slice = &self.row_prev[..prev_fill.min(self.row_prev.len())];
+            let cur_slice = &self.row_cur[..cur_fill.min(self.row_cur.len())];
+            let p_cap = cur_fill.min(prev_slice.len()).min(cur_slice.len());
+            let mut p = 0;
+            while p < p_cap && prev_slice[p] == cur_slice[p] {
+                p += 1;
+            }
+            let mut s = 0;
+            while s < p_cap
+                && prev_slice[prev_slice.len() - 1 - s] == cur_slice[cur_slice.len() - 1 - s]
+            {
+                s += 1;
+            }
             if cur_fill > 0 && p + s >= cur_fill {
                 let s_span = s.min(cur_fill - p.min(cur_fill));
                 let c0 = p.min(prev.caret as usize).min(cur_fill) as u16;
                 let c1 = (prev_fill - s_span).max(c0 as usize + 1) as u16;
                 let survivor_holds_ink = s_span > 0
-                    || self.row_cur[..(c0 as usize).min(self.row_cur.len())]
+                    || cur_slice[..(c0 as usize).min(cur_slice.len())]
                         .iter()
                         .any(|&ch| ch != ' ');
                 if survivor_holds_ink {

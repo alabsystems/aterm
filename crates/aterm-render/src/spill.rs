@@ -6,7 +6,7 @@
 use aterm_core::render::{FxBlend, FxInk, FxLayer, FxSlot, FxSpace, PxRect};
 
 use crate::fire_field;
-use crate::fx_raster::{self, FxCanvas, FxFrame, FxScratch, FxSlice};
+use crate::fx_raster::{self, FxCanvas, FxFrame, FxScratch, FxSlice, Knock};
 use crate::{
     FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput, Renderer, add_sat, halo_row_ny,
     halo_weight, over_rgb, premul_rgb,
@@ -518,35 +518,37 @@ impl SpillBand {
             }
             let color = &mut color[off..off + n];
             let cover = &mut cover[off..off + n];
-            let mut fx = |color: &mut [u32], cover: &mut [u8], slot, blend| {
-                if cur.fx.iter().any(|l| {
-                    l.slot == slot
-                        && l.blend == blend
-                        && geom
-                            .layer_rect(l)
-                            .is_some_and(|r| clip_to_strip(s, r).is_some())
-                }) {
-                    fx_raster::draw_layers_on(
-                        &mut StripCanvas { s, color, cover },
-                        &frame,
-                        &cur.fx,
-                        &cur.fx_occluders,
-                        slot,
-                        blend,
-                        None,
-                        fx_scratch,
-                    );
-                }
-            };
-            fx(color, cover, FxSlot::Under, FxBlend::Linear);
+            let mut fx =
+                |color: &mut [u32], cover: &mut [u8], (slot, blend, knock): (_, _, Knock)| {
+                    if cur.fx.iter().any(|l| {
+                        l.slot == slot
+                            && l.blend == blend
+                            && knock.takes(l)
+                            && geom
+                                .layer_rect(l)
+                                .is_some_and(|r| clip_to_strip(s, r).is_some())
+                    }) {
+                        fx_raster::draw_picked_layers_on(
+                            &mut StripCanvas { s, color, cover },
+                            &frame,
+                            &cur.fx,
+                            &cur.fx_occluders,
+                            (slot, blend, knock),
+                            None,
+                            fx_scratch,
+                        );
+                    }
+                };
+            fx(color, cover, (FxSlot::Under, FxBlend::Linear, Knock::Not));
             replay_flat_add(color, cover, s, &cur.glow_under);
-            fx(color, cover, FxSlot::Under, FxBlend::Exact);
+            fx(color, cover, (FxSlot::Under, FxBlend::Exact, Knock::Any));
             replay_fire(color, cover, s, pad, &cur.fire);
+            fx(color, cover, (FxSlot::Under, FxBlend::Linear, Knock::Only));
             replay_flat_add(color, cover, s, &cur.glow);
-            fx(color, cover, FxSlot::Glow, FxBlend::Exact);
+            fx(color, cover, (FxSlot::Glow, FxBlend::Exact, Knock::Any));
             replay_halo(color, cover, s, &cur.halo);
-            fx(color, cover, FxSlot::Over, FxBlend::Exact);
-            fx(color, cover, FxSlot::Over, FxBlend::Linear);
+            fx(color, cover, (FxSlot::Over, FxBlend::Exact, Knock::Any));
+            fx(color, cover, (FxSlot::Over, FxBlend::Linear, Knock::Any));
             off += n;
         }
         for ((c, a), out) in self

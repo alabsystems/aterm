@@ -2126,6 +2126,266 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale)
     out.join(" ")
 }
 
+// The deck's glance (the refined Stats Deck, 2026-10-24): what the deck says where it shows
+// Details. The owner, on 0.134's deck: "there is too much text". The glance keeps each row's
+// figure in its unit and says a clause only while it is unusual; the lens, the spoken sentence
+// and ⌘C keep every word above.
+
+/// The busiest program is named in the deck only once it burns at least this many cores.
+pub const GLANCE_BUSIEST_CORES: f32 = 1.0;
+
+/// The share of the per-user process limit from which the deck says "yours": the bar is a share
+/// of the system's limit and cannot show the user's.
+pub const GLANCE_YOURS_NEAR: f64 = 0.8;
+
+/// A rate against a capacity under 1 MB/s is said in whole KB/s (decimal, as Finder writes
+/// it), so a share the % prints never sits beside a figure of `0.0`.
+const GLANCE_KB_BELOW_BPS: f64 = 0.95e6;
+
+/// The amount where the deck shows Details: the figure in its unit, since the % and the bar's
+/// track say its share of capacity. A share of something other than the row's own capacity keeps
+/// its base: Network's peak (or link; `18 of 200 KB/s peak`), the per-user process limit. The
+/// GPU says none (its % is the reading).
+#[must_use]
+pub fn glance_amount(res: Resource, view: &ResourceView, loc: &Locale) -> Vec<String> {
+    match res {
+        Resource::Cpu => view
+            .now
+            .map(|now| vec![format!("{} cores", fixed(now, 1))])
+            .unwrap_or_default(),
+        Resource::Gpu => Vec::new(),
+        Resource::Memory => view
+            .now
+            .map(|now| vec![format!("{} GiB", fixed(now / GIB, 1))])
+            .unwrap_or_default(),
+        Resource::Disk => glance_disk(view).into_iter().collect(),
+        Resource::Network => glance_network(view),
+        Resource::Tokens => tokens_amount(view, Ladder::Det),
+        Resource::Processes => glance_processes(view, loc.platform),
+    }
+}
+
+fn glance_disk(view: &ResourceView) -> Option<String> {
+    let used = view.now?.max(0.0) as u64;
+    Some(match view.capacity.map(|c| c as u64).filter(|&t| t > 0) {
+        Some(total) => {
+            let p = parts_of(total, &[used, total.saturating_sub(used)]);
+            format!("{} {}", p.parts[0], p.unit)
+        }
+        None => bytes_dec(used),
+    })
+}
+
+fn glance_network(view: &ResourceView) -> Vec<String> {
+    let b = view.binding();
+    let (Some(now), Some(word), Some(cap)) = (b.now, basis_word(view.basis), b.capacity) else {
+        return network_amount(view, Ladder::Det);
+    };
+    let (n, c, unit) = if cap < GLANCE_KB_BELOW_BPS {
+        let kb = |v: f64| grouped(half_up(v.max(0.0) / 1e3) as u64);
+        (kb(now), kb(cap), "KB/s")
+    } else {
+        (rate_figure(now / 1e6), rate_figure(cap / 1e6), "MB/s")
+    };
+    vec![
+        format!("{n} of {c} {unit} {word}"),
+        format!("{n}/{c} {unit} {word}"),
+    ]
+}
+
+fn glance_processes(view: &ResourceView, platform: Platform) -> Vec<String> {
+    if second_binds(view) {
+        return processes_amount(view, Ladder::Cols, platform);
+    }
+    let Some(now) = view.binding().now else {
+        return Vec::new();
+    };
+    let n = grouped(half_up(now) as u64);
+    if platform.counts_threads() {
+        vec![format!("{n} threads")]
+    } else {
+        vec![n]
+    }
+}
+
+/// The aterm and Tab cells in the deck: the figure alone, since the amount beside them names its
+/// unit (a disk's writes keep theirs: `0 MB/s`, never a bare `0` beside a TB figure). `None`
+/// where no scope can have a figure (the GPU and the network are read for the whole machine):
+/// the deck draws nothing there, and the lens says why.
+#[must_use]
+pub fn glance_scope(res: Resource, view: &ResourceView, loc: &Locale) -> Option<ScopeForms> {
+    if matches!(res, Resource::Gpu | Resource::Network)
+        || view.aterm.missing == Some(NoFigure::NotPerApp)
+    {
+        return None;
+    }
+    Some(match scope_forms(res, view, loc) {
+        ScopeForms::Each { .. } => ScopeForms::Each {
+            aterm: glance_cell(res, &view.aterm),
+            tab: glance_cell(res, &view.tab),
+        },
+        span @ ScopeForms::Span(_) => span,
+    })
+}
+
+fn glance_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
+    let (Some(v), Resource::Cpu | Resource::Memory | Resource::Disk | Resource::Processes) =
+        (fig.now, res)
+    else {
+        return scope_cell(res, fig);
+    };
+    if fig.missing == Some(NoFigure::NoAgent) {
+        return scope_cell(res, fig);
+    }
+    let forms = match res {
+        Resource::Cpu => vec![fixed(v, 1)],
+        Resource::Memory => {
+            let g = v / GIB;
+            vec![fixed(g, if g < 0.995 { 2 } else { 1 })]
+        }
+        Resource::Disk => writes_forms(v)
+            .into_iter()
+            .map(|f| match f.strip_prefix("writes ") {
+                Some("0") => "0 MB/s".to_owned(),
+                Some(rate) => rate.to_owned(),
+                None => f,
+            })
+            .collect(),
+        _ => vec![grouped(half_up(v) as u64)],
+    };
+    ScopeCell {
+        forms,
+        ink: InkKind::Words,
+    }
+}
+
+/// The Details clauses the deck draws: a row's state clauses ([`details`]' kept ones) and only
+/// what is unusual now. CPU: the threads waiting for a core while some wait, the cause, and the
+/// busiest program once it burns [`GLANCE_BUSIEST_CORES`]. Memory: pressure past normal and
+/// swapping. Disk: its states and when it fills. Network: the other direction while it moves.
+/// Processes: the jobs' marks, and "yours" from [`GLANCE_YOURS_NEAR`] of the user's limit.
+/// The standing facts (GPU cores and memory, file cache, freed, growth, free space, the link,
+/// TCP) stay in the lens and the spoken sentence.
+#[must_use]
+pub fn glance_details(res: Resource, snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
+    let mut out = match res {
+        Resource::Cpu => glance_cpu(snap, loc),
+        Resource::Gpu | Resource::Disk => details(res, snap, loc)
+            .into_iter()
+            .filter(|c| c.keep)
+            .collect(),
+        Resource::Memory => memory_details(snap)
+            .into_iter()
+            .filter(|c| c.keep || c.prio == 1)
+            .collect(),
+        Resource::Network => glance_network_details(snap),
+        Resource::Tokens => tokens_details(snap, loc),
+        Resource::Processes => glance_processes_details(snap),
+    };
+    if res == Resource::Disk
+        && let Some(f) = snap.facts.filling.filter(|f| !f.outranks_level())
+    {
+        out.push(Clause::new(
+            2,
+            vec![format!("full in {}", duration_approx(f.secs))],
+        ));
+    }
+    out.sort_by_key(|c| (c.prio, !c.keep));
+    out
+}
+
+fn glance_cpu(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
+    let view = &snap.resources[Resource::Cpu.index()];
+    let mut out = Vec::new();
+    if let (Some(load), Some(n)) = (snap.facts.load1, view.capacity) {
+        let l = fixed(load, 1);
+        let waiting = half_up(load - n);
+        if loc.platform != Platform::Linux && waiting >= 1.0 {
+            let w = waiting as u64;
+            out.push(
+                Clause::new(0, vec![format!("{w} waiting for a core")])
+                    .kept()
+                    .said(format!("{w} waiting for a core, load {l} on {n:.0} cores.")),
+            );
+        } else if loc.platform == Platform::Linux && load > n {
+            out.push(
+                Clause::new(
+                    0,
+                    vec![format!("load {l} on {n:.0} cores"), format!("load {l}")],
+                )
+                .kept(),
+            );
+        }
+    }
+    out.extend(cause(snap));
+    // The busiest by name, where it runs, and by name alone where Details is short.
+    if let Some(g) = snap
+        .facts
+        .busiest
+        .as_ref()
+        .filter(|g| g.cores >= GLANCE_BUSIEST_CORES)
+        && let Some(mut c) = busiest(snap)
+    {
+        c.forms.remove(0);
+        let times = if g.n > 1 {
+            format!(" \u{d7}{}", g.n)
+        } else {
+            String::new()
+        };
+        c.forms.push(format!("{}{times}", g.name));
+        c.forms.dedup();
+        out.push(c);
+    }
+    out
+}
+
+fn glance_network_details(snap: &Snapshot) -> Vec<Clause> {
+    let view = &snap.resources[Resource::Network.index()];
+    let (other, mark, verb) = if second_binds(view) {
+        (Some(view.first()), Mark::Down, "Receiving")
+    } else {
+        (view.second.clone(), Mark::Up, "Sending")
+    };
+    let Some(now) = other.and_then(|s| s.now) else {
+        return Vec::new();
+    };
+    if half_up(now / 1e5) < 1.0 {
+        return Vec::new();
+    }
+    let n = rate_figure(now / 1e6);
+    vec![
+        Clause::new(0, vec![format!("{n} MB/s")])
+            .marked(Some(mark))
+            .said(format!("{verb} {n} megabytes per second.")),
+    ]
+}
+
+fn glance_processes_details(snap: &Snapshot) -> Vec<Clause> {
+    let view = &snap.resources[Resource::Processes.index()];
+    let mut out: Vec<Clause> = processes_details(snap)
+        .into_iter()
+        .filter(|c| c.mark.is_some())
+        .collect();
+    if let Some(yours) = view.second.as_ref().filter(|s| !s.binds)
+        && let (Some(n), Some(cap)) = (yours.now, yours.capacity)
+        && cap > 0.0
+        && n >= GLANCE_YOURS_NEAR * cap
+    {
+        let n = grouped(half_up(n) as u64);
+        out.push(
+            Clause::new(
+                2,
+                vec![
+                    format!("yours {n} of {}", grouped(half_up(cap) as u64)),
+                    format!("yours {n}"),
+                ],
+            )
+            .kept(),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3734,5 +3994,154 @@ mod tests {
             Some((Mark::Zombie, InkKind::Warn))
         );
         assert_eq!(well(Resource::Cpu, &row(1.0, 2.0)), None);
+    }
+
+    /// The glance says each figure in its unit, and keeps a base only where the share is of
+    /// something other than the row's own capacity (refined deck, 2026-10-24).
+    #[test]
+    fn the_glance_says_the_figure_in_its_unit() {
+        let amount = |loc: &Locale| -> Vec<(Resource, Vec<String>)> {
+            ladder_rows(loc)
+                .into_iter()
+                .map(|(res, view)| (res, glance_amount(res, &view, loc)))
+                .collect()
+        };
+        let golden = |procs: &str| {
+            [
+                (Resource::Cpu, strings(&["17.7 cores"])),
+                (Resource::Gpu, Vec::new()),
+                (Resource::Memory, strings(&["42.1 GiB"])),
+                (Resource::Disk, strings(&["1.11 TB"])),
+                (
+                    Resource::Network,
+                    strings(&["2.1 of 11.8 MB/s peak", "2.1/11.8 MB/s peak"]),
+                ),
+                (
+                    Resource::Tokens,
+                    tokens_amount(&ladder_rows(&MAC)[5].1, Ladder::Det),
+                ),
+                (Resource::Processes, strings(&[procs])),
+            ]
+        };
+        assert_eq!(amount(&MAC), golden("897"));
+        assert_eq!(amount(&LINUX), golden("3,412 threads"));
+
+        let mut slow = row(18.4e3, 200e3);
+        slow.basis = CapBasis::Peak;
+        assert_eq!(
+            glance_amount(Resource::Network, &slow, &MAC),
+            strings(&["18 of 200 KB/s peak", "18/200 KB/s peak"])
+        );
+        assert_eq!(
+            glance_amount(Resource::Cpu, &ResourceView::default(), &MAC),
+            Vec::<String>::new(),
+            "an unread figure is left out"
+        );
+
+        let mut cpu = row(17.7, 18.0);
+        cpu.aterm = fig(6.8);
+        cpu.tabs = vec![(2, fig(0.04))];
+        let Some(ScopeForms::Each { aterm, .. }) = glance_scope(Resource::Cpu, &cpu, &MAC) else {
+            panic!("CPU has an aterm cell");
+        };
+        assert_eq!(aterm.forms, strings(&["6.8"]));
+        let mut disk = row(1.11e12, 2e12);
+        disk.aterm = fig(0.0);
+        let Some(ScopeForms::Each { aterm, .. }) = glance_scope(Resource::Disk, &disk, &MAC) else {
+            panic!("Disk has an aterm cell");
+        };
+        assert_eq!(
+            aterm.forms,
+            strings(&["0 MB/s"]),
+            "a disk's writes keep their unit"
+        );
+        for res in [Resource::Gpu, Resource::Network] {
+            assert!(glance_scope(res, &row(1.0, 2.0), &MAC).is_none(), "{res:?}");
+        }
+    }
+
+    /// The glance says a clause only while it is unusual: Spotlight's cause always, the threads
+    /// waiting once one waits, the busiest program from a core, the other direction from 0.1 MB/s,
+    /// "yours" from 80% of the user's limit.
+    #[test]
+    fn the_glance_says_a_clause_only_while_it_is_unusual() {
+        let forms = |res: Resource, s: &Snapshot| -> Vec<Vec<String>> {
+            glance_details(res, s, &MAC)
+                .into_iter()
+                .map(|c| c.forms)
+                .collect()
+        };
+        let mut s = snap();
+        set(&mut s, Resource::Cpu, row(3.3, 18.0));
+        s.facts.load1 = Some(5.6);
+        s.facts.busiest = Some(Busiest {
+            name: "siriactionsd".into(),
+            cores: 0.7,
+            n: 1,
+            scope: None,
+            born_ms: None,
+            unborn: 1,
+        });
+        assert_eq!(forms(Resource::Cpu, &s), Vec::<Vec<String>>::new(), "calm");
+        assert_eq!(
+            details(Resource::Cpu, &s, &MAC).len(),
+            2,
+            "CONTROL: load and busiest"
+        );
+
+        s.facts.load1 = Some(25.7);
+        s.why = spotlight(Some(Context::Startup));
+        s.facts.busiest = Some(Busiest {
+            name: "rustc".into(),
+            cores: 5.9,
+            n: 9,
+            scope: Some(ProcScope::Tab(3)),
+            born_ms: None,
+            unborn: 9,
+        });
+        assert_eq!(
+            forms(Resource::Cpu, &s),
+            [
+                strings(&["8 waiting for a core"]),
+                strings(&["Spotlight, after start-up", "Spotlight"]),
+                strings(&["rustc \u{d7}9 in Tab 3", "rustc \u{d7}9"]),
+            ]
+        );
+        assert_eq!(
+            glance_details(Resource::Cpu, &s, &LINUX)[0].forms,
+            strings(&["load 25.7 on 18 cores", "load 25.7"]),
+            "Linux says its load"
+        );
+
+        let mut net = row(2.1e6, 11.8e6);
+        net.basis = CapBasis::Peak;
+        net.second = Some(series(0.3e6, 4.2e6, false));
+        set(&mut s, Resource::Network, net.clone());
+        let up = glance_details(Resource::Network, &s, &MAC);
+        assert_eq!(
+            up.iter()
+                .map(|c| (c.forms.clone(), c.mark))
+                .collect::<Vec<_>>(),
+            [(strings(&["0.3 MB/s"]), Some(Mark::Up))]
+        );
+        net.second = Some(series(0.04e6, 4.2e6, false));
+        set(&mut s, Resource::Network, net);
+        assert_eq!(
+            forms(Resource::Network, &s),
+            Vec::<Vec<String>>::new(),
+            "quiet"
+        );
+
+        let mut p = processes_trouble();
+        let marked = glance_details(Resource::Processes, &p, &MAC);
+        assert!(
+            !marked.is_empty() && marked.iter().all(|c| c.mark.is_some()),
+            "the jobs' marks: {marked:?}"
+        );
+        p.resources[Resource::Processes.index()].second = Some(series(9_000.0, 10_666.0, false));
+        assert_eq!(
+            forms(Resource::Processes, &p).last(),
+            Some(&strings(&["yours 9,000 of 10,666", "yours 9,000"]))
+        );
     }
 }

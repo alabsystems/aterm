@@ -270,11 +270,39 @@ pub(crate) struct Board {
     pub(crate) asks: BTreeMap<String, AskOwed>,
     /// Why a session of this process may not be asked to free space (`sid -> why`: its task
     /// finished or landed, it has none, its Autopilot is Off, or it is the person's own exchange
-    /// or a manager's worker), as its worker read at its last turn break: the ask seats none of
-    /// these.
-    pub(crate) unfit: BTreeMap<String, &'static str>,
+    /// or a manager's worker), as its worker found it at its last turn break: the ask seats none
+    /// of these while the finding holds ([`Unfit::bars`], `crate::harness_disk_ask`).
+    pub(crate) unfit: BTreeMap<String, Unfit>,
     /// The next demand's id.
     next_demand: u64,
+}
+
+/// Why a session's worker found it may not be asked to free space at its last turn break
+/// ([`Board::unfit`]): what holds while the session rests there, and what holds across its turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Unfit {
+    /// What the session itself was there: its task finished or landed (`finished`), nobody gave
+    /// it one (`taskless`), or its Autopilot is Off (`autopilot-off`). This holds only until the
+    /// session works again, as one that works was given something to do: its worker drops this at
+    /// the turn's first busy read, and the seat rule reads none of it while the session's agent
+    /// reads busy.
+    pub(crate) own: Option<&'static str>,
+    /// Whose the session is for as long as they keep it: the person's own exchange (`exchange`)
+    /// or a manager's wait (`managed`). This holds across the session's turns until its next turn
+    /// break finds it again.
+    pub(crate) theirs: Option<&'static str>,
+}
+
+impl Unfit {
+    /// The word that bars the session from a seat, its agent working now (`working`: it reads
+    /// busy) or not: whose it is alone while it works ([`Self::own`]). `None`: it may be seated.
+    pub(crate) fn bars(&self, working: bool) -> Option<&'static str> {
+        if working {
+            self.theirs
+        } else {
+            self.own.or(self.theirs)
+        }
+    }
 }
 
 /// A `disk-free@v1` line owed one session ([`Board::asks`]).

@@ -11,7 +11,9 @@ use aterm_lexicon::Lexicon;
 use aterm_spec::derive::{Model, Value};
 use aterm_time::Instant;
 
-use super::{PetBrain, PetInputKind, PetSense, VIGIL_AFTER, WATCH_GATE, WATCH_HUG_ROWS};
+use super::{
+    PetBrain, PetInputKind, PetSense, SETTLE_CAP, VIGIL_AFTER, WATCH_GATE, WATCH_HUG_ROWS,
+};
 use crate::companion::{CompanionFrame, CompanionOwner, GlowOwnership, PetFacts};
 use crate::cursor_glow::GlowStyle;
 use crate::host::{CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFacts, Visibility};
@@ -610,7 +612,8 @@ fn a_live_stare_lets_go_the_tick_the_full_screen_comes_up() {
         pet.sense_ink(0, &[(0, 14); 13], Some(12));
         pet.note_full_screen(told);
         let mut hugs = 0;
-        for k in 0..40u16 {
+        let walked = (SETTLE_CAP / VSYNC.as_secs_f32()) as u16 + 40;
+        for k in 0..walked {
             t += VSYNC;
             let row = 3 + k % 2;
             let _ = pet.tick(PetSense {

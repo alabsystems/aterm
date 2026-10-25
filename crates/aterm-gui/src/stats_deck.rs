@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use aterm_vitals::Strain;
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{DiskLevel, HeatCell, Resource, ResourceView, ScopeFig, Snapshot, State};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform, ScopeForms};
@@ -14,14 +15,21 @@ use crate::deck_face::Boxed;
 use crate::deck_face::{
     ASCENT_EM, BoxKind, Boxes, DESCENT_EM, FaceMetrics, Txt, deck_metrics, fit, txts,
 };
+use crate::stats_gauge::{self as gauge, Gauge, GaugeInks};
 use crate::stats_live::{self as live, DeckLive, LiveLayer};
 use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
 use crate::stats_plan::{
     self as plan, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm, DeckSizePref,
-    FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Rows, StateLabel, Strip,
+    FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem, Label, Rows,
+    StateLabel, Strip,
 };
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
+
+/// The slot left of the Full deck's names (the gauge's) and its divider run from this far below
+/// the deck's top to this far above its foot, pt.
+const SLOT_TOP: f64 = 4.0;
+const SLOT_FOOT: f64 = 6.0;
 
 /// The Folded deck's height in points (124 device px at 2×, 62 at 1×): two blocks of four rows.
 pub(crate) const FOLDED_PT: f64 = 62.0;
@@ -439,12 +447,15 @@ struct RowWords {
     /// one last, and the one before them, which the glide slides out at the left.
     cols: [Vec<HeatCell>; 3],
     bar: Option<BarFill>,
-    /// The amount's forms on each ladder: Det (with the compact forms that
-    /// repeat no Details figure after them), Cols, NoCols.
-    amount: [Vec<Txt>; 3],
+    /// The amount's forms on each ladder ([`Table::ladder`]): the glance's in Full wide and mid
+    /// ([`words::glance_amount`]); elsewhere Det (with the compact forms that repeat no Details
+    /// figure after them), Cols and NoCols.
+    amount: [Vec<Txt>; 4],
     state: Option<StateTxt>,
-    scope: ScopeTxt,
-    details: Vec<ClauseTxt>,
+    /// The aterm and Tab cells: the glance's, then the other tables' ([`Table::said`]).
+    scope: [ScopeTxt; 2],
+    /// The Details clauses: the glance's, then the other tables' ([`Table::said`]).
+    details: [Vec<ClauseTxt>; 2],
 }
 
 /// One cluster of cores, fastest first.
@@ -461,6 +472,9 @@ struct CoreCluster {
 pub(crate) struct DeckWords {
     rows: Vec<RowWords>,
     cores: Vec<CoreCluster>,
+    /// How hard the whole Mac works now and for how long: the gauge's reading. `None` with no
+    /// snapshot yet.
+    strain: Option<Strain>,
     /// No snapshot yet: the rows say they are reading, and nothing is a hit.
     reading: bool,
 }
@@ -510,6 +524,7 @@ impl DeckWords {
         Self {
             rows,
             cores,
+            strain: Some(Strain::of(snap)),
             reading: false,
         }
     }
@@ -526,17 +541,27 @@ impl DeckWords {
                 strip_text: Some(vec![Txt::new("reading\u{2026}", m)]),
                 cols: [Vec::new(), Vec::new(), Vec::new()],
                 bar: None,
-                amount: [Vec::new(), Vec::new(), Vec::new()],
+                amount: Default::default(),
                 state: None,
-                scope: ScopeTxt::None,
-                details: Vec::new(),
+                scope: [ScopeTxt::None, ScopeTxt::None],
+                details: [Vec::new(), Vec::new()],
             })
             .collect();
         Self {
             rows,
             cores: Vec::new(),
+            strain: None,
             reading: true,
         }
+    }
+
+    /// Whether a strip of `strip`'s period draws an over mark: in any column it holds, the one
+    /// the glide slides out included, so the key holds still while the strips glide.
+    fn over_shown(&self, strip: &Strip) -> bool {
+        let k = period_ix(strip);
+        self.rows.iter().any(|row| {
+            row.strip_text.is_none() && row.cols.get(k).is_some_and(|c| c.iter().any(|c| c.over))
+        })
     }
 
     fn clusters(&self) -> Vec<Cluster<'_>> {
@@ -555,6 +580,7 @@ impl RowWords {
         let view = snap.resource(res, panes);
         let facts = &snap.facts;
         let forms = |ladder| words::amount_forms(res, &view, facts, ladder, loc);
+        let glance = words::glance_amount(res, &view, loc);
         let mut det = forms(Ladder::Det);
         let cols = forms(Ladder::Cols);
         for f in &cols {
@@ -564,17 +590,18 @@ impl RowWords {
         }
         let strip_text = words::strip_words(res, snap).map(|forms| txts(forms, m));
         let unread_gpu = res == Resource::Gpu && view.now.is_none();
-        let scope = if unread_gpu {
-            ScopeTxt::None
-        } else {
-            match words::scope_forms(res, &view, loc) {
-                ScopeForms::Each { aterm, tab } => ScopeTxt::Each {
-                    aterm: (txts(aterm.forms, m), aterm.ink),
-                    tab: (txts(tab.forms, m), tab.ink),
-                },
-                ScopeForms::Span(cell) => ScopeTxt::Span(txts(cell.forms, m), cell.ink),
-            }
+        let scope_txt = |forms: Option<ScopeForms>| match forms.filter(|_| !unread_gpu) {
+            None => ScopeTxt::None,
+            Some(ScopeForms::Each { aterm, tab }) => ScopeTxt::Each {
+                aterm: (txts(aterm.forms, m), aterm.ink),
+                tab: (txts(tab.forms, m), tab.ink),
+            },
+            Some(ScopeForms::Span(cell)) => ScopeTxt::Span(txts(cell.forms, m), cell.ink),
         };
+        let scope = [
+            scope_txt(words::glance_scope(res, &view, loc)),
+            scope_txt(Some(words::scope_forms(res, &view, loc))),
+        ];
         let state = words::state(res, snap, loc).map(|st| StateTxt {
             state: st.state,
             clauses: txts(st.clauses, m),
@@ -584,16 +611,22 @@ impl RowWords {
             mark: WellMark::of(st.mark),
             ink: st.ink,
         });
-        let details = words::details(res, snap, loc)
-            .into_iter()
-            .map(|c| ClauseTxt {
-                forms: txts(c.forms, m),
-                prio: c.prio,
-                keep: c.keep,
-                mark: c.mark.map(WellMark::of),
-                ink: c.ink,
-            })
-            .collect();
+        let clauses = |clauses: Vec<words::Clause>| -> Vec<ClauseTxt> {
+            clauses
+                .into_iter()
+                .map(|c| ClauseTxt {
+                    forms: txts(c.forms, m),
+                    prio: c.prio,
+                    keep: c.keep,
+                    mark: c.mark.map(WellMark::of),
+                    ink: c.ink,
+                })
+                .collect()
+        };
+        let details = [
+            clauses(words::glance_details(res, snap, loc)),
+            clauses(words::details(res, snap, loc)),
+        ];
         Self {
             res,
             name: Txt::new(words::resource_name(res), m),
@@ -604,7 +637,12 @@ impl RowWords {
             cols: STRIP_PERIODS
                 .map(|per| view.heat_columns(per, (600 / per) as usize + 1, snap.at_unix_ms)),
             bar: bar_fill(res, &view, snap),
-            amount: [txts(det, m), txts(cols, m), txts(forms(Ladder::NoCols), m)],
+            amount: [
+                txts(glance, m),
+                txts(det, m),
+                txts(cols, m),
+                txts(forms(Ladder::NoCols), m),
+            ],
             state,
             scope,
             details,
@@ -674,6 +712,10 @@ struct Table {
     aterm: Option<Col>,
     tab: Option<Col>,
     details: Option<Col>,
+    /// Whether the table says the glance (§6.8): Full wide and mid, as the refined sketches drew
+    /// them, at every width, Details or none, and every Folded tier (the form every window draws
+    /// unless Full is chosen). Full narrow and slim say the words before it.
+    glance: bool,
     /// The well mark's size.
     mark_pt: f64,
     /// Where a row's hit region ends.
@@ -698,6 +740,7 @@ impl Table {
             aterm: p.aterm,
             tab: p.tab,
             details: p.details,
+            glance: matches!(p.kind, FullKind::Wide | FullKind::Mid),
             mark_pt: match p.kind {
                 FullKind::Wide | FullKind::Mid => 10.0,
                 FullKind::Narrow | FullKind::Slim => 9.5,
@@ -718,6 +761,7 @@ impl Table {
             aterm: b.aterm,
             tab: b.tab,
             details: b.details,
+            glance: true,
             mark_pt: match b.kind {
                 BlockKind::Wide | BlockKind::Mid => 9.5,
                 BlockKind::Narrow | BlockKind::Slim => 8.5,
@@ -732,8 +776,18 @@ impl Table {
         (top - gap / 2.0, top + self.rows.cell + gap / 2.0)
     }
 
+    /// The row's amount forms this table says ([`RowWords::amount`]).
     fn ladder(&self) -> usize {
-        ladder_ix(self.details.is_some(), self.aterm.is_some())
+        if self.glance {
+            0
+        } else {
+            1 + ladder_ix(self.details.is_some(), self.aterm.is_some())
+        }
+    }
+
+    /// The row's scope cells and Details clauses this table says: the glance's or the others'.
+    const fn said(&self) -> usize {
+        if self.glance { 0 } else { 1 }
     }
 }
 
@@ -1307,8 +1361,15 @@ impl<'a> Deck<'a> {
         let mark = Some((st.mark, self.mark_ink(st.mark, st.ink)));
         let ink = self.ink(st.ink);
         let says: Vec<&Txt> = st.clauses.iter().chain(std::iter::once(&st.word)).collect();
+        // The glance's amount before the state where the table says the glance (`897`, not
+        // `897/16,000`).
+        let amounts = if t.glance {
+            row.amount.first().map_or(&[][..], Vec::as_slice)
+        } else {
+            &st.amounts
+        };
         for said in &says {
-            for am in &st.amounts {
+            for am in amounts {
                 if am.w(pt, false) + STATE_GAP + madv + said.w(pt, true) <= col.w + 0.01 {
                     let w = self.text(col.x, base, am.s.clone(), pt, false, words_ink, room);
                     let x = col.x + w + STATE_GAP;
@@ -1329,8 +1390,8 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn scope_cells(&mut self, row: &RowWords, aterm: Col, tab: Col, base: f64, pt: f64) {
-        match &row.scope {
+    fn scope_cells(&mut self, scope: &ScopeTxt, aterm: Col, tab: Col, base: f64, pt: f64) {
+        match scope {
             ScopeTxt::None => {}
             ScopeTxt::Span(forms, ink) => {
                 let room = tab.end() - aterm.x;
@@ -1511,10 +1572,10 @@ impl<'a> Deck<'a> {
             self.amount(col, base, rows.amount_pt, row, t);
         }
         if let (Some(aterm), Some(tab)) = (t.aterm, t.tab) {
-            self.scope_cells(row, aterm, tab, base, rows.figure_pt);
+            self.scope_cells(&row.scope[t.said()], aterm, tab, base, rows.figure_pt);
         }
         if let Some(col) = t.details {
-            self.details(col, base, &row.details);
+            self.details(col, base, &row.details[t.said()]);
         }
         if reading {
             return;
@@ -1559,45 +1620,44 @@ impl<'a> Deck<'a> {
         }
     }
 
-    fn cores_block(&mut self, at: Col, top0: f64, words: &DeckWords) {
-        let clusters = words.clusters();
-        let room = Some((at.x, at.end()));
-        let title = plan::cores_block_title(&clusters, self.m);
-        let words2 = self.inks.words2;
-        self.text(at.x, HEADER_BASE_FULL, title, SMALL_PT, false, words2, room);
-        let CoresMode::Block { pitch, sq, per_row } = plan::cores_block_mode(&clusters, self.h_pt)
-        else {
+    /// The strain gauge in Full's slot left of the row names (wide and mid), centred on the six
+    /// rows ([`crate::stats_gauge`]).
+    fn gauge(&mut self, at: Col, rows: &Rows, words: &DeckWords) {
+        let cx = at.x + at.w / 2.0;
+        let last = DECK_RESOURCES.len() as u32 - 1;
+        let cy = (rows.top(0) + rows.top(last) + rows.cell) / 2.0;
+        let slot = [at.x, SLOT_TOP, at.end(), self.h_pt - SLOT_FOOT];
+        self.dial((cx, cy), gauge::R_FACE, slot, words);
+    }
+
+    /// The strain gauge at the Folded deck's top left, as large as the band holds, its bloom
+    /// kept inside the band (short of the seam) and left of its divider.
+    fn folded_gauge(&mut self, g: &FoldedGauge, words: &DeckWords) {
+        let slot = [0.0, 0.0, g.divider, self.h_pt - 1.0];
+        self.dial(g.centre(), FOLD_GAUGE_R, slot, words);
+    }
+
+    /// The dial of radius `r` pt at `centre`, its bloom clipped to `slot` (pt, `x0, y0, x1, y1`).
+    fn dial(&mut self, (cx, cy): (f64, f64), r: f64, slot: [f64; 4], words: &DeckWords) {
+        self.note(BoxKind::Gauge, [cx - r, cy - r, cx + r, cy + r], "", None);
+        if !self.draw {
             return;
-        };
-        let per_row = per_row.max(1) as usize;
-        let radius = self.s.round().max(1.0) as f32;
-        let mut y = top0;
-        for (cluster, cc) in clusters.iter().zip(&words.cores) {
-            let squares = match plan::cores_block_caption(cluster, self.m) {
-                Some(caption) => {
-                    let base = y + 8.0;
-                    let ink = self.inks.words;
-                    let w = self.text(at.x, base, caption.count, SMALL_PT, true, ink, room);
-                    self.text(at.x + w, base, caption.name, SMALL_PT, false, words2, room);
-                    y + 11.0
-                }
-                None => y + 1.0,
-            };
-            let grid = self.lattice(at.x, squares, pitch, sq);
-            for (i, &heat) in cc.heat.iter().enumerate() {
-                self.core(&grid, (i % per_row, i / per_row), heat, radius);
-            }
-            let rows = cluster.count.div_ceil(per_row) as f64;
-            let across = cluster.count.min(per_row) as f64;
-            let bottom = squares + rows * pitch - (pitch - sq);
-            self.note(
-                BoxKind::Core,
-                [at.x, squares, at.x + across * pitch - (pitch - sq), bottom],
-                "",
-                None,
-            );
-            y = bottom + 4.0;
         }
+        let g = words.strain.as_ref().map_or(Gauge::UNREAD, Gauge::of);
+        let heat = if self.ic {
+            self.inks.heat_ic
+        } else {
+            self.inks.heat
+        };
+        let inks = GaugeInks::new(&self.inks, heat, g.soak);
+        let (x, y, w, h) = self.px_rect(slot[0], slot[1], slot[2], slot[3]);
+        let place = gauge::Place {
+            centre: (self.px(cx), self.px(cy)),
+            slot: [x, y, x + w, y + h],
+            s: self.s,
+            r,
+        };
+        gauge::draw(g, place, &inks, &mut self.p.prims);
     }
 
     fn cores_row(
@@ -1861,9 +1921,9 @@ impl<'a> Deck<'a> {
         self.gridlines(&plan.strip, GRID_FROM_FULL, last, &holes);
         match plan.cores {
             CoresAt::Block { at, divider } => {
-                self.cores_block(at, rows.top0, words);
+                self.gauge(at, &rows, words);
                 let w = (0.5 * self.s).round().max(1.0) as f32;
-                let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
+                let (y0, y1) = (self.px(SLOT_TOP), self.px(self.h_pt - SLOT_FOOT));
                 let grid = self.inks.grid;
                 self.rect((self.px(divider), y0, w, y1 - y0), 0.0, grid);
                 if !words.reading {
@@ -1884,7 +1944,9 @@ impl<'a> Deck<'a> {
                     ink,
                     Some((plan.name.x, plan.name.end())),
                 );
-                let mode = plan.cores_mode(&words.clusters(), self.h_pt, self.m);
+                let mode = plan
+                    .cores_mode(&words.clusters(), self.m)
+                    .unwrap_or(CoresMode::CountOnly);
                 self.cores_row(room, top, rows.cell, mode, SMALL_PT, words);
                 if !words.reading {
                     let (y0, y1) = t.band(r);
@@ -1900,6 +1962,7 @@ impl<'a> Deck<'a> {
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
+            over: words.over_shown(&plan.strip),
         };
         let head = self
             .head
@@ -1924,6 +1987,14 @@ impl<'a> Deck<'a> {
         let (y0, y1) = (self.px(4.0), self.px(self.h_pt - 6.0));
         let grid = self.inks.grid;
         self.rect((self.px(plan.divider), y0, w, y1 - y0), 0.0, grid);
+        if let Some(g) = plan.gauge {
+            self.folded_gauge(&g, words);
+            self.rect((self.px(g.divider), y0, w, y1 - y0), 0.0, grid);
+            if !words.reading {
+                let rect = self.px_rect(g.at.x, 0.0, g.at.end(), self.h_pt - 6.0);
+                self.hits_first.push(Hit::cores(rect));
+            }
+        }
         let clusters = words.clusters();
         let mut states: Vec<HeadState<'_>> = Vec::new();
         for (bi, block) in plan.blocks.iter().enumerate() {
@@ -1974,6 +2045,10 @@ impl<'a> Deck<'a> {
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
+            over: plan
+                .blocks
+                .first()
+                .is_some_and(|b| words.over_shown(&b.strip)),
         };
         let labels: [Option<StateLabel<'_>>; 2] = [0, 1].map(|bi| {
             let x = plan.blocks.get(bi).map(|b| b.name.x)?;

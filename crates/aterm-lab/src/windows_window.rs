@@ -11,7 +11,7 @@ use crate::linux_proof::{
     reply,
 };
 use crate::paths::paths;
-use crate::windows::{self, GPU_ID, Layout, Up, lane_lock, not_run, run_on_desktop, task_name};
+use crate::windows::{self, GPU_ID, Layout, Up, not_run, run_on_desktop, task_name};
 use crate::windows_desk::{
     self as desk, ATERM_CLASS, Monitor, VIRTIO_ADAPTER, Window, helper_line, instance_dir,
 };
@@ -1233,7 +1233,7 @@ fn arch_rows(
     let mut rows: Vec<Row> = Vec::new();
     let tag = if ask.cpu { "window --cpu" } else { "window" };
     let name = |what: &str| format!("{} {tag} {what}", arch.name());
-    let mut env = guest::cargo_env(arch);
+    let mut env = up.cargo_env(arch);
     env.extend(windows::build_facts(repo));
     let build = ["cargo", "build", "-p", "aterm-gui", "-p", "aterm-ctl"].map(String::from);
     println!("windows: {} ({}) build …", arch.name(), arch.runs());
@@ -1383,7 +1383,7 @@ fn parse_args(args: &[String]) -> Result<Ask, Fail> {
 pub fn cmd_window(args: &[String]) -> Res {
     let ask = parse_args(args)?;
     let l = Layout::find()?;
-    let _lock = lane_lock(&l)?;
+    let _lock = windows::boot_lane(&l)?;
     let results = paths().need_state()?.join("windows");
     std::fs::create_dir_all(&results)
         .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;

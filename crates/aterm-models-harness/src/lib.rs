@@ -16,6 +16,12 @@
 //! tests drive these models dev-depend on this one, so editing a model here rebuilds this crate
 //! and those tests, never a library.
 
+mod models_account_identity;
+mod models_account_pool_launch;
+mod models_account_signin;
+mod models_account_signin_lock;
+mod models_account_state_read;
+mod models_account_state_retention;
 mod models_agent_verdict;
 mod models_disk;
 mod models_harness;
@@ -33,6 +39,12 @@ mod models_supervise_accounts;
 mod models_supervise_tape;
 mod models_wakes;
 
+pub use models_account_identity::account_identity_model;
+pub use models_account_pool_launch::account_pool_launch_model;
+pub use models_account_signin::account_signin_admission_model;
+pub use models_account_signin_lock::account_signin_lock_model;
+pub use models_account_state_read::account_state_read_model;
+pub use models_account_state_retention::account_state_retention_model;
 pub use models_agent_verdict::claude_idle_at_composer_model;
 pub use models_disk::{
     disk_await_liveness, disk_await_model, disk_free_ask_model, disk_reclaim_pass_model,

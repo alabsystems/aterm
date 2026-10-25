@@ -561,12 +561,13 @@ pub(super) fn page(root: &Path, rows: &[Row]) -> super::PassPage {
     page
 }
 
-/// What the page says after a failed Secrets try that aterm tries again on its pause.
-pub(super) const PAGE_RETRIES: &str = "aterm tries again by itself.";
+/// What the page says after a failed Secrets try that aterm tries again on its pause: a
+/// transient failure that waits for that try ([`aterm_types::macos_setup::FailureKind`]).
+pub(super) const PAGE_RETRIES: &str = aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF;
 
-/// What the page says once two tries in a row failed: only a change, or a person, asks again.
-pub(super) const PAGE_HELD: &str = "aterm tried twice, so it tries again once this Mac's network \
-                                    or vault changes, or on Set up now.";
+/// What the page says once two tries in a row failed: its tries are spent, so it failed, and only
+/// a change, or a person, asks again.
+pub(super) const PAGE_HELD: &str = aterm_types::macos_setup::TRIED_TWICE;
 
 const HELD: &str = "aterm tried this twice by itself and it did not take, so it tries again only when this Mac's network or vault changes, after an update of aterm, or on Set up now or Join in System State";
 

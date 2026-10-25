@@ -170,6 +170,58 @@ impl TestFs {
         }
     }
 
+    /// Where the open `file` is (`F_GETPATH`), recorded as asked about: a reader that followed a
+    /// link at its path is recorded at the link's target.
+    fn record_opened(&self, file: &std::fs::File) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut at = [0_i8; libc::PATH_MAX as usize];
+            // SAFETY: `file` is open for the call and `at` is writable storage large enough for
+            // Darwin's F_GETPATH contract.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, at.as_mut_ptr()) } < 0 {
+                return;
+            }
+            // SAFETY: a successful F_GETPATH writes a NUL-terminated path.
+            let at = unsafe { std::ffi::CStr::from_ptr(at.as_ptr()) };
+            let at = PathBuf::from(std::ffi::OsStr::from_bytes(at.to_bytes()));
+            self.touched.lock().unwrap().push(at);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = file;
+    }
+
+    fn touch(&self, path: &Path, ask: Ask) {
+        let landed = path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .zip(path.file_name())
+            .map_or_else(|| path.to_path_buf(), |(parent, name)| parent.join(name));
+        self.touched.lock().unwrap().push(landed);
+        let on_ask = {
+            let mut slot = self.on_ask.lock().unwrap();
+            match slot.take() {
+                Some((want, on_ask)) if want == Ask::Path || want == ask => Some(on_ask),
+                held => {
+                    *slot = held;
+                    None
+                }
+            }
+        };
+        if let Some(on_ask) = on_ask {
+            on_ask();
+        }
+    }
+
+    fn touched_any(&self) -> bool {
+        !self.touched.lock().unwrap().is_empty()
+    }
+}
+
+/// What the file tests, which run on macOS, set up.
+#[cfg(target_os = "macos")]
+impl TestFs {
     /// A home `<scratch>/Users//u` holding `scratch.noindex` and `Documents`, on one local volume,
     /// under the user containment, its watch budget the process's own. The scratch folder's name
     /// has no leading dot (a root under a dotted folder is no root).
@@ -224,50 +276,6 @@ impl TestFs {
         self.mounts.lock().unwrap().complete = complete;
     }
 
-    /// Where the open `file` is (`F_GETPATH`), recorded as asked about: a reader that followed a
-    /// link at its path is recorded at the link's target.
-    fn record_opened(&self, file: &std::fs::File) {
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd as _;
-            use std::os::unix::ffi::OsStrExt as _;
-            let mut at = [0_i8; libc::PATH_MAX as usize];
-            // SAFETY: `file` is open for the call and `at` is writable storage large enough for
-            // Darwin's F_GETPATH contract.
-            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, at.as_mut_ptr()) } < 0 {
-                return;
-            }
-            // SAFETY: a successful F_GETPATH writes a NUL-terminated path.
-            let at = unsafe { std::ffi::CStr::from_ptr(at.as_ptr()) };
-            let at = PathBuf::from(std::ffi::OsStr::from_bytes(at.to_bytes()));
-            self.touched.lock().unwrap().push(at);
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = file;
-    }
-
-    fn touch(&self, path: &Path, ask: Ask) {
-        let landed = path
-            .parent()
-            .and_then(|parent| std::fs::canonicalize(parent).ok())
-            .zip(path.file_name())
-            .map_or_else(|| path.to_path_buf(), |(parent, name)| parent.join(name));
-        self.touched.lock().unwrap().push(landed);
-        let on_ask = {
-            let mut slot = self.on_ask.lock().unwrap();
-            match slot.take() {
-                Some((want, on_ask)) if want == Ask::Path || want == ask => Some(on_ask),
-                held => {
-                    *slot = held;
-                    None
-                }
-            }
-        };
-        if let Some(on_ask) = on_ask {
-            on_ask();
-        }
-    }
-
     /// The next `ask` (any path asked about, a watch's open or a reader's) runs `on_ask` once it
     /// is recorded, before the open.
     fn on_next_ask(&self, ask: Ask, on_ask: OnAsk) {
@@ -299,10 +307,6 @@ impl TestFs {
             .filter(|p| p.starts_with(dir))
             .cloned()
             .collect()
-    }
-
-    fn touched_any(&self) -> bool {
-        !self.touched.lock().unwrap().is_empty()
     }
 }
 

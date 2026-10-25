@@ -56,6 +56,7 @@ fn add(desk: &Desk, label: &str, email: Option<&str>) -> (ExitCode, String, Stri
             label: label.to_owned(),
             class: Class::Dedicated,
             email: email.map(str::to_owned),
+            identity_email: None,
             browser: None,
         },
         &env_of(desk, NOW),

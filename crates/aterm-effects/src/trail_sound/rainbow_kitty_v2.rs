@@ -295,7 +295,8 @@ const BED_PARTIAL_NORM: f32 = 0.838_1;
 
 #[inline]
 const fn compute_sky_bed_degrees(chord: usize) -> [i32; 3] {
-    let lit = CHORD_LOOP[chord % SKY_BED_CHORDS].lit;
+    const _: () = assert!(SKY_BED_CHORDS.is_power_of_two());
+    let lit = CHORD_LOOP[chord & (SKY_BED_CHORDS - 1)].lit;
     let mut out = [0i32; 3];
     let mut n = 0;
     let mut d = 0;
@@ -338,7 +339,7 @@ const SKY_BED_TARGETS: [[f32; 3]; SKY_BED_CHORDS] = {
 /// The sky's voicing for one chord of [`CHORD_LOOP`].
 #[inline]
 pub(super) const fn sky_bed_degrees(chord: usize) -> [i32; 3] {
-    SKY_BED_DEGREES_TABLE[chord % SKY_BED_CHORDS]
+    SKY_BED_DEGREES_TABLE[chord & (SKY_BED_CHORDS - 1)]
 }
 
 #[inline]
@@ -1537,6 +1538,8 @@ impl MelodyV2 {
     }
 
     const fn on_space(&mut self, at: u32) -> bool {
+        const _: () = assert!(CHORD_LOOP.len().is_power_of_two());
+        const CHORD_MASK: u8 = CHORD_LOOP.len() as u8 - 1;
         let head = !self.space_run;
         if head {
             self.push_undo();
@@ -1544,10 +1547,10 @@ impl MelodyV2 {
             let n = CHORD_LOOP.len() as u8;
             self.text.chord = match mark_chords(pending) {
                 Some(want) => {
-                    let mut chosen = (self.text.chord + 1) % n;
+                    let mut chosen = (self.text.chord + 1) & CHORD_MASK;
                     let mut k = 1u8;
                     while k <= n {
-                        let c = (self.text.chord + k) % n;
+                        let c = (self.text.chord + k) & CHORD_MASK;
                         if c == want[0] || c == want[1] {
                             chosen = c;
                             break;
@@ -1556,7 +1559,7 @@ impl MelodyV2 {
                     }
                     chosen
                 }
-                None => (self.text.chord + 1) % n,
+                None => (self.text.chord + 1) & CHORD_MASK,
             };
             if matches!(pending, MARK_PERIOD | MARK_BANG | MARK_QMARK) {
                 self.relatch_motif();
@@ -1657,7 +1660,8 @@ impl MelodyV2 {
 
     #[inline]
     const fn open_next_run_phrase(&mut self) {
-        self.run_phrase = (self.run_phrase + 1) % (SONG_FORM.len() as u8 - 1);
+        const _: () = assert!((SONG_FORM.len() - 1).is_power_of_two());
+        self.run_phrase = (self.run_phrase + 1) & (SONG_FORM.len() as u8 - 2);
         self.run_theme_pos = SONG_FORM[self.run_phrase as usize];
     }
 
@@ -2746,7 +2750,7 @@ impl TrailSynth {
             let mut tap = bloom(deg, roof, TAU_V_MAX_S);
             tap.lp_cut = shifted_roof(tap.lp_cut, shifted);
             tap.delay = after + AIR_TAP_DELAY_S[k];
-            let side = if k % 2 == 0 {
+            let side = if k & 1 == 0 {
                 -AIR_TAP_PAN
             } else {
                 AIR_TAP_PAN
@@ -2864,7 +2868,7 @@ impl TrailSynth {
                 let mut voice = tine(f, Touch::Step, tau, roof, false, self.v2.flow);
                 voice.delay = CASCADE_DELAYS_S[k];
                 voice.lane = LANE_CASCADE;
-                let pan = if k % 2 == 0 { ev.pan } else { -ev.pan };
+                let pan = if k & 1 == 0 { ev.pan } else { -ev.pan };
                 let gain = ev.gain * KEY_TINE_TRIM * CASCADE_LEVELS[k];
                 self.v2_spawn(voice, gain, pan);
             }
@@ -3357,7 +3361,7 @@ impl TrailSynth {
                 && BED_PARTIALS[2] == 3
                 && BED_PARTIALS[3] == 4
         );
-        let tgt = SKY_BED_TARGETS[usize::from(self.v2.text.chord) % SKY_BED_CHORDS];
+        let tgt = SKY_BED_TARGETS[usize::from(self.v2.text.chord) & (SKY_BED_CHORDS - 1)];
         let b = &mut self.bed;
         if b.sky_glide_dt != dt {
             const INV_BED_GLIDE_TAU_S: f32 = -1.0 / BED_GLIDE_TAU_S;

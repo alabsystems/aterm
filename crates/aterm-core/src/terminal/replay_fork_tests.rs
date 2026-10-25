@@ -91,11 +91,19 @@ impl Fixture {
         &self,
         copy: impl Fn(&Terminal) -> Option<Terminal>,
     ) -> (Seen, Vec<Option<Seen>>) {
+        self.at_every_boundary_from(|| self.engine(), copy)
+    }
+
+    fn at_every_boundary_from(
+        &self,
+        engine: impl Fn() -> Terminal,
+        copy: impl Fn(&Terminal) -> Option<Terminal>,
+    ) -> (Seen, Vec<Option<Seen>>) {
         let epoch = fixture_epoch();
-        let mut straight = self.engine();
+        let mut straight = engine();
         self.apply(&mut straight, epoch, 0);
         let end = seen(&straight);
-        let mut src = self.engine();
+        let mut src = engine();
         let mut ends = Vec::new();
         for (k, ev) in self.events.iter().enumerate() {
             match ev {
@@ -321,6 +329,36 @@ fn live_images() -> Fixture {
     }
 }
 
+/// Some 1440 lines in 24 writes with a narrowing, a widening and a re-narrowing between: enough to fill a 1000-line ring, stage rows and evict from a small store.
+fn long() -> Fixture {
+    let mut events = Vec::new();
+    for i in 0..24 {
+        let mut chunk = String::new();
+        for j in 0..60 {
+            chunk.push_str(&format!(
+                "\x1b[3{}mline {i}.{j}\x1b[m {}\r\n",
+                j % 8,
+                "y".repeat(j % 50)
+            ));
+        }
+        events.push(out(chunk));
+        match i {
+            8 => events.push(Ev::Resize(10, 30)),
+            14 => events.push(Ev::Resize(14, 50)),
+            18 => events.push(Ev::Resize(14, 41)),
+            _ => {}
+        }
+    }
+    Fixture {
+        name: "long",
+        rows: 12,
+        cols: 41,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events,
+    }
+}
+
 fn fixtures() -> Vec<Fixture> {
     let mut fixtures = vec![
         session(),
@@ -335,13 +373,22 @@ fn fixtures() -> Vec<Fixture> {
 
 #[test]
 fn a_fork_folds_the_rest_as_the_straight_fold_does() {
-    for fx in &fixtures() {
-        let (end, ends) = fx.at_every_boundary(Terminal::replay_fork);
+    let mut all = fixtures();
+    all.push(long());
+    for fx in &all {
+        assert_forks_fold_the_straight_end(fx, &fx.at_every_boundary(Terminal::replay_fork));
+    }
+}
+
+/// Every fork in `at` ends where the straight fold does, and the boundaries that refuse are the expected ones.
+fn assert_forks_fold_the_straight_end(fx: &Fixture, at: &(Seen, Vec<Option<Seen>>)) {
+    let (end, ends) = at;
+    {
         let mut refused = Vec::new();
         for (k, fork_end) in ends.iter().enumerate() {
             match fork_end {
                 Some(fork_end) => {
-                    assert_eq!(fork_end, &end, "{}: forked after {} events", fx.name, k + 1)
+                    assert_eq!(fork_end, end, "{}: forked after {} events", fx.name, k + 1)
                 }
                 None => refused.push(k + 1),
             }
@@ -364,6 +411,16 @@ fn a_fork_folds_the_rest_as_the_straight_fold_does() {
             "kitty" => assert_eq!(refused, [2, 3, 4, 5, 8, 9], "{}", fx.name),
             "sync_left_open" | "live_images" => {
                 assert!(refused.is_empty(), "{}: {refused:?}", fx.name);
+            }
+            "long" => {
+                let after_resize: Vec<usize> = (1..=n)
+                    .filter(|&k| matches!(fx.events[k - 1], Ev::Resize(..)))
+                    .collect();
+                assert!(
+                    refused.iter().all(|k| after_resize.contains(k)),
+                    "{}: {refused:?}",
+                    fx.name
+                );
             }
             _ => assert!(refused.len() < n / 4, "{}: {refused:?} of {n}", fx.name),
         }
@@ -395,7 +452,7 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
         fixtures.extend(conpty_fixtures());
         fixtures
     };
-    let pieces: [(&str, Strip, Vec<Fixture>); 6] = [
+    let pieces: [(&str, Strip, Vec<Fixture>); 7] = [
         (
             "the orphaned-screen leave's notes",
             |fork| {
@@ -427,6 +484,11 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
         (
             "its source's restore lineage",
             |fork| fork.holder_carried_at = Some(fork.transient.screen_mutations),
+            vec![session()],
+        ),
+        (
+            "the resize hand-back",
+            |fork| fork.grid_mut().forget_handback(),
             vec![session()],
         ),
     ];
@@ -514,5 +576,140 @@ fn a_replay_restore_continues_an_engine_with_no_restore_pending() {
         replayed.checkpoint_continuing(),
         carried.checkpoint_continuing(),
         "a pending restore shows once output comes"
+    );
+}
+
+/// A fresh engine for `fx` on a tiered store kept to `store_lines` lines past its ring, as the Rewind view folds on.
+fn bounded(fx: &Fixture, store_lines: usize) -> Terminal {
+    let blank = Terminal::new(fx.rows, fx.cols).checkpoint();
+    let mut t = Terminal::replay_from_checkpoint_bounded(&blank, store_lines);
+    fx.configure(&mut t);
+    t
+}
+
+#[test]
+fn a_fork_of_a_bounded_restore_folds_the_rest_as_the_straight_fold_does() {
+    let mut all = fixtures();
+    all.push(long());
+    for fx in &all {
+        let store_lines = if fx.name == "long" { 300 } else { 2048 };
+        let premise = bounded(fx, store_lines);
+        assert!(
+            premise.grid().scrollback().is_some(),
+            "premise: a tiered store"
+        );
+        assert_forks_fold_the_straight_end(
+            fx,
+            &fx.at_every_boundary_from(|| bounded(fx, store_lines), Terminal::replay_fork),
+        );
+    }
+    let fx = long();
+    let mut evicted = bounded(&fx, 300);
+    fx.apply(&mut evicted, fixture_epoch(), 0);
+    assert!(
+        evicted.grid().scrollback_lines() < 1440 - 12,
+        "premise: the small store evicted"
+    );
+}
+
+/// Each fixture restored at every keyframe boundary onto an unbounded tiered store and onto one kept to `store_lines`, both folded through the rest.
+fn bounded_against_unbounded(fx: &Fixture, store_lines: usize) -> Vec<(Terminal, Terminal)> {
+    let epoch = fixture_epoch();
+    let mut src = fx.engine();
+    let mut out = Vec::new();
+    for (k, ev) in fx.events.iter().enumerate() {
+        match ev {
+            Ev::Out(bytes) => src.process_at(bytes, clock(epoch, k)),
+            Ev::Resize(rows, cols) => src.resize_with_policy(*rows, *cols, fx.policy),
+        }
+        let Some(keyframe) = src.checkpoint_continuing() else {
+            continue;
+        };
+        let mut unbounded = Terminal::replay_from_checkpoint(&keyframe);
+        let mut kept = Terminal::replay_from_checkpoint_bounded(&keyframe, store_lines);
+        for t in [&mut unbounded, &mut kept] {
+            fx.configure(t);
+            fx.apply(t, epoch, k + 1);
+        }
+        out.push((kept, unbounded));
+    }
+    out
+}
+
+#[test]
+fn a_bounded_restore_folds_the_rest_as_the_unbounded_restore_does() {
+    let mut all = fixtures();
+    all.push(long());
+    for fx in &all {
+        let compared = bounded_against_unbounded(fx, 2048);
+        assert!(!compared.is_empty(), "{}: no keyframe boundary", fx.name);
+        for (k, (kept, unbounded)) in compared.iter().enumerate() {
+            assert_eq!(
+                seen(kept),
+                seen(unbounded),
+                "{}: restored at boundary {k}",
+                fx.name
+            );
+        }
+    }
+    let fx = long();
+    let small = bounded_against_unbounded(&fx, 300);
+    let mut renumbered = 0;
+    for (k, (kept, unbounded)) in small.iter().enumerate() {
+        let (Some(mut kept), Some(unbounded)) =
+            (kept.checkpoint_visible(), unbounded.checkpoint_visible())
+        else {
+            panic!("long: at ground at boundary {k}");
+        };
+        if kept.absolute_row_counter != unbounded.absolute_row_counter {
+            renumbered += 1;
+            kept.absolute_row_counter = unbounded.absolute_row_counter;
+        }
+        assert_eq!(
+            kept, unbounded,
+            "long: what a witness compares but the row counter, restored at boundary {k}"
+        );
+    }
+    assert!(
+        renumbered > 0,
+        "the known gap: a narrowing raises the row counter over the history each store keeps, so a small store renumbers differently"
+    );
+    assert!(
+        small
+            .iter()
+            .any(|(kept, unbounded)| seen(kept).checkpoint != seen(unbounded).checkpoint),
+        "negative control: a store kept to 300 lines holds other history"
+    );
+}
+
+#[test]
+fn a_fork_verifies_the_marks_its_source_does() {
+    const KEY: [u8; 32] = [0x6B; 32];
+    let id = crate::terminal::ShellIntegrationNonce(KEY).to_hex();
+    let mark = |m: &str| format!("\x1b]133;{m};id={id}\x07");
+    // One clock for every engine, so a mark's recorded time cannot tell them apart.
+    let epoch = fixture_epoch();
+    let mut src = Terminal::new(6, 30);
+    src.authorize_shell_integration(KEY);
+    src.set_require_shell_integration_nonce(true);
+    src.process_at(
+        format!("{}$ {}ls\r\n{}", mark("A"), mark("B"), mark("C")).as_bytes(),
+        clock(epoch, 0),
+    );
+    let mut fork = src.replay_fork().expect("at ground with no image");
+    let mut keyless = Terminal::from_checkpoint(&src.checkpoint());
+    let rest = format!("file\r\n{}{}$ {}", mark("D;0"), mark("A"), mark("B"));
+    for t in [&mut src, &mut fork, &mut keyless] {
+        t.process_at(rest.as_bytes(), clock(epoch, 1));
+    }
+    assert_eq!(
+        seen(&fork),
+        seen(&src),
+        "the fork verifies the marks after it"
+    );
+    assert_ne!(
+        seen(&keyless).checkpoint,
+        seen(&src).checkpoint,
+        "negative control: an engine without the key drops them"
     );
 }

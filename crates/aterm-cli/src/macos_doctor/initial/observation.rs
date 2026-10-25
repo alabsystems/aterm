@@ -147,10 +147,11 @@ fn with(
     root: &Path,
     mut read: impl FnMut() -> Result<Records, String>,
 ) -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
-    let before = publications(root).map_err(InitialSetupSnapshotError::Read)?;
-    let records = read().map_err(InitialSetupSnapshotError::Read)?;
-    let confirmed = read().map_err(InitialSetupSnapshotError::Read)?;
-    let after = publications(root).map_err(InitialSetupSnapshotError::Read)?;
+    let before = publications(root).map_err(InitialSetupSnapshotError::read)?;
+    let unread = |why| InitialSetupSnapshotError::read_at(root, why);
+    let records = read().map_err(unread)?;
+    let confirmed = read().map_err(unread)?;
+    let after = publications(root).map_err(InitialSetupSnapshotError::read)?;
     if before != after || records != confirmed {
         return Err(InitialSetupSnapshotError::Updating);
     }

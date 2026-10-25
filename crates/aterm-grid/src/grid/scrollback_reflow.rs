@@ -184,7 +184,7 @@ impl Grid {
         added
     }
 
-    fn build_scrollback_row(
+    pub(super) fn build_scrollback_row(
         &mut self,
         line: &Line,
         new_cols: u16,

@@ -833,6 +833,8 @@ pub struct Opened {
     pub bake: Option<PartialBake>,
     /// What it took.
     pub steps: Vec<(String, f64)>,
+    /// This run's claim on the VM ([`crate::vm_admit`]): its memory and vCPUs when it boots.
+    pub admitted: crate::vm_admit::Admitted,
 }
 
 /// The share entry's name for the directory `path` of `kind` (`repo`, `git`):
@@ -945,6 +947,7 @@ pub fn open(repo: &Path) -> Result<Opened, Fail> {
         t0.elapsed().as_secs_f64(),
         session.phase.name()
     );
+    let mut admitted = crate::vm_admit::admit(&crate::vm_admit::VZ, booted_here)?;
     let mut bake = None;
     let prepare = || -> Result<Plan, Fail> {
         let (plan, partial) = plan(&paths, &seed_user, &boot_share, &agent.sha256, &shares)?;
@@ -965,6 +968,14 @@ pub fn open(repo: &Path) -> Result<Opened, Fail> {
             if bake.is_some() { "bake boot" } else { "boot" }.to_string(),
             t0.elapsed().as_secs_f64(),
         ));
+        let disk = bake
+            .as_ref()
+            .map_or_else(|| paths.live_disk(), |b| b.path().to_path_buf());
+        let helper = Record::read(&paths.record()).map(|r| r.pid);
+        admitted.credit(
+            "linux",
+            &crate::vm_admit::vm_procs(&disk, helper.as_slice()),
+        );
     }
     let vz = Vz::new(Box::new(session), user, paths, placed.sha256, hello);
     if let Err(why) = vz.mount(&shares) {
@@ -978,6 +989,7 @@ pub fn open(repo: &Path) -> Result<Opened, Fail> {
         booted_here,
         bake,
         steps,
+        admitted,
     })
 }
 
@@ -1896,7 +1908,7 @@ pub fn cmd_vz_smoke(rest: &[String]) -> crate::Res {
         }
     };
     crate::linux_driver::choose("vz")?;
-    let _lock = crate::linux::LaneLock::take()?;
+    let _lock = crate::linux::LaneLock::boot()?;
     let t0 = Instant::now();
     let up = crate::linux::bring_up()?;
     for step in &up.timings {

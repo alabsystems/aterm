@@ -523,7 +523,9 @@ impl EchoLedger {
 
     #[inline]
     fn expire(&mut self, now: Instant) {
-        let stale = |at: Instant| now.saturating_duration_since(at).as_secs_f32() > ECHO_PATIENCE_S;
+        let stale = |at: Instant| {
+            now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR
+        };
         let mut any = false;
         for slot in &mut self.slots {
             let Some((at, _)) = *slot else { break };
@@ -641,7 +643,7 @@ impl EchoLedger {
         let (mut older, mut younger, mut stale) = (0, 0, 0);
         for &(at, cells) in self.slots.iter().flatten() {
             let cells = usize::from(cells);
-            if now.saturating_duration_since(at).as_secs_f32() > ECHO_PATIENCE_S {
+            if now.saturating_duration_since(at) > crate::cursor_glow::IN_FLIGHT_PATIENCE_DUR {
                 stale += cells;
             } else if at < key {
                 older += cells;
@@ -1302,10 +1304,11 @@ impl Engine {
         let budget = out.len().min(witness::WITNESS_ROWS);
         let mut n = self.band_rows(&mut out[..budget], caret_move, add);
         if let Some(row) = arming {
-            for r in [Some(row), row.checked_sub(1), row.checked_add(1)]
-                .into_iter()
-                .flatten()
-            {
+            add(out, &mut n, row);
+            if let Some(r) = row.checked_sub(1) {
+                add(out, &mut n, r);
+            }
+            if let Some(r) = row.checked_add(1) {
                 add(out, &mut n, r);
             }
         }
@@ -1334,16 +1337,17 @@ impl Engine {
             .filter(|&d| d.unsigned_abs() > 2 && d != i32::from(carry));
         let ahead = |row: u16| lead.and_then(|d| u16::try_from(i32::from(row) + d).ok());
         if let Some(focus) = focus {
-            for row in [
-                Some(focus),
-                focus.checked_sub(1),
-                focus.checked_add(1),
-                back(focus),
-                ahead(focus),
-            ]
-            .into_iter()
-            .flatten()
-            {
+            add(out, &mut n, focus);
+            if let Some(row) = focus.checked_sub(1) {
+                add(out, &mut n, row);
+            }
+            if let Some(row) = focus.checked_add(1) {
+                add(out, &mut n, row);
+            }
+            if let Some(row) = back(focus) {
+                add(out, &mut n, row);
+            }
+            if let Some(row) = ahead(focus) {
                 add(out, &mut n, row);
             }
             if n == out.len() {
@@ -1550,12 +1554,16 @@ impl Engine {
         }
         let Some(run) = self.hand_line_follow(rows, None) else {
             let row = self.caret.0;
-            let waits = [-2i16, -1, 1, 2]
-                .into_iter()
-                .filter_map(|dr| row.checked_add_signed(dr))
-                .find_map(|to| self.hand_line_follow(rows, Some(to)));
-            self.witness
-                .await_caret(waits.map(|run| (run.row, run.cohort)));
+            let mut waits = None;
+            for dr in [-2i16, -1, 1, 2] {
+                if let Some(to) = row.checked_add_signed(dr)
+                    && let Some(found) = self.hand_line_follow(rows, Some(to))
+                {
+                    waits = Some((found.row, found.cohort));
+                    break;
+                }
+            }
+            self.witness.await_caret(waits);
             return None;
         };
         let to = run.row.checked_add_signed(run.dr)?;

@@ -379,6 +379,62 @@ impl Standing {
     }
 }
 
+/// What can end a failure (design §3.6), decided where the failure is found and carried to
+/// System State's page, its menu line, the tab's diamond and the setup run's retry loop alike,
+/// so none of them says a step waits that only a person, or nothing quick, can finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FailureKind {
+    /// A retry can help: a network blip, a vault that did not answer, a busy lock, a process
+    /// that exited oddly. While aterm still tries it again by itself the page is calm and
+    /// counts it as waiting; once those tries are spent it failed. A failure nobody classified
+    /// is one of these, never a person's.
+    Transient,
+    /// Only a person's act ends it: a GitHub token refused or missing, a vault password to
+    /// retype, an approval only an admin Mac gives, a switch only the person flips. It needs
+    /// them at once, and no pass retries it. A reading says it as [`Standing::NeedsYou`], with
+    /// its remedy in the row's note, and the run's row for it parks the run.
+    NeedsPerson,
+    /// Neither a retry nor a quick act ends it: it failed at once, with its reason, and
+    /// `aterm doctor` says more. A step's row says it with [`FAILED_FOR_GOOD`], and no pass
+    /// retries it.
+    ForGood,
+}
+
+impl FailureKind {
+    /// Whether aterm tries a failure of this kind again by itself.
+    #[must_use]
+    pub const fn retried(self) -> bool {
+        matches!(self, Self::Transient)
+    }
+
+    /// The kind of failure a setup step's row `status` reports, `None` for a status that is no
+    /// failure. `error` and `failed` name no kind, so they are [`Self::Transient`]: retried
+    /// while tries remain, then failed. A step only a person finishes is said by its row's
+    /// reading ([`Standing::NeedsYou`]), never by a step status.
+    #[must_use]
+    pub fn of_status(status: &str) -> Option<Self> {
+        match status {
+            "error" | "failed" => Some(Self::Transient),
+            FAILED_FOR_GOOD => Some(Self::ForGood),
+            _ => None,
+        }
+    }
+}
+
+/// The status of a setup step's row that failed for good ([`FailureKind::ForGood`]).
+pub const FAILED_FOR_GOOD: &str = "failed for good";
+
+/// What a failed setup step's row says, in System State's words, while aterm still tries it
+/// again by itself on its own pause ([`FailureKind::Transient`], a Secrets vault try): it waits
+/// for that try whatever the run's retry loop does.
+pub const TRIES_AGAIN_BY_ITSELF: &str = "aterm tries again by itself.";
+
+/// What a failed Secrets vault try's row says once two tries in a row failed: its tries are
+/// spent, so it failed, and only a change of this Mac's network or vault, or Set up now, tries
+/// it again ([`FailureKind::Transient`]).
+pub const TRIED_TWICE: &str = "aterm tried twice, so it tries again once this Mac's network or \
+                               vault changes, or on Set up now.";
+
 /// The Local Network row's note when nothing says whether aterm may use the local network
 /// ([`Standing::Untold`]): macOS does not tell apps (design §3.3).
 pub const LOCAL_NETWORK_UNTOLD: &str = "macOS does not tell apps whether it is on";
@@ -1454,6 +1510,30 @@ mod tests {
         let unread = Observation::unknown(Subject::Access(Access::LocalNetwork));
         assert_eq!(unread.now, None);
         assert_eq!(unread.wanted, "On");
+    }
+
+    /// Every failed step's status names its kind, a status that names none is a retry's, and
+    /// no status is ever a person's: a reading says that (design §3.6).
+    #[test]
+    fn a_step_status_names_its_failure_kind_and_never_a_persons() {
+        assert_eq!(
+            FailureKind::of_status("error"),
+            Some(FailureKind::Transient)
+        );
+        assert_eq!(
+            FailureKind::of_status("failed"),
+            Some(FailureKind::Transient)
+        );
+        assert_eq!(
+            FailureKind::of_status(FAILED_FOR_GOOD),
+            Some(FailureKind::ForGood)
+        );
+        for calm in ["ok", "applied", "waiting", "blocked", "unverified", "noted"] {
+            assert_eq!(FailureKind::of_status(calm), None, "{calm}");
+        }
+        assert!(FailureKind::Transient.retried());
+        assert!(!FailureKind::NeedsPerson.retried());
+        assert!(!FailureKind::ForGood.retried());
     }
 
     #[test]

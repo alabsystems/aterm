@@ -24,6 +24,9 @@ pub const BUDGET_SECS: u64 = 300;
 /// The glow on, so a typed key reaches the hosted task.
 const GLOW_ON: &str = "serious_mode = false\ncursor_trail = true\ncursor_momentum_glow = true";
 
+/// The shell's rc: the keys go to `cat` on a tty that echoes them, since a recording stops at a key a program reads raw outside an integrated prompt.
+const TYPED_INTO: &str = "exec /bin/cat\n";
+
 /// One row's outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AosReport {
@@ -91,6 +94,8 @@ pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
     }
     let world = World::prepare(scratch.path(), GLOW_ON)
         .map_err(|e| CouldNotRun(format!("cannot lay out the scratch world: {e}")))?;
+    std::fs::write(world.home.join(".shrc"), TYPED_INTO)
+        .map_err(|e| CouldNotRun(format!("cannot write the scratch shell's rc: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;
     let attached = ctl.ok(&["aos", "attach", "code=shipped"])?;

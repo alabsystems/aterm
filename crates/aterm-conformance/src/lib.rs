@@ -13,6 +13,9 @@ pub mod measure;
 
 // Exercise the benches' runner with deterministic rows, without launching an instance.
 #[cfg(all(test, unix))]
+#[path = "../benches/support/quiet.rs"]
+pub mod measuring_quiet;
+#[cfg(all(test, unix))]
 #[path = "../benches/support/mod.rs"]
 pub mod measuring_runner;
 

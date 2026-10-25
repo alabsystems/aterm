@@ -13,6 +13,15 @@ const NOW: i64 = 1_790_000_000;
 const MIN: i64 = 60;
 const HOUR: i64 = 3600;
 
+// Existing selection tests compare the chosen row. Refusal tests below inspect the
+// production Result directly, including the distinction from an unmanaged launch.
+fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<LoginEnv> {
+    super::launch_env(seat, cli, read).ok().flatten()
+}
+
+#[path = "accounts_pool_launch_tests.rs"]
+mod launch_admission;
+
 struct World {
     _dir: aterm_tempfile::TempDir,
     root: PathBuf,

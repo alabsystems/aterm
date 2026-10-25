@@ -744,7 +744,7 @@ fn fx_linear_is_the_free_sprite_law() {
             under: true,
         };
         let mut want = base;
-        crate::legacy_sprite_oracle::stamp(&mut want, w, h, 0, 0, &old, 0, h);
+        crate::legacy_sprite_oracle::stamp(&mut want, w, h, 0, 0, &old, 0, h, None);
         assert!(got == want, "case {case}: scale {s}");
     }
 }

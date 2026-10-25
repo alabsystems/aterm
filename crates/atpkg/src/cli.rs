@@ -206,7 +206,8 @@ const TABLE: &[Verb] = &[
                 Control off for this host, Rosetta 2 on Apple silicon), then reclaim what \
                 `machine cache` lists\n\
                 aterm pkg machine cache           — what the apply would take from the Rust \
-                build cache and the tooling cache, and why; removes nothing\n\
+                build cache, the tooling cache and the retired verify gate's leftovers, and \
+                why; removes nothing\n\
                 aterm pkg machine cache clean     — reclaim only that, without applying host \
                 settings",
         arity: Arity::Own,
@@ -6315,7 +6316,25 @@ fn machine_read_verdict(st: &crate::machine::MachineState, refusal: Option<Strin
     }
 }
 
+/// The retired verify gate's leftovers ([`crate::build_cache::retired`]): removed once each is
+/// unused, every one named with what became of it. The count removed.
+fn retire_verify_gate() -> usize {
+    use crate::build_cache::retired;
+    let Some(roots) = retired::Roots::live() else {
+        return 0;
+    };
+    let done = retired::retire(&roots, std::time::SystemTime::now(), &retired::GitCli);
+    for (left, result) in &done {
+        match result {
+            Ok(()) => println!("removed {} — {}", left.path.display(), left.words()),
+            Err(why) => println!("kept {} — {why}", left.path.display()),
+        }
+    }
+    done.iter().filter(|(_, r)| r.is_ok()).count()
+}
+
 fn reclaim_build_cache() -> usize {
+    let retired = retire_verify_gate();
     let removed = crate::build_cache::reclaim_home();
     let parts = removed
         .iter()
@@ -6333,7 +6352,7 @@ fn reclaim_build_cache() -> usize {
              build cache folder(s)"
         );
     }
-    removed.len()
+    removed.len() + retired
 }
 
 fn cmd_machine(rest: &[String]) -> ExitCode {
@@ -6421,11 +6440,38 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                     }
                 );
             }
+            let leftovers = crate::build_cache::retired::Roots::live()
+                .map(|roots| {
+                    crate::build_cache::retired::plan(
+                        &roots,
+                        std::time::SystemTime::now(),
+                        &crate::build_cache::retired::GitCli,
+                    )
+                })
+                .unwrap_or_default();
+            for one in &leftovers {
+                let bytes = crate::build_cache::allocated(std::slice::from_ref(&one.path));
+                if one.goes() {
+                    total = total.saturating_add(bytes);
+                }
+                println!(
+                    "{:>10}  {}\n            {}",
+                    crate::cost::human_bytes(bytes),
+                    one.path.display(),
+                    one.words()
+                );
+            }
+            let gate = leftovers.iter().filter(|l| l.goes()).count();
             println!(
-                "{} to go from {} Rust build cache folder(s) at the next `aterm pkg machine \
+                "{} to go from {} Rust build cache folder(s){} at the next `aterm pkg machine \
                  apply` (nothing removed now)",
                 crate::cost::human_bytes(total),
-                planned.len()
+                planned.len(),
+                if gate > 0 {
+                    format!(" and {gate} retired verify gate folder(s)")
+                } else {
+                    String::new()
+                }
             );
             ExitCode::SUCCESS
         }

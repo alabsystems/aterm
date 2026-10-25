@@ -133,7 +133,7 @@ pub fn cmd_browser(args: &[String]) -> Res {
     let ok = laid.verdict == Verdict::Pass;
     rows.push(laid);
     if ok {
-        let lock = linux::LaneLock::take()?;
+        let lock = linux::LaneLock::boot()?;
         waited = lock.waited();
         let up = linux::bring_up()?;
         rows.extend(up.timings.iter().map(|step| Row {
@@ -266,7 +266,7 @@ fn drive(
                 continue;
             }
         }
-        let mut env = guest::cargo_env(arch, &format!("{lane}/target"), false);
+        let mut env = up.cargo_env(arch, &format!("{lane}/target"), false);
         let mut build = vec![
             "cargo".to_string(),
             "build".into(),

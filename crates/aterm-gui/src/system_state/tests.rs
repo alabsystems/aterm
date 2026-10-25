@@ -422,7 +422,7 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
         if subject == repositories {
             assert_eq!(
                 node.map(|node| node.label.as_str()),
-                Some("Waits for your GitHub token from the Secrets vault"),
+                Some("Waits for the vault to finish syncing this Mac"),
                 "{key}"
             );
         } else if subject == lan {
@@ -1322,10 +1322,16 @@ fn named_result_failure_headline_survives_new_readings_until_recovery() {
             Some(repository),
             "fresh in-place readings cannot make a failed operation successful"
         );
-        assert_eq!(line(&current).text, expected.text);
+        // While the run retries the step waits; once it stops, the step failed.
+        let words = if retrying {
+            "1 step waiting: GitHub repositories"
+        } else {
+            expected.text.as_str()
+        };
+        assert_eq!(line(&current).text, words);
         assert_eq!(app.needs_attention(), !retrying);
         let compiled = compile(&app, &view, 999.0, 740.0);
-        assert_eq!(label(&compiled, HEADLINE), expected.text);
+        assert_eq!(label(&compiled, HEADLINE), words);
         assert!(
             compiled
                 .semantic(&UiKey::new("system-state/headline/show"))
@@ -1552,8 +1558,9 @@ fn a_failed_check_again_is_a_page_note_only() {
 }
 
 /// A stage's error or a failed row the worker still retries leaves the tab's diamond dark, and
-/// lights it once retrying stops (§3.5, §3.6); the page says the failure throughout. A row that
-/// needs a person lights it at once.
+/// lights it once retrying stops (§3.5, §3.6). While it retries the page says the step waits;
+/// once retrying stops the headline says it failed, with the diamond. A row that needs a person
+/// lights it at once.
 #[test]
 fn a_failure_the_run_still_retries_leaves_the_tab_dark() {
     let secrets = Subject::Setting(Setting::Secrets);
@@ -1584,13 +1591,13 @@ fn a_failure_the_run_still_retries_leaves_the_tab_dark() {
                 &rows(&status, Selection::all()),
                 status.plan.as_ref(),
             );
-            assert!(
-                shown.text.contains("failed")
-                    || status
-                        .notes(status.plan.as_ref().unwrap())
-                        .iter()
-                        .any(|note| note.contains("failed")),
-                "the page says it: {}",
+            assert_eq!(
+                (
+                    shown.text.contains("failed"),
+                    shown.text.contains("waiting")
+                ),
+                (!retrying, retrying),
+                "retrying {retrying}: {}",
                 shown.text
             );
             let mut app = SystemStateApp::new(Plan::default());
@@ -2227,7 +2234,9 @@ fn only_a_group_choice_or_join_makes_the_plan_the_choosers() {
     let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(Request::new(Plan::default(), send)));
-    app.tick(true, true, false);
+    let now = Instant::now();
+    app.tick_at(now, true, true, false);
+    app.tick_at(now + Duration::from_secs(30), true, true, false);
     assert!(!chosen(app.take_action()));
 }
 
@@ -2257,21 +2266,136 @@ fn an_accepted_plan_does_not_undo_a_choice_made_while_it_waited() {
 }
 
 #[test]
-fn the_first_run_offer_applies_on_the_first_active_tick_with_no_timer() {
+fn startup_review_waits_before_automatically_submitting() {
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(request.clone()));
-    app.tick(false, true, false);
+    app.tick(true, true, false);
+    assert!(
+        app.take_action().is_none(),
+        "the first visible tick starts the review, not its work"
+    );
+    assert!(request.pending());
+    assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+}
+
+#[test]
+fn startup_review_group_changes_remain_unsubmitted_until_apply() {
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    let mut app = SystemStateApp::new(Plan::default());
+    assert!(app.offer(request.clone()));
+    let (mut runtime, instance, view) = runtime_with_app(app);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/group/2/leave"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        runtime.take_system_state_action().is_none(),
+        "a first-launch group change edits the review without starting setup"
+    );
+    let NativeApp::SystemState(page) = runtime.app(instance).unwrap() else {
+        unreachable!()
+    };
+    assert!(!page.reviewed_plan().selection.contains(Setting::Dock));
+    assert!(request.pending());
+    assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+}
+
+#[test]
+fn startup_review_join_keeps_the_address_and_password_for_apply() {
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    let mut app = SystemStateApp::new(Plan::default());
+    assert!(app.offer(request.clone()));
+    let (mut runtime, instance, view) = runtime_with_app(app);
+    for (key, value) in [
+        (
+            "system-state/url",
+            Some("http://draft.local:7484/v1/review"),
+        ),
+        ("system-state/password", Some("synthetic-review-secret")),
+        ("system-state/vault/join", None),
+    ] {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(key),
+                    value: value.map(|value| SemanticInput::Text(value.into())),
+                }),
+            )
+            .unwrap();
+    }
+    assert!(
+        runtime.take_system_state_action().is_none(),
+        "Join in the startup review must not release credentials before Apply"
+    );
+    let NativeApp::SystemState(page) = runtime.app(instance).unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        page.reviewed_plan().vault_url,
+        "http://draft.local:7484/v1/review"
+    );
+    assert_eq!(page.password.text(), "synthetic-review-secret");
+    assert!(request.pending());
+    assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+}
+
+#[test]
+fn startup_review_counts_only_active_visible_time_and_submits_once() {
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    let mut app = SystemStateApp::new(Plan::default());
+    assert!(app.offer(request.clone()));
+    let start = Instant::now();
+    app.tick_at(start, false, true, false);
     assert!(
         app.take_action().is_none(),
         "not until it is in an active window"
     );
-    app.tick(true, true, false);
+    app.tick_at(start + Duration::from_secs(100), true, false, false);
+    assert!(app.take_action().is_none(), "a hidden page counts no time");
+    app.tick_at(start + Duration::from_secs(101), true, true, false);
+    app.tick_at(start + Duration::from_secs(111), true, true, false);
+    let view = SystemStateViewState::default();
+    assert_eq!(
+        compile(&app, &view, 900.0, 900.0)
+            .semantic(&UiKey::new("system-state/apply"))
+            .unwrap()
+            .label,
+        "Apply (20)"
+    );
+    app.publish(SetupStatus {
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    });
+    app.tick_at(start + Duration::from_secs(111), false, true, false);
+    app.tick_at(start + Duration::from_secs(1000), true, true, false);
+    app.tick_at(start + Duration::from_secs(1019), true, true, false);
+    assert!(
+        app.take_action().is_none(),
+        "focus and status never restart or consume paused time"
+    );
+    app.tick_at(start + Duration::from_secs(1020), true, true, false);
     let Some(SystemStateAction::Apply(answer, who)) = app.take_action() else {
         panic!("the offer applies");
     };
     assert_eq!(who, Admission::Automatic);
+    assert!(!answer.chosen && !answer.vault_typed && answer.password.is_none());
+    assert_eq!(
+        answer.changed, None,
+        "the full reviewed selection is applied"
+    );
     assert!(request.finish_answer(answer));
     assert!(matches!(
         receive
@@ -2280,6 +2404,129 @@ fn the_first_run_offer_applies_on_the_first_active_tick_with_no_timer() {
             .decision,
         WorkstationSetupDecision::Begin(_)
     ));
+    app.tick_at(start + Duration::from_secs(2000), true, true, false);
+    assert!(app.take_action().is_none());
+    assert!(receive.try_recv().is_err());
+}
+
+#[test]
+fn startup_review_pauses_when_busy_starts_and_ends_between_ticks() {
+    let (send, _receive) = mpsc::channel();
+    let mut app = SystemStateApp::new(Plan::default());
+    assert!(app.offer(Request::new(Plan::default(), send)));
+    let start = Instant::now();
+    app.tick_at(start, true, true, false);
+    app.tick_at(start + Duration::from_secs(10), true, true, false);
+    app.publish(SetupStatus {
+        busy: true,
+        ..SetupStatus::default()
+    });
+    app.publish(SetupStatus::default());
+    app.tick_at(start + Duration::from_secs(1000), true, true, false);
+    assert!(
+        app.take_action().is_none(),
+        "busy publications pause the review even without a busy tick"
+    );
+    assert_eq!(app.review_seconds(), Some(20));
+    app.tick_at(start + Duration::from_secs(1019), true, true, false);
+    assert!(app.take_action().is_none());
+    app.tick_at(start + Duration::from_secs(1020), true, true, false);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Apply(_, Admission::Automatic))
+    ));
+}
+
+#[test]
+fn startup_review_interaction_stops_automatic_apply_for_the_whole_offer() {
+    for event in [
+        AppEvent::ScrollLines(1),
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("system-state/row/secrets/disclose"),
+            value: None,
+        }),
+        AppEvent::TextInput(TextInputEvent::Commit("x".into())),
+        AppEvent::TextInput(TextInputEvent::Left { extend: false }),
+    ] {
+        let (send, _receive) = mpsc::channel();
+        let mut app = SystemStateApp::new(Plan::default());
+        assert!(app.offer(Request::new(Plan::default(), send)));
+        let (mut runtime, instance, view) = runtime_with_app(app);
+        let start = Instant::now();
+        runtime.tick_system_state_at(start, true, true, &[view]);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
+            )
+            .unwrap();
+        runtime.dispatch(instance, view, event).unwrap();
+        runtime.tick_system_state_at(start + Duration::from_secs(60), true, true, &[view]);
+        runtime.publish_system_state(SetupStatus {
+            plan: Some(Plan::default()),
+            ..SetupStatus::default()
+        });
+        runtime.tick_system_state_at(start + Duration::from_secs(120), false, false, &[]);
+        runtime.tick_system_state_at(start + Duration::from_secs(180), true, true, &[view]);
+        assert!(runtime.take_system_state_action().is_none());
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/apply"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let (_, admission, _) = submitted(runtime.take_system_state_action());
+        assert_eq!(admission, Admission::Client);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/apply"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        assert!(
+            runtime.take_system_state_action().is_none(),
+            "Apply is single-flight"
+        );
+    }
+}
+
+#[test]
+fn startup_review_focus_and_empty_preedit_do_not_stop_the_countdown() {
+    let (send, _receive) = mpsc::channel();
+    let mut app = SystemStateApp::new(Plan::default());
+    assert!(app.offer(Request::new(Plan::default(), send)));
+    let (mut runtime, instance, view) = runtime_with_app(app);
+    let start = Instant::now();
+    runtime.tick_system_state_at(start, true, true, &[view]);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Preedit {
+                text: String::new(),
+                selection: None,
+            }),
+        )
+        .unwrap();
+    runtime.tick_system_state_at(start + Duration::from_secs(30), true, true, &[view]);
+    let (_, admission, _) = submitted(runtime.take_system_state_action());
+    assert_eq!(admission, Admission::Automatic);
 }
 
 #[test]
@@ -2386,6 +2633,51 @@ fn only_a_join_names_a_typed_vault() {
     app.status.busy = false;
     act(&mut app, "system-state/vault/join");
     assert!(typed(app.take_action()), "Join");
+}
+
+/// A Join aterm cannot make because it cannot read this Mac's vault settings is said in one
+/// calm line, never a failure: no Set up now, menu line or tab attention. Refused as a press on
+/// the page, it leaves the typed vault and its password in their fields; the launch's answer,
+/// admitted without its Join, keeps the typed vault in its field. Either way the person Joins
+/// once the settings read.
+#[test]
+fn a_join_aterm_cannot_make_for_unread_vault_settings_is_said_calmly() {
+    const TYPED: &str = "http://typed.local:7484/v1/team";
+    for refused in [true, false] {
+        let mut app = SystemStateApp::new(Plan::default());
+        let unread = status_of("vault-unreadable");
+        app.publish(unread.clone());
+        app.gesture(true);
+        app.password
+            .input(TextInputEvent::Commit("test-only-password".into()));
+        app.url.select_all();
+        app.url.insert(TYPED);
+        act(&mut app, "system-state/vault/join");
+        let (plan, _, _) = submitted(app.take_action());
+        let (note, in_force) = if refused {
+            assert!(app.apply_refused());
+            (VAULT_UNREAD_NOTE, unread.plan.clone())
+        } else {
+            app.apply_accepted(plan.clone());
+            (VAULT_NOT_JOINED_NOTE, Some(plan))
+        };
+        app.publish(SetupStatus {
+            plan: in_force,
+            rows: vec![calm_setup_row(note)],
+            ..unread.clone()
+        });
+        let reviewed = app.reviewed_plan();
+        assert!(
+            app.status.notes(&reviewed).iter().any(|said| said == note),
+            "{:?}",
+            app.status.notes(&reviewed)
+        );
+        assert!(!app.headline().start, "refused {refused}");
+        assert!(!app.needs_attention(), "refused {refused}");
+        assert!(crate::system_state_access::menu_line(&app.status, false).is_none());
+        assert_eq!(app.url.value(), TYPED, "refused {refused}");
+        assert_eq!(app.password.value.is_some(), refused);
+    }
 }
 
 #[test]
@@ -3888,7 +4180,7 @@ fn page_states() -> Vec<(String, SetupStatus, bool)> {
                 repos,
                 Standing::Waiting,
                 None,
-                Some("Your GitHub token is for another account"),
+                Some("GitHub can't be reached"),
             ),
         ),
         false,
@@ -4417,6 +4709,7 @@ fn every_scenarios_notes_are_sentences_in_the_pages_words() {
                 "journal",
                 "Init",
                 "stage",
+                "record",
             ] {
                 assert!(!note.contains(word), "{scenario}: {word:?} in {note:?}");
             }
@@ -4433,7 +4726,7 @@ fn every_scenarios_notes_are_sentences_in_the_pages_words() {
 }
 
 /// Every scenario the page's fixture seam draws.
-const SCENARIOS: [&str; 25] = [
+const SCENARIOS: [&str; 35] = [
     "checking",
     "running",
     "widened",
@@ -4459,6 +4752,16 @@ const SCENARIOS: [&str; 25] = [
     "vault-source-mismatch",
     "plan-unread",
     "fresh",
+    "queued-choice",
+    "queued-restore",
+    "set-aside",
+    "set-aside-non-alab",
+    "startup-retry",
+    "restore-failed",
+    "setup-retried",
+    "failed-retrying",
+    "github-sign-in",
+    "vault-unreadable",
 ];
 
 /// Changes aterm made and could not log are a fact for later, never a signal (design §3.6):
@@ -4759,19 +5062,20 @@ fn a_choice_waiting_for_another_setup_says_why_once_and_calmly() {
 /// group's buttons stay live.
 #[test]
 fn a_set_aside_setup_is_one_calm_note_with_every_group_live() {
-    let status = SetupStatus {
-        recovered: true,
-        ..all_in_place()
-    };
+    let status = status_of("set-aside");
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status.clone());
-    assert_eq!(status.notes(&app.reviewed_plan()), [RECOVERED_NOTE]);
+    let notes = status.notes(&app.reviewed_plan());
+    assert!(
+        notes.len() == 1 && notes[0].starts_with(RECOVERED_NOTE),
+        "{notes:?}"
+    );
     assert!(!app.needs_attention());
     assert!(crate::system_state_access::menu_line(&status, false).is_none());
     app.gesture(true);
-    act(&mut app, "system-state/group/2/leave");
+    act(&mut app, "system-state/group/2/set-up");
     let (plan, _, _) = submitted(app.take_action());
-    assert!(!plan.selection.contains(Setting::Dock));
+    assert!(plan.selection.contains(Setting::Dock));
 }
 
 /// A Restore that failed as a whole is headlined as the Restore it is (§3.4), never as a setup
@@ -4863,6 +5167,18 @@ fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
     assert_eq!(
         crate::system_state_access::menu_line(&held, false).map(|line| line.label),
         Some("System State: Secrets vault failed".to_owned())
+    );
+    // A vault try held after two has spent its tries though the run still retries other
+    // steps: it failed, and says so with them.
+    held.retrying = true;
+    assert_eq!(line(&held).text, "1 step failed: Secrets vault");
+    assert_eq!(
+        crate::system_state_access::menu_line(&held, false).map(|line| line.label),
+        Some("System State: Secrets vault failed".to_owned())
+    );
+    assert_eq!(
+        row_view(secrets, &held, Selection::all()).chip,
+        Some(Chip::Failed)
     );
     step.retrying = false;
     assert_eq!(line(&step).text, "1 step failed: GitHub repositories");
@@ -5021,4 +5337,553 @@ fn a_headline_claims_no_more_than_was_confirmed() {
     app.publish(status_of("check-unconfirmed"));
     assert!(!app.needs_attention());
     assert!(crate::system_state_access::menu_line(&app.status, false).is_none());
+}
+
+/// The menu line's label for `status`, if one (design §3.6).
+fn menu(status: &SetupStatus) -> Option<String> {
+    crate::system_state_access::menu_line(status, false).map(|line| line.label)
+}
+
+/// A setup run that did not finish as a whole, which the run tries again by itself, is no
+/// failure (design §3.5): the headline waits for that try, before and after the page knows the
+/// plan, beside the one calm note saying what aterm does next, and nothing signals it. Once the
+/// tries stop, `Setup needs attention` with Set up now, the menu line and the diamond say it
+/// together.
+#[test]
+fn a_setup_run_aterm_retries_waits_and_is_no_failure() {
+    let setup = status_of("setup-retried");
+    let plan = setup.plan.clone().unwrap();
+    let line = headline(&setup, &rows(&setup, plan.selection), Some(&plan));
+    assert_eq!((line.text.as_str(), line.start), (SETUP_RETRIED, false));
+    assert_eq!(
+        setup.notes(&plan),
+        [format!("Setup did not finish this time. {RETRIES_NOTE}")]
+    );
+    assert!(setup.failed_steps(Some(&plan)).next().is_none());
+    assert_eq!(menu(&setup), None);
+    let mut app = SystemStateApp::new(plan.clone());
+    app.publish(setup.clone());
+    assert!(!app.needs_attention());
+    let unknown = SetupStatus {
+        plan: None,
+        ..setup.clone()
+    };
+    assert_eq!(Headline::before_plan(&unknown).text, SETUP_RETRIED);
+    let stopped = SetupStatus {
+        retrying: false,
+        ..setup
+    };
+    let line = headline(&stopped, &rows(&stopped, plan.selection), Some(&plan));
+    assert_eq!(
+        (line.text.as_str(), line.start),
+        ("Setup needs attention", true)
+    );
+    assert_eq!(
+        menu(&stopped).as_deref(),
+        Some("System State: 1 step failed")
+    );
+    app.publish(stopped);
+    assert!(app.needs_attention());
+}
+
+/// A launch's setup that could not start and tries again by itself (design §3.5) waits for that
+/// try: nothing a person presses changes what comes next, so the headline offers no Set up now
+/// for the rows that run changes, beside the one calm line, and nothing signals.
+#[test]
+fn a_startup_aterm_retries_waits_with_no_set_up_now() {
+    let startup = status_of("startup-retry");
+    let plan = startup.plan.clone().unwrap();
+    let line = headline(&startup, &rows(&startup, plan.selection), Some(&plan));
+    assert_eq!((line.text.as_str(), line.start), (SETUP_RETRIED, false));
+    assert_eq!(startup.notes(&plan), [STARTUP_RETRY_NOTE]);
+    assert_eq!(menu(&startup), None);
+    let mut app = SystemStateApp::new(plan);
+    app.publish(startup);
+    assert!(!app.needs_attention());
+}
+
+/// The headline, the menu line and the tab's diamond signal a failure together or not at all
+/// (design §3.6). A step that failed with its own reason while the run still tries again by
+/// itself waits for that try (`1 step waiting`), its row or note keeping the reason under the
+/// waiting chip, never `Failed`, and the village draws it waiting; once the tries stop, all of
+/// them say it failed at once.
+#[test]
+fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
+    let agree = |status: &SetupStatus| {
+        let plan = status.plan.clone().unwrap();
+        let line = headline(status, &rows(status, plan.selection), Some(&plan));
+        let mut app = SystemStateApp::new(plan.clone());
+        app.publish(status.clone());
+        let fails = line.text.contains("failed");
+        assert_eq!(
+            (menu(status).is_some(), app.needs_attention()),
+            (fails, fails),
+            "headline {:?}, menu line {:?}, notes {:?}",
+            line.text,
+            menu(status),
+            status.notes(&plan)
+        );
+        line.text
+    };
+    let station = |status: &SetupStatus, setting: Setting| {
+        let plan = status.plan.clone().unwrap();
+        let spec = village_spec(status, &rows(status, plan.selection), &plan, 0);
+        let at = Setting::ALL.iter().position(|s| *s == setting).unwrap();
+        spec.rsplit("states=")
+            .next()
+            .and_then(|states| states.chars().nth(at))
+            .unwrap()
+    };
+    let repositories = Subject::Setting(Setting::Repositories);
+    // A reading that failed, with its reason on its row.
+    let retrying = status_of("failed-retrying");
+    assert_eq!(agree(&retrying), "1 step waiting: GitHub repositories");
+    assert_eq!(station(&retrying, Setting::Repositories), 'D');
+    let plan = retrying.plan.clone().unwrap();
+    assert_eq!(
+        retrying.notes(&plan),
+        [format!(
+            "GitHub repositories did not finish this time. {RETRIES_NOTE}"
+        )],
+        "one line says what aterm does next"
+    );
+    let row = row_view(repositories, &retrying, Selection::all());
+    assert_eq!(
+        (row.chip, row.note.as_deref()),
+        (Some(Chip::WillChange { busy: false }), Some(GITHUB_STOPPED)),
+        "the row waits with its reason, never red"
+    );
+    let stopped = SetupStatus {
+        retrying: false,
+        ..retrying
+    };
+    assert_eq!(agree(&stopped), "1 step failed: GitHub repositories");
+    assert_eq!(station(&stopped, Setting::Repositories), 'E');
+    assert_eq!(
+        row_view(repositories, &stopped, Selection::all()).chip,
+        Some(Chip::Failed)
+    );
+    assert!(stopped.notes(&plan).is_empty(), "the row says why");
+    // A step the run could not finish, with its own reason in the page's note.
+    let mut step = status_of("set-up");
+    step.rows = pass_rows(&PassOutcome {
+        rolled_back: None,
+        unfinished: vec![(Setting::Dock, Unfinished::Failed)],
+    });
+    step.retrying = true;
+    let plan = step.plan.clone().unwrap();
+    assert_eq!(agree(&step), "1 step waiting: Dock");
+    assert_eq!(station(&step, Setting::Dock), 'D');
+    assert_eq!(
+        step.notes(&plan),
+        [format!(
+            "Dock did not finish this time. The change did not take. {RETRIES_NOTE}"
+        )]
+    );
+    step.retrying = false;
+    assert_eq!(agree(&step), "1 step failed: Dock");
+    assert_eq!(station(&step, Setting::Dock), 'E');
+    assert_eq!(step.notes(&plan), ["Dock failed. The change did not take."]);
+}
+
+/// What every signal says of one row (design §3.6): the headline, the row's chip, the village's
+/// station, the menu line and the tab's diamond.
+fn signals(
+    status: &SetupStatus,
+    subject: Subject,
+) -> (String, Option<Chip>, char, Option<String>, bool) {
+    let plan = status.plan.clone().unwrap();
+    let all = rows(status, plan.selection);
+    let spec = village_spec(status, &all, &plan, 0);
+    let at = Setting::ALL
+        .iter()
+        .position(|setting| *setting == subject.setting())
+        .unwrap();
+    let station = spec
+        .rsplit("states=")
+        .next()
+        .and_then(|states| states.chars().nth(at))
+        .unwrap();
+    let mut app = SystemStateApp::new(plan.clone());
+    app.publish(status.clone());
+    (
+        headline(status, &all, Some(&plan)).text,
+        row_view(subject, status, plan.selection).chip,
+        station,
+        menu(status),
+        app.needs_attention(),
+    )
+}
+
+/// A step that failed for good, as the worker reports GitHub repositories on a Mac with two
+/// user accounts: its row reads failed with the same words, and `detail` is the step's.
+fn failed_for_good(detail: &str, retrying: bool) -> SetupStatus {
+    let mut status = status_of("set-up");
+    status.retrying = retrying;
+    if let Some(row) = status
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == Subject::Setting(Setting::Repositories))
+    {
+        row.standing = Standing::Failed;
+        row.now = None;
+        row.detail = Some(detail.to_owned());
+    }
+    status.rows = vec![SetupStatusRow {
+        name: Setting::Repositories.name().into(),
+        status: FAILED_FOR_GOOD.into(),
+        detail: detail.to_owned(),
+    }];
+    status
+}
+
+/// Every failure has one kind, and each signal says it alike (design §3.6): the headline, the
+/// row's chip, the village's station, the menu line and the tab's diamond agree for a transient
+/// failure while aterm tries it again (waiting, calm) and once the tries are spent (failed), for
+/// one only a person ends (needs you, at once, whether or not the run retries), and for one that
+/// failed for good (failed, at once, though the run retries other steps).
+#[test]
+fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu_and_the_diamond() {
+    let repositories = Subject::Setting(Setting::Repositories);
+    let waiting = |name: &str| {
+        (
+            format!("1 step waiting: {name}"),
+            Some(Chip::WillChange { busy: false }),
+            'D',
+            None,
+            false,
+        )
+    };
+    let failed = |name: &str| {
+        (
+            format!("1 step failed: {name}"),
+            Some(Chip::Failed),
+            'E',
+            Some(format!("System State: {name} failed")),
+            true,
+        )
+    };
+    let needs_you = |name: &str| {
+        (
+            format!("Needs you: {name}"),
+            Some(Chip::NeedsYou),
+            'E',
+            Some(format!("System State: {name} needs you")),
+            true,
+        )
+    };
+    let github = "GitHub repositories";
+
+    // Transient: a reading that failed, and a step the run could not finish.
+    assert_eq!(
+        signals(&status_of("failed-retrying"), repositories),
+        waiting(github)
+    );
+    assert_eq!(signals(&status_of("failed"), repositories), failed(github));
+    let mut step = status_of("named-result-failed");
+    step.retrying = true;
+    assert_eq!(signals(&step, repositories), waiting(github));
+    step.retrying = false;
+    assert_eq!(
+        signals(&step, repositories),
+        failed(github),
+        "though the row reads in place"
+    );
+
+    // Needs a person: never waiting, never retried, said at once.
+    for retrying in [false, true] {
+        let mut sign_in = status_of("github-sign-in");
+        sign_in.retrying = retrying;
+        assert_eq!(
+            signals(&sign_in, repositories),
+            needs_you(github),
+            "retrying {retrying}"
+        );
+        let line = crate::system_state_access::menu_line(&sign_in, false).unwrap();
+        assert_eq!(line.note.as_deref(), Some(GITHUB_TOKEN_REFUSED));
+        let row = row_view(repositories, &sign_in, Selection::all());
+        assert_eq!(
+            (row.note.as_deref(), &row.value),
+            (
+                Some(GITHUB_TOKEN_REFUSED),
+                &RowValue::Change {
+                    now: "Needs sign-in".into(),
+                    wanted: Setting::Repositories.wanted().into(),
+                }
+            )
+        );
+        let plan = sign_in.plan.clone().unwrap();
+        assert!(sign_in.notes(&plan).is_empty(), "the row says the remedy");
+        // A step of the run that names the row is the person's too: never a failure, a wait
+        // or a try aterm makes again.
+        sign_in.rows = vec![SetupStatusRow {
+            name: Setting::Repositories.name().into(),
+            status: "error".into(),
+            detail: RETRIES_NOTE.into(),
+        }];
+        assert_eq!(
+            signals(&sign_in, repositories),
+            needs_you(github),
+            "retrying {retrying}"
+        );
+        let failures: Vec<Failure> = sign_in.result_failures(Some(&plan)).collect();
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| (failure.kind, failure.retried, failure.failed()))
+                .collect::<Vec<_>>(),
+            [(FailureKind::NeedsPerson, false, false)]
+        );
+        assert!(
+            sign_in.notes(&plan).is_empty(),
+            "{:?}",
+            sign_in.notes(&plan)
+        );
+    }
+
+    // Failed for good: said at once, though the run retries other steps, with its reason, and
+    // no Set up now, which cannot change it.
+    let reason = "aterm sets up GitHub repositories only on a Mac with one user account.";
+    for retrying in [false, true] {
+        let for_good = failed_for_good(reason, retrying);
+        assert_eq!(
+            signals(&for_good, repositories),
+            failed(github),
+            "retrying {retrying}"
+        );
+        let plan = for_good.plan.clone().unwrap();
+        assert!(!headline(&for_good, &rows(&for_good, plan.selection), Some(&plan)).start);
+        assert_eq!(
+            for_good.notes(&plan),
+            [format!("{github} failed. {reason}")]
+        );
+    }
+    let unexplained = failed_for_good("", true);
+    let plan = unexplained.plan.clone().unwrap();
+    assert_eq!(
+        unexplained.notes(&plan),
+        [format!("{github} failed. {FOR_GOOD_NOTE}")]
+    );
+
+    // A transient vault try held after two has spent its tries, though the run retries.
+    let mut held = status_of("vault-failed");
+    held.rows[0].detail = TRIED_TWICE.into();
+    assert_eq!(
+        signals(&held, Subject::Setting(Setting::Secrets)),
+        failed("Secrets vault")
+    );
+}
+
+/// No fixture's signals contradict one another (design §3.6): wherever a row's chip says
+/// `Failed` the headline says a step failed, the diamond and the menu line show, and the
+/// village draws the error look, and wherever the headline counts a step waiting no row reads
+/// `Failed` and nothing signals.
+#[test]
+fn no_fixture_says_waiting_and_failed_at_once() {
+    for scenario in SCENARIOS {
+        let status = status_of(scenario);
+        let Some(plan) = status.plan.clone() else {
+            continue;
+        };
+        let all = rows(&status, plan.selection);
+        let line = headline(&status, &all, Some(&plan)).text;
+        let red: Vec<Subject> = all
+            .iter()
+            .filter(|row| row.chip == Some(Chip::Failed))
+            .map(|row| row.subject)
+            .collect();
+        let mut app = SystemStateApp::new(plan.clone());
+        app.publish(status.clone());
+        if !red.is_empty() {
+            assert!(
+                line.contains("failed") || line.starts_with("Needs you"),
+                "{scenario}: {line:?} beside failed rows {red:?}"
+            );
+            assert!(app.needs_attention(), "{scenario}");
+            assert!(menu(&status).is_some(), "{scenario}");
+        }
+        if line.contains("waiting") {
+            assert!(
+                red.is_empty(),
+                "{scenario}: {line:?} beside failed rows {red:?}"
+            );
+            if !all.iter().any(|row| row.chip == Some(Chip::NeedsYou)) {
+                assert!(!app.needs_attention(), "{scenario}: {line:?}");
+                assert!(menu(&status).is_none(), "{scenario}: {line:?}");
+            }
+        }
+    }
+}
+
+/// A Restore waiting for another setup leaves the person their say (design §3.4): the groups
+/// and Check again stay live, and the Restore button says it waits. Check again reads the rows
+/// beside it, the Restore keeping its words, and a group pressed meanwhile replaces it, as a
+/// later press replaces a choice waiting: the latest intent wins.
+#[test]
+fn a_waiting_restore_leaves_the_groups_and_check_again_live() {
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(all_in_place());
+    app.publish(status_of("queued-restore"));
+    assert_eq!(app.headline().text, "Waiting to restore previous settings…");
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 2000.0);
+    let enabled = |key: &str| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("{key} is in the tree"))
+            .state
+            .is_some_and(|state| state.enabled)
+    };
+    for index in 0..Group::ALL.len() {
+        for choice in ["set-up", "leave"] {
+            let key = format!("system-state/group/{index}/{choice}");
+            assert!(enabled(&key), "{key}");
+        }
+    }
+    assert!(enabled("system-state/check"));
+    assert!(!enabled("system-state/restore"));
+    assert_eq!(label(&compiled, "system-state/restore"), RESTORE_WAITS);
+    for key in ["system-state/stop", "system-state/meter"] {
+        assert!(compiled.semantic(&UiKey::new(key)).is_none(), "{key}");
+    }
+    act(&mut app, "system-state/check");
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(_))
+    ));
+    assert_eq!(app.headline().text, "Waiting to restore previous settings…");
+    app.gesture(true);
+    act(&mut app, "system-state/group/2/leave");
+    let (plan, _, _) = submitted(app.take_action());
+    assert!(!plan.selection.contains(Setting::Dock));
+    assert_eq!(app.headline().text, "Waiting to apply your choice…");
+}
+
+/// After aterm set aside a saved setup it could not read (design §3.5), its one calm note says
+/// what aterm kept as the groups show it: every Mac preference group left as is, Permissions
+/// set up, and on an ALab Mac the vault and repositories set up, which leaves Workspace partly
+/// set up (Rust in Spotlight left as is), neither segment chosen. A Mac that is not an ALab Mac
+/// hears nothing of a vault. Nothing signals either.
+#[test]
+fn the_set_aside_note_says_what_aterm_kept_as_the_groups_show_it() {
+    for (scenario, note, workspace) in [
+        (
+            "set-aside",
+            "aterm could not read its saved setup, so it started afresh: your Mac settings are \
+             left as they are, and the vault and repositories stay set up.",
+            GroupChoice::Partly,
+        ),
+        (
+            "set-aside-non-alab",
+            "aterm could not read its saved setup, so it started afresh: your Mac settings are \
+             left as they are.",
+            GroupChoice::LeaveAsIs,
+        ),
+    ] {
+        let status = status_of(scenario);
+        let plan = status.plan.clone().unwrap();
+        assert_eq!(status.notes(&plan), [note], "{scenario}");
+        for group in [Group::Input, Group::Desktop, Group::Accounts] {
+            assert_eq!(
+                group_choice(group, plan.selection),
+                GroupChoice::LeaveAsIs,
+                "{scenario}: {group:?}"
+            );
+        }
+        assert_eq!(
+            group_choice(Group::Access, plan.selection),
+            GroupChoice::SetUp
+        );
+        assert_eq!(
+            group_choice(Group::Developer, plan.selection),
+            workspace,
+            "{scenario}"
+        );
+        let (count, _) = group_words(
+            Group::Developer,
+            plan.selection,
+            &rows(&status, plan.selection),
+        );
+        assert_eq!(
+            count.as_deref(),
+            (workspace == GroupChoice::Partly).then_some("Partly set up"),
+            "{scenario}"
+        );
+        assert_eq!(menu(&status), None);
+        let mut app = SystemStateApp::new(plan);
+        app.publish(status);
+        assert!(!app.needs_attention());
+    }
+}
+
+/// The set-aside note speaks in the page's words: no record, file or path.
+#[test]
+fn the_set_aside_note_names_no_record() {
+    for scenario in ["set-aside", "set-aside-non-alab"] {
+        let status = status_of(scenario);
+        for note in status.notes(&status.plan.clone().unwrap()) {
+            for word in ["record", "file", ".json", "unreadable", "/"] {
+                assert!(!note.contains(word), "{scenario}: {word:?} in {note:?}");
+            }
+        }
+    }
+}
+
+/// A row read in place that a Check, or a run, could not confirm is not drawn as settled
+/// (design §3.2): its village station waits (`D`), its row has no check mark and says `Not
+/// confirmed` in its note, where the headline's Show lands; once confirmed it is settled again.
+#[test]
+fn an_unconfirmed_row_is_drawn_waiting_with_its_note() {
+    let station = |app: &SystemStateApp, setting: Setting| {
+        let spec = village_spec(&app.status, &app.reviewed_rows(), &app.reviewed_plan(), 0);
+        let at = Setting::ALL.iter().position(|s| *s == setting).unwrap();
+        spec.rsplit("states=")
+            .next()
+            .and_then(|states| states.chars().nth(at))
+            .unwrap()
+    };
+    let repositories = Subject::Setting(Setting::Repositories);
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("check-unconfirmed"));
+    let line = app.headline();
+    assert_eq!(line.show, Some(repositories));
+    assert_eq!(station(&app, Setting::Repositories), 'D');
+    let row = app.reviewed_row(repositories);
+    assert_eq!(
+        (row.chip, row.note.as_deref()),
+        (None, Some(UNCONFIRMED_NOTE)),
+        "{}",
+        line.text
+    );
+    assert!(row.label.ends_with(", not confirmed"), "{}", row.label);
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
+    let heard: Vec<&str> = compiled
+        .semantics
+        .iter()
+        .map(|node| node.label.as_str())
+        .filter(|label| !label.is_empty())
+        .collect();
+    let at = heard
+        .iter()
+        .position(|label| *label == row.label)
+        .unwrap_or_else(|| panic!("{heard:?}"));
+    assert_eq!(heard.get(at + 1).copied(), Some(UNCONFIRMED_NOTE));
+    // A run that could not confirm a change does the same.
+    let mut ran = status_of("set-up");
+    ran.rows = pass_rows(&PassOutcome {
+        rolled_back: None,
+        unfinished: vec![(Setting::Dock, Unfinished::Unconfirmed)],
+    });
+    app.publish(ran);
+    assert_eq!(station(&app, Setting::Dock), 'D');
+    assert_eq!(
+        app.reviewed_row(Subject::Setting(Setting::Dock))
+            .note
+            .as_deref(),
+        Some(UNCONFIRMED_NOTE)
+    );
+    // Confirmed, the rows are settled again.
+    app.publish(status_of("set-up"));
+    assert_eq!(station(&app, Setting::Repositories), 'G');
+    assert_eq!(station(&app, Setting::Dock), 'G');
+    assert_eq!(app.reviewed_row(repositories).chip, Some(Chip::InPlace));
 }

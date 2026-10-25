@@ -8,6 +8,8 @@
 #[cfg(target_os = "macos")]
 mod abrew_admission;
 #[cfg(target_os = "macos")]
+mod admission;
+#[cfg(target_os = "macos")]
 mod aos_gpu_bench;
 #[cfg(target_os = "macos")]
 mod aos_learn;
@@ -213,6 +215,8 @@ mod upgrade_muse;
 mod util;
 #[cfg(target_os = "macos")]
 mod verbs;
+#[cfg(target_os = "macos")]
+mod vm_admit;
 #[cfg(target_os = "macos")]
 mod windows;
 #[cfg(target_os = "macos")]
@@ -505,6 +509,11 @@ Outside any lab (no jail, no stub):
   windows up|down|status|exec|smoke|window|destroy
                                  manage and run the Windows 11 arm64 QEMU VM runtime lane on aarch64 and Prism x86_64 (`windows help`)
 
+Every verb that opens a window (--window, and the Linux lane's GUI rows) first waits for a quiet machine: alone
+among quiet claims in the per-user capacity ledger, once the 1-minute load is low, saying once a minute what it
+waits for; `--admit now` (or `--admit=now`), given to any verb, starts it at once, and a lane's VM boot without
+waiting for disk.
+
 Exit: 0 pass, 1 a finding or a refusal (also an unknown command and, on many verbs, a bad argument), 2 usage,
 3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
 ";
@@ -790,26 +799,29 @@ fn main() -> std::process::ExitCode {
                 _ => {
                     sys::forget_env(paths::forgotten);
                     sys::confine_env();
-                    let r = if matches!(
-                        cmd.as_str(),
-                        "" | "help"
-                            | "-h"
-                            | "--help"
-                            | "paths"
-                            | "protected"
-                            | "fleet-sim"
-                            | "reduce"
-                            | "trail-contrast"
-                            | "abrew-admission"
-                    ) {
-                        dispatch(&cmd, rest)
-                    } else {
-                        check_state_dir().and_then(|()| dispatch(&cmd, rest))
-                    };
+                    let mut rest = rest.to_vec();
+                    let r = admission::take(&cmd, &mut rest).and_then(|()| {
+                        if matches!(
+                            cmd.as_str(),
+                            "" | "help"
+                                | "-h"
+                                | "--help"
+                                | "paths"
+                                | "protected"
+                                | "fleet-sim"
+                                | "reduce"
+                                | "trail-contrast"
+                                | "abrew-admission"
+                        ) {
+                            dispatch(&cmd, &rest)
+                        } else {
+                            check_state_dir().and_then(|()| dispatch(&cmd, &rest))
+                        }
+                    });
                     match r {
                         Ok(c) => c,
                         Err(f) => {
-                            if let Some(usage) = help_instead(&cmd, rest, &f) {
+                            if let Some(usage) = help_instead(&cmd, &rest, &f) {
                                 print!("{usage}");
                                 return std::process::ExitCode::SUCCESS;
                             }

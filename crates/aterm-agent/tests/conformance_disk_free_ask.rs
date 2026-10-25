@@ -9,7 +9,11 @@
 //! successor adopt its sessions under their sids (a seamless update), while the other host's
 //! looks leave the ended host's pick to it for `ask::ADOPT_MS`; and a line's record can be lost to
 //! a write that fails and be recorded at its host's next look, after its pick was handed off and
-//! another session elected.
+//! another session elected, or after another host ended its episode: a look that reads the volume
+//! clear leaves the lease alone only when no episode is open and its host has no line the lease
+//! has yet to record (`ask::rests`). A successor adopts an owed pick of the host it replaced
+//! whether it still supervises the pick or bars it, so a pick whose agent exited across the
+//! update is released at no election's cost.
 
 use std::path::PathBuf;
 
@@ -299,16 +303,26 @@ impl World {
     /// volume short against its own floor; A's host holds A unseated and barred once its task is
     /// done, and off its supervised roster once its agent exited. A look that reads the asked
     /// session's rise is the model's `Frees` first, so the lease's step is checked against a
-    /// model that knows space was freed. A host holding a line whose record was lost records it
+    /// model that knows space was freed. A look that reads the volume clear of its host's floor
+    /// steps nothing where the window's look takes no lock (`ask::rests`: no episode open, no
+    /// line of its host's to record). A host holding a line whose record was lost records it
     /// first, in the same step ([`World::record`]). A look that leaves standing what the model
     /// would move (a cooldown it is past, a pass it says is spent, a parked episode it gives way)
     /// is refused, as is a hand-off that spends an election on a pick its own host bars, on one
-    /// whose host ended while this host supervises its session, or, before the pick's deadline,
-    /// on one whose host ended less than [`ask::ADOPT_MS`] ago (its successor may yet look).
+    /// whose host ended while this host supervises its session or bars it, or, before the pick's
+    /// deadline, on one whose host ended less than [`ask::ADOPT_MS`] ago (its successor may yet
+    /// look).
     fn look(&mut self, h: usize) -> Result<(), String> {
         if self.s["phase"] == 3 && self.s["rose"] == 0 && self.free >= self.free_at + ask::FREED_MIN
         {
             self.fire("Frees")?;
+        }
+        let short = self.free < FLOORS[h];
+        let lost = self.unrecorded[h].take();
+        if !short && ask::rests(&self.lease(), KEY, lost.as_ref().map(|t| t.at)) {
+            self.trail.push(format!("host {h} look: rests"));
+            self.unrecorded[h] = lost;
+            return Ok(());
         }
         let mut before = self.lease().entry(KEY).cloned();
         let host = self.hosts[h].clone();
@@ -330,7 +344,6 @@ impl World {
             .collect();
         let dead: Vec<HostId> = self.dead.iter().map(|(h, _)| h.clone()).collect();
         let alive = move |x: &HostId| !dead.contains(x);
-        let short = self.free < FLOORS[h];
         let look = ask::Look {
             now_ms: self.now,
             host: &host,
@@ -347,7 +360,6 @@ impl World {
             live: &live,
             alive: &alive,
         };
-        let lost = self.unrecorded[h].take();
         let (recorded, said, after) = ask::transact(&self.dir.0, &ask::LOCK_LADDER, |l| {
             let recorded = lost.as_ref().map(|t| {
                 ask::typed_unrecorded(l, KEY, &host, &t.sid, t.at, t.free);
@@ -392,7 +404,9 @@ impl World {
         let barred_here = |pick: &Pick| pick.host == host && barred.contains(&pick.sid);
         let ended: Vec<HostId> = self.dead.iter().map(|(h, _)| h.clone()).collect();
         let adoptable = |pick: &Pick| {
-            pick.host != host && supervised.contains(&pick.sid) && ended.contains(&pick.host)
+            pick.host != host
+                && (supervised.contains(&pick.sid) || barred.contains(&pick.sid))
+                && ended.contains(&pick.host)
         };
         // An owed pick whose host ended lately, handed off before its deadline: its successor may
         // not have looked yet.
@@ -581,9 +595,10 @@ impl World {
     /// (`ReleaseA`), or any other hand-off. A release must count in the lease's `released`
     /// (`freed_a_pick`), so it spends no election, and nothing else may; a pick its own host
     /// bars (`barred_here`) is never handed off as undelivered, which would spend one; nor is one
-    /// whose host ended while the looking host supervises its session, or ended less than
-    /// [`ask::ADOPT_MS`] before its deadline (`adoptable`): the first host is its successor, and
-    /// adopts it, and any other leaves it to the successor's first look.
+    /// whose host ended while the looking host supervises its session or bars it, or ended less
+    /// than [`ask::ADOPT_MS`] before its deadline (`adoptable`): the first host is its successor,
+    /// and adopts it (releasing one it bars), and any other leaves it to the successor's first
+    /// look.
     fn owed_off(
         &mut self,
         why: Option<Miss>,
@@ -605,8 +620,8 @@ impl World {
         }
         if adoptable && why == Some(Miss::Undelivered) {
             return Err(self.fail(
-                "the lease handed off as undelivered a pick its host's successor supervises or \
-                 may yet adopt"
+                "the lease handed off as undelivered a pick its host's successor supervises, \
+                 bars or may yet adopt"
                     .to_owned(),
             ));
         }
@@ -1184,6 +1199,110 @@ fn a_late_record_that_leaves_a_line_keeps_a_pick_elected_since() {
     }
 }
 
+/// A's line goes with its record lost, and A frees enough that the second host's look ends the
+/// episode before the first host looks again. The first host's next look reads the volume clear
+/// of its floor with no episode open, yet records A's line before it rests, so the cooldown A's
+/// line started holds a new episode shut when the volume falls short again, until it is over.
+fn lost_record_past_the_end(w: &mut World) -> Result<(), String> {
+    w.to(2)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.turn_break_lost()?;
+    w.to(4)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.look(0)?;
+    w.to(0)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.wait(ask::COOLDOWN_MS)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_lost_record_is_kept_by_a_look_that_reads_the_volume_clear_after_its_episode_ended() {
+    let mut w = World::new("lost-record-past-end");
+    lost_record_past_the_end(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .filter_map(|t| t.strip_prefix("host 0 look: "))
+        .map(|t| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Opened", "Elected", "Quiet", "rests", "Cooldown"],
+        "the clear look after the end recorded the line, and the next one rested: {:#?}",
+        w.trail
+    );
+    assert!(
+        w.trail
+            .iter()
+            .any(|t| t.starts_with("host 1 look: Cooldown")),
+        "the second host's short look waits out A's cooldown: {:#?}",
+        w.trail
+    );
+    for action in ["TypeALost", "End", "Cools", "OpenL"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
+/// A is elected; its agent exits with its task (its record says exited, and it leaves the
+/// supervised roster) and its host is replaced by a seamless update before that host looks
+/// again. The successor's seat rule bars A, so its first look adopts A's pick and releases it at
+/// no election's cost, and the next round elects C.
+fn exited_across_a_succession(w: &mut World) -> Result<(), String> {
+    w.to(2)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.exit_a()?;
+    w.succeed(0);
+    w.wait(2 * 60_000)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::ADOPT_MS)?;
+    w.look(0)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_successor_releases_an_exited_pick_of_the_host_it_replaced_at_no_elections_cost() {
+    let mut w = World::new("exited-succession");
+    exited_across_a_succession(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.released, e.asks),
+        (2, 1, 0),
+        "released, not handed off undelivered: {:#?}",
+        w.trail
+    );
+    assert!(
+        matches!(&e.phase, Phase::Owed { pick, .. } if pick.sid == "s-c"),
+        "{:#?}",
+        w.trail
+    );
+    for action in ["ElectA", "Finish", "ReleaseA", "ElectC"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
 /// A fixed-seed walk over every host's looks, turn breaks and releases and the world's moves.
 fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
     let mut x = seed;
@@ -1414,4 +1533,31 @@ fn a_record_that_leaves_a_lost_line_uncounted_is_rejected() {
     let caught = ask::fault::with(ask::fault::Fault::CountOwedOnly, || lost_record(&mut w))
         .expect_err("the checker must reject a line the lease never counts");
     assert!(caught.contains("`RecordLostA` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that reads the volume clear and rests with its host's line
+/// unrecorded (`Fault::RestUnrecorded`, the window's look before it recorded such a line first)
+/// never starts the cooldown of a line whose episode another host ended, so the second host opens
+/// a new episode inside it, and the checker rejects that opening.
+#[test]
+fn a_look_that_rests_with_a_lost_line_unrecorded_is_rejected() {
+    let mut w = World::new("rest-unrecorded");
+    let caught = ask::fault::with(ask::fault::Fault::RestUnrecorded, || {
+        lost_record_past_the_end(&mut w)
+    })
+    .expect_err("the checker must reject an episode opened inside a lost line's cooldown");
+    assert!(caught.contains("`OpenL` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that adopts an ended host's pick only where it supervises its session
+/// (`Fault::AdoptSupervisedOnly`, the look before it adopted one its seat rule bars) leaves an
+/// exited pick owed at its successor's look, which bars it, and the checker rejects that look.
+#[test]
+fn a_successor_that_keeps_an_exited_pick_of_the_host_it_replaced_owed_is_rejected() {
+    let mut w = World::new("adopt-supervised-only");
+    let caught = ask::fault::with(ask::fault::Fault::AdoptSupervisedOnly, || {
+        exited_across_a_succession(&mut w)
+    })
+    .expect_err("the checker must reject an exited pick its successor keeps owed");
+    assert!(caught.contains("`KeepA` is not enabled"), "{caught}");
 }

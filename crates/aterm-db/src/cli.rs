@@ -18,6 +18,7 @@ use std::{
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
   Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
   commons-status                       local membership, control history and sharing setting\n\
+  commons-authority                    inspect cached admin control metadata; changes nothing\n\
   commons-tables                       list declarations, provenance and subscriptions\n\
   commons-open --application <id> --role <id> [--version <n>]\n\
                                        open a deterministic offline application table\n\
@@ -30,9 +31,19 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
                                        atomic proposals; null is reversible deletion\n\
   accounts-revert --operation <digest> --request <hex>\n\
   accounts-history                    signed provenance and local receipts\n\
+  accounts-check                      diagnose explicit contact links; grants no login rights\n\
   accounts-import-csv --file <path> --request <hex>\n\
                                        one atomic, inert CSV candidate document\n\
   accounts-imports                    shared candidates and signed provenance\n\
+  resources-propose --terms <json>    prepare an untrusted fixed-allocation proposal\n\
+  resources-init --allocation <hex> --pin <digest>\n\
+                                      retain an independently trusted allocation pin\n\
+  resources-status --allocation <hex> --pin <digest>\n\
+                                      locally retained usage; no remote-share reclaim\n\
+  resources-reserve --allocation <hex> --pin <digest> --cost <units> --request <hex>\n\
+                                      reserve fixed rights; performs no provider request\n\
+  resources-attempt --allocation <hex> --pin <digest> --request <hex>\n\
+                                      read an attempt; unknown can include a running adapter\n\
   The private database commands below take --dir, except nonce and inspect-csv.\n\
   init [--namespace accounts]           create a complete single-machine database\n\
   request                              create/print this installation's public actor\n\
@@ -123,12 +134,26 @@ pub fn run(words: &[String]) -> Result<Value> {
     }
     if matches!(
         command,
-        "commons-status" | "commons-tables" | "commons-open" | "commons-create"
+        "commons-status"
+            | "commons-authority"
+            | "commons-tables"
+            | "commons-open"
+            | "commons-create"
     ) {
         return crate::catalog::command::run(command, options);
     }
     if matches!(command, "accounts-import-csv" | "accounts-imports") {
         return crate::import::commons::run(command, options);
+    }
+    if matches!(
+        command,
+        "resources-propose"
+            | "resources-init"
+            | "resources-status"
+            | "resources-reserve"
+            | "resources-attempt"
+    ) {
+        return crate::resources::command::run(command, options);
     }
     if matches!(
         command,
@@ -138,6 +163,7 @@ pub fn run(words: &[String]) -> Result<Value> {
             | "accounts-write"
             | "accounts-revert"
             | "accounts-history"
+            | "accounts-check"
     ) {
         return crate::accounts::proposals::command::run(command, options);
     }

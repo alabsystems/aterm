@@ -18,10 +18,12 @@ mod admin_keys;
 mod admission;
 mod creation;
 mod enrollment;
+mod inspection;
 mod retirement;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
 pub use enrollment::admin_cached;
+pub use inspection::CommonsControlInspection;
 pub use retirement::{Retirement, Revocation, admin_retire, admin_revoke};
 #[cfg(test)]
 mod birth_tests;

@@ -510,7 +510,7 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
         let target_dir = format!("{lane}/{dir}");
         // A build has no hang detector: on a loaded host it is slow, not hung (as in test_run).
         let argv = guest::with_env(
-            &guest::cargo_env(arch, &target_dir, false),
+            &up.cargo_env(arch, &target_dir, false),
             &verifier_build_args(&manifest, arch.triple(), assertions),
         );
         let out = up.guest.shell_streamed(&up.home, &argv, "  | ");
@@ -533,7 +533,7 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
         });
         built.push(exe);
     }
-    let mut env = guest::cargo_env(arch, &format!("{lane}/target"), false);
+    let mut env = up.cargo_env(arch, &format!("{lane}/target"), false);
     env.push(("ATERM_TEST_BOOTSTRAP_VERIFIER".into(), built[1].clone()));
     env.push((
         "ATERM_TEST_BOOTSTRAP_VERIFIER_SHIPPED".into(),
@@ -1931,7 +1931,7 @@ pub fn cmd_a11y(args: &[String]) -> Res {
 
 fn run(ask: &ProofArgs, kind: &str) -> Res {
     crate::stop::install();
-    let _lock = linux::LaneLock::take()?;
+    let _lock = linux::LaneLock::boot()?;
     let results = linux::state_dir()?.join(format!(
         "{kind}-{}",
         crate::util::compact_stamp(crate::util::now_secs())
@@ -1994,8 +1994,8 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 continue;
             }
         }
-        let env = guest::cargo_env(arch, &format!("{lane}/target"), false);
-        let oracle_env = guest::cargo_env(arch, &format!("{lane}/libc-oracle-target"), false);
+        let env = up.cargo_env(arch, &format!("{lane}/target"), false);
+        let oracle_env = up.cargo_env(arch, &format!("{lane}/libc-oracle-target"), false);
         let bin = arch.bin_dir(&format!("{lane}/target"));
         let a11y =
             (!ask.gone_only && !ask.cpu_only && !ask.deck_only).then(|| crate::linux_a11y::Cell {
@@ -2188,6 +2188,11 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             "  | ",
         );
         let built = out.ok();
+        // The GUI rows that follow are timed: they run on the quiet machine, from here to the
+        // end of this arch ([`crate::admission`]).
+        let _quiet = built
+            .then(|| crate::admission::quiet(&format!("{tag} GUI rows")))
+            .flatten();
         rows.push(Row {
             name: format!("{tag} build aterm-gui{oracle}"),
             verdict: if built { Verdict::Pass } else { Verdict::Fail },

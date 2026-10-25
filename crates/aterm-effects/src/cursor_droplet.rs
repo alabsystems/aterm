@@ -90,25 +90,26 @@ impl Default for DropletFrame {
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 fn ramp_band_on(ground: u32) -> (f32, f32) {
     let lum_g = crate::color_math::relative_luminance(ground);
+    let lum_g_plus = lum_g + 0.05;
     #[inline]
-    const fn meets_rgb(lum_g: f32, rgb: u32) -> bool {
+    const fn meets_rgb(lum_g: f32, lum_g_plus: f32, rgb: u32) -> bool {
         let lum_w = crate::color_math::relative_luminance(rgb);
-        let (hi, lo) = if lum_w > lum_g {
-            (lum_w, lum_g)
+        let (hi_plus, lo_plus) = if lum_w > lum_g {
+            (lum_w + 0.05, lum_g_plus)
         } else {
-            (lum_g, lum_w)
+            (lum_g_plus, lum_w + 0.05)
         };
-        (hi + 0.05) / (lo + 0.05) >= CARET_PAGE_MIN_CONTRAST
+        hi_plus / lo_plus >= CARET_PAGE_MIN_CONTRAST
     }
     let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };
     let far_rgb = water_ramp(far);
-    if !meets_rgb(lum_g, far_rgb) {
+    if !meets_rgb(lum_g, lum_g_plus, far_rgb) {
         return (far, far);
     }
     let near = 1.0 - far;
     let near_rgb = water_ramp(near);
-    if meets_rgb(lum_g, near_rgb) {
+    if meets_rgb(lum_g, lum_g_plus, near_rgb) {
         return (0.0, 1.0);
     }
     let (mut pass, mut fail) = (far, near);
@@ -122,7 +123,7 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
             pass = mid;
         } else if mid_rgb == fail_rgb {
             fail = mid;
-        } else if meets_rgb(lum_g, mid_rgb) {
+        } else if meets_rgb(lum_g, lum_g_plus, mid_rgb) {
             pass = mid;
             pass_rgb = mid_rgb;
         } else {

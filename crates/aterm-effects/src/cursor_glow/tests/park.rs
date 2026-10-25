@@ -663,8 +663,7 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
         "the mirror never left the origin"
     );
     assert!(
-        glow.type_hint
-            .any_fresh(at(460), CursorGlow::TYPE_HINT_FRESH),
+        glow.type_hint.any_fresh(at(460), TYPE_HINT_FRESH_DUR),
         "the key's stamp survives for its own echo"
     );
     assert_eq!(glow.typed_credits_within(at(460)), 1);
@@ -876,7 +875,7 @@ fn a_late_park_flush_cannot_spend_a_stamp_banked_after_the_park() {
     );
     assert!(
         glow.type_hint
-            .any_fresh(k5 + Duration::from_millis(10), CursorGlow::TYPE_HINT_FRESH),
+            .any_fresh(k5 + Duration::from_millis(10), TYPE_HINT_FRESH_DUR),
         "the new key's stamp survives the flush"
     );
     assert_eq!(

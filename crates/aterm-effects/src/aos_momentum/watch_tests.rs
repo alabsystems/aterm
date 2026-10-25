@@ -517,3 +517,70 @@ fn a_trace_from_another_build_is_refused_identity_before_it_replays() {
         "the plain replay names only the code"
     );
 }
+
+#[test]
+fn a_reattach_keeps_the_dropped_recordings_retired_segments_for_the_watcher() {
+    let t0 = Instant::now();
+    let (mut host, now, _) = strand(attached(t0, MomentumCode::DemoStrandedSettle), t0, true);
+    host.aos_pause(now, LANE).expect("pauses");
+    host.aos_repair(MomentumCode::Shipped).expect("repairs");
+    assert_eq!(
+        host.aos_retired_waiting(),
+        1,
+        "fixture: the commit retired a segment"
+    );
+    host.aos_attach(now + ms(10), MomentumCode::Shipped, BUILD, 2);
+    assert!(host.aos_attached(), "re-attached on a new epoch");
+    assert_eq!(
+        host.aos_retired_waiting(),
+        1,
+        "the dropped recording's segment waits"
+    );
+    let judged: Vec<_> = host
+        .aos_take_retired()
+        .into_iter()
+        .map(Segment::judge)
+        .collect();
+    assert_eq!(judged.len(), 1);
+    assert_eq!(judged[0].cause, Retire::Committed);
+    assert_eq!(judged[0].code, "demo-stranded-settle");
+    assert!(
+        matches!(
+            judged[0].judged,
+            Judged::Fail {
+                law: HOT_HAS_WAKE,
+                ..
+            }
+        ),
+        "{:?}",
+        judged[0].judged
+    );
+}
+
+#[test]
+fn a_segment_the_watcher_could_not_judge_keeps_its_span_and_no_fault() {
+    let t0 = Instant::now();
+    let (mut host, now, _) = strand(attached(t0, MomentumCode::DemoStrandedSettle), t0, true);
+    host.aos_pause(now, LANE).expect("pauses");
+    host.aos_repair(MomentumCode::Shipped).expect("repairs");
+    let schema = hosted(&host).boundary.schema().clone();
+    let mut retired = hosted_mut(&mut host).boundary.drain_retired();
+    let r = retired
+        .pop()
+        .expect("fixture: the commit retired a segment");
+    let judged = Segment::new(schema.clone(), r.clone()).judge();
+    assert!(judged.judged.failed(), "negative control: judged, it fails");
+    let left = Segment::new(schema, r).unjudged("the worker did not run");
+    assert_eq!(left.judged, Judged::Unjudged("the worker did not run"));
+    assert_eq!(left.fault, None);
+    assert_eq!(
+        (left.cause, left.code, left.log_epoch, left.from, left.to),
+        (
+            judged.cause,
+            judged.code,
+            judged.log_epoch,
+            judged.from,
+            judged.to
+        )
+    );
+}

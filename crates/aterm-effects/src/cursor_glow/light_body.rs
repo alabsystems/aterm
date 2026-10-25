@@ -49,21 +49,22 @@ const fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
 /// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves `theme_fg` `keep` of its contrast on the bare paper, composited as the renderer composites a quad.
 #[must_use]
 pub(crate) const fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
+    let table = crate::color_math::relative_luminance_table();
     let (fg, bg) = (theme_fg & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF);
-    let lum_fg = relative_luminance(fg);
+    let lum_fg = crate::color_math::relative_luminance_with(table, fg);
     #[inline]
-    const fn ratio(lum_fg: f32, c: u32) -> f32 {
-        let l = relative_luminance(c);
+    const fn ratio(table: &crate::color_math::RelativeLuminanceTable, lum_fg: f32, c: u32) -> f32 {
+        let l = crate::color_math::relative_luminance_with(table, c);
         (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05)
     }
-    let want = ratio(lum_fg, bg) * keep;
-    if ratio(lum_fg, over_at(bg, ink, u8::MAX)) >= want {
+    let want = ratio(table, lum_fg, bg) * keep;
+    if ratio(table, lum_fg, over_at(bg, ink, u8::MAX)) >= want {
         return u8::MAX as f32;
     }
     let (mut lo, mut hi) = (0u8, u8::MAX);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if ratio(lum_fg, over_at(bg, ink, mid)) >= want {
+        if ratio(table, lum_fg, over_at(bg, ink, mid)) >= want {
             lo = mid;
         } else {
             hi = mid;
@@ -114,12 +115,15 @@ pub(crate) const fn light_ink_vivid_over_floor(
         }
         ch(bold, k, 16) | ch(bold, k, 8) | ch(bold, k, 0)
     }
+    let table = crate::color_math::relative_luminance_table();
     let top = if peak == 0 { 1.0 } else { 255.0 / peak as f32 };
     let top_rgb = scaled(bold, top);
     if a_max == 0
         || rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
-        || relative_luminance(over_at(theme_bg, bold, a_max)) >= floor
-        || relative_luminance(over_at(theme_bg, top_rgb, a_max)) < floor
+        || crate::color_math::relative_luminance_with(table, over_at(theme_bg, bold, a_max))
+            >= floor
+        || crate::color_math::relative_luminance_with(table, over_at(theme_bg, top_rgb, a_max))
+            < floor
     {
         return light_ink_over_floor(rgb, theme_bg, a_max, floor);
     }
@@ -129,7 +133,8 @@ pub(crate) const fn light_ink_vivid_over_floor(
     while i < FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = scaled(bold, mid);
-        let mid_lum = relative_luminance(over_at(theme_bg, mid_rgb, a_max));
+        let mid_lum =
+            crate::color_math::relative_luminance_with(table, over_at(theme_bg, mid_rgb, a_max));
         if mid_rgb == hi_rgb || (mid_rgb != lo_rgb && mid_lum >= floor) {
             hi = mid;
             hi_rgb = mid_rgb;
@@ -155,39 +160,46 @@ pub(crate) const fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floo
     if a_max == 0 {
         return ink;
     }
-    if relative_luminance(over_at(theme_bg, ink, a_max)) >= floor {
+    let table = crate::color_math::relative_luminance_table();
+    if crate::color_math::relative_luminance_with(table, over_at(theme_bg, ink, a_max)) >= floor {
         return ink;
     }
-    let (w_bar, bar_rgb) = if relative_luminance(over_at(theme_bg, 0x00FF_FFFF, a_max)) >= floor {
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
-        let mut i = 0;
-        while i < FRESH_INK_GLYPH_BISECT {
-            let mid = 0.5 * (lo + hi);
-            let mid_rgb = toward_white(ink, mid);
-            let matches = if mid_rgb == lo_rgb {
-                false
-            } else if mid_rgb == hi_rgb {
-                true
-            } else {
-                relative_luminance(over_at(theme_bg, mid_rgb, a_max)) >= floor
-            };
-            if matches {
-                hi = mid;
-                hi_rgb = mid_rgb;
-            } else {
-                lo = mid;
-                lo_rgb = mid_rgb;
+    let (w_bar, bar_rgb) =
+        if crate::color_math::relative_luminance_with(table, over_at(theme_bg, 0x00FF_FFFF, a_max))
+            >= floor
+        {
+            let (mut lo, mut hi) = (0.0f32, 1.0f32);
+            let (mut lo_rgb, mut hi_rgb) = (ink, 0x00FF_FFFF);
+            let mut i = 0;
+            while i < FRESH_INK_GLYPH_BISECT {
+                let mid = 0.5 * (lo + hi);
+                let mid_rgb = toward_white(ink, mid);
+                let matches = if mid_rgb == lo_rgb {
+                    false
+                } else if mid_rgb == hi_rgb {
+                    true
+                } else {
+                    crate::color_math::relative_luminance_with(
+                        table,
+                        over_at(theme_bg, mid_rgb, a_max),
+                    ) >= floor
+                };
+                if matches {
+                    hi = mid;
+                    hi_rgb = mid_rgb;
+                } else {
+                    lo = mid;
+                    lo_rgb = mid_rgb;
+                }
+                if lo_rgb == hi_rgb {
+                    break;
+                }
+                i += 1;
             }
-            if lo_rgb == hi_rgb {
-                break;
-            }
-            i += 1;
-        }
-        (hi, hi_rgb)
-    } else {
-        (1.0, 0x00FF_FFFF)
-    };
+            (hi, hi_rgb)
+        } else {
+            (1.0, 0x00FF_FFFF)
+        };
     if !crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, ink, a_max), theme_bg) {
         ink
     } else if crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, bar_rgb, a_max), theme_bg) {
@@ -404,13 +416,18 @@ fn soft_ellipse(
         lift: 0.0,
         lift_span: 0.0,
     }; STEPS + 1];
-    let xs: [f32; STEPS + 1] = std::array::from_fn(|i| {
+    let mut xs = [0.0f32; STEPS + 1];
+    let mut i = 0;
+    while i <= STEPS {
         let (u, _) = u_round[i];
-        cx + u * if u < 0.0 { left } else { right }
-    });
-    for (i, v) in verts.iter_mut().enumerate() {
+        xs[i] = cx + u * if u < 0.0 { left } else { right };
+        i += 1;
+    }
+    let mut i = 0;
+    while i <= STEPS {
         let (_, round) = u_round[i];
         let r = (reach * round).max(0.5);
+        let v = &mut verts[i];
         v.x = xs[i];
         v.up = r;
         v.dn = r;
@@ -418,6 +435,7 @@ fn soft_ellipse(
         v.core_dn = r * 0.3;
         let kept = share(xs[i.saturating_sub(1)], xs[(i + 1).min(STEPS)]).clamp(0.0, 1.0);
         v.cov = peak * round * round * kept;
+        i += 1;
     }
     let stride = (geom.cw / 8).max(1);
     ribbon_beam(out, geom.beam_clip(), &verts, 1.0, stride, budget, blend);

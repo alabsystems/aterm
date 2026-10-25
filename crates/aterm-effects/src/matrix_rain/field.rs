@@ -258,8 +258,9 @@ pub const fn dither_epoch(tick: u64, dq: u32) -> u32 {
 #[must_use]
 #[inline]
 pub const fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u32, bool) {
+    const _: () = assert!(GLYPH_COUNT.is_power_of_two());
     let g = rain_hash32(seed32 ^ pack(row, col) ^ glyph_epoch);
-    (g % GLYPH_COUNT, (g >> 8) & 1 == 1)
+    (g & (GLYPH_COUNT - 1), (g >> 8) & 1 == 1)
 }
 
 /// Frame-invariant glyph mutation epoch `tick / mq`.
@@ -310,8 +311,9 @@ impl DensityRing {
     /// Record a `(tick, density)` change point once deduplicated by the caller.
     #[inline]
     pub const fn push(&mut self, tick: u64, density: u8) {
+        const _: () = assert!(DENSITY_RING.is_power_of_two());
         self.entries[self.head] = (tick, density);
-        self.head = (self.head + 1) % DENSITY_RING;
+        self.head = (self.head + 1) & (DENSITY_RING - 1);
         let next_len = self.len + 1;
         self.len = if next_len < DENSITY_RING {
             next_len

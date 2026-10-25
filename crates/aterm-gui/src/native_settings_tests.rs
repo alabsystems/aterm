@@ -36474,95 +36474,367 @@ fn a_key_before_an_opened_pickers_first_layout_takes_the_window_with_it() {
     assert!(window.start > 0, "the list scrolls at this size");
 }
 
-#[test]
-fn a_picker_last_screen_fills_its_list() {
-    let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
-    let mut checked = 0;
-    let mut widest_band = 0.0_f32;
-    for (width, height) in [
-        (584.0, 350.0),
-        (738.0, 420.0),
-        (1_074.0, 684.0),
-        (1_193.0, 516.0),
-    ] {
-        let context = format!("{width}x{height}");
-        let cx = view_cx_at(width, height);
-        let (mut runtime, instance, view) = full_theme_picker_at(&cx);
-        {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
+/// A light theme file of the person's own, listed under YOURS.
+const PAPER_THEME: &str =
+    "name = Paper\nappearance = light\nforeground = #24292f\nbackground = #ffffff\n";
+
+/// What a picker's screen draws wrong, read off what the compiler painted (a
+/// tile an edge cuts through its name is not painted at all): a section
+/// heading an edge cuts, a caption over no row of its own section, a row
+/// under another section's caption or none, a band of blank under a screen
+/// the list goes on past (more than a gap and a sliver no edge draws), a last
+/// screen that neither ends on the list's bottom edge nor starts whole at its
+/// top, and a spoken name that names other sections than the rows the screen
+/// draws live.
+fn picker_screen_faults(
+    compiled: &crate::native_ui::CompiledUi,
+    picker: &ChoicePicker,
+) -> Vec<String> {
+    let key = picker.key.as_str();
+    let Some(list) = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str() == format!("settings/choice-list/{key}"))
+    else {
+        return vec!["no list".to_string()];
+    };
+    let section_prefix = format!("settings/choice-section/{key}/");
+    // What the list paints, top first: a heading (its section's key word) or
+    // a tile (the key word of its captioned section; `None` where no caption
+    // names it), where it shows, and whether it is the fading peek.
+    type Painted = (f32, f32, bool, Result<String, Option<String>>);
+    let mut items: Vec<Painted> = compiled
+        .paint
+        .iter()
+        .filter(|node| node.clip.height > 0.5 && list.clip.intersect(node.clip).is_some())
+        .filter_map(|node| {
+            let item = if let Some(word) = node.key.as_str().strip_prefix(&section_prefix) {
+                Ok(word.to_string())
+            } else if matches!(node.content, UiContent::Button(_)) {
+                let position = picker.focus_position(&node.key)?;
+                Err(picker
+                    .cell_section(position)
+                    .filter(|heading| picker.headed() && section_captioned(heading))
+                    .map(key_fragment))
+            } else {
+                return None;
             };
-            state.common.last_focus = None;
+            Some((node.clip.y, node.clip.bottom(), node.fade.is_some(), item))
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut faults = Vec::new();
+    let heading_over = |at: f32| {
+        items
+            .iter()
+            .rev()
+            .find(|(_, bottom, _, item)| item.is_ok() && *bottom <= at + 0.5)
+            .and_then(|(_, _, _, item)| item.clone().ok())
+    };
+    for (index, (top, bottom, fades, item)) in items.iter().enumerate() {
+        match item {
+            Ok(word) => {
+                let node = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == format!("{section_prefix}{word}"))
+                    .expect("painted");
+                if !fades && node.clip.height + 0.5 < node.rect.height {
+                    faults.push(format!(
+                        "{word} cut to {:.0} of {:.0}",
+                        node.clip.height, node.rect.height
+                    ));
+                }
+                if !fades {
+                    let next = items[index + 1..].first();
+                    if !matches!(next, Some((_, _, _, Err(Some(under)))) if under == word) {
+                        faults.push(format!("{word} at {top:.0} stands over {next:?}"));
+                    }
+                }
+            }
+            Err(Some(section)) => {
+                let over = heading_over(*top);
+                if over.as_deref() != Some(section.as_str()) {
+                    faults.push(format!(
+                        "a {section} row at {top:.0}..{bottom:.0} under {over:?}"
+                    ));
+                }
+            }
+            Err(None) => {}
         }
-        let picker = open_theme_picker(&runtime, view);
-        picker.offset.set(picker.rows().len().saturating_sub(1));
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        let picker = open_theme_picker(&runtime, view);
-        let rows = picker.rows();
-        let window = picker.window(&rows);
-        if window.start == 0 {
-            continue;
-        }
-        let list = compiled
-            .paint
-            .iter()
-            .find(|node| node.key.as_str() == format!("settings/choice-list/{}", prefs::EDIT_THEME))
-            .unwrap_or_else(|| panic!("{context}: the list"))
-            .rect;
-        let lowest = compiled
-            .paint
-            .iter()
-            .filter(|node| {
-                node.key
-                    .as_str()
-                    .starts_with(&format!("settings/choice-row/{}/", prefs::EDIT_THEME))
-            })
-            .map(|node| node.rect.bottom())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            (list.bottom() - lowest).abs() <= 0.5,
-            "{context}: the last row ends at {lowest}, the list at {}",
-            list.bottom()
-        );
-        let top = compiled
-            .paint
-            .iter()
-            .filter(|node| {
-                node.key.as_str().starts_with(&section)
-                    || node
-                        .key
-                        .as_str()
-                        .starts_with(&format!("settings/choice-row/{}/", prefs::EDIT_THEME))
-            })
-            .filter(|node| node.clip.height > 0.5)
-            .min_by(|a, b| a.clip.y.total_cmp(&b.clip.y))
-            .unwrap_or_else(|| panic!("{context}: rows"));
-        assert!(
-            top.key.as_str().starts_with(&section),
-            "{context}: the screen starts on {}",
-            top.key.as_str()
-        );
-        let room = picker.room.get().get();
-        let gap = picker.gap.get().get();
-        let used = picker_rows_height(&rows[window.clone()], gap)
-            + picker
-                .carried_heading(&rows, window.start)
-                .map_or(0.0, |_| picker_heading_height() + gap);
-        widest_band = widest_band.max(room - used);
-        assert!(
-            compiled
-                .paint_audit_lines()
-                .iter()
-                .all(|line| !line.contains("clipped=1")),
-            "{context}: no accidental clip"
-        );
-        checked += 1;
     }
-    assert!(checked >= 2, "the sizes scroll: {checked}");
-    assert!(
-        widest_band > scaled_control_height() / 2.0,
-        "no size left a band: {widest_band}"
+    let rows = picker.rows();
+    let window = picker.window(&rows);
+    let gap = picker.gap.get().get();
+    let lowest = items.iter().map(|item| item.1).fold(list.clip.y, f32::max);
+    let highest = items.first().map_or(list.clip.bottom(), |item| item.0);
+    if window.end < rows.len() {
+        let band = list.clip.bottom() - lowest;
+        if band + 0.5 >= gap + crate::native_ui::LIST_PEEK_MIN {
+            faults.push(format!(
+                "{band:.0}pt blank under a screen the list goes on past"
+            ));
+        }
+    } else if window.start > 0
+        && (list.clip.bottom() - lowest).abs() > 0.5
+        && highest > list.clip.y + 0.5
+    {
+        faults.push(format!(
+            "the last screen ends {:.0}pt over the list's bottom and starts {:.0}pt under its top",
+            list.clip.bottom() - lowest,
+            highest - list.clip.y
+        ));
+    }
+    if picker.headed() {
+        let mut shown: Vec<&str> = Vec::new();
+        for node in compiled.paint.iter().filter(|node| {
+            node.fade.is_none()
+                && node.clip.height > 0.5
+                && matches!(node.content, UiContent::Button(_))
+        }) {
+            if let Some(section) = picker
+                .option_index(&node.key)
+                .and_then(|index| picker.options[index].theme.as_ref())
+                .map(|theme| theme.section.label())
+                && !shown.contains(&section)
+            {
+                shown.push(section);
+            }
+        }
+        let label = compiled
+            .semantic(&list.key)
+            .map(|node| node.label.clone())
+            .unwrap_or_default();
+        let said: Vec<&str> = label
+            .split_once(": ")
+            .map(|(_, sections)| sections.split(", ").collect())
+            .unwrap_or_default();
+        if said != shown {
+            faults.push(format!("the list says {said:?} over {shown:?}"));
+        }
+    }
+    faults
+}
+
+/// The theme picker, one with a theme of the person's own (a YOURS section)
+/// and a font picker, open at `cx`, each with the keyboard on nothing.
+fn pickers_at(
+    cx: &ViewCx<'_>,
+) -> Vec<(
+    &'static str,
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+)> {
+    let (runtime, instance, view) = full_theme_picker_at(cx);
+    let mut pickers = vec![("themes", runtime, instance, view)];
+    let (runtime, instance, view) = theme_picker_runtime(theme_catalog_with(
+        "screens",
+        &[("paper.conf", PAPER_THEME)],
+    ));
+    pickers.push(("yours", runtime, instance, view));
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        assert!(state.replace_font_families(injected_font_families()));
+    }
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/font-picker/font_family",
     );
+    pickers.push(("fonts", runtime, instance, view));
+    for (_, runtime, _, view) in &mut pickers {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(*view) else {
+            unreachable!();
+        };
+        state.common.last_focus = None;
+    }
+    pickers
+}
+
+/// EVERY SCREEN OF A PICKER NAMES ITS ROWS AND FILLS ITS LIST, from every
+/// first row at sizes and text scales whose picker scrolls: no heading is
+/// cut, a caption stands over a row of its own section and every row under
+/// its own section's caption, no screen the list goes on past ends on more
+/// than a gap and a sliver of blank, the last screen ends on the list's
+/// bottom edge or starts whole at its top, and the spoken name names the
+/// sections it draws ([`picker_screen_faults`]). Negative control: the walk
+/// back that pinned the caption of the row it stopped at drew LIGHT over
+/// THEME FILES cut to 6pt at 1193x434, DARK over LIGHT at 1074x684 and LIGHT
+/// over the user theme with YOURS cut to a point at 738x418; a heading too
+/// low for a row under it left 35pt blank over THEME FILES at 738x418.
+#[test]
+fn every_picker_screen_names_its_rows_and_fills_its_list() {
+    let mut sizes = vec![
+        (738.0, 418.0),
+        (738.0, 420.0),
+        (864.0, 434.0),
+        (1_074.0, 684.0),
+        (1_193.0, 434.0),
+    ];
+    for width in [584.0, 864.0, 1_193.0] {
+        sizes.extend((340..=860).step_by(52).map(|height| (width, height as f32)));
+    }
+    at_each_text_scale(&[1.0, 2.0], "picker screens", |scale| {
+        let mut screens = 0;
+        let mut faults = Vec::new();
+        for &(width, height) in &sizes {
+            let cx = view_cx_at(width, height);
+            for (fixture, runtime, instance, view) in pickers_at(&cx) {
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let rows = open_picker(&runtime, view).rows().len();
+                for first in 0..rows {
+                    open_picker(&runtime, view).offset.set(first);
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    let picker = open_picker(&runtime, view);
+                    let all = picker.rows();
+                    if picker.window(&all).len() == all.len() {
+                        break;
+                    }
+                    screens += 1;
+                    for fault in picker_screen_faults(&compiled, picker) {
+                        faults.push(format!(
+                            "{scale}x {fixture} {width}x{height} from row {first}: {fault}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(
+            screens > 100,
+            "{scale}x: the pickers scroll at these sizes ({screens} screens)"
+        );
+    });
+}
+
+fn open_picker(runtime: &NativeRuntime, view: crate::native_app::ViewId) -> &ChoicePicker {
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    state.choice_picker.as_ref().expect("a picker is open")
+}
+
+/// A tile an open picker draws in its peek, the picture fading out under its window, is no live
+/// control: a press there scrolls it into the window and chooses nothing, the keyboard and the
+/// preview where they were, as a press on the page list's peek does. Control: in the window the
+/// same tile is live, and a press on it chooses it.
+#[test]
+fn a_press_on_a_pickers_peek_scrolls_the_tile_in_and_chooses_nothing() {
+    let cx = view_cx_at(738.0, 418.0);
+    let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let picker = open_theme_picker(&runtime, view);
+    let picture = compiled
+        .list_pictures
+        .iter()
+        .find(|picture| picker.option_index(&picture.key).is_some())
+        .expect("the first screen fades a row of tiles in under its window")
+        .key
+        .clone();
+    assert!(
+        compiled.semantic(&picture).is_none() && compiled.hits.iter().all(|hit| hit.key != picture),
+        "the peek is a picture, not a control"
+    );
+    let index = picker.option_index(&picture).expect("an option");
+    assert!(!picker.is_visible(index), "it is past the window");
+    let before = {
+        let state = settings_state(&runtime, view);
+        (
+            state.common.last_focus.clone(),
+            picker_candidate(state, prefs::EDIT_THEME).map(str::to_string),
+        )
+    };
+    let outcome = runtime
+        .dispatch(instance, view, AppEvent::PressListPicture(picture.clone()))
+        .unwrap();
+    assert!(
+        !outcome
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::ConfigPatch { .. })),
+        "nothing is chosen"
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let state = settings_state(&runtime, view);
+    assert_eq!(
+        (
+            state.common.last_focus.clone(),
+            picker_candidate(state, prefs::EDIT_THEME).map(str::to_string),
+        ),
+        before,
+        "the keyboard and the preview stay"
+    );
+    assert!(
+        open_theme_picker(&runtime, view).is_visible(index),
+        "the press scrolled the tile into the window"
+    );
+    assert!(compiled.hits.iter().any(|hit| hit.key == picture));
+    assert!(
+        theme_written_by(&mut runtime, instance, view, picture.as_str(), None).is_some(),
+        "a press on the live tile chooses it"
+    );
+}
+
+/// A SHORT HOST STILL GIVES THE PICKER A ROW UNDER ITS CAPTION: in a window too short for the
+/// page's heading, the preview's least and the picker's least form, the page sheds its heading,
+/// as a compact page does, so the theme picker's list shows a whole row of themes under its
+/// section's caption (at 167x26 the heading left the list 28pt: DARK over no theme).
+#[test]
+fn a_short_picker_host_shows_a_whole_row_under_its_caption() {
+    let row = format!("settings/choice-row/{}/", prefs::EDIT_THEME);
+    let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
+    for height in [366.0, 376.0, 390.0] {
+        let cx = view_cx_at(1_193.0, height);
+        for host in ["home", "appearance"] {
+            let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Nord\"\n", true);
+            if host == "appearance" {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Appearance);
+            }
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            theme_written_by(
+                &mut runtime,
+                instance,
+                view,
+                &format!("settings/set/{}", prefs::EDIT_THEME),
+                None,
+            );
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let caption = compiled
+                .paint
+                .iter()
+                .filter(|node| node.key.as_str().starts_with(&section) && node.fade.is_none())
+                .map(|node| node.clip.bottom())
+                .fold(f32::NEG_INFINITY, f32::max);
+            let whole = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key.as_str().starts_with(&row)
+                        && node.fade.is_none()
+                        && (node.clip.height - node.rect.height).abs() < 0.5
+                        && node.clip.y >= caption
+                })
+                .count();
+            assert!(
+                caption.is_finite() && whole >= 1,
+                "1193x{height} {host}: {whole} whole rows of themes under the caption"
+            );
+        }
+    }
 }
 
 #[test]
@@ -36834,6 +37106,8 @@ fn every_picker_host_leaves_the_theme_picker_a_heading_over_two_rows() {
     }
 }
 
+/// What the theme picker's list paints ends on a section heading only in its fading peek, a
+/// picture of what follows the window, never as a live caption over no row of its section.
 #[test]
 fn a_theme_picker_list_never_ends_on_a_bare_heading() {
     let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
@@ -36871,8 +37145,8 @@ fn a_theme_picker_list_never_ends_on_a_bare_heading() {
                 .iter()
                 .any(|node| node.key.as_str().starts_with(&section));
             assert!(
-                last.key.as_str().starts_with(&row),
-                "{width}x{height} from row {first}: the list ends on {}",
+                last.key.as_str().starts_with(&row) || last.fade.is_some(),
+                "{width}x{height} from row {first}: the list ends on a live {}",
                 last.key.as_str()
             );
         }
@@ -40086,6 +40360,166 @@ fn a_font_not_found_is_said_everywhere_in_the_same_frame() {
     assert!(header.starts_with(&format!("Font: {family}")), "{header}");
     assert!(!header.contains("Not found"), "{header}");
     assert_eq!(pill.as_deref(), Some("Loading font"));
+}
+
+/// THE LAST SCREEN DRAWS NO BAND OF BLANK OVER ITS ROWS: on the last screen of every list page,
+/// over a sweep of window sizes at 1× and 2× text, no caption its seat cuts is hidden over the
+/// rows under it, and no caption is kept over a stop before the screen's own first cut under it.
+/// Hidden, a cut caption left a band of blank over the whole rows under it (Packages' ACTIVITY
+/// and its Open Log 40pt at 1074x670, Window's SESSION 21pt at 738x418, Harness' UPDATES 22pt at
+/// 1074x670); kept, a caption stood over a row cut through its words, drawn not at all
+/// (Harness' UPDATES at 1074x485 over 17pt of a row). And Packages' activity, its 64pt head over
+/// 32pt rows, starts its last screen under ACTIVITY or with a row whole at the list's top, with
+/// less room to spare under its end than the stop before the screen would take: scrolled off, the
+/// head left 40pt under the end at 1074x670, where a 32pt row fits under it.
+#[test]
+fn the_last_screen_draws_no_band_over_its_rows() {
+    let sizes: Vec<(f32, f32)> = [738.0, 1_074.0]
+        .into_iter()
+        .flat_map(|width| {
+            (360..=760)
+                .step_by(25)
+                .map(move |height| (width, height as f32))
+        })
+        .collect();
+    at_each_text_scale(&[1.0, 2.0], "last screens", |scale| {
+        let mut faults = Vec::new();
+        let (mut filled, mut activity) = (0, 0);
+        for route in SettingsRoute::ALL {
+            for &(width, height) in &sizes {
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = setup();
+                assert!(runtime.replace_settings_packages(packages_state_with_activity(20), 2));
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.navigate(route);
+                }
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let limit = settings_state(&runtime, view)
+                    .scroll_plan()
+                    .map_or(0, |plan| plan.limit());
+                if limit == 0 {
+                    continue;
+                }
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.scroll_page_to(limit);
+                    state.page_reveal = None;
+                }
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let context = format!("{scale}x {route:?} {width}x{height}");
+                let Some(plan) = settings_state(&runtime, view).scroll_plan() else {
+                    continue;
+                };
+                let screen = plan.screen(plan.limit());
+                if screen.drawn.start < screen.view.start {
+                    filled += 1;
+                }
+                match screen.caption {
+                    Some(caption) if !caption.kept => {
+                        faults.push(format!("{context}: a caption its top cuts, hidden"));
+                    }
+                    Some(_) if screen.drawn.start < screen.view.start => faults.push(format!(
+                        "{context}: a caption kept over stop {} cut under it",
+                        screen.drawn.start
+                    )),
+                    _ => {}
+                }
+                if route != SettingsRoute::Packages {
+                    continue;
+                }
+                let Some(list) = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "packages/list")
+                    .map(|node| node.clip)
+                else {
+                    continue;
+                };
+                let mut rows: Vec<&crate::native_ui::PaintNode> = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        node.key
+                            .as_str()
+                            .strip_prefix("packages/activity/")
+                            .is_some_and(|row| {
+                                let parts: Vec<&str> = row.split('/').collect();
+                                parts[0].parse::<usize>().is_ok()
+                                    && (parts.len() == 1 || parts.len() == 3 && parts[1] == "more")
+                            })
+                            && node.clip.height > 0.5
+                            && list.intersect(node.clip).is_some()
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.clip.y.total_cmp(&b.clip.y));
+                let heading = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "packages/activity/heading")
+                    .filter(|node| node.clip.height > 0.5 && list.intersect(node.clip).is_some());
+                let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+                    continue;
+                };
+                let above = compiled.paint.iter().any(|node| {
+                    matches!(node.content, UiContent::Text(_))
+                        && node.clip.height > 0.5
+                        && list.intersect(node.clip).is_some()
+                        && node.clip.bottom() <= first.clip.y + 0.5
+                        && !node.key.as_str().starts_with("packages/activity/")
+                });
+                if above {
+                    continue;
+                }
+                activity += 1;
+                match heading {
+                    Some(heading) if heading.clip.height + 0.5 < heading.rect.height => {
+                        faults.push(format!("{context}: ACTIVITY cut"));
+                    }
+                    Some(_) => {}
+                    None if first.clip.y - list.y > crate::native_ui::LIST_PEEK_MIN
+                        || first.clip.height + 0.5 < first.rect.height =>
+                    {
+                        faults.push(format!(
+                            "{context}: the activity rows start {:.0}pt under the list's top \
+                             under no ACTIVITY",
+                            first.clip.y - list.y
+                        ));
+                    }
+                    None => {}
+                }
+                // Less room to spare under the end than the stop before the screen would have
+                // taken: no stop that fits is given up.
+                let first = screen.drawn.start;
+                let given = if first > 0 {
+                    plan.span(first - 1..plan.len()) - plan.span(first..plan.len())
+                } else {
+                    f32::INFINITY
+                };
+                let spare = list.y + plan.room() - last.clip.bottom();
+                if spare + 0.5 >= given {
+                    faults.push(format!(
+                        "{context}: {spare:.0}pt to spare under the activity's end, where the \
+                         {given:.0}pt stop before the screen fits"
+                    ));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(
+            filled > 25 && activity > 10,
+            "{scale}x: the sweep reaches the cases: {filled} filled, {activity} activity ends"
+        );
+    });
 }
 
 /// No page moves the rail's rows: the rail lists the same rows on every page, a sub-page's

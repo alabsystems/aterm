@@ -28,6 +28,11 @@ aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
 aterm-types = { workspace = true }
+# The matrices start on a quiet machine (benches/support/quiet.rs): a claim in
+# the per-user capacity ledger (docs/DESIGN-adaptive-build-2026-10-24.md,
+# QUIET-ADMIT).
+# Workspace crate; first-party dependencies only.
+aterm-capacity = { workspace = true }
 # Scratch directories for the scanner's end-to-end PNG test.
 aterm-tempfile = { workspace = true }
 # THE DIFFERENTIAL VT ORACLE (tests/vt_oracle/): astream's pure, zero-dependency
@@ -74,5 +79,12 @@ test = false
 [[bench]]
 name = "aos"
 path = "benches/aos.rs"
+harness = false
+test = false
+
+# The rewind rows: as `paint`, with ATERM_REWIND_BIN (or ATERM_PAINT_BIN).
+[[bench]]
+name = "rewind"
+path = "benches/rewind.rs"
 harness = false
 test = false

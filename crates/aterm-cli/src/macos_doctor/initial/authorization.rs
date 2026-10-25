@@ -24,6 +24,9 @@ pub struct InitialSetupAuthorization {
     vault: AdmittedVault,
     state: AuthorizationState,
     stop: StopReservation,
+    /// This ticket's Join was admitted without its Join: aterm could not read which vault this
+    /// Mac is in ([`Self::join_unread`]).
+    join_unread: bool,
 }
 
 enum AuthorizationState {
@@ -48,6 +51,11 @@ struct AuthorizationCommit {
 enum Admission {
     /// A person's reviewed choice: the plan is theirs and is never widened.
     Person,
+    /// The window's own answer of the plan it offered, with no press, where that plan is not
+    /// aterm's provisional one: measured as a person's answer is, but nothing new is chosen, so
+    /// the run it admits keeps the link that lets a Stop of the run it carries on hold it
+    /// ([`Progress::continues`]), and System State's note that aterm set its records aside stays.
+    Offered,
     /// An explicit Join: the chooser's plan, whose vault-dependent steps run again.
     Join,
     /// aterm's own first-launch plan (System State design §3.5): provisional.
@@ -182,7 +190,11 @@ impl AuthorizationCommit {
         let restored = baseline.records.restored;
         let mut still_restored = None;
         if restored.is_some()
-            || (!same_plan && matches!(admission, Admission::Person | Admission::Join))
+            || (!same_plan
+                && matches!(
+                    admission,
+                    Admission::Person | Admission::Join | Admission::Offered
+                ))
         {
             // A person's answer, or any answer after a Restore (no startup answer is Set up now
             // then), is a choice: whichever plan it admits (the one a choice cut short staged,
@@ -225,8 +237,11 @@ impl AuthorizationCommit {
         next.completed = plan.selection.is_empty();
         next.admitted = false;
         next.running = None;
-        // An admission is a run of its own: an older run's Stop holds it no more.
-        next.continues = None;
+        // An admission is a run of its own: an older run's Stop holds it no more. The window's own
+        // answer of the run it offered chooses nothing new: that run keeps its link.
+        if !(same_plan && admission == Admission::Offered) {
+            next.continues = None;
+        }
         next.admitted_vault = vault;
         let first = if admission == Admission::Upgrade {
             AuthorizationWrite::UpgradePlan(
@@ -328,6 +343,7 @@ impl InitialSetupAuthorization {
             vault: AdmittedVault::Unknown,
             state: AuthorizationState::Bound(baseline),
             stop: StopReservation::default(),
+            join_unread: false,
         })
     }
 
@@ -375,14 +391,22 @@ impl InitialSetupAuthorization {
         )
     }
 
-    /// Some confirms this ticket's exact admitted revision, including an empty plan.
+    /// Some confirms this ticket's exact admitted revision, including an empty plan. A person
+    /// answered: System State's note that aterm set its records aside goes, as after a choice.
     pub fn persist_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
         self.persist_as(plan, Admission::Person)
+    }
+
+    /// [`Self::persist_observed`] for the window's own answer of the plan it offered, with no
+    /// press, where that plan is not aterm's provisional one ([`Admission::Offered`]).
+    pub fn persist_offered_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+        self.persist_as(plan, Admission::Offered)
     }
 
     /// An explicit Join answered through this bound startup review. Its original
     /// doctor records must still be current; the vault this intentional join may
     /// replace is read once as that review starts writing, under the profile lock.
+    /// Where that read fails, the answer is admitted without its Join ([`Self::join_unread`]).
     pub fn persist_join_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
         observe_person_choice(|root| {
             self.persist_join_with(
@@ -395,6 +419,20 @@ impl InitialSetupAuthorization {
         })
     }
 
+    /// Whether this ticket's Join was admitted without its Join ([`Self::persist_join_observed`]):
+    /// aterm could not read which vault this Mac is in (a root-owned or newer-format
+    /// `source.toml`), and that is the vault a Join replaces. Holding the whole first-launch
+    /// answer back for it would hold aterm's own permissions back with it, and try the same
+    /// answer again and again, so the answer is admitted as the person's choice of groups, as
+    /// a group choice is ([`InitialSetupRestart::persist_observed`]), with no vault recorded:
+    /// Permissions and every other group run, and the Secrets step waits with its calm note,
+    /// joining nothing and replacing no vault it did not read ([`AdmittedVault::stands_in`]).
+    /// System State says the vault was not joined and why, and the person can Join once the
+    /// settings read again.
+    pub const fn join_unread(&self) -> bool {
+        self.join_unread
+    }
+
     fn persist_join_with(
         &mut self,
         root: &Path,
@@ -403,14 +441,23 @@ impl InitialSetupAuthorization {
         write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
-        self.persist_with_vault(
+        let mut unread = false;
+        let admitted = self.persist_with_vault(
             root,
             plan,
             Admission::Join,
-            |_| read().map(|configured| AdmittedVault::of(Ok(configured))),
+            |_, admission| match read() {
+                Ok(configured) => Ok((AdmittedVault::of(Ok(configured)), admission)),
+                Err(_) => {
+                    unread = true;
+                    Ok((AdmittedVault::None, Admission::Person))
+                }
+            },
             write,
             observe,
-        )
+        );
+        self.join_unread |= unread;
+        admitted
     }
 
     /// [`Self::persist_observed`] for the plan aterm chose by itself at first
@@ -463,6 +510,16 @@ impl InitialSetupAuthorization {
         plan: &Plan,
     ) -> InitialSetupObserved<Option<u64>> {
         self.persist_at_as(root, plan, Admission::Person)
+    }
+
+    /// [`Self::persist_offered_observed`] at `root`.
+    #[cfg(test)]
+    pub(super) fn persist_offered_at(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+    ) -> InitialSetupObserved<Option<u64>> {
+        self.persist_at_as(root, plan, Admission::Offered)
     }
 
     /// [`Self::persist_join_observed`] at `root`, in the vault `configured` this Mac is in now.
@@ -527,7 +584,14 @@ impl InitialSetupAuthorization {
         write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
-        self.persist_with_vault(root, plan, admission, Ok, write, observe)
+        self.persist_with_vault(
+            root,
+            plan,
+            admission,
+            |vault, admission| Ok((vault, admission)),
+            write,
+            observe,
+        )
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -621,12 +685,35 @@ impl InitialSetupAuthorization {
         .result
     }
 
+    /// Admit `plan` as `admission` says. A person's answer or Join, once admitted, takes System
+    /// State's note that aterm set its records aside away, as a choice does
+    /// ([`InitialSetupRestart::persist_observed`]); one left only keeps that calm note up.
+    /// `read` says, as the ticket starts writing, the vault the admission records and who
+    /// admits it: a Join whose read fails is the person's answer ([`Self::join_unread`]).
     fn persist_with_vault(
         &mut self,
         root: &Path,
         plan: &Plan,
         admission: Admission,
-        read: impl FnOnce(AdmittedVault) -> Result<AdmittedVault, String>,
+        read: impl FnOnce(AdmittedVault, Admission) -> Result<(AdmittedVault, Admission), String>,
+        write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
+        observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
+    ) -> Result<Option<u64>, String> {
+        let admitted = self.admit_with_vault(root, plan, admission, read, write, observe);
+        if matches!(admitted, Ok(Some(_)))
+            && matches!(admission, Admission::Person | Admission::Join)
+        {
+            let _ = set_aside::forget_at(root);
+        }
+        admitted
+    }
+
+    fn admit_with_vault(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        admission: Admission,
+        read: impl FnOnce(AdmittedVault, Admission) -> Result<(AdmittedVault, Admission), String>,
         mut write: impl FnMut(&AuthorizationWrite, &Path) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
@@ -651,7 +738,7 @@ impl InitialSetupAuthorization {
                     return Ok(None);
                 }
                 let owned = baseline.clone();
-                let vault = read(self.vault)?;
+                let (vault, admission) = read(self.vault, admission)?;
                 let waiting = owned.records.restored.is_some() && restore_waits(root);
                 let revision_floor = revision::floor(root)?;
                 self.state = AuthorizationState::Ended;
@@ -978,43 +1065,51 @@ mod tests {
         }
     }
 
+    /// The first-launch offer answered with a typed Join while this Mac's vault configuration
+    /// cannot be read (a root-owned `source.toml`): the Join's own read fails, and holding the
+    /// answer back for it would hold aterm's own permissions back too, trying the same answer
+    /// again and again. It is admitted at once as the person's choice of groups, with no vault
+    /// recorded and nothing joined: Permissions and every other group run, the Secrets step
+    /// waits with its calm note, and a vault the configuration names once it reads is left in
+    /// place.
     #[test]
-    fn a_startup_join_read_failure_keeps_the_unwritten_bound_review() {
+    fn a_startup_join_over_an_unreadable_vault_admits_the_answer_without_the_join() {
         let root = aterm_tempfile::tempdir().unwrap();
-        let offered = vault(root.path(), "offered");
-        let joined = vault(root.path(), "joined");
-        let plan = offered.present(selected(&[Setting::Secrets]));
-        save_plan_as(root.path(), &plan, true).unwrap();
         let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
-        ticket
-            .offer_reading(root.path(), || Ok(Some(offered)))
+        let offered = ticket
+            .offer_reading(root.path(), || Err("source.toml: Permission denied".into()))
             .unwrap();
-        let before = observation_at(root.path()).unwrap();
-        let failed = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+        assert!(offered.selection.contains(Setting::Permissions));
+        let mut joined = offered.clone();
+        joined.selection.set(Setting::Secrets, true);
+        joined.vault_url = "https://typed.example/v1/typed".into();
+        let tried = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
             ticket.persist_join_with(
                 root,
-                &plan,
-                || Err("injected current vault read failure".into()),
-                |_, _| panic!("an unreadable authority cannot start writing"),
-                observe,
-            )
-        });
-        assert!(failed.result.is_err());
-        assert!(ticket.pending());
-        assert_eq!(observation_at(root.path()).unwrap(), before);
-        let recovered = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
-            ticket.persist_join_with(
-                root,
-                &plan,
-                || Ok(Some(joined.clone())),
+                &joined,
+                || Err("source.toml: Permission denied".into()),
                 AuthorizationWrite::persist,
                 observe,
             )
         });
-        assert_eq!(recovered.result.unwrap(), Some(1));
-        assert_eq!(
-            progress(root.path()).unwrap().unwrap().admitted_vault,
-            AdmittedVault::Configured(joined.identity())
+        assert!(matches!(tried.result, Ok(Some(_))), "{:?}", tried.result);
+        assert!(!ticket.pending(), "the startup tries nothing again");
+        assert!(
+            ticket.join_unread(),
+            "System State says the vault was not joined"
+        );
+        let admitted = progress(root.path()).unwrap().unwrap();
+        assert!(
+            admitted.admitted,
+            "Full Disk Access, the debugger and Local Network run"
+        );
+        assert_eq!(admitted.admitted_vault, AdmittedVault::None);
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(joined.clone()));
+        assert!(
+            admitted
+                .admitted_vault
+                .stands_in(&joined, &vault(root.path(), "configured")),
+            "the vault this Mac is in stays as it is"
         );
     }
 

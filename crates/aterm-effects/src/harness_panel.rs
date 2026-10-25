@@ -457,19 +457,25 @@ const fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let g = over_rgb(ground, fresh, veil) & 0x00FF_FFFF;
     let lg = relative_luminance(g);
+    let lg_plus = lg + 0.05;
     let lc = relative_luminance(fresh);
     let r_lin = table.linear[((fresh >> 16) & 0xff) as usize];
     let g_lin = table.linear[((fresh >> 8) & 0xff) as usize];
     let b_lin = table.linear[(fresh & 0xff) as usize];
     #[inline]
-    const fn holds_rgb(fresh: u32, veil: u8, lg: f32, ring_rgb: u32) -> bool {
+    const fn holds_rgb(fresh: u32, veil: u8, lg: f32, lg_plus: f32, ring_rgb: u32) -> bool {
         let r = over_rgb(ring_rgb, fresh, veil) & 0x00FF_FFFF;
         let lr = relative_luminance(r);
-        (lr.max(lg) + 0.05) / (lr.min(lg) + 0.05) >= PRINT_RING_CONTRAST
+        let (num, den) = if lr >= lg {
+            (lr + 0.05, lg_plus)
+        } else {
+            (lg_plus, lr + 0.05)
+        };
+        num / den >= PRINT_RING_CONTRAST
     }
     let top = top.min(lc).max(0.0);
     let top_rgb = at_luminance_linear(r_lin, g_lin, b_lin, lc, top);
-    if holds_rgb(fresh, veil, lg, top_rgb) {
+    if holds_rgb(fresh, veil, lg, lg_plus, top_rgb) {
         return top_rgb;
     }
     let (mut lo, mut hi) = (0.0f32, top);
@@ -487,7 +493,7 @@ const fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
             hi = mid;
             continue;
         }
-        if holds_rgb(fresh, veil, lg, mid_rgb) {
+        if holds_rgb(fresh, veil, lg, lg_plus, mid_rgb) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {

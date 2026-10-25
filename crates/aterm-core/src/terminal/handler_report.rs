@@ -454,6 +454,51 @@ mod color_scheme_tests {
         }
     }
 
+    /// The policy's palette bucket refills by the clocks the slices were parsed at, never the system's: a drained bucket answers an OSC 4 query only once the slice's clock has moved.
+    #[test]
+    fn the_palette_bucket_refills_by_the_slices_clocks() {
+        use crate::terminal::ClockReading;
+        use std::time::Duration;
+        let at = |base: ClockReading, ms: u64| ClockReading {
+            monotonic: base.monotonic + Duration::from_millis(ms),
+            wall_ms: base.wall_ms.map(|w| w + ms),
+        };
+        // Twelve queries of seven pairs (the OSC parser keeps 15 parameters): 84 against the 64-token bucket.
+        let mut drain_bucket = Vec::new();
+        for _ in 0..12 {
+            drain_bucket.extend_from_slice(b"\x1b]4");
+            for i in 0..7 {
+                drain_bucket.extend_from_slice(format!(";{i};?").as_bytes());
+            }
+            drain_bucket.push(0x07);
+        }
+        for (gap_ms, pause, admitted) in [
+            (0, Duration::from_millis(150), false),
+            (2_000, Duration::ZERO, true),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
+                aterm_policy::profiles::standard(),
+            ));
+            let base = ClockReading::now();
+            term.process_at(&drain_bucket, base);
+            let drained = drain(&mut term);
+            assert_eq!(
+                drained.windows(4).filter(|w| w == b"\x1b]4;").count(),
+                64,
+                "fixture: the bucket answered 64 pairs, then ran dry"
+            );
+            std::thread::sleep(pause);
+            term.process_at(b"\x1b]4;0;?\x07", at(base, gap_ms));
+            let answer = drain(&mut term);
+            assert_eq!(
+                answer.windows(6).any(|w| w == b"\x1b]4;0;"),
+                admitted,
+                "{gap_ms} ms later by the slices' clocks, {pause:?} later by the system's: {answer:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_2031_push_is_a_report_and_the_996_answer_a_reply() {
         let mut term = Terminal::new(24, 80);

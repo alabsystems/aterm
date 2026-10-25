@@ -401,6 +401,7 @@ const GUI_LIB: &str = "crates/aterm-gui/src/lib.rs";
 const SETUP: &str = "crates/aterm-gui/src/workstation_setup.rs";
 const HOST: &str = "crates/aterm-gui/src/system_state_host.rs";
 const ACCESS: &str = "crates/aterm-gui/src/system_state_access.rs";
+const KEY_EVENTS: &str = "crates/aterm-gui/src/app_input.rs";
 const NATIVE_EVENTS: &str = "crates/aterm-gui/src/app_native.rs";
 const MOUSE_EVENTS: &str = "crates/aterm-gui/src/app_mouse.rs";
 
@@ -437,6 +438,7 @@ const FENCES: &[Fence] = &[
         home: HOST,
         gate: None,
         callers: &[
+            (KEY_EVENTS, "on_key_native_mode"),
             (NATIVE_EVENTS, "dispatch_native_event"),
             (NATIVE_EVENTS, "native_input_event"),
             (MOUSE_EVENTS, "mouse_input_then_fold"),

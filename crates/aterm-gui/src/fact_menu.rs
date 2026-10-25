@@ -319,6 +319,8 @@ pub(crate) struct FactMenuFacts {
     pub(crate) cli: Option<aterm_agent::harness::accounts::Cli>,
     /// The rotation accounts in roster order (dedicated first, then pool).
     pub(crate) accounts: Vec<AccountMenuRow>,
+    /// Why the local pool cannot safely supply choices.
+    pub(crate) accounts_refused: Option<String>,
     /// Whether automatic rotation (`!state.pinned`) is active.
     pub(crate) auto_rotate: bool,
     /// The facts hidden in this session.
@@ -481,6 +483,18 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 }
             }
             note(&mut out);
+            if let Some(why) = &facts.accounts_refused {
+                out.push(MenuRow::note(format!("Account state unavailable: {why}")));
+                out.push(MenuRow::Item {
+                    glyph: "\u{22ef}",
+                    label: "Account settings\u{2026}".to_string(),
+                    spoken: "Account settings".to_string(),
+                    act: MenuAct::Fact(fact, FactAct::AccountSettings),
+                    enabled: true,
+                    checked: false,
+                });
+                return out;
+            }
             let other = facts
                 .cli
                 .filter(|cli| *cli != aterm_agent::harness::accounts::Cli::Claude);
@@ -779,10 +793,10 @@ fn build_account_menu_rows(
     session_account: Option<&str>,
     session_email: Option<&str>,
     session: SessionWeek,
-) -> (Vec<AccountMenuRow>, bool) {
+) -> Result<(Vec<AccountMenuRow>, bool), String> {
     use aterm_agent::harness::accounts;
     if cfg!(test) {
-        return (Vec::new(), true);
+        return Ok((Vec::new(), true));
     }
     if cli != accounts::Cli::Claude {
         let now = aterm_time::unix_secs()
@@ -793,7 +807,7 @@ fn build_account_menu_rows(
             crate::harness_host::harness_state(),
             aterm_primer::home_dir(),
         ) else {
-            return (Vec::new(), true);
+            return Err("account home, configuration or state directory is unavailable".into());
         };
         return pool_menu_rows(
             cli,
@@ -806,23 +820,21 @@ fn build_account_menu_rows(
         .and_then(|n| i64::try_from(n).ok())
         .unwrap_or(0);
     let Some(roster_path) = accounts::default_roster_path() else {
-        return (Vec::new(), true);
+        return Err("account roster path is unavailable".into());
     };
     let state_dir = crate::harness_host::harness_state();
-    let roster = accounts::Roster::load(&roster_path)
-        .ok()
-        .unwrap_or_default();
+    let roster = accounts::Roster::load(&roster_path)?;
     let (roster, state) = match state_dir.as_deref() {
         Some(dir) => {
             let store = accounts::Store::at(dir);
-            let roster = store.bound(&roster, now).unwrap_or(roster);
-            let (state, _) = store.load(now).unwrap_or_default();
+            let roster = store.bound(&roster, now)?;
+            let (state, _) = store.load(now)?;
             (roster, state)
         }
-        None => (roster, accounts::State::default()),
+        None => return Err("account state directory is unavailable".into()),
     };
     let enrolled = accounts::enrolled(&roster);
-    account_menu_rows_from(
+    Ok(account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -830,31 +842,30 @@ fn build_account_menu_rows(
         session_email,
         session,
         now,
-    )
+    ))
 }
 
 /// The account rows of another CLI's pool for a session of it ([`build_account_menu_rows`]): its
 /// roster beside `config` (`accounts-<cli>.toml`), bound to the logins its renewals made, each
 /// row's condition from its own store (`accounts::Store::at_for`); a row is enrolled once its
 /// login file exists (`accounts::enrolled_for`). No roster, or a refused one, is no rows.
-#[must_use]
+/// # Errors
+/// The roster, state or login bindings could not be read.
 pub(crate) fn pool_menu_rows(
     cli: aterm_agent::harness::accounts::Cli,
     (config, state_dir, home): (&std::path::Path, &std::path::Path, &std::path::Path),
     (session_account, session_email): (Option<&str>, Option<&str>),
     now: i64,
-) -> (Vec<AccountMenuRow>, bool) {
+) -> Result<(Vec<AccountMenuRow>, bool), String> {
     use aterm_agent::harness::accounts;
-    let Some(roster) = accounts::roster_beside_for(config, cli)
-        .and_then(|path| accounts::Roster::load_for(cli, &path).ok())
-    else {
-        return (Vec::new(), true);
-    };
+    let path =
+        accounts::roster_beside_for(config, cli).ok_or("account roster path is unavailable")?;
+    let roster = accounts::Roster::load_for(cli, &path)?;
     let store = accounts::Store::at_for(state_dir, cli, home);
-    let roster = store.bound(&roster, now).unwrap_or(roster);
-    let (state, _) = store.load(now).unwrap_or_default();
+    let roster = store.bound(&roster, now)?;
+    let (state, _) = store.load(now)?;
     let enrolled = accounts::enrolled_for(cli, &roster);
-    account_menu_rows_from(
+    Ok(account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -862,7 +873,7 @@ pub(crate) fn pool_menu_rows(
         session_email,
         SessionWeek::default(),
         now,
-    )
+    ))
 }
 
 /// Selects `label` in `cli`'s pool from the fact menu: pins an eligible row at once, or saves a
@@ -1148,12 +1159,18 @@ impl App {
         if fact == Fact::Account {
             let cli = self.session_cli(session);
             out.cli = Some(cli);
-            (out.accounts, out.auto_rotate) = build_account_menu_rows(
+            match build_account_menu_rows(
                 cli,
                 session_acct.as_deref(),
                 session_email.as_deref(),
                 session_week,
-            );
+            ) {
+                Ok((accounts, auto_rotate)) => {
+                    out.accounts = accounts;
+                    out.auto_rotate = auto_rotate;
+                }
+                Err(why) => out.accounts_refused = Some(why),
+            }
         }
         if matches!(fact, Fact::Path | Fact::Branch)
             && !cfg!(test)

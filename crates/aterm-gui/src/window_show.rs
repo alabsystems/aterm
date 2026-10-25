@@ -452,8 +452,19 @@ impl crate::App {
         }
         let ops = carried.plan.fullscreen_ops();
         self.carried_window_show = None;
+        let now = std::time::Instant::now();
         for op in &ops {
             self.perform_show_op(*op);
+            // A window owing its restore re-grid waits for the full screen's size from here
+            // (`App::pay_restore_regrid_if_due`).
+            if let ShowOp::EnterFullScreen(window) = *op
+                && let Some(owed) = self
+                    .windows
+                    .get_mut(&window)
+                    .and_then(|ws| ws.restore_regrid_owed.as_mut())
+            {
+                owed.since = now;
+            }
         }
         aterm_log::info!(
             "window show: {} carried window(s) going back to full screen",

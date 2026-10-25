@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aterm_render::TrailCell;
 
-use crate::cursor_glow::{TypedStamps, band_row, hint_fresh, take_hint_fresh};
+use crate::cursor_glow::{TypedStamps, band_row, hint_fresh_dur, take_hint_fresh_dur};
 
 const HEAD_ALPHA_GENTLE: u32 = 42;
 const HEAD_ALPHA_IGNITED: u32 = 70;
@@ -275,9 +275,17 @@ impl CursorTrail {
     const MAX_SPARKS: usize = 512;
     const DEDUP_SLOTS: usize = 1024;
     const TYPE_HINT_FRESH: f32 = 0.25;
+    const TYPE_HINT_FRESH_DUR: Duration =
+        Duration::from_nanos((Self::TYPE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
     const BLINK_HINT_FRESH: f32 = 0.5;
+    const BLINK_HINT_FRESH_DUR: Duration =
+        Duration::from_nanos((Self::BLINK_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
     const NAV_HINT_FRESH: f32 = 0.25;
+    const NAV_HINT_FRESH_DUR: Duration =
+        Duration::from_nanos((Self::NAV_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
     const MOVE_HINT_FRESH: f32 = 0.25;
+    const MOVE_HINT_FRESH_DUR: Duration =
+        Duration::from_nanos((Self::MOVE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
 
     /// Fresh dormant trail animation state.
     #[inline]
@@ -520,8 +528,8 @@ impl CursorTrail {
         let spawn_from = self.last.or_else(|| {
             let ((r, c), seen) = self.last_visible?;
             let fresh = now.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS;
-            let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
-            let nav_bridge = hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+            let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH_DUR);
+            let nav_bridge = hint_fresh_dur(self.nav_hint, now, Self::NAV_HINT_FRESH_DUR)
                 && self
                     .nav_hint
                     .is_some_and(|key| nav_bridge_admits(key, seen, now));
@@ -551,9 +559,9 @@ impl CursorTrail {
         } else if declined_hidden_relocation {
             self.clear_typed();
         } else if completed_hidden_reappearance {
-            let fresh_nav = self.nav_hint.filter(|t| {
-                now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH
-            });
+            let fresh_nav = self
+                .nav_hint
+                .filter(|t| now.saturating_duration_since(*t) <= Self::NAV_HINT_FRESH_DUR);
             self.clear_typed();
             self.nav_hint = fresh_nav;
         } else if unseeded_visible {
@@ -628,9 +636,9 @@ impl CursorTrail {
     #[must_use]
     #[inline]
     pub fn move_licensed(&self, now: Instant) -> bool {
-        self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
-            || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
-            || hint_fresh(self.move_hint, now, Self::MOVE_HINT_FRESH)
+        self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.nav_hint, now, Self::NAV_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.move_hint, now, Self::MOVE_HINT_FRESH_DUR)
     }
 
     fn spawn(
@@ -645,14 +653,15 @@ impl CursorTrail {
         if !self.move_licensed(now) {
             return false;
         }
-        let move_paired =
-            !(cr == pr && cc > pc) && hint_fresh(self.move_hint, now, Self::MOVE_HINT_FRESH);
+        let move_paired = !(cr == pr && cc > pc)
+            && hint_fresh_dur(self.move_hint, now, Self::MOVE_HINT_FRESH_DUR);
         let paired = !move_paired
             && self
                 .type_hint
-                .take_fresh(now, Self::TYPE_HINT_FRESH)
+                .take_fresh(now, Self::TYPE_HINT_FRESH_DUR)
                 .is_some();
-        let nav_paired = take_hint_fresh(&mut self.nav_hint, now, Self::NAV_HINT_FRESH).is_some();
+        let nav_paired =
+            take_hint_fresh_dur(&mut self.nav_hint, now, Self::NAV_HINT_FRESH_DUR).is_some();
         let _ = self.move_hint.take();
         if nav_paired {
             return false;
@@ -666,7 +675,7 @@ impl CursorTrail {
             && !physical_fold
             && dr_abs <= 1
             && raw_dist > 2
-            && (!self.ctx_alt || hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH))
+            && (!self.ctx_alt || hint_fresh_dur(self.blink_hint, now, Self::BLINK_HINT_FRESH_DUR))
         {
             return false;
         }
@@ -1592,7 +1601,7 @@ mod tests {
         assert!(
             trail
                 .type_hint
-                .any_fresh(resp, CursorTrail::TYPE_HINT_FRESH),
+                .any_fresh(resp, CursorTrail::TYPE_HINT_FRESH_DUR),
             "…leaving the glyph's stamp for the glyph's own echo"
         );
         let echo = resp + ms(20);
@@ -1608,7 +1617,7 @@ mod tests {
         assert!(
             !trail
                 .type_hint
-                .any_fresh(echo, CursorTrail::TYPE_HINT_FRESH),
+                .any_fresh(echo, CursorTrail::TYPE_HINT_FRESH_DUR),
             "one stamp, one echo"
         );
         assert!(!trail.move_licensed(echo + ms(50)));

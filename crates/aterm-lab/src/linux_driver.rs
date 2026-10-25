@@ -251,22 +251,31 @@ impl Driver {
     /// Let go of the VM at a run's end: with `keep`, it stays up (the vz arm sets `keep`
     /// on its session first); else lima stops a VM this run booted (`booted_here`), and
     /// the vz arm's session closes under the release rule, which powers off a VM nobody
-    /// else holds and nobody kept, and waits for its helper to end.
-    pub fn end(self, booted_here: bool, keep: bool) {
+    /// else holds and nobody kept, and waits for its helper to end. `false` only when lima's
+    /// stop of a VM this run booted failed: the VM may still run.
+    pub fn end(self, booted_here: bool, keep: bool) -> bool {
         match self {
             Self::Lima(l) => {
-                if stops_vm(booted_here, keep) {
-                    let out = l.stop();
-                    if out.ok() {
-                        println!("linux: VM stopped (this run booted it)");
-                    } else {
-                        eprintln!("aterm-lab: linux: limactl stop failed: {}", out.tail(5));
-                    }
+                if !stops_vm(booted_here, keep) {
+                    return true;
                 }
+                let out = l.stop();
+                if out.ok() {
+                    println!("linux: VM stopped (this run booted it)");
+                } else {
+                    eprintln!("aterm-lab: linux: limactl stop failed: {}", out.tail(5));
+                }
+                out.ok()
             }
-            Self::Vz(v) => v.end(booted_here, keep),
+            Self::Vz(v) => {
+                v.end(booted_here, keep);
+                true
+            }
             #[cfg(test)]
-            Self::Fake(g) => g.end(booted_here, keep),
+            Self::Fake(g) => {
+                g.end(booted_here, keep);
+                true
+            }
         }
     }
 }

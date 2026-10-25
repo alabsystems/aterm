@@ -1031,14 +1031,15 @@ impl<C: Ctl> Session<'_, C> {
                 .person_at()
                 .and_then(|typed| typed.checked_add(grace))
                 .is_some_and(|until| until > now);
+        let (exchange, managed) = self.held_for_others();
         Guards {
             brake,
             person,
             halted: self.halted,
             draft: self.draft_seen.is_some(),
             taskless: reader.fresh(rows),
-            exchange: self.turn_end.left_to_person(),
-            managed: self.turn_end.managed() && !armed(Fault::NoteAndType),
+            exchange,
+            managed,
             memory: self.memory_seen.is_some()
                 || matches!(
                     self.memory_told,
@@ -1047,6 +1048,28 @@ impl<C: Ctl> Session<'_, C> {
             reach_down: matches!(self.reach_seen, Some(Reach::Down { .. })),
             mode: cfg.autopilot_for(self.autopilot.word()),
         }
+    }
+
+    /// The guards' `exchange` and `managed`: the task is done and the person's own exchange holds
+    /// it; a manager waits on the session.
+    fn held_for_others(&self) -> (bool, bool) {
+        (
+            self.turn_end.left_to_person(),
+            self.turn_end.managed() && !armed(Fault::NoteAndType),
+        )
+    }
+
+    /// Whose the session is for as long as they keep it ([`Guards::theirs`]: the person's own
+    /// exchange or a manager's wait), as [`Self::occupancy_guards`] reads those guards: nothing is
+    /// read for it, neither the screen nor the clock.
+    pub(super) fn occupancy_theirs(&self) -> Option<Guard> {
+        let (exchange, managed) = self.held_for_others();
+        Guards {
+            exchange,
+            managed,
+            ..Guards::clear(Autopilot::Off)
+        }
+        .theirs()
     }
 
     /// One rule's verdict at a break: its line where it changed, and a would-be line's row.

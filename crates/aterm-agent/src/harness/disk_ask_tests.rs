@@ -1221,6 +1221,68 @@ fn a_successor_that_supervises_a_pick_whose_host_ended_adopts_it_owed_or_asked()
     );
 }
 
+/// A pick whose agent exited around a seamless update: its task record says exited, so the
+/// successor's seat rule bars it, and it has left the successor's supervised roster. The
+/// successor adopts it all the same and releases it at once, at no election's cost, where the
+/// look before handed it off as undelivered once the adoption window was over.
+#[test]
+fn a_successor_adopts_and_releases_an_exited_pick_of_the_host_it_replaced() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
+    let one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 2, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    let mut successor = At::short(&h3, vec![seat("s-b", 2, true)]);
+    successor.supervised = vec!["s-b".to_owned()];
+    successor.barred = vec!["s-a".to_owned()];
+    successor.live = vec!["s-a".to_owned(), "s-b".to_owned()];
+    successor.dead = vec![1];
+    let t = T0 + NOMINATE_MS + 2 * 60_000;
+    let mut lease = Lease::default();
+    elected(&mut lease, &one, &two);
+    assert_eq!(
+        successor.step(&mut lease, t),
+        Said::Handoff {
+            from: Pick {
+                host: h3.clone(),
+                sid: "s-a".to_owned()
+            },
+            why: Miss::Released
+        },
+        "adopted, then released by the seat rule that bars it"
+    );
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.released, e.asks),
+        (1, 1, 0),
+        "no election spent"
+    );
+    assert!(matches!(e.phase, Phase::Nominating { .. }));
+    let unadopted = fault::with(fault::Fault::AdoptSupervisedOnly, || {
+        let mut lease = Lease::default();
+        elected(&mut lease, &one, &two);
+        let first = successor.step(&mut lease, t);
+        let later = successor.step(&mut lease, t + ADOPT_MS);
+        (first, later, lease.entry(KEY).map(|e| e.released))
+    });
+    assert!(
+        matches!(&unadopted.0, Said::Owed { pick, .. } if pick.host == h1),
+        "{unadopted:?}"
+    );
+    assert_eq!(
+        (unadopted.1, unadopted.2),
+        (
+            Said::Handoff {
+                from: Pick {
+                    host: h1.clone(),
+                    sid: "s-a".to_owned()
+                },
+                why: Miss::Undelivered
+            },
+            Some(0)
+        ),
+        "the planted defect the conformance control arms: an election spent"
+    );
+}
+
 #[test]
 fn another_hosts_look_leaves_an_ended_hosts_pick_owed_until_its_successor_adopts_it() {
     let (h1, h2, h3) = (host(1), host(2), host(3));
@@ -1589,6 +1651,70 @@ fn a_lost_record_of_an_earlier_episode_counts_for_the_cooldown_alone() {
     assert_eq!(
         e.asks, 0,
         "a line before the episode opened is none of its lines"
+    );
+}
+
+/// A clear look rests (steps nothing, takes no lock) only with no episode open and no line of
+/// its host's for the lease to record. A's line goes but its record is lost, and another host's
+/// look ends the episode before A's host looks again: that host's clear look still records the
+/// line, so the cooldown holds a new episode shut, where the look before rested and left the
+/// cooldown unstarted, so another host's short look asked a second session inside it.
+#[test]
+fn a_clear_look_records_a_lost_line_whose_episode_another_host_ended_before_it_rests() {
+    let (h1, h2) = (host(1), host(2));
+    let mut empty = Lease::default();
+    assert!(rests(&empty, KEY, None), "nothing to step");
+    assert!(!rests(&empty, KEY, Some(T0)), "a line the lease never saw");
+    typed(&mut empty, KEY, &h1, "s-a", T0, 20 * GIB);
+    assert!(rests(&empty, KEY, Some(T0)), "recorded");
+    assert!(!rests(&empty, KEY, Some(T0 + 1)), "a later line is not");
+
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    let opened = |lease: &mut Lease| {
+        elected(lease, &one, &two);
+        assert!(!rests(lease, KEY, None), "an episode is open");
+    };
+    let at = T0 + NOMINATE_MS + 60_000;
+    let mut clear = At::short(&h2, vec![seat("s-c", 3, true)]);
+    clear.reads(100 * GIB);
+    let mut lease = Lease::default();
+    opened(&mut lease);
+    // A's line went at `at`, its record lost to a full disk: the lease still owes it.
+    assert!(matches!(
+        clear.step(&mut lease, at + 60_000),
+        Said::Ended { asks: 0 }
+    ));
+    assert!(
+        !rests(&lease, KEY, Some(at)),
+        "A's host's clear look must step, to record its line"
+    );
+    assert!(typed_unrecorded(&mut lease, KEY, &h1, "s-a", at, 20 * GIB));
+    assert!(rests(&lease, KEY, Some(at)), "and then rests");
+    let mut short = At::short(&h2, vec![seat("s-c", 3, true)]);
+    short.reads(20 * GIB);
+    assert_eq!(
+        short.step(&mut lease, at + 10 * 60_000),
+        Said::Cooldown { last_ms: at },
+        "no second session is asked within the cooldown of A's line"
+    );
+    assert!(
+        fault::with(fault::Fault::RestUnrecorded, || rests(
+            &Lease::default(),
+            KEY,
+            Some(at)
+        )),
+        "the planted defect the conformance control arms rests with the line unrecorded"
+    );
+    let mut unrecorded = Lease::default();
+    opened(&mut unrecorded);
+    clear.step(&mut unrecorded, at + 60_000);
+    assert!(
+        matches!(
+            short.step(&mut unrecorded, at + 10 * 60_000),
+            Said::Opened { .. }
+        ),
+        "left unrecorded, a new episode opens inside the cooldown"
     );
 }
 

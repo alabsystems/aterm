@@ -341,7 +341,7 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     let mut env = env_at(&tmp);
     env.sock = None;
     let (code, _, err) = run_line(
-        "accounts add codex-one --cli codex --email codex-one@example.com",
+        "accounts add codex-one --cli codex --email login-alias@example.com --identity-email codex-one@example.com",
         &env,
     );
     assert_eq!(code, exit(0), "{err}");
@@ -358,8 +358,8 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(out.contains("codex-one: REFUSED: wrong account"), "{out}");
     assert!(
-        stagings(&logins_root, "codex-one").is_empty(),
-        "staging removed"
+        stagings(&logins_root, "codex-one").len() == 1,
+        "completed wrong-account login retained"
     );
     let logins = read(&store.logins_file());
     assert!(
@@ -376,7 +376,7 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     );
     let logins = read(&store.logins_file());
     assert!(
-        logins.contains("codex-one+1") && logins.contains("\"proved_by\":\"status\""),
+        logins.contains("codex-one+2") && logins.contains("\"proved_by\":\"status\""),
         "{logins}"
     );
     let ledger = read(&store.ledger_path());
@@ -593,6 +593,47 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
         parsed("accounts adopt-default main").is_err(),
         "Claude Code's needs it"
     );
+}
+
+#[test]
+fn codex_adopt_default_checks_an_explicit_canonical_identity() {
+    for alias in ["", " --email alias@example.test"] {
+        for report in [Some("owner@example.test"), Some("other@example.test"), None] {
+            let tmp = tmp_dir("adopt-codex-identity");
+            let env = env_at(&tmp);
+            let host = PoolHost {
+                account: report,
+                usage: None,
+            };
+            let (code, out, err) = renew(
+                &format!(
+                    "accounts adopt-default account --cli codex --identity-email owner@example.test{alias}"
+                ),
+                &env,
+                &host,
+            );
+            let matched = report == Some("owner@example.test");
+            assert_eq!(code, exit(if matched { 0 } else { 1 }), "{out}{err}");
+            let path = tmp.path().join("accounts-codex.toml");
+            assert_eq!(path.is_file(), matched);
+            if matched {
+                let roster = Roster::load_for(Cli::Codex, &path).unwrap();
+                assert_eq!(
+                    roster.row("account").unwrap().identity_email.as_deref(),
+                    report
+                );
+                let store = env.accounts_store_for(Cli::Codex).unwrap();
+                assert!(
+                    store
+                        .load_logins(env.now)
+                        .unwrap()
+                        .0
+                        .get("account")
+                        .is_none()
+                );
+            }
+        }
+    }
 }
 
 fn full_main(cli: Cli, home: &Path, now: i64) -> Option<crate::harness::codex_app_login::Usage> {
@@ -1223,7 +1264,16 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
     let renewal = |outcome: login_drive::Outcome| {
         let host = SignInHost::new(Script::Ends(outcome), &home);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        renew_one_for(Cli::Kimi, 0, &host, &store, &row, None, &mut out, &mut err)
+        renew_one_for(
+            Cli::Kimi,
+            0,
+            &host,
+            &store,
+            (&row, &tmp.path().join("accounts-kimi.toml")),
+            None,
+            &mut out,
+            &mut err,
+        )
     };
     for outcome in [
         login_drive::Outcome::NeedsSignIn("the sign-in waits on a person".to_owned()),
@@ -1264,7 +1314,7 @@ fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discar
             0,
             &host,
             &store,
-            row,
+            (row, &tmp.path().join("accounts-kimi.toml")),
             None,
             &mut io::sink(),
             &mut io::sink()

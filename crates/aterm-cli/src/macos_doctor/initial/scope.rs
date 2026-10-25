@@ -452,9 +452,7 @@ impl UpgradeProgress {
     }
 
     fn read(root: &Path, value: &Value, plan: &Plan) -> Result<Self, String> {
-        if value["version"].as_u64() != Some(1) {
-            return Err("unrecognized automatic upgrade recovery".into());
-        }
+        known_version(&value["version"], "unrecognized automatic upgrade recovery")?;
         let previous = match value.get("previous") {
             Some(Value::Null) => None,
             Some(value) => Some(parse_progress(value)?),
@@ -600,6 +598,12 @@ pub(super) fn upgrade_progress(
 /// The plan record's key for a put-back's recovery ([`put_back_held_widen`]).
 const PUT_BACK: &str = "put_back";
 
+/// Whether the plan's `record` is one a Stop put back ([`put_back_held_widen`]): the person's,
+/// never widened again, whatever its `provisional` field says (an earlier build wrote it so).
+pub(super) fn put_back(record: &Value) -> bool {
+    record.get(PUT_BACK).is_some()
+}
+
 /// A widened run a Stop held, and the run of the plan it widened that takes its place.
 struct PutBack {
     /// The plan the upgrade widened, which goes back in force as the person's: their Stop
@@ -633,9 +637,7 @@ impl PutBack {
     /// provisional one an earlier build wrote.
     fn read(record: &Value, marker: &Value) -> Result<Self, String> {
         let (plan, _) = parse_plan_record(record)?;
-        if marker["version"].as_u64() != Some(1) {
-            return Err("unrecognized System State put-back".into());
-        }
+        known_version(&marker["version"], "unrecognized System State put-back")?;
         let held = parse_progress(&marker["held"])?;
         let restored = parse_progress(&marker["restored"])?;
         if !restored.belongs_to(&plan)
@@ -1177,6 +1179,29 @@ mod tests {
             );
             assert_eq!(saved_plan(root.path()).unwrap(), Some(narrow));
         }
+    }
+
+    /// A put-back an earlier build saved provisional is the person's all the same: the Stop
+    /// declined the widen, so once its run is finished no later look widens it again.
+    #[test]
+    fn an_earlier_builds_provisional_put_back_is_never_widened_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (_, _, widened) = widened_and_stopped(root.path(), true);
+        assert!(put_back_held_widen(root.path(), widened).unwrap());
+        let path = root.path().join("automatic-plan.json");
+        let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("provisional".into(), Value::Bool(true));
+        write_json(&path, &record).unwrap();
+        fold_stop_request(root.path()).unwrap();
+        assert!(
+            prepare_upgrade(root.path(), || true, || Ok(None))
+                .unwrap()
+                .is_none(),
+            "the plan a Stop put back is widened again"
+        );
     }
 
     /// Set up now on the plan a Stop put back runs it as it stands, and the plan stays the

@@ -1544,17 +1544,21 @@ pub const VERBS: &[VerbSpec] = &[
         "— hosts the front window's typing-momentum glow as an Aos task, in every build. `aos \
          [status]` answers `OK window=<id> attached=<bool> code=<name> …` (revision, pause queue, \
          trace cursor, hot/active/settling flags, `cold_at=`, last wake and boundary counters). \
-         `aos ls` answers `OK tasks=<n>`, then per window a `slot=<id> kind=effect task=<name> \
-         code= attached= paused= rev= log_epoch= log= waiting= kept= rows= dropped=` line and \
-         its timeline rows, `slot=<id> row=<k> segment cause=full|broken|restored|committed code= \
+         `aos ls` answers `OK <n>` and n rows: `tasks=<n>`, then per window a `slot=<id> \
+         kind=effect task=<name> code= attached= paused= rev= log_epoch= log= waiting= kept= rows= \
+         dropped=` row and its timeline rows, `slot=<id> row=<k> segment \
+         cause=full|broken|restored|committed code= \
          log_epoch= range=<a>..<b> judged=pass|fail:<law>@<cursor>|unjudged:<why> kept=<id>|no` \
          or `slot=<id> row=<k> detached why=<why>`: an online watcher judges each retired log \
          epoch on a host worker and keeps a failing one as a fault (at most 4, timeline rows \
          only, no alert). `aos attach [code=<name>]` checkpoints the glow and records keys, \
          resets, frame ticks and scheduler queries (refused while Secure Keyboard Entry is on or \
-         the glow wears Sparkle's paper gold on a light theme; a key the tty does not echo, one \
-         under Secure Keyboard Entry, or the gold going on detaches the recording before it is \
-         logged); `aos pause` holds at the step boundary; `aos repair \
+         the glow wears Sparkle's paper gold on a light theme; a typed key aterm does not see \
+         echoed, because the tty's echo is off or a program reads it raw with no prompt of \
+         aterm's own integrated shell open for it, as at an ssh, sudo or Node password prompt, \
+         one under Secure Keyboard Entry, or the gold going on detaches the recording before it \
+         is logged, and an attach after such a key starts the glow from rest); `aos pause` \
+         holds at the step boundary; `aos repair \
          [code=<name>]` shadow-replays live and candidate code over the trace from the attach \
          checkpoint on a host worker and, back on the main thread, swaps the candidate in only \
          when live reproduces the paused head and the candidate keeps \
@@ -1579,7 +1583,10 @@ pub const VERBS: &[VerbSpec] = &[
          `aos bundle`, which exports the live plan's candidate bundle (`bundle=<digest> rev= \
          bytes= hex=`).",
     )
-    .forms(&[form(AnyOf(&["status", "trace", "ls"])).op(Read)])
+    .forms(&[
+        form(Word("ls")).framing(Lines).op(Read),
+        form(AnyOf(&["status", "trace"])).op(Read),
+    ])
     .input(Input::NONE),
 
     v(
@@ -1754,16 +1761,23 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "rewind [status|open|step|text|close]: freeze the pane on a past screen its recorder kept",
+        "rewind [status|open|step|changed|text|export|close]: show the pane's kept past screens",
         "— `rewind open [ago=<secs>|at=<tick>]` freezes every view of the session on the newest \
          recorded state at or before that instant (default: the newest), as View > Rewind Pane \
-         does; `rewind step <+-n>` moves `n` recorded states and `rewind close` returns it to \
-         live. Each answers `OK recording=<bool> view=open|closed at=<tick|-> state=<n>/<N|-> \
+         does; `rewind step <+-n> [by=sec|cmd]` moves `n` recorded states, `n` seconds (at least \
+         one state) or `n` command starts (OSC 133 `C`), skipping states inside an open \
+         mode-2026 frame, and `rewind close` returns it to live. Each answers `OK \
+         recording=<bool> view=open|closed at=<tick|-> state=<n>/<N|-> \
          faithful=yes|no|unchecked|- live_bytes=<n>` once that state is on screen; \
-         `faithful=yes` only when a live witness matched it. `rewind text [trim]` is the shown \
-         screen, framed as `temporal`. While a view is open the person's keys and clicks reach \
-         no program (a client's `send` and `key` still do). Needs `temporal_recording = true` \
-         when the session started (`ERR rewind: this session keeps no screen history; …`).",
+         `faithful=yes` only when a live witness matched it. `rewind changed <row>,<col>` \
+         (0-based) goes to the state that last changed that cell at or before the shown one and \
+         adds ` cell=<row>,<col> changed=yes|no bytes=<n>` (`no`: as at the oldest kept state). \
+         `rewind text [trim]` is the shown screen, framed as `temporal`. `rewind export` writes \
+         the kept history as an asciicast v2 file, mode 0600, under the state directory's \
+         `rewind/` and answers `OK events=<n> bytes=<n> dropped_input=<n> lost_resizes=<n> \
+         path=<file>`. While a view is open the person's keys and clicks reach no program (a \
+         client's `send` and `key` still do). Needs `temporal_recording = true` when the \
+         session started (`ERR rewind: this session keeps no screen history; …`).",
     )
     .forms(&[form(Word("text")).framing(Bytes)]),
     v(
@@ -2175,8 +2189,12 @@ pub const VERBS: &[VerbSpec] = &[
              matches; `settle=gone:<re>` waits for `<re>` to appear within `submit_window` and \
              then leave (an idle settle when it never shows); `settle=submitted` returns once the \
              submit is verified (`status=submitted`). `submit_verify=auto` (the default) \
-             verifies a Claude Code submit by the typed text leaving the composer, another TUI's \
-             by `seq`, and a shell's by its command block. `submit=guarded:<re>` presses Enter \
+             verifies a Claude Code submit by the typed text leaving the composer, a shell's by \
+             its command block, and any other program's (one with no shell integration among \
+             them) by the screen, as `seq` does: content that moves, or the cursor leaving the \
+             row the text was typed on; a press that shows neither is pressed again, and a turn \
+             none of whose presses showed is `submitted=0 … pressed=<n>`, the Enters it pressed. \
+             `submit=guarded:<re>` presses Enter \
              only while the cursor row matches `<re>`, under the same terminal lock (as `key \
              if=`; a first-press miss is `OK 0 turn skipped reason=guard submitted=0 seq=<n> \
              id=<n>`, plus `pressed=<n>` when re-presses stop; a first Enter the sink takes none \
@@ -2188,7 +2206,11 @@ pub const VERBS: &[VerbSpec] = &[
              pastes the rest (`typed=<keys> pasted=<graphemes>`), stopping with `OK 0 turn \
              skipped reason=<deadline|person|changed> typed=<k> pasted=<p> submitted=0 seq=<n> \
              id=<n>` when the timeout, a person's key, or a screen or input-frame change \
-             overtakes it. `yield=<floor 0..=1>` waits for `trail status` `momentum=` to fall to \
+             overtakes it. Fenced on a composer box, a key waits for an open DEC 2026 frame to \
+             close, a digit also for the program to read and draw the key before it, and a \
+             guarded submit for the last key; a wait gives its time back to `timeout=` once \
+             it ends, so `timeout=` bounds each wait, not their sum. \
+             `yield=<floor 0..=1>` waits for `trail status` `momentum=` to fall to \
              `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout momentum=<v>`). \
              `if-gen=<epoch>.<seq>` (`status gen=`) and `if-rows=<first>-<last>:<hex16>` \
              (FNV-1a-64 of those rows) fence on the screen before typing (`reason=changed` on a \
@@ -3905,6 +3927,14 @@ mod tests {
         assert_eq!(framing_of("rewind", "rewind text"), Bytes);
         assert_eq!(framing_of("rewind", "@s-a rewind text trim"), Bytes);
         assert_eq!(framing_of("rewind", "rewind close"), Status);
+        assert_eq!(framing_of("rewind", "rewind step -1 by=cmd"), Status);
+        assert_eq!(framing_of("rewind", "rewind changed 17,41"), Status);
+        assert_eq!(framing_of("rewind", "@s-a rewind export"), Status);
+        assert_eq!(framing_of("aos", "aos ls"), Lines);
+        assert_eq!(framing_of("aos", "@s-a aos ls"), Lines);
+        assert_eq!(framing_of("aos", "aos status"), Status);
+        assert_eq!(framing_of("aos", "aos trace hex"), Status);
+        assert_eq!(framing_of("aos", "aos attach code=shipped"), Status);
         assert_eq!(framing_of("topic", "topic"), Lines);
         assert_eq!(framing_of("topic", "topic ls"), Lines);
         assert_eq!(framing_of("topic", "topic add build ttl=60"), Status);

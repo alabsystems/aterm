@@ -4013,18 +4013,30 @@ impl App {
                 }
             }
             AppEffect::OpenDocumentEditor { document } => {
-                let uri = self
+                let outcome = self
                     .document_store
                     .canonical_uri(document)
-                    .ok_or_else(|| "Markdown document disappeared before edit".to_string())?
-                    .to_string();
-                self.open_document_tab_in_window(wid, crate::native_app::AppKind::Editor, &uri)?;
-                self.dispatch_native_completion(
+                    .ok_or_else(|| "Markdown document disappeared before edit".to_string())
+                    .map(str::to_string)
+                    .and_then(|uri| {
+                        self.open_document_tab_in_window(
+                            wid,
+                            crate::native_app::AppKind::Editor,
+                            &uri,
+                        )
+                        .map(|_| ())
+                    });
+                let completion = self.dispatch_native_completion(
                     wid,
                     instance,
                     view,
-                    AppEvent::DocumentEditorOpened { document },
-                )?;
+                    AppEvent::DocumentEditorFinished {
+                        document,
+                        outcome: outcome.clone(),
+                    },
+                );
+                outcome?;
+                completion?;
             }
             AppEffect::ChooseWallpaperImage => {
                 // Only an affirmative selection writes config, through the same

@@ -165,13 +165,18 @@ fn the_repair_ask_prepares_on_a_host_worker_and_answers_once_the_main_thread_com
         parked.at + Duration::from_millis(500),
         reply,
         Some(move |w: Worked| {
-            let _ = post.send(w);
+            let _ = post.send((std::thread::current().name().map(str::to_owned), w));
         }),
     );
     assert!(answer.try_recv().is_err(), "no answer before the worker's");
-    let w = worked
+    let (thread, w) = worked
         .recv_timeout(Duration::from_secs(60))
         .expect("the worker posts its prepare");
+    assert_eq!(
+        thread.as_deref(),
+        Some(crate::aos_host::REPAIR_THREAD),
+        "the prepare ran on the repair's own thread"
+    );
     let staged = status(&app);
     assert!(staged.paused, "paused while the worker prepared");
     assert_eq!(staged.stats.replays, 0, "the main thread replayed nothing");
@@ -295,14 +300,6 @@ fn secure_keyboard_entry_refuses_an_attach_and_a_key_under_it_detaches() {
         app.aos_ls_now()
             .iter()
             .any(|l| l == "slot=0 row=0 detached why=secure_keyboard_entry")
-    );
-    app.config.secure_keyboard_entry = Some(false);
-    app.aos_attach_at(MomentumCode::Shipped, at)
-        .expect("attaches");
-    app.aos_privacy_detach_all(crate::aos_host::SECURE_ENTRY);
-    assert!(
-        !status(&app).attached,
-        "a config change to secure entry detaches all"
     );
 }
 

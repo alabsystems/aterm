@@ -62,21 +62,33 @@ impl Segment {
         self.retired.cause
     }
 
+    /// The segment as a judgement of `judged`, with no fault kept.
+    fn judgement(&self, judged: Judged) -> SegmentJudgement {
+        let log = &self.retired.log;
+        SegmentJudgement {
+            cause: self.retired.cause,
+            code: self.retired.code.sched().name(),
+            log_epoch: log.header().log_epoch,
+            from: log.header().first_cursor,
+            to: log.end_cursor(),
+            judged,
+            fault: None,
+        }
+    }
+
+    /// The segment left unjudged for `why` with no replay, as when the watcher's worker did not run.
+    #[must_use]
+    pub fn unjudged(self, why: &'static str) -> SegmentJudgement {
+        self.judgement(Judged::Unjudged(why))
+    }
+
     /// Replays the segment from its checkpoint under the code that ran it, requires the replay to reach the state the segment ended in, and judges the run by `momentum-glow.no-stranded-light`.
     #[must_use]
     pub fn judge(self) -> SegmentJudgement {
+        let mut out = self.judgement(Judged::Unjudged("not judged"));
         let Segment { schema, retired } = self;
         let log = &retired.log;
-        let (from, to) = (log.header().first_cursor, log.end_cursor());
-        let mut out = SegmentJudgement {
-            cause: retired.cause,
-            code: retired.code.sched().name(),
-            log_epoch: log.header().log_epoch,
-            from,
-            to,
-            judged: Judged::Unjudged("not judged"),
-            fault: None,
-        };
+        let from = out.from;
         let contract = NoStrandedLight::new();
         let identity = &log.header().identity;
         if log.broken().is_some() {

@@ -67,6 +67,11 @@ pub(crate) fn screen(live: &Live<'_>) -> Vec<String> {
 
 /// Paint `rows` into `session`'s terminal, the rules in Claude's gray, the caret on the composer.
 pub(crate) fn feed(app: &App, session: u64, rows: &[String]) {
+    bytes(app, session, paint(rows).as_bytes());
+}
+
+/// The bytes [`feed`] paints `rows` with.
+pub(crate) fn paint(rows: &[String]) -> String {
     let mut out = String::from("\x1b[2J");
     for (i, row) in rows.iter().enumerate() {
         let sgr = if row.starts_with('\u{2500}') {
@@ -81,7 +86,20 @@ pub(crate) fn feed(app: &App, session: u64, rows: &[String]) {
         .rposition(|r| r.starts_with('\u{276F}'))
         .unwrap_or(0);
     out.push_str(&format!("\x1b[{};3H", caret + 1));
-    bytes(app, session, out.as_bytes());
+    out
+}
+
+/// [`AT_REST`] with Claude's `left`% context reading over the composer.
+#[cfg(test)]
+pub(crate) fn context_screen(left: u8) -> Vec<String> {
+    let mut rows = screen(&AT_REST);
+    let top = rows
+        .iter()
+        .position(|r| r.starts_with('\u{2500}'))
+        .expect("the composer's top rule");
+    let text = format!("{left}% until auto-compact");
+    rows[top - 1] = format!("{}{text}", " ".repeat(usize::from(COLS) - 2 - text.len()));
+    rows
 }
 
 pub(crate) fn bytes(app: &App, session: u64, bytes: &[u8]) {

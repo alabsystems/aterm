@@ -1903,6 +1903,8 @@ mod macos {
         /// The agent-upgrade rows of the same pop-time snapshot (session, build, word);
         /// a `tabMenuUpgrade:` click decodes its `tag` against it.
         menu_upgrade: RefCell<Vec<(String, String, aterm_messages::UpgradeWord)>>,
+        /// The Rewind timeline rows of the same snapshot, by when each happened; a `tabMenuRewind:` click decodes its `tag` against it.
+        menu_rewind: RefCell<Vec<u64>>,
     }
 
     aterm_objc::declare_class! {
@@ -2199,6 +2201,28 @@ mod macos {
                     word,
                 });
             }
+
+            /// Open Rewind at the timeline row indexed by the sender's tag.
+            @sel(tabMenuRewind:)
+            fn tab_menu_rewind(&self, sender: Id) {
+                if sender.is_null() {
+                    return;
+                }
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender;
+                // `-tag` is `-(NSInteger)`, side-effect free.
+                let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                let ivars = self.ivars();
+                let Ok(i) = usize::try_from(tag) else { return };
+                let Some(at_ms) = ivars.menu_rewind.borrow().get(i).copied() else {
+                    return;
+                };
+                let Some(tab) = ivars.menu_tab.get() else { return };
+                let _ = ivars.proxy.send_event(Wake::TabMenuRewind {
+                    window: ivars.window,
+                    tab,
+                    at_ms,
+                });
+            }
         }
     }
 
@@ -2460,6 +2484,7 @@ mod macos {
                 menu_entries: RefCell::new(Vec::new()),
                 menu_conn: RefCell::new(Vec::new()),
                 menu_upgrade: RefCell::new(Vec::new()),
+                menu_rewind: RefCell::new(Vec::new()),
             };
             // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one designated initializer, which is the next send; `-initWithFrame:` is `-(id)(NSRect)` and consumes that +1, returning the initialised +1 `Retained::from_owned` adopts.
             let this: Retained<Self> = unsafe {
@@ -2855,6 +2880,14 @@ mod macos {
                 })
                 .collect();
             let mut upgrade_index: isize = 0;
+            *self.ivars().menu_rewind.borrow_mut() = entries
+                .iter()
+                .filter_map(|e| match e {
+                    TabMenuEntry::RewindTo { at_ms, .. } => Some(*at_ms),
+                    _ => None,
+                })
+                .collect();
+            let mut rewind_index: isize = 0;
             // SAFETY: `+[NSMenu new]` is `+(id)` and returns a +1 the `Obj`
             // adopts; the menu is released when this frame ends, after the
             // synchronous tracking session `popUpContextMenu:` runs.
@@ -2915,6 +2948,16 @@ mod macos {
                             appkit::send_v_isize(item.id(), sel!(setTag:), conn_index);
                             conn_index += 1;
                             appkit::send_v_bool(item.id(), sel!(setEnabled:), *enabled);
+                            appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
+                            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+                        }
+                        TabMenuEntry::RewindTo { words, .. } => {
+                            let Some(item) = item_with(words, sel!(tabMenuRewind:)) else {
+                                continue;
+                            };
+                            appkit::send_v_isize(item.id(), sel!(setTag:), rewind_index);
+                            rewind_index += 1;
+                            appkit::send_v_bool(item.id(), sel!(setEnabled:), true);
                             appkit::send_v_id(item.id(), sel!(setTarget:), self.as_id());
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }

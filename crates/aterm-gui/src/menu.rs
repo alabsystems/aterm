@@ -254,6 +254,8 @@ pub(crate) enum MenuAction {
     ToggleStatsLens,
     /// View ▸ Rewind Pane (⇧⌘R): freeze the focused pane on its recorded past, or return it to live.
     RewindPane,
+    /// View ▸ Export Pane History…: the focused pane's kept history as an asciicast file a save panel names.
+    ExportPaneHistory,
     /// Open Settings at the Packages route.
     Packages,
     /// Open Settings at the Messages route.
@@ -390,6 +392,7 @@ impl MenuAction {
             MenuAction::StatsBarsOff => 86,
             MenuAction::ToggleStatsLens => 87,
             MenuAction::RewindPane => 93,
+            MenuAction::ExportPaneHistory => 94,
             MenuAction::DeckSizeAuto => 88,
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
@@ -479,6 +482,7 @@ impl MenuAction {
             91 => MenuAction::Save,
             92 => MenuAction::SystemState,
             93 => MenuAction::RewindPane,
+            94 => MenuAction::ExportPaneHistory,
             _ => return None,
         })
     }
@@ -541,6 +545,7 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
             | MenuAction::RewindPane
+            | MenuAction::ExportPaneHistory
     )
 }
 
@@ -774,7 +779,7 @@ pub(crate) fn native_item_tip(action: MenuAction) -> Option<String> {
         MenuAction::SummarizeFleet => agents_live()
             .summarize_block
             .map(|why| format!("{} {why}", action.help())),
-        MenuAction::RewindPane if !menu_live().can_rewind => {
+        MenuAction::RewindPane | MenuAction::ExportPaneHistory if !menu_live().can_rewind => {
             Some(crate::rewind::REWIND_OFF_TIP.to_string())
         }
         _ => None,
@@ -969,7 +974,7 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         MenuAction::NextTab | MenuAction::PrevTab => live.multi_tab,
         MenuAction::ReopenClosedTab => live.can_reopen_closed_tab,
         MenuAction::ReopenClosedView => live.can_reopen_closed_view,
-        MenuAction::RewindPane => live.can_rewind,
+        MenuAction::RewindPane | MenuAction::ExportPaneHistory => live.can_rewind,
         _ => true,
     };
     precondition
@@ -1040,7 +1045,7 @@ impl MenuAction {
             MenuAction::DeckSizeAuto | MenuAction::DeckSizeFull | MenuAction::DeckSizeFolded => {
                 ConfigWrite
             }
-            MenuAction::ToggleStatsLens => PersonOnly,
+            MenuAction::ToggleStatsLens | MenuAction::ExportPaneHistory => PersonOnly,
             MenuAction::ChooseTheme => ConfigWrite,
             MenuAction::About
             | MenuAction::Version
@@ -1095,7 +1100,8 @@ impl MenuAction {
             | MenuAction::DeckSizeFull
             | MenuAction::DeckSizeFolded
             | MenuAction::ToggleStatsLens
-            | MenuAction::RewindPane => false,
+            | MenuAction::RewindPane
+            | MenuAction::ExportPaneHistory => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1316,6 +1322,9 @@ impl MenuAction {
                 "Show this pane's recent past, read-only: Left and Right step through it, Esc \
                  returns to live."
             }
+            MenuAction::ExportPaneHistory => {
+                "Save this pane's kept screen history as an asciicast file, where you choose."
+            }
             MenuAction::Help => "Open the aterm guide.",
         }
     }
@@ -1405,6 +1414,7 @@ impl MenuAction {
             "DeckSizeFolded" => Some(MenuAction::DeckSizeFolded),
             "ToggleStatsLens" => Some(MenuAction::ToggleStatsLens),
             "RewindPane" => Some(MenuAction::RewindPane),
+            "ExportPaneHistory" => Some(MenuAction::ExportPaneHistory),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
             "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
@@ -1813,6 +1823,12 @@ const VIEW_MENU: &[MenuEntry] = &[
         action: MenuAction::RewindPane,
         key: "r",
         mods: MenuMods::CommandShift,
+    },
+    Item {
+        label: "Export Pane History\u{2026}",
+        action: MenuAction::ExportPaneHistory,
+        key: "",
+        mods: MenuMods::None,
     },
     Separator,
     Item {
@@ -2228,7 +2244,7 @@ fn chrome_lines_for(
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MenuHandle, choose_local_file, choose_local_image, confirm, confirm_owner,
+    MenuHandle, choose_local_file, choose_local_image, choose_save_path, confirm, confirm_owner,
     defer_quit_for_terminate, install, notify, ok_alert, open_file_in_workspace, open_help_url,
     order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
     update_version_menu,
@@ -2308,6 +2324,16 @@ pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::
 #[cfg(windows)]
 pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
     crate::file_picker_win::choose_image(title, prompt)
+}
+
+/// No save panel off macOS: nothing is written.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn choose_save_path(
+    _title: &str,
+    _prompt: &str,
+    _name: &str,
+) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// No native picker is linked on the remaining targets (Linux).
@@ -2879,6 +2905,49 @@ mod macos {
     /// [`choose_local_file`] offering only images.
     pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
         open_panel(title, prompt, &["public.image"])
+    }
+
+    /// A save panel titled `title` offering `name`: the path the person chose, `None` when they cancelled.
+    pub(crate) fn choose_save_path(
+        title: &str,
+        prompt: &str,
+        name: &str,
+    ) -> Option<std::path::PathBuf> {
+        if super::os_ui_refused(title) {
+            return None;
+        }
+        let _main_thread = MainThread::new()?;
+        let _park = crate::watchdog::park_modal();
+        let title = appkit::nsstring(title)?;
+        let prompt = appkit::nsstring(prompt)?;
+        let name = appkit::nsstring(name)?;
+        // SAFETY: NSSavePanel is created and run on AppKit's main thread (`_main_thread` is the
+        // witness). `+savePanel` is `-(id)` and returns an AUTORELEASED panel, borrowed for the
+        // length of this pool. The setters are `-(void)(BOOL)` and `-(void)(NSString *)`;
+        // `-runModal` is `-(NSModalResponse)` and owns its nested modal loop; `-URL` and `-path`
+        // are `-(id)` accessors valid until the pool pops.
+        autoreleasepool(|_| unsafe {
+            let panel = appkit::send_id(class(c"NSSavePanel").as_id(), sel!(savePanel));
+            if panel.is_null() {
+                return None;
+            }
+            appkit::send_v_bool(panel, sel!(setCanCreateDirectories:), true);
+            appkit::send_v_id(panel, sel!(setTitle:), title.id());
+            appkit::send_v_id(panel, sel!(setPrompt:), prompt.id());
+            appkit::send_v_id(panel, sel!(setNameFieldStringValue:), name.id());
+            if appkit::send_isize(panel, sel!(runModal)) != NS_MODAL_RESPONSE_OK {
+                return None;
+            }
+            let url = appkit::send_id(panel, sel!(URL));
+            if url.is_null() {
+                return None;
+            }
+            let path = appkit::send_id(url, sel!(path));
+            if path.is_null() {
+                return None;
+            }
+            Some(std::path::PathBuf::from(appkit::nsstring_to_rust(path)))
+        })
     }
 
     fn open_panel(title: &str, prompt: &str, types: &[&str]) -> Option<std::path::PathBuf> {

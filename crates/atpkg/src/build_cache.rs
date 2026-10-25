@@ -12,6 +12,9 @@ pub mod stale;
 #[path = "build_cache_tooling.rs"]
 pub mod tooling;
 
+#[path = "build_cache_retired.rs"]
+pub mod retired;
+
 pub use stale::RECLAIM_STALE;
 
 /// When a workspace is gone: the rule the window's disk watch uses too.
@@ -790,42 +793,30 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
     }
 }
 
-/// The bytes `paths` hold on disk: each file's allocated blocks once, however many names it has among them, never following a link.
+/// The bytes paths hold on disk: one definition with the capacity ledger's footprints.
+pub use aterm_capacity::footprint::allocated;
+
+/// The workspaces whose build directories the cache under `root` holds.
 #[must_use]
-pub fn allocated(paths: &[PathBuf]) -> u64 {
-    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
-    let mut total = 0u64;
-    let mut stack: Vec<PathBuf> = paths.to_vec();
-    while let Some(path) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+pub fn workspaces(root: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
-        if meta.is_dir() {
-            stack.extend(
-                std::fs::read_dir(&path)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|e| e.path()),
-            );
-            continue;
-        }
-        #[cfg(unix)]
-        let bytes = {
-            use std::os::unix::fs::MetadataExt as _;
-            if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
+        for e in entries.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            meta.blocks().saturating_mul(512)
-        };
-        #[cfg(not(unix))]
-        let bytes = {
-            let _ = &mut seen;
-            meta.len()
-        };
-        total = total.saturating_add(bytes);
+            if e.file_name() == LEAF {
+                out.extend(workspace_of(root, dir));
+            } else if depth < MAX_DEPTH && e.file_name() != DOOMED {
+                walk(root, &e.path(), depth + 1, out);
+            }
+        }
     }
-    total
+    let mut out = Vec::new();
+    walk(root, root, 0, &mut out);
+    out
 }
 
 #[cfg(test)]

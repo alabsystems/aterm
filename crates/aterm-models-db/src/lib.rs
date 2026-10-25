@@ -5,6 +5,90 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 use aterm_spec::derive::Model;
 
+mod dispatch;
+pub use dispatch::resource_dispatch_model;
+mod enrollment_gate;
+pub use enrollment_gate::enrollment_gate_model;
+
+/// Bounded executions of the durable fixed-share reservation API. Initial pins
+/// are assumed coherent across consumers; this model grants no provider access.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn resource_reservation_model() -> Model {
+    aterm_spec::ty_model! {
+        DbResourceReservation {
+            const Buggy = 0;
+            var scenario = 0; var accepted = 0; var fresh = 0;
+            var durable = 0; var same = 1; var used = 0; var capacity = 3;
+            action Reserve when (scenario == 0) {
+                scenario = 1; accepted = if Buggy == 6 {0} else {1}; fresh = 1;
+                durable = if Buggy == 1 {0} else {1}; used = if Buggy == 5 {4} else {3};
+            }
+            action Retry when (scenario == 0) {
+                scenario = 2; accepted = 1; fresh = if Buggy == 2 {1} else {0};
+                durable = 1; same = if Buggy == 3 {0} else {1}; used = 2;
+            }
+            action WrongCost when (scenario == 0) {
+                scenario = 3; accepted = if Buggy == 4 {1} else {0}; durable = 1; used = 2;
+            }
+            action Exhausted when (scenario == 0) {
+                scenario = 4; accepted = if Buggy == 7 {1} else {0}; durable = 1; used = 3;
+            }
+            action WrongPin when (scenario == 0) {
+                scenario = 5; accepted = if Buggy == 8 {1} else {0}; durable = 1; used = 2;
+            }
+            action BadHistory when (scenario == 0) {
+                scenario = 6; accepted = if Buggy == 9 {1} else {0}; durable = 1; used = 2;
+            }
+            action NoShare when (scenario == 0) {
+                scenario = 7; accepted = if Buggy == 10 {1} else {0};
+            }
+            action TwoOffline when (scenario == 0) {
+                scenario = 8; accepted = 1; fresh = 1; durable = 1; used = 5; capacity = 5;
+            }
+            action Uninitialized when (scenario == 0) {
+                scenario = 9; accepted = if Buggy == 11 {1} else {0};
+            }
+            action NoPin when (scenario == 0) {
+                scenario = 10; accepted = if Buggy == 12 {1} else {0};
+            }
+            invariant DurableReceipt: accepted == 0 || durable == 1;
+            invariant RetryIsNotFresh: 2 > scenario || scenario > 2 || fresh == 0;
+            invariant RetryKeepsReceipt: 2 > scenario || scenario > 2 || same == 1;
+            invariant RefusalNeverGrants: 3 > scenario || scenario == 8 || accepted == 0;
+            invariant FixedCapacity: used <= capacity;
+            invariant EligibleProgress: ((1 > scenario || scenario > 1) && (8 > scenario || scenario > 8)) || (accepted == 1 && fresh == 1);
+        }
+    }
+}
+
+/// A reference diagnostic identifies observed ambiguity without granting rights
+/// or changing proposals. Traversal limits remain visible in the report.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn account_references_model() -> Model {
+    aterm_spec::ty_model! {
+        DbAccountReferences {
+            const Buggy = 0;
+            var scenario = 0; var warning = 0; var truncated = 0; var effects = 0;
+            action Clean when (scenario == 0) {
+                scenario = 1; warning = if Buggy == 8 {1} else {0}; effects = if Buggy == 9 {1} else {0};
+            }
+            action Cycle when (scenario == 0) {scenario = 2; warning = if Buggy == 1 {0} else {1};}
+            action Conflict when (scenario == 0) {scenario = 3; warning = if Buggy == 2 {0} else {1};}
+            action Deleted when (scenario == 0) {scenario = 4; warning = if Buggy == 3 {0} else {1};}
+            action Route when (scenario == 0) {scenario = 5; warning = if Buggy == 4 {0} else {1};}
+            action Duplicate when (scenario == 0) {scenario = 6; warning = if Buggy == 5 {0} else {1};}
+            action Namespace when (scenario == 0) {scenario = 7; warning = if Buggy == 6 {0} else {1};}
+            action Limit when (scenario == 0) {scenario = 8; warning = 1; truncated = if Buggy == 7 {0} else {1};}
+            invariant ReportReferences: 2 > scenario || scenario > 7 || warning == 1;
+            invariant NoInventedRequirement: 1 > scenario || scenario > 1 || warning == 0;
+            invariant BoundedInspection: 8 > scenario || truncated == 1;
+            invariant NoEffects: effects == 0;
+        }
+    }
+}
+
 /// Recipient retirement survives a delayed binding and recovery of a concurrent
 /// enrollment branch; only a fresh covering epoch permits continued local use.
 #[must_use]

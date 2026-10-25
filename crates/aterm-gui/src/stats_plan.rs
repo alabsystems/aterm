@@ -91,8 +91,28 @@ const GROW_GAP_MAX: f64 = 16.0;
 const SLIM_AMOUNT_MIN: f64 = 92.0;
 const AMOUNT_DRAWN_MIN: f64 = 40.0;
 const BLOCK_GUTTER: f64 = 29.0;
-const B_MAX: f64 = 528.0 + 10.0 + DETAILS_MAX;
+/// The widest Folded block: fwide's columns (480 pt on Helvetica Neue since the glance narrowed
+/// them; 528 held 0.134's), the gap and the widest Details. Wider decks centre the table.
+const B_MAX: f64 = 480.0 + 10.0 + DETAILS_MAX;
 const CORES_BLOCK_W: f64 = 68.0;
+/// The amount column where the Full deck shows its glance (wide, mid): `16.5 GiB`, `18 of 200 KB/s
+/// peak` (the refined deck, 2026-10-24; 120 pt held 0.134's longer words).
+const GLANCE_AMOUNT_W: f64 = 96.0;
+/// The aterm and Tab columns there, each: a bare figure (`2.2`, `0.1 MB/s`); 76 pt held 0.134's
+/// `0.46 GiB` and `48 processes`.
+const GLANCE_SCOPE_W: f64 = 56.0;
+/// The strain gauge at the Folded deck's top left (the refined deck's Folded form, 2026-10-24):
+/// its dial's radius, pt. The dial is 54 pt across (Full's is 62) and sits 4 pt inside the
+/// 62 pt band at its top and its foot, the largest the band holds with room for the bezel's
+/// bloom.
+pub(crate) const FOLD_GAUGE_R: f64 = 27.0;
+/// The dial's centre, pt below the deck's top: the middle of the 62 pt band.
+pub(crate) const FOLD_GAUGE_CY: f64 = 31.0;
+/// From the dial's right edge to its divider, and from the divider to block A, pt (Full's slot
+/// leaves 11 and 9).
+const FOLD_GAUGE_GAP: f64 = 9.0;
+/// What the gauge takes from the blocks' width: the dial, its divider and the two gaps.
+const FOLD_GAUGE_W: f64 = 2.0 * FOLD_GAUGE_R + 2.0 * FOLD_GAUGE_GAP;
 const ROW_NAMES: [&str; 8] = [
     "CPU",
     "GPU",
@@ -292,7 +312,8 @@ impl FullKind {
 /// Placement of CPU cores in the `Full` deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CoresAt {
-    /// Dedicated block to the left of the rows.
+    /// The slot left of the rows, past a divider: it holds the strain gauge (the refined deck,
+    /// 2026-10-24), and a click in it opens the CPU lens, which keeps the per-core view.
     Block { at: Col, divider: f64 },
     /// Eighth row spanning from the strip to the right margin.
     Row(Col),
@@ -325,24 +346,24 @@ pub(crate) struct FullPlan {
 }
 
 impl FullPlan {
-    /// Chooses the [`CoresMode`] for `clusters` in a full deck of height `deck_pt`.
+    /// Chooses the Cores row's [`CoresMode`] for `clusters`: narrow and slim have the row;
+    /// wide and mid draw the strain gauge in [`CoresAt::Block`] and have none.
     pub(crate) fn cores_mode(
         &self,
         clusters: &[Cluster<'_>],
-        deck_pt: f64,
         m: &FaceMetrics,
-    ) -> CoresMode {
-        match self.cores {
-            CoresAt::Block { .. } => cores_block_mode(clusters, deck_pt),
-            CoresAt::Row(room) => cores_row_mode(
-                clusters,
-                room.w,
-                self.rows.cell,
-                &[CoresMode::Stack, CoresMode::Tiny],
-                CORES_CAPTION_PT,
-                m,
-            ),
-        }
+    ) -> Option<CoresMode> {
+        let CoresAt::Row(room) = self.cores else {
+            return None;
+        };
+        Some(cores_row_mode(
+            clusters,
+            room.w,
+            self.rows.cell,
+            &[CoresMode::Stack, CoresMode::Tiny],
+            CORES_CAPTION_PT,
+            m,
+        ))
     }
 
     fn shift(&mut self, dx: f64) {
@@ -466,9 +487,9 @@ fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
             plan.pct = Some(pen.col(6.0, 30.0));
             let bar_w = if kind == FullKind::Wide { 96.0 } else { 80.0 };
             plan.bar = Some(pen.col(8.0, bar_w));
-            plan.amount = Some(pen.col(8.0, 120.0));
-            plan.aterm = Some(pen.col(8.0, 76.0));
-            plan.tab = Some(pen.col(8.0, 76.0));
+            plan.amount = Some(pen.col(8.0, GLANCE_AMOUNT_W));
+            plan.aterm = Some(pen.col(8.0, GLANCE_SCOPE_W));
+            plan.tab = Some(pen.col(8.0, GLANCE_SCOPE_W));
             let rest = right - (pen.0 + 10.0);
             if rest >= DETAILS_MIN {
                 plan.details = Some(Col::new(pen.0 + 10.0, rest.min(DETAILS_MAX)));
@@ -572,6 +593,31 @@ impl BlockPlan {
     }
 }
 
+/// Where the strain gauge sits in a Folded deck: at its top left, block A moved right of it
+/// (the refined deck, 2026-10-24).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FoldedGauge {
+    /// The dial's span across, [`FOLD_GAUGE_R`] each side of its centre.
+    pub(crate) at: Col,
+    /// X-coordinate of the divider between the dial and block A.
+    pub(crate) divider: f64,
+}
+
+impl FoldedGauge {
+    /// The dial's centre, pt.
+    pub(crate) fn centre(&self) -> (f64, f64) {
+        (self.at.x + self.at.w / 2.0, FOLD_GAUGE_CY)
+    }
+
+    /// The dial's box, pt: `x0, y0, x1, y1` (the painter notes the same box from [`Self::centre`]).
+    #[cfg(test)]
+    pub(crate) fn dial(&self) -> [f64; 4] {
+        let (cx, cy) = self.centre();
+        let r = FOLD_GAUGE_R;
+        [cx - r, cy - r, cx + r, cy + r]
+    }
+}
+
 /// Column layout plan for the `Folded` deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FoldedPlan {
@@ -581,18 +627,31 @@ pub(crate) struct FoldedPlan {
     pub(crate) ground_only: bool,
     /// X-coordinate of the vertical divider between the two blocks.
     pub(crate) divider: f64,
+    /// The strain gauge at the top left; `None` where not even two slim blocks fit beside it.
+    pub(crate) gauge: Option<FoldedGauge>,
     /// Layout plans for Block A and Block B.
     pub(crate) blocks: [BlockPlan; 2],
 }
 
-/// Computes the [`FoldedPlan`] for deck width `w_pt`.
+/// Computes the [`FoldedPlan`] for deck width `w_pt`. The gauge comes first: the blocks take the
+/// widest kind that fits beside it, and only where not even slim fits beside it (under about
+/// 417 pt) does the deck draw no gauge and give the blocks its room.
 pub(crate) fn plan_folded(w_pt: f64, m: &FaceMetrics) -> FoldedPlan {
     let w = whole_width(w_pt);
-    let mut b = ((w - 2.0 * X0 - BLOCK_GUTTER) / 2.0).floor().max(0.0);
-    let mut xa = X0;
+    match lay_folded(w, true, m) {
+        (plan, true) => plan,
+        (_, false) => lay_folded(w, false, m).0,
+    }
+}
+
+/// The Folded plan at `w` with the gauge or without it, and whether some block kind fits.
+fn lay_folded(w: f64, gauge: bool, m: &FaceMetrics) -> (FoldedPlan, bool) {
+    let g = if gauge { FOLD_GAUGE_W } else { 0.0 };
+    let mut b = ((w - 2.0 * X0 - BLOCK_GUTTER - g) / 2.0).floor().max(0.0);
+    let mut xa = X0 + g;
     if b > B_MAX {
         b = B_MAX;
-        xa = X0 + ((w - 2.0 * X0 - (2.0 * b + BLOCK_GUTTER)) / 2.0).floor();
+        xa = X0 + g + ((w - 2.0 * X0 - (g + 2.0 * b + BLOCK_GUTTER)) / 2.0).floor();
     }
     let kind = BlockKind::ALL
         .into_iter()
@@ -606,12 +665,17 @@ pub(crate) fn plan_folded(w_pt: f64, m: &FaceMetrics) -> FoldedPlan {
         }
     };
     let blocks = [block(xa), block(xa + b + BLOCK_GUTTER)];
-    FoldedPlan {
+    let plan = FoldedPlan {
         w,
         ground_only: w < MIN_TABLE_W || blocks.iter().any(|blk| blk.strip.end() > blk.at.end()),
         divider: xa + b + 14.0,
+        gauge: gauge.then(|| FoldedGauge {
+            at: Col::new(xa - g, 2.0 * FOLD_GAUGE_R),
+            divider: xa - FOLD_GAUGE_GAP,
+        }),
         blocks,
-    }
+    };
+    (plan, kind.is_some())
 }
 
 fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bool) {
@@ -649,10 +713,13 @@ fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bo
     };
     let fits = match kind {
         BlockKind::Wide => {
+            // The glance's columns, as Full wide's: 117, 70 and 69 pt held 0.134's words.
             plan.pct = Some(Col::new(e + 6.0, 30.0));
-            plan.amount = Some(Col::new(e + 44.0, 117.0));
-            plan.aterm = Some(Col::new(e + 167.0, 70.0));
-            let tab = Col::new(e + 243.0, 69.0);
+            let amount = Col::new(e + 44.0, GLANCE_AMOUNT_W);
+            plan.amount = Some(amount);
+            let aterm = Col::new(amount.end() + 6.0, GLANCE_SCOPE_W);
+            plan.aterm = Some(aterm);
+            let tab = Col::new(aterm.end() + 6.0, GLANCE_SCOPE_W);
             plan.tab = Some(tab);
             let spare = end - tab.end();
             if spare >= 130.0 {
@@ -695,8 +762,10 @@ pub(crate) struct Breakpoints {
     pub(crate) full: [f64; 4],
     /// Minimum block widths for [`BlockKind::ALL`].
     pub(crate) block: [f64; 4],
-    /// Minimum deck widths (`2B + 53`) for [`BlockKind::ALL`].
+    /// Minimum deck widths (`2B + 53` and the gauge's 72) for [`BlockKind::ALL`].
     pub(crate) folded: [f64; 4],
+    /// Minimum deck width (`2B + 53`) for slim blocks without the gauge.
+    pub(crate) folded_bare: f64,
 }
 
 /// Scans whole-point widths to find the [`Breakpoints`] for `m`.
@@ -710,18 +779,16 @@ pub(crate) fn breakpoints(m: &FaceMetrics) -> Breakpoints {
     };
     let full = FullKind::ALL.map(|kind| first(&|w| lay_full(w, kind, m).1));
     let block = BlockKind::ALL.map(|kind| first(&|b| lay_block(X0, b, kind, m).1));
-    let folded = block.map(|b| 2.0 * b + 2.0 * X0 + BLOCK_GUTTER);
+    let folded = block.map(|b| 2.0 * b + 2.0 * X0 + BLOCK_GUTTER + FOLD_GAUGE_W);
     Breakpoints {
         full,
         block,
         folded,
+        folded_bare: block[3] + block[3] + 2.0 * X0 + BLOCK_GUTTER,
     }
 }
 
 const CORES_CAPTION_PT: f64 = 9.5;
-
-const CORES_BLOCK_SIZES: [(f64, f64); 5] =
-    [(11.0, 9.0), (9.0, 7.0), (7.0, 5.5), (5.5, 4.0), (2.5, 2.0)];
 
 const CORES_NOT_READ: [&str; 2] = ["cores not read", "not read"];
 
@@ -736,8 +803,6 @@ pub(crate) struct Cluster<'a> {
 /// Display mode for CPU cores.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CoresMode {
-    /// Grid of squares in the dedicated full-deck cores block.
-    Block { pitch: f64, sq: f64, per_row: u32 },
     /// Single row of cell-high squares at 10 pt pitch.
     Big,
     /// Two stacked rows of half-height squares.
@@ -748,73 +813,8 @@ pub(crate) enum CoresMode {
     CountOnly,
 }
 
-impl CoresMode {
-    fn block((pitch, sq): (f64, f64)) -> Self {
-        Self::Block {
-            pitch,
-            sq,
-            per_row: (CORES_BLOCK_W / pitch).floor() as u32,
-        }
-    }
-}
-
 fn total_cores(clusters: &[Cluster<'_>]) -> usize {
     clusters.iter().map(|c| c.count).sum()
-}
-
-/// Chooses the [`CoresMode`] for the full-deck cores block at height `deck_pt`.
-pub(crate) fn cores_block_mode(clusters: &[Cluster<'_>], deck_pt: f64) -> CoresMode {
-    if total_cores(clusters) == 0 {
-        return CoresMode::CountOnly;
-    }
-    CORES_BLOCK_SIZES
-        .into_iter()
-        .map(CoresMode::block)
-        .find(|&mode| cores_block_bottom(clusters, mode) <= deck_pt - 6.0)
-        .unwrap_or(CoresMode::CountOnly)
-}
-
-/// Formatted count and name caption for a cluster in the cores block.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CoresCaption {
-    /// Core count with trailing space in bold.
-    pub(crate) count: String,
-    /// Cluster name truncated to fit the 68 pt block width.
-    pub(crate) name: String,
-}
-
-impl CoresCaption {
-    /// Returns the advance width of the caption.
-    #[cfg(test)]
-    pub(crate) fn width(&self, m: &FaceMetrics) -> f64 {
-        m.width(&self.count, CORES_CAPTION_PT, true) + m.width(&self.name, CORES_CAPTION_PT, false)
-    }
-}
-
-/// Formats `cluster`'s caption for the 68 pt cores block, or `None` if unnamed.
-pub(crate) fn cores_block_caption(cluster: &Cluster<'_>, m: &FaceMetrics) -> Option<CoresCaption> {
-    let name = cluster.name?;
-    let count = format!("{} ", cluster.count);
-    let room = CORES_BLOCK_W - m.width(&count, CORES_CAPTION_PT, true);
-    let name = m.fit(&[name], room, CORES_CAPTION_PT, false);
-    Some(CoresCaption { count, name })
-}
-
-/// Returns the bottom y-coordinate of the last square in the cores block.
-pub(crate) fn cores_block_bottom(clusters: &[Cluster<'_>], mode: CoresMode) -> f64 {
-    let top = Rows::full(FullKind::Wide).top0;
-    let CoresMode::Block { pitch, sq, per_row } = mode else {
-        return top;
-    };
-    let mut y = top;
-    let mut bottom = top;
-    for cluster in clusters {
-        let squares = y + if cluster.name.is_some() { 11.0 } else { 1.0 };
-        let rows = cluster.count.div_ceil(per_row.max(1) as usize);
-        bottom = squares + rows as f64 * pitch - (pitch - sq);
-        y = bottom + 4.0;
-    }
-    bottom
 }
 
 /// Returns the width required by a Cores row in `mode`, or `f64::INFINITY` if it cannot fit.
@@ -835,11 +835,10 @@ pub(crate) fn cores_row_width(
                 cols * side + (cols - 1.0) * 0.5
             }
             CoresMode::Tiny => ((n / 3.0).ceil() - 1.0) * 2.5 + 2.0,
-            CoresMode::Block { .. } | CoresMode::CountOnly => f64::INFINITY,
+            CoresMode::CountOnly => f64::INFINITY,
         }
     };
     match mode {
-        CoresMode::Block { .. } => f64::INFINITY,
         CoresMode::CountOnly => m.width(&count_words(clusters), caption_pt, false),
         CoresMode::Big | CoresMode::Stack | CoresMode::Tiny => {
             let each = clusters.iter().map(|cluster| {
@@ -873,27 +872,6 @@ pub(crate) fn cores_row_mode(
         .copied()
         .find(|&mode| cores_row_width(clusters, mode, cell, caption_pt, m) <= room)
         .unwrap_or(CoresMode::CountOnly)
-}
-
-/// Formats the header title for the full-deck cores block.
-pub(crate) fn cores_block_title(clusters: &[Cluster<'_>], m: &FaceMetrics) -> String {
-    let total = total_cores(clusters);
-    if total == 0 {
-        let [short, shortest] = CORES_NOT_READ;
-        return m.fit(
-            &["CPU cores not read", short, shortest],
-            CORES_BLOCK_W,
-            HEADER_PT,
-            false,
-        );
-    }
-    let long = format!("{total} CPU cores");
-    m.fit(
-        &[&long, &count_words(clusters)],
-        CORES_BLOCK_W,
-        HEADER_PT,
-        false,
-    )
 }
 
 fn count_words(clusters: &[Cluster<'_>]) -> String {
@@ -954,8 +932,14 @@ pub(crate) struct HeaderLabel {
 pub(crate) struct HeaderText<'a> {
     /// Active tab label (`"Tab 2"`).
     pub(crate) tab: &'a str,
-    /// Machine noun after `"Global · "` (`"this Mac"` or `"this computer"`).
+    /// The machine's noun (`"this Mac"` or `"this computer"`): the Global label where the deck
+    /// says the glance (Full wide and mid, and Folded), and nothing elsewhere.
     pub(crate) machine: &'a str,
+    /// Whether a strip on screen draws an over mark. Where the deck says the glance (Full wide
+    /// and mid, and Folded) the header keys "over max" only then, and keys nothing else (the
+    /// refined deck, 2026-10-24: a legend learned once need not stay); Full narrow and slim key
+    /// all three marks by rule K.
+    pub(crate) over: bool,
 }
 
 /// Worst-state strings for an `fslim` block header.
@@ -1045,8 +1029,8 @@ impl KeyScore {
     }
 }
 
-/// Assigns [`KeyItem`]s to free header `spans` to maximize priority weight.
-pub(crate) fn place_key(mut spans: Vec<KeySpan>, m: &FaceMetrics) -> KeyPlan {
+/// Assigns the [`KeyItem`]s among `items` to free header `spans` to maximize priority weight.
+pub(crate) fn place_key(mut spans: Vec<KeySpan>, items: &[KeyItem], m: &FaceMetrics) -> KeyPlan {
     spans.sort_by(|a, b| a.x0.total_cmp(&b.x0));
     let widths = KeyItem::SEARCH.map(|item| item.width(m));
     let narrowest = widths.iter().copied().fold(f64::INFINITY, f64::min);
@@ -1066,6 +1050,9 @@ pub(crate) fn place_key(mut spans: Vec<KeySpan>, m: &FaceMetrics) -> KeyPlan {
         };
         for ((item, width), at) in KeyItem::SEARCH.into_iter().zip(widths).zip(combo) {
             let Some(at) = at else { continue };
+            if !items.contains(&item) {
+                return None;
+            }
             let (span, (taken, n)) = (spans.get(at)?, used.get_mut(at)?);
             *taken += width + if *n > 0 { KEY_GAP } else { 0.0 };
             *n += 1;
@@ -1153,6 +1140,8 @@ struct Header<'m> {
     spans: Vec<KeySpan>,
     /// The strip whose header carries the time label and the scale.
     time: Option<Strip>,
+    /// The key's items this header may place.
+    keys: &'static [KeyItem],
 }
 
 impl<'m> Header<'m> {
@@ -1162,6 +1151,7 @@ impl<'m> Header<'m> {
             labels: Vec::new(),
             spans: Vec::new(),
             time: None,
+            keys: &KeyItem::SEARCH,
         }
     }
 
@@ -1191,9 +1181,9 @@ impl<'m> Header<'m> {
         w
     }
 
-    fn scope_keys(&mut self, mut x: f64, limit: f64, tab: &str) -> f64 {
+    fn scope_keys(&mut self, mut x: f64, limit: f64, global: &str, tab: &str) -> f64 {
         for (bar, words) in [
-            (Bar::Global, "Global"),
+            (Bar::Global, global),
             (Bar::Aterm, "aterm"),
             (Bar::Tab, tab),
         ] {
@@ -1269,7 +1259,11 @@ impl<'m> Header<'m> {
                 continue;
             }
             let key_with = |ticks: &[RulerTick]| {
-                weight(&place_key(self.spans_with(strip, label_w, ticks), self.m))
+                weight(&place_key(
+                    self.spans_with(strip, label_w, ticks),
+                    self.keys,
+                    self.m,
+                ))
             };
             let clear = |chosen: &[RulerTick], t: &RulerTick| {
                 let w = self.words(&t.text);
@@ -1318,7 +1312,7 @@ impl<'m> Header<'m> {
             ruler = ticks;
         }
         HeaderPlan {
-            key: place_key(self.spans, self.m),
+            key: place_key(self.spans, self.keys, self.m),
             labels: self.labels,
             ruler,
         }
@@ -1332,26 +1326,32 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
     }
     let mut head = Header::new(m);
     head.time(plan.strip);
+    // Wide and mid say the glance's header: "now" beside the live edge's dot (the owner's), the
+    // scopes' names alone, no "Details" (its clauses say what they are), and a key for the over
+    // mark only while a strip draws one.
+    let long = matches!(plan.kind, FullKind::Wide | FullKind::Mid);
+    if long {
+        head.keys = if text.over { &[KeyItem::Over] } else { &[] };
+    }
     if let Some(pct) = plan.pct {
         head.label(Label::Now, pct.end(), "now");
     }
     if let CoresAt::Row(_) = plan.cores {
         head.span(plan.name.x, plan.strip.x - 6.0, false);
     }
-    let long = matches!(plan.kind, FullKind::Wide | FullKind::Mid);
     if plan.kind == FullKind::Slim {
         if let (Some(bar), Some(amount)) = (plan.bar, plan.amount) {
-            let end = head.scope_keys(bar.x, plan.w - X0, text.tab);
+            let end = head.scope_keys(bar.x, plan.w - X0, "Global", text.tab);
             head.span(end + 2.0, amount.end(), false);
         } else if let Some(bar) = plan.bar {
-            head.scope_keys(bar.x, plan.w - X0, text.tab);
+            head.scope_keys(bar.x, plan.w - X0, "Global", text.tab);
         }
         return head.finish();
     }
     if let Some(amount) = plan.amount {
         let x = plan.bar.map_or(amount.x, |bar| bar.x);
         let global = if long {
-            format!("Global · {}", text.machine)
+            text.machine.to_owned()
         } else {
             "Global".to_owned()
         };
@@ -1359,17 +1359,8 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
         head.span(x + w + KEY_GAP, amount.end(), false);
     }
     if let (Some(aterm), Some(tab)) = (plan.aterm, plan.tab) {
-        let this_tab = format!("{} · this tab", text.tab);
-        let aterm_forms: &[&str] = if long {
-            &["aterm · all tabs", "aterm"]
-        } else {
-            &["aterm"]
-        };
-        let tab_forms: &[&str] = if long {
-            &[&this_tab, text.tab]
-        } else {
-            &[text.tab]
-        };
+        let aterm_forms: &[&str] = &["aterm"];
+        let tab_forms: &[&str] = &[text.tab];
         let tab_gap = plan.details.map_or(X0, |details| details.x - tab.end());
         for (col, bar, forms, gap) in [
             (aterm, Bar::Aterm, aterm_forms, tab.x - aterm.end()),
@@ -1391,22 +1382,28 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
         }
     }
     if let Some(details) = plan.details {
-        let words = if head.words(DETAILS_LONG) <= details.w {
-            DETAILS_LONG
+        if long {
+            head.span(details.x, details.end(), false);
         } else {
-            "Details"
-        };
-        head.label(Label::Details, details.x, words);
-        head.span(
-            details.x + head.words(words) + KEY_GAP,
-            details.end(),
-            false,
-        );
+            let words = if head.words(DETAILS_LONG) <= details.w {
+                DETAILS_LONG
+            } else {
+                "Details"
+            };
+            head.label(Label::Details, details.x, words);
+            head.span(
+                details.x + head.words(words) + KEY_GAP,
+                details.end(),
+                false,
+            );
+        }
     }
     head.finish()
 }
 
-/// Lays out the header line and key for a `Folded` deck plan.
+/// Lays out the header line and key for a `Folded` deck plan. Folded says the glance (§6.8) at
+/// every tier, so its header does as Full wide and mid's: "now" over each %, "this Mac" for
+/// Global, no "Details", and a key for the over mark only while a strip draws one.
 pub(crate) fn header_folded(
     plan: &FoldedPlan,
     text: HeaderText<'_>,
@@ -1417,6 +1414,7 @@ pub(crate) fn header_folded(
         return HeaderPlan::default();
     }
     let mut head = Header::new(m);
+    head.keys = if text.over { &[KeyItem::Over] } else { &[] };
     let mut free_strips: [Option<Strip>; 2] = [None; 2];
     let mut a_spilled = false;
     for (i, (block, state)) in plan.blocks.iter().zip(states).enumerate() {
@@ -1451,7 +1449,7 @@ pub(crate) fn header_folded(
         }
         if let (Some(amount), Some(aterm), Some(tab)) = (block.amount, block.aterm, block.tab) {
             for (col, bar, words) in [
-                (amount, Bar::Global, "Global"),
+                (amount, Bar::Global, text.machine),
                 (aterm, Bar::Aterm, "aterm"),
                 (tab, Bar::Tab, text.tab),
             ] {
@@ -1460,18 +1458,19 @@ pub(crate) fn header_folded(
                 head.span(col.x + w + KEY_GAP, col.end(), false);
             }
         } else if let (Some(bar), Some(amount)) = (block.bar, block.amount) {
-            let end = head.scope_keys(bar.x, block.at.end(), text.tab);
-            head.span(end + 2.0, amount.end(), false);
+            // The bar's key once, over block A: block B's bar is the same three scopes on the
+            // same line, and a legend learned once need not be said twice.
+            if i == 0 {
+                let end = head.scope_keys(bar.x, block.at.end(), text.machine, text.tab);
+                head.span(end + 2.0, amount.end(), false);
+            } else {
+                head.span(bar.x, amount.end(), false);
+            }
         } else if let Some(amount) = block.amount {
             head.span(amount.x, amount.end(), false);
         }
         if let Some(details) = block.details {
-            head.label(Label::Details, details.x, "Details");
-            head.span(
-                details.x + head.words("Details") + KEY_GAP,
-                details.end(),
-                false,
-            );
+            head.span(details.x, details.end(), false);
         }
     }
     match free_strips {
@@ -1494,6 +1493,7 @@ mod tests {
     const TEXT: HeaderText<'static> = HeaderText {
         tab: "Tab 2",
         machine: "this Mac",
+        over: true,
     };
 
     fn hn() -> FaceMetrics {
@@ -1586,10 +1586,10 @@ mod tests {
         assert_eq!(p.strip.end(), 466.0);
         assert_eq!(p.pct.map(Col::end), Some(503.0));
         assert_eq!(p.bar, Some(Col::new(511.0, 96.0)));
-        assert_eq!(p.amount, Some(Col::new(615.0, 120.0)));
-        assert_eq!(p.aterm, Some(Col::new(743.0, 76.0)));
-        assert_eq!(p.tab, Some(Col::new(827.0, 76.0)));
-        assert_eq!(p.details, Some(Col::new(913.0, 194.0)));
+        assert_eq!(p.amount, Some(Col::new(615.0, 96.0)));
+        assert_eq!(p.aterm, Some(Col::new(719.0, 56.0)));
+        assert_eq!(p.tab, Some(Col::new(783.0, 56.0)));
+        assert_eq!(p.details, Some(Col::new(849.0, 258.0)));
         assert_eq!(
             p.cores,
             CoresAt::Block {
@@ -1607,7 +1607,7 @@ mod tests {
         );
         assert_eq!(p.pct.map(Col::end), Some(563.0));
         assert_eq!(p.amount.map(|a| a.x), Some(675.0));
-        assert_eq!(p.details, Some(Col::new(973.0, 439.0)));
+        assert_eq!(p.details, Some(Col::new(909.0, 503.0)));
 
         let p = at(900.0);
         assert_eq!(p.kind, FullKind::Mid);
@@ -1619,8 +1619,8 @@ mod tests {
         assert_eq!(p.pct.map(Col::end), Some(443.0));
         assert_eq!(p.bar, Some(Col::new(451.0, 80.0)));
         assert_eq!(p.amount.map(|a| a.x), Some(539.0));
-        assert_eq!(p.aterm.map(|a| a.x), Some(667.0));
-        assert_eq!(p.tab.map(|t| t.x), Some(751.0));
+        assert_eq!(p.aterm.map(|a| a.x), Some(643.0));
+        assert_eq!(p.tab.map(|t| t.x), Some(707.0));
         assert_eq!(p.details, None);
 
         let p = at(550.0);
@@ -1645,15 +1645,15 @@ mod tests {
 
         let p = at(2560.0);
         assert_eq!((p.kind, p.strip.pitch), (FullKind::Wide, 9.0));
-        assert_eq!((p.gap_grow, p.offset), (16.0, 369.0));
+        assert_eq!((p.gap_grow, p.offset), (16.0, 401.0));
         let CoresAt::Block { at: cores, divider } = p.cores else {
             panic!("wide has the cores block");
         };
-        assert_eq!((cores.x, divider, p.name.x), (381.0, 457.0, 466.0));
+        assert_eq!((cores.x, divider, p.name.x), (413.0, 489.0, 498.0));
         let details = p.details.expect("wide has Details");
         assert_eq!(details.w, 560.0);
         assert!((cores.x - (p.w - details.end())).abs() <= 1.0);
-        assert_eq!([1700.0, 2000.0].map(|w| at(w).offset), [2.0, 119.0]);
+        assert_eq!([1700.0, 2000.0].map(|w| at(w).offset), [31.0, 151.0]);
     }
 
     #[test]
@@ -1669,62 +1669,84 @@ mod tests {
         };
         let kinds = |plan: &FoldedPlan| plan.blocks.map(|b| b.kind);
         let details = |plan: &FoldedPlan| plan.blocks.map(|b| b.details);
+        let gauge = |at: f64| FoldedGauge {
+            at: Col::new(at, 54.0),
+            divider: at + 63.0,
+        };
 
+        // The gauge at the top left, 54 pt across, its divider 9 pt past it and block A 9 pt
+        // past that; the blocks share what is left.
         let p = at(1119.0);
+        assert_eq!(p.gauge, Some(gauge(12.0)));
+        assert_eq!(p.gauge.map(|g| g.dial()), Some([12.0, 4.0, 66.0, 58.0]));
         assert_eq!(kinds(&p), [BlockKind::Wide; 2]);
         assert_eq!(
             p.blocks.map(|b| b.at),
-            [Col::new(12.0, 533.0), Col::new(574.0, 533.0)]
+            [Col::new(84.0, 497.0), Col::new(610.0, 497.0)]
         );
-        assert_eq!(p.divider, 559.0);
+        assert_eq!(p.divider, 595.0);
         assert_eq!(details(&p), [None, None]);
         let a = p.blocks[0];
-        assert_eq!((a.strip.x, a.strip.cols, a.strip.pitch), (78.0, 30, 5.0));
-        assert_eq!(a.pct, Some(Col::new(234.0, 30.0)));
-        assert_eq!(a.amount, Some(Col::new(272.0, 117.0)));
+        assert_eq!((a.strip.x, a.strip.cols, a.strip.pitch), (150.0, 30, 5.0));
+        assert_eq!(a.pct, Some(Col::new(306.0, 30.0)));
+        // The glance's columns, as Full wide's (§3.2).
+        assert_eq!(a.amount, Some(Col::new(344.0, 96.0)));
         assert_eq!(
             (a.aterm, a.tab),
-            (Some(Col::new(395.0, 70.0)), Some(Col::new(471.0, 69.0)))
+            (Some(Col::new(446.0, 56.0)), Some(Col::new(508.0, 56.0)))
         );
 
         let p = at(1424.0);
         assert_eq!(kinds(&p), [BlockKind::Wide; 2]);
         assert_eq!(
             details(&p),
-            [Some(Col::new(550.0, 147.0)), Some(Col::new(1264.0, 147.0))]
+            [Some(Col::new(574.0, 159.0)), Some(Col::new(1252.0, 159.0))]
         );
 
+        // The owner's window: mid beside the gauge.
+        let p = at(1039.0);
+        assert_eq!(
+            (p.gauge, kinds(&p)),
+            (Some(gauge(12.0)), [BlockKind::Mid; 2])
+        );
+        assert_eq!(p.blocks[0].bar, Some(Col::new(269.0, 28.0)));
+        assert_eq!(p.blocks[0].amount, Some(Col::new(303.0, 160.0)));
+
         let p = at(750.0);
-        assert_eq!(kinds(&p), [BlockKind::Mid; 2]);
-        assert_eq!(p.blocks[0].bar, Some(Col::new(197.0, 28.0)));
-        assert_eq!(p.blocks[0].amount, Some(Col::new(231.0, 129.0)));
-
-        let p = at(550.0);
         assert_eq!(kinds(&p), [BlockKind::Narrow; 2]);
-        assert_eq!(p.blocks[0].bar, None);
-        assert_eq!(p.blocks[0].amount, Some(Col::new(165.0, 95.0)));
+        assert_eq!(p.blocks[0].bar, Some(Col::new(237.0, 24.0)));
+        assert_eq!(p.blocks[0].amount, Some(Col::new(266.0, 130.0)));
 
-        let p = at(640.0);
-        assert_eq!(kinds(&p), [BlockKind::Narrow; 2]);
-        assert_eq!(p.blocks[0].bar, Some(Col::new(165.0, 24.0)));
-        assert_eq!(p.blocks[0].amount, Some(Col::new(194.0, 111.0)));
+        for w in [550.0, 450.0] {
+            let p = at(w);
+            assert_eq!(
+                (p.gauge, kinds(&p)),
+                (Some(gauge(12.0)), [BlockKind::Slim; 2])
+            );
+            assert_eq!(p.blocks[0].pct, Some(Col::new(204.0, 26.0)));
+            assert_eq!(p.blocks[0].amount, None);
+        }
 
+        // Under 417 pt not even slim fits beside the gauge: the deck draws none, and the blocks
+        // are 0.134's.
         let p = at(350.0);
-        assert_eq!(kinds(&p), [BlockKind::Slim; 2]);
+        assert_eq!((p.gauge, kinds(&p)), (None, [BlockKind::Slim; 2]));
         assert_eq!(p.blocks[0].pct, Some(Col::new(132.0, 26.0)));
         assert_eq!(p.blocks[0].amount, None);
 
+        // Past the cap the table is centred, the gauge leading it as Full's slot leads its table.
         let p = at(2560.0);
+        assert_eq!(p.gauge, Some(gauge(179.0)));
         assert_eq!(
             p.blocks.map(|b| b.at),
-            [Col::new(167.0, 1098.0), Col::new(1294.0, 1098.0)]
+            [Col::new(251.0, 1050.0), Col::new(1330.0, 1050.0)]
         );
         assert_eq!(details(&p).map(|d| d.map(|d| d.w)), [Some(560.0); 2]);
 
         let p = at(320.0);
         assert_eq!(
-            (kinds(&p), p.blocks.map(|b| b.pct)),
-            ([BlockKind::Slim; 2], [None; 2])
+            (p.gauge, kinds(&p), p.blocks.map(|b| b.pct)),
+            (None, [BlockKind::Slim; 2], [None; 2])
         );
         assert!(!p.ground_only);
     }
@@ -1788,17 +1810,19 @@ mod tests {
     #[test]
     fn breakpoints_follow_the_face() {
         let helvetica = breakpoints(&hn());
-        assert_eq!(helvetica.full, [1045.0, 839.0, 522.0, 323.0]);
-        assert_eq!(helvetica.block, [528.0, 319.0, 245.0, 146.0]);
-        assert_eq!(helvetica.folded, [1109.0, 691.0, 543.0, 345.0]);
+        assert_eq!(helvetica.full, [981.0, 775.0, 522.0, 323.0]);
+        assert_eq!(helvetica.block, [480.0, 319.0, 245.0, 146.0]);
+        assert_eq!(helvetica.folded, [1085.0, 763.0, 615.0, 417.0]);
+        assert_eq!(helvetica.folded_bare, 345.0);
 
         let stack = FaceMetrics::test_stack();
         assert_eq!(plan_full(1119.0, &stack).name.w, 59.0);
         assert_eq!(plan_full(550.0, &stack).name.w, 56.0);
         let dejavu = breakpoints(&stack);
-        assert_eq!(dejavu.full, [1048.0, 842.0, 526.0, 328.0]);
-        assert_eq!(dejavu.block, [532.0, 323.0, 250.0, 151.0]);
-        assert_eq!(dejavu.folded, [1117.0, 699.0, 553.0, 355.0]);
+        assert_eq!(dejavu.full, [984.0, 778.0, 526.0, 328.0]);
+        assert_eq!(dejavu.block, [484.0, 323.0, 250.0, 151.0]);
+        assert_eq!(dejavu.folded, [1093.0, 771.0, 625.0, 427.0]);
+        assert_eq!(dejavu.folded_bare, 355.0);
 
         let drawn = |w: f64| {
             (
@@ -1819,20 +1843,29 @@ mod tests {
                 assert_ne!(plan_full(w - 1.0, m).kind, kind);
             }
             for (kind, w) in BlockKind::ALL.into_iter().zip(bp.folded) {
-                assert_eq!(plan_folded(w, m).blocks.map(|b| b.kind), [kind; 2]);
-                let below = plan_folded(w - 1.0, m).blocks[0];
+                let at = plan_folded(w, m);
+                assert_eq!(at.blocks.map(|b| b.kind), [kind; 2]);
+                assert!(at.gauge.is_some(), "{kind:?} at {w} has the gauge");
+                let below = plan_folded(w - 1.0, m);
                 if kind == BlockKind::Slim {
-                    assert_eq!((below.kind, below.pct), (kind, None));
+                    assert_eq!((below.gauge, below.blocks[0].kind), (None, kind));
+                    assert!(below.blocks[0].pct.is_some());
                 } else {
-                    assert_ne!(below.kind, kind);
+                    assert_ne!(below.blocks[0].kind, kind);
                 }
             }
+            let bare = plan_folded(bp.folded_bare, m);
+            assert_eq!((bare.gauge, bare.blocks[0].kind), (None, BlockKind::Slim));
+            assert!(bare.blocks[0].pct.is_some());
+            let below = plan_folded(bp.folded_bare - 1.0, m).blocks[0];
+            assert_eq!((below.kind, below.pct), (BlockKind::Slim, None));
         }
     }
 
     #[test]
     fn every_width_plans_inside_the_card() {
         for m in [hn(), FaceMetrics::test_stack()] {
+            let slim_beside = breakpoints(&m).folded[3];
             for w in (160..=5120).map(f64::from) {
                 let full = plan_full(w, &m);
                 let period = match full.kind {
@@ -1861,6 +1894,16 @@ mod tests {
                 let folded = plan_folded(w, &m);
                 let [a, b] = folded.blocks;
                 assert!(a.at.end() < folded.divider && folded.divider < b.at.x);
+                if let Some(g) = folded.gauge {
+                    let [x0, y0, x1, y1] = g.dial();
+                    assert!(
+                        x0 >= X0 && x1 < g.divider && g.divider < a.at.x && a.at.x == a.name.x,
+                        "Folded W {w}: the gauge left of block A: {g:?} {:?}",
+                        a.at
+                    );
+                    assert!(y0 >= 4.0 && y1 <= 58.0, "Folded W {w}: {g:?} in the band");
+                }
+                assert_eq!(folded.gauge.is_some(), w >= slim_beside, "Folded W {w}");
                 for block in &folded.blocks {
                     let period = if block.kind == BlockKind::Wide {
                         20
@@ -1998,39 +2041,11 @@ mod tests {
             let full_rows = [bp.full[2], bp.full[3]].map(|w| plan_full(w, &m));
             let folded = bp.folded.map(|w| plan_folded(w, &m).blocks[1]);
             for clusters in &machines {
-                let total: usize = clusters.iter().map(|c| c.count).sum();
-                let title = cores_block_title(clusters, &m);
-                assert!(title.starts_with(&format!("{total} ")) && !title.ends_with('…'));
-                let floor = FULL_TABLE_PT - 6.0;
-                let mode = cores_block_mode(clusters, FULL_TABLE_PT);
-                let CoresMode::Block { pitch, sq, per_row } = mode else {
-                    panic!("{clusters:?} lost the block's grid: {mode:?}");
-                };
-                assert!(cores_block_bottom(clusters, mode) <= floor);
-                for &size in CORES_BLOCK_SIZES.iter().take_while(|size| size.0 > pitch) {
-                    let larger = CoresMode::block(size);
-                    assert!(
-                        cores_block_bottom(clusters, larger) > floor,
-                        "{clusters:?} fits {larger:?}"
-                    );
-                }
-                assert!(f64::from(per_row - 1) * pitch + sq <= CORES_BLOCK_W);
-                for cluster in clusters {
-                    let caption = cores_block_caption(cluster, &m);
-                    assert_eq!(caption.is_some(), cluster.name.is_some());
-                    if let Some(caption) = caption {
-                        assert_eq!(caption.count, format!("{} ", cluster.count));
-                        assert!(
-                            !caption.name.is_empty() && caption.width(&m) <= CORES_BLOCK_W + 0.01,
-                            "{caption:?} leaves the block"
-                        );
-                    }
-                }
                 for plan in &full_rows {
                     let CoresAt::Row(room) = plan.cores else {
                         panic!("{:?} has a Cores row", plan.kind);
                     };
-                    let mode = plan.cores_mode(clusters, FULL_TABLE_PT, &m);
+                    let mode = plan.cores_mode(clusters, &m).expect("a Cores row");
                     let ladder = [CoresMode::Stack, CoresMode::Tiny];
                     assert_row_fits(
                         clusters,
@@ -2063,17 +2078,11 @@ mod tests {
                 name: None,
             }];
             for clusters in [&[][..], &unread] {
-                let title = cores_block_title(clusters, &m);
-                assert!(title.ends_with("not read"), "the title says {title:?}");
-                assert_eq!(
-                    cores_block_mode(clusters, FULL_TABLE_PT),
-                    CoresMode::CountOnly
-                );
                 let rows = full_rows.iter().map(|plan| {
                     let CoresAt::Row(room) = plan.cores else {
                         panic!("{:?} has a Cores row", plan.kind);
                     };
-                    (plan.cores_mode(clusters, FULL_TABLE_PT, &m), room.w)
+                    (plan.cores_mode(clusters, &m).expect("a Cores row"), room.w)
                 });
                 let blocks = folded
                     .iter()
@@ -2085,14 +2094,6 @@ mod tests {
                 }
             }
         }
-
-        let huge = [Cluster {
-            count: 1024,
-            name: None,
-        }];
-        let smallest = CORES_BLOCK_SIZES[CORES_BLOCK_SIZES.len() - 1];
-        assert!(cores_block_bottom(&huge, CoresMode::block(smallest)) > FULL_TABLE_PT - 6.0);
-        assert_eq!(cores_block_mode(&huge, FULL_TABLE_PT), CoresMode::CountOnly);
     }
 
     #[test]
@@ -2109,17 +2110,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            cores_block_mode(&m5, 104.0),
-            CoresMode::Block {
-                pitch: 11.0,
-                sq: 9.0,
-                per_row: 6
-            }
+            plan_full(1119.0, &m).cores_mode(&m5, &m),
+            None,
+            "the gauge's slot"
         );
-        assert_eq!(cores_block_title(&m5, &m), "18 CPU cores");
         assert_eq!(
-            plan_full(550.0, &m).cores_mode(&m5, 104.0, &m),
-            CoresMode::Stack
+            plan_full(550.0, &m).cores_mode(&m5, &m),
+            Some(CoresMode::Stack)
         );
         assert_eq!(
             plan_folded(1119.0, &m).blocks[1].cores_mode(&m5, &m),
@@ -2158,34 +2155,44 @@ mod tests {
         let plan = plan_full(1119.0, &m);
         let head = header_full(&plan, TEXT, &m);
         let after_time = plan.strip.x + time_w + KEY_GAP;
-        let ticks: Vec<(u32, f64)> = head.ruler.iter().map(|t| (t.age_s, t.left)).collect();
-        assert_eq!(ticks.iter().map(|t| t.0).collect::<Vec<_>>(), [300, 60]);
+        let ticks: Vec<u32> = head.ruler.iter().map(|t| t.age_s).collect();
+        assert_eq!(ticks, [300, 60]);
         assert_eq!(placed(&head, KeyItem::Over), Some(after_time));
-        let mid_tick_end = ticks[0].1 + m.width(&tick_words(300), HEADER_PT, false) + KEY_GAP;
-        assert_eq!(placed(&head, KeyItem::NotRead), Some(mid_tick_end));
-        let global = label_x(&head, Label::Scope(Bar::Global)).unwrap_or_default();
-        let global_end = global + SWATCH_ADVANCE + m.width("Global · this Mac", HEADER_PT, false);
-        assert!(
-            placed(&head, KeyItem::Ramp).is_some_and(|x| (x - (global_end + KEY_GAP)).abs() < 1e-9),
-            "the ramp after the global scope: {:?}",
-            head.key.placed
-        );
-        let scope = |bar| head.labels.iter().find(|l| l.label == Label::Scope(bar));
         assert_eq!(
-            scope(Bar::Global).map(|l| l.text.as_str()),
-            Some("Global · this Mac")
+            (
+                placed(&head, KeyItem::Ramp),
+                placed(&head, KeyItem::NotRead)
+            ),
+            (None, None),
+            "wide keys only the over mark"
+        );
+        let scope = |bar| {
+            head.labels
+                .iter()
+                .find(|l| l.label == Label::Scope(bar))
+                .map(|l| l.text.as_str())
+        };
+        assert_eq!(
+            [Bar::Global, Bar::Aterm, Bar::Tab].map(scope),
+            [Some("this Mac"), Some("aterm"), Some("Tab 2")]
         );
         assert_eq!(
-            scope(Bar::Aterm).map(|l| l.text.as_str()),
-            Some("aterm · all tabs")
+            label_x(&head, Label::Now),
+            plan.pct.map(Col::end),
+            "\"now\" beside the live edge's dot"
         );
-        assert_eq!(
-            scope(Bar::Tab).map(|l| l.text.as_str()),
-            Some("Tab 2 · this tab")
+        assert_eq!(label_x(&head, Label::Details), None);
+        // With no over mark on screen the key is empty, and the scale keeps what it had.
+        let calm = header_full(
+            &plan,
+            HeaderText {
+                over: false,
+                ..TEXT
+            },
+            &m,
         );
-        assert_eq!(label_x(&head, Label::Now), plan.pct.map(Col::end));
-        let details = head.labels.iter().find(|l| l.label == Label::Details);
-        assert_eq!(details.map(|l| l.text.as_str()), Some(DETAILS_LONG));
+        assert!(calm.key.placed.is_empty(), "{:?}", calm.key.placed);
+        assert!(calm.ruler.len() >= head.ruler.len());
 
         let plan = plan_full(550.0, &m);
         let head = header_full(&plan, TEXT, &m);
@@ -2209,6 +2216,8 @@ mod tests {
         );
         assert!(label_x(&head, Label::Scope(Bar::Tab)).is_some());
 
+        // Folded says the glance: "over max" alone, over block B's strip (block A's carries the
+        // time label and the scale), and only while a strip draws an over mark.
         let plan = plan_folded(1119.0, &m);
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
@@ -2217,10 +2226,55 @@ mod tests {
             head.ruler.iter().map(|t| t.age_s).collect::<Vec<_>>(),
             [300, 60]
         );
-        assert_eq!(placed(&head, KeyItem::Over), Some(a.name.x));
-        assert_eq!(placed(&head, KeyItem::Ramp), Some(b.strip.x));
-        let ramp_end = b.strip.x + KeyItem::Ramp.width(&m) + KEY_GAP;
-        assert_eq!(placed(&head, KeyItem::NotRead), Some(ramp_end));
+        assert_eq!(placed(&head, KeyItem::Over), Some(b.strip.x));
+        assert_eq!(
+            (
+                placed(&head, KeyItem::Ramp),
+                placed(&head, KeyItem::NotRead)
+            ),
+            (None, None)
+        );
+        let calm = HeaderText {
+            over: false,
+            ..TEXT
+        };
+        assert!(
+            header_folded(&plan, calm, [None, None], &m)
+                .key
+                .placed
+                .is_empty()
+        );
+        let scopes = |head: &HeaderPlan| -> Vec<(f64, String)> {
+            head.labels
+                .iter()
+                .filter(|l| matches!(l.label, Label::Scope(_)))
+                .map(|l| (l.x, l.text.clone()))
+                .collect()
+        };
+        assert_eq!(
+            scopes(&head),
+            [
+                (a.amount.map_or(0.0, |c| c.x), "this Mac".to_owned()),
+                (a.aterm.map_or(0.0, |c| c.x), "aterm".to_owned()),
+                (a.tab.map_or(0.0, |c| c.x), "Tab 2".to_owned()),
+                (b.amount.map_or(0.0, |c| c.x), "this Mac".to_owned()),
+                (b.aterm.map_or(0.0, |c| c.x), "aterm".to_owned()),
+                (b.tab.map_or(0.0, |c| c.x), "Tab 2".to_owned()),
+            ],
+            "wide heads each block's columns"
+        );
+        assert_eq!(label_x(&head, Label::Details), None);
+        // Mid keys the bar once, over block A.
+        let plan = plan_folded(1039.0, &m);
+        let head = header_folded(&plan, TEXT, [None, None], &m);
+        let bar = plan.blocks[0].bar.map_or(0.0, |c| c.x);
+        assert_eq!(
+            scopes(&head)
+                .iter()
+                .map(|(x, t)| (*x >= bar && *x < plan.divider, t.as_str()))
+                .collect::<Vec<_>>(),
+            [(true, "this Mac"), (true, "aterm"), (true, "Tab 2")]
+        );
     }
 
     #[test]

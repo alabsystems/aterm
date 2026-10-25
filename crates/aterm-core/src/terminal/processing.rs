@@ -419,14 +419,23 @@ impl Terminal {
                     .checked_add(self.sync_timeout_duration)
                     .is_none_or(|deadline| self.transient.process_now >= deadline);
                 if expired {
-                    self.modes.synchronized_output = false;
-                    self.transient.sync_start = None;
-                    self.transient.sync_open_dirty = false;
-                    self.transient.sync_end_seq += 1;
+                    self.end_synchronized_output();
                 }
             }
         }
         damage_class
+    }
+
+    /// End an open synchronized-output (mode 2026) frame as its timeout does, without the parser, so a partly received character stays pending: whether one was open.
+    pub fn end_synchronized_output(&mut self) -> bool {
+        if !self.modes.synchronized_output {
+            return false;
+        }
+        self.modes.synchronized_output = false;
+        self.transient.sync_start = None;
+        self.transient.sync_open_dirty = false;
+        self.transient.sync_end_seq += 1;
+        true
     }
 
     /// Backdate the synchronized-output (mode 2026) start timestamp for testing timeout behavior.
@@ -589,6 +598,29 @@ mod tests {
 
     fn row_text(t: &Terminal, row: u16) -> String {
         t.grid().row(row).map(|r| r.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn ending_an_open_frame_keeps_a_partly_received_character_pending() {
+        let mut t = Terminal::new(2, 10);
+        t.process(b"\x1b[?2026hab\xe2\x94");
+        assert!(t.end_synchronized_output(), "a frame was open");
+        assert!(!t.modes().synchronized_output());
+        assert!(!t.end_synchronized_output(), "none is open now");
+        assert_eq!(row_text(&t, 0).trim_end(), "ab", "nothing forced out");
+        t.process(b"\x80");
+        assert_eq!(
+            row_text(&t, 0).trim_end(),
+            "ab\u{2500}",
+            "the character completes"
+        );
+        let mut parsed = Terminal::new(2, 10);
+        parsed.process(b"\x1b[?2026hab\xe2\x94\x1b[?2026l");
+        assert!(
+            row_text(&parsed, 0).contains('\u{FFFD}'),
+            "negative control: closing through the parser breaks the character: {:?}",
+            row_text(&parsed, 0)
+        );
     }
 
     #[test]

@@ -26,11 +26,24 @@ pub const DEFAULT_BUDGET: Duration = Duration::from_secs(6 * 3600);
 /// Maximum time to wait for a foreign or silent `trustd` to leave the socket.
 pub const TRUSTD_WAIT: Duration = Duration::from_secs(330);
 
-/// Peak RSS (`16 GiB`) at or above which a check is scheduled as heavy.
+/// The memory (`16 GiB`, and never more than half the RAM) a check claims when the cost
+/// history has no peak for its library ([`claim_need`]).
 const HEAVY_BYTES: u64 = 16 << 30;
 
 /// How often the slots are polled.
 const POLL: Duration = Duration::from_millis(250);
+
+/// What a run claims of its target root's volume where none was measured there: 6 GiB, the
+/// lane's budget in the gate's preflight (`TRUST_LANE_BYTES`, 42e8a9a273^,
+/// `crates/aterm-verify/src/disk.rs`). MEASURED there 2026-09-27: one slot peaked at 1.7 GiB
+/// (`du -sh`) checking aterm-gui's whole graph, three slots on that machine, read up to 6. A
+/// whole run's peak was not measured then. A first run claims it less what the root holds
+/// already; a run measured here claims what it wrote instead ([`DISK_RECORD`]).
+const COLD_DISK: u64 = 6 << 30;
+
+/// The file under the target root's `logs` keeping what the last runs wrote there
+/// (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
+const DISK_RECORD: &str = "footprint.json";
 
 /// The variable whose random value marks every process of one check ([`proc_tree::Mark`]).
 pub const CHECK_VAR: &str = aterm_uds::process::TRUST_CHECK_VAR;
@@ -89,6 +102,10 @@ pub struct Config {
     /// Whether a target root another run holds is COULD NOT RUN at once (`--no-wait`) instead
     /// of waited for.
     pub no_wait: bool,
+    /// How the run's disk claim and each check's memory claim are admitted (`--admit wait`, the
+    /// default, or `--admit now`, which takes each at once and says what it would have waited
+    /// for).
+    pub admit: aterm_capacity::Admit,
 }
 
 impl Config {
@@ -109,6 +126,7 @@ impl Config {
             state: None,
             trustd_wait: TRUSTD_WAIT,
             no_wait: false,
+            admit: aterm_capacity::Admit::Wait,
         }
     }
 }
@@ -200,6 +218,11 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
             "--no-obligations" => cfg.obligations = false,
             "--stop-if-narrowed" => cfg.stop_if_narrowed = true,
             "--no-wait" => cfg.no_wait = true,
+            aterm_capacity::Admit::FLAG => {
+                let v = value()?;
+                cfg.admit = aterm_capacity::Admit::parse(v)
+                    .ok_or(format!("trust run: --admit takes wait or now, got {v:?}"))?;
+            }
             other => return Err(format!("trust run: unknown flag {other:?}")),
         }
     }
@@ -709,23 +732,27 @@ pub fn select(libs: &[Lib], names: Option<&[String]>) -> Result<Vec<Selected>, S
         .collect())
 }
 
-/// Automatic slot count (`--jobs auto`) from logical cores and total memory in bytes.
+/// Automatic slot count (`--jobs auto`) from logical cores: one slot per 6, at least one.
+/// Memory sets no slot count: each check's claim is admitted at the launch gate against the
+/// memory available then ([`Admission`]).
 #[must_use]
-pub fn auto_slots(cores: usize, mem: u64) -> usize {
-    let by_mem = if mem == 0 {
-        1
-    } else {
-        usize::try_from(mem / (16 << 30)).unwrap_or(usize::MAX)
-    };
-    (cores / 6).min(by_mem).max(1)
+pub fn auto_slots(cores: usize) -> usize {
+    (cores / 6).max(1)
 }
 
-/// Maximum concurrent heavy checks for total memory `mem` in bytes.
+/// The memory a check of a library claims: its last recorded peak (`cost`'s largest process)
+/// plus a margin ([`trust_facts::peak_claim`]), or with no peak recorded [`HEAVY_BYTES`] or
+/// half of `ram` (this host's RAM, when read), whichever is less, so a host of any size can
+/// admit a library it has not measured. A claim is never cut to fit the RAM: one that is not
+/// below it is refused up front ([`trust_facts::peak_seen`]), and under `--try-refused` it
+/// starts at once ([`Admission::admit`]).
 #[must_use]
-pub fn heavy_slots(mem: u64) -> usize {
-    usize::try_from(mem / (64 << 30))
-        .unwrap_or(usize::MAX)
-        .max(1)
+pub fn claim_need(cost: Option<&Cost>, ram: u64) -> u64 {
+    match cost.filter(|c| c.maxrss > 0) {
+        Some(c) => trust_facts::peak_claim(c.maxrss),
+        None if ram > 0 => HEAVY_BYTES.min(ram / 2),
+        None => HEAVY_BYTES,
+    }
 }
 
 /// Historical resource cost of a library's last completed check.
@@ -739,16 +766,22 @@ pub struct Cost {
     pub when: String,
 }
 
-const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all";
+const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <largest process's peak RSS bytes> <when>; the slots take the longest first, a library with no row first of all, and each check claims its peak and a margin before it starts (a claim not below the RAM is refused up front)";
 
 /// The committed seed's first line ([`trust_facts::COSTS`]), above [`COSTS_HEADER`].
-const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library its git directory's aterm-release/trust-costs.tsv has no row for takes its row here). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, as heavy.";
+const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library's newer row of this file and its git directory's aterm-release/trust-costs.tsv is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, claiming 16 GiB or half the RAM, whichever is less.";
 
-/// Loads cost history, overlaying local `history` onto the committed `seed`.
+/// Loads cost history: for each library the newer of the committed `seed`'s row and the local
+/// `history`'s (by its stamp; the history's on a tie), so a peak measured on another host
+/// after this clone's last run of it is the one read.
 #[must_use]
 pub fn read_costs(history: Option<&Path>, seed: &Path) -> BTreeMap<String, Cost> {
     let mut all = cost_file(seed);
-    all.extend(history.map(cost_file).unwrap_or_default());
+    for (name, row) in history.map(cost_file).unwrap_or_default() {
+        if all.get(&name).is_none_or(|c| row.when >= c.when) {
+            all.insert(name, row);
+        }
+    }
     all
 }
 
@@ -796,23 +829,15 @@ pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
         .collect()
 }
 
-/// Orders `names` for execution, unknown cost first, then by descending CPU time, each with
-/// whether it is heavy (an unknown cost counts as heavy).
+/// Orders `names` for execution, unknown cost first, then by descending CPU time.
 #[must_use]
-pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<(usize, bool)> {
+pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..names.len()).collect();
     idx.sort_by_key(|&i| match costs.get(names[i]) {
         None => (0, 0, i),
         Some(c) => (1, u64::MAX - c.cpu, i),
     });
-    idx.into_iter()
-        .map(|i| {
-            (
-                i,
-                costs.get(names[i]).is_none_or(|c| c.maxrss >= HEAVY_BYTES),
-            )
-        })
-        .collect()
+    idx
 }
 
 /// Single verification check scheduled on a slot.
@@ -826,7 +851,8 @@ pub struct Job {
     pub report: Option<PathBuf>,
     /// Slot `CARGO_TARGET_DIR` assigned when the check starts.
     pub target: PathBuf,
-    pub heavy: bool,
+    /// The memory it claims before it starts, in bytes ([`claim_need`]); 0 claims none.
+    pub need: u64,
     /// Fork `Cargo.lock` state tracked when checking a fork by manifest path ([`fork_lock`]).
     pub lock: Option<ForkLock>,
 }
@@ -893,6 +919,197 @@ pub trait Checks {
     fn held(&self, slot: usize) -> bool;
     /// The host's one-minute load average now; `None` when it cannot be read.
     fn load(&self) -> Option<f64>;
+    /// Admits `job`'s memory claim ([`Job::need`]) at the launch gate: the claim, held until
+    /// the check ends, or `None` while it waits for room ([`Admission::admit`]).
+    fn admit(&mut self, job: &Job) -> Option<Admitted>;
+}
+
+/// A check's admitted memory claim in the capacity ledger ([`aterm_capacity::Claim`]), held for
+/// as long as the check runs and let go when it ends; none when nothing was claimed.
+#[derive(Debug, Default)]
+pub struct Admitted {
+    /// Held only to be let go when the check ends (its drop).
+    _claim: Option<aterm_capacity::Claim>,
+}
+
+impl Admitted {
+    /// A check admitted with no claim.
+    #[must_use]
+    pub const fn unclaimed() -> Admitted {
+        Admitted { _claim: None }
+    }
+
+    /// A check admitted holding `claim`.
+    const fn holding(claim: aterm_capacity::Claim) -> Admitted {
+        Admitted {
+            _claim: Some(claim),
+        }
+    }
+}
+
+/// THE LAUNCH GATE'S MEMORY ADMISSION (`docs/DESIGN-adaptive-build-2026-10-24.md`, TRUST-MEM):
+/// one claim per check in this user's capacity ledger ([`aterm_capacity`]), its need the
+/// check's [`Job::need`]. The check at the head of the queue enters the ledger as a
+/// [`aterm_capacity::Waiter`] and is looked at once a [`aterm_capacity::Pace::poll`] until its
+/// need fits beside every claim ahead of it, this run's own running checks' included: the
+/// blocking `aterm_capacity::admit` would hold the slots still, so no running check could end
+/// and let its claim go. While it waits it says, once a minute, what it is short of and who
+/// holds it. Under `--admit now` each claim is taken at once, saying what it would have waited
+/// for. A claim the machine can never admit ([`aterm_capacity::never`]: all its RAM or more,
+/// which the plan refuses up front where it reads the RAM, unless `--try-refused`) waits for
+/// nothing: it is taken at once, saying so. With no ledger (no home) or one that cannot be
+/// written, a check starts unclaimed and says so.
+pub struct Admission<'m> {
+    ledger: Option<aterm_capacity::Ledger>,
+    machine: &'m dyn aterm_capacity::Machine,
+    mode: aterm_capacity::Admit,
+    pace: aterm_capacity::Pace,
+    head: Option<Head>,
+}
+
+/// The check at the head of the queue, waiting in the ledger.
+struct Head {
+    name: String,
+    waiter: aterm_capacity::Waiter,
+    /// When it entered, on the slots' clock ([`Checks::now`]).
+    entered: Duration,
+    /// When it was last looked at; `None` before the first look.
+    looked: Option<Duration>,
+    /// When it last said it waits.
+    said: Option<Duration>,
+}
+
+impl<'m> Admission<'m> {
+    /// Admission in `ledger` (none: every check starts unclaimed) on `machine`.
+    #[must_use]
+    pub fn new(
+        ledger: Option<aterm_capacity::Ledger>,
+        machine: &'m dyn aterm_capacity::Machine,
+        mode: aterm_capacity::Admit,
+        pace: aterm_capacity::Pace,
+    ) -> Admission<'m> {
+        Admission {
+            ledger,
+            machine,
+            mode,
+            pace,
+            head: None,
+        }
+    }
+
+    /// Admits `job` at `now` (the slots' clock), saying through `say` what it waits for: its
+    /// claim, or `None` while it waits. A job that claims nothing is admitted at once.
+    pub fn admit(
+        &mut self,
+        job: &Job,
+        now: Duration,
+        say: &mut dyn FnMut(&str),
+    ) -> Option<Admitted> {
+        use aterm_capacity::{Admit, Polled, Short, span};
+        if job.need == 0 {
+            return Some(Admitted::unclaimed());
+        }
+        let what = format!("trust check {}", job.name);
+        let Some(ledger) = &self.ledger else {
+            say(&format!(
+                "capacity: {what} starts unclaimed: there is no home to keep the capacity ledger under"
+            ));
+            return Some(Admitted::unclaimed());
+        };
+        if self.head.as_ref().is_some_and(|h| h.name != job.name) {
+            self.head = None;
+        }
+        let need = aterm_capacity::Need::new(what.clone()).mem(job.need);
+        // A need no amount of waiting could meet would hold its place at the head of this
+        // run and of every claimant's queue on the machine for good.
+        let never = self
+            .head
+            .is_none()
+            .then(|| aterm_capacity::never(&need, &self.machine.read(None)))
+            .flatten();
+        if let Some(why) = &never {
+            say(&format!(
+                "capacity: {why}: it can never be admitted here, so it starts at once and holds its claim"
+            ));
+        }
+        if self.mode == Admit::Now || never.is_some() {
+            let mut quiet = |_: &str| {};
+            let told: &mut dyn FnMut(&str) = if never.is_some() {
+                &mut quiet
+            } else {
+                &mut *say
+            };
+            return Some(
+                match aterm_capacity::admit_with(
+                    ledger,
+                    self.machine,
+                    need,
+                    Admit::Now,
+                    self.pace,
+                    told,
+                ) {
+                    Ok(claim) => Admitted::holding(claim),
+                    Err(e) => {
+                        say(&format!("capacity: {what} starts unclaimed: {e}"));
+                        Admitted::unclaimed()
+                    }
+                },
+            );
+        }
+        let mut head = match self.head.take() {
+            Some(head) => head,
+            None => match aterm_capacity::Waiter::enter(ledger, self.machine, need) {
+                Ok(waiter) => Head {
+                    name: job.name.clone(),
+                    waiter,
+                    entered: now,
+                    looked: None,
+                    said: None,
+                },
+                Err(e) => {
+                    say(&format!(
+                        "capacity: {what} starts unclaimed: the capacity ledger could not be used: {e}"
+                    ));
+                    return Some(Admitted::unclaimed());
+                }
+            },
+        };
+        if head
+            .looked
+            .is_some_and(|t| now.saturating_sub(t) < self.pace.poll)
+        {
+            self.head = Some(head);
+            return None;
+        }
+        let waited = now.saturating_sub(head.entered);
+        match head.waiter.poll(self.machine) {
+            Polled::Admitted(claim) => {
+                if head.said.is_some() {
+                    say(&format!("capacity: {what} admitted after {}", span(waited)));
+                }
+                Some(Admitted::holding(claim))
+            }
+            Polled::Waiting(waiter, short) => {
+                head.waiter = waiter;
+                // Another waiter held the ledger's lock for its own look: look again at the
+                // next pass, and say so only once it has lasted a minute.
+                let turn = matches!(short.shorts[..], [Short::Turn { .. }]);
+                head.looked = (!turn).then_some(now);
+                let due = head
+                    .said
+                    .is_none_or(|t| now.saturating_sub(t) >= self.pace.line_every);
+                if due && (!turn || waited >= self.pace.line_every) {
+                    say(&format!(
+                        "capacity: {what} waits ({}): {short}",
+                        span(waited)
+                    ));
+                    head.said = Some(now);
+                }
+                self.head = Some(head);
+                None
+            }
+        }
+    }
 }
 
 /// Completed check result reported by [`run_slots`].
@@ -916,17 +1133,17 @@ pub enum Stopped {
     Unstartable(String),
 }
 
-/// Runs `jobs` across `slots` concurrent slots (at most `heavy` heavy checks at once), each
-/// check in the lowest-numbered slot no check runs in and none holds ([`Checks::held`]): a
-/// slot a check was killed or failed in, or whose record another run left, is held, so the
-/// next check starts in another.
+/// Runs `jobs` across `slots` concurrent slots, in their order, each check in the
+/// lowest-numbered slot no check runs in and none holds ([`Checks::held`]): a slot a check was
+/// killed or failed in, or whose record another run left, is held, so the next check starts in
+/// another. A check starts only once its memory claim is admitted ([`Checks::admit`]), and
+/// holds it until it ends; the checks behind it wait with it.
 ///
 /// # Errors
 /// Returns [`Stopped`] if interrupted or if a check cannot be started.
 pub fn run_slots(
     jobs: Vec<Job>,
     slots: usize,
-    heavy: usize,
     budget: Duration,
     checks: &mut dyn Checks,
     done: &mut dyn FnMut(Finished, &mut dyn Checks),
@@ -937,6 +1154,8 @@ pub fn run_slots(
         since: Duration,
         /// The load readings taken while it ran: their sum and count.
         load: (f64, u32),
+        /// Its memory claim, let go when it ends.
+        _claim: Admitted,
     }
     let mut queue: VecDeque<Job> = jobs.into();
     let slots = slots.max(1);
@@ -953,16 +1172,15 @@ pub fn run_slots(
             return Err(Stopped::Interrupted);
         }
         while running.len() < slots && (running.is_empty() || checks.trustd_held()) {
-            let heavy_now = running.iter().filter(|r| r.job.heavy).count();
-            let Some(i) = queue.iter().position(|j| !j.heavy || heavy_now < heavy) else {
-                break;
-            };
             let Some(slot) = (0..usize::MAX)
                 .find(|n| !running.iter().any(|r| r.job.slot == *n) && !checks.held(*n))
             else {
                 break;
             };
-            let Some(mut job) = queue.remove(i) else {
+            let Some(claim) = queue.front().and_then(|job| checks.admit(job)) else {
+                break;
+            };
+            let Some(mut job) = queue.pop_front() else {
                 break;
             };
             job.slot = slot;
@@ -972,6 +1190,7 @@ pub fn run_slots(
                     check,
                     since: checks.now(),
                     load: (0.0, 0),
+                    _claim: claim,
                 }),
                 Err(e) => {
                     stop_all(&mut running);
@@ -1083,6 +1302,16 @@ trait Bench {
     fn cargo_home(&self) -> String;
     /// Base cache directory for fallback target roots ([`cache_base`]).
     fn cache(&self) -> Option<PathBuf>;
+    /// This host's RAM in bytes (0 unread) and whether it was read as Linux's `MemTotal`.
+    fn memory(&self) -> (u64, bool);
+    /// The host's one-minute load average now; `None` when it cannot be read.
+    fn load(&self) -> Option<f64>;
+    /// Whether `driver`'s `trustc -Z help` lists the verifier's memory ceiling flag
+    /// ([`trust_facts::CEILING_FLAG`]): `Err` names why it could not be read.
+    ///
+    /// # Errors
+    /// trustc could not be run, or printed nothing.
+    fn takes_ceiling(&mut self, driver: &Driver) -> Result<bool, String>;
     /// Runs `jobs` across `slots` beside this prover's `trustd`.
     ///
     /// # Errors
@@ -1096,6 +1325,19 @@ trait Bench {
         done: &mut dyn FnMut(Finished, &mut dyn Checks),
         out: &mut dyn Write,
     ) -> Result<(), String>;
+    /// Claims `run`'s disk in the capacity ledger before the checks start, as `mode` admits
+    /// (waiting for room, or at once), saying on `out` what it waits for. `None`: no claim was
+    /// made.
+    ///
+    /// # Errors
+    /// The need can never fit on the volume ([`atpkg::admit_disk::Error::Never`]), or the
+    /// ledger could not be used.
+    fn disk(
+        &mut self,
+        run: atpkg::admit_disk::Run,
+        mode: atpkg::admit_disk::Admit,
+        out: &mut dyn Write,
+    ) -> Result<Option<atpkg::admit_disk::Admitted>, atpkg::admit_disk::Error>;
 }
 
 /// The machine's prover, graph and trustd.
@@ -1145,6 +1387,36 @@ impl Bench for Machine {
         )
     }
 
+    fn memory(&self) -> (u64, bool) {
+        host_memory()
+    }
+
+    fn load(&self) -> Option<f64> {
+        aterm_sysprobe::load_average().map(|l| l[0])
+    }
+
+    fn takes_ceiling(&mut self, driver: &Driver) -> Result<bool, String> {
+        let trustc = driver.bin.join("trustc");
+        let o = command(&trustc)
+            .args(["-Z", "help"])
+            .env_clear()
+            .envs(lane_env(&driver.bin, &host_var))
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("{} -Z help: {e}", trustc.display()))?;
+        let help = String::from_utf8_lossy(&o.stdout);
+        if !o.status.success() || help.trim().is_empty() {
+            return Err(format!(
+                "{} -Z help exited {} and printed {} bytes",
+                trustc.display(),
+                o.status,
+                o.stdout.len()
+            ));
+        }
+        Ok(lists_ceiling(&help))
+    }
+
     fn checks(
         &mut self,
         cfg: &Config,
@@ -1174,15 +1446,15 @@ impl Bench for Machine {
             t0: Instant::now(),
             locks: BTreeMap::new(),
             serial: aterm_uds::process::process_serial,
+            admission: Admission::new(
+                aterm_capacity::Ledger::user(),
+                &aterm_capacity::Live,
+                cfg.admit,
+                aterm_capacity::Pace::default(),
+            ),
+            out: Box::new(&mut *out),
         };
-        let ran = run_slots(
-            jobs,
-            slots,
-            heavy_slots(prep.mem),
-            cfg.budget,
-            &mut real,
-            done,
-        );
+        let ran = run_slots(jobs, slots, cfg.budget, &mut real, done);
         let locks = std::mem::take(&mut real.locks);
         drop(real);
         drop(keeper);
@@ -1195,6 +1467,18 @@ impl Bench for Machine {
             reap_stale_checks(&prep.root);
         }
         ran.map_err(stopped)
+    }
+
+    fn disk(
+        &mut self,
+        run: atpkg::admit_disk::Run,
+        mode: atpkg::admit_disk::Admit,
+        out: &mut dyn Write,
+    ) -> Result<Option<atpkg::admit_disk::Admitted>, atpkg::admit_disk::Error> {
+        atpkg::admit_disk::admit(run, mode, &mut |line| {
+            let _ = writeln!(out, "trust: {line}");
+        })
+        .map(Some)
     }
 }
 
@@ -1220,6 +1504,11 @@ struct Prepared {
     mem: u64,
     cores: usize,
     costs_path: Option<PathBuf>,
+    /// Each library's last recorded cost ([`read_costs`]): the order, the claims and the
+    /// up-front refusals for a claim not below the RAM are all read from it.
+    costs: BTreeMap<String, Cost>,
+    /// The host's one-minute load as the run began ([`load_word`]).
+    load_start: String,
     /// All library row names in the resolved graph ([`seed_rows`]).
     libraries: BTreeSet<String>,
     _lock: RunLock,
@@ -1255,7 +1544,25 @@ pub fn run(cfg: &Config, out: &mut dyn Write) -> Outcome {
 fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
     let ran = match prepare(cfg, bench, out) {
         Ok(prep) => {
-            let judged = check_and_conclude(cfg, &prep, bench, out).map_err(Stop::CouldNotRun);
+            let judged = match claim_disk(cfg, &prep.root, bench, out) {
+                Ok(disk) => {
+                    let judged =
+                        check_and_conclude(cfg, &prep, bench, out).map_err(Stop::CouldNotRun);
+                    if let Some(disk) = disk {
+                        let claimed = disk.estimate;
+                        let took = disk.finish();
+                        let _ = writeln!(
+                            out,
+                            "trust: disk: claimed {claimed}; this run's target root held {} at \
+                             most and grew by {} before its slots were emptied",
+                            atpkg::admit_disk::size(took.peak),
+                            atpkg::admit_disk::size(took.grew)
+                        );
+                    }
+                    judged
+                }
+                Err(stop) => Err(stop),
+            };
             let kept = clear_slots(&prep.root).unwrap_or_default();
             if !kept.is_empty() {
                 let _ = writeln!(out, "trust: {}", held_words(&kept));
@@ -1449,9 +1756,13 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         }
     };
     let selected = select(&libs, names.as_deref())?;
-    let (mem, memtotal) = host_memory();
+    let (mem, memtotal) = bench.memory();
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let jobs = cfg.jobs.unwrap_or_else(|| auto_slots(cores, mem));
+    let jobs = cfg.jobs.unwrap_or_else(|| auto_slots(cores));
+    let ceiling = driver_ceiling(bench, &driver, state.as_deref(), out);
+    let load_start = load_word(bench.load());
+    let costs_path = state.as_ref().map(|s| s.join("trust-costs.tsv"));
+    let costs = read_costs(costs_path.as_deref(), &cfg.repo.join(trust_facts::COSTS));
     let host_obs = state.as_ref().map(|s| s.join("trust-memory-host.tsv"));
     let mut plan = String::new();
     plan.push_str(trust_facts::PLAN_MAGIC);
@@ -1485,7 +1796,9 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             "host-mem-os",
             if memtotal { "MemTotal" } else { "-" }.into(),
         ),
+        ("driver-ceiling", if ceiling { "yes" } else { "no" }.into()),
         ("now", utc_now()),
+        ("load-start", load_start.clone()),
     ] {
         push_kv(&mut plan, k, &v);
     }
@@ -1514,7 +1827,11 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         ));
     }
     let parsed = Plan::parse(&plan)?;
-    let (admit_lines, refusals) = parsed.admit()?;
+    let peaks: BTreeMap<String, (u64, String)> = costs
+        .iter()
+        .map(|(name, c)| (name.clone(), (c.maxrss, c.when.clone())))
+        .collect();
+    let (admit_lines, refusals) = parsed.admit(&peaks)?;
     plan.push_str(&admit_lines);
     let plan_path = logdir.join(".plan");
     fs::write(&plan_path, &plan).map_err(|e| format!("{}: {e}", plan_path.display()))?;
@@ -1540,7 +1857,9 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         jobs,
         mem,
         cores,
-        costs_path: state.as_ref().map(|s| s.join("trust-costs.tsv")),
+        costs_path,
+        costs,
+        load_start,
         libraries: libs.iter().map(|l| l.name.clone()).collect(),
         root,
         _lock: lock,
@@ -1578,11 +1897,11 @@ fn check_and_conclude(
         let _ = fs::remove_dir_all(format!("{}.report", log.display()));
     }
     let seed = cfg.repo.join(trust_facts::COSTS);
-    let costs = read_costs(prep.costs_path.as_deref(), &seed);
+    let costs = &prep.costs;
     let names: Vec<&str> = work.iter().map(|s| s.lib.name.as_str()).collect();
-    let jobs: Vec<Job> = order(&names, &costs)
+    let jobs: Vec<Job> = order(&names, costs)
         .into_iter()
-        .map(|(i, heavy)| {
+        .map(|i| {
             let lib = &work[i].lib;
             let log = prep.logdir.join(format!("{}.log", lib.spec));
             Job {
@@ -1594,7 +1913,7 @@ fn check_and_conclude(
                     .then(|| PathBuf::from(format!("{}.report", log.display()))),
                 log,
                 target: PathBuf::new(),
-                heavy,
+                need: claim_need(costs.get(&lib.name), prep.mem),
                 lock: None,
             }
         })
@@ -1643,6 +1962,8 @@ fn check_and_conclude(
     }
     let mut plan = prep.plan.clone();
     plan.push_str(&format!("trustd {}\n", trustd::socket().display()));
+    let load_end = load_word(bench.load());
+    push_kv(&mut plan, "load-end", &load_end);
     if let Some(f) = &prep.files {
         let mut why = f.why_not.clone();
         if why.is_empty() && tree_state(&cfg.repo) != f.start {
@@ -1679,14 +2000,18 @@ fn check_and_conclude(
             (
                 "load",
                 if loads.is_empty() {
-                    "-".into()
+                    format!("{} at the start, {load_end} at the end", prep.load_start)
                 } else {
                     #[expect(
                         clippy::cast_precision_loss,
                         reason = "a count of checks is far below 2^52"
                     )]
                     let n = loads.len() as f64;
-                    format!("{:.2}", loads.iter().sum::<f64>() / n)
+                    format!(
+                        "{:.2} over its checks, {} at the start, {load_end} at the end",
+                        loads.iter().sum::<f64>() / n,
+                        prep.load_start
+                    )
                 },
             ),
             ("jobs", prep.jobs.to_string()),
@@ -1925,6 +2250,51 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
     let git = GitCli::new(repo);
     let rev = |r: &str| crate::ledger::rev_parse(&git, r).ok();
     Some((rev("HEAD")?, rev("HEAD^{tree}")?))
+}
+
+/// The disk a run claims (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT): its target
+/// root, where its slots build and its logs go, measured, with what the last runs there wrote
+/// kept under `logs`, or where none was measured [`COLD_DISK`] less what the root holds.
+fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
+    let scope = match &cfg.scope {
+        Scope::WholeTree => String::new(),
+        Scope::Packages(p) => p.iter().map(|n| format!(" -p {n}")).collect(),
+        Scope::Remeasure => " --remeasure".to_owned(),
+    };
+    atpkg::admit_disk::Run {
+        what: format!("ship trust run{scope}"),
+        dirs: vec![root.to_path_buf()],
+        record: root.join("logs").join(DISK_RECORD),
+        cold: COLD_DISK,
+        on: root.to_path_buf(),
+    }
+}
+
+/// Claims the run's disk ([`disk_run`]) once it holds its target root and before a check
+/// starts. A ledger that cannot be used is said, and the run goes on without a claim.
+///
+/// # Errors
+/// The volume holding the root can never hold the need above its floor: COULD NOT RUN.
+fn claim_disk(
+    cfg: &Config,
+    root: &Path,
+    bench: &mut dyn Bench,
+    out: &mut dyn Write,
+) -> Result<Option<atpkg::admit_disk::Admitted>, Stop> {
+    match bench.disk(disk_run(cfg, root), cfg.admit, out) {
+        Ok(held) => Ok(held),
+        Err(atpkg::admit_disk::Error::Never(why)) => Err(Stop::CouldNotRun(format!(
+            "{why}; it can never be admitted there. Fix: give it a --target-root on a larger \
+             volume"
+        ))),
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "trust: the run's disk is not claimed ({e}); it runs without a claim"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Empties `root`'s slots, which are scratch: every check names its units by a fresh session
@@ -2316,6 +2686,93 @@ fn keep_in_record(record: &Path, reached: &[(i32, u64)]) -> bool {
     .is_ok()
 }
 
+/// Whether a `trustc -Z help` listing names the verifier's memory ceiling flag
+/// ([`trust_facts::CEILING_FLAG`]) as one of its `-Z` options.
+#[must_use]
+pub fn lists_ceiling(help: &str) -> bool {
+    help.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("-Z")
+            .and_then(|rest| rest.trim_start().strip_prefix(trust_facts::CEILING_FLAG))
+            .is_some_and(|after| after.is_empty() || after.starts_with(['=', ' ']))
+    })
+}
+
+/// Where a clone keeps each prover build's [`lists_ceiling`] answer.
+const CEILING_CACHE: &str = "trust-driver-ceiling.tsv";
+
+const CEILING_CACHE_HEADER: &str = "# trust lane: whether each prover's trustc takes a verifier memory ceiling: <trustc> <bytes> <modified ns> <yes|no>, probed once per build (`trustc -Z help`). Local to this clone, never committed.";
+
+/// Whether `driver` takes a verifier memory ceiling ([`Bench::takes_ceiling`]), probed once per
+/// prover build: the answer is kept in `state`'s [`CEILING_CACHE`] under its trustc's path, size
+/// and modification time, which a store build never changes. A probe that cannot read the
+/// answer is said on `out` and taken as no ceiling: the RAM / 8 model then refuses nothing,
+/// and a library is still refused for a recorded peak whose claim is not below the RAM.
+fn driver_ceiling(
+    bench: &mut dyn Bench,
+    driver: &Driver,
+    state: Option<&Path>,
+    out: &mut dyn Write,
+) -> bool {
+    let trustc = driver.bin.join("trustc");
+    let key = fs::metadata(&trustc).ok().and_then(|md| {
+        let ns = md
+            .modified()
+            .ok()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(format!("{}\t{}\t{ns}\t", trustc.display(), md.len()))
+    });
+    let cache = state.map(|s| s.join(CEILING_CACHE));
+    let text = cache
+        .as_deref()
+        .and_then(|c| fs::read_to_string(c).ok())
+        .unwrap_or_default();
+    let kept = key.as_deref().and_then(|k| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .and_then(|word| match word {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            })
+    });
+    if let Some(takes) = kept {
+        return takes;
+    }
+    let takes = match bench.takes_ceiling(driver) {
+        Ok(takes) => takes,
+        Err(why) => {
+            let _ = writeln!(
+                out,
+                "trust: {why}; this prover is taken to have no verifier memory ceiling"
+            );
+            return false;
+        }
+    };
+    if let (Some(key), Some(cache)) = (key, cache) {
+        let mine = format!("{}\t", trustc.display());
+        let mut rows: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(&mine))
+            .collect();
+        let row = format!("{key}{}", if takes { "yes" } else { "no" });
+        rows.push(&row);
+        let body = format!("{CEILING_CACHE_HEADER}\n{}\n", rows.join("\n"));
+        let tmp = cache.with_extension(format!("tsv.{}", std::process::id()));
+        let written = cache
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| fs::write(&tmp, body))
+            .and_then(|()| fs::rename(&tmp, &cache));
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    takes
+}
+
 /// Returns this host's RAM in bytes and whether it was read from Linux `MemTotal`.
 fn host_memory() -> (u64, bool) {
     if let Some(b) = crate::artifact::host_memory_bytes() {
@@ -2334,6 +2791,11 @@ fn utc_now() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     aterm_types::rfc3339::format_rfc3339(secs)
+}
+
+/// A one-minute load as a plan writes it: to a hundredth, `unread` when none was read.
+fn load_word(load: Option<f64>) -> String {
+    load.map_or_else(|| "unread".into(), |l| format!("{l:.2}"))
 }
 
 fn push_kv(plan: &mut String, k: &str, v: &str) {
@@ -3088,9 +3550,21 @@ struct RealChecks<'a> {
     locks: BTreeMap<PathBuf, bool>,
     /// Reads a spawned root's serial ([`aterm_uds::process::process_serial`]).
     serial: fn(i32) -> Option<u64>,
+    /// Each check's memory claim, admitted at the launch gate.
+    admission: Admission<'a>,
+    /// Where the gate says what a check waits for.
+    out: Box<dyn Write + 'a>,
 }
 
 impl Checks for RealChecks<'_> {
+    fn admit(&mut self, job: &Job) -> Option<Admitted> {
+        let now = self.t0.elapsed();
+        let out = &mut self.out;
+        self.admission.admit(job, now, &mut |line| {
+            let _ = writeln!(out, "trust: {line}");
+        })
+    }
+
     fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>> {
         let target = self.root.join(format!("j{}", job.slot));
         owner_dirs(&target)?;
@@ -5099,10 +5573,25 @@ mod tests {
         assert_eq!(
             read_costs(Some(&path), &seed),
             BTreeMap::from([
-                ("a".into(), one(3)),
+                ("a".into(), one(9)),
                 ("b".into(), one(2)),
                 ("c".into(), one(4))
-            ])
+            ]),
+            "a's seed row is newer than this clone's own"
+        );
+        let tied = Cost { cpu: 19, ..one(9) };
+        write_costs(
+            Some(&path),
+            &BTreeMap::from([("a".to_string(), tied), ("c".to_string(), one(5))]),
+            &mut out,
+        );
+        assert_eq!(
+            read_costs(Some(&path), &seed)
+                .into_iter()
+                .map(|(n, c)| (n, c.cpu))
+                .collect::<Vec<_>>(),
+            [("a".into(), 19), ("b".into(), 2), ("c".into(), 5)],
+            "the history's row on a tie, and wherever it is newer"
         );
         let none = d.path().join("no-history.tsv");
         assert_eq!(read_costs(Some(&none), &seed).len(), 2, "a fresh clone");
@@ -5122,10 +5611,12 @@ mod tests {
     struct World {
         now: Duration,
         live: usize,
-        live_heavy: usize,
         peak: usize,
-        peak_heavy: usize,
         starts: Vec<String>,
+        /// When each check started, in order.
+        started_at: Vec<Duration>,
+        /// What the launch gate said, and when.
+        said: Vec<(Duration, String)>,
         ended_by_lane: Vec<String>,
         /// The slots each check started in, in order.
         slots: Vec<usize>,
@@ -5133,7 +5624,7 @@ mod tests {
         held: BTreeSet<usize>,
     }
 
-    struct Fake {
+    struct Fake<'m> {
         w: Rc<RefCell<World>>,
         /// How long each library's check runs; absent runs forever.
         takes: BTreeMap<String, Duration>,
@@ -5143,13 +5634,16 @@ mod tests {
         unstartable: Option<String>,
         /// The host's load at a moment of the fake clock; `None` reads none.
         load: Option<fn(Duration) -> f64>,
+        /// The launch gate's memory admission; none admits every check unclaimed.
+        gate: Option<Admission<'m>>,
+        /// A claim another holder keeps in the gate's ledger, let go at that moment.
+        holder: Option<(Duration, aterm_capacity::Claim)>,
     }
 
     struct FakeCheck {
         w: Rc<RefCell<World>>,
         name: String,
         slot: usize,
-        heavy: bool,
         until: Option<Duration>,
         done: bool,
     }
@@ -5158,11 +5652,7 @@ mod tests {
         fn finish(&mut self, code: i32) -> Ended {
             if !self.done {
                 self.done = true;
-                let mut w = self.w.borrow_mut();
-                w.live -= 1;
-                if self.heavy {
-                    w.live_heavy -= 1;
-                }
+                self.w.borrow_mut().live -= 1;
             }
             Ended {
                 code,
@@ -5186,7 +5676,7 @@ mod tests {
         }
     }
 
-    impl Checks for Fake {
+    impl Checks for Fake<'_> {
         fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>> {
             if self.unstartable.as_deref() == Some(job.name.as_str()) {
                 return Err(std::io::Error::other("no targo"));
@@ -5194,21 +5684,28 @@ mod tests {
             job.target = PathBuf::from(format!("/slots/j{}", job.slot));
             let mut w = self.w.borrow_mut();
             w.starts.push(job.name.clone());
+            let now = w.now;
+            w.started_at.push(now);
             w.slots.push(job.slot);
             w.live += 1;
             w.peak = w.peak.max(w.live);
-            if job.heavy {
-                w.live_heavy += 1;
-                w.peak_heavy = w.peak_heavy.max(w.live_heavy);
-            }
             Ok(Box::new(FakeCheck {
                 w: Rc::clone(&self.w),
                 name: job.name.clone(),
                 slot: job.slot,
-                heavy: job.heavy,
                 until: self.takes.get(&job.name).map(|d| w.now + *d),
                 done: false,
             }))
+        }
+        fn admit(&mut self, job: &Job) -> Option<Admitted> {
+            let Some(gate) = &mut self.gate else {
+                return Some(Admitted::unclaimed());
+            };
+            let now = self.w.borrow().now;
+            let w = Rc::clone(&self.w);
+            gate.admit(job, now, &mut |line| {
+                w.borrow_mut().said.push((now, line.to_string()));
+            })
         }
         fn trustd_held(&self) -> bool {
             self.w.borrow().starts.len() >= self.held_after
@@ -5223,7 +5720,14 @@ mod tests {
             self.w.borrow().now
         }
         fn pause(&mut self) {
-            self.w.borrow_mut().now += Duration::from_secs(1);
+            let now = {
+                let mut w = self.w.borrow_mut();
+                w.now += Duration::from_secs(1);
+                w.now
+            };
+            if self.holder.as_ref().is_some_and(|(at, _)| now >= *at) {
+                self.holder = None;
+            }
         }
         fn held(&self, slot: usize) -> bool {
             self.w.borrow().held.contains(&slot)
@@ -5233,7 +5737,8 @@ mod tests {
         }
     }
 
-    fn job(name: &str, heavy: bool) -> Job {
+    /// A check of `name` that claims no memory.
+    fn job(name: &str) -> Job {
         Job {
             slot: 0,
             name: name.into(),
@@ -5241,7 +5746,7 @@ mod tests {
             log: PathBuf::from(format!("/nowhere/{name}.log")),
             report: None,
             target: PathBuf::new(),
-            heavy,
+            need: 0,
             lock: None,
         }
     }
@@ -5281,7 +5786,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let mut check = job(row, false);
+            let mut check = job(row);
             check.log = slot.join(format!("{row}@1.0.0.log"));
             check.report = Some(report.clone());
             let raw_path = report.join("report.ndjson");
@@ -5331,7 +5836,7 @@ mod tests {
         }
     }
 
-    fn fake(takes: &[(&str, u64)]) -> Fake {
+    fn fake(takes: &[(&str, u64)]) -> Fake<'static> {
         Fake {
             w: Rc::new(RefCell::new(World::default())),
             takes: takes
@@ -5342,6 +5847,8 @@ mod tests {
             interrupt_at: None,
             unstartable: None,
             load: None,
+            gate: None,
+            holder: None,
         }
     }
 
@@ -5351,11 +5858,11 @@ mod tests {
     fn a_check_carries_the_mean_load_it_ran_under() {
         let mut f = fake(&[("a", 4)]);
         f.load = Some(|now| now.as_secs_f64());
-        let (r, done) = slots(&mut f, vec![job("a", false)], 1, 1, 100);
+        let (r, done) = slots(&mut f, vec![job("a")], 1, 100);
         assert_eq!(r, Ok(()));
         assert_eq!(done[0].load, Some(2.0), "read at 0, 1, 2, 3 and 4 s");
         let mut f = fake(&[("a", 4)]);
-        let (_, done) = slots(&mut f, vec![job("a", false)], 1, 1, 100);
+        let (_, done) = slots(&mut f, vec![job("a")], 1, 100);
         assert_eq!(done[0].load, None);
     }
 
@@ -5370,30 +5877,39 @@ mod tests {
         );
     }
 
+    /// A run waits for room for its disk unless `--admit now` says to take it at once; another
+    /// word is refused, naming it.
+    #[test]
+    fn a_run_waits_for_its_disk_unless_admitted_now() {
+        let admit = |args: &[&str]| parse(&mut args.iter().copied()).map(|c| c.admit);
+        assert_eq!(admit(&["-p", "alpha"]), Ok(atpkg::admit_disk::Admit::Wait));
+        assert_eq!(
+            admit(&["-p", "alpha", "--admit", "now"]),
+            Ok(atpkg::admit_disk::Admit::Now)
+        );
+        assert!(
+            admit(&["--admit", "later", "-p", "alpha"]).is_err_and(|e| e.contains("\"later\""))
+        );
+    }
+
     fn slots(
-        f: &mut Fake,
+        f: &mut Fake<'_>,
         jobs: Vec<Job>,
         n: usize,
-        heavy: usize,
         budget: u64,
     ) -> (Result<(), Stopped>, Vec<Finished>) {
         let mut done = Vec::new();
-        let r = run_slots(
-            jobs,
-            n,
-            heavy,
-            Duration::from_secs(budget),
-            f,
-            &mut |fin, _| done.push(fin),
-        );
+        let r = run_slots(jobs, n, Duration::from_secs(budget), f, &mut |fin, _| {
+            done.push(fin)
+        });
         (r, done)
     }
 
     #[test]
     fn each_queued_check_runs_once_within_the_slots() {
         let mut f = fake(&[("a", 5), ("b", 1), ("c", 2), ("d", 1)]);
-        let jobs = ["a", "b", "c", "d"].map(|n| job(n, false)).to_vec();
-        let (r, done) = slots(&mut f, jobs, 2, 1, 100);
+        let jobs = ["a", "b", "c", "d"].map(job).to_vec();
+        let (r, done) = slots(&mut f, jobs, 2, 100);
         assert_eq!(r, Ok(()));
         let w = f.w.borrow();
         assert_eq!(w.starts, ["a", "b", "c", "d"]);
@@ -5411,37 +5927,273 @@ mod tests {
         assert_eq!(slots_used, [0, 1]);
     }
 
+    const GIB: u64 = 1 << 30;
+
+    /// A scratch capacity ledger, removed when the test ends.
+    fn ledger() -> (aterm_tempfile::TempDir, aterm_capacity::Ledger) {
+        let d = tmp("trust-gate");
+        let l = aterm_capacity::Ledger::at(d.path().join("ledger"));
+        (d, l)
+    }
+
+    /// A check of `name` claiming `gib` GiB.
+    fn needing(name: &str, gib: u64) -> Job {
+        Job {
+            need: gib * GIB,
+            ..job(name)
+        }
+    }
+
+    /// The gate on `machine`'s memory in `ledger`: one look every 2 s, a line a minute.
+    fn gate<'m>(
+        ledger: &aterm_capacity::Ledger,
+        machine: &'m aterm_capacity::Fixed,
+        mode: aterm_capacity::Admit,
+    ) -> Admission<'m> {
+        Admission::new(
+            Some(ledger.clone()),
+            machine,
+            mode,
+            aterm_capacity::Pace {
+                poll: Duration::from_secs(2),
+                line_every: Duration::from_secs(60),
+            },
+        )
+    }
+
+    /// The slot count follows memory: on 40 GiB available, two checks claiming 25 GiB each run
+    /// one after the other in three slots, and two claiming 15 GiB run side by side. Each
+    /// claim is held while its check runs and let go when it ends.
     #[test]
-    fn heavy_checks_never_stack_past_their_slots() {
-        let mut f = fake(&[("h1", 3), ("h2", 3), ("h3", 3), ("l", 1)]);
-        let jobs = vec![
-            job("h1", true),
-            job("h2", true),
-            job("h3", true),
-            job("l", false),
-        ];
-        let (r, done) = slots(&mut f, jobs, 3, 1, 100);
+    fn checks_whose_claims_do_not_fit_together_run_one_at_a_time() {
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let mut f = fake(&[("a", 5), ("b", 5)]);
+        f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        let jobs = vec![needing("a", 25), needing("b", 25)];
+        let mut held = Vec::new();
+        let r = run_slots(jobs, 3, Duration::from_secs(100), &mut f, &mut |fin, _| {
+            let claims = l.list().unwrap();
+            held.push((fin.job.name.clone(), claims.len()));
+        });
         assert_eq!(r, Ok(()));
         let w = f.w.borrow();
-        assert_eq!(w.peak_heavy, 1);
+        assert_eq!(w.peak, 1, "25 + 25 GiB never fit in 40");
+        assert!(w.started_at[1] >= w.started_at[0] + Duration::from_secs(5));
         assert_eq!(
-            w.starts[..2],
-            ["h1", "l"],
-            "the light one runs beside the heavy"
+            held,
+            [("a".to_string(), 2), ("b".to_string(), 1)],
+            "a's claim and b's waiter, then b's claim, as each ended"
         );
-        assert_eq!(done.len(), 4);
         drop(w);
-        let mut g = fake(&[("h1", 3), ("h2", 3), ("h3", 3)]);
-        let jobs = vec![job("h1", true), job("h2", true), job("h3", true)];
-        slots(&mut g, jobs, 3, 2, 100).0.unwrap();
-        assert_eq!(g.w.borrow().peak_heavy, 2);
+        assert!(l.list().unwrap().is_empty(), "every claim let go");
+
+        let mut g = fake(&[("a", 5), ("b", 5)]);
+        g.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        slots(&mut g, vec![needing("a", 15), needing("b", 15)], 3, 100)
+            .0
+            .unwrap();
+        assert_eq!(g.w.borrow().peak, 2, "15 + 15 GiB fit in 40");
+    }
+
+    /// TRUST-MEM's acceptance on an injected machine: another holder's claim leaves
+    /// aterm-render's recorded 15 GB peak (and its margin) no room, so its check waits at the
+    /// gate, saying once a minute what it is short of and who holds it, and starts at the
+    /// first look after that claim is let go. Negative control: while the claim is held it
+    /// never starts.
+    #[test]
+    fn a_check_waits_at_the_gate_until_its_claim_fits_and_starts_at_the_next_look() {
+        let render = Cost {
+            cpu: 8318,
+            wall: 7256,
+            maxrss: 15_018_508_288,
+            when: "2026-10-21T14:40:38Z".into(),
+        };
+        let need = claim_need(Some(&render), 48 * GIB);
+        let mut check = job("aterm-render");
+        check.need = need;
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let hold = |l: &aterm_capacity::Ledger| match aterm_capacity::Waiter::enter(
+            l,
+            &m,
+            aterm_capacity::Need::new("hold").mem_gib(30),
+        )
+        .unwrap()
+        .poll(&m)
+        {
+            aterm_capacity::Polled::Admitted(c) => c,
+            aterm_capacity::Polled::Waiting(_, short) => panic!("the holder waits: {short}"),
+        };
+        let mut f = fake(&[("aterm-render", 5)]);
+        f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        f.holder = Some((Duration::from_secs(150), hold(&l)));
+        let (r, _) = slots(&mut f, vec![check.clone()], 1, 1000);
+        assert_eq!(r, Ok(()));
+        let w = f.w.borrow();
+        let at = w.started_at[0];
+        assert!(
+            (Duration::from_secs(150)..=Duration::from_secs(152)).contains(&at),
+            "started {at:?}, the claim let go at 150 s and the gate looks every 2 s"
+        );
+        let waits: Vec<&(Duration, String)> = w
+            .said
+            .iter()
+            .filter(|(_, l)| l.contains(" waits "))
+            .collect();
+        assert_eq!(
+            waits.iter().map(|(t, _)| t.as_secs()).collect::<Vec<_>>(),
+            [0, 60, 120],
+            "{:?}",
+            w.said
+        );
+        let me = std::process::id().to_string();
+        for (_, line) in &waits {
+            for named in [
+                "trust check aterm-render",
+                "memory short by 6.8 GiB",
+                "needs 16.8 GiB",
+                "40 GiB available",
+                me.as_str(),
+                "\"hold\"",
+            ] {
+                assert!(line.contains(named), "{line:?} does not name {named:?}");
+            }
+        }
+        assert!(
+            w.said
+                .last()
+                .is_some_and(|(_, l)| l.contains("admitted after 2m30s")),
+            "{:?}",
+            w.said
+        );
+        drop(w);
+
+        let mut never = fake(&[("aterm-render", 5)]);
+        never.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        never.holder = Some((Duration::MAX, hold(&l)));
+        never.interrupt_at = Some(Duration::from_secs(400));
+        let (r, _) = slots(&mut never, vec![check], 1, 1000);
+        assert_eq!(r, Err(Stopped::Interrupted));
+        let w = never.w.borrow();
+        assert!(
+            w.starts.is_empty(),
+            "it started beside a claim with no room"
+        );
+        assert_eq!(
+            w.said.iter().filter(|(_, l)| l.contains(" waits ")).count(),
+            7,
+            "one line a minute for 400 s"
+        );
+    }
+
+    /// `--admit now` starts a check whose claim has no room at once, and says what it would
+    /// have waited for.
+    #[test]
+    fn admit_now_starts_a_check_at_once_and_says_what_it_would_wait_for() {
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 10, 14));
+        let mut f = fake(&[("big", 3)]);
+        f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Now));
+        let (r, _) = slots(&mut f, vec![needing("big", 30)], 1, 100);
+        assert_eq!(r, Ok(()));
+        let w = f.w.borrow();
+        assert_eq!(w.started_at, [Duration::ZERO]);
+        assert!(
+            w.said
+                .iter()
+                .any(|(_, l)| l.contains("--admit now") && l.contains("memory short by 20 GiB")),
+            "{:?}",
+            w.said
+        );
+    }
+
+    /// A check claims its recorded peak and a fifth more, at least 1 GiB more; with no peak
+    /// recorded 16 GiB, or half the RAM where that is less. A claim is never cut to fit the
+    /// RAM: one that is not below it is refused or, under `--try-refused`, starts at once.
+    #[test]
+    fn a_claim_is_the_recorded_peak_and_its_margin() {
+        let cost = |maxrss| Cost {
+            cpu: 1,
+            wall: 1,
+            maxrss,
+            when: String::new(),
+        };
+        assert_eq!(claim_need(None, 48 * GIB), 16 * GIB);
+        assert_eq!(claim_need(Some(&cost(0)), 48 * GIB), 16 * GIB);
+        assert_eq!(claim_need(None, 16 * GIB), 8 * GIB);
+        assert_eq!(claim_need(None, 8 * GIB), 4 * GIB);
+        assert_eq!(claim_need(None, 0), 16 * GIB);
+        assert_eq!(claim_need(Some(&cost(10 * GIB)), 48 * GIB), 12 * GIB);
+        assert_eq!(claim_need(Some(&cost(GIB)), 48 * GIB), 2 * GIB);
+        assert_eq!(claim_need(Some(&cost(45 * GIB)), 48 * GIB), 54 * GIB);
+        assert_eq!(claim_need(Some(&cost(45 * GIB)), 0), 54 * GIB);
+    }
+
+    /// On a 16 GiB host whose available memory is below its RAM, as every host's is: a
+    /// library with no recorded peak claims half the RAM and starts at the first look, and a
+    /// claim of all the RAM or more (one `--try-refused` lets past the plan) starts at once
+    /// beside it, saying it can never be admitted here, and holds its claim while it runs.
+    /// Negative control: a claim of all the RAM, the most a claim once took, waited for
+    /// memory that is never available, and every check behind it waited too.
+    #[test]
+    fn a_claim_this_host_can_never_admit_starts_at_once_and_an_unmeasured_one_fits() {
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(16, 12, 8));
+        let peaked = Cost {
+            cpu: 1,
+            wall: 1,
+            maxrss: 15 * GIB,
+            when: String::new(),
+        };
+        for big in [claim_need(Some(&peaked), 16 * GIB), 16 * GIB] {
+            let mut f = fake(&[("new", 3), ("huge", 3)]);
+            f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+            f.interrupt_at = Some(Duration::from_secs(300));
+            let mut jobs = vec![job("new"), job("huge")];
+            jobs[0].need = claim_need(None, 16 * GIB);
+            jobs[1].need = big;
+            let mut held = Vec::new();
+            let r = run_slots(jobs, 2, Duration::from_secs(100), &mut f, &mut |fin, _| {
+                held.push((fin.job.name.clone(), l.list().unwrap().len()));
+            });
+            assert_eq!(r, Ok(()), "{big}");
+            let w = f.w.borrow();
+            assert_eq!(w.starts, ["new", "huge"]);
+            assert_eq!(w.started_at, [Duration::ZERO; 2], "{:?}", w.said);
+            let never: Vec<&String> = w
+                .said
+                .iter()
+                .map(|(_, l)| l)
+                .filter(|l| l.contains("can never be admitted here"))
+                .collect();
+            assert_eq!(never.len(), 1, "{:?}", w.said);
+            for named in ["trust check huge", "16 GiB of memory", "starts at once"] {
+                assert!(
+                    never[0].contains(named),
+                    "{never:?} does not name {named:?}"
+                );
+            }
+            assert!(
+                !w.said.iter().any(|(_, l)| l.contains(" waits ")),
+                "{:?}",
+                w.said
+            );
+            assert_eq!(
+                held.iter().map(|(_, n)| *n).max(),
+                Some(2),
+                "both claims held while both ran: {held:?}"
+            );
+            drop(w);
+            assert!(l.list().unwrap().is_empty(), "every claim let go");
+        }
     }
 
     #[test]
     fn a_check_over_its_budget_is_ended_and_marked() {
         let mut f = fake(&[("quick", 2)]);
-        let jobs = vec![job("stuck", false), job("quick", false)];
-        let (r, done) = slots(&mut f, jobs, 2, 1, 10);
+        let jobs = vec![job("stuck"), job("quick")];
+        let (r, done) = slots(&mut f, jobs, 2, 10);
         assert_eq!(r, Ok(()));
         let stuck = done.iter().find(|d| d.job.name == "stuck").unwrap();
         assert!(stuck.over_budget);
@@ -5456,12 +6208,12 @@ mod tests {
     fn a_second_check_waits_for_this_builds_trustd() {
         let mut f = fake(&[("a", 3), ("b", 3), ("c", 3)]);
         f.held_after = usize::MAX;
-        let jobs = ["a", "b", "c"].map(|n| job(n, false)).to_vec();
-        slots(&mut f, jobs.clone(), 3, 3, 100).0.unwrap();
+        let jobs = ["a", "b", "c"].map(job).to_vec();
+        slots(&mut f, jobs.clone(), 3, 100).0.unwrap();
         assert_eq!(f.w.borrow().peak, 1, "never two while trustd is not held");
         let mut g = fake(&[("a", 3), ("b", 3), ("c", 3)]);
         g.held_after = 1;
-        slots(&mut g, jobs, 3, 3, 100).0.unwrap();
+        slots(&mut g, jobs, 3, 100).0.unwrap();
         assert_eq!(g.w.borrow().peak, 3);
     }
 
@@ -5469,8 +6221,8 @@ mod tests {
     fn an_interrupt_ends_every_running_check() {
         let mut f = fake(&[]);
         f.interrupt_at = Some(Duration::from_secs(3));
-        let jobs = ["a", "b", "c"].map(|n| job(n, false)).to_vec();
-        let (r, done) = slots(&mut f, jobs, 2, 2, 100);
+        let jobs = ["a", "b", "c"].map(job).to_vec();
+        let (r, done) = slots(&mut f, jobs, 2, 100);
         assert_eq!(r, Err(Stopped::Interrupted));
         assert!(done.is_empty());
         let w = f.w.borrow();
@@ -5483,8 +6235,8 @@ mod tests {
     fn an_unstartable_check_stops_the_run() {
         let mut f = fake(&[]);
         f.unstartable = Some("b".into());
-        let jobs = ["a", "b"].map(|n| job(n, false)).to_vec();
-        let (r, _) = slots(&mut f, jobs, 2, 2, 100);
+        let jobs = ["a", "b"].map(job).to_vec();
+        let (r, _) = slots(&mut f, jobs, 2, 100);
         assert!(matches!(r, Err(Stopped::Unstartable(why)) if why.contains("no targo")));
         assert_eq!(f.w.borrow().ended_by_lane, ["a"]);
     }
@@ -5495,8 +6247,8 @@ mod tests {
     fn no_check_starts_in_a_held_slot() {
         let mut f = fake(&[("a", 2), ("b", 2)]);
         f.w.borrow_mut().held.insert(0);
-        let jobs = vec![job("stuck", false), job("a", false), job("b", false)];
-        let (r, done) = slots(&mut f, jobs, 1, 1, 3);
+        let jobs = vec![job("stuck"), job("a"), job("b")];
+        let (r, done) = slots(&mut f, jobs, 1, 3);
         assert_eq!(r, Ok(()));
         assert_eq!(done.len(), 3);
         let w = f.w.borrow();
@@ -5508,7 +6260,7 @@ mod tests {
     fn finished(dir: &Path, log_text: &str, code: i32, over: bool) -> Finished {
         let log = dir.join("alpha@1.0.0.log");
         fs::write(&log, log_text).unwrap();
-        let mut j = job("alpha", false);
+        let mut j = job("alpha");
         j.log = log;
         j.target = dir.join("j0");
         Finished {
@@ -5651,7 +6403,16 @@ mod tests {
         started: &'a mut Vec<String>,
         stamp: Option<SystemTime>,
         load: Option<f64>,
+        /// The launch gate's memory admission; none admits every check unclaimed.
+        gate: Option<Admission<'a>>,
+        /// What the gate said.
+        said: Vec<String>,
     }
+
+    /// How long a gated run may go on the fake clock before it counts as interrupted: a
+    /// check the gate must admit at once is admitted well inside it, so one that waits ends
+    /// the run instead of hanging the test.
+    const GATE_HANG: Duration = Duration::from_secs(60);
 
     struct Over;
 
@@ -5692,7 +6453,7 @@ mod tests {
             "ours\tthis build's".into()
         }
         fn interrupted(&self) -> bool {
-            self.interrupt
+            self.interrupt || (self.gate.is_some() && self.now >= GATE_HANG)
         }
         fn now(&self) -> Duration {
             self.now
@@ -5705,6 +6466,13 @@ mod tests {
         }
         fn load(&self) -> Option<f64> {
             self.load
+        }
+        fn admit(&mut self, job: &Job) -> Option<Admitted> {
+            let Some(gate) = &mut self.gate else {
+                return Some(Admitted::unclaimed());
+            };
+            let said = &mut self.said;
+            gate.admit(job, self.now, &mut |line| said.push(line.to_string()))
         }
     }
 
@@ -5730,6 +6498,14 @@ mod tests {
         updated: Option<Driver>,
         /// How often the run resolved its prover.
         drivers_asked: usize,
+        /// The host's RAM, and whether it was read as `MemTotal`.
+        mem: (u64, bool),
+        /// What the prover's `trustc -Z help` says of the memory ceiling flag.
+        ceiling: Result<bool, String>,
+        /// How often the run read `trustc -Z help`.
+        ceiling_probes: usize,
+        /// The launch gate's machine and ledger; none admits every check unclaimed.
+        gate: Option<(aterm_capacity::Fixed, aterm_capacity::Ledger)>,
     }
 
     impl Bench for Site {
@@ -5776,6 +6552,16 @@ mod tests {
         fn cache(&self) -> Option<PathBuf> {
             Some(self.cache.clone())
         }
+        fn memory(&self) -> (u64, bool) {
+            self.mem
+        }
+        fn load(&self) -> Option<f64> {
+            self.load
+        }
+        fn takes_ceiling(&mut self, _: &Driver) -> Result<bool, String> {
+            self.ceiling_probes += 1;
+            self.ceiling.clone()
+        }
         fn checks(
             &mut self,
             cfg: &Config,
@@ -5783,8 +6569,19 @@ mod tests {
             jobs: Vec<Job>,
             slots: usize,
             done: &mut dyn FnMut(Finished, &mut dyn Checks),
-            _: &mut dyn Write,
+            out: &mut dyn Write,
         ) -> Result<(), String> {
+            let gate = self.gate.as_ref().map(|(machine, ledger)| {
+                Admission::new(
+                    Some(ledger.clone()),
+                    machine,
+                    cfg.admit,
+                    aterm_capacity::Pace {
+                        poll: Duration::from_secs(2),
+                        line_every: Duration::from_secs(60),
+                    },
+                )
+            });
             let mut quick = Quick {
                 root: prep.root.clone(),
                 log: self.log,
@@ -5793,12 +6590,27 @@ mod tests {
                 started: &mut self.started,
                 stamp: self.stamp,
                 load: self.load,
+                gate,
+                said: Vec::new(),
             };
-            let ran = run_slots(jobs, slots, 1, cfg.budget, &mut quick, done);
+            let ran = run_slots(jobs, slots, cfg.budget, &mut quick, done);
+            for line in std::mem::take(&mut quick.said) {
+                let _ = writeln!(out, "trust: {line}");
+            }
             if let Some(edit) = self.meanwhile.take() {
                 edit(&self.repo);
             }
             ran.map_err(stopped)
+        }
+        /// No claim: a test run never reads the live volume or writes the user's ledger
+        /// ([`Claims`] stands in for the ledger's answers).
+        fn disk(
+            &mut self,
+            _: atpkg::admit_disk::Run,
+            _: atpkg::admit_disk::Admit,
+            _: &mut dyn Write,
+        ) -> Result<Option<atpkg::admit_disk::Admitted>, atpkg::admit_disk::Error> {
+            Ok(None)
         }
     }
 
@@ -5901,6 +6713,10 @@ mod tests {
             load: None,
             updated: None,
             drivers_asked: 0,
+            mem: (48 * GIB, false),
+            ceiling: Ok(false),
+            ceiling_probes: 0,
+            gate: None,
         }
     }
 
@@ -5923,6 +6739,123 @@ mod tests {
             .unwrap_or_default();
         filed.sort();
         (outcome, String::from_utf8(out).unwrap(), filed)
+    }
+
+    /// A [`Site`] whose disk claim answers as the capacity ledger would, refused (`never`) or
+    /// admitted with no claim, keeping each run it was asked to claim with how many checks had
+    /// started by then.
+    struct Claims<'s> {
+        site: &'s mut Site,
+        never: Option<String>,
+        asked: Vec<(atpkg::admit_disk::Run, atpkg::admit_disk::Admit, usize)>,
+    }
+
+    impl Bench for Claims<'_> {
+        fn driver(&mut self, cfg: &Config) -> Result<Driver, String> {
+            self.site.driver(cfg)
+        }
+        fn metadata(&mut self, driver: &Driver, repo: &Path) -> Result<Vec<u8>, String> {
+            self.site.metadata(driver, repo)
+        }
+        fn cargo_home(&self) -> String {
+            self.site.cargo_home()
+        }
+        fn cache(&self) -> Option<PathBuf> {
+            self.site.cache()
+        }
+        fn memory(&self) -> (u64, bool) {
+            self.site.memory()
+        }
+        fn load(&self) -> Option<f64> {
+            self.site.load()
+        }
+        fn takes_ceiling(&mut self, driver: &Driver) -> Result<bool, String> {
+            self.site.takes_ceiling(driver)
+        }
+        fn checks(
+            &mut self,
+            cfg: &Config,
+            prep: &Prepared,
+            jobs: Vec<Job>,
+            slots: usize,
+            done: &mut dyn FnMut(Finished, &mut dyn Checks),
+            out: &mut dyn Write,
+        ) -> Result<(), String> {
+            self.site.checks(cfg, prep, jobs, slots, done, out)
+        }
+        fn disk(
+            &mut self,
+            run: atpkg::admit_disk::Run,
+            mode: atpkg::admit_disk::Admit,
+            _: &mut dyn Write,
+        ) -> Result<Option<atpkg::admit_disk::Admitted>, atpkg::admit_disk::Error> {
+            self.asked.push((run, mode, self.site.started.len()));
+            match &self.never {
+                Some(why) => Err(atpkg::admit_disk::Error::Never(why.clone())),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// A run claims its target root's disk once it holds the root and before any check starts:
+    /// the cold budget on the root's volume, kept under its `logs`. Negative control: a need the
+    /// volume can never hold is COULD NOT RUN naming the fix, and no check starts.
+    #[test]
+    fn a_run_claims_its_roots_disk_before_any_check() {
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        let cfg = s.cfg.clone();
+        let mut claims = Claims {
+            site: &mut s,
+            never: None,
+            asked: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let outcome = run_on(&cfg, &mut claims, &mut out);
+        let said = String::from_utf8(out).unwrap();
+        assert_eq!(outcome, Outcome::Pass, "{said}");
+        let [(run, mode, started)] = &claims.asked[..] else {
+            panic!("one claim: {:?}", claims.asked);
+        };
+        assert_eq!(*started, 0, "the claim comes before the checks");
+        assert_eq!(
+            *mode,
+            atpkg::admit_disk::Admit::Wait,
+            "it waits unless told"
+        );
+        let root = &run.dirs[0];
+        assert_eq!(
+            run,
+            &atpkg::admit_disk::Run {
+                what: "ship trust run -p alpha".into(),
+                dirs: vec![root.clone()],
+                record: root.join("logs").join(DISK_RECORD),
+                cold: COLD_DISK,
+                on: root.clone(),
+            }
+        );
+        assert!(root.join("logs").is_dir(), "{}", root.display());
+        assert!(!claims.site.started.is_empty(), "{said}");
+
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        let cfg = s.cfg.clone();
+        let mut claims = Claims {
+            site: &mut s,
+            never: Some(
+                "ship trust run -p alpha: needs 6 GiB on /Volumes/s, which holds 2 GiB above its \
+                 floor"
+                    .into(),
+            ),
+            asked: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let outcome = run_on(&cfg, &mut claims, &mut out);
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains("needs 6 GiB on /Volumes/s") && why.contains("--target-root")),
+            "{outcome:?}: {said}"
+        );
+        assert!(claims.site.started.is_empty(), "{said}");
     }
 
     #[test]
@@ -6346,6 +7279,7 @@ mod tests {
     fn a_floor_this_host_cannot_reproduce_narrows_the_run() {
         for stop in [true, false] {
             let mut s = site(Scope::WholeTree);
+            s.ceiling = Ok(true);
             fs::write(
                 s.repo.join(trust_facts::MEMORY),
                 "# no host here verifies alpha's floor\nalpha\t4096.0\t4096\t512.0\t1000.0\t=\ta test\n",
@@ -6367,6 +7301,214 @@ mod tests {
                 assert!(filed.is_empty(), "a run that stopped files nothing: {said}");
             }
         }
+    }
+
+    /// A memory record row of aterm-gpu's shape on this 48 GiB host: measured under the
+    /// RAM / 8 ceiling, it ran out at 6 GiB, so it needs more than 19.9 GiB.
+    const GPU_ROW: &str =
+        "# alpha ran out at its 6 GiB ceiling\nalpha\t-\t48\t6.0\t19.9\t>\t2026-10-20\n";
+
+    /// Under a prover whose trustc takes no memory ceiling, the RAM / 8 model refuses nothing:
+    /// a library whose row says it ran out at 6 GiB runs, and the HOST line says there is no
+    /// ceiling. Negative control: under a prover that takes one, the same row refuses it.
+    #[test]
+    fn a_prover_with_no_ceiling_runs_what_the_ram_eighth_model_refuses() {
+        for takes in [false, true] {
+            let mut s = site(Scope::Packages(vec!["alpha".into()]));
+            s.ceiling = Ok(takes);
+            fs::write(s.repo.join(trust_facts::MEMORY), GPU_ROW).unwrap();
+            let (outcome, said, _) = run_site(&mut s);
+            let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+            if takes {
+                assert!(
+                    matches!(&outcome, Outcome::Narrowed(l) if l == &["alpha: needs >19.9 GiB"]),
+                    "{outcome:?}: {said}"
+                );
+                assert!(s.started.is_empty(), "{said}");
+                assert!(plan.contains("\ndriver-ceiling yes\n"), "{plan}");
+                assert!(said.contains("needs more than 19.9 GiB, this host gives 6.0 GiB"));
+            } else {
+                assert_eq!(outcome, Outcome::Pass, "{said}");
+                assert_eq!(s.started, ["alpha"]);
+                assert!(plan.contains("\ndriver-ceiling no\n"), "{plan}");
+                assert!(!plan.contains("\nrefused "), "{plan}");
+                assert!(
+                    said.contains("HOST: 48 GiB RAM, no verifier ceiling"),
+                    "{said}"
+                );
+            }
+        }
+    }
+
+    /// A site whose cost history says alpha's last check peaked at `maxrss` bytes on
+    /// 2026-10-20, under a prover that does (`takes`) or does not take a memory ceiling.
+    fn with_peak(maxrss: u64, takes: bool) -> Site {
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        s.ceiling = Ok(takes);
+        let state = s.cfg.state.clone().unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("trust-costs.tsv"),
+            format!("{COSTS_HEADER}\nalpha\t16972\t17245\t{maxrss}\t2026-10-20T17:45:18Z\n"),
+        )
+        .unwrap();
+        s
+    }
+
+    /// A library whose last recorded check peaked above this host's RAM is refused up front
+    /// under any prover, in one line naming the peak, its date and the RAM, and no check
+    /// starts. So is one whose peak is below the RAM but whose claim, with its margin, is
+    /// not, since the launch gate never has all of the RAM available; its line names the
+    /// claim too. Negative controls: a claim below the RAM runs, and `--try-refused` runs it.
+    #[test]
+    fn a_library_whose_recorded_peak_is_above_the_ram_is_refused_up_front() {
+        let line = "alpha not verified here: its last check peaked at 62.45 GB on 2026-10-20, above this host's 51.5 GB (48 GiB) of RAM";
+        for takes in [false, true] {
+            let mut s = with_peak(62_450_089_984, takes);
+            let (outcome, said, _) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::Narrowed(l) if l == &["alpha: needs ~69.8 GiB"]),
+                "{outcome:?}: {said}"
+            );
+            assert!(s.started.is_empty(), "no check starts: {said}");
+            assert!(said.contains(&format!("trust: {line}\n")), "{said}");
+            assert!(
+                said.contains(
+                    "it needs a host with more RAM than its recorded peak and its margin"
+                ),
+                "{said}"
+            );
+            let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+            assert!(
+                plan.contains("\nrefused alpha\tpeak\t-\t62450089984\t2026-10-20T17:45:18Z\n"),
+                "{plan}"
+            );
+        }
+        let mut tight = with_peak(40 * GIB, false);
+        let (outcome, said, _) = run_site(&mut tight);
+        assert!(
+            matches!(&outcome, Outcome::Narrowed(l) if l == &["alpha: needs ~48.0 GiB"]),
+            "{outcome:?}: {said}"
+        );
+        assert!(tight.started.is_empty(), "no check starts: {said}");
+        assert!(
+            said.contains("trust: alpha not verified here: its last check peaked at 42.95 GB on 2026-10-20, and with its margin it claims 51.54 GB, not below this host's 51.5 GB (48 GiB) of RAM, which the launch gate never has available\n"),
+            "{said}"
+        );
+        let mut fits = with_peak(39 * GIB, false);
+        let (outcome, said, _) = run_site(&mut fits);
+        assert_eq!((outcome, fits.started.len()), (Outcome::Pass, 1), "{said}");
+        let mut forced = with_peak(62_450_089_984, false);
+        forced.cfg.try_refused = true;
+        let (outcome, said, _) = run_site(&mut forced);
+        assert_eq!(
+            (outcome, forced.started.len()),
+            (Outcome::Pass, 1),
+            "{said}"
+        );
+    }
+
+    /// `--try-refused` on a library whose recorded peak is above the RAM, with the launch gate
+    /// on: on a machine whose available memory is below its RAM, its check starts at once,
+    /// saying it can never be admitted here, and lets its claim go when it ends. Negative
+    /// control: the claim once took all of the RAM and waited at the gate for memory that is
+    /// never available (here the run would end interrupted at [`GATE_HANG`]).
+    #[test]
+    fn try_refused_starts_a_claim_this_host_can_never_admit_at_once() {
+        let mut s = with_peak(62_450_089_984, false);
+        s.cfg.try_refused = true;
+        let dir = tmp("trust-gate-site");
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        s.gate = Some((
+            aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 28, 14)),
+            ledger.clone(),
+        ));
+        let (outcome, said, _) = run_site(&mut s);
+        assert_eq!((outcome, s.started.len()), (Outcome::Pass, 1), "{said}");
+        assert!(
+            said.contains("trust: capacity: trust check alpha: needs 69.8 GiB, this Mac has 48 GiB of memory: it can never be admitted here, so it starts at once and holds its claim\n")
+                || said.contains("trust: capacity: trust check alpha: needs 69.8 GiB, this machine has 48 GiB of memory: it can never be admitted here, so it starts at once and holds its claim\n"),
+            "{said}"
+        );
+        assert!(!said.contains(" waits "), "{said}");
+        assert!(ledger.list().unwrap().is_empty(), "its claim let go");
+    }
+
+    /// The probe reads `trustc -Z help`'s option rows: a row for the ceiling flag (321aaeda7's,
+    /// as its trustc prints it) lists it, and a row for another flag that mentions it, or a
+    /// longer flag that starts with its name, does not.
+    #[test]
+    fn the_ceiling_probe_reads_the_flag_s_own_row() {
+        let row = "    -Z             trust-verify-memory-ceiling-bytes=val -- set the resident-memory ceiling for this verifier process in bytes (0 = disabled).";
+        assert!(lists_ceiling(&format!(
+            "    -Z  trust-ir-lower=val -- off|on\n{row}\n"
+        )));
+        assert!(lists_ceiling("-Z trust-verify-memory-ceiling-bytes"));
+        for other in [
+            "    -Z     trust-proc-macro-boundary=val -- requires -Ztrust-verify-session and verification",
+            "    -Z     trust-limits=val -- replaces -Ztrust-verify-memory-ceiling-bytes",
+            "    -Z     trust-verify-memory-ceiling-bytes-soft=val -- a longer flag",
+            "",
+        ] {
+            assert!(!lists_ceiling(other), "{other}");
+        }
+    }
+
+    /// Whether the prover takes a ceiling is probed once per build: a second run reads the
+    /// kept answer, a rebuilt trustc is probed again, and a probe that cannot be read is said,
+    /// taken as no ceiling and kept for nothing.
+    #[test]
+    fn the_ceiling_probe_is_kept_per_prover_build() {
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        s.ceiling = Ok(true);
+        run_site(&mut s);
+        run_site(&mut s);
+        assert_eq!(s.ceiling_probes, 1);
+        fs::write(s.driver.bin.join("trustc"), "trustc, rebuilt").unwrap();
+        s.ceiling = Ok(false);
+        let (outcome, said, _) = run_site(&mut s);
+        assert_eq!((s.ceiling_probes, outcome), (2, Outcome::Pass), "{said}");
+        let kept = fs::read_to_string(s.cfg.state.as_ref().unwrap().join(CEILING_CACHE)).unwrap();
+        assert_eq!(
+            kept.lines().filter(|l| !l.starts_with('#')).count(),
+            1,
+            "{kept}"
+        );
+        assert!(kept.ends_with("\tno\n"), "{kept}");
+
+        let mut unread = site(Scope::Packages(vec!["alpha".into()]));
+        unread.ceiling = Err("trustc -Z help exited 1".into());
+        let (_, said, _) = run_site(&mut unread);
+        assert!(
+            said.contains("trust: trustc -Z help exited 1; this prover is taken to have no verifier memory ceiling"),
+            "{said}"
+        );
+        run_site(&mut unread);
+        assert_eq!(unread.ceiling_probes, 2, "an unread answer is not kept");
+        let plan = fs::read_to_string(root_of(&unread).join("logs/.plan")).unwrap();
+        assert!(plan.contains("\ndriver-ceiling no\n"), "{plan}");
+    }
+
+    /// The plan says the host's load as the run began and as it ended, and a filing run's
+    /// provenance says them beside the mean over its checks.
+    #[test]
+    fn the_plan_says_the_load_at_the_start_and_the_end() {
+        let mut s = site(Scope::WholeTree);
+        s.load = Some(3.5);
+        let (outcome, said, filed) = run_site(&mut s);
+        assert_eq!((outcome, filed.len()), (Outcome::Pass, 1), "{said}");
+        let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+        for line in [
+            "\nload-start 3.50\n",
+            "\nload-end 3.50\n",
+            "\nload 3.50 over its checks, 3.50 at the start, 3.50 at the end\n",
+        ] {
+            assert!(plan.contains(line), "{line:?}: {plan}");
+        }
+        let mut unread = site(Scope::Packages(vec!["alpha".into()]));
+        run_site(&mut unread);
+        let plan = fs::read_to_string(root_of(&unread).join("logs/.plan")).unwrap();
+        assert!(plan.contains("\nload-start unread\n"), "{plan}");
     }
 
     #[test]
@@ -9828,6 +10970,13 @@ mod tests {
             t0: Instant::now(),
             locks: BTreeMap::new(),
             serial,
+            admission: Admission::new(
+                None,
+                &aterm_capacity::Live,
+                aterm_capacity::Admit::Wait,
+                aterm_capacity::Pace::default(),
+            ),
+            out: Box::new(std::io::sink()),
         }
     }
 
@@ -9879,7 +11028,7 @@ mod tests {
             &sock,
             aterm_uds::process::process_serial,
         );
-        let mut j = job("alpha", false);
+        let mut j = job("alpha");
         j.log = d.path().join("alpha.log");
         let mut check = real.start(&mut j).unwrap();
         assert!(!stamp.exists(), "the spent stamp is gone");
@@ -9927,7 +11076,7 @@ mod tests {
             ASKED.store(pid, Ordering::SeqCst);
             None
         });
-        let mut j = job("alpha", false);
+        let mut j = job("alpha");
         j.log = d.path().join("alpha.log");
         let Err(e) = real.start(&mut j) else {
             panic!("a check whose root was not identified started");
@@ -9980,7 +11129,7 @@ mod tests {
             fs::write(dir.join("root.pid"), format!("{pid} {serial}")).unwrap();
             aterm_uds::process::kill_self_now()
         });
-        let mut j = job("alpha", false);
+        let mut j = job("alpha");
         j.log = d.join("alpha.log");
         let started = real.start(&mut j).map(|_| ());
         panic!("the lane outlived reading its root's serial: {started:?}");
@@ -10249,7 +11398,7 @@ mod tests {
             &sock,
             aterm_uds::process::process_serial,
         );
-        let mut j = job("alpha", false);
+        let mut j = job("alpha");
         j.log = d.path().join("alpha.log");
         assert!(real.start(&mut j).is_err());
         assert!(!root.join(".check.0").exists());
@@ -10288,7 +11437,7 @@ mod tests {
                 &sock,
                 aterm_uds::process::process_serial,
             );
-            let mut j = job("alpha", false);
+            let mut j = job("alpha");
             j.log = d.path().join("alpha.log");
             let Err(e) = real.start(&mut j) else {
                 panic!("{how}: a check started");
@@ -10327,7 +11476,7 @@ mod tests {
             aterm_uds::process::process_serial,
         );
         assert!(real.held(0));
-        let mut j = job("alpha", false);
+        let mut j = job("alpha");
         j.log = d.path().join("alpha.log");
         let Err(e) = real.start(&mut j) else {
             panic!("a check started over another run's record");

@@ -863,7 +863,8 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         &seat,
         &no_usage,
         1,
-    );
+    )
+    .expect("pooled launch");
     assert_eq!(rotated.env, vec![("CODEX_HOME".to_string(), c2_str)]);
 
     // 2. When `main` (default home, `dir = None`) is pinned, a starter carrying `codex-1` drops
@@ -882,7 +883,8 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         &seat,
         &no_usage,
         2,
-    );
+    )
+    .expect("pinned launch");
     assert!(to_main.env.is_empty(), "{:?}", to_main.env);
 
     // 3. CONTROL: a custom scratch `CODEX_HOME` outside the bound roster, a non-default CLI home
@@ -894,12 +896,12 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
     let custom = starter_on(&[("CODEX_HOME", &custom_dir)]);
     assert_eq!(
         super::pooled_starter_in(custom.clone(), Cli::Codex, &seat, &panic_read, 3),
-        custom
+        Ok(custom)
     );
     let overridden = starter_on(&[("CODEX_HOME", &c1_str), ("CODEX_API_KEY", "sk-override")]);
     assert_eq!(
         super::pooled_starter_in(overridden.clone(), Cli::Codex, &seat, &panic_read, 4),
-        overridden
+        Ok(overridden)
     );
     let default_overridden = starter_on(&[("CODEX_API_KEY", "sk-override")]);
     assert_eq!(
@@ -910,11 +912,61 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
             &panic_read,
             5,
         ),
-        default_overridden
+        Ok(default_overridden)
     );
     let custom_grok = starter_on(&[("GROK_HOME", "/g/custom")]);
     assert_eq!(
         super::pooled_starter_in(custom_grok.clone(), Cli::Grok, &seat, &panic_read, 6),
-        custom_grok
+        Ok(custom_grok)
+    );
+
+    seat.store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            s.pinned = false;
+            Ok(accounts::note_wall(
+                s,
+                "codex-2",
+                "five_hour",
+                Some(NOW + 3600),
+                NOW,
+                NOW,
+            ))
+        })
+        .expect("all accounts limited");
+    let held = super::pooled_starter_in(starter_on(&[]), Cli::Codex, &seat, &no_usage, 7);
+    assert!(held.unwrap_err().contains("no usable account"));
+    std::fs::write(seat.store(Cli::Codex).state_file(), "not JSON").unwrap();
+    let held = super::pooled_starter_in(starter_on(&[]), Cli::Codex, &seat, &panic_read, 8);
+    assert!(held.unwrap_err().contains("state.json"));
+    let outside = starter_on(&[("CODEX_HOME", &custom_dir)]);
+    assert_eq!(
+        super::pooled_starter_in(outside.clone(), Cli::Codex, &seat, &panic_read, 9),
+        Ok(outside)
+    );
+    let orphan = seat.store(Cli::Codex).logins_dir().join("orphaned-renewal");
+    let orphan_text = orphan.display().to_string();
+    let owned = super::pooled_starter_in(
+        starter_on(&[("CODEX_HOME", &orphan_text)]),
+        Cli::Codex,
+        &seat,
+        &panic_read,
+        10,
+    );
+    assert!(owned.unwrap_err().contains("no current account binding"));
+    std::fs::write(seat.store(Cli::Codex).logins_file(), "not JSON").unwrap();
+    assert!(
+        super::pooled_starter_in(
+            starter_on(&[("CODEX_HOME", &c1_str)]),
+            Cli::Codex,
+            &seat,
+            &panic_read,
+            10
+        )
+        .is_err()
+    );
+    let override_key = starter_on(&[("CODEX_API_KEY", "explicit-override")]);
+    assert_eq!(
+        super::pooled_starter_in(override_key.clone(), Cli::Codex, &seat, &panic_read, 11),
+        Ok(override_key)
     );
 }

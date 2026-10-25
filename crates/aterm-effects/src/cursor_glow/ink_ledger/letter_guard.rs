@@ -194,25 +194,39 @@ fn ramp_row(
             continue;
         }
         let own = share_of(col);
-        let mut eased = if (lo..=hi).contains(&col) {
-            cuts.iter()
-                .map(|&(c, s)| s + RAMP_SLOPE * (c - col).abs() as f32)
-                .fold(own, f32::min)
-        } else {
-            own
-        };
+        let mut eased = own;
+        if col >= lo && col <= hi {
+            for &(c, s) in cuts {
+                eased = eased.min(s + RAMP_SLOPE * (c - col).abs() as f32);
+            }
+        }
         if !climb && !lettered(col) {
-            let left = (1..=reach)
-                .map(|d| col - d)
-                .find(|&c| c >= 0 && lettered(c));
-            let right = (1..=reach).map(|d| col + d).find(|&c| lettered(c));
-            if let (Some(a), Some(b)) = (left, right)
-                && b - a - 1 <= WORD_GAP_COLS
-            {
-                let (sa, sb) = (share_of(a), share_of(b));
-                if sa.min(sb) < 1.0 {
-                    let u = (col - a) as f32 / (b - a) as f32;
-                    eased = eased.min(sa + (sb - sa) * u);
+            let mut left = None;
+            for d in 1..=reach {
+                let c = col - d;
+                if c < 0 {
+                    break;
+                }
+                if lettered(c) {
+                    left = Some(c);
+                    break;
+                }
+            }
+            if let Some(a) = left {
+                let max_b = (col + reach).min(a + 1 + WORD_GAP_COLS);
+                let mut right = None;
+                for c in col + 1..=max_b {
+                    if lettered(c) {
+                        right = Some(c);
+                        break;
+                    }
+                }
+                if let Some(b) = right {
+                    let (sa, sb) = (share_of(a), share_of(b));
+                    if sa.min(sb) < 1.0 {
+                        let u = (col - a) as f32 / (b - a) as f32;
+                        eased = eased.min(sa + (sb - sa) * u);
+                    }
                 }
             }
         }
@@ -1467,7 +1481,14 @@ impl CursorGlow {
                     prev_g = g;
                     ratio_ink(g) >= bar
                 };
-                Some((1..=u8::MAX).find(|&a| holds(a)).unwrap_or(u8::MAX))
+                let mut found = u8::MAX;
+                for a in 1..=u8::MAX {
+                    if holds(a) {
+                        found = a;
+                        break;
+                    }
+                }
+                Some(found)
             })();
             veil_memo = Some(((ink, ground), ans));
             ans
@@ -1564,22 +1585,32 @@ impl CursorGlow {
             // A rise keeps to the coat the row's own edge pixel row veils:
             // where the silhouette leaves the row bare, it lays nothing.
             let edge_span = |y: i32| {
-                bands
-                    .iter()
-                    .filter(|b| b.2 <= y && y < b.3)
-                    .map(|b| (b.0.max(l0), b.1.min(r1)))
-                    .filter(|(a, b)| b > a)
-                    .reduce(|(a0, b0), (a1, b1)| (a0.min(a1), b0.max(b1)))
+                let mut span: Option<(i32, i32)> = None;
+                for b in &bands {
+                    if b.2 <= y && y < b.3 {
+                        let (a0, b0) = (b.0.max(l0), b.1.min(r1));
+                        if b0 > a0 {
+                            span = Some(match span {
+                                Some((sa, sb)) => (sa.min(a0), sb.max(b0)),
+                                None => (a0, b0),
+                            });
+                        }
+                    }
+                }
+                span
             };
             // The coat's depth into the row from an edge pixel row `y`,
             // stepping `dy`, up to `rise`.
             let depth = |y: i32, dy: i32| {
-                (0..rise)
-                    .take_while(|&k| {
-                        let yk = y + dy * k;
-                        (y0..y1).contains(&yk) && edge_span(yk).is_some()
-                    })
-                    .count() as i32
+                let mut d = 0;
+                while d < rise {
+                    let yk = y + dy * d;
+                    if yk < y0 || yk >= y1 || edge_span(yk).is_none() {
+                        break;
+                    }
+                    d += 1;
+                }
+                d
             };
             let feathers = [(edges.0, y0, 1, -1, y0 - 1), (edges.1, y1 - 1, -1, 1, y1)];
             for (open, edge, inward, outward, first) in feathers {

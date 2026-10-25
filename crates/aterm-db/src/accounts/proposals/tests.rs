@@ -25,6 +25,39 @@ fn account(plan: &str) -> Change {
         ),
     }
 }
+
+#[test]
+fn reference_report_reads_existing_proposals_without_publishing_or_changing_history() {
+    let lab = Lab::new(&[Role::Writer]);
+    let db = app(&lab, 0);
+    assert!(command::run_at("accounts-check", Default::default(), lab.paths[0].clone()).is_err());
+    assert!(db.snapshot().is_err());
+    db.write([1; 16], vec![account("basic")]).unwrap();
+    let before = db.snapshot().unwrap();
+    let history =
+        command::run_at("accounts-history", Default::default(), lab.paths[0].clone()).unwrap();
+    let report =
+        command::run_at("accounts-check", Default::default(), lab.paths[0].clone()).unwrap();
+    assert_eq!(report["authority"].as_str(), Some("none"));
+    assert_eq!(
+        report["issues"][0]["code"].as_str(),
+        Some("missing-reference")
+    );
+    assert_eq!(report["issues"][0]["target"]["key"].as_str(), Some("inbox"));
+    assert_eq!(before.cells, db.snapshot().unwrap().cells);
+    assert_eq!(
+        history,
+        command::run_at("accounts-history", Default::default(), lab.paths[0].clone()).unwrap()
+    );
+    assert!(
+        command::run_at(
+            "accounts-check",
+            std::collections::BTreeMap::from([("--dir", "ignored")]),
+            lab.paths[0].clone()
+        )
+        .is_err()
+    );
+}
 fn cell(snapshot: &Snapshot) -> &crate::database::Cell {
     &snapshot.cells[&("accounts".into(), "one".into())]
 }

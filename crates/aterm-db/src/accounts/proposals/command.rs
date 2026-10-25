@@ -55,6 +55,9 @@ pub(super) fn run_at(
         return Err(Error::new("unknown account proposal option"));
     }
     let db = Proposals::at(paths);
+    if command == "accounts-check" {
+        return db.check();
+    }
     if command == "accounts-init" {
         let scope = db.initialize()?;
         return Ok(json!({"table":hex::encode_lower(&scope.digest()), "kind":"account-proposals"}));

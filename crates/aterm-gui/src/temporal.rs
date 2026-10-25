@@ -34,12 +34,20 @@ pub(crate) enum TemporalMsg {
     Witness(Arc<TerminalCheckpoint>),
 }
 
-/// The bytes of one `RawIn` and the clock reading the live engine parsed them at.
+/// The bytes of one `RawIn`, the clock reading the live engine parsed them at, and what the live screen showed after them.
 #[derive(Clone)]
 pub(crate) struct InputSlice {
     batch: Arc<[u8]>,
     range: Range<usize>,
     clock: ClockReading,
+    marks: SliceMarks,
+}
+
+/// What the live engine showed right after one slice: a mode-2026 frame still open, and a command the slice started (an accepted OSC 133/633 `C`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SliceMarks {
+    pub(crate) sync_open: bool,
+    pub(crate) command: bool,
 }
 
 impl InputSlice {
@@ -54,6 +62,7 @@ impl InputSlice {
             batch,
             range,
             clock,
+            marks: SliceMarks::default(),
         }
     }
 
@@ -63,8 +72,13 @@ impl InputSlice {
         Self::new(batch, 0..bytes.len(), clock)
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.batch[self.range.clone()]
+    }
+
+    /// What the live screen showed after this slice ([`SpineMark::record`]).
+    pub(crate) const fn marks(&self) -> SliceMarks {
+        self.marks
     }
 
     fn len(&self) -> usize {
@@ -228,13 +242,14 @@ pub(crate) struct SpineMark {
     witnessed_at: Option<aterm_time::Instant>,
 }
 
-/// What one reader hold read before processing its bytes: the engine's resize lifetime, ordinal and geometry.
+/// What one reader hold read before processing its bytes: the engine's resize lifetime, ordinal and geometry, and its count of started commands.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpinePre {
     lifetime: u64,
     ordinal: u64,
     rows: u16,
     cols: u16,
+    started: u64,
 }
 
 impl SpinePre {
@@ -245,6 +260,7 @@ impl SpinePre {
             ordinal: term.resize_ordinal(),
             rows: term.rows(),
             cols: term.cols(),
+            started: term.started_command_seq(),
         }
     }
 }
@@ -314,14 +330,18 @@ impl SpineMark {
         }
     }
 
-    /// Record one slice on the spine, then a live witness when one is due ([`WITNESS_BYTES`], [`WITNESS_INTERVAL`]).
+    /// Record one slice on the spine with what the live screen showed after it ([`SliceMarks`]), then a live witness when one is due ([`WITNESS_BYTES`], [`WITNESS_INTERVAL`]).
     pub(crate) fn record(
         &mut self,
         tx: &TemporalTx,
         pre: SpinePre,
         term: &Terminal,
-        input: InputSlice,
+        mut input: InputSlice,
     ) {
+        input.marks = SliceMarks {
+            sync_open: term.modes().synchronized_output(),
+            command: term.started_command_seq() != pre.started,
+        };
         if self.broken {
             self.resync(tx, term, true);
             return;
@@ -480,7 +500,12 @@ pub(crate) struct TemporalRecorder {
     disabled_trigger: Option<RekeyTrigger>,
     #[cfg(test)]
     frozen_now: Option<Ticks>,
+    /// A sleep the test adds to the clock, as a machine asleep would.
+    #[cfg(test)]
+    slept_ns: u64,
     epoch: Instant,
+    /// The sleep-counting clock at `epoch` ([`Self::clock_ns`]), when the platform has one.
+    epoch_ns: Option<u64>,
     resize_policy: ResizePolicy,
     host_resyncs_alt_screen: bool,
     handoff: Option<crate::session_timeline::HandoffGap>,
@@ -568,7 +593,10 @@ impl TemporalRecorder {
             disabled_trigger: None,
             #[cfg(test)]
             frozen_now: None,
+            #[cfg(test)]
+            slept_ns: 0,
             epoch: Instant::now(),
+            epoch_ns: aterm_uds::process::continuous_ns(),
             resize_policy: ResizePolicy::Native,
             host_resyncs_alt_screen: false,
             handoff: None,
@@ -603,14 +631,33 @@ impl TemporalRecorder {
         self.host_resyncs_alt_screen = on;
     }
 
-    /// The current tick on this recorder's timeline (micros since the epoch).
+    /// The current tick on this recorder's timeline: micros since the epoch on a clock that counts time asleep, so ticks apart are time elapsed.
     #[must_use]
     pub(crate) fn now(&self) -> Ticks {
         #[cfg(test)]
         if let Some(frozen) = self.frozen_now {
             return frozen;
         }
-        Ticks(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))
+        let micros = match (self.epoch_ns, self.clock_ns()) {
+            (Some(epoch), Some(now)) => u128::from(now.saturating_sub(epoch) / 1000),
+            _ => self.epoch.elapsed().as_micros(),
+        };
+        Ticks(u64::try_from(micros).unwrap_or(u64::MAX))
+    }
+
+    /// The sleep-counting clock the timeline runs on, in nanoseconds (`std::time::Instant` stops while macOS sleeps).
+    fn clock_ns(&self) -> Option<u64> {
+        let ns = aterm_uds::process::continuous_ns();
+        #[cfg(test)]
+        let ns = ns.map(|ns| ns.saturating_add(self.slept_ns));
+        ns
+    }
+
+    /// Let the clock run on by `slept` with no awake time passing, as a machine asleep would.
+    #[cfg(test)]
+    pub(crate) fn sleep_for_test(&mut self, slept: std::time::Duration) {
+        let ns = u64::try_from(slept.as_nanos()).unwrap_or(u64::MAX);
+        self.slept_ns = self.slept_ns.saturating_add(ns);
     }
 
     fn append(&mut self, op: Op, ts: Ticks) -> Seq {
@@ -777,6 +824,11 @@ impl TemporalRecorder {
 
     /// Record a keyframe (a serialized [`TerminalCheckpoint`]), the seed for replays to instants at or after it.
     pub(crate) fn record_keyframe(&mut self, checkpoint: impl Into<Arc<TerminalCheckpoint>>) {
+        self.record_keyframe_as(checkpoint.into(), false);
+    }
+
+    /// [`Self::record_keyframe`], marked as minted by a replay (a rekey) or taken from the live engine.
+    fn record_keyframe_as(&mut self, checkpoint: Arc<TerminalCheckpoint>, replayed: bool) {
         let ts = self.now();
         let id = KeyframeId(self.next_keyframe);
         self.next_keyframe += 1;
@@ -788,7 +840,8 @@ impl TemporalRecorder {
             ts,
             first_blob: self.next_blob,
             cut: None,
-            checkpoint: checkpoint.into(),
+            replayed,
+            checkpoint,
         };
         self.used += keyframe.charge();
         self.keyframes.push_back(keyframe);
@@ -843,7 +896,7 @@ impl TemporalRecorder {
         self.judge(minted.judged);
         match minted.checkpoint {
             Some(checkpoint) if self.log.head() == minted.head && !self.chain_diverged => {
-                self.record_keyframe(checkpoint);
+                self.record_keyframe_as(checkpoint.into(), true);
             }
             Some(_) => self.enforce_budget(),
             None => {
@@ -1091,28 +1144,60 @@ impl TemporalRecorder {
         if base.cut.is_some_and(|end| at > end) {
             return None;
         }
+        self.plan_from(base, at)
+    }
+
+    /// The replay of `base`'s chain through every event at or before `at`, each step with its seq and tick.
+    fn plan_from(&self, base: &RetainedKeyframe, at: Ticks) -> Option<ReplayPlan> {
         let mut steps = Vec::new();
+        let next = self
+            .keyframes
+            .iter()
+            .find(|kf| kf.seq > base.seq)
+            .map(|kf| kf.seq);
         for ev in self.log.live_after(base.seq) {
-            if ev.ts > at {
+            if ev.ts > at || next.is_some_and(|next| ev.seq >= next) {
                 break;
             }
-            match ev.op {
-                Op::RawIn(id) => steps.push(Step::RawIn(self.blob(id)?.clone())),
-                Op::Resize { rows, cols } => steps.push(Step::Resize { rows, cols }),
-                Op::Witness(id) => {
-                    if let Some(live) = self.pending_witness(id) {
-                        steps.push(Step::Witness(id, live));
-                    }
-                }
-                _ => {}
-            }
+            let step = match ev.op {
+                Op::RawIn(id) => Step::RawIn(self.blob(id)?.clone()),
+                Op::Resize { rows, cols } => Step::Resize { rows, cols },
+                Op::Witness(id) => match self.pending_witness(id) {
+                    Some(live) => Step::Witness(id, live),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            steps.push(Placed {
+                seq: ev.seq,
+                ts: ev.ts,
+                step,
+            });
         }
         Some(ReplayPlan {
             base: base.checkpoint.clone(),
+            base_seq: base.seq,
+            base_ts: base.ts,
             steps,
             policy: self.resize_policy,
             host_resyncs: self.host_resyncs_alt_screen,
         })
+    }
+
+    /// The replay of each replayable chain to `at`'s, oldest first, the last folding only to `at` ([`App::rewind_changed`](crate::App)).
+    #[must_use]
+    pub(crate) fn chain_plans(&self, at: Ticks) -> Vec<ReplayPlan> {
+        let Some(oldest) = self.oldest_replayable().map(|kf| kf.seq) else {
+            return Vec::new();
+        };
+        let Some(last) = self.base_keyframe(at).map(|kf| kf.seq) else {
+            return Vec::new();
+        };
+        self.keyframes
+            .iter()
+            .filter(|kf| kf.seq >= oldest && kf.seq <= last)
+            .filter_map(|kf| self.plan_from(kf, if kf.seq == last { at } else { Ticks(u64::MAX) }))
+            .collect()
     }
 
     /// The replay `temporal` folds for instant `at` (default: the spine's end).
@@ -1125,24 +1210,125 @@ impl TemporalRecorder {
         self.plan(at.unwrap_or(latest))
     }
 
-    /// The distinct instants a Rewind view steps through, oldest first: the oldest keyframe every later instant replays from, then each later slice or resize.
+    /// The distinct instants a Rewind view steps through, oldest first: the oldest keyframe every later instant replays from, then each later tick a slice or resize lands on, less each the live screen showed inside an open mode-2026 frame.
     #[must_use]
-    pub(crate) fn rewind_instants(&self) -> Vec<Ticks> {
+    pub(crate) fn rewind_instants(&self) -> Vec<RewindInstant> {
         if self.spine.break_open() {
             return Vec::new();
         }
         let Some(base) = self.oldest_replayable() else {
             return Vec::new();
         };
-        let mut out = vec![base.ts];
+        let mut out = Vec::new();
+        let mut open = Some(RewindInstant {
+            at: base.ts,
+            command: false,
+        });
+        let mut sync_open = base.checkpoint.modes.synchronized_output();
         for ev in self.log.live_after(base.seq) {
-            if matches!(ev.op, Op::RawIn(_) | Op::Resize { .. })
-                && out.last().is_some_and(|last| ev.ts > *last)
-            {
-                out.push(ev.ts);
+            let (marks, starts) = match ev.op {
+                Op::RawIn(id) => (self.blob(id).map(InputSlice::marks), true),
+                Op::Resize { .. } => (None, true),
+                Op::Keyframe(_) => (None, false),
+                _ => continue,
+            };
+            if open.is_none_or(|o| ev.ts > o.at) {
+                out.extend(open.take().filter(|_| !sync_open));
+                open = starts.then_some(RewindInstant {
+                    at: ev.ts,
+                    command: false,
+                });
+            }
+            if let Op::Keyframe(_) = ev.op {
+                if let Some(kf) = self.keyframes.iter().find(|kf| kf.seq == ev.seq) {
+                    sync_open = kf.checkpoint.modes.synchronized_output();
+                }
+            } else if let Some(marks) = marks {
+                sync_open = marks.sync_open;
+                if let Some(o) = open.as_mut() {
+                    o.command |= marks.command;
+                }
             }
         }
+        out.extend(open.filter(|_| !sync_open));
         out
+    }
+
+    /// The Rewind track: the ticks the spine still names, and the stretches in them a view cannot rebuild or whose replay a live witness did not match.
+    #[must_use]
+    pub(crate) fn rewind_track(&self) -> Track {
+        let to = self.latest_tick();
+        let replayable = self.oldest_replayable().map(|kf| (kf.seq, kf.ts));
+        let first = [
+            self.log.oldest_live().map(|ev| ev.ts),
+            self.keyframes.front().map(|kf| kf.ts),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(to);
+        let mut spans = Vec::new();
+        match replayable {
+            Some((_, from)) if from > first => spans.push((first, from, Span::Lost)),
+            Some(_) => {}
+            None => spans.push((first, to, Span::Lost)),
+        }
+        if self.spine.break_open() {
+            spans.push((first, to, Span::Lost));
+        }
+        let kept = self
+            .keyframes
+            .iter()
+            .filter(|kf| replayable.is_some_and(|(seq, _)| kf.seq >= seq));
+        for kf in kept {
+            let end = self
+                .keyframes
+                .iter()
+                .find(|next| next.seq > kf.seq)
+                .map_or(to, |next| next.ts);
+            let mut before = kf.ts;
+            for w in self.chain_witnesses(kf.seq) {
+                if matches!(w.state, WitnessState::Diverged) {
+                    spans.push((before, end, Span::Differs));
+                    break;
+                }
+                before = w.ts;
+            }
+        }
+        Track {
+            from: first,
+            to,
+            spans,
+        }
+    }
+
+    /// What `rewind export` writes: the oldest replayable keyframe and every slice and resize after it.
+    #[must_use]
+    pub(crate) fn export(&self) -> Option<Export> {
+        if self.spine.break_open() {
+            return None;
+        }
+        let base = self.oldest_replayable()?;
+        let mut events = Vec::new();
+        for ev in self.log.live_after(base.seq) {
+            let t = ev.ts.0.saturating_sub(base.ts.0);
+            match ev.op {
+                Op::RawIn(id) => events.push((t, Exported::Output(self.blob(id)?.clone()))),
+                Op::Resize { rows, cols } => events.push((t, Exported::Resize { rows, cols })),
+                Op::Keyframe(_) => {
+                    let live = self.keyframes.iter().find(|kf| kf.seq == ev.seq);
+                    if let Some(kf) = live.filter(|kf| !kf.replayed) {
+                        events.push((t, Exported::Screen(kf.checkpoint.clone())));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(Export {
+            base: base.checkpoint.clone(),
+            events,
+            dropped: (self.dropped_input(), self.lost_resizes()),
+        })
     }
 
     /// [`Self::replay_plan`], folded in place.
@@ -1152,6 +1338,49 @@ impl TemporalRecorder {
     }
 }
 
+/// One instant a Rewind view steps to ([`TemporalRecorder::rewind_instants`]): its tick, and whether a slice on it started a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RewindInstant {
+    pub(crate) at: Ticks,
+    pub(crate) command: bool,
+}
+
+/// The ticks a Rewind track spans and its hatched stretches ([`TemporalRecorder::rewind_track`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Track {
+    pub(crate) from: Ticks,
+    pub(crate) to: Ticks,
+    pub(crate) spans: Vec<(Ticks, Ticks, Span)>,
+}
+
+/// Why a stretch of the track is hatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Span {
+    /// Nothing kept rebuilds it: its keyframe or bytes are gone, or the spine broke.
+    Lost,
+    /// A live witness in it did not match its replay.
+    Differs,
+}
+
+/// The recording `rewind export` writes ([`TemporalRecorder::export`]): a keyframe and what followed it, each at its microseconds after it.
+pub(crate) struct Export {
+    pub(crate) base: Arc<TerminalCheckpoint>,
+    pub(crate) events: Vec<(u64, Exported)>,
+    /// Slices and resizes the spine lost, as `temporal status` counts them.
+    pub(crate) dropped: (u64, u64),
+}
+
+/// One event of an [`Export`].
+pub(crate) enum Exported {
+    Output(InputSlice),
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    /// A keyframe of the live engine, which stands in for the slice it followed (the spine keeps no bytes for that slice).
+    Screen(Arc<TerminalCheckpoint>),
+}
+
 struct RetainedKeyframe {
     #[cfg(test)]
     id: KeyframeId,
@@ -1159,6 +1388,8 @@ struct RetainedKeyframe {
     ts: Ticks,
     first_blob: u64,
     cut: Option<Ticks>,
+    /// Whether a replay minted it (a rekey), so the slices before it are all on the spine.
+    replayed: bool,
     checkpoint: Arc<TerminalCheckpoint>,
 }
 
@@ -1187,15 +1418,32 @@ pub(crate) fn write(recorder: &Mutex<TemporalRecorder>, msg: TemporalMsg) {
 /// A replay lifted out of the recorder ([`TemporalRecorder::replay_plan`]).
 pub(crate) struct ReplayPlan {
     base: Arc<TerminalCheckpoint>,
-    steps: Vec<Step>,
+    base_seq: Seq,
+    base_ts: Ticks,
+    steps: Vec<Placed>,
     policy: ResizePolicy,
     host_resyncs: bool,
+}
+
+/// One step of a plan where it sits on the spine.
+struct Placed {
+    seq: Seq,
+    ts: Ticks,
+    step: Step,
 }
 
 enum Step {
     RawIn(InputSlice),
     Resize { rows: u16, cols: u16 },
     Witness(WitnessId, Arc<TerminalCheckpoint>),
+}
+
+/// One slice or resize a view fold applied ([`ReplayPlan::fold_onto`]).
+pub(crate) struct Passed<'a> {
+    pub(crate) ts: Ticks,
+    /// The slice's bytes, or `None` for a resize.
+    pub(crate) bytes: Option<&'a [u8]>,
+    pub(crate) resize: Option<(u16, u16)>,
 }
 
 impl ReplayPlan {
@@ -1207,7 +1455,7 @@ impl ReplayPlan {
         let mut replay = ReplayEngine::from_checkpoint(&self.base, self.policy)
             .with_host_resyncs_alt_screen(self.host_resyncs);
         let mut judged = Vec::new();
-        for step in self.steps {
+        for Placed { step, .. } in self.steps {
             match step {
                 #[cfg(test)]
                 Step::RawIn(input) if replay_clock::live() => replay.process(input.bytes()),
@@ -1230,6 +1478,102 @@ impl ReplayPlan {
     #[must_use]
     pub(crate) fn run(self) -> Terminal {
         self.fold().term
+    }
+
+    /// The base keyframe's seq, which names its chain.
+    pub(crate) const fn base_seq(&self) -> Seq {
+        self.base_seq
+    }
+
+    /// The base keyframe's tick.
+    pub(crate) const fn base_ts(&self) -> Ticks {
+        self.base_ts
+    }
+
+    /// The seq of the last step the plan folds, or its base's.
+    pub(crate) fn end_seq(&self) -> Seq {
+        self.steps.last().map_or(self.base_seq, |p| p.seq)
+    }
+
+    /// The base restored onto an engine whose history keeps `store_lines` lines past its ring ([`ReplayEngine::from_checkpoint_bounded`]), so a fork of it copies in bounded time.
+    pub(crate) fn restore_bounded(&self, store_lines: usize) -> ReplayEngine {
+        ReplayEngine::from_checkpoint_bounded(&self.base, self.policy, store_lines)
+            .with_host_resyncs_alt_screen(self.host_resyncs)
+    }
+
+    /// Fold the steps after `after` onto `replay` (the base restored, or a fork of it taken at `after`) while `passed`, called after each slice or resize, says to go on. Returns whether a pending witness it passed differed from the replay in more than the row counter, which a bounded history renumbers (aterm-core spec `replay-bounded-restore`), and the seq of the last step it applied.
+    pub(crate) fn fold_onto(
+        &self,
+        replay: &mut ReplayEngine,
+        after: Seq,
+        mut passed: impl FnMut(Passed<'_>, &ReplayEngine) -> bool,
+    ) -> (bool, Seq) {
+        let mut differs = false;
+        let mut last = after;
+        for placed in self.steps.iter().filter(|p| p.seq > after) {
+            let (bytes, resize) = match &placed.step {
+                Step::RawIn(input) => {
+                    replay.process_at(input.bytes(), input.clock);
+                    (Some(input.bytes()), None)
+                }
+                Step::Resize { rows, cols } => {
+                    replay.resize(*rows, *cols);
+                    (None, Some((*rows, *cols)))
+                }
+                Step::Witness(_, live) => {
+                    differs |= replay
+                        .terminal()
+                        .checkpoint_visible()
+                        .is_none_or(|mut seen| {
+                            seen.absolute_row_counter = live.absolute_row_counter;
+                            seen != **live
+                        });
+                    last = placed.seq;
+                    continue;
+                }
+            };
+            last = placed.seq;
+            let go_on = passed(
+                Passed {
+                    ts: placed.ts,
+                    bytes,
+                    resize,
+                },
+                replay,
+            );
+            if !go_on {
+                break;
+            }
+        }
+        (differs, last)
+    }
+
+    /// Fold every step onto `replay` (the base restored), calling `before` ahead of each slice or resize with the engine as the steps before it left it.
+    pub(crate) fn fold_before(
+        &self,
+        replay: &mut ReplayEngine,
+        mut before: impl FnMut(Passed<'_>, &ReplayEngine),
+    ) {
+        for placed in &self.steps {
+            let (bytes, resize) = match &placed.step {
+                Step::RawIn(input) => (Some(input.bytes()), None),
+                Step::Resize { rows, cols } => (None, Some((*rows, *cols))),
+                Step::Witness(..) => continue,
+            };
+            before(
+                Passed {
+                    ts: placed.ts,
+                    bytes,
+                    resize,
+                },
+                replay,
+            );
+            match &placed.step {
+                Step::RawIn(input) => replay.process_at(input.bytes(), input.clock),
+                Step::Resize { rows, cols } => replay.resize(*rows, *cols),
+                Step::Witness(..) => {}
+            }
+        }
     }
 }
 
@@ -2440,7 +2784,13 @@ mod tests {
                 live.checkpoint_continuing_bounded(REKEY_SCROLLBACK_LINES)
                     .expect("carried, as a string to swallow"),
             ),
-            steps: vec![Step::RawIn(InputSlice::at(&tail[..], clock(0)))],
+            base_seq: Seq(0),
+            base_ts: Ticks(0),
+            steps: vec![Placed {
+                seq: Seq(1),
+                ts: Ticks(0),
+                step: Step::RawIn(InputSlice::at(&tail[..], clock(0))),
+            }],
             policy: ResizePolicy::Native,
             host_resyncs: false,
         };

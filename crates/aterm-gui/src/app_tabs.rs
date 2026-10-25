@@ -1636,6 +1636,7 @@ impl App {
             agent,
             sid,
             clause: clause.as_ref().map(|(_, line)| line.clone()),
+            rewind: self.session_records(session),
         };
         let ext = chrome::TabChromeExt {
             tooltip: chrome::compose_tooltip(&input),
@@ -4674,6 +4675,10 @@ impl App {
                     candidate.value.original_tab,
                     prior_projection,
                 );
+                if let Some(window) = self.windows.get_mut(&wid) {
+                    window.tab_set.switch_to(candidate.value.original_tab);
+                    align_terminal_projection_to_active(window, &self.view_store);
+                }
                 self.refresh_aggregate_tab_presentation(wid, candidate.value.original_tab);
                 self.resize_panes(wid);
                 self.resync_active_or_window(wid);
@@ -5305,7 +5310,20 @@ impl App {
                 _ => None,
             }
         });
+        let rewind_row = self.windows.get(&wid).and_then(|ws| {
+            let menu = ws.tab_menu.as_ref()?;
+            match menu.entries.get(i)? {
+                crate::session_chrome::TabMenuEntry::RewindTo { at_ms, .. } => {
+                    Some((menu.tab, *at_ms))
+                }
+                _ => None,
+            }
+        });
         self.close_tab_menu(wid);
+        if let Some((tab, at_ms)) = rewind_row {
+            self.dispatch_tab_menu_rewind(wid, tab, at_ms);
+            return;
+        }
         if let Some((tab, sid, to, word)) = upgrade {
             self.dispatch_tab_menu_upgrade(wid, tab, sid, to, word);
         }
@@ -6937,6 +6955,556 @@ mod mixed_tab_tests {
             Some(crate::tab_model::View::Native(_))
         ));
         assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn reopening_a_closed_terminal_pane_activates_its_original_tab_and_input_target() {
+        let terminal_state = |app: &App, session| {
+            let terminal = crate::term_lock(&app.pool.get(session).unwrap().term);
+            (
+                terminal.grid().rows(),
+                terminal.grid().cols(),
+                (0..usize::from(terminal.grid().rows()))
+                    .map(|row| terminal.row_text(row))
+                    .collect::<Vec<_>>(),
+                terminal.text_selection().clone(),
+                terminal.grid().display_offset(),
+            )
+        };
+        let mut failures = Vec::new();
+        for settings_front in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let closed_session = app.split_active_stub_tab(wid);
+            let original = app.windows[&wid].tab_set.active().unwrap();
+            let original_tab = original.id;
+            let original_root = original.root.clone();
+            let old_view = original.focus;
+            let sibling_view = original_root.leaves()[0];
+            let sibling_term = app.pool.get(0).unwrap().term.clone();
+            crate::term_lock(&sibling_term).process(b"SIBLING SURVIVES");
+            let sibling_before = terminal_state(&app, 0);
+            assert_eq!(original_root.leaves()[1], old_view);
+            assert_eq!(app.focused_session_id(wid), Some(closed_session));
+
+            assert_eq!(app.close_active_tab(), None, "only the pane closes");
+            assert_eq!(app.closed_recovery.views.len(), 1);
+            assert!(app.closed_recovery.tabs.is_empty());
+            assert!(app.pool.get(closed_session).is_none());
+            assert!(app.view_store.get(old_view).is_none());
+            assert_eq!(app.windows[&wid].tab_set.active_id(), Some(original_tab));
+            assert_eq!(app.focused_session_id(wid), Some(0));
+
+            let unrelated_session = app.next_session_id;
+            app.push_stub_tab(wid, crate::stub_session(unrelated_session));
+            let unrelated_tab = app.windows[&wid].tab_set.active().unwrap().clone();
+            let unrelated_term = app.pool.get(unrelated_session).unwrap().term.clone();
+            crate::term_lock(&unrelated_term).process(b"UNRELATED TAB STAYS");
+            let unrelated_before = terminal_state(&app, unrelated_session);
+            let unrelated_layout = app.windows[&wid].layouts[1].clone();
+            if settings_front {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+                assert!(app.active_native_view(wid).is_some());
+            }
+            let tab_order = app.windows[&wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>();
+            assert_ne!(app.windows[&wid].tab_set.active_id(), Some(original_tab));
+            assert_eq!(app.windows[&wid].tabs.active, 1);
+            let view_count = app.view_store.len();
+
+            app.reopen_last_closed_view().unwrap();
+
+            let ws = &app.windows[&wid];
+            let restored = ws.tab_set.get(original_tab).unwrap();
+            let reopened_view = restored.focus;
+            assert_ne!(
+                reopened_view, old_view,
+                "the closed view identity is retired"
+            );
+            assert_ne!(reopened_view, sibling_view, "the reopened pane owns focus");
+            let reopened_session = app
+                .view_store
+                .get(reopened_view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                .expect("the reopened pane is a terminal");
+            assert_ne!(
+                reopened_session, closed_session,
+                "the closed shell is not revived"
+            );
+            let expected_root = original_root.map(&mut |view| {
+                if *view == old_view {
+                    reopened_view
+                } else {
+                    *view
+                }
+            });
+            assert_eq!(
+                restored.root, expected_root,
+                "split placement and sibling order return"
+            );
+            assert!(!restored.zoomed);
+            if ws.tab_set.active_id() != Some(original_tab) {
+                failures.push(format!(
+                    "settings_front={settings_front}: original tab stayed inactive"
+                ));
+            }
+            if ws.tabs.active != 0 {
+                failures.push(format!(
+                    "settings_front={settings_front}: terminal projection stayed {}",
+                    ws.tabs.active
+                ));
+            }
+            if app.focused_session_id(wid) != Some(reopened_session)
+                || app.front_terminal(wid).map(|terminal| terminal.session)
+                    != Some(reopened_session)
+                || app
+                    .active_handle
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|handle| handle.id)
+                    != Some(reopened_session)
+                || app.active_tree(wid).map(pane::PaneTree::focus) != Some(reopened_session)
+            {
+                failures.push(format!("settings_front={settings_front}: reopened session {reopened_session} is not the active input target"));
+            }
+            assert_eq!(ws.layouts[0].sessions(), vec![0, reopened_session]);
+            assert_eq!(ws.layouts[0].focus(), reopened_session);
+            assert_eq!(
+                ws.layouts[1], unrelated_layout,
+                "the unrelated layout stays intact"
+            );
+            assert_eq!(ws.tab_set.get(unrelated_tab.id), Some(&unrelated_tab));
+            assert_eq!(
+                ws.tab_set
+                    .tabs()
+                    .iter()
+                    .map(|tab| tab.id)
+                    .collect::<Vec<_>>(),
+                tab_order,
+                "reopen reuses the original tab without reordering others"
+            );
+            assert_eq!(app.view_store.len(), view_count + 1);
+            assert!(std::sync::Arc::ptr_eq(
+                &sibling_term,
+                &app.pool.get(0).unwrap().term
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                &unrelated_term,
+                &app.pool.get(unrelated_session).unwrap().term
+            ));
+            assert_eq!(
+                terminal_state(&app, 0),
+                sibling_before,
+                "the retained pane keeps its data"
+            );
+            assert_eq!(terminal_state(&app, unrelated_session), unrelated_before);
+            assert!(app.closed_recovery.views.is_empty());
+            assert!(app.closed_recovery.tabs.is_empty());
+            assert!(app.structural_invariants_ok());
+
+            let after_root = restored.root.clone();
+            let after_active = ws.tab_set.active_id();
+            let after_next_session = app.next_session_id;
+            assert!(
+                app.reopen_last_closed_view().is_err(),
+                "the record is consumed once"
+            );
+            assert_eq!(
+                app.windows[&wid].tab_set.get(original_tab).unwrap().root,
+                after_root
+            );
+            assert_eq!(app.windows[&wid].tab_set.active_id(), after_active);
+            assert_eq!(app.next_session_id, after_next_session);
+            assert_eq!(app.view_store.len(), view_count + 1);
+            assert!(app.structural_invariants_ok());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn reopening_a_closed_pane_in_another_window_preserves_the_front_input_owner() {
+        let mut app = App::headless_for_test();
+        let original_window = WindowId(0);
+        let closed_session = app.split_active_stub_tab(original_window);
+        let original = app.windows[&original_window].tab_set.active().unwrap();
+        let original_tab = original.id;
+        let original_root = original.root.clone();
+        let old_view = original.focus;
+        assert_eq!(app.close_active_tab(), None);
+        assert_eq!(app.closed_recovery.views.len(), 1);
+        let parked_session = app.next_session_id;
+        app.push_stub_tab(original_window, crate::stub_session(parked_session));
+        let parked_tab = app.windows[&original_window]
+            .tab_set
+            .active()
+            .unwrap()
+            .clone();
+
+        let front_session = app.next_session_id;
+        let front_window = app.insert_logical_window(crate::stub_session(front_session), 24, 80);
+        let front_term = app.pool.get(front_session).unwrap().term.clone();
+        crate::term_lock(&front_term).process(b"FRONT WINDOW UNCHANGED");
+        let front_text = |app: &App| {
+            let terminal = crate::term_lock(&app.pool.get(front_session).unwrap().term);
+            (
+                terminal.grid().rows(),
+                terminal.grid().cols(),
+                (0..usize::from(terminal.grid().rows()))
+                    .map(|row| terminal.row_text(row))
+                    .collect::<Vec<_>>(),
+                terminal.text_selection().clone(),
+                terminal.grid().display_offset(),
+            )
+        };
+        let before_text = front_text(&app);
+        let front = &app.windows[&front_window];
+        let before_tabs = front.tab_set.tabs().to_vec();
+        let before_active = front.tab_set.active_id();
+        let before_layouts = front.layouts.clone();
+        let before_projection = front.tabs;
+        let before_content = front.front_content;
+        let before_focus = front.window_focus;
+        assert_eq!(app.frontmost_window, Some(front_window));
+        assert_eq!(
+            app.active_handle.lock().unwrap().as_ref().unwrap().id,
+            front_session
+        );
+        assert_eq!(app.clipboard_session_in(front_window), Some(front_session));
+        let view_count = app.view_store.len();
+
+        app.reopen_last_closed_view().unwrap();
+
+        let restored_window = &app.windows[&original_window];
+        let restored = restored_window.tab_set.active().unwrap();
+        assert_eq!(
+            restored.id, original_tab,
+            "the original window selects its restored tab"
+        );
+        assert_eq!(restored_window.tabs.active, 0);
+        let reopened_view = restored.focus;
+        assert_ne!(reopened_view, old_view);
+        let reopened_session = app
+            .view_store
+            .get(reopened_view)
+            .copied()
+            .and_then(crate::tab_model::View::terminal_session)
+            .unwrap();
+        assert_ne!(reopened_session, closed_session);
+        assert_eq!(
+            restored.root,
+            original_root.map(&mut |view| if *view == old_view {
+                reopened_view
+            } else {
+                *view
+            }),
+            "the closed pane returns to its existing split position"
+        );
+        assert_eq!(
+            app.focused_session_id(original_window),
+            Some(reopened_session)
+        );
+        assert_eq!(
+            app.active_tree(original_window).map(pane::PaneTree::focus),
+            Some(reopened_session)
+        );
+        assert_eq!(
+            restored_window.tab_set.get(parked_tab.id),
+            Some(&parked_tab)
+        );
+
+        let mut failures = Vec::new();
+        if app.frontmost_window != Some(front_window) {
+            failures.push("reopening a background pane changed the front window");
+        }
+        let active = app.active_handle.lock().unwrap();
+        if !active.as_ref().is_some_and(|handle| {
+            handle.id == front_session && std::sync::Arc::ptr_eq(&handle.term, &front_term)
+        }) {
+            failures.push("reopening a background pane replaced the global input handle");
+        }
+        drop(active);
+        if app
+            .frontmost_window
+            .and_then(|wid| app.clipboard_session_in(wid))
+            != Some(front_session)
+        {
+            failures.push("the native menu Paste resolver no longer belongs to the front terminal");
+        }
+        let front = &app.windows[&front_window];
+        assert_eq!(front.tab_set.tabs(), before_tabs);
+        assert_eq!(front.tab_set.active_id(), before_active);
+        assert_eq!(front.layouts, before_layouts);
+        assert_eq!(front.tabs, before_projection);
+        assert_eq!(front.front_content, before_content);
+        assert_eq!(front.window_focus, before_focus);
+        assert_eq!(app.focused_session_id(front_window), Some(front_session));
+        assert!(std::sync::Arc::ptr_eq(
+            &front_term,
+            &app.front_terminal(front_window).unwrap().term
+        ));
+        assert_eq!(front_text(&app), before_text);
+        assert_eq!(app.view_store.len(), view_count + 1);
+        assert!(app.closed_recovery.views.is_empty());
+        assert!(app.closed_recovery.tabs.is_empty());
+        assert!(app.structural_invariants_ok());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn reopened_background_recovery_preserves_the_global_input_owner() {
+        let terminal_state = |app: &App, session| {
+            let terminal = crate::term_lock(&app.pool.get(session).unwrap().term);
+            (
+                terminal.grid().rows(),
+                terminal.grid().cols(),
+                (0..usize::from(terminal.grid().rows()))
+                    .map(|row| terminal.row_text(row))
+                    .collect::<Vec<_>>(),
+                terminal.text_selection().clone(),
+                terminal.grid().display_offset(),
+            )
+        };
+        let mut failures = Vec::new();
+        for (path, pane_fallback, native, background) in [
+            ("terminal tab", false, false, false),
+            ("terminal tab", false, false, true),
+            ("Settings tab", false, true, false),
+            ("Settings tab", false, true, true),
+            ("pane fallback", true, false, false),
+            ("pane fallback", true, false, true),
+        ] {
+            let mut app = App::headless_for_test();
+            let target_window = WindowId(0);
+            let (closed_views, closed_shape, survivor_session) = if pane_fallback {
+                let survivor = app.split_active_stub_tab(target_window);
+                let closed = app.split_active_stub_tab(target_window);
+                let closed_view = app.windows[&target_window].tab_set.active().unwrap().focus;
+                assert_eq!(app.close_active_tab(), None);
+                let now_ms = app.lat_epoch.elapsed().as_millis() as u64;
+                let candidate = app.closed_recovery.views.candidate(now_ms).unwrap();
+                assert_eq!(
+                    candidate.value.placement.parent_path,
+                    vec![crate::restore::RestoreBranch::Second]
+                );
+                // Reader EOF removes the older outer sibling without adding a human-close
+                // recovery entry. The saved Second path no longer exists in the live host.
+                assert!(!app.close_session(target_window, 0));
+                assert_eq!(app.closed_recovery.views.len(), 1);
+                assert_eq!(
+                    app.windows[&target_window]
+                        .tab_set
+                        .active()
+                        .unwrap()
+                        .root
+                        .len(),
+                    1
+                );
+                assert_eq!(app.focused_session_id(target_window), Some(survivor));
+                assert!(app.pool.get(closed).is_none());
+                (
+                    vec![closed_view],
+                    crate::tab_model::SplitTree::leaf(false),
+                    survivor,
+                )
+            } else {
+                if native {
+                    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+                } else {
+                    app.push_stub_tab(target_window, crate::stub_session(app.next_session_id));
+                    app.split_active_stub_tab(target_window);
+                }
+                let tab = app.windows[&target_window].tab_set.active().unwrap();
+                let views = tab.root.leaves();
+                let shape = tab.root.map(&mut |view| {
+                    matches!(
+                        app.view_store.get(*view),
+                        Some(crate::tab_model::View::Native(_))
+                    )
+                });
+                assert!(!app.close_tab_at(target_window, 1));
+                assert_eq!(app.closed_recovery.tabs.len(), 1);
+                assert!(app.closed_recovery.views.is_empty());
+                (views, shape, 0)
+            };
+            assert!(
+                closed_views
+                    .iter()
+                    .all(|view| !app.view_store.contains(*view))
+            );
+            let surviving_tabs = app.windows[&target_window].tab_set.tabs().to_vec();
+            let surviving_layouts = app.windows[&target_window].layouts.clone();
+            let survivor_term = app.pool.get(survivor_session).unwrap().term.clone();
+            crate::term_lock(&survivor_term).process(b"SURVIVOR KEPT");
+            let survivor_before = terminal_state(&app, survivor_session);
+
+            let front_window = if background {
+                app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80)
+            } else {
+                target_window
+            };
+            let front_session = app.focused_session_id(front_window).unwrap();
+            let front_term = app.pool.get(front_session).unwrap().term.clone();
+            if background {
+                crate::term_lock(&front_term).process(b"FRONT OWNER KEPT");
+            }
+            let before_front_text = terminal_state(&app, front_session);
+            let front = &app.windows[&front_window];
+            let before_front = (
+                front.tab_set.tabs().to_vec(),
+                front.tab_set.active_id(),
+                front.layouts.clone(),
+                front.tabs,
+                front.front_content,
+                front.window_focus,
+            );
+            assert_eq!(app.frontmost_window, Some(front_window));
+            assert_eq!(
+                app.active_handle.lock().unwrap().as_ref().unwrap().id,
+                front_session
+            );
+            assert_eq!(app.clipboard_session_in(front_window), Some(front_session));
+            let view_count = app.view_store.len();
+
+            if pane_fallback {
+                app.reopen_last_closed_view().unwrap();
+            } else {
+                app.reopen_last_closed_tab().unwrap();
+            }
+
+            let target = &app.windows[&target_window];
+            let restored = target.tab_set.active().unwrap();
+            assert_eq!(
+                target.tab_set.len(),
+                surviving_tabs.len() + 1,
+                "{path}: a fresh tab is selected"
+            );
+            assert!(surviving_tabs.iter().all(|tab| tab.id != restored.id));
+            assert_eq!(target.tab_set.active_index(), Some(1));
+            assert_eq!(
+                restored.root.map(&mut |view| matches!(
+                    app.view_store.get(*view),
+                    Some(crate::tab_model::View::Native(_))
+                )),
+                closed_shape,
+                "{path}: restored leaf kinds, split ratio and order"
+            );
+            assert!(
+                restored
+                    .root
+                    .leaves()
+                    .iter()
+                    .all(|view| !closed_views.contains(view))
+            );
+            assert_eq!(app.view_store.len(), view_count + closed_views.len());
+            for (index, tab) in surviving_tabs.iter().enumerate() {
+                assert_eq!(
+                    target.tab_set.tab_at(index),
+                    Some(tab),
+                    "{path}: retained tab unchanged"
+                );
+                assert_eq!(target.layouts[index], surviving_layouts[index]);
+            }
+            assert!(std::sync::Arc::ptr_eq(
+                &survivor_term,
+                &app.pool.get(survivor_session).unwrap().term
+            ));
+            assert_eq!(terminal_state(&app, survivor_session), survivor_before);
+            let restored_session = if native {
+                let (instance, view) = app.active_native_view(target_window).unwrap();
+                assert_eq!(view, restored.focus);
+                assert!(matches!(app.native_runtime.view_state(view),
+                    Some(crate::native_app::AppViewState::Settings(state))
+                        if state.route == crate::native_settings::SettingsRoute::About));
+                assert_eq!(
+                    app.native_runtime.app(instance).unwrap().kind(),
+                    crate::native_app::AppKind::Settings
+                );
+                None
+            } else {
+                let session = app.focused_session_id(target_window).unwrap();
+                assert_eq!(
+                    target.tabs.active, 1,
+                    "{path}: projection follows the new tab"
+                );
+                assert_eq!(app.active_tree(target_window).unwrap().focus(), session);
+                Some(session)
+            };
+            let expected_owner = if background {
+                Some(front_session)
+            } else {
+                restored_session
+            };
+            if app.frontmost_window != Some(front_window) {
+                failures.push(format!(
+                    "{path}, background={background}: changed the front window"
+                ));
+            }
+            let active = app.active_handle.lock().unwrap();
+            if active.as_ref().map(|handle| handle.id) != expected_owner
+                || (background
+                    && !active
+                        .as_ref()
+                        .is_some_and(|handle| std::sync::Arc::ptr_eq(&handle.term, &front_term)))
+            {
+                failures.push(format!(
+                    "{path}, background={background}: changed the global input owner"
+                ));
+            }
+            drop(active);
+            if app
+                .frontmost_window
+                .and_then(|wid| app.clipboard_session_in(wid))
+                != expected_owner
+            {
+                failures.push(format!(
+                    "{path}, background={background}: changed the menu Paste resolver owner"
+                ));
+            }
+            if background {
+                let front = &app.windows[&front_window];
+                assert_eq!(
+                    (
+                        front.tab_set.tabs().to_vec(),
+                        front.tab_set.active_id(),
+                        front.layouts.clone(),
+                        front.tabs,
+                        front.front_content,
+                        front.window_focus
+                    ),
+                    before_front
+                );
+                assert_eq!(terminal_state(&app, front_session), before_front_text);
+                assert!(std::sync::Arc::ptr_eq(
+                    &front_term,
+                    &app.front_terminal(front_window).unwrap().term
+                ));
+            }
+            assert!(app.closed_recovery.tabs.is_empty());
+            assert!(app.closed_recovery.views.is_empty());
+            assert!(app.structural_invariants_ok());
+            let after_view_count = app.view_store.len();
+            let after_next = app.next_session_id;
+            let after_tab = restored.clone();
+            let again = if pane_fallback {
+                app.reopen_last_closed_view()
+            } else {
+                app.reopen_last_closed_tab()
+            };
+            assert!(again.is_err(), "{path}: recovery is consumed once");
+            assert_eq!(
+                app.windows[&target_window].tab_set.active(),
+                Some(&after_tab)
+            );
+            assert_eq!(app.view_store.len(), after_view_count);
+            assert_eq!(app.next_session_id, after_next);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

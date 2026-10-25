@@ -4,10 +4,10 @@
 //! The sprite path the fx engine replaced (`SpriteQuad`, `FreeSprite` and
 //! their atlases), kept as the differential oracle the companions and the rain
 //! are held to: [`stamp`] is the old `stamp_free_sprite` (whose white-rain and
-//! cat-quad twins drew the same bytes over their texels), the knock boxes are
-//! the old `knock_rects`, and [`crate::Renderer::set_legacy_sprites`] draws them
-//! where the old composite did, so a frame through either path can be compared
-//! byte for byte.
+//! cat-quad twins drew the same bytes over their texels), cut where its letters
+//! lie as the layers are ([`crate::Renderer::cut_knock_layers`]), and
+//! [`crate::Renderer::set_legacy_sprites`] draws them where the old composite
+//! did, so a frame through either path can be compared byte for byte.
 
 use std::sync::Arc;
 
@@ -50,28 +50,32 @@ pub struct LegacySprites {
     pub sprites: Vec<LegacySprite>,
 }
 
-impl LegacySprites {
-    /// The old `knock_rects`: the frame-pixel box of every under-text sprite
-    /// with a non-zero alpha and size.
-    pub fn knock_rects(&self, pad_x: i32, pad_y: i32) -> impl Iterator<Item = [i32; 4]> {
-        self.sprites
-            .iter()
-            .filter(|s| s.under && s.alpha > 0 && s.w > 0 && s.h > 0)
-            .map(move |s| {
-                let x0 = pad_x.saturating_add(s.x);
-                let y0 = pad_y.saturating_add(s.y);
-                [
-                    x0,
-                    y0,
-                    x0.saturating_add(i32::from(s.w)),
-                    y0.saturating_add(i32::from(s.h)),
-                ]
-            })
-    }
+/// `s`'s destination box in the frame (`[x0, y0, x1, y1)`), cut to a `w × h` frame whose grid
+/// interior starts at `(pad_x, pad_y)`; `None` when nothing of it is in the frame.
+#[must_use]
+pub fn frame_box(
+    s: &LegacySprite,
+    pad_x: usize,
+    pad_y: usize,
+    w: usize,
+    h: usize,
+) -> Option<[i32; 4]> {
+    let ox = pad_x as i32 + s.x;
+    let oy = pad_y as i32 + s.y;
+    let b = [
+        ox.max(0),
+        oy.max(0),
+        (ox + i32::from(s.w)).min(w as i32),
+        (oy + i32::from(s.h)).min(h as i32),
+    ];
+    (b[0] < b[2] && b[1] < b[3]).then_some(b)
 }
 
 /// The old `stamp_free_sprite`: `s` over the pixel rows `[y_lo, y_hi)` of a
-/// `w × h` frame whose grid interior starts at `(pad_x, pad_y)`.
+/// `w × h` frame whose grid interior starts at `(pad_x, pad_y)`; under `cut`
+/// (`(box, mask)`: the knock-out's rings over `box`, one word a pixel, its low
+/// byte the share cut away) each texel's alpha is cut as the layers' are
+/// ([`crate::Renderer::cut_knock_layers`]).
 #[allow(clippy::too_many_arguments)]
 pub fn stamp(
     pixels: &mut [u32],
@@ -82,6 +86,7 @@ pub fn stamp(
     s: &LegacySprite,
     y_lo: usize,
     y_hi: usize,
+    cut: Option<([i32; 4], &[u32])>,
 ) {
     assert_eq!(
         s.art.texels(),
@@ -131,7 +136,19 @@ pub fn stamp(
             };
             let sx = if s.flip_x { aw - 1 - sx0 } else { sx0 };
             let i = (arow + usize::from(ax) + sx) * 4;
-            let a8 = mul8(u32::from(rgba[i + 3]), qa);
+            let texel_a = match cut {
+                Some((b, mask))
+                    if (b[0]..b[2]).contains(&(px as i32))
+                        && (b[1]..b[3]).contains(&(py as i32)) =>
+                {
+                    let m = mask[(py as i32 - b[1]) as usize * (b[2] - b[0]) as usize
+                        + (px as i32 - b[0]) as usize]
+                        & 0xff;
+                    mul8(u32::from(rgba[i + 3]), 255 - m)
+                }
+                _ => u32::from(rgba[i + 3]),
+            };
+            let a8 = mul8(texel_a, qa);
             if a8 == 0 {
                 continue;
             }

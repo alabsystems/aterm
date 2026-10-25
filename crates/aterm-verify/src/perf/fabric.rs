@@ -188,7 +188,7 @@ impl Args {
                         format!("`{flag}` needs a non-negative integer, got `{raw}`")
                     })?);
                 }
-                "--no-windows" => {}
+                "--no-windows" | "--admit" => {}
                 other => {
                     return Err(format!(
                         "internal: `{other}` has no parser in the fabric lane"

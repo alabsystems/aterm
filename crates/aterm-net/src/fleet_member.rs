@@ -877,6 +877,16 @@ pub fn read_peers_as(dir: &Path, fleet: FleetMark) -> Result<Vec<Peer>, PeersErr
     Ok(read_book(dir, Some(fleet))?.0)
 }
 
+/// Whether the book in `dir` names an issuer other than `own`, of whichever fleet it marks: a machine whose book may list this one still.
+#[must_use]
+pub fn names_an_issuer(dir: &Path, own: Option<&str>) -> bool {
+    read_book(dir, held_mark(dir)).is_ok_and(|(held, other)| {
+        held.iter().chain(&other).any(|peer| {
+            peer.via == Via::Issuer && peer.node.is_some() && peer.node.as_deref() != own
+        })
+    })
+}
+
 /// The mark of the fleet whose key `dir` holds, when it holds one it can read.
 fn held_mark(dir: &Path) -> Option<FleetMark> {
     crate::fleet::read_key_file(dir)

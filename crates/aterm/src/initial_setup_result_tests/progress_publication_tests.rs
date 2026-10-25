@@ -21,7 +21,7 @@ impl SetupStartup for Startup<'_> {
         self.sent.send();
     }
 
-    fn bring_forward(&mut self) -> bool {
+    fn bring_forward(&mut self) -> Result<bool, String> {
         self.brought += 1;
         assert_eq!(
             self.brought, 1,
@@ -34,7 +34,7 @@ impl SetupStartup for Startup<'_> {
         if self.stop {
             stop_initial_setup();
         }
-        true
+        Ok(true)
     }
 
     fn bind_authorization(&mut self) -> Result<u64, String> {

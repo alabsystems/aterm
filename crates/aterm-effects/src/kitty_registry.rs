@@ -43,6 +43,17 @@ const TRANSPARENT_PREFIXES: &[&str] = &["sudo", "env", "npx"];
 /// Extract the first meaningful program token of a shell commandline, basenamed and lowercased.
 #[must_use]
 pub fn app_basename(commandline: &str) -> Option<String> {
+    #[inline]
+    const fn is_transparent_prefix(base: &str) -> bool {
+        let mut i = 0;
+        while i < TRANSPARENT_PREFIXES.len() {
+            if base.eq_ignore_ascii_case(TRANSPARENT_PREFIXES[i]) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
     for token in commandline.split_whitespace() {
         // Launcher plumbing, not the app: `FOO=bar cargo …`, `sudo -E cargo …`.
         if token.starts_with('-') || token.contains('=') {
@@ -57,11 +68,7 @@ pub fn app_basename(commandline: &str) -> Option<String> {
         } else {
             base
         };
-        if base.is_empty()
-            || TRANSPARENT_PREFIXES
-                .iter()
-                .any(|p| base.eq_ignore_ascii_case(p))
-        {
+        if base.is_empty() || is_transparent_prefix(base) {
             continue;
         }
         return Some(base.to_ascii_lowercase());

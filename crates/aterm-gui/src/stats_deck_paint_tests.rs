@@ -943,11 +943,11 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
     assert_eq!(
         wide,
         [
-            "8 waiting for a core (load 25.7)",
+            "8 waiting for a core",
             sep,
             "Spotlight, after start-up",
             sep,
-            "busiest rustc \u{d7}9 in Tab 3, 5.9 cores",
+            "rustc \u{d7}9 in Tab 3",
         ]
     );
     let cause: Vec<&Boxed> = marks.iter().filter(|b| b.text == "cause").collect();
@@ -996,22 +996,34 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
     let (mid, _) = drawn(Scene::Trouble, 1119.0, DeckForm::Full).expect("Details at W 1119");
     assert_eq!(
         mid,
-        ["8 waiting for a core (load 25.7)", sep, "Spotlight"],
-        "busiest folds first, then the cause shortens"
+        [
+            "8 waiting for a core",
+            sep,
+            "Spotlight, after start-up",
+            sep,
+            "rustc \u{d7}9"
+        ],
+        "the busiest clause sheds its tab first"
     );
-    let (col, ..) = cpu_details(1175.0, DeckForm::Full, &m).expect("Details at W 1175");
-    assert!((col.w - 250.0).abs() < 0.5, "a 250 pt column: {col:?}");
-    let (between, _) = drawn(Scene::Trouble, 1175.0, DeckForm::Full).expect("Details");
+    let (between, _) = drawn(Scene::Trouble, 1060.0, DeckForm::Full).expect("Details at W 1060");
     assert_eq!(
         between,
         [
-            "load 25.7 on 18 cores",
+            "8 waiting for a core",
             sep,
             "Spotlight",
             sep,
-            "rustc \u{d7}9 in Tab 3"
+            "rustc \u{d7}9"
         ],
-        "all three short"
+        "then the cause shortens"
+    );
+    let (col, ..) = cpu_details(1039.0, DeckForm::Full, &m).expect("Details at W 1039");
+    assert!((col.w - 178.0).abs() < 0.5, "a 178 pt column: {col:?}");
+    let (owner, _) = drawn(Scene::Trouble, 1039.0, DeckForm::Full).expect("Details");
+    assert_eq!(
+        owner,
+        ["8 waiting for a core", sep, "Spotlight"],
+        "and busiest folds before the load"
     );
     assert_eq!(
         drawn(Scene::Trouble, 900.0, DeckForm::Full),
@@ -1065,7 +1077,12 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
 fn frame(laid: &Laid) -> Vec<(BoxKind, [f64; 4])> {
     laid.boxes
         .iter()
-        .filter(|b| matches!(b.kind, BoxKind::Strip | BoxKind::Bar | BoxKind::Core))
+        .filter(|b| {
+            matches!(
+                b.kind,
+                BoxKind::Strip | BoxKind::Bar | BoxKind::Core | BoxKind::Gauge
+            )
+        })
         .map(|b| (b.kind, b.r))
         .collect()
 }
@@ -1132,24 +1149,26 @@ fn core_squares_never_touch() {
     assert!(squares > 10_000, "CONTROL: {squares} squares drawn");
 }
 
+/// Full slim's compact amount keeps the freed figure; Folded says the glance (§6.8), whose disk
+/// amount is the used figure alone: freed is a standing fact the lens keeps.
 #[test]
 fn freed_reaches_the_compact_amounts() {
     let m = FaceMetrics::helvetica_neue();
-    for (w, form) in [
-        (1119.0, DeckForm::Folded),
-        (350.0, DeckForm::Full),
-        (348.0, DeckForm::Full),
+    for (w, form, want) in [
+        (1119.0, DeckForm::Folded, "1.11 TB"),
+        (350.0, DeckForm::Full, "1.11 TB used · freed 41 GB"),
+        (348.0, DeckForm::Full, "1.11 TB used · freed 41 GB"),
     ] {
         for s in [1.0, 2.0] {
             let laid = laid(Scene::Calm, w, s, form, &m, false);
             let amount = laid
                 .boxes
                 .iter()
-                .find(|b| b.kind == BoxKind::Text && b.text.contains("TB used"))
+                .find(|b| b.kind == BoxKind::Text && b.text.starts_with("1.11 TB"))
                 .map(|b| b.text.as_str());
-            assert_eq!(
-                amount,
-                Some("1.11 TB used · freed 41 GB"),
+            assert_eq!(amount, Some(want), "{form:?} {w} pt at {s}×");
+            assert!(
+                form == DeckForm::Full || !laid.boxes.iter().any(|b| b.text.contains("freed")),
                 "{form:?} {w} pt at {s}×"
             );
         }
@@ -1323,10 +1342,16 @@ fn rule_s(
     rows: Rows,
     r: u32,
     at: &str,
+    glance: bool,
 ) {
-    let Some(st) = words::state(res, snap, &MAC) else {
+    let Some(mut st) = words::state(res, snap, &MAC) else {
         return;
     };
+    // Full wide and mid and Folded say the glance: its amount before the state (`897`, not
+    // `897/16,000`).
+    if glance {
+        st.amount_forms = words::glance_amount(res, &snap.resources[res.index()], &MAC);
+    }
     let pt = rows.amount_pt;
     let top = rows.top(r);
     let drawn = texts_in(laid, col, top - 1.0, top + rows.cell + 1.0);
@@ -1384,7 +1409,8 @@ fn state_is_said_in_words_without_details() {
         let col = p.amount.unwrap_or_else(|| panic!("{at}: an amount column"));
         for (i, &res) in DECK_RESOURCES.iter().enumerate() {
             if states.contains(&res) {
-                rule_s(&laid, &m, &snap, res, col, p.rows, i as u32, &at);
+                let glance = matches!(kind, FullKind::Wide | FullKind::Mid);
+                rule_s(&laid, &m, &snap, res, col, p.rows, i as u32, &at, glance);
                 said += 1;
             }
         }
@@ -1415,7 +1441,7 @@ fn state_is_said_in_words_without_details() {
                         };
                         let top = b.rows.top(r);
                         let drawn = texts_in(&laid, details, top - 1.0, top + b.rows.cell + 1.0);
-                        let kept = words::details(res, &snap, &MAC)
+                        let kept = words::glance_details(res, &snap, &MAC)
                             .into_iter()
                             .find(|c| c.keep)
                             .map(|c| c.forms)
@@ -1431,7 +1457,7 @@ fn state_is_said_in_words_without_details() {
                 (None, Some(amount)) => {
                     for &(r, res) in &ours {
                         if states.contains(&res) {
-                            rule_s(&laid, &m, &snap, res, amount, b.rows, r, &at);
+                            rule_s(&laid, &m, &snap, res, amount, b.rows, r, &at, true);
                             said += 1;
                         }
                     }
@@ -1593,6 +1619,16 @@ fn hit_map() {
                 );
             }
         }
+        // The gauge at the top left is the Cores hit, as Full's slot is, over the header line too.
+        let g = p.gauge.expect("CONTROL: the gauge at every width here");
+        let (cx, cy) = g.centre();
+        for y in [6.0, cy] {
+            assert_eq!(
+                hit_at(hits, cx, y, s),
+                Some(HitKind::Cores),
+                "{at}: the gauge"
+            );
+        }
         let y = p.blocks[0].rows.top(1) + 4.0;
         let gutter = (p.blocks[0].at.end() + p.blocks[1].at.x) / 2.0;
         assert_eq!(hit_at(hits, gutter, y, s), None, "{at}: the gutter");
@@ -1653,6 +1689,7 @@ fn deck_gallery() {
             (1119.0, 2.0),
             (550.0, 2.0),
             (350.0, 2.0),
+            (700.0, 2.0),
             (1119.0, 1.0),
             (450.0, 1.0),
         ] {
@@ -1684,5 +1721,8 @@ fn deck_gallery() {
             }
         }
     }
-    assert_eq!(written.len(), scenes.len() * 5 * 2 * 2);
+    assert_eq!(written.len(), scenes.len() * 6 * 2 * 2);
 }
+
+#[path = "stats_deck_owner_scenes.rs"]
+mod owner_scenes;

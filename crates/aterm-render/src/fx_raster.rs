@@ -379,14 +379,6 @@ pub(crate) struct FxScratch {
     cols: SpriteCols,
 }
 
-impl FxScratch {
-    /// The slicer, for a reader that slices without drawing ([`knock_rects`]).
-    #[inline]
-    pub(crate) const fn slicer(&mut self) -> &mut FxSlicer {
-        &mut self.slicer
-    }
-}
-
 /// A sprite's column table ([`sprite_cols`]), built when a slice of the sprite is first drawn and kept while the sprites drawn after it have the same art width and destination width.
 #[derive(Debug, Default)]
 pub struct SpriteCols {
@@ -470,31 +462,122 @@ pub fn slice_layers<'a>(
     }
 }
 
-/// The knock-out's boxes: every slice (`[x0, y0, x1, y1)`, frame pixels,
-/// right and bottom exclusive) of a sprite on a knock layer
-/// ([`FxLayer::knock`], a Linear layer at [`FxSlot::Under`]) whose ink is
-/// not clear, after the layer's clips and the occluders, into `out`
-/// (cleared first). The CPU knock-out (`Renderer::knock_out_under_text`)
-/// and the GPU's glyph-knock stream both read these, so a body cut by a
-/// pane edge or a card knocks out no letter beyond what it draws.
+/// One rect of a knock layer's body ([`knock_rects`]): `[x0, x1) × [y0, y1)` frame pixels
+/// (right and bottom exclusive) where the body draws (a texel of any alpha under an ink of any
+/// alpha).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnockRect {
+    /// Left edge.
+    pub x0: i32,
+    /// Top edge.
+    pub y0: i32,
+    /// Right edge, exclusive.
+    pub x1: i32,
+    /// Bottom edge, exclusive.
+    pub y1: i32,
+}
+
+impl KnockRect {
+    /// Whether the rect meets `[x0, x1) × [y0, y1)`.
+    #[inline]
+    #[must_use]
+    pub const fn meets(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+        self.x0 < x1 && self.x1 > x0 && self.y0 < y1 && self.y1 > y0
+    }
+}
+
+/// Append the run `[x0, x1) × [y0, y1)` to `out`, joined to the last rect when that one sits
+/// beside it on the same rows.
+pub(crate) fn push_knock_run(out: &mut Vec<KnockRect>, x0: i32, x1: i32, y0: i32, y1: i32) {
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    if let Some(last) = out.last_mut()
+        && last.y0 == y0
+        && last.y1 == y1
+    {
+        if last.x1 == x0 {
+            last.x1 = x1;
+            return;
+        }
+        if last.x0 == x1 {
+            last.x0 = x0;
+            return;
+        }
+    }
+    out.push(KnockRect { x0, y0, x1, y1 });
+}
+
+/// Join the rects of `out[from..]` that stack: same columns, one's bottom the other's top.
+/// The rects stay disjoint, so a pixel is knocked out once whatever the cut.
+pub(crate) fn merge_knock_rows(out: &mut Vec<KnockRect>, from: usize) {
+    out[from..].sort_unstable_by_key(|r| (r.x0, r.x1, r.y0));
+    let mut kept = from;
+    for i in from..out.len() {
+        let r = out[i];
+        if kept > from {
+            let last = &mut out[kept - 1];
+            if last.x0 == r.x0 && last.x1 == r.x1 && last.y1 == r.y0 {
+                last.y1 = r.y1;
+                continue;
+            }
+        }
+        out[kept] = r;
+        kept += 1;
+    }
+    out.truncate(kept);
+}
+
+/// The companions' bodies: where every sprite on a knock layer ([`FxLayer::knock`], a Linear
+/// layer at [`FxSlot::Under`]) draws, as rects ([`KnockRect`]), after the layer's clips and
+/// the occluders, into `out` (cleared first): a reader that judges a letter on a body as a
+/// companion's (the gallery's trail judge), not the trail's.
 pub fn knock_rects(
     f: &FxFrame,
     layers: &[FxLayer],
     occluders: &[PxRect],
     slicer: &mut FxSlicer,
-    out: &mut Vec<[i32; 4]>,
+    cols: &mut SpriteCols,
+    out: &mut Vec<KnockRect>,
 ) {
-    /// Collects the slices of every sprite whose ink is not clear.
-    struct Knocks<'o>(&'o mut Vec<[i32; 4]>);
-    impl<'a> FxSliceSink<'a> for Knocks<'_> {
-        fn item(&mut self, layer: &'a FxLayer, item: &'a FxItem, _: (i64, i64)) -> bool {
-            matches!(item, FxItem::Sprite(sp)
-                if layer.content.palette().get(sp.ink as usize).is_some_and(|k| k.alpha > 0))
+    /// Collects the drawn runs of every sprite whose ink is not clear.
+    struct Knocks<'o, 'a> {
+        out: &'o mut Vec<KnockRect>,
+        cols: &'o mut SpriteCols,
+        cur: Option<(&'a FxSprite, (i64, i64), &'a [FxInk])>,
+    }
+    impl<'a> FxSliceSink<'a> for Knocks<'_, 'a> {
+        fn item(&mut self, layer: &'a FxLayer, item: &'a FxItem, origin: (i64, i64)) -> bool {
+            self.cur = match item {
+                FxItem::Sprite(sp)
+                    if layer
+                        .content
+                        .palette()
+                        .get(sp.ink as usize)
+                        .is_some_and(|k| k.alpha > 0) =>
+                {
+                    Some((sp, origin, layer.content.palette()))
+                }
+                _ => None,
+            };
+            self.cur.is_some()
         }
 
         fn slice(&mut self, s: FxSlice, _band: usize) {
+            let Some((sp, o, palette)) = self.cur else {
+                return;
+            };
+            let from = self.out.len();
+            let cols = self.cols.of(sp);
             let px = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
-            self.0.push([px(s.x0), px(s.y0), px(s.x1), px(s.y1)]);
+            let out = &mut *self.out;
+            sprite_spans(s, o, sp, palette, cols, |x0, x1, y0, y1, paint| {
+                let (SpanPaint::Exact(_, a) | SpanPaint::Straight(_, a)) = paint;
+                if a > 0 {
+                    push_knock_run(out, px(x0), px(x1), px(y0), px(y1));
+                }
+            });
+            merge_knock_rows(self.out, from);
         }
     }
     out.clear();
@@ -508,8 +591,87 @@ pub fn knock_rects(
         |l| l.knock && l.slot == FxSlot::Under && l.blend == FxBlend::Linear,
         |_| true,
         slicer,
-        &mut Knocks(out),
+        &mut Knocks {
+            out,
+            cols,
+            cur: None,
+        },
     );
+}
+
+/// Where a knock layer's one sprite draws in the frame, before the occluders: its origin `O`
+/// (window pixels, pixel law F's), and its box within its own clip, the layer clip and the
+/// frame, as `[x0, y0, x1, y1)`. `None` for a layer that is not one straight-RGBA sprite on a
+/// knock layer with a visible ink, or that draws nothing in the frame.
+pub(crate) fn knock_sprite_area<'a>(
+    f: &FxFrame,
+    layer: &'a FxLayer,
+) -> Option<((i64, i64), [i32; 4], &'a FxSprite)> {
+    if !(layer.knock && layer.slot == FxSlot::Under && layer.blend == FxBlend::Linear) {
+        return None;
+    }
+    let [FxItem::Sprite(sp)] = layer.content.items() else {
+        return None;
+    };
+    if sp.art.texels() != FxTexels::Rgba8Straight
+        || sp.art.is_empty()
+        || sp.dw == 0
+        || sp.dh == 0
+        || layer
+            .content
+            .palette()
+            .get(sp.ink as usize)
+            .is_none_or(|k| k.alpha == 0)
+    {
+        return None;
+    }
+    let (shift, clip) = layer_place(f, layer)?;
+    let item = &layer.content.items()[0];
+    let (origin, area) = item_place(item, shift);
+    let a = area.intersect(clip);
+    if a.is_empty() {
+        return None;
+    }
+    let px = |v: i64| i32::try_from(v).ok();
+    Some((origin, [px(a.x0)?, px(a.y0)?, px(a.x1)?, px(a.y1)?], sp))
+}
+
+/// `sp`'s straight texels drawn at origin `o` over `area` (`[x0, y0, x1, y1)`, frame pixels) by
+/// pixel law F, as a 1:1 straight-RGBA art, each texel's alpha cut by `mask` (one word a pixel
+/// of `area`, row-major; its low byte the share of the pixel cut away). `None` when the art
+/// cannot hold the area.
+pub(crate) fn cut_sprite_art(
+    o: (i64, i64),
+    area: [i32; 4],
+    sp: &FxSprite,
+    mask: &[u32],
+    out: &mut Vec<u8>,
+) -> Option<FxArt> {
+    let art = &*sp.art;
+    let (aw, ah) = (u64::from(art.w()), u64::from(art.h()));
+    let (dw, dh) = (u64::from(sp.dw), u64::from(sp.dh));
+    let (w, h) = (
+        u16::try_from(area[2] - area[0]).ok()?,
+        u16::try_from(area[3] - area[1]).ok()?,
+    );
+    let data = art.data();
+    out.clear();
+    out.reserve(usize::from(w) * usize::from(h) * 4);
+    for y in area[1]..area[3] {
+        let m = (i64::from(y) - o.1) as u64;
+        let ty = (m * ah / dh).min(ah - 1) as usize;
+        for x in area[0]..area[2] {
+            let l = (i64::from(x) - o.0) as u64;
+            let d = (l * aw / dw).min(aw - 1) as usize;
+            let tx = if sp.flip_x { aw as usize - 1 - d } else { d };
+            let i = (ty * aw as usize + tx) * 4;
+            let cut =
+                mask[((y - area[1]) as usize) * usize::from(w) + (x - area[0]) as usize] & 0xff;
+            let a = (u32::from(data[i + 3]) * (255 - cut) + 127) / 255;
+            out.extend_from_slice(&[data[i], data[i + 1], data[i + 2], a as u8]);
+        }
+    }
+    FxArt::new(w, h, FxTexels::Rgba8Straight, std::mem::take(out))
 }
 
 /// The CPU sink: stamps each slice into a frame buffer.
@@ -546,6 +708,30 @@ impl<'a, C: FxCanvas> FxSliceSink<'a> for Stamper<'_, 'a, C> {
     }
 }
 
+/// Which layers of a slot and blend a draw takes: all of them, or only the knock layers (the
+/// companions' bodies under the text, drawn over the under-glyph light), or all but them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Knock {
+    /// Every layer.
+    Any,
+    /// Only [`FxLayer::knock`] layers.
+    Only,
+    /// Every layer but those.
+    Not,
+}
+
+impl Knock {
+    /// Whether the pick takes `layer`.
+    #[inline]
+    pub(crate) const fn takes(self, layer: &FxLayer) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only => layer.knock,
+            Self::Not => !layer.knock,
+        }
+    }
+}
+
 /// Draw every layer of `slot` and `blend` into `px` (row-major, `f.w` wide).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_layers(
@@ -558,31 +744,43 @@ pub(crate) fn draw_layers(
     dirty: Option<&[bool]>,
     scratch: &mut FxScratch,
 ) {
-    if px.len() < f.w * f.h {
-        return;
-    }
-    let mut canvas = FramePx::new(&mut px[..f.w * f.h], f.w);
-    draw_layers_on(
-        &mut canvas,
+    draw_picked_layers(
+        px,
         f,
         layers,
         occluders,
-        slot,
-        blend,
+        (slot, blend, Knock::Any),
         dirty,
         scratch,
     );
 }
 
-/// [`draw_layers`] onto any [`FxCanvas`]: the shared slicer still owns geometry, bands and occluders; the CPU sink intersects its slices with the target while retaining each item's original window-pixel origin.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn draw_layers_on<C: FxCanvas>(
+/// [`draw_layers`] of the layers `pick` takes.
+pub(crate) fn draw_picked_layers(
+    px: &mut [u32],
+    f: &FxFrame,
+    layers: &[FxLayer],
+    occluders: &[PxRect],
+    pick: (FxSlot, FxBlend, Knock),
+    dirty: Option<&[bool]>,
+    scratch: &mut FxScratch,
+) {
+    if px.len() < f.w * f.h {
+        return;
+    }
+    let mut canvas = FramePx::new(&mut px[..f.w * f.h], f.w);
+    draw_picked_layers_on(&mut canvas, f, layers, occluders, pick, dirty, scratch);
+}
+
+/// [`draw_picked_layers`] onto any [`FxCanvas`]: the shared slicer still owns geometry, bands and
+/// occluders; the CPU sink intersects its slices with the target while retaining each item's
+/// original window-pixel origin.
+pub(crate) fn draw_picked_layers_on<C: FxCanvas>(
     canvas: &mut C,
     f: &FxFrame,
     layers: &[FxLayer],
     occluders: &[PxRect],
-    slot: FxSlot,
-    blend: FxBlend,
+    (slot, blend, knock): (FxSlot, FxBlend, Knock),
     dirty: Option<&[bool]>,
     scratch: &mut FxScratch,
 ) {
@@ -596,7 +794,7 @@ pub(crate) fn draw_layers_on<C: FxCanvas>(
         f,
         layers,
         occluders,
-        |l| l.slot == slot && l.blend == blend,
+        |l| l.slot == slot && l.blend == blend && knock.takes(l),
         |b| dirty.is_none_or(|d| d.get(b).copied().unwrap_or(false)),
         slicer,
         &mut sink,
@@ -1322,13 +1520,12 @@ mod canvas_tests {
                     dirty,
                     &mut scratch,
                 );
-                draw_layers_on(
+                draw_picked_layers_on(
                     &mut window,
                     &f,
                     &layers,
                     &occluders,
-                    FxSlot::Over,
-                    blend,
+                    (FxSlot::Over, blend, Knock::Any),
                     dirty,
                     &mut scratch,
                 );

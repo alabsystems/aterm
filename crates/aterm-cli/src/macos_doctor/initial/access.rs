@@ -53,40 +53,55 @@ impl LanAnswer {
     }
 }
 
-/// The last answer a LAN look heard in this process, with its time (Unix seconds).
+/// The last answer a LAN look heard in this process, with its place in the order of answers
+/// ([`hear_answer`]).
 static HEARD: Mutex<Option<(LanAnswer, u64)>> = Mutex::new(None);
 
-/// The record, in aterm's doctor state, of the last answer a LAN look heard and when: a later
-/// launch reads Local Network from it, since a joined ALab Mac's launch looks for nothing and a
-/// Mac with no ALab vault on its LAN hears no answer to a look.
+/// The record, in aterm's doctor state, of the last answer a LAN look heard: a later launch reads
+/// Local Network from it, since a joined ALab Mac's launch looks for nothing and a Mac with no
+/// ALab vault on its LAN hears no answer to a look.
 const KEPT: &str = "local-network.json";
 
 const KEPT_LOCK: &str = "local-network.lock";
 
-/// Note what a look at the LAN heard, now: for this process, and kept for later launches unless
-/// the record holds a later answer. A record that cannot be written leaves later launches what
-/// they read before; this process still reads its own answer. The newer answer always wins, so an
-/// old refusal never outlasts a later step or look.
+/// Note what a look at the LAN heard, now: for this process, and kept for later launches. Each
+/// answer takes the next number of one sequence that this process and the record share
+/// ([`keep_answer`]), so the answer heard last always wins, whatever the Mac's clock said when
+/// either was heard: an old refusal never outlasts a later step or look. A record that cannot be
+/// written leaves later launches what they read before; this process still reads its own answer.
 pub(super) fn lan_answered(answer: LanAnswer) {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    hear_answer(&HEARD, answer, at);
-    let _kept = super::state_root().and_then(|root| keep_answer(&root, answer, at));
+    match super::state_root() {
+        Ok(root) => {
+            let _kept = keep_answer(&root, &HEARD, answer, at);
+        }
+        Err(_) => {
+            hear_answer(&HEARD, answer, 0);
+        }
+    }
 }
 
-fn hear_answer(heard: &Mutex<Option<(LanAnswer, u64)>>, answer: LanAnswer, at: u64) {
-    if let Ok(mut heard) = heard.lock()
-        && heard.is_none_or(|(_, previous)| at >= previous)
-    {
-        *heard = Some((answer, at));
-    }
+/// Note `answer` as this process's last, numbered after both the last answer it heard and
+/// `kept`, the number of the answer the record keeps: its number.
+fn hear_answer(heard: &Mutex<Option<(LanAnswer, u64)>>, answer: LanAnswer, kept: u64) -> u64 {
+    let Ok(mut heard) = heard.lock() else {
+        return kept.saturating_add(1);
+    };
+    let sequence = heard
+        .map_or(0, |(_, last)| last)
+        .max(kept)
+        .saturating_add(1);
+    *heard = Some((answer, sequence));
+    sequence
 }
 
 /// What the window's access step for Local Network says of the switch, heard now
 /// ([`lan_answered`]): its trigger raised macOS's question ([`LanAnswer::Asked`]), or it read the
-/// grant on ([`LanAnswer::Reached`]). The access record keeps no time, so this is what lets a
-/// step outrank an older answer kept from an earlier launch. Any other step says nothing of it.
+/// grant on ([`LanAnswer::Reached`]). The access record keeps no order of its own, so this is what
+/// lets a step outrank an older answer kept from an earlier launch. Any other step says nothing of
+/// it.
 pub(super) fn local_network_step(outcome: AccessOutcome) {
     if let Some(answer) = step_answer(outcome) {
         lan_answered(answer);
@@ -110,40 +125,52 @@ pub(super) fn lan_asked_before() -> bool {
     last_answer().is_some()
 }
 
-/// Keep `answer`, heard at `at`, in `root` unless the record there holds a later one.
-fn keep_answer(root: &Path, answer: LanAnswer, at: u64) -> Result<(), String> {
-    keep_answer_with(root, answer, at, || {})
+/// Note `answer`, heard at `at` (Unix seconds, kept for an older aterm, which orders answers by
+/// it), in `heard` and in the record in `root`, under the record's lock: numbered after the
+/// answer the record keeps and the last one `heard` holds, so every later answer, in any process,
+/// outranks it. Its number is noted in `heard` even when the record cannot be written.
+fn keep_answer(
+    root: &Path,
+    heard: &Mutex<Option<(LanAnswer, u64)>>,
+    answer: LanAnswer,
+    at: u64,
+) -> Result<u64, String> {
+    keep_answer_with(root, heard, answer, at, || {})
 }
 
 fn keep_answer_with(
     root: &Path,
+    heard: &Mutex<Option<(LanAnswer, u64)>>,
     answer: LanAnswer,
     at: u64,
     after_read: impl FnOnce(),
-) -> Result<(), String> {
-    let _lock = HeldLock::take_named(root, KEPT_LOCK)?;
-    if kept_answer(root).is_some_and(|(_, kept)| kept > at) {
-        return Ok(());
-    }
+) -> Result<u64, String> {
+    let lock = HeldLock::take_named(root, KEPT_LOCK);
+    let kept = kept_answer(root).map_or(0, |(_, sequence)| sequence);
+    let sequence = hear_answer(heard, answer, kept);
+    let _lock = lock?;
     after_read();
     super::write_json(
         &root.join(KEPT),
-        &json!({"profile":super::PROFILE,"answer":answer.word(),"at":at}),
-    )
+        &json!({"profile":super::PROFILE,"answer":answer.word(),"at":at,"sequence":sequence}),
+    )?;
+    Ok(sequence)
 }
 
-/// The answer kept in `root`, and when it was heard; `None` when there is none, or the record
-/// cannot be read (a reading that says nothing, never a guess).
+/// The answer kept in `root`, and its number in the order of answers (an older aterm's record,
+/// which keeps only the time it was heard, reads as the first); `None` when there is none, or the
+/// record cannot be read (a reading that says nothing, never a guess).
 fn kept_answer(root: &Path) -> Option<(LanAnswer, u64)> {
     let bytes = std::fs::read(root.join(KEPT)).ok()?;
     let value: Value = aterm_json::from_slice(&bytes).ok()?;
     if value["profile"].as_str() != Some(super::PROFILE) {
         return None;
     }
-    Some((
-        LanAnswer::of(value["answer"].as_str()?)?,
-        value["at"].as_u64()?,
-    ))
+    let sequence = match value.get("sequence") {
+        None => 0,
+        Some(sequence) => sequence.as_u64()?,
+    };
+    Some((LanAnswer::of(value["answer"].as_str()?)?, sequence))
 }
 
 /// The later of this process's last answer and the one kept from earlier launches.
@@ -153,12 +180,13 @@ fn last_answer() -> Option<LanAnswer> {
     latest([heard, kept])
 }
 
-/// The answer heard last of `answers`, each with when it was heard.
+/// The answer heard last of `answers`, each with its number in the order of answers: the higher
+/// number, and of two alike the kept one (the second), which another process may have written.
 fn latest(answers: [Option<(LanAnswer, u64)>; 2]) -> Option<LanAnswer> {
     answers
         .into_iter()
         .flatten()
-        .max_by_key(|(_, at)| *at)
+        .max_by_key(|(_, sequence)| *sequence)
         .map(|(answer, _)| answer)
 }
 
@@ -953,37 +981,53 @@ mod tests {
         );
     }
 
+    /// Keep `answer` from a process of its own, which has heard nothing before: what a later
+    /// launch's look does.
+    fn kept_by_another(root: &Path, answer: LanAnswer, at: u64) -> u64 {
+        keep_answer(root, &Mutex::new(None), answer, at).unwrap()
+    }
+
     #[test]
-    fn a_kept_answer_is_read_back_and_only_a_later_one_replaces_it() {
+    fn a_kept_answer_is_read_back_and_every_later_one_replaces_it() {
         let root = aterm_tempfile::tempdir().unwrap();
         assert_eq!(kept_answer(root.path()), None, "nothing kept yet");
-        keep_answer(root.path(), LanAnswer::Reached, 100).unwrap();
-        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Reached, 100)));
-        keep_answer(root.path(), LanAnswer::Refused, 50).unwrap();
-        assert_eq!(
-            kept_answer(root.path()),
-            Some((LanAnswer::Reached, 100)),
-            "an earlier answer never replaces a later one"
-        );
-        keep_answer(root.path(), LanAnswer::Refused, 200).unwrap();
-        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Refused, 200)));
+        let first = kept_by_another(root.path(), LanAnswer::Reached, 100);
+        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Reached, first)));
+        // Heard later, whatever the clock said then.
+        let second = kept_by_another(root.path(), LanAnswer::Refused, 50);
+        assert!(second > first);
+        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Refused, second)));
+        // An older aterm's record keeps only its time: it reads as the first answer, and the
+        // next one this aterm hears outranks it.
+        super::super::write_json(
+            &root.path().join(KEPT),
+            &json!({"profile":super::super::PROFILE,"answer":"reached","at":u64::MAX}),
+        )
+        .unwrap();
+        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Reached, 0)));
+        let after = kept_by_another(root.path(), LanAnswer::Refused, 1);
+        assert_eq!(kept_answer(root.path()), Some((LanAnswer::Refused, after)));
         std::fs::write(root.path().join(KEPT), b"{").unwrap();
         assert_eq!(
             kept_answer(root.path()),
             None,
             "an unreadable record says nothing"
         );
-        // This process's answer and the kept one: the later decides.
+        // This process's answer and the kept one: the later decides, and of two alike the kept.
         let reached = Some((LanAnswer::Reached, 10));
         let refused = Some((LanAnswer::Refused, 20));
         assert_eq!(latest([reached, refused]), Some(LanAnswer::Refused));
         assert_eq!(latest([refused, reached]), Some(LanAnswer::Refused));
         assert_eq!(latest([None, reached]), Some(LanAnswer::Reached));
+        assert_eq!(
+            latest([Some((LanAnswer::Reached, 20)), refused]),
+            Some(LanAnswer::Refused)
+        );
         assert_eq!(latest([None, None]), None);
     }
 
     /// A refusal kept long ago (heard at a launch, or carried over from an earlier install) gives
-    /// way to the window's later step, which is kept with its time ([`local_network_step`]): its
+    /// way to the window's later step, which is kept after it ([`local_network_step`]): its
     /// trigger raised macOS's question, so the row reads asked, never Off for good; the grant it
     /// read on, or a later look that reached the LAN, reads On; and a later look macOS refused
     /// reads Off, the person's new answer. No other step says anything of the switch.
@@ -997,16 +1041,14 @@ mod tests {
                 &[(Access::LocalNetwork, step)],
             )
         };
-        keep_answer(root.path(), LanAnswer::Refused, 1).unwrap();
+        kept_by_another(root.path(), LanAnswer::Refused, 1);
         assert_eq!(read(Triggered), Lan::Off, "the refusal, until a step");
-        keep_answer(root.path(), step_answer(Triggered).unwrap(), 2).unwrap();
+        kept_by_another(root.path(), step_answer(Triggered).unwrap(), 2);
         assert_eq!(read(Triggered), Lan::Asked, "asked again, no nag");
-        keep_answer(root.path(), step_answer(Granted).unwrap(), 3).unwrap();
+        kept_by_another(root.path(), step_answer(Granted).unwrap(), 3);
         assert_eq!(read(Granted), Lan::On);
-        keep_answer(root.path(), LanAnswer::Refused, 4).unwrap();
+        kept_by_another(root.path(), LanAnswer::Refused, 4);
         assert_eq!(read(Granted), Lan::Off, "a later refusal is the person's");
-        keep_answer(root.path(), step_answer(Triggered).unwrap(), 3).unwrap();
-        assert_eq!(read(Triggered), Lan::Off, "an older step replaces nothing");
         assert_eq!(step_answer(Handed), None);
         assert_eq!(step_answer(Declined), None);
     }
@@ -1023,6 +1065,9 @@ mod tests {
         assert_eq!(seen.standing, Standing::InPlace);
     }
 
+    /// Two processes keep an answer at once: the record's lock orders them, and the one that
+    /// takes it second is the later answer, which every reader then reads, this process's own
+    /// earlier one included.
     #[test]
     fn lan_answers_keep_the_latest_fact_across_overlapping_writers() {
         use std::sync::mpsc;
@@ -1040,16 +1085,17 @@ mod tests {
             if lock.is_some() {
                 // No writer lock excludes this newer publication from the gap.
                 drop(lock);
-                keep_answer(&path, LanAnswer::Refused, 200).unwrap();
+                kept_by_another(&path, LanAnswer::Refused, 1);
                 entered.send(()).unwrap();
             } else {
                 // The guarded writer must finish first. Then the actual newer
                 // writer waits for that short record lock and publishes last.
                 entered.send(()).unwrap();
-                keep_answer(&path, LanAnswer::Refused, 200).unwrap();
+                kept_by_another(&path, LanAnswer::Refused, 1);
             }
         });
-        keep_answer_with(root.path(), LanAnswer::Reached, 100, || {
+        let heard = Mutex::new(None);
+        keep_answer_with(root.path(), &heard, LanAnswer::Reached, 100, || {
             go.send(()).unwrap();
             entering
                 .recv_timeout(Duration::from_secs(60))
@@ -1058,32 +1104,72 @@ mod tests {
         .unwrap();
         newer.join().expect("the newer answer was kept");
         let kept = kept_answer(root.path());
-        assert_eq!(
-            kept,
-            Some((LanAnswer::Refused, 200)),
-            "a delayed older publication must not replace the newer answer"
+        assert!(
+            kept.is_some_and(|(answer, _)| answer == LanAnswer::Refused),
+            "a delayed older publication must not replace the newer answer: {kept:?}"
         );
-        assert_lan_refused(latest([Some((LanAnswer::Reached, 100)), kept]));
+        assert_lan_refused(latest([*heard.lock().unwrap(), kept]));
     }
 
+    /// An answer kept while the Mac's clock ran ahead (a year, fixed later by NTP or by hand)
+    /// never outranks a look made after it: the order of answers is their sequence, never the
+    /// clock. The person's later Allow reads On, in this process and at a later launch.
+    #[test]
+    fn an_answer_kept_under_a_fast_clock_never_outranks_a_later_look() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Refused while the clock read a year ahead.
+        kept_by_another(root.path(), LanAnswer::Refused, now + 365 * 24 * 3600);
+        // The clock is corrected; the person allows Local Network and a look reaches the LAN.
+        let heard = Mutex::new(None);
+        keep_answer(root.path(), &heard, LanAnswer::Reached, now).unwrap();
+        let kept = kept_answer(root.path());
+        assert_eq!(
+            latest([*heard.lock().unwrap(), kept]),
+            Some(LanAnswer::Reached),
+            "kept {kept:?}"
+        );
+        assert_eq!(
+            latest([None, kept]),
+            Some(LanAnswer::Reached),
+            "a later launch"
+        );
+    }
+
+    /// A record that cannot be written leaves later launches what they read before, and this
+    /// process still reads its own answers in the order it heard them.
     #[test]
     fn lan_answers_keep_the_latest_memory_fact_when_persistence_fails() {
         let root = aterm_tempfile::tempdir().unwrap();
-        // A destination directory makes the actual atomic replacement fail.
-        std::fs::create_dir(root.path().join(KEPT)).unwrap();
+        let earlier = kept_by_another(root.path(), LanAnswer::Reached, 1);
         let heard = Mutex::new(None);
-        hear_answer(&heard, LanAnswer::Refused, 200);
-        assert!(keep_answer(root.path(), LanAnswer::Refused, 200).is_err());
-        // This call captured its time earlier, but was delayed before taking
-        // the in-memory mutex. Its failed publication cannot supply a fallback.
-        hear_answer(&heard, LanAnswer::Reached, 100);
-        assert!(keep_answer(root.path(), LanAnswer::Reached, 100).is_err());
+        // A destination directory makes the actual atomic replacement fail.
+        std::fs::remove_file(root.path().join(KEPT)).unwrap();
+        std::fs::create_dir(root.path().join(KEPT)).unwrap();
+        assert!(keep_answer(root.path(), &heard, LanAnswer::Refused, 2).is_err());
         assert_eq!(kept_answer(root.path()), None);
         assert_lan_refused(latest([*heard.lock().unwrap(), kept_answer(root.path())]));
+        let refused = heard.lock().unwrap().unwrap().1;
+        assert!(refused > 0);
 
-        hear_answer(&heard, LanAnswer::Reached, 300);
+        assert!(keep_answer(root.path(), &heard, LanAnswer::Reached, 3).is_err());
         assert_eq!(
             latest([*heard.lock().unwrap(), None]),
+            Some(LanAnswer::Reached)
+        );
+        // The record readable again with what it kept before: this process's later answer
+        // still outranks it.
+        std::fs::remove_dir(root.path().join(KEPT)).unwrap();
+        super::super::write_json(
+            &root.path().join(KEPT),
+            &json!({"profile":super::super::PROFILE,"answer":"refused","at":1,"sequence":earlier}),
+        )
+        .unwrap();
+        assert_eq!(
+            latest([*heard.lock().unwrap(), kept_answer(root.path())]),
             Some(LanAnswer::Reached)
         );
     }

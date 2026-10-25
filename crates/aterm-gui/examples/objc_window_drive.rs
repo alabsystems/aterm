@@ -35,7 +35,7 @@ mod macos {
     };
     use aterm_window::application::ApplicationHandler;
     use aterm_window::event::WindowEvent;
-    use aterm_window::event_loop::ActiveEventLoop;
+    use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
     use aterm_window::platform::macos::MonitorHandleExtMacOS;
     use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use aterm_window::window::{Theme, Window, WindowId};
@@ -398,6 +398,8 @@ mod macos {
 
     struct Driver {
         window: Option<Window>,
+        proxy: Option<EventLoopProxy<u8>>,
+        proxy_events: Vec<u8>,
         report: Report,
         resized: usize,
         moved: usize,
@@ -444,7 +446,7 @@ mod macos {
         }
     }
 
-    impl ApplicationHandler for Driver {
+    impl ApplicationHandler<u8> for Driver {
         fn resumed(&mut self, el: &ActiveEventLoop) {
             if self.window.is_some() {
                 return;
@@ -481,8 +483,17 @@ mod macos {
             }
         }
 
+        fn user_event(&mut self, _el: &ActiveEventLoop, event: u8) {
+            self.proxy_events.push(event);
+        }
+
         fn about_to_wait(&mut self, el: &ActiveEventLoop) {
             if self.done {
+                return;
+            }
+            if self.stage == 15 && self.proxy_events.len() < 2 {
+                // The survivor's real send must wake and drain the loop. The
+                // outer one-minute budget detects a missing delivery.
                 return;
             }
             let Some((delegate, ns)) = self.pair() else {
@@ -509,7 +520,20 @@ mod macos {
                 12 => self.stage_default_menu(),
                 13 => self.stage_monitors(),
                 14 => self.stage_send_event_swizzle(),
+                15 => {
+                    if !self.stage_proxy_lifetime() {
+                        self.done = true;
+                        el.exit();
+                    }
+                }
                 _ => {
+                    self.report.check(
+                        self.proxy_events == [17, 29],
+                        &format!(
+                            "the surviving proxy delivers each event once in order: {:?}",
+                            self.proxy_events
+                        ),
+                    );
                     self.done = true;
                     el.exit();
                 }
@@ -518,6 +542,20 @@ mod macos {
     }
 
     impl Driver {
+        fn stage_proxy_lifetime(&mut self) -> bool {
+            println!("\n[15] event proxy — a clone outlives its original and another clone");
+            let original = self.proxy.take().expect("the driver owns a proxy");
+            let intermediate = original.clone();
+            let survivor = intermediate.clone();
+            drop(original);
+            drop(intermediate);
+            let queued = survivor.send_event(17).is_ok() && survivor.send_event(29).is_ok();
+            self.report
+                .check(queued, "the surviving proxy accepts both real sends");
+            self.proxy = Some(survivor);
+            queued
+        }
+
         fn w(&self) -> &Window {
             self.window.as_ref().expect("a window")
         }
@@ -1242,7 +1280,7 @@ mod macos {
 
     /// Drive the window loop through every verification stage and return an exit code.
     pub fn run() -> i32 {
-        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
+        let mut el = match aterm_gui::quiet_driver_event_loop_builder::<u8>().build() {
             Ok(el) => el,
             Err(e) => {
                 eprintln!("objc-window-drive: NOT RUN — no event loop: {e}");
@@ -1251,6 +1289,8 @@ mod macos {
         };
         let mut driver = Driver {
             window: None,
+            proxy: Some(el.create_proxy()),
+            proxy_events: Vec::new(),
             report: Report::default(),
             resized: 0,
             moved: 0,

@@ -32,6 +32,9 @@ pub struct Args {
     /// every cell no fleet machine hosts.
     pub cells: Vec<String>,
     pub no_windows: bool,
+    /// `--admit now|wait`: whether the run waits for room for the disk it will write and its
+    /// timed stages for a quiet machine (the default), or starts at once, saying what it lacks.
+    pub admit: aterm_capacity::Admit,
     pub test_threads: Option<NonZeroU32>,
     pub test_jobs: Option<NonZeroU32>,
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
@@ -106,6 +109,13 @@ where
             "--fix" => a.fix = true,
             "--cell" => a.cells.push(value("--cell")?),
             "--no-windows" => a.no_windows = true,
+            "--admit" => {
+                let v = value("--admit")?;
+                match aterm_capacity::Admit::parse(&v) {
+                    Some(mode) => a.admit = mode,
+                    None => return usage(format!("--admit takes now or wait, not `{v}`")),
+                }
+            }
             "--test-threads" => a.test_threads = Some(count("--test-threads", &value(&flag)?)?),
             "--test-jobs" => a.test_jobs = Some(count("--test-jobs", &value(&flag)?)?),
             "--timeout" => {
@@ -280,6 +290,12 @@ Options:
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --no-windows        skip each stage that opens a window (a named skip)
+      --admit <wait|now>  wait for room for the disk the run will write, and
+                          for a quiet machine before the first timed stage,
+                          held through the last (default wait, saying why
+                          once a minute); now starts at once, saying what
+                          it lacks, and a starved take is refused; the
+                          Linux lane's lab is given it too
       --test-threads <n>  RUST_TEST_THREADS for every test binary
       --test-jobs <n>     test binaries at once (default 8)
       --timeout <s|off>   hang ceiling for each child (default 3h)
@@ -347,6 +363,7 @@ mod tests {
             &["-p", "--all"],
             &["--test-jobs", "0"],
             &["--timeout", "45m"],
+            &["--admit", "later"],
             &["list", "fmt"],
             // --fix rewrites sources, so it runs alone, and only with fmt.
             &["lint", "--fix"],
@@ -389,9 +406,24 @@ mod tests {
         assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
         assert!(a.no_windows);
         assert_eq!(a.base.as_deref(), Some("main"));
+        assert_eq!(a.admit, aterm_capacity::Admit::Wait, "wait by default");
+        assert_eq!(
+            ok(&["measure", "--admit", "now"]).admit,
+            aterm_capacity::Admit::Now
+        );
+        assert_eq!(
+            ok(&["measure", "--admit=wait"]).admit,
+            aterm_capacity::Admit::Wait
+        );
+        assert!(parse(["measure", "--admit", "soon"]).is_err());
         assert_eq!(
             ok(&["--timeout", "90"]).timeout,
             Some(Some(Duration::from_secs(90)))
+        );
+        assert_eq!(ok(&["test"]).admit, atpkg::admit_disk::Admit::Wait);
+        assert_eq!(
+            ok(&["test", "--admit", "now"]).admit,
+            atpkg::admit_disk::Admit::Now
         );
     }
 }

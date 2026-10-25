@@ -191,6 +191,7 @@ fn the_grammar_parses_what_the_help_text_advertises() {
                 label: "work-2".to_string(),
                 class: Class::Dedicated,
                 email: None,
+                identity_email: None,
                 browser: None,
             }),
         ),
@@ -200,6 +201,7 @@ fn the_grammar_parses_what_the_help_text_advertises() {
                 label: "pool-a".to_string(),
                 class: Class::Shared,
                 email: None,
+                identity_email: None,
                 browser: None,
             }),
         ),
@@ -3634,6 +3636,7 @@ fn add(label: &str, class: Class) -> AccountsCmd {
         label: label.to_string(),
         class,
         email: None,
+        identity_email: None,
         browser: None,
     }
 }
@@ -4996,13 +4999,15 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
 
     for json in [false, true] {
         let (code, out, err) = acc_quiet(AccountsCmd::Report { json }, &env);
-        assert_eq!(code, exit(0), "{err}");
+        assert_eq!(code, exit(1), "{err}");
         assert!(err.contains("schema 2"), "{err}");
-        assert!(out.contains("main"), "the roster is still listed: {out}");
         if json {
             let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
-            assert_eq!(doc.get("active"), Some(&Value::Null), "{out}");
-            assert_eq!(doc.get("pinned"), Some(&Value::from(false)), "{out}");
+            assert!(doc["refused"].as_str().unwrap().contains("schema 2"));
+            assert!(doc["accounts"].as_array().unwrap().is_empty());
+            assert!(doc.get("next").is_none());
+        } else {
+            assert!(out.is_empty());
         }
     }
     assert_eq!(
@@ -5017,10 +5022,11 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
         },
         &env,
     );
-    assert_eq!(code, exit(0), "{err}");
-    let (state, note) = store.load(env.now).expect("this build's state now");
-    assert_eq!(note, None);
-    assert_eq!(state.active.as_deref(), Some("work-2"));
+    assert_eq!(code, exit(1), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(store.state_file()).unwrap(),
+        &newer[..newer.len() / 2]
+    );
 }
 
 /// `accounts add` on a roster that is a symlink (a dotfiles checkout) writes through the link:
@@ -7421,3 +7427,18 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
 
 #[path = "cli_signin_tests.rs"]
 mod signin;
+
+#[path = "cli_identity_tests.rs"]
+mod identity;
+
+#[path = "cli_state_tests.rs"]
+mod state_read;
+
+#[path = "cli_retention_tests.rs"]
+mod retention;
+
+#[path = "cli_admission_tests.rs"]
+mod admission;
+
+#[path = "cli_signin_lock_tests.rs"]
+mod signin_lock;

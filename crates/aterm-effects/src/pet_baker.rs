@@ -678,12 +678,20 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
     /// Drop the least-recently-used slot, lowest index breaking ties, so eviction is a
     /// deterministic function of the request sequence.
     fn evict_lru(&mut self) -> Option<Tile> {
-        let victim = self
-            .slots
-            .iter()
-            .enumerate()
-            .min_by_key(|(idx, s)| (s.last_used, *idx))
-            .map(|(idx, _)| idx)?;
+        let slots = self.slots.as_slice();
+        if slots.is_empty() {
+            return None;
+        }
+        let mut victim = 0;
+        let mut best_used = slots[0].last_used;
+        let mut idx = 1;
+        while idx < slots.len() {
+            if slots[idx].last_used < best_used {
+                victim = idx;
+                best_used = slots[idx].last_used;
+            }
+            idx += 1;
+        }
         let evicted = self.slots.remove(victim);
         self.bytes -= evicted.tile.pixels().len();
         Some(evicted.tile)

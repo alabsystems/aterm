@@ -261,7 +261,7 @@ type Case = (&'static str, fn(&mut App, WindowId, u64), SlashRefusal);
 
 #[test]
 fn each_guard_types_nothing_and_names_why() {
-    let cases: [Case; 13] = [
+    let cases: [Case; 14] = [
         (
             "a draft",
             |app, _, s| echo(app, s, CARET, "hello"),
@@ -343,6 +343,17 @@ fn each_guard_types_nothing_and_names_why() {
                 draw_claude(app, s, MANUAL);
                 let term = app.pool.get(s).expect("session").term.clone();
                 crate::term_lock(&term).scroll_display(3);
+            },
+            SlashRefusal::Covered,
+        ),
+        (
+            "a rewound view",
+            |app, _, s| {
+                assert_eq!(s, 0, "fixture: the recording helpers drive session 0");
+                crate::rewind::tests::start_recording(app);
+                let _ = crate::rewind::tests::slice(app, b"\x1b[0m");
+                app.rewind_open(s, crate::rewind::Target::Latest, None)
+                    .expect("open");
             },
             SlashRefusal::Covered,
         ),
@@ -1220,6 +1231,32 @@ fn one_aterm_input_per_session() {
     );
     app.toggle_claude_light(wid, session, Light::Mode);
     assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
+}
+
+/// A light pressed on a rewound pane is refused and begins no toggle, since its press could not reach the program.
+#[test]
+fn a_light_on_a_rewound_pane_is_refused_and_begins_no_toggle() {
+    let (mut app, wid, session, mut reader) = idle();
+    assert_eq!(session, 0, "fixture: the recording helpers drive session 0");
+    crate::rewind::tests::start_recording(&app);
+    let _ = crate::rewind::tests::slice(&app, b"\x1b[0m");
+    app.rewind_open(session, crate::rewind::Target::Latest, None)
+        .expect("open");
+    app.toggle_claude_light(wid, session, Light::Mode);
+    assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
+    let s = &app.windows[&wid].claude_lights.sessions[&session];
+    assert!(s.pending.is_none(), "no toggle began");
+    assert!(
+        matches!(s.refused, Some((Light::Mode, super::Refusal::NotShown, _))),
+        "refused as not on screen"
+    );
+    assert!(app.rewind_close(session));
+    app.toggle_claude_light(wid, session, Light::Mode);
+    assert_eq!(
+        pty(&mut reader, 3),
+        lights::SHIFT_TAB,
+        "CONTROL: live, one press"
+    );
 }
 
 #[test]

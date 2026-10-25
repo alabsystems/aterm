@@ -37,6 +37,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         weekly_gap: None,
         cli: None,
         accounts: Vec::new(),
+        accounts_refused: None,
         auto_rotate: true,
         off,
         cwd: side.then(|| PathBuf::from("/Users//someone/aterm")),
@@ -1103,7 +1104,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     )
     .unwrap();
     let (none, _) =
-        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW);
+        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW).unwrap();
     assert!(none.is_empty(), "no Kimi roster, no rows: {none:?}");
     let login = home.join(".aterm/logins/kimi/kimi-1");
     std::fs::write(
@@ -1116,9 +1117,43 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     )
     .unwrap();
     let (listed, _) =
-        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW);
+        super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &state, &home), (None, None), NOW).unwrap();
     let labels: Vec<&str> = listed.iter().map(|row| row.account.as_str()).collect();
     assert_eq!(labels, ["kimi-1"], "Kimi's roster alone: {listed:?}");
+
+    for damaged in ["state", "logins"] {
+        let dir = root.join(damaged);
+        let store = aterm_agent::harness::accounts::Store::at_for(&dir, Cli::Kimi, &home);
+        store.ensure().unwrap();
+        let path = if damaged == "state" {
+            store.state_file()
+        } else {
+            store.logins_file()
+        };
+        std::fs::write(&path, "{").unwrap();
+        let why = super::pool_menu_rows(Cli::Kimi, (&aterm_toml, &dir, &home), (None, None), NOW)
+            .unwrap_err();
+        let refused = FactMenuFacts {
+            cli: Some(Cli::Kimi),
+            accounts_refused: Some(why),
+            ..menu_facts(FactMask::default(), true)
+        };
+        let menu = shown(&rows(Fact::Account, &refused));
+        assert!(
+            menu.iter()
+                .any(|row| row.contains("Account state unavailable:")),
+            "{menu:?}"
+        );
+        assert!(
+            !menu.iter().any(|row| row.contains("Auto-rotate")),
+            "{menu:?}"
+        );
+        assert!(
+            !menu.iter().any(|row| row.contains("accounts add")),
+            "{menu:?}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"{");
+    }
 
     let empty = FactMenuFacts {
         title: "Accounts \u{b7} tab 1".into(),

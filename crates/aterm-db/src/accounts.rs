@@ -10,6 +10,8 @@ use aterm_json::Value;
 
 #[cfg(unix)]
 pub mod proposals;
+#[cfg(unix)]
+mod references;
 
 /// Validate the closed account schema, rejecting unknown credential-bearing fields.
 pub fn validate(value: &Value) -> Result<()> {

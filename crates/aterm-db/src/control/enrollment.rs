@@ -56,6 +56,8 @@ pub(super) fn client(
 }
 
 #[cfg(test)]
+mod preflight_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 #[cfg_attr(
@@ -114,6 +116,78 @@ pub(crate) mod tests;
         project = "aterm_db::control::enrollment::tests::enrollment_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "Eligible",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "NoEvidence",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "ExcludedBefore",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "RetiredBefore",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "ForkBefore",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "ExcludedDuring",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "RetiredDuring",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "ForkDuring",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbEnrollmentGate",
+        action = "InvalidProof",
+        project = "aterm_db::control::enrollment::preflight_tests::gate_transition"
+    )
+)]
 pub(super) fn serve(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
@@ -136,6 +210,15 @@ pub(super) fn serve(
         .paths
         .as_ref()
         .ok_or_else(|| Error::new("this peer does not serve enrollment"))?;
+    // A challenge is work for an eligible candidate, never an admission grant.
+    // Drop all local observations and locks before interacting with the peer.
+    {
+        let (admin, bootstrap) = local_authority(endpoint, paths)?;
+        let journal = Journal::open_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
+        admin
+            .check_commons_enrollment(&bootstrap, &journal, request.binding())
+            .map_err(failure)?;
+    }
     send_frame(stream, &endpoint.hello)?;
     let (mut pending, challenge) =
         Pending::issue(&request, endpoint.trust.network, endpoint.trust.authority)
@@ -145,15 +228,7 @@ pub(super) fn serve(
     let possession = pending.verify(&response).map_err(failure)?;
     // All cache/state/custody reads finish before taking the journal lock.
     // No vault-server request or peer I/O occurs while that lock is held.
-    let admin = client::admin_cached(paths).map_err(failure)?;
-    let bootstrap = Bootstrap::cached(paths)
-        .map_err(failure)?
-        .ok_or_else(|| Error::new("enrollment authority lost its local root"))?;
-    if bootstrap.trust() != endpoint.trust
-        || bootstrap.request().map_err(failure)?.binding().actor() != endpoint.actor
-    {
-        return Err(Error::new("enrollment authority custody changed"));
-    }
+    let (admin, bootstrap) = local_authority(endpoint, paths)?;
     let wire = {
         let mut journal = Journal::open_existing(&endpoint.dir, endpoint.trust).map_err(failure)?;
         admin
@@ -168,4 +243,20 @@ pub(super) fn serve(
         sent: 1,
         ..Report::default()
     })
+}
+
+fn local_authority(
+    endpoint: &Endpoint,
+    paths: &client::Paths,
+) -> Result<(client::Admin, Bootstrap)> {
+    let admin = client::admin_cached(paths).map_err(failure)?;
+    let bootstrap = Bootstrap::cached(paths)
+        .map_err(failure)?
+        .ok_or_else(|| Error::new("enrollment authority lost its local root"))?;
+    if bootstrap.trust() != endpoint.trust
+        || bootstrap.request().map_err(failure)?.binding().actor() != endpoint.actor
+    {
+        return Err(Error::new("enrollment authority custody changed"));
+    }
+    Ok((admin, bootstrap))
 }

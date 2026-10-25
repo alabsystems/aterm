@@ -302,6 +302,16 @@ impl Access {
     pub fn members(&self) -> &[Member] {
         &self.members
     }
+    /// Validate the prospective roster's capacity and device identity uniqueness.
+    /// This grants no membership and carries no certificate or key outward.
+    pub(crate) fn check_addition(&self, binding: &Binding, role: Role) -> Result<()> {
+        let mut members = self.members.clone();
+        members.push(Member {
+            binding: binding.clone(),
+            role,
+        });
+        validate_members(self.trust.network, self.trust.authority, &members)
+    }
     pub fn local(&self) -> &Member {
         &self.members[self.local]
     }

@@ -274,6 +274,16 @@ fn line(l: &Launch, via: Via, keeper: &Path, sock: &Path) -> Vec<String> {
     line
 }
 
+/// A windowed `l`'s quiet claim, taken before it starts: a window's frames and input are timed, so
+/// it starts alone among quiet claims on a quiet machine ([`crate::admission`]). A headless
+/// instance takes none.
+fn windowed_quiet(l: &Launch) -> Option<aterm_capacity::Claim> {
+    if l.headless {
+        return None;
+    }
+    crate::admission::quiet(&format!("a window of {}", l.aterm.display()))
+}
+
 /// A running private instance.
 pub struct Instance {
     child: Proc,
@@ -289,6 +299,8 @@ pub struct Instance {
     /// The instance's stdout and stderr.
     pub log: PathBuf,
     env: Vec<(String, String)>,
+    /// A windowed instance's quiet claim, held while it lives ([`crate::admission`]).
+    _quiet: Option<aterm_capacity::Claim>,
 }
 
 /// What one `ctl` client run said.
@@ -375,6 +387,7 @@ impl Instance {
     /// # Errors
     /// The log, the lifeline or the process could not be made.
     pub fn start(world: &World, l: Launch) -> Result<Instance, String> {
+        let quiet = windowed_quiet(&l);
         let log = world.dir.join("aterm.log");
         let out = std::fs::File::create(&log)
             .map_err(|e| format!("cannot create {}: {e}", log.display()))?;
@@ -407,6 +420,7 @@ impl Instance {
             sock: world.sock.clone(),
             log,
             env: world.env(),
+            _quiet: quiet,
         })
     }
 
@@ -419,6 +433,7 @@ impl Instance {
         if Via::of(&l, band)? == Via::Child {
             return Instance::start(world, l);
         }
+        let quiet = windowed_quiet(&l);
         let log = world.dir.join("aterm.log");
         std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
         let line = line(&l, Via::Job, &paths().exe, &world.sock);
@@ -433,6 +448,7 @@ impl Instance {
             sock: world.sock.clone(),
             log,
             env: world.env(),
+            _quiet: quiet,
         })
     }
 

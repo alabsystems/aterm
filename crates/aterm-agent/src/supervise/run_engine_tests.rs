@@ -3657,6 +3657,8 @@ struct TestHost {
     turns_ran: std::sync::atomic::AtomicUsize,
     taps: std::sync::atomic::AtomicUsize,
     busy_taps: std::sync::atomic::AtomicUsize,
+    /// Each turn break told ([`IdleHost::turn_break`]), its `theirs`.
+    breaks: std::sync::Mutex<Vec<Option<Guard>>>,
     types: AtomicBool,
     ends: AtomicBool,
     again: std::sync::atomic::AtomicUsize,
@@ -3824,6 +3826,9 @@ impl IdleHost for TestHost {
     }
     fn busy_tap(&self) {
         self.busy_taps.fetch_add(1, Ordering::SeqCst);
+    }
+    fn turn_break(&self, theirs: Option<Guard>) {
+        self.breaks.lock().unwrap().push(theirs);
     }
     fn limited(&self, open: bool) {
         self.limits.lock().unwrap().push(open);
@@ -7097,6 +7102,85 @@ fn the_host_reads_its_usage_tap_at_each_decided_idle_turn_end() {
         Stop::After(Duration::from_millis(300)),
     );
     assert_eq!(taps, 0, "a limit is no idle point");
+}
+
+/// The host is told each turn break the loop decides, whether or not it wants a step there:
+/// the window's worker makes the disk ask's seat-rule finding there (`disk-free@v1`), so a host
+/// that owes nothing is told as often as one that steps, and never mid-turn. It is told once per
+/// decision: the finding reads the session's records, and the wait's later looks at the same
+/// point, every 5 to 20 s for as long as the session rests, would find the same.
+#[test]
+fn the_host_is_told_each_turn_break_whether_or_not_it_wants_a_step_there() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |screens: Vec<Vec<String>>, wants: bool, stop: Stop| {
+        let host = Arc::new(TestHost::default());
+        host.owns.store(true, Ordering::SeqCst);
+        host.wants.store(wants, Ordering::SeqCst);
+        host.finds_nothing.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(screens);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.vanish_after = Some(0);
+        m.cursor_on_caret = true;
+        let _ = hosted_with_host(&mut m, &full, &host, stop, None);
+        let breaks = host.breaks.lock().unwrap().clone();
+        (breaks, host.steps.load(Ordering::SeqCst))
+    };
+    let both = || {
+        Stop::reached(
+            |h| h.turns_ran.load(Ordering::SeqCst) >= 1 && h.breaks.lock().unwrap().len() >= 2,
+            Duration::from_millis(300),
+        )
+    };
+    let turn = || vec![idle_screen(), busy_screen(), idle_screen()];
+    let (breaks, steps) = run(turn(), false, both());
+    assert!(
+        breaks.len() >= 2,
+        "both turn breaks, though the host wants no step: {breaks:?}"
+    );
+    assert!(
+        breaks.iter().all(Option::is_none),
+        "nobody else's session: {breaks:?}"
+    );
+    assert_eq!(steps, 0, "the gate held: no step was taken");
+    let (breaks, steps) = run(turn(), true, both());
+    assert!(breaks.len() >= 2, "{breaks:?}");
+    assert!(
+        steps >= 1,
+        "a host that wants a step is told too, and steps"
+    );
+    let (breaks, _) = run(
+        vec![busy_screen(), busy_screen()],
+        false,
+        Stop::After(Duration::from_millis(300)),
+    );
+    assert!(breaks.is_empty(), "no turn break mid-turn: {breaks:?}");
+    let host = Arc::new(TestHost::default());
+    host.owns.store(true, Ordering::SeqCst);
+    host.finds_nothing.store(true, Ordering::SeqCst);
+    let mut m = Mock::new(vec![idle_screen()]);
+    m.cursor_on_caret = true;
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let _ = hosted_with_host(
+        &mut m,
+        &full,
+        &host,
+        Stop::reached(
+            |h| h.asked.load(Ordering::SeqCst) >= 12,
+            Duration::from_millis(300),
+        ),
+        None,
+    );
+    let breaks = host.breaks.lock().unwrap().clone();
+    let asked = host.asked.load(Ordering::SeqCst);
+    assert!(asked >= 12, "the wait looked again and again: {asked}");
+    assert_eq!(
+        breaks.len(),
+        1,
+        "one decided turn break, told once though {asked} looks asked for a step: {breaks:?}"
+    );
 }
 
 #[test]

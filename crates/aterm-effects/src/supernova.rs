@@ -562,7 +562,7 @@ const fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
 const fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
     const ANG_SCALE: f32 = core::f32::consts::TAU / 4096.0;
     let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0xA24B_AED4_963E_E407));
-    let ang = (s % 4096) as f32 * ANG_SCALE + p * 1.8;
+    let ang = (s & 4095) as f32 * ANG_SCALE + p * 1.8;
     let r0 = env.r_max * (1.1 + (s >> 13 & 0x3) as f32 * 0.15);
     let r = r0 * (1.0 - p * p);
     let (sin_a, cos_a) = sin_cos_f32(ang);
@@ -755,8 +755,8 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
-                dx: ((x % cw) - half_cw).clamp(-6, 6) as i8,
-                dy: ((y % ch) - half_ch).clamp(-6, 6) as i8,
+                dx: ((x - col * cw) - half_cw).clamp(-6, 6) as i8,
+                dy: ((y - row * ch) - half_ch).clamp(-6, 6) as i8,
                 glyph: DecoGlyph::Dot,
                 blend: DecoBlend::Over,
                 color: hsv2rgb(hue, 1.0, 0.62),
@@ -918,7 +918,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 break;
             }
             let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let ang = (s % 4096) as f32 * ANG_SCALE;
+            let ang = (s & 4095) as f32 * ANG_SCALE;
             let speed = 0.5 + (s >> 13 & 0xff) as f32 * INV_255;
             let r = base_r * speed;
             let (sin_a, cos_a) = ang.sin_cos();
@@ -934,8 +934,8 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
-                dx: ((x % cw) - half_cw).clamp(-6, 6) as i8,
-                dy: ((y % ch) - half_ch).clamp(-6, 6) as i8,
+                dx: ((x - col * cw) - half_cw).clamp(-6, 6) as i8,
+                dy: ((y - row * ch) - half_ch).clamp(-6, 6) as i8,
                 glyph: if s & 1 == 0 {
                     DecoGlyph::Star4
                 } else {

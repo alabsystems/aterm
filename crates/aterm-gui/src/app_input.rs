@@ -4361,6 +4361,13 @@ impl App {
             && self.pool.is_rewound(session)
             && crate::rewind::withheld(&ev)
         {
+            if let InputEvent::MouseMove { row, col, side, .. } = ev
+                && let Some(ws) = self.windows.get_mut(&wid).filter(|ws| ws.selecting)
+            {
+                ws.last_mouse_side = side;
+                self.drag_selection(wid, row, col);
+                return InputOutcome::Ok;
+            }
             if crate::rewind::noticed(&ev) {
                 self.note_rewind_withheld(session);
             }
@@ -4537,7 +4544,7 @@ impl App {
                         term_cols,
                         ambiguous_width_double,
                         shell_executing,
-                        submit_prompt,
+                        front_prompt,
                     ) = {
                         let site = crate::metrics::TermWaitSite::Press;
                         let mut t = crate::term_lock_ui(&term, &ui_waiting, site);
@@ -4577,7 +4584,7 @@ impl App {
                         let ambiguous_width_double = t.modes().ambiguous_width_double;
                         let shell_executing =
                             typed_enter && crate::quit_safety::shell_executing(&t);
-                        let submit_prompt = line_terminator.then(|| t.prompt_in_front()).flatten();
+                        let front_prompt = t.prompt_in_front();
                         if crate::app_render::trace_spawn_enabled() && typed_forward.is_some() {
                             crate::logging::stderr_line!(
                                 "PRESS fwd={typed_forward:?} typed={typed:?} gen={}",
@@ -4593,9 +4600,10 @@ impl App {
                             term_cols,
                             ambiguous_width_double,
                             shell_executing,
-                            submit_prompt,
+                            front_prompt,
                         )
                     };
+                    let submit_prompt = front_prompt.filter(|_| line_terminator);
                     publish_release_relevance(session, kitty_owns_keyboard);
                     if (scrolled || cleared)
                         && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
@@ -4603,6 +4611,11 @@ impl App {
                         w.request_redraw();
                     }
                     if let Some(ws) = self.windows.get_mut(&wid) {
+                        if let Some(prompt) =
+                            front_prompt.filter(|_| line_terminator || keyed_enter)
+                        {
+                            ws.aos.note_submitted(session, prompt);
+                        }
                         let typed_press_supersede = typed_forward == Some(true)
                             && (!enter_like || (enter_like && !typed_enter && is_alt));
                         if inert_modifier {
@@ -4645,10 +4658,15 @@ impl App {
                                 })
                                 .unwrap_or(1)
                                 .max(1);
-                            if tty_swallows {
-                                crate::aos_host::privacy_detach(ws, crate::aos_host::NO_ECHO_KEY);
-                            } else if self.config.secure_keyboard_entry_or_default() {
-                                crate::aos_host::privacy_detach(ws, crate::aos_host::SECURE_ENTRY);
+                            let at_prompt =
+                                front_prompt.is_some_and(|p| ws.aos.prompt_open(session, p));
+                            if let Some(why) = crate::aos_host::key_privacy(
+                                tty_swallows,
+                                self.config.secure_keyboard_entry_or_default(),
+                                at_prompt,
+                                || sink.tty_echo(),
+                            ) {
+                                crate::aos_host::private_key(ws, why);
                             }
                             ws.fx.cursor_mut().momentum.on_key(
                                 input_now,
@@ -6010,6 +6028,20 @@ impl App {
             _ => None,
         };
         let tty_swallows = movement_capable && sink.tty_swallows_input();
+        // An unbracketed line break runs the line, so the prompt it lands at stops vouching for keys.
+        let submitted = match &ev {
+            InputEvent::Paste(text, _)
+                if !modes.bracketed_paste() && text.contains(['\r', '\n']) =>
+            {
+                term_lock(term).prompt_in_front()
+            }
+            _ => None,
+        };
+        if let Some(prompt) = submitted
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.aos.note_submitted(session, prompt);
+        }
         let ticket = insert
             .filter(|width| *width != InsertWidth::Cells(0))
             .filter(|_| !tty_swallows)
@@ -6882,6 +6914,11 @@ impl App {
         let Some((_, native_view)) = self.active_native_view(wid) else {
             return false;
         };
+
+        // Shortcuts may consume the key without a reducer event (Copy with
+        // no selection, or Paste with no clipboard text). It still reached
+        // the page and ends the startup review's automatic Apply.
+        self.interact_system_state(wid);
 
         if !self.keybindings.is_empty() || !self.key_sequences.is_empty() {
             let base = base_logical_key(ev);
@@ -9190,6 +9227,11 @@ impl App {
                     self.toggle_rewind(wid);
                 }
             }
+            MenuAction::ExportPaneHistory => {
+                if let Some(wid) = self.frontmost_window {
+                    self.export_pane_history(wid);
+                }
+            }
             MenuAction::CloseTab => {
                 // As Cmd-W; the window closes when its last tab did.
                 if let Some(closed) = self.close_active_tab() {
@@ -9847,6 +9889,10 @@ mod menu_only_action_dispatch_tests {
 #[cfg(test)]
 #[path = "app_input_native_keyboard_boundary_tests.rs"]
 mod native_keyboard_boundary_tests;
+
+#[cfg(test)]
+#[path = "app_input_startup_review_tests.rs"]
+mod startup_review_tests;
 
 #[cfg(test)]
 #[path = "app_input_native_clipboard_owner_tests.rs"]

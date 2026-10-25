@@ -3,19 +3,22 @@
 
 //! The System State tab (`docs/DESIGN-system-state-2026-10-21.md` §3): what
 //! this Mac reads now beside what aterm wants, in five groups. A group's
-//! `Set up │ Leave as is` choice takes effect at once; rows only report.
+//! `Set up │ Leave as is` choice takes effect at once on the manual page;
+//! a first-launch offer keeps those choices in its review until Apply.
 
 mod paint;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{
-    Access, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome, Selection, Setting,
-    Standing, Subject, Unfinished,
+    Access, FAILED_FOR_GOOD, FailureKind, Group, Observation, PassOutcome, Plan, PutBack,
+    RestoreOutcome, Selection, Setting, Standing, Subject, TRIED_TWICE, Unfinished,
 };
 
 use crate::native_app::{
@@ -124,8 +127,8 @@ pub struct SetupStatusRow {
 
 /// A step the last run, a Check or a Restore could not finish (§3.6): the page's row it
 /// names, if one, whether it is a row Restore could not put back ([`restore_rows`]), whether it
-/// is a Restore that failed as a whole, which names no row, whether a Check said it, and
-/// whether aterm tries it again by itself ([`SetupStatus::retries_by_itself`]).
+/// is a Restore that failed as a whole, which names no row, whether a Check said it, its kind,
+/// and whether aterm tries it again by itself ([`SetupStatus::retries_by_itself`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     pub(crate) row: Option<Subject>,
@@ -134,9 +137,26 @@ pub(crate) struct Failure {
     /// A Check's result: a read, whose remedy is pressing Check again, so the page's note alone
     /// says it (§3.6), never the headline, the menu line or the tab's attention.
     pub(crate) check: bool,
-    /// aterm tries it again by itself: the page counts it as waiting (§3.2) and nothing signals
-    /// it, since nobody needs to act.
+    /// What kind of failure it is (§3.6): one its source says no retry changes is failed for
+    /// good; one naming a row whose reading needs a person is that person's, which the row and
+    /// the headline say as needing you, never as a failure or a wait; any other is transient,
+    /// which aterm tries again while its tries last.
+    pub(crate) kind: FailureKind,
+    /// aterm tries it again by itself (a transient failure whose words say so, or one the run
+    /// still retries and whose tries are not spent): the page counts it as waiting (§3.2) and
+    /// nothing signals it, since nobody needs to act.
     pub(crate) retried: bool,
+}
+
+impl Failure {
+    /// Whether the page says it as a failure (§3.6): the headline names it failed, and the menu
+    /// line and the tab's attention say it with it. Not a Check's result (a read, whose remedy
+    /// is pressing Check again), not a step aterm tries again by itself, not a step whose row
+    /// needs a person (the row and the headline say that), and not a Restore that failed as a
+    /// whole, which the page alone says beside the button that tries it again (§3.4).
+    pub(crate) fn failed(&self) -> bool {
+        !self.check && !self.retried && !self.whole_restore && self.kind != FailureKind::NeedsPerson
+    }
 }
 
 impl SetupStatus {
@@ -160,9 +180,10 @@ impl SetupStatus {
             .filter(move |observation| !observation.subject.uses_vault_source() || source_matches)
     }
 
-    /// Whether a failure is a signal now (§3.6): never while the run still
-    /// retries it by itself (§3.5, [`Self::retrying`]), when the page alone
-    /// says it.
+    /// Whether a reading that failed is a signal now (§3.6): never while the run still
+    /// retries (§3.5, [`Self::retrying`]), when the page alone says it, as it waits for the next
+    /// try. A reading carries no kind, so it is transient while the tries last; a step's own
+    /// kind decides for it ([`Failure::retried`]).
     pub(crate) fn failures_signal(&self) -> bool {
         !self.retrying
     }
@@ -202,19 +223,31 @@ impl SetupStatus {
     fn result_failures<'a>(&'a self, plan: Option<&'a Plan>) -> impl Iterator<Item = Failure> + 'a {
         let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
         self.results(plan)
-            .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
-            .map(|result| {
+            .filter_map(|result| {
+                FailureKind::of_status(&result.row.status).map(|kind| (result, kind))
+            })
+            .map(move |(result, kind)| {
                 let whole_restore = result.name == RESTORE_FINISHED;
                 let (restore, name) = result
                     .name
                     .strip_prefix(RESTORE_ROW)
                     .map_or((whole_restore, result.name), |name| (true, name));
+                let row = subject_named(name);
+                let kind = if !restore && row.is_some_and(|row| self.needs_person(plan, row)) {
+                    FailureKind::NeedsPerson
+                } else {
+                    kind
+                };
                 Failure {
-                    row: subject_named(name),
+                    row,
                     restore,
                     whole_restore,
                     check: result.check,
-                    retried: !result.check && !restore && self.retries_by_itself(result.row),
+                    kind,
+                    retried: !result.check
+                        && !restore
+                        && kind.retried()
+                        && self.retries_by_itself(result.row),
                 }
             })
             .filter(move |failure| {
@@ -226,12 +259,12 @@ impl SetupStatus {
     }
 
     /// The steps the last run could not finish (a stage error, a join the
-    /// vault refused, a change that did not land), each with the row it
-    /// names, if one: failures, which the menu line and the tab's attention
+    /// vault refused, a change that did not land, a step that failed for good), each with the
+    /// row it names, if one: failures, which the menu line and the tab's attention
     /// say as they say a row that failed (§3.6), besides the page's notes,
-    /// once the run no longer retries them ([`Self::failures_signal`]) and
-    /// nothing else tries them again by itself (a vault try on its own pause,
-    /// [`Failure::retried`]). A step naming a row `plan` no longer manages is
+    /// once nothing tries them again by itself (the run's retries, or a vault try on its own
+    /// pause, [`Failure::retried`]) and no row they name needs a person
+    /// ([`Failure::failed`]). A step naming a row `plan` no longer manages is
     /// left out. A Check's results are never among them: a Check only reads,
     /// and pressing it again is its remedy, which the page's note says. A Restore that failed
     /// as a whole is the page's alone (§3.4): its headline and note say it beside the button
@@ -240,17 +273,51 @@ impl SetupStatus {
         &'a self,
         plan: Option<&'a Plan>,
     ) -> impl Iterator<Item = Failure> + 'a {
-        let signal = self.failures_signal();
-        self.result_failures(plan).filter(move |failure| {
-            signal && !failure.check && !failure.retried && !failure.whole_restore
+        self.result_failures(plan)
+            .filter(|failure| failure.failed())
+    }
+
+    /// Whether the GitHub repositories, which the plan in force manages, need a person (§3.6):
+    /// a token the vault has not got, or one GitHub refuses. Their remedy is the vault's, which
+    /// tells the page nothing, so a shown page reads them again by itself
+    /// ([`crate::system_state_host::PERSON_REREAD`]).
+    pub(crate) fn github_needs_person(&self) -> bool {
+        let repositories = Subject::Setting(Setting::Repositories);
+        self.plan.as_ref().is_some_and(|plan| {
+            manages(plan.selection, repositories) && self.needs_person(Some(plan), repositories)
         })
     }
 
-    /// Whether the note for `row`, a failed result, says aterm tries it again by itself (§3.5):
-    /// the words it carries say so, or it carries none while the run retries ([`Said::words`]).
-    /// Meanwhile Set up now is no remedy the page offers for it.
+    /// Whether `row`'s reading for `plan`'s vault needs a person (§3.6): a step that names it
+    /// is theirs, whatever came of the step.
+    fn needs_person(&self, plan: Option<&Plan>, row: Subject) -> bool {
+        self.observations_for(plan.map(|plan| plan.vault_url.as_str()))
+            .any(|observation| {
+                observation.subject == row && observation.standing == Standing::NeedsYou
+            })
+    }
+
+    /// The rows `plan` manages that a run, or a Check of `plan`, could not confirm (§3.2): a
+    /// change the run could not confirm, or a row the Check could not read.
+    fn unconfirmed<'a>(&'a self, plan: Option<&'a Plan>) -> impl Iterator<Item = Subject> + 'a {
+        let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
+        self.results(plan)
+            .filter(|result| {
+                result.row.status == "unverified"
+                    || (result.check && matches!(result.row.status.as_str(), "error" | "failed"))
+            })
+            .filter_map(|result| subject_named(result.name))
+            .filter(move |subject| manages(selection, *subject))
+    }
+
+    /// Whether aterm tries `row`, a failed result, again by itself (§3.5): it is transient
+    /// ([`FailureKind::of_status`]), and the words it carries say so, or the run still retries
+    /// and its words do not say its own tries are spent (a vault try held after two,
+    /// [`TRIED_TWICE`]). Meanwhile it counts as waiting, and Set up now is no remedy the page
+    /// offers for it ([`Said::words`]).
     fn retries_by_itself(&self, row: &SetupStatusRow) -> bool {
-        row.detail == RETRIES_NOTE || (row.detail.is_empty() && self.retrying)
+        FailureKind::of_status(&row.status).is_some_and(FailureKind::retried)
+            && (row.detail == RETRIES_NOTE || (self.retrying && row.detail != TRIED_TWICE))
     }
 
     /// The notes the page shows under its headline, in the page's own words
@@ -269,7 +336,7 @@ impl SetupStatus {
             notes.push(self.queued_note().to_owned());
         }
         if self.recovered {
-            notes.push(RECOVERED_NOTE.to_owned());
+            notes.push(self.recovered_note(plan));
         }
         if self.widened && self.running() {
             notes.push(WIDENED_NOTE.to_owned());
@@ -279,16 +346,24 @@ impl SetupStatus {
         let mut alike: Vec<(Said<'_>, Vec<&str>)> = Vec::new();
         let mut at_login: Vec<String> = Vec::new();
         for result in self.results(Some(plan)) {
+            // A step naming a row that needs a person is said by that row and the headline,
+            // which name the person's remedy (§3.6): a note that it failed, or that aterm tries
+            // it again, would say otherwise.
+            if !result.check
+                && !result.name.starts_with(RESTORE_ROW)
+                && subject_named(result.name).is_some_and(|row| self.needs_person(Some(plan), row))
+            {
+                continue;
+            }
             match result.row.status.as_str() {
-                "not started" | "error" | "failed" | "unverified" | "restored" | NOTED => {
-                    match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
-                        Some((_, names)) if !names.contains(&result.name) => {
-                            names.push(result.name);
-                        }
-                        Some(_) => {}
-                        None => alike.push((result, vec![result.name])),
+                "not started" | "error" | "failed" | "unverified" | "restored" | NOTED
+                | FAILED_FOR_GOOD => match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
+                    Some((_, names)) if !names.contains(&result.name) => {
+                        names.push(result.name);
                     }
-                }
+                    Some(_) => {}
+                    None => alike.push((result, vec![result.name])),
+                },
                 "login" if !at_login.contains(&result.row.name) => {
                     at_login.push(result.row.name.clone());
                 }
@@ -299,7 +374,31 @@ impl SetupStatus {
             let managed = names
                 .iter()
                 .all(|name| subject_named(name).is_some_and(|row| manages(plan.selection, row)));
-            notes.push(result.words(&names, self.retrying, managed));
+            notes.push(result.words(&names, self.retries_by_itself(result.row), managed));
+        }
+        // A reading that failed while the run retries waits for its next try (§3.5): its row
+        // keeps its reason, and one line says what comes next, as a step's does.
+        if self.retrying {
+            let said: Vec<Subject> = self
+                .results(Some(plan))
+                .filter_map(|result| subject_named(result.name))
+                .collect();
+            let waiting: Vec<String> = self
+                .observed
+                .iter()
+                .filter(|row| {
+                    row.standing == Standing::Failed
+                        && manages(plan.selection, row.subject)
+                        && !said.contains(&row.subject)
+                })
+                .map(|row| row.subject.name().to_owned())
+                .collect();
+            if !waiting.is_empty() {
+                notes.push(format!(
+                    "{} did not finish this time. {RETRIES_NOTE}",
+                    crate::toolchain_words::and_list(&waiting)
+                ));
+            }
         }
         if !at_login.is_empty() {
             let verb = if at_login.len() == 1 { "comes" } else { "come" };
@@ -327,11 +426,29 @@ pub(crate) const QUEUED_RESTORE_NOTE: &str =
     "Another setup is running; aterm restores your settings when it finishes.";
 
 /// The calm note while the plan in force is the one aterm set up afresh after setting aside a
-/// saved setup it could not read ([`SetupStatus::recovered`]).
-pub(crate) const RECOVERED_NOTE: &str = "aterm could not read its saved setup, so it set the \
-                                         record aside and left your Mac settings as they are.";
+/// saved setup it could not read ([`SetupStatus::recovered`]), up to what it says aterm kept
+/// ([`SetupStatus::recovered_note`]).
+pub(crate) const RECOVERED_NOTE: &str = "aterm could not read its saved setup, so it started \
+                                         afresh: your Mac settings are left as they are";
 
 impl SetupStatus {
+    /// [`RECOVERED_NOTE`], saying what aterm kept set up of the plan it went on with (the plan
+    /// in force, else the page's `plan`): the vault and the repositories where it sets them up,
+    /// as it does on an ALab Mac, and nothing more where it does not.
+    fn recovered_note(&self, plan: &Plan) -> String {
+        let selection = self.plan.as_ref().unwrap_or(plan).selection;
+        let kept = match (
+            selection.contains(Setting::Secrets),
+            selection.contains(Setting::Repositories),
+        ) {
+            (true, true) => ", and the vault and repositories stay set up",
+            (true, false) => ", and the vault stays set up",
+            (false, true) => ", and the repositories stay set up",
+            (false, false) => "",
+        };
+        format!("{RECOVERED_NOTE}{kept}.")
+    }
+
     /// The worker could not read the plan in force just now and says so in a calm line
     /// ([`STATE_UNREAD_NOTE`], [`calm_setup_row`]): it names no plan.
     fn plan_unread(&self) -> bool {
@@ -340,6 +457,18 @@ impl SetupStatus {
                 .rows
                 .iter()
                 .any(|row| row.name == SETUP_ROW && row.status == NOTED)
+    }
+
+    /// A setup run that did not finish as a whole (no row named), or a launch's setup that could
+    /// not start ([`STARTUP_RETRY_NOTE`]), which aterm tries again by itself (§3.5): the page
+    /// waits for that try, nothing a person presses changes what comes next, and nothing
+    /// signals it.
+    fn setup_retried(&self, plan: Option<&Plan>) -> bool {
+        self.rows.iter().any(|row| {
+            row.name == SETUP_ROW && row.status == NOTED && row.detail == STARTUP_RETRY_NOTE
+        }) || self.result_failures(plan).any(|failure| {
+            !failure.restore && !failure.check && failure.retried && failure.row.is_none()
+        })
     }
 
     /// The note for the press waiting for another setup: a Restore's while `operation` says so,
@@ -560,9 +689,10 @@ pub fn clear_setup_not_started() {
     crate::message_inbox::queue_exception_clear(setup_not_started_entry("").key());
 }
 
-/// The exceptions digest's entry for saved setup records aterm could not parse and set aside
-/// (§3.5): a fact for later, never an alert; the page says it in one calm line
-/// ([`RECOVERED_NOTE`]). `kept` names the records as they are kept now, which the log keeps.
+/// The exceptions digest's entry for a saved setup aterm could not read and set aside (§3.5): a
+/// fact for later, never an alert; the page says it in one calm line ([`RECOVERED_NOTE`]), and
+/// the entry goes with that line ([`clear_setup_set_aside`]). `kept` names the files as they are
+/// kept now, which the log keeps.
 #[must_use]
 pub fn setup_set_aside_entry(kept: &str) -> aterm_messages::exceptions::Entry {
     use aterm_messages::need::{Reason, Then, Why};
@@ -570,14 +700,14 @@ pub fn setup_set_aside_entry(kept: &str) -> aterm_messages::exceptions::Entry {
         aterm_messages::exceptions::Family::Setup,
         "",
         "set-aside",
-        "Unreadable setup records set aside",
+        "Saved setup set aside",
         Why::Spent {
             tried: Reason::new("read the setup it saved for this Mac"),
             reason: Reason::new(
-                "a record was unreadable, so aterm kept it aside and started afresh",
+                "aterm could not read its saved setup and set it aside, so it started afresh",
             ),
         },
-        Then::step("Read aterm.log for the records it names"),
+        Then::step("Read aterm.log for the files it kept"),
     )
     .log_line(format!(
         "System State: unreadable setup records kept as {kept}"
@@ -588,6 +718,13 @@ pub fn setup_set_aside_entry(kept: &str) -> aterm_messages::exceptions::Entry {
 #[cfg(unix)]
 pub fn note_setup_set_aside(kept: &str) {
     crate::message_inbox::queue_exception(setup_set_aside_entry(kept));
+}
+
+/// A person chose, or Restore ran, since aterm set its saved setup aside: the page's note is
+/// gone, and [`setup_set_aside_entry`] leaves the exceptions digest with it.
+#[cfg(unix)]
+pub fn clear_setup_set_aside() {
+    crate::message_inbox::queue_exception_clear(setup_set_aside_entry("").key());
 }
 
 /// The rows of `outcome` that came out `how`, in its order.
@@ -684,6 +821,10 @@ const RESTORE_FINISHED: &str = "Restore previous settings";
 /// The name of a pass's calm line for what its rollback put back ([`pass_rows`]).
 const UNDONE: &str = "Undo";
 
+/// The footer's Restore button while its Restore waits for another setup
+/// ([`SetupStatus::queued`]).
+const RESTORE_WAITS: &str = "Waiting to restore…";
+
 /// What opens the name of a row Restore could not put back ([`restore_rows`]): `Restore:
 /// Widgets`.
 const RESTORE_ROW: &str = "Restore: ";
@@ -724,10 +865,11 @@ impl Said<'_> {
     /// `aterm doctor` and the log keep those. A failed step of the page's own rows that carries
     /// none says what comes next: Set up now tries it again, where `managed` (the page's plan
     /// still manages them), as it starts a setup run that could not go ([`SETUP_ROW`]) again.
-    /// A step aterm tries again by itself (its words say so, or it carries none while the run
-    /// retries, `retrying`) is no failure: it did not finish this time, and aterm tries again by
-    /// itself (§3.5).
-    fn words(&self, names: &[&str], retrying: bool, managed: bool) -> String {
+    /// A step aterm tries again by itself (`retried`, [`SetupStatus::retries_by_itself`]) is
+    /// no failure: it did not finish this time, for the reason it carries if one, and aterm tries
+    /// again by itself (§3.5). A step that failed for good says its reason, which no press
+    /// changes, or else where to learn why ([`FOR_GOOD_NOTE`]), never Set up now.
+    fn words(&self, names: &[&str], retried: bool, managed: bool) -> String {
         if self.whole() {
             return self.row.detail.clone();
         }
@@ -747,21 +889,26 @@ impl Said<'_> {
         let status = self.row.status.as_str();
         let step = managed || names == [SETUP_ROW];
         let failed_step = step && !self.check && matches!(status, "error" | "failed");
-        let retried = failed_step
-            && (self.row.detail == RETRIES_NOTE || (self.row.detail.is_empty() && retrying));
+        let retried = failed_step && retried;
+        let for_good = status == FAILED_FOR_GOOD;
         let what = match status {
             _ if retried => format!("{list} did not finish this time."),
             "unverified" if self.check => format!("Check again could not confirm {list}."),
             "not started" => format!("{list} did not start."),
-            "error" | "failed" => format!("{list} failed."),
+            "error" | "failed" | FAILED_FOR_GOOD => format!("{list} failed."),
             "unverified" => format!("{list} could not be confirmed."),
             "restored" => format!("{list} finished."),
             other => format!("{list}: {other}."),
         };
-        let then = if retried {
+        let because = format!("{} {RETRIES_NOTE}", self.row.detail);
+        let then = if retried && !self.row.detail.is_empty() && self.row.detail != RETRIES_NOTE {
+            Some(because.as_str())
+        } else if retried {
             Some(RETRIES_NOTE)
         } else if !self.row.detail.is_empty() {
             Some(self.row.detail.as_str())
+        } else if for_good {
+            Some(FOR_GOOD_NOTE)
         } else if failed_step {
             Some(SET_UP_NOW_NOTE)
         } else {
@@ -777,13 +924,18 @@ impl Said<'_> {
 /// The headline while rows are read: a Check going, or readings still to come.
 const CHECKING: &str = "Checking this Mac…";
 
+/// The headline while a setup run that did not finish as a whole waits for aterm to try it
+/// again by itself (§3.5), and no row waits.
+const SETUP_RETRIED: &str = "Waiting to try setup again…";
+
 /// The name of the row for a setup run that could not go as a whole (its worker did not start,
 /// a pass failed before its stages): no System State row, and the note's own words.
 pub const SETUP_ROW: &str = "Setup";
 
-/// What the page says after `Check again failed.`: the button is its own remedy, and the rows
-/// keep their last readings meanwhile. The log keeps why.
-pub const CHECK_FAILED_NOTE: &str = "The rows show what aterm read before.";
+/// What the page says after `Check again failed.`: the rows keep their last readings meanwhile,
+/// and the button is its own remedy, said calmly. The log keeps why.
+pub const CHECK_FAILED_NOTE: &str =
+    "The rows show what aterm read before; pressing it again reads them anew.";
 
 /// What the page says under a Restore that failed as a whole (headlined `Restore previous
 /// settings failed`) for a reason the page has no words of its own for. The log keeps why.
@@ -802,6 +954,29 @@ pub const RESTORE_BACKUP_UNREAD_NOTE: &str =
 pub const STATE_UNREAD_NOTE: &str =
     "aterm could not read its saved setup just now; it reads it again by itself.";
 
+/// What the page says while a newer aterm's saved setup is in force (one built later, beside
+/// this one, which set this Mac up since): this aterm reads none of it and changes nothing of
+/// it, and a read again says the same until that aterm, or a person's choice in it, changes it.
+/// A calm line ([`calm_setup_row`]); the log keeps why.
+pub const NEWER_SETUP_NOTE: &str =
+    "A newer aterm set up this Mac; this aterm leaves its setup as it is.";
+
+/// What the page says when a Join was refused because aterm cannot read this Mac's vault settings
+/// (a root-owned or newer-format vault configuration): the Join changed nothing, the typed vault
+/// stays in its field for a Join once they read, and `aterm secrets status` says why. A calm line
+/// ([`calm_setup_row`]); the log keeps the file and the error.
+pub const VAULT_UNREAD_NOTE: &str =
+    "aterm cannot read this Mac's vault settings; aterm secrets status says why.";
+
+/// What the page says while the launch's answer to its offer, a Join, was admitted without the
+/// Join because aterm cannot read this Mac's vault settings: aterm's own permissions and every
+/// other group went ahead, the vault was not joined, and the typed vault stays in its field for
+/// a Join once they read. A calm line ([`calm_setup_row`]) for as long as the Secrets row reads
+/// so.
+pub const VAULT_NOT_JOINED_NOTE: &str = "aterm did not join the vault you typed: it cannot read \
+                                         this Mac's vault settings; aterm secrets status says \
+                                         why.";
+
 /// What the page says while the launch's setup could not start and aterm tries again by itself
 /// (§3.5): a calm line ([`calm_setup_row`]); the log keeps why.
 pub const STARTUP_RETRY_NOTE: &str =
@@ -818,8 +993,14 @@ pub fn calm_setup_row(words: &str) -> SetupStatusRow {
     }
 }
 
-/// What a failed step's note says while the run still tries it again by itself (§3.5).
-pub(crate) const RETRIES_NOTE: &str = "aterm tries again by itself.";
+/// What a failed step's note says while the run still tries it again by itself (§3.5): the
+/// words the worker's page gives a vault try on its own pause too
+/// ([`aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF`]).
+pub(crate) const RETRIES_NOTE: &str = aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF;
+
+/// What a step that failed for good says where its source gave no reason in the page's words
+/// (§3.6): no press changes it, so the note names where to learn why.
+pub(crate) const FOR_GOOD_NOTE: &str = "aterm doctor says why.";
 
 /// What a failed step's note says once the run no longer retries it: the headline's Set up now
 /// runs it again (§3.2).
@@ -836,8 +1017,7 @@ pub(crate) const fn text_input_interacts(event: &TextInputEvent) -> bool {
 /// admission receipt to the worker (`InitialSetupApplyReceipt::admission`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// The first-run offer, applied by the page once it was presented in an
-    /// active window.
+    /// The first-run offer, applied after its uninterrupted visible countdown.
     Automatic,
     /// A person pressed the page.
     Person,
@@ -867,6 +1047,8 @@ enum Submission {
     /// Join: a group choice that also sends the vault address as typed and
     /// its password.
     Join,
+    /// The entire first-launch review, with its committed vault draft.
+    Review,
 }
 
 #[derive(Debug)]
@@ -875,6 +1057,8 @@ pub(crate) enum SystemStateAction {
     /// a run is going, the worker stops it at its next step and runs this
     /// plan next (`InitialSetupHandlers::apply`).
     Apply(SetupAnswer, Admission),
+    /// End only the unanswered startup review; no setup records are changed.
+    CancelReview,
     /// Read every row again for this plan, prompt-free.
     Check(Plan),
     /// Put back the Mac preferences aterm saved.
@@ -1105,6 +1289,46 @@ fn row_view_for_source(
     let turn_on_sync = subject == Subject::Setting(Setting::Secrets)
         && standing == Some(Standing::InPlace)
         && wanted != subject.wanted();
+    // A step the last run said of this row (§3.6): one the page says failed takes the failed
+    // chip, though the row reads in place, and one aterm tries again by itself the waiting one,
+    // as the headline and the village say them. A step whose row needs a person says nothing of
+    // its own: the row's reading says it.
+    let step = {
+        let plan = Plan {
+            selection,
+            vault_url: vault_url.unwrap_or_default().to_owned(),
+        };
+        let said: Vec<Failure> = status
+            .result_failures(Some(&plan))
+            .filter(|failure| !failure.restore && !failure.check && failure.row == Some(subject))
+            .collect();
+        if said.iter().any(Failure::failed) {
+            Some(Chip::Failed)
+        } else if said.iter().any(|failure| failure.retried) {
+            Some(Chip::WillChange { busy })
+        } else {
+            None
+        }
+    };
+    // A row read in place that the last run, or a Check of this plan, could not confirm is no
+    // settled row (§3.2): no check mark, and a short note the headline's Show lands on.
+    let unconfirmed = step.is_none()
+        && matches!(standing, Some(Standing::InPlace | Standing::AtLogin))
+        && status
+            .unconfirmed(
+                vault_url
+                    .map(|vault_url| Plan {
+                        selection,
+                        vault_url: vault_url.to_owned(),
+                    })
+                    .as_ref(),
+            )
+            .any(|row| row == subject);
+    let (settled_chip, settled_words) = if unconfirmed {
+        (None, "not confirmed")
+    } else {
+        (Some(Chip::InPlace), "in place")
+    };
     let (value, chip, label) = match standing {
         None => (
             RowValue::One("—".to_owned()),
@@ -1138,13 +1362,13 @@ fn row_view_for_source(
                 if matches!(subject, Subject::Access(_)) && wanted != subject.wanted() {
                     note = explained();
                 }
-                let label = format!("{name}: {value}, in place");
-                (RowValue::One(value), Some(Chip::InPlace), label)
+                let label = format!("{name}: {value}, {settled_words}");
+                (RowValue::One(value), settled_chip, label)
             }
             None => (
                 RowValue::One("—".to_owned()),
-                Some(Chip::InPlace),
-                format!("{name}: in place"),
+                settled_chip,
+                format!("{name}: {settled_words}"),
             ),
         },
         // Set, and in use in full from the next login: the value with the check, and a quiet
@@ -1153,8 +1377,8 @@ fn row_view_for_source(
             note = Some(AT_LOGIN_NOTE.to_owned());
             (
                 RowValue::One(wanted.clone()),
-                Some(Chip::InPlace),
-                format!("{name}: {wanted}, in place"),
+                settled_chip,
+                format!("{name}: {wanted}, {settled_words}"),
             )
         }
         // The probe's own note only (set above): never the description.
@@ -1185,16 +1409,43 @@ fn row_view_for_source(
                 format!("{name}: {spoken_from}, needs you"),
             )
         }
+        // A reading that failed keeps its reason in its note. While the run still retries it
+        // waits for the next try (§3.5), as the headline and the village say: the waiting chip,
+        // never Failed, unless a step that failed for good says the row failed.
         Some(Standing::Failed) => {
             note = reading.and_then(|o| o.detail.clone().or_else(|| o.note.clone()));
-            (
-                change(),
-                Some(Chip::Failed),
-                format!("{name}: {spoken_from}, failed"),
-            )
+            if status.failures_signal() || step == Some(Chip::Failed) {
+                (
+                    change(),
+                    Some(Chip::Failed),
+                    format!("{name}: {spoken_from}, failed"),
+                )
+            } else {
+                (
+                    change(),
+                    Some(Chip::WillChange { busy }),
+                    format!("{name}: {spoken_from}, {RETRY_WORDS}"),
+                )
+            }
         }
         Some(Standing::NotNeeded) => unreachable!("a row not needed returned above"),
     };
+    // A step's chip stands for the row whose reading says less (§3.6): a row that needs a
+    // person, or whose reading failed, has said its own.
+    let (chip, label) = match step {
+        Some(said) if !matches!(standing, Some(Standing::NeedsYou | Standing::Failed)) => {
+            let words = if said == Chip::Failed {
+                "failed"
+            } else {
+                RETRY_WORDS
+            };
+            (Some(said), format!("{name}: {spoken_read}, {words}"))
+        }
+        _ => (chip, label),
+    };
+    if unconfirmed {
+        note = Some(UNCONFIRMED_NOTE.to_owned());
+    }
     let note = note.filter(|note| !note.trim().is_empty());
     // A row that waits always says why (§3.3): its probe's reason, or, where the
     // probe gave none, the one thing true of every waiting row.
@@ -1216,6 +1467,10 @@ fn row_view_for_source(
     }
 }
 
+/// What a screen reader hears of a row whose step aterm tries again by itself (§3.5), after its
+/// value: the waiting chip's words would say it will change, which is the next try's to say.
+const RETRY_WORDS: &str = "waiting for aterm to try again";
+
 /// The note of a waiting row whose probe gave no reason: it is blocked on
 /// something, and nothing more can be said of it.
 pub(crate) const WAITING_NOTE: &str = "Can't be set up yet";
@@ -1225,6 +1480,10 @@ pub(crate) const WAITING_NOTE: &str = "Can't be set up yet";
 /// behind other windows.
 pub(crate) const PASSWORD_NOTE: &str =
     "Waiting for your administrator password in the SamplingTools dialog";
+
+/// The note of a row read in place that the last run, or a Check, could not confirm
+/// ([`SetupStatus::unconfirmed`]): the headline counts it, and its Show lands here.
+pub(crate) const UNCONFIRMED_NOTE: &str = "Not confirmed";
 
 /// The note of a row a run set for macOS to take up in full at the next login
 /// (Trackpad scrolling): it reads in place, and says when it is all in effect.
@@ -1356,8 +1615,13 @@ impl Headline {
                 .or_else(|| {
                     status
                         .result_failures(None)
-                        .any(|failure| failure.row.is_none())
+                        .any(|failure| failure.row.is_none() && failure.failed())
                         .then(|| Self::line("Setup needs attention"))
+                })
+                .or_else(|| {
+                    status
+                        .setup_retried(None)
+                        .then(|| Self::line(SETUP_RETRIED))
                 })
                 .unwrap_or_else(|| Self::line(CHECKING)),
             _ => Self::line(CHECKING),
@@ -1446,10 +1710,11 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         let count = if failed.len() == 1 { "step" } else { "steps" };
         let names: Vec<&str> = failed.iter().map(|subject| subject.name()).collect();
         // Set up now is offered only where running the plan again can change the outcome: a
-        // step the last run tried and could not finish (a change that did not take, a stage
-        // that failed, a vault try held after two), whose note says Set up now tries it again.
-        // A reading that failed by itself names its own remedy in its note (sign in, then Check
-        // again), which Set up now cannot give: Show alone takes the person there.
+        // transient step the last run tried and could not finish (a change that did not take, a
+        // stage that failed, a vault try held after two), whose note says Set up now tries it
+        // again. A reading that failed by itself names its own remedy in its note, which Set up
+        // now cannot give, and a step that failed for good is one no run changes: Show alone
+        // takes the person there.
         return Headline {
             show: Some(*first),
             start: failed.iter().any(|subject| steps.rerun.contains(subject)),
@@ -1462,12 +1727,11 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     if status
         .result_failures(plan)
-        .any(|failure| !failure.restore && !failure.check && failure.row.is_none())
+        .any(|failure| !failure.restore && failure.failed() && failure.row.is_none())
     {
         // A setup run that could not go (its worker did not start, a pass failed as a whole)
-        // is one Set up now starts again, as its note says, unless the run tries it again by
-        // itself; a saved setup aterm cannot read says so in its own words, and a Check that
-        // failed is pressed again where it is.
+        // is one Set up now starts again, as its note says; a saved setup aterm cannot read
+        // says so in its own words, and a Check that failed is pressed again where it is.
         return Headline {
             start: status.rows.iter().any(|row| {
                 row.name == SETUP_ROW
@@ -1478,11 +1742,16 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             ..Headline::line("Setup needs attention")
         };
     }
-    // A step aterm tries again by itself is no failure (§3.5): it waits for that try, as a row
-    // that waits on something does, so the headline counts both as waiting, before any change
-    // to make, since a run is coming by itself.
-    if !steps.retried.is_empty() {
-        return Headline::waiting(&steps.waiting(rows));
+    // A step, or a setup run as a whole, that aterm tries again by itself is no failure (§3.5):
+    // it waits for that try, as a row that waits on something does, so the headline counts both
+    // as waiting, before any change to make, since a run is coming by itself. A run with no row
+    // waiting says it waits to try again.
+    if !steps.retried.is_empty() || status.setup_retried(plan) {
+        let waiting = steps.waiting(rows);
+        if waiting.is_empty() {
+            return Headline::line(SETUP_RETRIED);
+        }
+        return Headline::waiting(&waiting);
     }
     // Readings still to come, or a saved setup aterm reads again by itself, whose calm line
     // says so: nothing is claimed of a plan the worker could not read just now.
@@ -1590,13 +1859,16 @@ const AS_LAST_READ: &str = "as last read";
 /// what the headline names failed, counts as waiting or as not confirmed, and the village
 /// draws ([`village_spec`]).
 struct Steps {
-    /// Managed rows that failed: a reading that failed, or a step the run could not finish and
-    /// nothing tries again by itself. A Check's result is never one: a Check only reads.
+    /// Managed rows that failed: a reading that failed once the run no longer retries, or a step
+    /// the run could not finish that nothing tries again by itself, or one that failed for good
+    /// ([`Failure::failed`]). A Check's result is never one: a Check only reads. Nor is a step
+    /// whose row needs a person, which says so instead.
     failed: Vec<Subject>,
-    /// The failed rows Set up now can change: a step the last run tried and could not finish,
-    /// whose note says Set up now tries it again.
+    /// The failed rows Set up now can change: a transient step the last run tried and could not
+    /// finish, whose note says Set up now tries it again.
     rerun: Vec<Subject>,
-    /// Managed rows, not failed, with a step aterm tries again by itself.
+    /// Managed rows, not failed, with a step aterm tries again by itself, or a reading that
+    /// failed while the run still retries (§3.5): each waits for that try.
     retried: Vec<Subject>,
     /// Managed rows, not failed, whose change or Check could not be confirmed.
     unconfirmed: Vec<Subject>,
@@ -1617,38 +1889,30 @@ impl Steps {
                 .filter_map(|failure| failure.row)
                 .collect()
         };
-        let stopped = named(&|failure| !failure.check && !failure.retried);
+        let stopped = named(&Failure::failed);
         let retried = named(&|failure| failure.retried);
-        let checked = named(&|failure| failure.check);
-        let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
-        let unverified: Vec<Subject> = status
-            .results(plan)
-            .filter(|result| result.row.status == "unverified")
-            .filter_map(|result| subject_named(result.name))
-            .filter(|subject| manages(selection, *subject))
-            .collect();
+        let unverified: Vec<Subject> = status.unconfirmed(plan).collect();
         let managed = |keep: &dyn Fn(&RowView) -> bool| -> Vec<Subject> {
             rows.iter()
                 .filter(|row| row.managed && keep(row))
                 .map(|row| row.subject)
                 .collect()
         };
+        // A reading that failed waits for the run's next try while the run retries, keeping its
+        // reason on its row; once the tries stop it failed (§3.5, §3.6).
+        let signal = status.failures_signal();
         let failed = managed(&|row| {
-            row.standing == Some(Standing::Failed) || stopped.contains(&row.subject)
+            (signal && row.standing == Some(Standing::Failed)) || stopped.contains(&row.subject)
         });
-        let rerun = status
-            .results(plan)
-            .filter(|result| !result.check)
-            .filter(|result| matches!(result.row.status.as_str(), "error" | "failed"))
-            .filter(|result| !status.retries_by_itself(result.row))
-            .filter_map(|result| subject_named(result.name))
-            .collect();
-        let retried =
-            managed(&|row| !failed.contains(&row.subject) && retried.contains(&row.subject));
+        let rerun = named(&|failure| failure.failed() && failure.kind == FailureKind::Transient);
+        let retried = managed(&|row| {
+            !failed.contains(&row.subject)
+                && (retried.contains(&row.subject) || row.standing == Some(Standing::Failed))
+        });
         let unconfirmed = managed(&|row| {
             !failed.contains(&row.subject)
                 && !retried.contains(&row.subject)
-                && (unverified.contains(&row.subject) || checked.contains(&row.subject))
+                && unverified.contains(&row.subject)
         });
         Self {
             check_failed: failures
@@ -1680,9 +1944,10 @@ impl Steps {
 /// [`crate::settings::paint_rainbow_kitty_village`] draws beside the lockup,
 /// one station per [`Setting`] in its order, in the painter's letters: `_`
 /// left as is, `E` a managed row needs a person or failed (a reading, or a
-/// step the headline names failed), `W` running now, `D` a step aterm tries
-/// again by itself, which waits for that try, `G` every managed row in place,
-/// `D` otherwise (it differs, waits or is not read yet). `done` and `total`
+/// step, the headline names failed), `W` running now, `D` a step aterm tries
+/// again by itself, which waits for that try, or a row a run or a Check could
+/// not confirm, `G` every managed row in place, `D` otherwise (it differs,
+/// waits or is not read yet). `done` and `total`
 /// are the meter's count of managed rows. `plan` is the page's review, whose
 /// selection says what is left as is.
 pub(crate) fn village_spec(
@@ -1703,11 +1968,15 @@ pub(crate) fn village_spec(
                 .filter(|row| row.managed && row.subject.setting() == setting);
             if !plan.selection.contains(setting) {
                 '_'
-            } else if managed.clone().any(RowView::attention) || of(&steps.failed, setting) {
+            } else if managed
+                .clone()
+                .any(|row| row.standing == Some(Standing::NeedsYou))
+                || of(&steps.failed, setting)
+            {
                 'E'
             } else if status.running.contains(&setting) {
                 'W'
-            } else if of(&steps.retried, setting) {
+            } else if of(&steps.retried, setting) || of(&steps.unconfirmed, setting) {
                 'D'
             } else if managed.all(RowView::settled) {
                 'G'
@@ -1852,11 +2121,27 @@ fn whole_at(offset: f32, room: f32, top: f32, bottom: f32) -> f32 {
     }
 }
 
+/// Acceptance belongs to one submitted password value, independently of which
+/// later plan owns the host's admission receipt. It carries no plan authority.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PasswordAcceptance(Arc<AtomicBool>);
+
+impl PasswordAcceptance {
+    pub(crate) fn accept(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn accepted(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Password text never enters a UI projection, undo history, restore data or a
 /// diagnostic String. Its selection addresses graphemes in the masked value.
 #[derive(Default)]
 struct Password {
     value: Option<SecretBytes>,
+    acceptance: Option<PasswordAcceptance>,
     anchor: usize,
     head: usize,
     /// Marked text is never kept, but its presence owns the vault draft.
@@ -1865,17 +2150,23 @@ struct Password {
 
 impl Password {
     fn text(&self) -> &str {
+        if self
+            .acceptance
+            .as_ref()
+            .is_some_and(PasswordAcceptance::accepted)
+        {
+            return "";
+        }
         self.value
             .as_ref()
             .and_then(SecretBytes::as_str)
             .unwrap_or_default()
     }
 
-    fn boundaries(&self) -> Vec<usize> {
-        self.text()
-            .grapheme_indices()
+    fn boundaries(text: &str) -> Vec<usize> {
+        text.grapheme_indices()
             .map(|(byte, _)| byte)
-            .chain([self.text().len()])
+            .chain([text.len()])
             .collect()
     }
 
@@ -1885,10 +2176,13 @@ impl Password {
 
     fn replace(&mut self, text: SecretBytes) {
         self.composing = false;
-        let boundaries = self.boundaries();
+        // A worker can accept the old value at any point. Derive the edit's
+        // ranges and bytes from one snapshot, then detach its old marker.
+        let old = self.text();
+        let boundaries = Self::boundaries(old);
         let start = boundaries[self.anchor.min(self.head).min(boundaries.len() - 1)];
         let end = boundaries[self.anchor.max(self.head).min(boundaries.len() - 1)];
-        let old = self.text().as_bytes();
+        let old = old.as_bytes();
         if old.len() - (end - start) + text.len() > 1023
             || text
                 .as_slice()
@@ -1903,12 +2197,13 @@ impl Password {
         bytes.extend_from_slice(text.as_slice());
         bytes.extend_from_slice(&old[end..]);
         self.value = Some(SecretBytes::new(bytes));
+        // A late receipt for the old value cannot consume this new draft.
+        self.acceptance = None;
         // Insertion can join clusters on either side, as when a combining mark
         // follows a letter or a joiner connects two emoji. Resolve the caret in
         // the resulting value, at the first whole-cluster boundary after it.
-        self.head = self
-            .boundaries()
-            .partition_point(|boundary| *boundary < inserted_end);
+        self.head =
+            Self::boundaries(self.text()).partition_point(|boundary| *boundary < inserted_end);
         self.anchor = self.head;
     }
 
@@ -1981,17 +2276,45 @@ impl Password {
     }
 
     fn projection(&self) -> TextInputProjection {
+        let count = self.count();
         TextInputProjection {
-            text: "•".repeat(self.count()),
+            text: "•".repeat(count),
             selection: TextSelection {
-                anchor: self.anchor * "•".len(),
-                head: self.head * "•".len(),
+                anchor: self.anchor.min(count) * "•".len(),
+                head: self.head.min(count) * "•".len(),
             },
             preedit: None,
         }
     }
 
+    fn forget_accepted(&mut self) -> bool {
+        if !self
+            .acceptance
+            .as_ref()
+            .is_some_and(PasswordAcceptance::accepted)
+        {
+            return false;
+        }
+        drop(self.value.take());
+        self.acceptance = None;
+        self.anchor = 0;
+        self.head = 0;
+        true
+    }
+
+    fn copy_for_submission(&mut self) -> Option<SecretBytes> {
+        self.forget_accepted();
+        let password = self.value.clone().filter(|value| !value.is_empty());
+        if password.is_some() {
+            self.acceptance
+                .get_or_insert_with(PasswordAcceptance::default);
+        }
+        password
+    }
+
     fn take(&mut self) -> Option<SecretBytes> {
+        self.forget_accepted();
+        self.acceptance = None;
         self.anchor = 0;
         self.head = 0;
         self.composing = false;
@@ -2003,11 +2326,54 @@ impl Password {
 struct Awaiting {
     plan: Plan,
     /// It carried the vault password (Join), which goes once accepted.
-    password: bool,
+    password: Option<PasswordAcceptance>,
     /// The settings of the groups the person changed since the page last took the plan in
     /// force, which the worker applies onto it ([`SetupAnswer::changed`]); `None`: the plan
     /// as sent.
     changed: Option<Selection>,
+}
+
+/// A first-launch offer counts only time spent active and visible. Once input
+/// stops it, this offer can be submitted only by its Apply button.
+struct StartupReview {
+    remaining: Duration,
+    last_active: Option<Instant>,
+    stopped: bool,
+}
+
+impl StartupReview {
+    fn new() -> Self {
+        Self {
+            remaining: Duration::from_secs(30),
+            last_active: None,
+            stopped: false,
+        }
+    }
+
+    fn seconds(&self) -> Option<u64> {
+        (!self.stopped)
+            .then(|| self.remaining.as_secs() + u64::from(self.remaining.subsec_nanos() != 0))
+    }
+
+    fn stop(&mut self) -> bool {
+        let changed = !self.stopped;
+        self.stopped = true;
+        self.last_active = None;
+        changed
+    }
+
+    fn tick(&mut self, now: Instant, active: bool) -> bool {
+        if self.stopped || !active {
+            self.last_active = None;
+            return false;
+        }
+        if let Some(previous) = self.last_active.replace(now) {
+            self.remaining = self
+                .remaining
+                .saturating_sub(now.saturating_duration_since(previous));
+        }
+        self.remaining.is_zero()
+    }
 }
 
 pub(crate) struct SystemStateApp {
@@ -2032,6 +2398,7 @@ pub(crate) struct SystemStateApp {
     vault_open: Option<bool>,
     status: SetupStatus,
     request: Option<Request>,
+    startup_review: Option<StartupReview>,
     actions: VecDeque<SystemStateAction>,
     /// Whether the gesture being handled is a person's (not a control client's).
     by_person: bool,
@@ -2092,6 +2459,7 @@ impl SystemStateApp {
             vault_open: None,
             status: SetupStatus::default(),
             request: None,
+            startup_review: None,
             actions: VecDeque::new(),
             by_person: false,
             anim_ticks: 0,
@@ -2122,6 +2490,7 @@ impl SystemStateApp {
         self.password = Password::default();
         self.status = SetupStatus::default();
         self.request = Some(request);
+        self.startup_review = Some(StartupReview::new());
         true
     }
 
@@ -2129,6 +2498,9 @@ impl SystemStateApp {
     /// nothing the page sent waits for the worker (and no offer is up); a
     /// vault address being typed stays as typed.
     pub(crate) fn publish(&mut self, status: SetupStatus) -> bool {
+        if status.busy {
+            self.pause_review();
+        }
         let mut changed = self.status != status;
         if self.request.is_none()
             && self.awaiting.is_none()
@@ -2159,35 +2531,83 @@ impl SystemStateApp {
 
     /// Note whose gesture the next event is: the host stamps it before the
     /// reducer runs, from the App's gesture source.
-    pub(crate) fn gesture(&mut self, by_person: bool) {
+    pub(crate) fn gesture(&mut self, by_person: bool) -> bool {
         self.by_person = by_person;
+        self.interact()
     }
 
-    /// The page's clock-free step: a withdrawn offer is let go, and, in an
-    /// active window, the first-run offer is applied; while a setup run goes
+    fn reviewing(&self) -> bool {
+        self.pending() && self.startup_review.is_some()
+    }
+
+    fn interact(&mut self) -> bool {
+        self.reviewing()
+            && self
+                .startup_review
+                .as_mut()
+                .is_some_and(StartupReview::stop)
+    }
+
+    fn review_seconds(&self) -> Option<u64> {
+        self.startup_review
+            .as_ref()
+            .and_then(StartupReview::seconds)
+    }
+
+    /// Visibility can end between throttled ticks, including just before
+    /// sleep. Forget only that active sample; keep the remaining review time.
+    pub(crate) fn pause_review(&mut self) {
+        if let Some(review) = &mut self.startup_review {
+            review.last_active = None;
+        }
+    }
+
+    /// A withdrawn offer is let go. An untouched first-run review applies
+    /// after thirty seconds active and visible; while a setup run goes
     /// and the page is `shown` (the visible view of a window), the village's
     /// kitties walk a step. `walks` says whether a shown view's last render
     /// showed a walking village ([`SystemStateViewState::village_walks`]).
     /// `true` when the page changed: a page nobody sees, one Check again or
     /// Restore keeps busy, or one whose shown views draw no walking village
     /// owes no repaint for the walk.
+    #[cfg(test)]
     pub(crate) fn tick(&mut self, active: bool, shown: bool, walks: bool) -> bool {
-        let before = (self.request.is_some(), self.status.busy);
+        self.tick_at(Instant::now(), active, shown, walks)
+    }
+
+    pub(crate) fn tick_at(&mut self, now: Instant, active: bool, shown: bool, walks: bool) -> bool {
+        let before = (
+            self.request.is_some(),
+            self.status.busy,
+            self.review_seconds(),
+        );
         if self
             .request
             .as_ref()
             .is_some_and(|request| !request.pending())
         {
             self.request = None;
+            self.startup_review = None;
         }
-        if !self.status.busy && active && self.pending() {
-            self.apply(Admission::Automatic, Submission::AsItStands, None);
+        if self.reviewing()
+            && self
+                .startup_review
+                .as_mut()
+                .is_some_and(|review| review.tick(now, active && shown && !self.status.busy))
+        {
+            self.apply(Admission::Automatic, Submission::Review, None);
         }
         let walked = self.status.running() && shown && {
             self.anim_ticks = self.anim_ticks.wrapping_add(1);
             walks
         };
-        walked || before != (self.request.is_some(), self.status.busy)
+        walked
+            || before
+                != (
+                    self.request.is_some(),
+                    self.status.busy,
+                    self.review_seconds(),
+                )
     }
 
     pub(crate) fn pending(&self) -> bool {
@@ -2266,6 +2686,13 @@ impl SystemStateApp {
     /// headline says what the readings of the vault in force say, never that a check is going
     /// when none is; a Check's result still belongs to its exact plan alone.
     pub(crate) fn headline(&self) -> Headline {
+        if self.reviewing() {
+            return if self.status.busy {
+                Headline::before_plan(&self.status)
+            } else {
+                Headline::line("Review this Mac's setup")
+            };
+        }
         if !self.plan_known {
             return Headline::before_plan(&self.status);
         }
@@ -2283,7 +2710,9 @@ impl SystemStateApp {
     }
 
     pub(crate) fn can_open_access(&self, access: Access) -> bool {
-        self.plan_known && self.reviewed_row(Subject::Access(access)).open == Some(access)
+        !self.reviewing()
+            && self.plan_known
+            && self.reviewed_row(Subject::Access(access)).open == Some(access)
     }
 
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
@@ -2311,7 +2740,8 @@ impl SystemStateApp {
     /// and leaves a draft where it is. `changed` is what the worker takes of the plan onto the
     /// plan in force ([`SetupAnswer::changed`]).
     fn apply(&mut self, admission: Admission, submission: Submission, changed: Option<Selection>) {
-        let with_vault = submission == Submission::Join;
+        let review = submission == Submission::Review;
+        let with_vault = submission == Submission::Join || (review && self.vault_draft());
         let mut plan = self.plan.clone();
         plan.vault_url = if with_vault {
             self.url.value().trim().to_owned()
@@ -2321,19 +2751,17 @@ impl SystemStateApp {
         // The callback may refuse to start. Keep the scrubbable password until
         // the host confirms this answer was accepted.
         let password = if with_vault {
-            self.password
-                .value
-                .clone()
-                .filter(|value| !value.is_empty())
+            self.password.copy_for_submission()
         } else {
             None
         };
         self.status.busy = true;
         self.status.operation = None;
         self.stopping = false;
+        self.startup_review = None;
         self.awaiting = Some(Awaiting {
             plan: plan.clone(),
-            password: password.is_some(),
+            password: password.as_ref().and(self.password.acceptance.clone()),
             changed,
         });
         self.actions.push_back(SystemStateAction::Apply(
@@ -2341,7 +2769,11 @@ impl SystemStateApp {
                 decision: WorkstationSetupDecision::Begin(plan),
                 password,
                 receipt: None,
-                chosen: submission != Submission::AsItStands,
+                chosen: if review {
+                    admission != Admission::Automatic
+                } else {
+                    submission != Submission::AsItStands
+                },
                 vault_typed: with_vault,
                 changed,
             },
@@ -2349,18 +2781,31 @@ impl SystemStateApp {
         ));
     }
 
+    pub(crate) fn pending_password_acceptance(&self, plan: &Plan) -> Option<PasswordAcceptance> {
+        self.awaiting
+            .as_ref()
+            .filter(|awaiting| &awaiting.plan == plan)
+            .and_then(|awaiting| awaiting.password.clone())
+    }
+
+    pub(crate) fn forget_accepted_password(&mut self) -> bool {
+        self.password.forget_accepted()
+    }
+
     /// The worker durably accepted `plan`.
     pub(crate) fn apply_accepted(&mut self, plan: Plan) -> bool {
         self.submitted = plan.clone();
         self.plan_known = true;
         self.request = None;
-        if self
+        self.startup_review = None;
+        if let Some(password) = self
             .awaiting
             .take_if(|awaiting| awaiting.plan == plan)
-            .is_some_and(|awaiting| awaiting.password)
+            .and_then(|awaiting| awaiting.password)
         {
             // Joined: the address is the plan's now, and the password went once.
-            drop(self.password.take());
+            password.accept();
+            self.password.forget_accepted();
             self.url = TextInputState::new(plan.vault_url.clone());
         }
         true
@@ -2380,11 +2825,29 @@ impl SystemStateApp {
 
     /// The host calls this only after the final view has actually detached.
     /// Closing never cancels (§3.5): an unanswered offer is let go, and setup
-    /// resumes at the next launch. What the page sent is the worker's already.
+    /// can be offered in a later available window. What the page sent is the
+    /// worker's already.
     pub(crate) fn closed(&mut self, _scope: CloseScope) {
         if let Some(request) = self.request.take() {
             request.finish(WorkstationSetupDecision::Unavailable);
         }
+        self.startup_review = None;
+    }
+
+    fn cancel_review(&mut self) {
+        if !self.reviewing() {
+            return;
+        }
+        if let Some(request) = self.request.take() {
+            request.finish(WorkstationSetupDecision::Cancelled);
+        }
+        self.startup_review = None;
+        drop(self.password.take());
+        self.plan = self.submitted.clone();
+        self.url = TextInputState::new(self.submitted.vault_url.clone());
+        self.plan_known = self.status.plan.is_some();
+        self.publish(self.status.clone());
+        self.actions.push_back(SystemStateAction::CancelReview);
     }
 
     /// The plan the worker will run next: the one sent last, else the one it
@@ -2397,9 +2860,19 @@ impl SystemStateApp {
 
     /// Whether the worker is putting back the Mac preferences aterm saved
     /// (Restore previous settings): the groups take no choice meanwhile, since
-    /// the plan the page shows is the one the Restore is changing (§3.4).
+    /// the plan the page shows is the one the Restore is changing (§3.4). A
+    /// Restore waiting for another setup ([`SetupStatus::queued`]) changes
+    /// nothing yet: a group press replaces it, as a later press replaces a
+    /// choice waiting, since the latest intent wins.
     fn restoring(&self) -> bool {
-        self.status.operation == Some(SetupOperation::Restore)
+        self.status.operation == Some(SetupOperation::Restore) && !self.status.queued
+    }
+
+    /// Whether Check again can start: nothing is busy, or what is busy is a
+    /// press waiting for another setup ([`SetupStatus::queued`]), which runs
+    /// nothing meanwhile, so a reading of the rows can go (§3.4).
+    fn can_check(&self) -> bool {
+        self.plan_known && (!self.status.busy || self.status.queued)
     }
 
     /// The settings of the groups the person changed since the page last took
@@ -2428,6 +2901,9 @@ impl SystemStateApp {
         }
         for setting in group.settings() {
             self.plan.selection.set(*setting, on);
+        }
+        if self.reviewing() {
+            return;
         }
         if self.plan.selection != self.next_plan().selection || self.may_widen() {
             let changed = self.changed_with(group.settings());
@@ -2535,6 +3011,7 @@ impl SystemStateApp {
 
     /// One pressed control of the page.
     fn act(&mut self, view: &mut SystemStateViewState, key: &str, value: Option<SemanticInput>) {
+        self.interact();
         if let Some(rest) = key.strip_prefix("system-state/group/") {
             let mut parts = rest.split('/');
             if let (Some(group), Some(choice)) = (
@@ -2562,19 +3039,30 @@ impl SystemStateApp {
             return;
         }
         match key {
+            "system-state/apply" if self.reviewing() && !self.status.busy => {
+                self.apply(
+                    Admission::of_gesture(self.by_person),
+                    Submission::Review,
+                    None,
+                );
+            }
+            "system-state/cancel" if self.reviewing() => self.cancel_review(),
             "system-state/stop" if self.status.running() && !self.stopping => {
                 // Asked once: the worker keeps it, so a run that has not
                 // shown up yet stops once it does.
                 self.stopping = true;
                 self.actions.push_back(SystemStateAction::Stop);
             }
-            "system-state/check" if !self.status.busy && self.plan_known => {
+            "system-state/check" if self.can_check() => {
                 let plan = self.reviewed_plan();
-                self.status.busy = true;
-                self.status.operation = Some(SetupOperation::Check);
+                // A press waiting for another setup keeps its words: the reading goes beside it.
+                if !self.status.queued {
+                    self.status.busy = true;
+                    self.status.operation = Some(SetupOperation::Check);
+                }
                 self.actions.push_back(SystemStateAction::Check(plan));
             }
-            "system-state/restore" if !self.status.busy => {
+            "system-state/restore" if !self.status.busy && !self.reviewing() => {
                 self.status.busy = true;
                 self.status.operation = Some(SetupOperation::Restore);
                 self.actions.push_back(SystemStateAction::Restore);
@@ -2606,7 +3094,7 @@ impl SystemStateApp {
                 self.vault_open = Some(!self.vault_shown());
             }
             TURN_ON_SYNC => {
-                if self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
+                if !self.reviewing() && self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
                     self.actions.push_back(SystemStateAction::TurnSyncOn {
                         by_person: self.by_person,
                     });
@@ -2615,6 +3103,9 @@ impl SystemStateApp {
             "system-state/vault/join" if !self.status.busy && self.plan_known => {
                 self.vault_open = Some(true);
                 self.plan.selection.set(Setting::Secrets, true);
+                if self.reviewing() {
+                    return;
+                }
                 let changed = self.changed_with(&[Setting::Secrets]);
                 self.apply(
                     Admission::of_gesture(self.by_person),
@@ -2698,16 +3189,28 @@ impl NativeAppModel for SystemStateApp {
         event: AppEvent,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
+        let interacted = match &event {
+            AppEvent::TextInput(event) => text_input_interacts(event),
+            AppEvent::Action(_)
+            | AppEvent::ScrollLines(_)
+            | AppEvent::ScrollAt { .. }
+            | AppEvent::ScrollPage(_)
+            | AppEvent::PressListPicture(_) => true,
+            #[cfg(any(a11y_tree, test))]
+            AppEvent::InsertText(_) => true,
+            _ => false,
+        } && self.interact();
         // Scrolling and focus are this view's own; every other change is the
         // shared page's.
-        let shared = !matches!(
-            event,
-            AppEvent::FocusChanged(_)
-                | AppEvent::ScrollLines(_)
-                | AppEvent::ScrollAt { .. }
-                | AppEvent::ScrollPage(_)
-                | AppEvent::PressListPicture(_)
-        );
+        let shared = interacted
+            || !matches!(
+                event,
+                AppEvent::FocusChanged(_)
+                    | AppEvent::ScrollLines(_)
+                    | AppEvent::ScrollAt { .. }
+                    | AppEvent::ScrollPage(_)
+                    | AppEvent::PressListPicture(_)
+            );
         #[cfg(any(a11y_tree, test))]
         let shared = shared && !matches!(event, AppEvent::RevealControl(_));
         let handled = match event {
@@ -3519,24 +4022,70 @@ impl<'a, 'b> Page<'a, 'b> {
             None,
             Some("Check"),
             StyleRef::Secondary,
-            !self.busy() && self.app.plan_known,
+            self.app.can_check(),
             room,
         );
-        let mut restore = self.fitted_button(
-            "system-state/restore",
-            RESTORE_FINISHED.to_owned(),
-            None,
-            Some("Restore"),
-            StyleRef::Quiet,
-            !self.busy(),
-            room,
-        );
+        if self.app.reviewing() {
+            let label = self.app.review_seconds().map_or_else(
+                || "Apply".to_owned(),
+                |seconds| format!("Apply ({seconds})"),
+            );
+            let cancel = self.fitted_button(
+                "system-state/cancel",
+                "Cancel".to_owned(),
+                None,
+                None,
+                StyleRef::Secondary,
+                true,
+                room,
+            );
+            let mut apply = self.fitted_button(
+                "system-state/apply",
+                label,
+                None,
+                None,
+                StyleRef::Primary,
+                !self.busy(),
+                room,
+            );
+            // Pressing stops the countdown before release. Keep its painted
+            // target stable while the visible label changes to plain Apply.
+            apply.1 = self.m.button_w("Apply (30)").min(room).max(apply.1);
+            apply.0.layout.width = Length::Fixed(apply.1);
+            return Self::button_rows("system-state/footer", vec![check, cancel, apply], room);
+        }
+        // A Restore waiting for another setup says so on its own button, which waits with it.
+        let status = &self.app.status;
+        let restore_waits = status.queued && status.operation == Some(SetupOperation::Restore);
+        let mut restore = if restore_waits {
+            self.fitted_button(
+                "system-state/restore",
+                RESTORE_WAITS.to_owned(),
+                None,
+                Some("Waiting…"),
+                StyleRef::Quiet,
+                false,
+                room,
+            )
+        } else {
+            self.fitted_button(
+                "system-state/restore",
+                RESTORE_FINISHED.to_owned(),
+                None,
+                Some("Restore"),
+                StyleRef::Quiet,
+                !self.busy(),
+                room,
+            )
+        };
         if let UiContent::Button(control) = &mut restore.0.content {
-            control.spec.description = Some(
+            control.spec.description = Some(if restore_waits {
+                QUEUED_RESTORE_NOTE.to_owned()
+            } else {
                 "Puts back the Mac preferences aterm saved before changing them. Sign-outs, \
                  Rust docs, repositories, credentials and permissions stay."
-                    .to_owned(),
-            );
+                    .to_owned()
+            });
         }
         let side_by_side = check.1 + 16.0 + restore.1 <= room;
         if !side_by_side {
@@ -4154,13 +4703,14 @@ impl<'a, 'b> Page<'a, 'b> {
         // The button's key, label, face and shortest face.
         let face = row
             .open
+            .filter(|_| !self.app.reviewing())
             .map(|access| {
                 let (label, short) = open_words(access);
                 let visual = (access == Access::Debugger).then_some(short);
                 (format!("{key}/open"), label, visual, Some(short))
             })
             .or_else(|| {
-                row.turn_on_sync.then(|| {
+                (row.turn_on_sync && !self.app.reviewing()).then(|| {
                     (
                         TURN_ON_SYNC.to_owned(),
                         "Turn On Sync".to_owned(),
@@ -4621,7 +5171,7 @@ impl<'a, 'b> Page<'a, 'b> {
             m.line_h,
             None,
         );
-        let column = vec![
+        let mut column = vec![
             address_caption,
             field(
                 "system-state/url",
@@ -4639,20 +5189,39 @@ impl<'a, 'b> Page<'a, 'b> {
                 Some(blank),
             ),
             help,
-            self.button(
+        ];
+        let join = !self.app.reviewing();
+        if join {
+            column.push(self.button(
                 "system-state/vault/join",
                 "Join".to_owned(),
                 None,
                 StyleRef::Secondary,
                 enabled && self.app.plan_known,
-            ),
-        ];
-        let height = address_h + password_h + help_h + m.control_h * 3.0 + 4.0 * 5.0 + 10.0;
+            ));
+        }
+        let height = address_h
+            + password_h
+            + help_h
+            + m.control_h * if join { 3.0 } else { 2.0 }
+            + 4.0 * if join { 5.0 } else { 4.0 }
+            + 10.0;
         // Each field under its caption, 4pt apart (the column's gap).
         let url_top = top + disclose_h + address_h + 4.0;
         let password_top = url_top + m.control_h + 4.0 + password_h + 4.0;
         let join_top =
             top + disclose_h + address_h + password_h + help_h + m.control_h * 2.0 + 4.0 * 5.0;
+        let mut keys = vec![
+            ("system-state/url".to_owned(), url_top, m.control_h),
+            (
+                "system-state/password".to_owned(),
+                password_top,
+                m.control_h,
+            ),
+        ];
+        if join {
+            keys.push(("system-state/vault/join".to_owned(), join_top, m.control_h));
+        }
         out.push((
             UiNode::new(
                 "system-state/vault",
@@ -4671,15 +5240,7 @@ impl<'a, 'b> Page<'a, 'b> {
             )
             .children(column),
             height,
-            vec![
-                ("system-state/url".to_owned(), url_top, m.control_h),
-                (
-                    "system-state/password".to_owned(),
-                    password_top,
-                    m.control_h,
-                ),
-                ("system-state/vault/join".to_owned(), join_top, m.control_h),
-            ],
+            keys,
         ));
         out
     }
@@ -4759,12 +5320,24 @@ fn rule(key: String) -> UiNode {
     .paint_only()
 }
 
+/// Why the fixtures' repositories failed for a while: GitHub stopped answering, which passes.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+const GITHUB_STOPPED: &str = "GitHub stopped answering partway through.";
+
+/// The repositories' note where GitHub refuses the token the vault syncs, in
+/// `init_observe`'s words (`Wait::TokenRefused`).
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+pub(crate) const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token: renew it in the vault";
+
 /// The page's scenarios for looking at it without a Mac to set up
 /// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `widened`, `debugger`,
 /// `needs-you`, `vault`, `vault-unreached`, `vault-not-syncing`, `vault-not-set-up`,
 /// `sync-off`, `vault-failed`, `set-up`, `non-alab`, `widen-stopped`, `failed`,
 /// `check-failed`, `check-unconfirmed`, `mixed`, `named-result-failed`, `restore-at-login`,
-/// `restore-blocked`, `restore-unlogged`, `vault-source-mismatch`, `plan-unread` and `fresh`.
+/// `restore-blocked`, `restore-unlogged`, `vault-source-mismatch`, `plan-unread`, `fresh`,
+/// `queued-choice`, `queued-restore`, `set-aside`, `set-aside-non-alab`, `startup-retry`,
+/// `restore-failed`, `setup-retried`, `failed-retrying`, `github-sign-in` and
+/// `vault-unreadable`.
 /// Each draws only what the worker gives the page: the readings `init_observe` and the
 /// worker's probes make, and the rows a run, a Check or a Restore reports.
 /// Debug and dev-seam builds only: a release build carries none of
@@ -4826,10 +5399,11 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         note: Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD.to_owned()),
         ..access(Access::LocalNetwork, Untold, None)
     };
-    // The repositories as `init_observe` reads them before the vault has
-    // put a GitHub token on this Mac: no count, and the reason in its note.
+    // The repositories as the worker reads them before the vault has synced
+    // this Mac, and so its GitHub token: no count, and what they wait on in
+    // their note.
     let token_waiting = || Observation {
-        note: Some("Waits for your GitHub token from the Secrets vault".to_owned()),
+        note: Some("Waits for the vault to finish syncing this Mac".to_owned()),
         ..setting(Setting::Repositories, Waiting, None)
     };
     let all = Plan::default();
@@ -5053,12 +5627,18 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
         }
         "failed" => {
+            // A reading that failed for a reason that passes (GitHub stopped answering), once
+            // the run's tries are spent: the headline, the menu line and the diamond say it.
             let mut repositories = setting(Setting::Repositories, Failed, Some("3 of 12"));
-            repositories.detail = Some(
-                "GitHub refused the saved sign-in: the token expired. Sign in with gh auth \
-                 login, then Check again."
-                    .to_owned(),
-            );
+            repositories.detail = Some(GITHUB_STOPPED.to_owned());
+            status.observed = with(in_place(), vec![repositories]);
+        }
+        "github-sign-in" => {
+            // GitHub refuses the token the vault syncs, as `init_observe` reads the
+            // repositories then: a person renews it, so the row needs them, with the remedy in
+            // its note, and no run retries it (§3.6).
+            let mut repositories = setting(Setting::Repositories, NeedsYou, Some("Needs sign-in"));
+            repositories.note = Some(GITHUB_TOKEN_REFUSED.to_owned());
             status.observed = with(in_place(), vec![repositories]);
         }
         "named-result-failed" => {
@@ -5281,6 +5861,101 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     },
                 ],
             );
+        }
+        "queued-choice" => {
+            // The person left Desktop & Dock as is while another setup (another aterm, `aterm
+            // doctor` in a terminal) holds this Mac's setup records: their choice shows, and
+            // waits for it.
+            status.busy = true;
+            status.queued = true;
+            let mut selection = Selection::all();
+            for setting in Group::Desktop.settings() {
+                selection.set(*setting, false);
+            }
+            status.plan = Some(Plan::from(selection));
+            status.observed = with(
+                in_place(),
+                vec![setting(Setting::Dock, Differs, Some("9 apps"))],
+            );
+        }
+        "queued-restore" => {
+            // Restore previous settings waits for another setup that holds the records.
+            status.busy = true;
+            status.queued = true;
+            status.operation = Some(SetupOperation::Restore);
+            status.observed = in_place();
+        }
+        "set-aside" | "set-aside-non-alab" => {
+            // aterm could not read its saved setup and set it aside: the plan it went on with
+            // leaves every Mac preference group as is and sets up aterm's permissions, and, on
+            // an ALab Mac, the vault and the repositories, as a fresh install does.
+            let mut selection = Selection::none();
+            selection.set(Setting::Permissions, true);
+            if name == "set-aside" {
+                selection.set(Setting::Secrets, true);
+                selection.set(Setting::Repositories, true);
+            }
+            status.plan = Some(Plan::from(selection));
+            status.recovered = true;
+            status.observed = with(
+                in_place(),
+                vec![
+                    untold_lan(),
+                    setting(Setting::Dock, Differs, Some("9 apps")),
+                    setting(Setting::Spotlight, Differs, Some("Docs indexed")),
+                ],
+            );
+        }
+        "startup-retry" => {
+            // The launch's setup could not start just now, and tries again by itself.
+            status.retrying = true;
+            status.rows.push(calm_setup_row(STARTUP_RETRY_NOTE));
+            status.observed = with(
+                in_place(),
+                vec![setting(Setting::Dock, Differs, Some("9 apps"))],
+            );
+        }
+        "restore-failed" => {
+            // A Restore that failed as a whole: aterm cannot read what it saved before setup
+            // changed this Mac.
+            status.observed = in_place();
+            status.rows = vec![SetupStatusRow {
+                name: RESTORE_FINISHED.into(),
+                status: "failed".into(),
+                detail: RESTORE_BACKUP_UNREAD_NOTE.into(),
+            }];
+        }
+        "setup-retried" => {
+            // A setup run that did not finish as a whole, which the run tries again by itself.
+            status.retrying = true;
+            status.observed = in_place();
+            status.rows = vec![SetupStatusRow {
+                name: SETUP_ROW.into(),
+                status: "failed".into(),
+                detail: String::new(),
+            }];
+        }
+        "failed-retrying" => {
+            // A reading that failed for a reason that passes (GitHub stopped answering) while
+            // the run still tries again by itself: it waits for that try, calmly, and its row
+            // keeps its reason under the waiting chip.
+            status.retrying = true;
+            let mut repositories = setting(Setting::Repositories, Failed, Some("3 of 12"));
+            repositories.detail = Some(GITHUB_STOPPED.to_owned());
+            status.observed = with(in_place(), vec![repositories]);
+        }
+        "vault-unreadable" => {
+            // aterm cannot read this Mac's vault settings, as `init_observe` reads them: one calm
+            // note in the page's words, and the error (a path) for `aterm doctor`'s eyes alone.
+            let mut vault = read(Subject::Setting(Setting::Secrets), Unknown, None);
+            vault.note = Some(
+                "aterm cannot read this Mac's vault settings; aterm secrets status says why"
+                    .to_owned(),
+            );
+            vault.detail = Some(
+                "~/.config/aterm/secrets/source.toml: Permission denied (os error 13)".to_owned(),
+            );
+            status.observed = with(in_place(), vec![vault]);
         }
         _ => return None,
     }

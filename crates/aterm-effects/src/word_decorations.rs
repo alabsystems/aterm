@@ -4921,23 +4921,26 @@ impl WordDecorations {
         geom: EffectGeom,
     ) -> PrepassFlags {
         let mut flags = PrepassFlags::default();
-        let (mut cat_slots, mut animal_slots) =
-            self.occ.iter().fold((0usize, 0usize), |(c, a), occ| {
-                let Some(g) = occ.spec.graphic else {
-                    return (c, a);
-                };
-                if occ.inert {
-                    return (c, a);
-                }
-                let live = self.persist.get(&occ.ident).is_some_and(|e| {
-                    e.shown_as == Some(KittyShownAs::Cat) && !e.peek_done && !e.inert()
-                });
-                match g.collection {
-                    _ if !live => (c, a),
-                    Collection::Animals => (c, a + 1),
-                    _ => (c + 1, a),
-                }
+        let mut cat_slots = 0usize;
+        let mut animal_slots = 0usize;
+        for occ in &self.occ {
+            if occ.inert {
+                continue;
+            }
+            let Some(g) = occ.spec.graphic else {
+                continue;
+            };
+            let live = self.persist.get(&occ.ident).is_some_and(|e| {
+                e.shown_as == Some(KittyShownAs::Cat) && !e.peek_done && !e.inert()
             });
+            if live {
+                if g.collection == Collection::Animals {
+                    animal_slots += 1;
+                } else {
+                    cat_slots += 1;
+                }
+            }
+        }
         for occ in &self.occ {
             if occ.inert {
                 continue;
@@ -6107,7 +6110,7 @@ const fn dwell_base_ms(gkey: u64, range: (u32, u32)) -> u64 {
     } else {
         (range.1 as u64, range.0 as u64)
     };
-    lo + (mix(gkey ^ DWELL_SALT) % 4) * ((hi - lo) / 3)
+    lo + (mix(gkey ^ DWELL_SALT) & 3) * ((hi - lo) / 3)
 }
 
 #[inline]
@@ -6602,14 +6605,15 @@ const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
     }
-    let floor = PAPER_GLOW_KEEP * (lum_bg + 0.05) / (lum_fg + 0.05);
+    let num = lum_bg + 0.05;
+    let floor = PAPER_GLOW_KEEP * num / (lum_fg + 0.05);
     #[inline]
-    const fn reads_rgb(rgb: u32, lum_bg: f32, floor: f32) -> bool {
+    const fn reads_rgb(rgb: u32, lum_bg: f32, num: f32, floor: f32) -> bool {
         let lum = relative_luminance(rgb).min(lum_bg);
-        (lum_bg + 0.05) / (lum + 0.05) >= floor
+        num / (lum + 0.05) >= floor
     }
     let mut hi_rgb = mix_rgb(fg, lit, amp);
-    if reads_rgb(hi_rgb, lum_bg, floor) {
+    if reads_rgb(hi_rgb, lum_bg, num, floor) {
         return 1.0;
     }
     let mut lo_rgb = fg & 0x00FF_FFFF;
@@ -6618,7 +6622,7 @@ const fn paper_glow_scale_lum(fg: u32, lit: u32, lum_bg: f32, amp: f32) -> f32 {
     while step < 12 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix_rgb(fg, lit, mid);
-        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(mid_rgb, lum_bg, floor)) {
+        if mid_rgb == lo_rgb || (mid_rgb != hi_rgb && reads_rgb(mid_rgb, lum_bg, num, floor)) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
@@ -6838,16 +6842,26 @@ fn emit_ink(
 
 const fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum_bg: f32) -> f32 {
     #[inline]
-    const fn contrast(c: u32, lum_bg: f32) -> f32 {
+    const fn contrast(c: u32, lum_bg: f32, lum_bg_plus: f32) -> f32 {
         let la = relative_luminance(c);
-        (la.max(lum_bg) + 0.05) / (la.min(lum_bg) + 0.05)
+        if la >= lum_bg {
+            (la + 0.05) / lum_bg_plus
+        } else {
+            lum_bg_plus / (la + 0.05)
+        }
     }
+    let lum_bg_plus = lum_bg + 0.05;
     let mut strength = ink_strength.clamp(0.0, 1.0);
     let step = strength * 0.125;
     'guard: while strength > 0.0 {
         let mut idx = 0;
         while idx < samples.len() {
-            if contrast(mix_rgb(fg_first, samples[idx], strength), lum_bg) < MIN_INK_CONTRAST {
+            if contrast(
+                mix_rgb(fg_first, samples[idx], strength),
+                lum_bg,
+                lum_bg_plus,
+            ) < MIN_INK_CONTRAST
+            {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }
@@ -6995,7 +7009,7 @@ fn emit_rainbow_sparkles(
     let base_hue = rainbow_base_hue(occ.genome.gkey);
     let lift = ((i32::from(geom.cell_h).max(8) / 3).min(127)) as i8;
     let count = 3usize.min(MAX_DECORATIONS.saturating_sub(out.len()));
-    let inv_denom = 1.0 / (count.saturating_sub(1).max(1)) as f32;
+    let inv_denom = if count >= 3 { 0.5 } else { 1.0 };
     let p_tau = p * 4.0 * core::f32::consts::TAU;
     let seed_phase = (occ.seed & 0xff) as f32 * 0.013;
     let width_f = f32::from(width);
@@ -7306,7 +7320,7 @@ enum PeekDir {
 
 const CAT_MAX_BAND_OCCUPANCY: f32 = 0.75;
 
-fn clear_band_occupancy(
+const fn clear_band_occupancy(
     cells: &[Vec<RenderCell>],
     r0: usize,
     r1: usize,
@@ -7324,25 +7338,36 @@ fn clear_band_occupancy(
         return None;
     }
     let mut occupied = 0u32;
-    for r in r0..=r1 {
-        let Some(line) = cells.get(r) else {
-            continue;
-        };
-        let Some(slice) = line.get(c0..line.len().min(c1.saturating_add(1))) else {
-            continue;
-        };
-        for cell in slice {
-            if cell.wide {
-                return None;
-            }
-            let ch = cell.ch;
-            if is_ink_char(ch) {
-                if !('\u{2500}'..='\u{259F}').contains(&ch) {
+    let mut r = r0;
+    while r <= r1 {
+        if r < cells.len() {
+            let line = cells[r].as_slice();
+            let end_cand = c1.saturating_add(1);
+            let end = if end_cand < line.len() {
+                end_cand
+            } else {
+                line.len()
+            };
+            let mut c = c0;
+            while c < end {
+                let cell = &line[c];
+                if cell.wide {
                     return None;
                 }
-                occupied += 1;
+                let ch = cell.ch;
+                if is_ink_char(ch) {
+                    if !matches!(ch, '\u{2500}'..='\u{259F}') {
+                        return None;
+                    }
+                    occupied += 1;
+                }
+                c += 1;
             }
         }
+        if r == usize::MAX {
+            break;
+        }
+        r += 1;
     }
     Some(occupied as f32 / total as f32)
 }
@@ -7444,7 +7469,7 @@ const fn band_occupancy(
     Some(occupied as f32 / sampled as f32)
 }
 
-fn cat_peek_plan(
+const fn cat_peek_plan(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
     row: u16,
@@ -7456,37 +7481,49 @@ fn cat_peek_plan(
     if geom.cell_w == 0 || geom.cell_h == 0 || cells.is_empty() {
         return None;
     }
-    let special = feline_magic
-        .then(|| special_variant_v4(genome.magic))
-        .flatten();
-    let variant = special.unwrap_or_else(|| cat_variant_v4(genome.gkey));
+    let variant = if feline_magic && let Some(v) = special_variant_v4(genome.magic) {
+        v
+    } else {
+        cat_variant_v4(genome.gkey)
+    };
     let g = cat_geometry_for(start, end, genome.gkey, geom, variant);
-    let cw = i64::from(geom.cell_w);
-    let ch = i64::from(geom.cell_h);
-    let x0 = i64::from(g.x);
-    let x1 = (x0 + i64::from(g.w)).min(i64::from(geom.cols) * cw);
+    let cw = geom.cell_w as i64;
+    let ch = geom.cell_h as i64;
+    let x0 = g.x as i64;
+    let x1_max = (geom.cols as i64) * cw;
+    let x1_cand = x0 + (g.w as i64);
+    let x1 = if x1_cand < x1_max { x1_cand } else { x1_max };
     if x1 <= x0 {
         return None;
     }
-    let c0 = usize::try_from(x0 / cw).unwrap_or(0);
-    let c1 = usize::try_from((x1 - 1) / cw).unwrap_or(usize::MAX);
-    let body = (i64::from(g.hart) - i64::from(g.chin)).max(0);
-    let band_rows = usize::try_from((body + ch - 1) / ch).unwrap_or(0);
+    let c0 = if x0 >= 0 { (x0 / cw) as usize } else { 0 };
+    let c1 = if x1 > 0 {
+        ((x1 - 1) / cw) as usize
+    } else {
+        usize::MAX
+    };
+    let body_diff = (g.hart as i64) - (g.chin as i64);
+    let body = if body_diff > 0 { body_diff } else { 0 };
+    let band_rows = ((body + ch - 1) / ch) as usize;
     if band_rows == 0 {
         return Some(PeekDir::Up);
     }
-    let trigger = usize::from(row);
-    let rows = usize::from(geom.rows);
-    let up_band = (trigger >= band_rows)
-        .then(|| clear_band_occupancy(cells, trigger - band_rows, trigger - 1, c0, c1))
-        .flatten();
-    if up_band == Some(0.0) {
+    let trigger = row as usize;
+    let rows = geom.rows as usize;
+    let up_band = if trigger >= band_rows {
+        clear_band_occupancy(cells, trigger - band_rows, trigger - 1, c0, c1)
+    } else {
+        None
+    };
+    if matches!(up_band, Some(u) if u == 0.0) {
         return Some(PeekDir::Up);
     }
-    let down_band = (trigger + band_rows < rows)
-        .then(|| clear_band_occupancy(cells, trigger + 1, trigger + band_rows, c0, c1))
-        .flatten();
-    if down_band == Some(0.0) {
+    let down_band = if trigger + band_rows < rows {
+        clear_band_occupancy(cells, trigger + 1, trigger + band_rows, c0, c1)
+    } else {
+        None
+    };
+    if matches!(down_band, Some(d) if d == 0.0) {
         return Some(PeekDir::Down);
     }
     if up_band.is_none() && down_band.is_none() {
@@ -7498,12 +7535,24 @@ fn cat_peek_plan(
         trigger,
         c0,
         c1,
-        Some(usize::from(start)..=usize::from(end)),
+        Some((start as usize)..=(end as usize)),
     );
     const INV_3: f32 = 1.0 / 3.0;
-    let score_of = |band: f32| own.map_or(band, |o| (band * 2.0 + o) * INV_3);
-    let up = up_band.map(score_of);
-    let down = down_band.map(score_of);
+    #[inline]
+    const fn score_of(band: f32, own: Option<f32>) -> f32 {
+        match own {
+            Some(o) => (band * 2.0 + o) * INV_3,
+            None => band,
+        }
+    }
+    let up = match up_band {
+        Some(b) => Some(score_of(b, own)),
+        None => None,
+    };
+    let down = match down_band {
+        Some(b) => Some(score_of(b, own)),
+        None => None,
+    };
     match (up, down) {
         (Some(u), Some(d)) => {
             let (score, dir) = if d < u {
@@ -7511,10 +7560,26 @@ fn cat_peek_plan(
             } else {
                 (u, PeekDir::Up)
             };
-            (score <= CAT_MAX_BAND_OCCUPANCY).then_some(dir)
+            if score <= CAT_MAX_BAND_OCCUPANCY {
+                Some(dir)
+            } else {
+                None
+            }
         }
-        (Some(u), None) => (u <= CAT_MAX_BAND_OCCUPANCY).then_some(PeekDir::Up),
-        (None, Some(d)) => (d <= CAT_MAX_BAND_OCCUPANCY).then_some(PeekDir::Down),
+        (Some(u), None) => {
+            if u <= CAT_MAX_BAND_OCCUPANCY {
+                Some(PeekDir::Up)
+            } else {
+                None
+            }
+        }
+        (None, Some(d)) => {
+            if d <= CAT_MAX_BAND_OCCUPANCY {
+                Some(PeekDir::Down)
+            } else {
+                None
+            }
+        }
         (None, None) => None,
     }
 }

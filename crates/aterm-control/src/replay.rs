@@ -29,7 +29,24 @@ impl ReplayEngine {
     /// Restores an engine from `cp`, a keyframe this process took of the engine it replays ([`Terminal::replay_from_checkpoint`]), that resizes under `policy` and verifies shell marks with the nonce `cp` carries.
     #[must_use]
     pub fn from_checkpoint(cp: &TerminalCheckpoint, policy: ResizePolicy) -> Self {
-        let mut term = Terminal::replay_from_checkpoint(cp);
+        Self::restored(Terminal::replay_from_checkpoint(cp), cp, policy)
+    }
+
+    /// [`Self::from_checkpoint`] with the history kept to `store_lines` lines past the ring ([`Terminal::replay_from_checkpoint_bounded`]), so [`Self::fork`] copies it in bounded time.
+    #[must_use]
+    pub fn from_checkpoint_bounded(
+        cp: &TerminalCheckpoint,
+        policy: ResizePolicy,
+        store_lines: usize,
+    ) -> Self {
+        Self::restored(
+            Terminal::replay_from_checkpoint_bounded(cp, store_lines),
+            cp,
+            policy,
+        )
+    }
+
+    fn restored(mut term: Terminal, cp: &TerminalCheckpoint, policy: ResizePolicy) -> Self {
         if let Some(nonce) = cp.shell_integration_nonce {
             term.authorize_shell_integration(nonce.0);
         }
@@ -154,7 +171,12 @@ mod tests {
             foreign.set_console_host_posture(other);
             let fresh = ReplayEngine::new(6, 20, policy);
             let restored = ReplayEngine::from_checkpoint(&foreign.checkpoint(), policy);
-            for (how, mut engine) in [("new", fresh), ("from_checkpoint", restored)] {
+            let bounded = ReplayEngine::from_checkpoint_bounded(&foreign.checkpoint(), policy, 64);
+            for (how, mut engine) in [
+                ("new", fresh),
+                ("from_checkpoint", restored),
+                ("from_checkpoint_bounded", bounded),
+            ] {
                 assert!(replays(engine.terminal(), policy), "{how} {policy:?}");
                 engine.process(&lines);
                 engine.resize(10, 20);

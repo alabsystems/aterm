@@ -1509,6 +1509,37 @@ enum Look {
     Stop(&'static str),
 }
 
+/// The write a typing hold waits for the program to read and draw ([`TypingHold::held`]).
+#[derive(Clone, Copy)]
+struct Sent<'a> {
+    /// The caret the hold read just before the write, which the write's echo moves.
+    from: aterm_core::grid::Cursor,
+    /// A guarded submit's guard, at its tail: the cursor row matching it shows the write drawn,
+    /// though the program left the caret where it was.
+    guard: Option<&'a dyn aterm_core::terminal::RowMatch>,
+}
+
+impl Sent<'_> {
+    const fn key(from: aterm_core::grid::Cursor) -> Self {
+        Self { from, guard: None }
+    }
+
+    /// Whether `terminal`, its caret at `cursor`, shows the write drawn: the caret moved off
+    /// [`Sent::from`], or the cursor row matches the guard.
+    fn drawn(&self, terminal: &Terminal, cursor: aterm_core::grid::Cursor) -> bool {
+        use aterm_core::terminal::{RowRange, first_matching_row};
+        let row = usize::from(cursor.row);
+        let range = RowRange::Span {
+            start: row,
+            end: row,
+        };
+        self.from != cursor
+            || self
+                .guard
+                .is_some_and(|guard| first_matching_row(terminal, guard, range).is_some())
+    }
+}
+
 impl TypingHold {
     fn of(
         terminal: &Terminal,
@@ -1524,12 +1555,7 @@ impl TypingHold {
         }
     }
 
-    fn look(
-        &mut self,
-        terminal: &Terminal,
-        ctx: &SessionCtx,
-        sent_from: Option<aterm_core::grid::Cursor>,
-    ) -> Look {
+    fn look(&mut self, terminal: &Terminal, ctx: &SessionCtx, sent: Option<Sent<'_>>) -> Look {
         if ctx.human_input.seq() != self.person {
             return Look::Stop("person");
         }
@@ -1548,33 +1574,45 @@ impl TypingHold {
         }) || !frame.holds(terminal, usize::from(cursor.row))
         {
             Look::Stop("changed")
-        } else if (sent_from.is_some() && keys_unread(ctx)) || sent_from == Some(cursor) {
+        } else if sent.is_some_and(|sent| keys_unread(ctx) || !sent.drawn(terminal, cursor)) {
             Look::Wait
         } else {
             Look::Held(cursor)
         }
     }
 
+    /// Waits for a look that holds, cut at `deadline`. A wait that ends held gives the time it
+    /// took back to `deadline`: the program drawing a frame or an echo is not the turn's own
+    /// time, so a starved program that keeps drawing is never cut part-way by the sum of its
+    /// lags, and `deadline`'s slack bounds each wait alone, a hang detector.
     fn held(
         &mut self,
         term: &Arc<Mutex<Terminal>>,
         ctx: &SessionCtx,
         sub: &crate::session_watch::Subscription,
-        sent_from: Option<aterm_core::grid::Cursor>,
+        sent: Option<Sent<'_>>,
         tick: std::time::Duration,
-        deadline: std::time::Instant,
+        deadline: &mut std::time::Instant,
     ) -> Result<aterm_core::grid::Cursor, &'static str> {
+        let mut since = None;
         loop {
-            let look = self.look(&term_lock(term), ctx, sent_from);
+            let look = self.look(&term_lock(term), ctx, sent);
             match look {
-                Look::Held(cursor) => return Ok(cursor),
+                Look::Held(cursor) => {
+                    if let Some(since) = since {
+                        let waited = hold_wait_now().saturating_duration_since(since);
+                        *deadline = deadline.checked_add(waited).unwrap_or(*deadline);
+                    }
+                    return Ok(cursor);
+                }
                 Look::Stop(why) => return Err(why),
                 Look::Wait => {
                     let now = hold_wait_now();
-                    if now >= deadline {
+                    if now >= *deadline {
                         return Err("deadline");
                     }
-                    let _ = sub.wait(tick.min(deadline - now));
+                    since.get_or_insert(now);
+                    let _ = sub.wait(tick.min(*deadline - now));
                 }
             }
         }
@@ -1587,7 +1625,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// A test's hand at this thread's typing-hold waits: it plays the program there and answers the instant the wait is judged at (`None`: the clock).
+/// A test's hand at this thread's typing-hold waits: it plays the program there and answers the instant the wait is judged at, and the instant a wait that held ends at (`None`: the clock).
 #[cfg(test)]
 pub(crate) fn set_hold_wait_for_test(hand: Option<Box<dyn Fn() -> std::time::Instant>>) {
     HOLD_WAIT_FOR_TEST.with(|slot| *slot.borrow_mut() = hand);
@@ -1767,19 +1805,22 @@ fn watcher_look(
 enum PressLook {
     Latched,
     Started,
+    /// The cursor left the row the text was typed on: a program with no command blocks took the line.
+    Moved,
 }
 
 fn press_look(
     term: &Arc<Mutex<Terminal>>,
     id: aterm_core::terminal::WatchId,
-    base: Option<u64>,
+    (base, typed_row): (Option<u64>, Option<u16>),
 ) -> impl FnMut(std::time::Instant, bool, bool) -> (Option<PressLook>, Option<std::time::Instant>) + '_
 {
     move |now, parked, closing| {
         let mut t = term_lock(term);
         fire_idle_unless_parked(&mut t, now, parked);
         let latched = t.watch_poll(id).is_some();
-        if latched || closing {
+        let moved = typed_row.is_some_and(|row| t.cursor().row != row);
+        if latched || moved || closing {
             t.watch_disarm(id);
         }
         let started = closing && base.is_some_and(|base| t.started_command_seq() > base);
@@ -1787,6 +1828,8 @@ fn press_look(
             Some(PressLook::Started)
         } else if latched {
             Some(PressLook::Latched)
+        } else if moved {
+            Some(PressLook::Moved)
         } else {
             None
         };
@@ -2289,16 +2332,17 @@ fn turn_attempt(
             driver: io.driver.clone(),
             typing: true,
         });
-        (id, own)
+        (id, own.map(|hand| (hand, now)))
     };
-    let by = typed_by(&io.by, handed_back.as_ref());
+    let by = typed_by(&io.by, handed_back.as_ref().map(|(hand, _)| hand));
     struct LeaseGuard<'a> {
         turn_lease: &'a std::sync::Mutex<Option<crate::Lease>>,
         turns: &'a std::sync::Mutex<crate::turn_ledger::TurnLedger>,
         id: u64,
         sid: &'a aterm_session::SessionId,
         driver: Option<&'a aterm_session::SessionId>,
-        handed_back: Option<crate::Lease>,
+        /// The serving connection's own hand the turn holds the slot in place of, and when it took it.
+        handed_back: Option<(crate::Lease, u64)>,
     }
     impl Drop for LeaseGuard<'_> {
         fn drop(&mut self) {
@@ -2309,7 +2353,16 @@ fn turn_attempt(
             let mut lease = self.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(lease.as_ref(), Some(crate::Lease::Turn { id: held, .. }) if *held == self.id)
             {
-                *lease = self.handed_back.take();
+                // The hand's connection waits on this turn and cannot renew it meanwhile: its
+                // clock stood still while the turn held the slot, so it comes back with the time
+                // it had left, never lapsed by a turn longer than its TTL.
+                *lease = self.handed_back.take().map(|(mut hand, taken_us)| {
+                    if let crate::Lease::Drive { expires_us, .. } = &mut hand {
+                        let held = crate::metrics::now_us().saturating_sub(taken_us);
+                        *expires_us = expires_us.saturating_add(held);
+                    }
+                    hand
+                });
                 drop(lease);
                 crate::presence::post_lease_changed(self.sid);
                 if let Some(driver) = self.driver {
@@ -2341,7 +2394,7 @@ fn turn_attempt(
 
     let now0 = Instant::now();
     let started_ms = crate::turn_ledger::now_ms();
-    let deadline = now0 + Duration::from_millis(timeout_ms);
+    let mut deadline = now0 + Duration::from_millis(timeout_ms);
     let arch = crate::turn_ledger::ArchMark::of(&term_lock(term));
 
     let exited = exit_probe(store, session);
@@ -2438,6 +2491,8 @@ fn turn_attempt(
     let cadence = Duration::from_millis(cadence_ms);
     let mut committed: Option<crate::control::CommittedInput> = None;
     let mut echo_until = None;
+    // The caret the typing hold read just before the turn's last write, which its echo moves.
+    let mut sent_from = None;
     if !text.is_empty() {
         if typed {
             use aterm_grapheme::GraphemeClusters;
@@ -2449,7 +2504,6 @@ fn turn_attempt(
             if !keys.is_empty() && last_due >= deadline {
                 return typed_cut(term, "deadline", 0, 0, turn_id);
             }
-            let mut sent_from = None;
             for ev in keys {
                 let now = Instant::now();
                 if due > now {
@@ -2467,9 +2521,9 @@ fn turn_attempt(
                         term,
                         ctx,
                         &sub,
-                        sent_from.filter(|_| digit),
+                        sent_from.filter(|_| digit).map(Sent::key),
                         cadence,
-                        deadline,
+                        &mut deadline,
                     ) {
                         Ok(cursor) => sent_from = Some(cursor),
                         Err(why) => return typed_cut(term, why, typed_keys, 0, turn_id),
@@ -2495,11 +2549,13 @@ fn turn_attempt(
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
-                if let Some(Err(why)) = hold
+                match hold
                     .as_mut()
-                    .map(|h| h.held(term, ctx, &sub, None, cadence, deadline))
+                    .map(|h| h.held(term, ctx, &sub, None, cadence, &mut deadline))
                 {
-                    return typed_cut(term, why, typed_keys, 0, turn_id);
+                    Some(Err(why)) => return typed_cut(term, why, typed_keys, 0, turn_id),
+                    Some(Ok(cursor)) => sent_from = Some(cursor),
+                    None => {}
                 }
                 if let Some(cut) = halted(committed.is_some().then_some((typed_keys, 0))) {
                     return cut;
@@ -2528,6 +2584,25 @@ fn turn_attempt(
             }
             committed = Some(crate::control::CommittedInput::enter());
         }
+        // A guarded submit judges the tail the program drew, which a starved program draws
+        // later than any settle: it reads and draws the last write before its echo settles,
+        // the caret moving or the cursor row already matching the guard.
+        if let (Some(h), Some(from), Some(guard)) =
+            (hold.as_mut(), sent_from, submit_matcher.as_deref())
+            && let Err(why) = h.held(
+                term,
+                ctx,
+                &sub,
+                Some(Sent {
+                    from,
+                    guard: Some(guard),
+                }),
+                cadence,
+                &mut deadline,
+            )
+        {
+            return typed_cut(term, why, typed_keys, pasted_graphemes, turn_id);
+        }
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
             return format!("ERR {WAITS_FULL}\n");
         };
@@ -2539,14 +2614,15 @@ fn turn_attempt(
         }
         if let Some(Err(why)) = hold
             .as_mut()
-            .map(|h| h.held(term, ctx, &sub, None, cadence, deadline))
+            .map(|h| h.held(term, ctx, &sub, None, cadence, &mut deadline))
         {
             return typed_cut(term, why, typed_keys, pasted_graphemes, turn_id);
         }
     }
 
     let mut submitted = false;
-    let mut guarded_presses = 0u32;
+    let mut pressed = 0u32;
+    let mut unjudged = false;
     let task_found = task_record_of(ctx).map(|task| (task.rev, task.entered));
     let agent_found = {
         let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -2586,6 +2662,8 @@ fn turn_attempt(
         } else {
             None
         };
+        // No composer and no command block to read: the screen alone shows the program took the line.
+        let by_screen = composer_key.is_none() && !submit_verify_block;
         for press_no in 0..presses {
             // A re-press is for an Enter the program read and swallowed; one still unread would
             // only queue another behind it (`input_stall::repress_would_queue`).
@@ -2606,12 +2684,13 @@ fn turn_attempt(
                 return cut;
             }
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
-            let (base_started, mut id) = {
+            let (base_started, typed_row, mut id) = {
                 let mut t = term_lock(term);
                 let base = t.started_command_seq();
+                let row = by_screen.then(|| t.cursor().row);
                 let after = t.content_seq();
                 match t.watch(WatcherSpec::SeqAdvanced { after }, Instant::now()) {
-                    Some(id) => (base, id),
+                    Some(id) => (base, row, id),
                     None => return format!("ERR {WAITS_FULL}\n"),
                 }
             };
@@ -2619,7 +2698,7 @@ fn turn_attempt(
             let first = !wrote.replace(true);
             if let Some(guard) = submit_matcher.as_deref() {
                 match guarded_submit(term, ctx, guard, window, io.mark) {
-                    GuardedSubmit::Pressed => guarded_presses += 1,
+                    GuardedSubmit::Pressed => {}
                     GuardedSubmit::Missed => {
                         term_lock(term).watch_disarm(id);
                         if press_no == 0 {
@@ -2652,16 +2731,21 @@ fn turn_attempt(
                 term_lock(term).watch_disarm(id);
                 return undelivered(first, KEY_DELIVERY_FAILED);
             }
+            pressed += 1;
             let mut advanced = false;
             let mut composer_gone = false;
             loop {
                 match Park::new(&sub, &exited_now, OnHangup::Finish, stretch).run(
                     window,
-                    press_look(term, id, submit_verify_block.then_some(base_started)),
+                    press_look(
+                        term,
+                        id,
+                        (submit_verify_block.then_some(base_started), typed_row),
+                    ),
                     disarm_watch(term, id),
                 ) {
                     Parked::Exited => return "ERR exited\n".to_string(),
-                    Parked::Done(PressLook::Started) => {
+                    Parked::Done(PressLook::Started | PressLook::Moved) => {
                         submitted = true;
                         break;
                     }
@@ -2719,6 +2803,7 @@ fn turn_attempt(
                 break;
             }
         }
+        unjudged = by_screen && !submitted && pressed > 0;
     }
 
     drop(committed);
@@ -2836,9 +2921,10 @@ fn turn_attempt(
         use std::fmt::Write as _;
         let _ = write!(verdict, " yielded_ms={ms}");
     }
-    if submit_matcher.is_some() {
+    // A screen that showed no press is no proof the program left the line: the Enters are named.
+    if submit_matcher.is_some() || unjudged {
         use std::fmt::Write as _;
-        let _ = write!(verdict, " pressed={guarded_presses}");
+        let _ = write!(verdict, " pressed={pressed}");
     }
     if let Some((rev, _)) = task_found {
         use std::fmt::Write as _;

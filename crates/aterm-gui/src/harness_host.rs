@@ -3830,6 +3830,20 @@ impl IdleHost for WorkerIdle {
         }
     }
 
+    /// The loop decided a turn break, whether or not this worker wants a step there
+    /// ([`IdleHost::turn_break`]): the ask to free space (`disk-free@v1`) seats a session at
+    /// every disk look as its worker found it at its last turn break, so the finding is made here,
+    /// once per decided turn break, not only where a line is owed and the worker steps
+    /// ([`Self::idle_point`]). Otherwise a session found unfit once stayed unfit in every later
+    /// episode after it was fit again, and one never owed a line was never found unfit at all.
+    /// The finding reads the session's records ([`Self::disk_free_unfit`]), so the wait's later
+    /// looks at the same point, which would find the same, are not told.
+    fn turn_break(&self, theirs: Option<Guard>) {
+        if self.on() {
+            self.disk_ask_found(theirs);
+        }
+    }
+
     /// The usage tap at a decided idle turn end.
     fn usage_tap(&self) {
         if let Some(word) = self.tap_step(TapAt::Point) {
@@ -3837,8 +3851,11 @@ impl IdleHost for WorkerIdle {
         }
     }
 
-    /// The usage tap at a busy read, once per [`BUSY_TAP_S`] at most.
+    /// The usage tap at a busy read, once per [`BUSY_TAP_S`] at most. The session works again,
+    /// so what its last turn break found of it (`finished`, `taskless`) no longer bars the ask to
+    /// free space from seating it ([`disk_ask_busy`]).
     fn busy_tap(&self) {
+        disk_ask_busy(self.hooks.acts.disk_board, &self.sid);
         if let Some(word) = self.tap_step(TapAt::Busy) {
             aterm_log::info!("harness @{}: usage tap mid-turn: {word}", self.sid);
         }
@@ -4717,10 +4734,10 @@ impl WorkerIdle {
         // they keep it (the person's own exchange, a manager's wait: `IdlePoint::theirs`) is
         // unfit too, as no later turn break of theirs would take the line; one a person's grace
         // alone holds keeps its line owed for a later turn break, as the occupancy door's does.
-        let unfit = self
-            .disk_free_unfit()
-            .or_else(|| point.theirs.map(Guard::word));
-        disk_ask_fit(self.hooks.acts.disk_board, &self.sid, unfit);
+        // The loop told the finding at the turn break's decision, before it asked whether this
+        // worker wants a step there ([`IdleHost::turn_break`]); it is made again as the act reads
+        // it, as the line may come owed at a later look of the wait.
+        let unfit = self.disk_ask_found(point.theirs);
         if let Some(owed) = disk_ask_owed(self.hooks.acts.disk_board, &self.sid) {
             let held = point.held.map(Guard::word);
             let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit, held);
@@ -4973,6 +4990,18 @@ impl WorkerIdle {
         } else {
             None
         }
+    }
+
+    /// Why the ask to free space may not seat this session as of the turn break it rests at
+    /// ([`Self::disk_free_unfit`], or `theirs`: the person's own exchange or a manager's wait,
+    /// [`IdlePoint::theirs`]), written to the board every disk look reads ([`disk_ask_fit`]).
+    fn disk_ask_found(&self, theirs: Option<Guard>) -> Option<&'static str> {
+        let found = crate::disk_board::Unfit {
+            own: self.disk_free_unfit(),
+            theirs: theirs.map(Guard::word),
+        };
+        disk_ask_fit(self.hooks.acts.disk_board, &self.sid, found);
+        found.bars(false)
     }
 
     /// Why the disk resume is owed no longer, by the gates a continuation keeps.
@@ -17377,16 +17406,28 @@ fn disk_ask_owed(board: &Shelf, sid: &str) -> Option<crate::disk_board::AskOwed>
     board.board_lock().asks.get(sid).cloned()
 }
 
-/// Why tab `sid` may not be asked to free space now (`None`: it may), for the look's seats.
-fn disk_ask_fit(board: &Shelf, sid: &str, unfit: Option<&'static str>) {
+/// Why tab `sid` may not be asked to free space as of the turn break it rests at (nothing: it
+/// may), for the look's seats.
+fn disk_ask_fit(board: &Shelf, sid: &str, found: crate::disk_board::Unfit) {
     let mut b = board.board_lock();
-    match unfit {
-        Some(why) => {
-            b.unfit.insert(sid.to_owned(), why);
-        }
-        None => {
-            b.unfit.remove(sid);
-        }
+    if found == crate::disk_board::Unfit::default() {
+        b.unfit.remove(sid);
+    } else {
+        b.unfit.insert(sid.to_owned(), found);
+    }
+}
+
+/// Tab `sid` works again (a busy read): what its worker found of the session itself at its last
+/// turn break no longer holds, as it was given something to do ([`crate::disk_board::Unfit::own`]);
+/// whose it is holds on.
+fn disk_ask_busy(board: &Shelf, sid: &str) {
+    let mut b = board.board_lock();
+    let Some(found) = b.unfit.get_mut(sid) else {
+        return;
+    };
+    found.own = None;
+    if found.theirs.is_none() {
+        b.unfit.remove(sid);
     }
 }
 

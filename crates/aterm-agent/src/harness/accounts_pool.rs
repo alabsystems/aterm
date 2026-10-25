@@ -52,9 +52,6 @@ impl Seat<'_> {
     /// Why a roster file there does not parse.
     pub fn roster(&self, cli: Cli) -> Result<Roster, String> {
         let path = self.config_dir.join(cli.accounts().roster_file);
-        if !path.exists() {
-            return Ok(Roster::default());
-        }
         Roster::load_for(cli, &path)
     }
 
@@ -73,6 +70,9 @@ impl Seat<'_> {
     /// Why the roster or the bindings do not read.
     pub fn bound_roster(&self, cli: Cli) -> Result<Roster, String> {
         let roster = self.roster(cli)?;
+        if roster.rows.is_empty() {
+            return Ok(roster);
+        }
         let (logins, _) = self
             .store(cli)
             .load_logins(self.now)
@@ -168,17 +168,20 @@ fn row_home(cli: Cli, row: &Row, home: &Path) -> Option<std::path::PathBuf> {
 /// wall it names) in one transaction. The labels recorded. When an overlay CLI's default row is
 /// due, its default home is read before linking and reading the overlay homes so any shared
 /// suffix file the CLI creates at startup exists there first.
+/// # Errors
+/// Account state could not be read or fresh usage could not be recorded. A caller must
+/// not select from the old state after a failed write.
 pub fn record_usage(
     seat: &Seat<'_>,
     cli: Cli,
     roster: &Roster,
     enrolled: &std::collections::BTreeSet<String>,
     read: ReadUsage<'_>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let store = seat.store(cli);
-    let Ok((state, _)) = store.load(seat.now) else {
-        return Vec::new();
-    };
+    let (state, _) = store
+        .load(seat.now)
+        .map_err(|why| format!("{}: {why}", store.state_file().display()))?;
     let due_rows: Vec<&Row> = roster
         .rows
         .iter()
@@ -192,7 +195,7 @@ pub fn record_usage(
         })
         .collect();
     if due_rows.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let is_overlay = matches!(cli.accounts().seam, Seam::Overlay { .. });
     let mut readings: Vec<(String, Usage)> = Vec::new();
@@ -226,7 +229,7 @@ pub fn record_usage(
         }));
     }
     if readings.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut note = None;
     let recorded = store.transact_within(&accounts::LOCK_LADDER, seat.now, &mut note, |state| {
@@ -246,10 +249,13 @@ pub fn record_usage(
         }
         Ok(events)
     });
-    match recorded {
-        Ok(_) => readings.into_iter().map(|(label, _)| label).collect(),
-        Err(_) => Vec::new(),
-    }
+    recorded.map_err(|why| {
+        format!(
+            "{}: could not record fresh usage: {why}",
+            store.state_file().display()
+        )
+    })?;
+    Ok(readings.into_iter().map(|(label, _)| label).collect())
 }
 
 /// The product's [`ReadUsage`]: Codex's app server started in `home`, asked
@@ -264,53 +270,55 @@ pub fn live_usage(cli: Cli, home: &Path, now: i64) -> Option<Usage> {
     .flatten()
 }
 
-/// Whether `roster` gives [`launch_env`] a login to place or measure: at least one row's login is
-/// here, and it is not an unpinned single default-home row (nothing to pick between or rotate to).
-fn pool_acts(
-    roster: &Roster,
-    enrolled: &std::collections::BTreeSet<String>,
-    state: &accounts::State,
-) -> bool {
-    let here = |row: &Row| row.dir.is_none() || enrolled.contains(&row.label);
-    if !roster.rows.iter().any(here) {
-        return false;
-    }
-    if let [only] = roster.rows.as_slice()
-        && only.dir.is_none()
-        && !state.pinned
-    {
-        return false;
-    }
-    true
-}
-
 /// The login a launch aterm makes of `cli` starts under ([`accounts::launch_row`] over the bound
 /// roster, once [`record_usage`] read each row's usage with `read`): `None` with an unpinned lone
-/// default-home row, with no row here or usable, for a CLI whose seam no lab pass measured
-/// ([`crate::ai::connector::Accounts::measured`]), where the CLI keeps its login in the OS
-/// keyring ([`Seat::keyring_held`]), or where the pick's overlay home cannot be used
-/// ([`login_env`]). Under `[harness] accounts = "off"` only the owner's pin is honoured.
-#[must_use]
-pub fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<LoginEnv> {
+/// default-home row, with an empty roster, for a CLI whose seam no lab pass measured
+/// ([`crate::ai::connector::Accounts::measured`]), or where the CLI keeps its login in the OS
+/// keyring ([`Seat::keyring_held`]). Under `[harness] accounts = "off"` only the owner's pin
+/// is honoured.
+/// # Errors
+/// The pool's records cannot be read, no managed row is usable, or the chosen login's
+/// overlay cannot be prepared. A caller must hold the launch on these failures.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolLaunch",
+        action = "Choose",
+        project = "aterm_agent::harness::accounts_pool::tests::launch_admission::launch_transition"
+    )
+)]
+pub fn launch_env(
+    seat: &Seat<'_>,
+    cli: Cli,
+    read: ReadUsage<'_>,
+) -> Result<Option<LoginEnv>, String> {
     if !cli.accounts().measured || seat.keyring_held(cli) {
-        return None;
+        return Ok(None);
     }
-    let roster = seat.bound_roster(cli).ok()?;
+    let roster = seat.bound_roster(cli)?;
+    if roster.rows.is_empty() {
+        return Ok(None);
+    }
     let enrolled = accounts::enrolled_for(cli, &roster);
     let store = seat.store(cli);
-    let (initial_state, _) = store.load(seat.now).ok()?;
-    if !pool_acts(&roster, &enrolled, &initial_state) {
-        return None;
-    }
-    if seat.mode() == Mode::Off {
-        let pinned = initial_state
+    let load = || {
+        store
+            .load(seat.now)
+            .map_err(|why| format!("{}: {why}", store.state_file().display()))
+    };
+    let (initial_state, _) = load()?;
+    let checked_pin = |state: &accounts::State| -> Result<Option<&Row>, String> {
+        if !state.pinned {
+            return Ok(None);
+        }
+        let pinned = state
             .active
             .as_deref()
-            .filter(|_| initial_state.pinned)
-            .and_then(|label| roster.row(label))?;
+            .and_then(|label| roster.row(label))
+            .ok_or_else(|| format!("{} account pin names no roster row", cli.id()))?;
         let cond = accounts::condition(
             pinned,
-            &initial_state,
+            state,
             pinned.dir.is_none() || enrolled.contains(&pinned.label),
             seat.now,
         );
@@ -318,23 +326,47 @@ pub fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<Logi
             cond,
             accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
         ) {
-            return None;
+            return Err(format!(
+                "{} account {} is not signed in",
+                cli.id(),
+                pinned.label
+            ));
         }
-        return login_env(cli, pinned, seat.home).ok();
+        Ok(Some(pinned))
+    };
+    let pinned = checked_pin(&initial_state)?;
+    if seat.mode() == Mode::Off {
+        let Some(pinned) = pinned else {
+            return Ok(None);
+        };
+        return login_env(cli, pinned, seat.home)
+            .map(Some)
+            .map_err(|why| why.to_string());
     }
-    record_usage(seat, cli, &roster, &enrolled, read);
-    let (state, _) = store.load(seat.now).ok()?;
+    if let [only] = roster.rows.as_slice()
+        && only.dir.is_none()
+        && pinned.is_none()
+    {
+        return Ok(None);
+    }
+    record_usage(seat, cli, &roster, &enrolled, read)?;
+    let (state, _) = load()?;
+    checked_pin(&state)?;
     let mut candidate_enrolled = enrolled;
+    let mut last_overlay_error = None;
     loop {
-        let row = accounts::launch_row(&roster, &state, &candidate_enrolled, seat.now)?;
-        if let Ok(env) = login_env(cli, row, seat.home) {
-            return Some(env);
-        }
+        let row = accounts::launch_row(&roster, &state, &candidate_enrolled, seat.now)
+            .ok_or_else(|| last_overlay_error.take().unwrap_or_else(|| format!("{} account pool has no usable account; inspect `aterm harness accounts --cli {}`", cli.id(), cli.id())))?;
+        let why = match login_env(cli, row, seat.home) {
+            Ok(env) => return Ok(Some(env)),
+            Err(why) => why,
+        };
         if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
             || !candidate_enrolled.remove(&row.label)
         {
-            return None;
+            return Err(why.to_string());
         }
+        last_overlay_error = Some(why.to_string());
     }
 }
 
@@ -509,6 +541,89 @@ pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
         line: Some(line),
     }
 }
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "Unmanaged",
+        reason = "Bounded environment scenario: the conformance test stages a store holding only an unrelated old cache, which a launch leaves alone before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "Ready",
+        reason = "Bounded environment scenario: the conformance test stages two managed logins, the active one at its usage wall before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "StateUnread",
+        reason = "Bounded environment scenario: the conformance test stages an unreadable pool state file before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "BindingsUnread",
+        reason = "Bounded environment scenario: the conformance test stages unreadable login bindings before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "Exhausted",
+        reason = "Bounded environment scenario: the conformance test stages every managed login at its usage wall before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "Drifted",
+        reason = "Bounded environment scenario: the conformance test stages a login holding its own copy of a state file the shared home also holds before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "RosterUnread",
+        reason = "Bounded environment scenario: the conformance test stages an unreadable account roster before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "NoLocalLogin",
+        reason = "Bounded environment scenario: the conformance test stages a roster row whose directory holds no login before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "InvalidPin",
+        reason = "Bounded environment scenario: the conformance test stages a pin to a login the roster does not hold before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "UsageWriteFails",
+        reason = "Bounded environment scenario: the conformance test stages a held pool lock, so fresh usage cannot be recorded before the product's Choose"
+    )
+)]
+#[doc(hidden)]
+pub fn account_pool_launch_environment() {}
 
 #[cfg(test)]
 #[path = "accounts_pool_tests.rs"]

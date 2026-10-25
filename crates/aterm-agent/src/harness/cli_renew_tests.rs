@@ -238,6 +238,7 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
         Ok(Cmd::Accounts(AccountsCmd::AdoptDefault {
             label: "main".into(),
             email: Some(OWNER.into()),
+            identity_email: None,
             browser: Some("Claude".into()),
         }))
     );
@@ -248,6 +249,7 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
             label: "w2".into(),
             class: Class::Dedicated,
             email: Some(WORK.into()),
+            identity_email: None,
             browser: None,
         }))
     );
@@ -432,6 +434,7 @@ fn a_staging_home_is_never_a_rows_login_directory() {
         label: label.into(),
         class: Class::Dedicated,
         email: None,
+        identity_email: None,
         browser: None,
     };
     let (code, out, err) = acc(add("main.1"), &env, &host);
@@ -604,6 +607,9 @@ fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     cached_profile_only(&env);
     let store = env.accounts_store();
     store.ensure().expect("store");
+    store
+        .save(&accounts::State::default())
+        .expect("known prior state");
     std::fs::create_dir(store.ledger_path()).expect("block ledger append");
     let host = RenewHost::new();
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
@@ -681,6 +687,7 @@ fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
             label: "w3".into(),
             class: Class::Dedicated,
             email: Some("w3@example.test".into()),
+            identity_email: None,
             browser: None,
         },
         &env,
@@ -731,6 +738,7 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
             label: "work-3".into(),
             class: Class::Dedicated,
             email: Some("w3@example.test".into()),
+            identity_email: None,
             browser: None,
         },
         &env,
@@ -897,6 +905,7 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
         label: label.into(),
         class: Class::Dedicated,
         email: email.map(str::to_string),
+        identity_email: None,
         browser: None,
     };
     let (code, out, err) = acc(add("w3", Some("w3@example.com")), &env, &host);
@@ -950,6 +959,7 @@ fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
             label: "w3".into(),
             class: Class::Dedicated,
             email: Some("w3@example.com".into()),
+            identity_email: None,
             browser: None,
         },
         &env,
@@ -1033,6 +1043,7 @@ fn adopt_default_lists_this_machines_own_login_once() {
     let adopt = |label: &str, email: &str| AccountsCmd::AdoptDefault {
         label: label.into(),
         email: Some(email.into()),
+        identity_email: None,
         browser: Some("Claude m7-a".into()),
     };
     let (code, out, err) = acc_quiet(adopt("m7-a", OWNER), &env);
@@ -1070,6 +1081,7 @@ fn adopt_default_lists_this_machines_own_login_once() {
             label: "w2".into(),
             class: Class::Dedicated,
             email: Some(WORK.into()),
+            identity_email: None,
             browser: None,
         },
         &env,

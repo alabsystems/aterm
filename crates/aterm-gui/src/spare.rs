@@ -2794,7 +2794,7 @@ impl Wake {
             | Wake::CardSeed { .. }
             | Wake::Aos { .. }
             | Wake::Rewind { .. }
-            | Wake::RewindFolded(..)
+            | Wake::RewindDone(..)
             | Wake::AosWorked(..)
             | Wake::AosExport { .. }
             | Wake::PersonStandIn { .. }
@@ -2967,6 +2967,8 @@ impl Wake {
             Wake::TabMenuConnection { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::TabMenuUpgrade { .. } => None,
+            #[cfg(target_os = "macos")]
+            Wake::TabMenuRewind { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::BeginSessionRename { .. } => None,
             #[cfg(target_os = "macos")]

@@ -23,7 +23,8 @@ license = "Apache-2.0 AND (MIT OR Apache-2.0)"
 name = "aterm_win32"
 path = "src/lib.rs"
 # No unit tests live in src/; tests/recorded.rs holds the generated
-# declarations and tests/com.rs the hand-written ones.
+# declarations, tests/com.rs the hand-written ones, and tests/dxgi_live.rs
+# and tests/scrgb_live.rs call DXGI on a live Windows desktop.
 test = false
 
 # No dependencies, on any target: rustc writes each DLL import itself

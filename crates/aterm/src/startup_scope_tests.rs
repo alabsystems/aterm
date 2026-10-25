@@ -85,13 +85,13 @@ impl SetupStartup for Startup {
         Ok(self.set_aside.len() != before)
     }
 
-    fn bring_forward(&mut self) -> bool {
+    fn bring_forward(&mut self) -> Result<bool, String> {
         self.brought.push((self.backoffs, self.binds));
         self.lock_waits = self.busy > 0;
         if self.lock_waits {
             self.busy -= 1;
         }
-        !self.lock_waits
+        Ok(!self.lock_waits)
     }
 
     fn bind_authorization(&mut self) -> Result<u64, String> {

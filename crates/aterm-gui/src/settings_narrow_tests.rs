@@ -3426,6 +3426,9 @@ fn the_themes_page_keeps_its_words_and_buttons_in_its_panel() {
     });
 }
 
+/// Follow system's name stands beside its switch where it fits one line there, else over it in a
+/// row of its own, never a word broken: the chooser's list stands on whole rows, and a name wrapped
+/// beside the switch made a row of a line and a half that left the list's end short of its edge.
 #[test]
 fn follow_systems_name_goes_over_its_switch_before_it_breaks_a_word() {
     let footer = || {
@@ -3474,11 +3477,14 @@ fn follow_systems_name_goes_over_its_switch_before_it_breaks_a_word() {
     };
     at_each_text_scale(&[1.0, 2.0], "follow system", |scale| {
         let (lines, over, whole) = footer();
-        assert_eq!(lines, ["Follow", "system"], "{scale}x: its words whole");
         assert_eq!(
+            lines.join(" "),
+            "Follow system",
+            "{scale}x: its words whole: {lines:?}"
+        );
+        assert!(
             over,
-            scale > 1.5,
-            "{scale}x: over its switch only where beside breaks a word"
+            "{scale}x: over its switch, which leaves it no line beside"
         );
         assert!(
             whole,

@@ -72,7 +72,7 @@ impl CursorGlow {
         }
         if self.insert.orphan_exact.is_some_and(|run| {
             run.current().is_none_or(|key| {
-                now.saturating_duration_since(key.pressed_at).as_secs_f32() > IN_FLIGHT_PATIENCE_S
+                now.saturating_duration_since(key.pressed_at) > IN_FLIGHT_PATIENCE_DUR
             })
         }) {
             self.insert.orphan_exact = None;
@@ -118,8 +118,8 @@ impl CursorGlow {
         }
         let fresh = now.saturating_duration_since(seen).as_millis() as u64
             <= crate::cursor_trail::HIDE_BRIDGE_MS;
-        let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
-        let nav_bridge = hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+        let typed_fresh = self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR);
+        let nav_bridge = hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
             && self
                 .nav_hint
                 .is_some_and(|key| crate::cursor_trail::nav_bridge_admits(key, seen, now));
@@ -387,23 +387,23 @@ impl CursorGlow {
     #[inline]
     #[must_use]
     pub fn move_licensed(&self, now: Instant) -> bool {
-        self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH) || self.one_shot_licensed(now)
+        self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR) || self.one_shot_licensed(now)
     }
 
     /// The one-shot classes of [`Self::move_licensed`].
     #[inline]
     pub(super) fn one_shot_licensed(&self, now: Instant) -> bool {
-        hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH)
-            || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
-            || hint_fresh(self.return_hint, now, Self::RETURN_HINT_FRESH)
-            || hint_fresh(self.newline_hint, now, Self::RETURN_HINT_FRESH)
-            || hint_fresh(self.user_gesture_hint, now, Self::USER_GESTURE_HINT_FRESH)
+        hint_fresh_dur(self.quench_hint, now, QUENCH_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.return_hint, now, RETURN_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.newline_hint, now, RETURN_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.user_gesture_hint, now, USER_GESTURE_HINT_FRESH_DUR)
     }
 
     /// The licence at the seam ([`Self::spawn_judged`]'s gate).
     #[inline]
     pub(super) fn seam_licensed(&self, now: Instant, cfg: &GlowConfig) -> bool {
-        let stamp = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
+        let stamp = self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR)
             && (!matches!(cfg.style, GlowStyle::RainbowKitty)
                 || self.typed_credits_within(now) >= 1);
         stamp || self.one_shot_licensed(now)
@@ -541,13 +541,13 @@ impl CursorGlow {
     ) -> Option<ExactTypedRun> {
         if !self.v2.engaged()
             || !matches!(cfg.style, GlowStyle::RainbowKitty)
-            || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
-            || hint_fresh(self.return_hint, now, Self::RETURN_HINT_FRESH)
-            || hint_fresh(self.newline_hint, now, Self::RETURN_HINT_FRESH)
-            || hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH)
+            || hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.return_hint, now, RETURN_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.newline_hint, now, RETURN_HINT_FRESH_DUR)
+            || hint_fresh_dur(self.quench_hint, now, QUENCH_HINT_FRESH_DUR)
             || hint_fresh(self.kill_hint, now, Self::KILL_HINT_FRESH)
             || hint_fresh(self.reflow_hint, now, Self::REFLOW_HINT_FRESH)
-            || hint_fresh(self.user_gesture_hint, now, Self::USER_GESTURE_HINT_FRESH)
+            || hint_fresh_dur(self.user_gesture_hint, now, USER_GESTURE_HINT_FRESH_DUR)
             || self.insert.fresh(now).is_some()
             || self.last_erase.is_some_and(|erase| erase.owed_at(now))
         {
@@ -604,7 +604,7 @@ impl CursorGlow {
             now,
             shown.at,
             glyphs,
-            IN_FLIGHT_PATIENCE_S,
+            IN_FLIGHT_PATIENCE_DUR,
         )?;
         Some(ExactTypedRun {
             origin_row: cr,
@@ -651,13 +651,17 @@ impl CursorGlow {
         else {
             return false;
         };
-        [false, true].into_iter().any(|dropped| {
+        for dropped in [false, true] {
             let split = first.len() + usize::from(dropped);
-            (!dropped || tail.get(first.len()) == Some(&' '))
+            if (!dropped || tail.get(first.len()) == Some(&' '))
                 && tail.get(split..).is_some_and(|rest| {
                     self.row_below_cur.get(start..start + rest.len()) == Some(rest)
                 })
-        })
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn exact_hand_prefix(
@@ -784,7 +788,7 @@ impl CursorGlow {
                 now,
                 previous.at,
                 &glyphs[..cells],
-                IN_FLIGHT_PATIENCE_S,
+                IN_FLIGHT_PATIENCE_DUR,
             ) {
                 return Some(ExactTypedRun {
                     origin_row: source_row,
@@ -828,7 +832,7 @@ impl CursorGlow {
             || self
                 .print_anchor
                 .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
-            || (!same_caret && !self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH))
+            || (!same_caret && !self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR))
             || self.typed_credits_within(now) == 0
             || !self
                 .row_prev_meta
@@ -850,12 +854,12 @@ impl CursorGlow {
                 now,
                 self.row_prev_meta?.at,
                 &[new],
-                IN_FLIGHT_PATIENCE_S,
+                IN_FLIGHT_PATIENCE_DUR,
             )?
         } else {
             let (slot, expected) = self
                 .type_press_ring
-                .oldest_fresh_glyph(now, Self::TYPE_HINT_FRESH)?;
+                .oldest_fresh_glyph(now, TYPE_HINT_FRESH_DUR)?;
             (new == expected).then_some(slot)?
         };
         self.v2
@@ -1133,7 +1137,7 @@ impl CursorGlow {
             now,
             previous.at,
             &glyphs[..cells],
-            IN_FLIGHT_PATIENCE_S,
+            IN_FLIGHT_PATIENCE_DUR,
         )?;
         Some(ExactTypedRun {
             origin_row: pr,
@@ -1320,7 +1324,7 @@ impl CursorGlow {
                     })
             });
         let younger_than_stamp =
-            |at: Instant| now.saturating_duration_since(at).as_secs_f32() <= Self::TYPE_HINT_FRESH;
+            |at: Instant| now.saturating_duration_since(at) <= TYPE_HINT_FRESH_DUR;
         let insert_admits = prev.and_then(|pc| {
             let ins = self.insert_echo(ar, pc, ar, ac, now, cfg)?;
             let spoken = self
@@ -1363,7 +1367,7 @@ impl CursorGlow {
             self.last_anchor_sweep = Some((ar, now));
             return;
         }
-        let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
+        let typed_fresh = self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR);
         if !typed_fresh && !in_flight && self.insert.fresh(now).is_none() {
             if let Some(pc) = prev
                 && ac > pc
@@ -1644,9 +1648,6 @@ impl CursorGlow {
     /// The clock a swept cell is born at.
     #[inline]
     pub(super) fn sweep_born(key_at: Instant, now: Instant) -> Instant {
-        const TYPE_HINT_FRESH_DUR: Duration = Duration::from_nanos(
-            (CursorGlow::TYPE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64,
-        );
         key_at.max(now.checked_sub(TYPE_HINT_FRESH_DUR).unwrap_or(now))
     }
 
@@ -1822,7 +1823,7 @@ impl CursorGlow {
             && (col..old_end).all(|c| rk::witness::unit_at(&sample.cols, c).is_blank())
             && self
                 .type_press_ring
-                .fresh_glyph(now, IN_FLIGHT_PATIENCE_S, glyph.ch)
+                .fresh_glyph(now, IN_FLIGHT_PATIENCE_DUR, glyph.ch)
     }
 
     /// One past the last glyph of a sampled row inside the focused pane (the whole row when no pane is set).
@@ -1920,7 +1921,7 @@ impl CursorGlow {
             run.row == row
                 && run.end() == col0
                 && usize::from(run.len) + usize::from(col1 - col0) <= RECENT_TYPED_RUN_CAP
-                && now.saturating_duration_since(run.at).as_secs_f32() <= rk::ribbon::CHAIN_GAP_MAX
+                && now.saturating_duration_since(run.at) <= rk::ribbon::CHAIN_GAP_MAX_DUR
                 && (run.col0..col0).all(|col| {
                     self.row_cur.get(usize::from(col)).copied().unwrap_or(' ')
                         == run.glyphs[usize::from(col - run.col0)]
@@ -2386,13 +2387,13 @@ impl CursorGlow {
         let return_taken = if glyph_echo {
             None
         } else {
-            take_hint_fresh(&mut self.return_hint, now, Self::RETURN_HINT_FRESH)
+            take_hint_fresh_dur(&mut self.return_hint, now, RETURN_HINT_FRESH_DUR)
         };
         let return_licensed = return_taken.is_some();
         let newline_taken = if glyph_echo {
             None
         } else {
-            take_hint_fresh(&mut self.newline_hint, now, Self::RETURN_HINT_FRESH)
+            take_hint_fresh_dur(&mut self.newline_hint, now, RETURN_HINT_FRESH_DUR)
         };
         let newline_licensed = newline_taken.is_some();
         let gesture_taken = self.user_gesture_hint.take();
@@ -2571,11 +2572,14 @@ impl CursorGlow {
             Some(EraseHop::Late(cells)) => usize::from(cells),
             _ => 0,
         };
-        let wrap_echo_rhythm = self.last_type.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() <= Self::PHASER_CHAIN_GAP_MAX
-        });
+        const PHASER_CHAIN_GAP_MAX_DUR: Duration = Duration::from_nanos(
+            (CursorGlow::PHASER_CHAIN_GAP_MAX as f64 * 1_000_000_000.0).round() as u64,
+        );
+        let wrap_echo_rhythm = self
+            .last_type
+            .is_some_and(|t| now.saturating_duration_since(t) <= PHASER_CHAIN_GAP_MAX_DUR);
         let (pane_col0, pane_cols) = self.pane_span(geom);
-        let fresh_stamp = self.type_hint.peek_fresh(now, Self::TYPE_HINT_FRESH);
+        let fresh_stamp = self.type_hint.peek_fresh(now, TYPE_HINT_FRESH_DUR);
         let mut typed_at = fresh_stamp;
         let mut in_flight_licence = false;
         if let Some(run) = exact_typed_run {
@@ -2593,17 +2597,17 @@ impl CursorGlow {
         let fold_cells = tight_fold.or(coalesced_fold);
         let typed_pair = typed_at.is_some();
         let owed_retreat = matches!(erase_hop, Some(EraseHop::Retreat(_)));
-        let bs_pair = hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH) || owed_retreat;
+        let bs_pair = hint_fresh_dur(self.quench_hint, now, QUENCH_HINT_FRESH_DUR) || owed_retreat;
         let bs_fwd = bs_pair && !fwd;
-        let return_paired = !fwd && hint_fresh(self.return_hint, now, Self::RETURN_HINT_FRESH);
-        let newline_paired = !fwd && hint_fresh(self.newline_hint, now, Self::RETURN_HINT_FRESH);
+        let return_paired = !fwd && hint_fresh_dur(self.return_hint, now, RETURN_HINT_FRESH_DUR);
+        let newline_paired = !fwd && hint_fresh_dur(self.newline_hint, now, RETURN_HINT_FRESH_DUR);
         let blink_fresh = self.blink_fresh(now);
         let glyph_fwd = matches!(cfg.style, GlowStyle::RainbowKitty)
             && fwd
             && (hint_fresh(self.kill_retreat_pending, now, Self::KILL_HINT_FRESH)
                 || (dc_abs == 1 && self.typed_credits_within(now) >= 1)
                 || (dc_abs >= 2 && self.typed_share_paid(cr, pc, cc, now)));
-        let nav_paired = !glyph_fwd && hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH);
+        let nav_paired = !glyph_fwd && hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR);
         let echo_run = typed_pair
             && !nav_paired
             && !matches!(cfg.style, GlowStyle::RainbowKitty)
@@ -2703,7 +2707,7 @@ impl CursorGlow {
             let own_press_unpaid =
                 older_batch && self.type_press_ring.cells_where(now, |t| t >= stamp) >= 1;
             if !own_press_unpaid {
-                let _ = self.type_hint.take_fresh(now, Self::TYPE_HINT_FRESH);
+                let _ = self.type_hint.take_fresh(now, TYPE_HINT_FRESH_DUR);
             }
         }
         let dist = if wrap || rainbow_coalesce || echo_run {
@@ -2715,7 +2719,7 @@ impl CursorGlow {
         let fire = matches!(cfg.style, GlowStyle::Fire);
         let forward = typing && cr == pr && cc as i32 == pc as i32 + 1;
         let quench_taken = late_erased == 0
-            && (take_hint_fresh(&mut self.quench_hint, now, Self::QUENCH_HINT_FRESH).is_some()
+            && (take_hint_fresh_dur(&mut self.quench_hint, now, QUENCH_HINT_FRESH_DUR).is_some()
                 || owed_retreat);
         if let (Some(hop), Some(erase)) = (erase_hop, &mut self.last_erase) {
             match hop {
@@ -2736,7 +2740,7 @@ impl CursorGlow {
         }
         let deletion = typing && quench_taken && !fwd;
         let nav_taken = if nav_paired {
-            take_hint_fresh(&mut self.nav_hint, now, Self::NAV_HINT_FRESH)
+            take_hint_fresh_dur(&mut self.nav_hint, now, NAV_HINT_FRESH_DUR)
         } else {
             None
         };

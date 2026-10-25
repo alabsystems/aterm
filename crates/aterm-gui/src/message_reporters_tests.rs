@@ -2807,9 +2807,9 @@ fn asks_a_sign_in(msg: &aterm_messages::Message) -> bool {
 /// NO CLAUDE ACCOUNTS FACT ASKS A PERSON TO SIGN IN (owner, 2026-10-24: sign-in is autonomous):
 /// the signed-out, due, none-soon, wrong-account and no-sign-in entries each say what aterm did
 /// and why it is not enough, their step the read of each route tried, their rows in Details;
-/// another CLI's due entry, which the upkeep renews in the background too, is such a fact, its
-/// step the read of its pool. CONTROL: another CLI's wrong-account entry and a background
-/// sign-in stopped for a person, which still name a sign-in by hand, are caught by the same
+/// another CLI's due and wrong-account entries, whose rows the upkeep signs in again in the
+/// background too, are such facts, their step the read of its pool. CONTROL: a background
+/// sign-in stopped for a person, which still names a sign-in by hand, is caught by the same
 /// reading.
 #[test]
 fn no_claude_accounts_fact_asks_a_person_to_sign_in() {
@@ -2853,36 +2853,51 @@ fn no_claude_accounts_fact_asks_a_person_to_sign_in() {
             );
         }
     }
-    let pool_due = shown(super::accounts_due_entry_for(
-        Cli::Kimi,
-        &labels(&["kimi-1"]),
-    ));
-    assert!(!asks_a_sign_in(&pool_due), "{pool_due:?}");
-    assert!(
-        pool_due.detail[1].starts_with("Run aterm harness accounts")
-            && pool_due.detail[1].contains("--cli kimi")
-            && !pool_due.detail[1].contains("kimi-1"),
-        "the step reads the pool: {:?}",
-        pool_due.detail
-    );
-    for (cli, entry) in [
+    for (what, cli, label, entry) in [
         (
+            "pool due",
+            Cli::Kimi,
+            "kimi-1",
+            super::accounts_due_entry_for(Cli::Kimi, &labels(&["kimi-1"])),
+        ),
+        (
+            "pool wrong",
             Cli::Codex,
+            "codex-2",
             super::accounts_wrong_entry_for(Cli::Codex, &labels(&["codex-2"])),
         ),
-        (
-            Cli::Kimi,
-            super::accounts_sign_in_entry_for(
-                Cli::Kimi,
-                &[(
-                    "kimi-1".to_string(),
-                    aterm_agent::harness::accounts::SignInAction::Login,
-                )],
-            ),
-        ),
     ] {
-        assert!(asks_a_sign_in(&shown(entry)), "the control: {cli:?}");
+        let msg = shown(entry);
+        assert!(!asks_a_sign_in(&msg), "{what}: {msg:?}");
+        assert!(
+            msg.detail[0].starts_with("aterm "),
+            "{what}: {:?}",
+            msg.detail
+        );
+        assert!(
+            msg.detail[1].starts_with("Run aterm harness accounts")
+                && msg.detail[1].contains(&format!("--cli {}", cli.id()))
+                && !msg.detail[1].contains(label),
+            "{what}: the step reads the pool: {:?}",
+            msg.detail
+        );
+        assert!(
+            msg.detail[2..].iter().any(|l| l.contains(label)),
+            "{what}: the row is in Details: {:?}",
+            msg.detail
+        );
     }
+    let stopped = super::accounts_sign_in_entry_for(
+        Cli::Kimi,
+        &[(
+            "kimi-1".to_string(),
+            aterm_agent::harness::accounts::SignInAction::Login,
+        )],
+    );
+    assert!(
+        asks_a_sign_in(&shown(stopped)),
+        "the control: a sign-in stopped for a person"
+    );
 }
 
 #[test]

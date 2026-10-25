@@ -290,6 +290,9 @@ pub struct Row {
     pub dir: Option<String>,
     /// The account's email ([`email_matches`]).
     pub email: Option<String>,
+    /// Codex's expected `account/read` email, when its login address is an alias.
+    /// This explicit expectation is not proof of a login or budget authority.
+    pub identity_email: Option<String>,
     /// The browser profile that holds the account's claude.ai session.
     pub browser: Option<String>,
     /// The logins a renewal here bound this row away from ([`Binding::was`], [`bound`]).
@@ -309,6 +312,12 @@ pub struct Vendor {
 }
 
 impl Row {
+    /// The email Codex must report for this row, independently of its login address.
+    #[must_use]
+    pub fn expected_identity_email(&self) -> Option<&str> {
+        self.identity_email.as_deref().or(self.email.as_deref())
+    }
+
     /// The sign-in flow of this `cli` row: its own `flow`, else the CLI's default, `None` for a
     /// CLI that takes no `flow`.
     #[must_use]
@@ -440,7 +449,8 @@ impl Roster {
     ///
     /// As [`Roster::parse`], and: a vendor key this CLI does not take (Claude Code takes none);
     /// a `region` other than `global` or `mainland-cn`, or a Kimi row with an `email` and no
-    /// `region`; a `flow` other than `browser` or `device`.
+    /// `region`; a `flow` other than `browser` or `device`; `identity_email` outside
+    /// Codex, an invalid identity address, or two Codex rows expecting the same identity.
     pub fn parse_for(cli: Cli, text: &str) -> Result<Roster, String> {
         let file = cli.accounts().roster_file;
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| {
@@ -501,6 +511,18 @@ impl Roster {
             }) {
                 return Err(format!(
                     "{file}: rows `{}` and `{}` name one email; an account is one row",
+                    twin.label, row.label
+                ));
+            }
+            if cli == Cli::Codex
+                && let Some(twin) = rows.iter().find(|r| {
+                    r.expected_identity_email()
+                        .zip(row.expected_identity_email())
+                        .is_some_and(|(a, b)| email_matches(a, b))
+                })
+            {
+                return Err(format!(
+                    "{file}: rows `{}` and `{}` expect one provider identity; an account is one row",
                     twin.label, row.label
                 ));
             }
@@ -634,12 +656,18 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
     };
     if let Some(key) = table.keys().find(|k| {
         !matches!(k.as_str(), "label" | "class" | "dir" | "email" | "browser")
+            && !(cli == Cli::Codex && k.as_str() == "identity_email")
             && Some(k.as_str()) != vendor_key
     }) {
         let holds = vendor_key.map_or_else(
             || "email and browser".to_owned(),
             |key| format!("email, browser and {key}"),
         );
+        let holds = if cli == Cli::Codex {
+            format!("{holds}, and identity_email")
+        } else {
+            holds
+        };
         return Err(format!(
             "{file}: row `{label}` has an unknown key `{}`; a row holds label, class, \
              dir, {holds}",
@@ -711,6 +739,20 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
             ));
         }
     };
+    let identity_email = match table.get("identity_email") {
+        None => None,
+        Some(aterm_toml::Value::String(email)) => {
+            if let Some(why) = email_refusal(email) {
+                return Err(format!("{file}: row `{label}`: its identity_email {why}"));
+            }
+            Some(email.clone())
+        }
+        Some(_) => {
+            return Err(format!(
+                "{file}: row `{label}`: identity_email must be a string"
+            ));
+        }
+    };
     let word = |key: &str| match table.get(key) {
         None => Ok(None),
         Some(aterm_toml::Value::String(word)) => Ok(Some(word.as_str())),
@@ -761,6 +803,7 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         class,
         dir,
         email,
+        identity_email,
         browser,
         was: Vec::new(),
         vendor,
@@ -803,6 +846,9 @@ fn row_refusal(row: &Row) -> Option<String> {
     if let Some(why) = row.email.as_deref().and_then(email_refusal) {
         return Some(format!("row `{label}`: its email {why}"));
     }
+    if let Some(why) = row.identity_email.as_deref().and_then(email_refusal) {
+        return Some(format!("row `{label}`: its identity_email {why}"));
+    }
     row.browser
         .as_deref()
         .and_then(browser_refusal)
@@ -820,7 +866,7 @@ pub fn row_toml(label: &str, class: Class, dir: Option<&str>) -> Option<String> 
     })
 }
 
-/// Formats a complete [`Row`] (including `email` and `browser`) as an `[[account]]` TOML block.
+/// Formats a complete [`Row`] (including login and identity emails) as an `[[account]]` TOML block.
 #[must_use]
 pub fn row_text(row: &Row) -> Option<String> {
     if row_refusal(row).is_some() {
@@ -838,6 +884,7 @@ pub fn row_text(row: &Row) -> Option<String> {
     };
     put("dir", row.dir.as_deref());
     put("email", row.email.as_deref());
+    put("identity_email", row.identity_email.as_deref());
     put("browser", row.browser.as_deref());
     put("region", row.vendor.region.map(Region::as_str));
     put("flow", row.vendor.flow.map(Flow::as_str));
@@ -878,6 +925,9 @@ fn row_inline_of(row: &Row) -> Option<String> {
             ", email = {}",
             aterm_toml::Value::from(EMAIL_BY_HAND)
         ));
+    }
+    if row.identity_email.is_some() {
+        out.push_str(", identity_email = \"<the --identity-email you gave>\"");
     }
     if let Some(browser) = &row.browser {
         out.push_str(&format!(
@@ -1543,6 +1593,10 @@ pub struct Binding {
     /// bound it ([`note_proof`]); a Claude Code renewal's proof is its status check, never
     /// written.
     pub proved_by: Option<Proof>,
+    /// The checked provider email, scoped to `proved_dir`, not a mutable row label.
+    pub proved_email: Option<String>,
+    /// The login directory whose identity was checked.
+    pub proved_dir: Option<String>,
     /// The remaining human step of a renewal, cleared by a successful sign-in.
     pub sign_in_task: Option<SignInTask>,
     /// How the row's last automatic sign-in ended and the routes it tried
@@ -1693,6 +1747,8 @@ impl Default for Binding {
             wrong_at: None,
             was: Vec::new(),
             proved_by: None,
+            proved_email: None,
+            proved_dir: None,
             sign_in_task: None,
             sign_in_attempt: None,
         }
@@ -1700,6 +1756,39 @@ impl Default for Binding {
 }
 
 impl Binding {
+    /// A recorded CLI identity check still matching this effective row from
+    /// [`bound`] and this binding's current login directory.
+    /// This local historical evidence grants no provider budget authority.
+    #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountIdentity",
+            action = "ChangedIdentity",
+            project = "aterm_agent::harness::cli::tests::identity::identity_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountIdentity",
+            action = "ChangedDirectory",
+            project = "aterm_agent::harness::cli::tests::identity::identity_transition"
+        )
+    )]
+    pub fn identity_proof_for(&self, row: &Row) -> Option<Proof> {
+        let proof = self.proved_by.filter(|proof| *proof == Proof::Status)?;
+        (self.proved_dir.as_deref() == self.dir.as_deref()
+            && self.proved_dir.as_deref() == row.dir.as_deref()
+            && self.proved_dir.is_some()
+            && self
+                .proved_email
+                .as_deref()
+                .zip(row.expected_identity_email())
+                .is_some_and(|(seen, expected)| email_matches(expected, seen)))
+        .then_some(proof)
+    }
+
     /// Ends a failed automatic sign-in's record once the row has a login again: what it tried is
     /// no news of the new login, whose own end, due date or failed renewal is told afresh.
     fn clear_failed_sign_in(&mut self) {
@@ -1781,6 +1870,12 @@ impl Logins {
                 );
                 if let Some(proof) = b.proved_by {
                     m.insert("proved_by".to_owned(), Value::from(proof.as_str()));
+                }
+                if let Some(email) = &b.proved_email {
+                    m.insert("proved_email".into(), Value::from(email.clone()));
+                }
+                if let Some(dir) = &b.proved_dir {
+                    m.insert("proved_dir".into(), Value::from(dir.clone()));
                 }
                 if let Some(task) = b.sign_in_task {
                     let mut pending = Map::new();
@@ -1903,6 +1998,16 @@ impl Logins {
                     .get("proved_by")
                     .and_then(Value::as_str)
                     .and_then(Proof::parse),
+                proved_email: v
+                    .get("proved_email")
+                    .and_then(Value::as_str)
+                    .filter(|email| email_refusal(email).is_none())
+                    .map(str::to_owned),
+                proved_dir: v
+                    .get("proved_dir")
+                    .and_then(Value::as_str)
+                    .filter(|dir| dir_refusal(dir).is_none())
+                    .map(str::to_owned),
                 sign_in_task,
                 sign_in_attempt,
             };
@@ -2263,6 +2368,8 @@ pub fn note_renewed(
     binding.ended_at = None;
     binding.wrong_at = None;
     binding.proved_by = None;
+    binding.proved_email = None;
+    binding.proved_dir = None;
     binding.sign_in_task = None;
     binding.clear_failed_sign_in();
     binding.subscription = subscription
@@ -2278,6 +2385,22 @@ pub fn note_renewed(
 pub fn note_proof(logins: &mut Logins, label: &str, proof: Proof) {
     if let Some(binding) = logins.labels.get_mut(label) {
         binding.proved_by = Some(proof);
+        binding.proved_email = None;
+        binding.proved_dir = None;
+    }
+}
+
+/// Retain the checked identity with the exact login it describes. Legacy proof
+/// flags with no identity or directory are never upgraded by this function.
+pub fn note_identity(logins: &mut Logins, label: &str, proof: Proof, email: Option<&str>) {
+    note_proof(logins, label, proof);
+    if proof == Proof::Status
+        && let Some(email) = email.filter(|email| email_refusal(email).is_none())
+        && let Some(binding) = logins.labels.get_mut(label)
+        && binding.dir.is_some()
+    {
+        binding.proved_email = Some(email.to_owned());
+        binding.proved_dir = binding.dir.clone();
     }
 }
 
@@ -3545,7 +3668,7 @@ impl State {
     /// Deserializes and sanitizes `state.json` against `now`.
     /// # Errors
     ///
-    /// [`Unread::Torn`]: not JSON (a file cut short, which the next write may replace).
+    /// [`Unread::Torn`]: not JSON, including a file cut short.
     /// [`Unread::NotOurs`]: JSON but not an object, or naming no schema or one other than
     /// [`SCHEMA`]: a file this build must not guess at or write over.
     pub fn from_json(text: &str, now: i64) -> Result<State, Unread> {
@@ -6056,6 +6179,8 @@ const LOCK_FILE: &str = "accounts.lock";
 
 const STATE_FILE: &str = "state.json";
 
+const STATE_WITNESS_FILE: &str = "state.seen";
+
 const LEDGER_FILE: &str = "ledger.jsonl";
 
 const WAKE_FILE: &str = "wake";
@@ -6137,9 +6262,77 @@ pub const SIGNIN_HELD: &str = "another sign-in holds the machine's sign-in lock"
 #[derive(Debug)]
 pub struct Lock(std::fs::File);
 
+// Inspect the opened handle before locking it. Unix opens must neither follow a link nor
+// wait on a special file before the caller's bounded lock wait even begins.
+fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+    let not_regular = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: lock is not a regular file", path.display()),
+        )
+    };
+    #[cfg(not(any(unix, windows)))]
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return Err(not_regular()),
+        Err(why) if why.kind() != io::ErrorKind::NotFound => return Err(why),
+        _ => {}
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = open.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(not_regular());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(not_regular());
+        }
+    }
+    Ok(file)
+}
+
+// Stock anchor attributes emit associated constants, so release lives outside the trait impl.
+impl Lock {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSigninLock",
+            action = "ReleaseA",
+            project = "aterm_agent::harness::cli::tests::signin_lock::lock_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSigninLock",
+            action = "ReleaseB",
+            project = "aterm_agent::harness::cli::tests::signin_lock::lock_transition"
+        )
+    )]
+    fn release(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        self.release();
     }
 }
 
@@ -6212,7 +6405,8 @@ impl Store {
     /// headless browser's profile admits one process and Codex's login listens on one fixed
     /// port. `None` when it stayed held past the ladder.
     /// # Errors
-    /// The directory or the lock file cannot be made, or the lock failed.
+    /// The directory or lock file cannot be made, the opened path is not a regular file,
+    /// the platform refuses a link, or the lock failed.
     pub fn signin_within(&self) -> io::Result<Option<Lock>> {
         self.signin_on(self.ladder)
     }
@@ -6225,17 +6419,26 @@ impl Store {
         self.signin_on(&[])
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSigninLock",
+            action = "TakeA",
+            project = "aterm_agent::harness::cli::tests::signin_lock::lock_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSigninLock",
+            action = "TakeB",
+            project = "aterm_agent::harness::cli::tests::signin_lock::lock_transition"
+        )
+    )]
     fn signin_on(&self, ladder: &[std::time::Duration]) -> io::Result<Option<Lock>> {
         let shared = self.shared_dir();
         aterm_types::fs_restricted::ensure_private_dir(&shared)?;
-        let mut open = std::fs::OpenOptions::new();
-        open.create(true).truncate(false).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
-        }
-        let mut file = match Self::try_take(open.open(shared.join(SIGNIN_LOCK_FILE))?)? {
+        let mut file = match Self::try_take(open_lock_file(&shared.join(SIGNIN_LOCK_FILE))?)? {
             Ok(lock) => return Ok(Some(lock)),
             Err(file) => file,
         };
@@ -6266,19 +6469,13 @@ impl Store {
 
     fn lock_file(&self) -> io::Result<std::fs::File> {
         self.ensure()?;
-        let mut open = std::fs::OpenOptions::new();
-        open.create(true).truncate(false).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
-        }
-        open.open(self.dir.join(LOCK_FILE))
+        open_lock_file(&self.dir.join(LOCK_FILE))
     }
 
     /// Acquires `accounts.lock`, blocking until the lock is available.
     /// # Errors
-    /// The directory or the lock file cannot be made, or the lock failed.
+    /// The directory or lock file cannot be made, the opened path is not a regular file,
+    /// the platform refuses a link, or the lock failed.
     pub fn acquire(&self) -> io::Result<Lock> {
         let file: std::fs::File = self.lock_file()?;
         loop {
@@ -6337,6 +6534,28 @@ impl Store {
     #[must_use]
     pub fn state_file(&self) -> PathBuf {
         self.dir.join(STATE_FILE)
+    }
+
+    /// The retained evidence that a state snapshot has been prepared for publication.
+    #[must_use]
+    pub fn state_witness_file(&self) -> PathBuf {
+        self.dir.join(STATE_WITNESS_FILE)
+    }
+
+    fn absent_state(&self) -> Result<State, String> {
+        for path in [self.state_witness_file(), self.ledger_path()] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "{STATE_FILE} is missing but {} remains; account state is unknown",
+                        path.display()
+                    ));
+                }
+                Err(why) if why.kind() == io::ErrorKind::NotFound => {}
+                Err(why) => return Err(format!("{}: {why}", path.display())),
+            }
+        }
+        Ok(State::default())
     }
 
     /// Path to `ledger.jsonl`.
@@ -6418,6 +6637,27 @@ impl Store {
         }
     }
 
+    /// Checks that local state and login bindings can be read before starting a sign-in.
+    /// This read-only check grants no account rights; completion still needs a transaction
+    /// against the state and bindings current when the new login is published.
+    /// # Errors
+    /// As [`Self::load`] or [`Self::load_logins`].
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSigninAdmission",
+            action = "Read",
+            project = "aterm_agent::harness::cli::tests::admission::admission_transition"
+        )
+    )]
+    pub fn check_signin_state(&self, now: i64) -> Result<(), String> {
+        self.load(now)
+            .map_err(|why| format!("{why} ({})", self.state_file().display()))?;
+        self.load_logins(now)
+            .map_err(|why| format!("{why} ({})", self.logins_file().display()))?;
+        Ok(())
+    }
+
     /// Loads `logins.json` and returns `roster` with machine-local renewal bindings applied.
     /// # Errors
     /// As [`Self::load_logins`].
@@ -6444,30 +6684,79 @@ impl Store {
         super::upgrade_models::write_atomic_ordered(&self.wake_path(), "")
     }
 
-    /// Loads `state.json` as of `now`; an absent, torn or non-UTF-8 file reads as an empty state.
+    /// Loads the state snapshot as of now. An absent snapshot reads as empty only when neither
+    /// its publication witness nor the legacy ledger remains.
     /// # Errors
     /// A file that is not ours to replace, named: one that could not be read (a permission, an
-    /// I/O error, a directory in its place), one larger than [`MAX_STATE_BYTES`], or JSON of
-    /// another schema or none ([`Unread::NotOurs`]). It may hold a pin, walls and signed-out
-    /// words, so a transaction that gets this answer stops without saving, and a read-only
-    /// caller shows an empty state beside the reason.
+    /// I/O error, a directory in its place), one larger than [`MAX_STATE_BYTES`], non-UTF-8
+    /// bytes, malformed JSON, or JSON of another schema or none ([`Unread::NotOurs`]). It may
+    /// hold a pin, walls and signed-out words, so a transaction stops without saving and a
+    /// read-only caller must not infer availability from a replacement empty state. An absent
+    /// snapshot also refuses when retained publication evidence exists or cannot be inspected.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "Read",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "Absent",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "Valid",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "Torn",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "NonUtf8",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "ForeignSchema",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "Unreadable",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
     pub fn load(&self, now: i64) -> Result<(State, Option<String>), String> {
-        let (mut state, mut note) = match read_bounded(&self.state_file(), MAX_STATE_BYTES) {
-            Ok(None) => (State::default(), None),
-            Ok(Some(text)) => match State::from_json(&text, now) {
-                Ok(state) => (state, None),
-                Err(Unread::Torn(why)) => (
-                    State::default(),
-                    Some(format!("{STATE_FILE}: {why}; read as an empty state")),
-                ),
-                Err(Unread::NotOurs(why)) => return Err(format!("{STATE_FILE}: {why}")),
-            },
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => (
-                State::default(),
-                Some(format!("{STATE_FILE}: {e}; read as an empty state")),
-            ),
+        let mut state = match read_bounded(&self.state_file(), MAX_STATE_BYTES) {
+            Ok(None) => self.absent_state()?,
+            Ok(Some(text)) => State::from_json(&text, now)
+                .map_err(|why| format!("{STATE_FILE}: {}", why.why()))?,
             Err(e) => return Err(format!("{STATE_FILE}: {e}")),
         };
+        let mut note = None;
         match self.kept_machine() {
             Ok(Some(id)) => state.machine = id,
             Ok(None) if !state.machine.is_empty() => {}
@@ -6513,6 +6802,14 @@ impl Store {
     /// # Errors
     /// The directory cannot be made, the file holds no id, or the write or
     /// the link failed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "StatsOnly",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
     pub fn machine_id(&self, held: &str) -> io::Result<String> {
         if let Some(id) = self.kept_machine()? {
             return Ok(id);
@@ -6555,14 +6852,58 @@ impl Store {
         written
     }
 
-    /// Atomically writes `state.json` (`0600`) via a sibling temporary file.
+    /// Prepares the state snapshot (0600) in a private sibling temporary file, retains durable
+    /// publication evidence, then atomically replaces the snapshot and flushes its directory.
+    /// A missing snapshot cannot become a fresh state while that witness survives. Transaction
+    /// callers must first load successfully; restoring known-good state may call this directly.
     /// # Errors
-    /// The directory cannot be made or the write or rename failed.
+    /// The directory or witness cannot be opened, the witness is not a regular file, or a
+    /// write, rename or durability flush failed. A failure after preparation may leave the
+    /// witness without a snapshot, which reads refuse until an explicit snapshot restore succeeds.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "Save",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "InterruptedSave",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
     pub fn save(&self, state: &State) -> io::Result<()> {
         self.ensure()?;
         let mut text = state.to_json();
         text.push('\n');
-        super::upgrade_models::write_atomic(&self.state_file(), &text)
+        super::upgrade_models::write_atomic_before_publish(&self.state_file(), &text, || {
+            self.retain_state_witness()
+        })?;
+        aterm_durable::durable_dir(&self.dir)
+    }
+
+    fn retain_state_witness(&self) -> io::Result<()> {
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let witness = open.open(self.state_witness_file())?;
+        if !witness.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state witness is not a regular file",
+            ));
+        }
+        aterm_durable::durable(&witness)?;
+        aterm_durable::durable_dir(&self.dir)
     }
 
     /// Appends `events` to `ledger.jsonl` ([`LEDGER_MAX_BYTES`]).
@@ -6790,6 +7131,30 @@ impl Store {
         Ok(events)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRead",
+            action = "Torn",
+            project = "aterm_agent::harness::cli::tests::state_read::state_read_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "Edit",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountStateRetention",
+            action = "EventOnly",
+            project = "aterm_agent::harness::cli::tests::retention::retention_transition"
+        )
+    )]
     fn transact_held(
         &self,
         _held: &Lock,
@@ -6799,8 +7164,8 @@ impl Store {
     ) -> Result<Vec<Event>, String> {
         let (mut state, read) = self.load(now).map_err(|why| {
             format!(
-                "{why}: {} is left as it is and nothing was written (move it aside to start \
-                 from an empty state)",
+                "{why}: {} is left as it is and no account state was written; restore a \
+                 known-good state before changing accounts",
                 self.state_file().display()
             )
         })?;
@@ -6810,7 +7175,12 @@ impl Store {
         }
         let before = state.clone();
         let events = edit(&mut state)?;
-        if state != before {
+        let first_event = !events.is_empty()
+            && !self
+                .state_file()
+                .try_exists()
+                .map_err(|e| format!("{}: {e}", self.state_file().display()))?;
+        if state != before || first_event {
             drop_stale_sessions(&mut state, now);
             self.save(&state)
                 .map_err(|e| format!("{}: {e}", self.state_file().display()))?;
@@ -7192,6 +7562,87 @@ pub fn record_gone(store: &Store, sid: &str, now: i64) -> Result<bool, String> {
     Ok(forgot)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninAdmission",
+        action = "Fresh",
+        reason = "Bounded environment scenario: the conformance test makes no store before the product's Read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninAdmission",
+        action = "Known",
+        reason = "Bounded environment scenario: the conformance test seeds a readable default state and login bindings before the product's Read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninAdmission",
+        action = "StateUnread",
+        reason = "Bounded environment scenario: the conformance test seeds an unreadable state file before the product's Read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninAdmission",
+        action = "BindingsUnread",
+        reason = "Bounded environment scenario: the conformance test seeds unreadable login bindings before the product's Read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninAdmission",
+        action = "StateLost",
+        reason = "Bounded environment scenario: the conformance test seeds a state witness whose state file is gone before the product's Read"
+    )
+)]
+#[doc(hidden)]
+pub fn account_signin_admission_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninLock",
+        action = "RetryA",
+        reason = "Model bookkeeping: a refused contender may take the sign-in lock again; the retry is its next TakeA, which is bound"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSigninLock",
+        action = "RetryB",
+        reason = "Model bookkeeping: a refused contender may take the sign-in lock again; the retry is its next TakeB, which is bound"
+    )
+)]
+#[doc(hidden)]
+pub fn account_signin_lock_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountStateRetention",
+        action = "Legacy",
+        reason = "Bounded environment scenario: the store holds the snapshot and ledger an older aterm wrote, which the conformance test writes as bytes"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountStateRetention",
+        action = "LoseSnapshot",
+        reason = "Environment: the snapshot file vanishes from under the store (the conformance test renames it away)"
+    )
+)]
+#[doc(hidden)]
+pub fn account_state_retention_environment() {}
+
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
 mod tests;
@@ -7199,3 +7650,7 @@ mod tests;
 #[cfg(test)]
 #[path = "accounts_logins_tests.rs"]
 mod logins_tests;
+
+#[cfg(test)]
+#[path = "accounts_lock_tests.rs"]
+mod lock_tests;

@@ -124,6 +124,10 @@ window_ledger! {
         pub(crate) out_req: Dist,
         pub(crate) ime: Histogram,
         pub(crate) ime_cancelled: Counter,
+        /// A Rewind step taken on the main thread → the first present showing its fold.
+        pub(crate) rewind_step: Histogram,
+        /// A Rewind step taken on the main thread → its fold shown and its redraw asked for (a headless instance presents nothing).
+        pub(crate) rewind_shown: Histogram,
         /// Input REFUSED because its session's input queue was full: the program has stopped reading and the key (or paste) was refused.
         pub(crate) refused: Counter,
         /// Terminal query REPLIES dropped at submission (`spawn::ReplyLane::submit`).
@@ -1136,6 +1140,24 @@ pub(crate) fn note_ime_compose(ns: u64) {
     METRICS.window.input.ime.record(ns);
 }
 
+/// Book one Rewind step's latency, from the main thread taking it to the present that shows it (`InputLedger::rewind_step`).
+pub(crate) fn note_rewind_step(elapsed: std::time::Duration) {
+    METRICS
+        .window
+        .input
+        .rewind_step
+        .record(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+}
+
+/// Book one Rewind step's latency, from the main thread taking it to its fold shown and its redraw asked for (`InputLedger::rewind_shown`).
+pub(crate) fn note_rewind_shown(elapsed: std::time::Duration) {
+    METRICS
+        .window
+        .input
+        .rewind_shown
+        .record(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+}
+
 /// Book one build of the menu-bar item's glance, in ns (`InputLedger::status_glance`).
 pub(crate) fn note_status_glance(ns: u64) {
     let input = &METRICS.window.input;
@@ -1196,6 +1218,26 @@ fn emit_input_legs(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
         &input.ime.copy_out(),
     );
     s.count("ime_cancelled", input.ime_cancelled.get());
+    emit_quantiles(
+        s,
+        [
+            "n_rewind_step",
+            "rewind_step_p50_ms",
+            "rewind_step_p95_ms",
+            "rewind_step_p99_ms",
+        ],
+        &input.rewind_step.copy_out(),
+    );
+    emit_quantiles(
+        s,
+        [
+            "n_rewind_shown",
+            "rewind_shown_p50_ms",
+            "rewind_shown_p95_ms",
+            "rewind_shown_p99_ms",
+        ],
+        &input.rewind_shown.copy_out(),
+    );
     s.count("input_refused", input.refused.get());
     s.count("reply_dropped", input.reply_dropped.get());
     emit_quantiles_ms3(

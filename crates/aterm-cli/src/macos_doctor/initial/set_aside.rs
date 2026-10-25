@@ -15,9 +15,19 @@
 //!   would have them (on an ALab Mac, set up).
 //!
 //! The run's history goes with it, and so does a Stop request no pass folded in, which named the
-//! retired run (its hold is kept in the plan instead). A fresh, unadmitted progress checkpoint
-//! names the recovered plan for Stop without authorizing any stage. A decision that stopped
-//! setup stays; any other becomes pending, so the next startup offers and admits the plan.
+//! retired run. Its hold is kept in the plan, empty, and in the decision, stopped: an older
+//! aterm's Cancel is that decision, and a Restore's decision stands, held for aterm's own
+//! permissions too ([`Restored::held`]), so no bring-forward stages them over it. A fresh,
+//! unadmitted progress checkpoint names the recovered plan for Stop without authorizing any
+//! stage. With no hold, a decision that stopped setup stays and any other becomes pending, so
+//! the next startup offers and admits the plan.
+//!
+//! Only a record that is not JSON, or not of this profile's shape, is damaged. One a newer aterm
+//! wrote ([`NEWER_SETUP`]) is sound: while one is there nothing is set aside, since that aterm
+//! keeps its setup. A run counter that does not parse is rebuilt ([`revision::repair`]); that
+//! changes nothing a person sees. A marker that does not parse, while every record does, says
+//! nothing of a hold: it is kept beside itself and written again, finished, with the hold the
+//! records say; nothing is set aside again.
 //!
 //! Each step can be taken again with the same outcome, and the marker ([`MARKER`]) records one
 //! under way with whether a Stop held and its reserved replacement revision, so a set-aside cut
@@ -83,6 +93,31 @@ pub fn set_aside_unreadable_setup_at_observing(
     mut published: impl FnMut(u64),
 ) -> Result<Option<SetAside>, String> {
     set_aside_with(root, || alab, &mut |_| Ok(()), &mut published)
+}
+
+/// Scratch recovery with a caller's filesystem change after Plan/Decision
+/// publication and before the actual checkpoint reservation.
+#[cfg(any(test, debug_assertions))]
+pub fn set_aside_unreadable_setup_at_observing_before_checkpoint(
+    root: &Path,
+    alab: bool,
+    before: impl FnOnce(),
+    mut published: impl FnMut(u64),
+) -> Result<Option<SetAside>, String> {
+    let mut before = Some(before);
+    set_aside_with(
+        root,
+        || alab,
+        &mut |at| {
+            if at == Step::Revision
+                && let Some(before) = before.take()
+            {
+                before();
+            }
+            Ok(())
+        },
+        &mut published,
+    )
 }
 
 /// The actual recovery with an error after its final marker was published, as
@@ -158,10 +193,12 @@ fn set_aside_with(
     step: &mut dyn FnMut(Step) -> Result<(), String>,
     published: &mut dyn FnMut(u64),
 ) -> Result<Option<SetAside>, String> {
-    let first = unparsable(root)?;
+    let Some((first, counter)) = survey(root)? else {
+        return Ok(None);
+    };
     let under_way =
         |marker: &Option<Marker>| marker.as_ref().is_some_and(|marker| marker.under_way);
-    if first.is_empty() && !under_way(&marker_at(root)?) {
+    if first.is_empty() && !counter && !under_way(&marker_at(root)?) {
         return Ok(None);
     }
     // A fresh install's vault and repositories, asked before the lock: the probe of the ALab
@@ -170,10 +207,18 @@ fn set_aside_with(
     let Some(_lock) = HeldLock::try_take(root)? else {
         return Err("another setup is saving this Mac's setup records".into());
     };
-    let corrupt = unparsable(root)?;
+    let Some((corrupt, _)) = survey(root)? else {
+        return Ok(None);
+    };
+    revision::repair(root)?;
     let marker = marker_at(root)?;
     if corrupt.is_empty() && !under_way(&marker) {
         return Ok(None);
+    }
+    if corrupt.is_empty()
+        && let Some(marker) = marker.as_ref().filter(|marker| marker.unreadable)
+    {
+        return rewrite_marker(root, marker);
     }
     if corrupt.contains(&PLAN) && !first.contains(&PLAN) {
         return Err("the saved setup plan changed while aterm read it".into());
@@ -261,12 +306,11 @@ fn set_aside_with(
     // published is preserved in the marker and plan before it is consumed.
     let _stop_lock = HeldLock::take_named(root, STOP_REQUEST_LOCK)?;
     let stop = stop_request_at(root);
+    let restored = known_decision.and_then(|(_, restored)| restored);
     let held = marker
         .as_ref()
         .is_some_and(|marker| marker.under_way && marker.held)
-        || decision == Some(Decision::Stopped(Stop::Cancelled))
-        || stop.is_some()
-        || progress.is_some_and(|progress| progress.stopped);
+        || holds(decision, restored, progress, stop);
     let reserved = marker
         .as_ref()
         .filter(|marker| marker.under_way)
@@ -274,13 +318,7 @@ fn set_aside_with(
     let recovered = recovered_plan(plan, held, fresh_alab);
     validate_plan(&recovered)?;
     let planned = plan_record(&recovered, false);
-    let pending = match decision {
-        Some(Decision::Stopped(_)) => None,
-        _ => Some(match known_decision.and_then(|(_, restored)| restored) {
-            Some(restored) => restored.record(RestoredState::Pending),
-            None => json!({ "profile": PROFILE, "state": "pending" }),
-        }),
-    };
+    let pending = decided(decision, restored, held);
     // Write ahead of both record renames. Their exact prefixes are the only
     // readable states a retry may replace, even before a revision is reserved.
     let bindings = checkpoint_prefixes(root, &planned, pending.as_ref())?;
@@ -357,6 +395,74 @@ fn set_aside_with(
     Ok(Some(SetAside { kept, stop_target }))
 }
 
+/// Whether the records hold aterm's own permissions: a Cancel, a Restore's decision a set-aside
+/// held ([`Restored::held`]), a Stop asked for, or a run a person stopped.
+fn holds(
+    decision: Option<Decision>,
+    restored: Option<Restored>,
+    progress: Option<Progress>,
+    stop: Option<StopRequest>,
+) -> bool {
+    decision == Some(Decision::Stopped(Stop::Cancelled))
+        || restored.is_some_and(|restored| restored.held)
+        || stop.is_some()
+        || progress.is_some_and(|progress| progress.stopped)
+}
+
+/// The decision a set-aside writes over `decision` (`None`: it stays as it is). A `held` one
+/// is stopped: a Cancel stays; what a Restore keeps stands as the Restore's own decision, held
+/// ([`Restored::held`]), so the preferences it put back stay put back; any other becomes a
+/// Cancel, which an older aterm reads too. With no hold a stopped decision stays, and any other
+/// becomes pending, keeping what a Restore keeps.
+fn decided(decision: Option<Decision>, restored: Option<Restored>, held: bool) -> Option<Value> {
+    match (decision, restored) {
+        (Some(Decision::Stopped(Stop::Cancelled)), _) => None,
+        (decision, Some(restored)) if held => {
+            (decision != Some(Decision::Stopped(Stop::Restored)) || !restored.held).then(|| {
+                Restored {
+                    held: true,
+                    ..restored
+                }
+                .record(RestoredState::Restored)
+            })
+        }
+        _ if held => Some(stamped(json!({ "profile": PROFILE, "state": "cancelled" }))),
+        (Some(Decision::Stopped(_)), _) => None,
+        (_, Some(restored)) => Some(restored.record(RestoredState::Pending)),
+        (_, None) => Some(stamped(json!({ "profile": PROFILE, "state": "pending" }))),
+    }
+}
+
+/// Every record parses and the marker does not: it says nothing of a hold. It is kept beside
+/// itself and written again, finished, with the hold the records say; nothing is set aside.
+fn rewrite_marker(root: &Path, marker: &Marker) -> Result<Option<SetAside>, String> {
+    let mut kept = marker.kept.clone();
+    let aside = keep_aside(root, MARKER)?;
+    if !kept.contains(&aside) {
+        kept.push(aside);
+    }
+    durable_directory(root).map_err(|error| error.to_string())?;
+    let (decision, restored) = decision_record(root)?;
+    let held = holds(
+        Some(decision),
+        restored,
+        progress_file(root)?,
+        stop_request_at(root),
+    );
+    write_marker(
+        root,
+        &Marker {
+            kept,
+            held,
+            under_way: false,
+            unreadable: false,
+            revision: None,
+            bindings: Vec::new(),
+        },
+    )?;
+    Ok(None)
+}
+
 /// The plan aterm goes on with: no Mac preference group; aterm's own permissions unless a
 /// person's Stop or Cancel `held` them, and then nothing at all; the vault and the repositories
 /// as the readable plan had them, or as a fresh install has them (`fresh_alab`).
@@ -383,19 +489,34 @@ fn recovered_plan(readable: Option<(Plan, bool)>, held: bool, fresh_alab: bool) 
     }
 }
 
-/// The records of [`RECORDS`] that are there and fail to parse. A read that fails for another
-/// reason (a permission, a disk error, a folder where a record should be) is an error: nothing
-/// says the record is corrupt.
-fn unparsable(root: &Path) -> Result<Vec<&'static str>, String> {
+/// Whether one of the records at `root` is a newer aterm's ([`survey`]): a read of them that
+/// failed says so ([`InitialSetupSnapshotError::Newer`]) even where another record beside it is
+/// damaged, since no set-aside goes while that one is there.
+pub(super) fn holds_newer(root: &Path) -> bool {
+    matches!(survey(root), Ok(None))
+}
+
+/// The records of [`RECORDS`] that are there and are damaged ([`reading`]), and whether the run
+/// counter is ([`revision::damaged`]); `None` while one of them is a newer aterm's
+/// ([`NEWER_SETUP`]), which keeps its setup. A read that fails for another reason (a permission,
+/// a disk error, a folder where a record should be) is an error: nothing says the record is
+/// corrupt.
+fn survey(root: &Path) -> Result<Option<(Vec<&'static str>, bool)>, String> {
+    let counter = match revision::damaged(root) {
+        Err(why) if setup_is_newer(&why) => return Ok(None),
+        counter => counter?,
+    };
     let mut corrupt = Vec::new();
     for name in RECORDS {
-        if let Some(bytes) = read_bytes(root, name)?
-            && !parses(name, &bytes)
-        {
-            corrupt.push(name);
+        if let Some(bytes) = read_bytes(root, name)? {
+            match reading(name, &bytes) {
+                Ok(()) => {}
+                Err(why) if setup_is_newer(&why) => return Ok(None),
+                Err(_) => corrupt.push(name),
+            }
         }
     }
-    Ok(corrupt)
+    Ok(Some((corrupt, counter)))
 }
 
 fn read_bytes(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -458,14 +579,16 @@ fn retire_marker(root: &Path) -> Result<(), String> {
     durable_directory(root).map_err(|error| error.to_string())
 }
 
-/// Whether `bytes` parse as record `name`, as its reader parses them.
-fn parses(name: &str, bytes: &[u8]) -> bool {
+/// `bytes` read as record `name`, as its reader reads them: an error is damage, or a newer
+/// aterm's record ([`NEWER_SETUP`]).
+fn reading(name: &str, bytes: &[u8]) -> Result<(), String> {
     match name {
-        PLAN => plan_from(bytes).is_ok(),
+        PLAN => plan_from(bytes).map(|_| ()),
         PROGRESS => aterm_json::from_slice::<Value>(bytes)
-            .ok()
-            .is_some_and(|value| parse_progress(&value).is_ok()),
-        _ => parse_decision(bytes).is_ok(),
+            .map_err(|_| "invalid initial setup progress record".to_owned())
+            .and_then(|value| parse_progress(&value))
+            .map(|_| ()),
+        _ => parse_decision(bytes).map(|_| ()),
     }
 }
 
@@ -486,7 +609,7 @@ fn plan_from(bytes: &[u8]) -> Result<(Plan, bool), String> {
 /// `<name>.unreadable`, `<name>.unreadable.2`, … that is free or already holds these bytes, so
 /// a set-aside taken again keeps one copy. A hard link keeps the very file; where the folder
 /// cannot hold one, a copy flushed before its name is published.
-fn keep_aside(root: &Path, name: &str) -> Result<String, String> {
+pub(super) fn keep_aside(root: &Path, name: &str) -> Result<String, String> {
     let path = root.join(name);
     let bytes = std::fs::read(&path).map_err(|error| format!("{name}: {error}"))?;
     for n in 1..=99_u32 {
@@ -521,8 +644,9 @@ struct Marker {
     bindings: Vec<[u8; 32]>,
 }
 
-/// The marker, if one. An unreadable marker cannot release a recorded Stop:
-/// its replacement holds automatic work until a person chooses again.
+/// The marker, if one. An unreadable marker says nothing of a hold: what held is read again from
+/// the records, where a held set-aside writes it ([`decided`]) before it lets the Stop request
+/// go.
 fn marker_at(root: &Path) -> Result<Option<Marker>, String> {
     let Some(bytes) = read_bytes(root, MARKER)? else {
         return Ok(None);
@@ -561,7 +685,6 @@ fn marker_at(root: &Path) -> Result<Option<Marker>, String> {
             })
         })
         .unwrap_or(Marker {
-            held: true,
             under_way: true,
             unreadable: true,
             ..Marker::default()
@@ -720,8 +843,9 @@ mod tests {
     }
 
     /// A person's Stop or Cancel holds aterm's own permissions through a set-aside: the plan it
-    /// goes on with sets up nothing, and the Stop request that named the lost run goes, so it
-    /// never stops a later run that takes its number.
+    /// goes on with sets up nothing and the decision stands stopped, so no launch offers it, and
+    /// the Stop request that named the lost run goes, so it never stops a later run that takes
+    /// its number.
     #[test]
     fn a_stop_or_cancel_holds_through_a_set_aside() {
         for cancelled in [false, true] {
@@ -742,12 +866,10 @@ mod tests {
             assert!(stop_request_at(root).is_none());
             assert_eq!(
                 decision_at(root).unwrap(),
-                if cancelled {
-                    Decision::Stopped(Stop::Cancelled)
-                } else {
-                    Decision::Pending
-                }
+                Decision::Stopped(Stop::Cancelled),
+                "{cancelled}"
             );
+            assert!(finished_at(root).unwrap());
         }
     }
 
@@ -773,7 +895,10 @@ mod tests {
         assert!(saved(root).selection.is_empty(), "the later Stop holds");
         assert!(marker_at(root).unwrap().unwrap().held);
         assert!(stop_request_at(root).is_none());
-        assert_eq!(decision_at(root).unwrap(), Decision::Pending);
+        assert_eq!(
+            decision_at(root).unwrap(),
+            Decision::Stopped(Stop::Cancelled)
+        );
         assert_eq!(set_aside_unreadable_setup_at(root, false).unwrap(), None);
     }
 
@@ -793,7 +918,10 @@ mod tests {
         assert!(saved(root).selection.is_empty(), "the later Stop holds");
         assert!(marker_at(root).unwrap().unwrap().held);
         assert!(stop_request_at(root).is_none());
-        assert_eq!(decision_at(root).unwrap(), Decision::Pending);
+        assert_eq!(
+            decision_at(root).unwrap(),
+            Decision::Stopped(Stop::Cancelled)
+        );
     }
 
     #[test]
@@ -830,9 +958,15 @@ mod tests {
         assert!(!progress_file(root).unwrap().unwrap().admitted);
         std::fs::write(root.join(MARKER), damaged).unwrap();
 
-        set_aside_unreadable_setup_at(root, false).unwrap().unwrap();
+        // Every record parses: the marker is written again, finished, holding what they hold.
+        assert_eq!(set_aside_unreadable_setup_at(root, false).unwrap(), None);
         assert!(saved(root).selection.is_empty(), "the earlier Stop holds");
-        assert!(marker_at(root).unwrap().unwrap().held);
+        let marker = marker_at(root).unwrap().unwrap();
+        assert!(marker.held && !marker.under_way);
+        assert_eq!(
+            decision_at(root).unwrap(),
+            Decision::Stopped(Stop::Cancelled)
+        );
         assert_eq!(
             std::fs::read(root.join("set-aside.json.unreadable")).unwrap(),
             damaged,

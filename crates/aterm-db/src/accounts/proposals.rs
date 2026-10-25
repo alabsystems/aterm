@@ -48,6 +48,11 @@ impl Proposals {
             Ok(Log::read_with(session, store, scope, decode)?.snapshot())
         })
     }
+    /// Diagnose explicit references without resolving credentials or authorizing
+    /// login. This reads the existing table and appends no application operation.
+    pub fn check(&self) -> Result<aterm_json::Value> {
+        Ok(super::references::inspect(&self.snapshot()?))
+    }
     /// Commit one whole-value transaction. Requests are scoped to this certified
     /// writer incarnation. Exact retries return their original durable receipt.
     /// `None` deletes a value reversibly; this API creates no permanent stop.

@@ -103,6 +103,91 @@ fn read_named(_: &Env, source: &str) -> Result<String, String> {
     fs::read_to_string(source).map_err(|why| format!("{source}: {why}"))
 }
 
+#[test]
+fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for bad in ["state", "bindings", "lost"] {
+            let bed = Bed::new("signin-read-refusal");
+            let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+            store.ensure().unwrap();
+            if bad == "lost" {
+                fs::write(store.state_witness_file(), "").unwrap();
+            } else {
+                fs::write(
+                    store.state_file(),
+                    if bad == "state" {
+                        "{".to_owned()
+                    } else {
+                        accounts::State::default().to_json()
+                    },
+                )
+                .unwrap();
+            }
+            if bad == "bindings" {
+                fs::write(store.logins_file(), "{").unwrap();
+            }
+            let browser = bed.home.join(
+                ".cache/aterm/browser.noindex/chrome-headless-shell-fixture/chrome-headless-shell",
+            );
+            fs::create_dir_all(browser.parent().unwrap()).unwrap();
+            fs::write(browser, "inert browser fixture").unwrap();
+            let region = if cli == Cli::Kimi {
+                "region='global'\n"
+            } else {
+                ""
+            };
+            let roster = Roster::parse_for(cli, &format!("[[account]]\nlabel='main'\nclass='dedicated'\nemail='owner@example.test'\nbrowser='Main'\n{region}")).unwrap();
+            let row = roster.row("main").unwrap().clone();
+            let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+            let before = Bed::tree(bed._dir.path());
+            let dispatch = spawn_row_renewal(
+                cli,
+                &bed.home,
+                &bed.state,
+                &bed.roster(cli),
+                roster,
+                &accounts::Logins::default(),
+                row,
+                (None, true),
+                NOW,
+                &guard,
+                &|_| panic!("unknown records cannot dispatch a sign-in"),
+                None,
+            );
+            assert_eq!(dispatch, RenewalDispatch::Failed, "{cli:?}/{bad}");
+            assert!(guard.lock().unwrap().last_attempt.is_empty());
+            assert_eq!(Bed::tree(bed._dir.path()), before);
+        }
+    }
+}
+
+#[test]
+fn codex_sync_preserves_explicit_identity_when_appending_a_row() {
+    for login in ["email='alias@example.test'\n", ""] {
+        for (label, email) in [
+            ("account", "alias@example.test"),
+            ("account", "owner@example.test"),
+            ("different", "owner@example.test"),
+        ] {
+            let bed = Bed::new("codex-identity-policy");
+            let text = format!(
+                "[[account]]\nlabel='account'\nclass='dedicated'\n{login}identity_email='owner@example.test'\n"
+            );
+            fs::write(bed.roster(Cli::Codex), &text).unwrap();
+            bed.secret(&cli_fleet_file(Cli::Codex), &format!("[[account]]\nlabel='{label}'\nemail='{email}'\nmachines=['m16']\n\n[[account]]\nlabel='second'\nemail='second@example.test'\nmachines=['m16']\n"));
+            assert!(matches!(bed.sync(Cli::Codex, None), Ok(CliSync::Synced(_))));
+            let after = fs::read_to_string(bed.roster(Cli::Codex)).unwrap();
+            assert!(after.starts_with(&text));
+            let roster = Roster::load_for(Cli::Codex, &bed.roster(Cli::Codex)).unwrap();
+            assert_eq!(roster.rows.len(), 2);
+            assert_eq!(
+                roster.row("account").unwrap().expected_identity_email(),
+                Some("owner@example.test")
+            );
+        }
+    }
+}
+
 const KIMI_FLEET: &str = "\
 [[account]]
 label = \"kimi-1\"
@@ -451,6 +536,32 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
     assert!(!html.contains('@'), "no email on the page: {html}");
 }
 
+#[test]
+fn unreadable_pool_state_and_bindings_are_refused_by_inventory_and_dashboard() {
+    for damaged in ["state", "logins"] {
+        let bed = Bed::new("dashboard-refused");
+        fs::write(
+            bed.roster(Cli::Kimi),
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+        )
+        .unwrap();
+        let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+        store.ensure().unwrap();
+        let path = if damaged == "state" {
+            store.state_file()
+        } else {
+            store.logins_file()
+        };
+        fs::write(&path, "{").unwrap();
+        let pools = cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW);
+        assert_eq!(cli_pools_words(&pools).as_deref(), Some("kimi refused"));
+        let html = pools_html(&pools, NOW);
+        assert!(html.contains("The pool is refused:"), "{html}");
+        assert!(!html.contains("<code>main</code>"), "{html}");
+        assert_eq!(fs::read(&path).unwrap(), b"{");
+    }
+}
+
 /// A Grok row's background renewal starts on macOS too, now that its sign-in runs under the
 /// no-desk sandbox there (`SignIn::no_desk`): a headless browser installed and the row's email
 /// known, its work is handed off (never run here). CONTROL: a row with no email starts nothing.
@@ -477,6 +588,7 @@ fn a_grok_rows_background_renewal_starts_on_macos() {
             Cli::Grok,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Grok),
             &roster,
             &logins,
             roster.row(label).cloned().unwrap(),
@@ -538,7 +650,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
     .unwrap();
 
     assert!(
-        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, &roster, &guard, NOW),
+        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, (&roster, None), &guard, NOW),
         "CONTROLS: neither wrong-CLI checkpoint nor credential-less staging dir may recover"
     );
 
@@ -560,7 +672,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
     // CONTROL 3: while a live sign-in holds `signin.lock`, recovery yields instead of racing it.
     let live_lock = store.signin_now().unwrap().expect("signin lock free");
     assert!(
-        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, &roster, &guard, NOW),
+        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, (&roster, None), &guard, NOW),
         "CONTROL: recovery yields while signin.lock is held"
     );
     drop(live_lock);
@@ -636,6 +748,7 @@ region = \"global\"
             Cli::Kimi,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Kimi),
             &roster,
             &empty_logins,
             roster.row("kimi-1").cloned().unwrap(),
@@ -663,6 +776,7 @@ region = \"global\"
             Cli::Kimi,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Kimi),
             &roster,
             &wrong_logins,
             roster.row("kimi-1").cloned().unwrap(),
@@ -698,6 +812,7 @@ region = \"global\"
             Cli::Kimi,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Kimi),
             &roster,
             &wrong_logins,
             roster.row("kimi-1").cloned().unwrap(),
@@ -762,6 +877,85 @@ region = \"global\"
     );
 }
 
+/// ANOTHER CLI'S ROW WHOSE RENEWAL SIGNED IN ANOTHER ACCOUNT IS SIGNED IN AGAIN BY THE UPKEEP
+/// ITSELF (the fact the window's wrong-account entry tells, `accounts_wrong_entry_for`): the row,
+/// still signed out, stays its pool's candidate, and once the wrong account's hold has passed the
+/// upkeep starts its renewal again with nothing a person does. CONTROL: within the hold nothing
+/// starts, and no cooldown is burnt.
+#[test]
+fn a_pool_rows_wrong_account_is_signed_in_again_by_the_upkeep() {
+    let bed = Bed::new("vendor-wrong-again");
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Kimi);
+    bed.secret(
+        &cli_fleet_file(Cli::Kimi),
+        "\
+[[account]]
+label = \"kimi-1\"
+email = \"kimi-one@example.com\"
+machines = [\"m16\"]
+region = \"global\"
+",
+    );
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 1_000;
+    assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
+    signed_out_kimi_login(&bed, "kimi-1");
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+    for (ago, again) in [(60, false), (901, true)] {
+        let mut note = None;
+        store
+            .transact_logins(now, &mut note, |_, logins| {
+                Ok(accounts::note_wrong_account(logins, "kimi-1", now - ago))
+            })
+            .unwrap();
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let cooldown = Mutex::new(None);
+        let fx = UpkeepEffects {
+            fetch: &fetch,
+            spawn_renewal: &spawn,
+            sync_cooldown: &cooldown,
+            rediscovery: &Mutex::new(Rediscovery::default()),
+            renew_guard: &guard,
+            find_browser: &|_: &Path| false,
+            vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+            spawn_vault: &|_work| Ok(()),
+            mailbox: &ladder_mailbox_files,
+            log: std::sync::Arc::new(|_: &str| {}),
+            run_attempt: None,
+        };
+        assert_eq!(
+            renew_pool_due(
+                Cli::Kimi,
+                &bed.home,
+                &bed.state,
+                &bed.roster(Cli::Kimi),
+                now,
+                &fx,
+            ),
+            again,
+            "the wrong account {ago} s ago"
+        );
+        assert_eq!(
+            guard
+                .lock()
+                .unwrap()
+                .last_attempt
+                .contains_key("kimi:kimi-1"),
+            again,
+            "the wrong account {ago} s ago"
+        );
+    }
+}
+
 #[test]
 fn durable_sign_in_tasks_hold_across_restarts_sort_last_and_unpark_after_browser_sign_in() {
     let bed = Bed::new("durable-signin-task");
@@ -820,6 +1014,7 @@ region = \"global\"
                 Cli::Kimi,
                 &bed.home,
                 &bed.state,
+                &bed.roster(Cli::Kimi),
                 &roster,
                 &task_logins,
                 roster.row("kimi-1").cloned().unwrap(),
@@ -929,6 +1124,7 @@ region = \"global\"
                 Cli::Kimi,
                 &bed.home,
                 &bed.state,
+                &bed.roster(Cli::Kimi),
                 &roster,
                 &logins_with_task,
                 roster.row("kimi-1").cloned().unwrap(),
@@ -955,6 +1151,7 @@ region = \"global\"
             Cli::Kimi,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Kimi),
             &roster,
             &logins_with_task,
             roster.row("kimi-1").cloned().unwrap(),
@@ -971,6 +1168,7 @@ region = \"global\"
             Cli::Kimi,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Kimi),
             &roster,
             &logins_with_task,
             roster.row("kimi-1").cloned().unwrap(),
@@ -1003,6 +1201,7 @@ region = \"global\"
             Cli::Kimi,
             &bed.home,
             &bed.state,
+            &bed.roster(Cli::Kimi),
             &roster,
             &login_task_logins,
             roster.row("kimi-1").cloned().unwrap(),

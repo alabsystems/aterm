@@ -94,9 +94,9 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 /// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
-const MEASURING_TARGETS: [&str; 3] = ["paint", "spin", "aos"];
+const MEASURING_TARGETS: [&str; 4] = ["paint", "spin", "aos", "rewind"];
 
-/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos`: the measuring stage's one child, the paint, spin and aos matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes and repair main-thread time on a live instance.
+/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos --bench rewind`: the measuring stage's one child, the paint, spin, aos and rewind matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes, repair main-thread time and Rewind step latency on a live instance.
 #[must_use]
 pub fn measuring_args() -> Vec<String> {
     measuring_targets_args()
@@ -1777,13 +1777,19 @@ pub fn linux_lab_build_cmd(ctx: &Ctx) -> Cmd {
 /// The `SIGTERM` grace a Linux lane over the hang ceiling gets: the lab ends the step in flight, stops its units and the VM it booted, then exits.
 pub const LINUX_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// `<target>/debug/aterm-lab linux proof`: every arch, every display.
+/// `<target>/debug/aterm-lab linux proof`: every arch, every display. A run's `--admit now`
+/// ([`Ctx::quiet`]) is the lab's too, for its boot's disk claim and its GUI rows' quiet claim.
 #[must_use]
 pub fn linux_lane_cmd(ctx: &Ctx) -> Cmd {
-    Cmd::new(main_bin(ctx, "aterm-lab"))
+    let lane = Cmd::new(main_bin(ctx, "aterm-lab"))
         .term_grace(LINUX_TERM_GRACE)
-        .arg("linux")
-        .arg("proof")
+        .arg("linux");
+    let lane = if ctx.quiet == Some(aterm_capacity::Admit::Now) {
+        lane.arg(aterm_capacity::Admit::FLAG).arg("now")
+    } else {
+        lane
+    };
+    lane.arg("proof")
 }
 
 /// The Linux lane's exit, read by [`lab_lane_outcome`]: its NOT RUN is COULD NOT RUN, exit 3, never a skip.
@@ -2684,7 +2690,7 @@ mod tests {
             let (_, measuring) = measuring_cmd(&c, &artifact, measuring_args());
             assert!(
                 !measuring.demoted,
-                "the measuring benches run the paint, spin and aos guards"
+                "the measuring benches run the paint, spin, aos and rewind guards"
             );
         }
         assert!(
@@ -3084,7 +3090,8 @@ mod tests {
             )
         };
         let paint = result("paint", 23, 23, 0, 0);
-        let spin = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0);
+        let spin =
+            result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &result("rewind", 2, 2, 0, 0);
         let decide = |ok: bool, output: String| {
             let run = exec::Run {
                 ok,
@@ -3132,6 +3139,7 @@ mod tests {
                 result("paint", 23, 0, 0, 23)
                     + &result("spin", 2, 0, 0, 2)
                     + &result("aos", 1, 0, 0, 1)
+                    + &result("rewind", 2, 0, 0, 2)
             )
             .0,
             could_not_run,
@@ -3143,6 +3151,7 @@ mod tests {
                 result("paint", 23, 22, 1, 0)
                     + &result("spin", 2, 0, 0, 2)
                     + &result("aos", 1, 0, 0, 1)
+                    + &result("rewind", 2, 0, 0, 2)
             )
             .0,
             Outcome::Fail(Severity::GateFailed),
@@ -3321,6 +3330,17 @@ mod tests {
         );
         assert_eq!(lane.program, c.target_dir.join("debug/aterm-lab"));
         assert_eq!(lane.argv()[1..], ["linux".to_string(), "proof".to_string()]);
+        let admitting = |mode| linux_lane_cmd(&ctx(Scope::workspace()).with_quiet(Some(mode)));
+        assert_eq!(
+            admitting(aterm_capacity::Admit::Now).argv()[1..],
+            ["linux", "--admit", "now", "proof"].map(String::from),
+            "the run's --admit now is the lab's"
+        );
+        assert_eq!(
+            admitting(aterm_capacity::Admit::Wait).argv()[1..],
+            ["linux", "proof"].map(String::from),
+            "wait is the lab's own default"
+        );
         assert_eq!(
             linux_lane_outcome(Some(0), ""),
             (Outcome::Ok, LINUX_LANE.to_string())

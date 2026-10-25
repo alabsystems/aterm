@@ -2655,4 +2655,276 @@ mod tests {
             FrameRefill::Scoped { rows_refilled: 0 }
         );
     }
+
+    /// One frame of a window with a host chrome row (a tab strip, the message
+    /// band) in the native redraw's order: undo the last frame's prepend,
+    /// refill, prepend this frame's `band` row. The refilled engine rows must be
+    /// the rows a full extract resolves, and the band must sit above them.
+    fn banded_step(
+        term: &mut Terminal,
+        scratch: &mut crate::render::RenderInput,
+        pool: &mut Vec<Vec<RenderCell>>,
+        dims: (usize, usize),
+        band: &str,
+        what: &str,
+    ) -> crate::render::FrameRefill {
+        let (refill, reference) = banded_refill(term, scratch, pool, dims, what);
+        prepend_band(scratch, pool, &reference, band, what);
+        refill
+    }
+
+    /// The first half of [`banded_step`]: undo the last frame's prepend and
+    /// refill, checked against a full extract, which it returns.
+    fn banded_refill(
+        term: &mut Terminal,
+        scratch: &mut crate::render::RenderInput,
+        pool: &mut Vec<Vec<RenderCell>>,
+        (rows, cols): (usize, usize),
+        what: &str,
+    ) -> (crate::render::FrameRefill, crate::render::RenderInput) {
+        if scratch.row_shift > 0 && !scratch.undo_host_row_prepend(rows, pool, 1) {
+            scratch.cells.truncate(rows);
+        }
+        let reference = term.cell_frame(rows, cols);
+        let refill = term.cell_frame_damage_scoped_into(scratch, rows, cols);
+        assert!(
+            *scratch == reference,
+            "a banded window's refill diverged from the full extract after: {what} ({refill:?})"
+        );
+        (refill, reference)
+    }
+
+    /// The second half of [`banded_step`]: prepend this frame's `band` row
+    /// over the engine rows `reference` resolved.
+    fn prepend_band(
+        scratch: &mut crate::render::RenderInput,
+        pool: &mut Vec<Vec<RenderCell>>,
+        reference: &crate::render::RenderInput,
+        band: &str,
+        what: &str,
+    ) {
+        let cols = reference.cols;
+        let row: Vec<RenderCell> = band
+            .chars()
+            .chain(std::iter::repeat(' '))
+            .take(cols)
+            .map(|ch| RenderCell {
+                ch,
+                ..RenderCell::default()
+            })
+            .collect();
+        scratch.prepend_host_rows(
+            1,
+            std::iter::once(row.as_slice()),
+            16,
+            0,
+            pool,
+            crate::render::HostRowPixels::Placed,
+        );
+        assert_eq!(
+            scratch.cells[0], row,
+            "{what}: the top row is this frame's band"
+        );
+        assert!(
+            scratch.cells[1..] == reference.cells[..],
+            "{what}: the engine rows sit under the band"
+        );
+    }
+
+    #[test]
+    fn scr2_a_banded_viewport_parked_in_history_refills_only_what_changed() {
+        use crate::render::{FrameRefill, FullRefillCause};
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+        const SCROLLED: FrameRefill = FrameRefill::Full {
+            cause: FullRefillCause::EngineScrolled,
+        };
+        const UNCHANGED: FrameRefill = FrameRefill::Scoped { rows_refilled: 0 };
+        let (mut term, mut scratch) = scr2_parked_in_history(ROWS, COLS, 3);
+        let mut pool = Vec::new();
+        let mut step = |term: &mut Terminal, band: &str, what: &str| {
+            banded_step(term, &mut scratch, &mut pool, (ROWS, COLS), band, what)
+        };
+
+        assert_eq!(step(&mut term, "warn: disk", "band raised"), UNCHANGED);
+        for i in 0..3 {
+            assert_eq!(
+                step(&mut term, "warn: disk", &format!("unchanged frame {i}")),
+                UNCHANGED,
+                "a parked viewport under a band whose prepend nothing else wrote over is \
+                 refilled from its own rows (frame {i})"
+            );
+        }
+        assert_eq!(
+            step(&mut term, "warn: disk full", "band text change"),
+            UNCHANGED,
+            "the band's own text is the host's row, painted afresh each frame"
+        );
+        term.scroll_display(1);
+        assert_eq!(
+            step(&mut term, "warn: disk full", "wheel step"),
+            FrameRefill::Scoped { rows_refilled: 1 }
+        );
+        term.process(b"tail\r\n");
+        assert_eq!(step(&mut term, "warn: disk full", "output"), SCROLLED);
+        assert_eq!(
+            step(&mut term, "warn: disk full", "after output"),
+            UNCHANGED
+        );
+        term.set_default_background(crate::terminal::Rgb {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+        });
+        assert_eq!(step(&mut term, "warn: disk full", "theme"), SCROLLED);
+        assert_eq!(step(&mut term, "warn: disk full", "after theme"), UNCHANGED);
+        term.scroll_to_bottom();
+        assert_eq!(
+            step(&mut term, "warn: disk full", "back to the bottom"),
+            FrameRefill::Full {
+                cause: FullRefillCause::ScratchScrolled
+            }
+        );
+        assert_eq!(
+            step(&mut term, "warn: disk full", "live and unchanged"),
+            UNCHANGED
+        );
+    }
+
+    #[test]
+    fn scr2_a_banded_resize_and_a_host_write_refill_in_full() {
+        use crate::render::{FrameRefill, FullRefillCause};
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+        let (mut term, mut scratch) = scr2_parked_in_history(ROWS, COLS, 3);
+        let mut pool = Vec::new();
+        let _ = banded_step(
+            &mut term,
+            &mut scratch,
+            &mut pool,
+            (ROWS, COLS),
+            "warn",
+            "band raised",
+        );
+        scratch.cells[2][0].ch = '~';
+        scratch.snapshot_seq = scratch.snapshot_seq.wrapping_add(1);
+        assert_eq!(
+            banded_step(
+                &mut term,
+                &mut scratch,
+                &mut pool,
+                (ROWS, COLS),
+                "warn",
+                "a host wrote a cell over the parked rows"
+            ),
+            FrameRefill::Full {
+                cause: FullRefillCause::HostMutation
+            }
+        );
+        term.resize(ROWS as u16 + 2, COLS as u16);
+        assert!(matches!(
+            banded_step(
+                &mut term,
+                &mut scratch,
+                &mut pool,
+                (ROWS + 2, COLS),
+                "warn",
+                "resize while parked"
+            ),
+            FrameRefill::Full { .. }
+        ));
+        assert_eq!(
+            banded_step(
+                &mut term,
+                &mut scratch,
+                &mut pool,
+                (ROWS + 2, COLS),
+                "warn",
+                "after the resize"
+            ),
+            FrameRefill::Scoped { rows_refilled: 0 }
+        );
+    }
+
+    #[test]
+    fn a_banded_live_fill_under_whole_grid_damage_is_undone_so_the_next_echo_refills_one_row() {
+        use crate::render::{FrameRefill, FullRefillCause, PrependBlessing};
+        const ROWS: usize = 8;
+        const COLS: usize = 32;
+        let mut term = Terminal::new(ROWS as u16, COLS as u16);
+        term.process(b"one\r\ntwo\r\nthree");
+        // Clear the new terminal's whole-grid damage, so the first fill carries a
+        // revision lane and only the theme frame's prepend is a Shift.
+        term.take_damage();
+        let mut scratch = crate::render::RenderInput::empty();
+        let mut pool = Vec::new();
+        let (_, reference) = banded_refill(
+            &mut term,
+            &mut scratch,
+            &mut pool,
+            (ROWS, COLS),
+            "band raised",
+        );
+        assert_eq!(scratch.host_prepend_blessing(), PrependBlessing::Lane);
+        prepend_band(&mut scratch, &mut pool, &reference, "warn", "band raised");
+        assert_eq!(
+            banded_step(
+                &mut term,
+                &mut scratch,
+                &mut pool,
+                (ROWS, COLS),
+                "warn",
+                "settled"
+            ),
+            FrameRefill::Scoped { rows_refilled: 0 }
+        );
+        term.set_default_background(crate::terminal::Rgb {
+            r: 0x10,
+            g: 0x20,
+            b: 0x30,
+        });
+        let (refill, reference) =
+            banded_refill(&mut term, &mut scratch, &mut pool, (ROWS, COLS), "theme");
+        assert_eq!(
+            refill,
+            FrameRefill::Full {
+                cause: FullRefillCause::FullDamage
+            }
+        );
+        assert_eq!(scratch.display_offset, 0, "precondition: the view is live");
+        assert_eq!(
+            scratch.row_rev_lane, 0,
+            "precondition: a fill under whole-grid damage publishes no revision lane"
+        );
+        assert_eq!(
+            scratch.host_prepend_blessing(),
+            PrependBlessing::Shift,
+            "a live engine fill without a lane can still be shifted back"
+        );
+        prepend_band(&mut scratch, &mut pool, &reference, "warn", "theme");
+        term.process(b"x");
+        assert_eq!(
+            banded_step(
+                &mut term,
+                &mut scratch,
+                &mut pool,
+                (ROWS, COLS),
+                "warn",
+                "echo after the theme frame"
+            ),
+            FrameRefill::Scoped { rows_refilled: 1 },
+            "the undo restores the engine fill, so the echo takes the live scoped arm"
+        );
+        assert_eq!(
+            banded_step(
+                &mut term,
+                &mut scratch,
+                &mut pool,
+                (ROWS, COLS),
+                "warn",
+                "settled after the echo"
+            ),
+            FrameRefill::Scoped { rows_refilled: 0 }
+        );
+    }
 }

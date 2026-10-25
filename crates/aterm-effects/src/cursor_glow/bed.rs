@@ -644,14 +644,27 @@ pub(crate) fn air_lit(
     let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
     let (inv_cw, inv_ch) = (1.0 / (geom.cw as f32), 1.0 / (geom.ch as f32));
     let reach = i32::from(!alone);
-    let blank = |s: &CometSample| {
-        let (row, col) = (
+    out.reserve(run.len());
+    let mut prev_cell: Option<((i32, i32), bool)> = None;
+    for s in run {
+        let cell = (
             ((s.y - oyf) * inv_ch).floor() as i32,
             ((s.x - oxf) * inv_cw).floor() as i32,
         );
-        (col - reach..=col + reach).all(|c| !text.over_text(row, c))
-    };
-    out.extend(run.iter().map(blank));
+        let ok = match prev_cell {
+            Some((prev, ans)) if prev == cell => ans,
+            _ => {
+                let (row, col) = cell;
+                let mut clear = !text.over_text(row, col);
+                if clear && reach != 0 {
+                    clear = !text.over_text(row, col - 1) && !text.over_text(row, col + 1);
+                }
+                prev_cell = Some((cell, clear));
+                clear
+            }
+        };
+        out.push(ok);
+    }
     if alone {
         return;
     }
@@ -934,11 +947,11 @@ pub(crate) fn lay_dark_bed(
                     break;
                 }
                 let stretch = &run[start..i];
-                let reach = stretch
-                    .iter()
-                    .map(|s| shape.at(s.cov, chf, 1.0).1)
-                    .sum::<f32>()
-                    / stretch.len() as f32;
+                let mut reach_sum = 0.0f32;
+                for s in stretch {
+                    reach_sum += shape.at(s.cov, chf, 1.0).1;
+                }
+                let reach = reach_sum / stretch.len() as f32;
                 let vertex = |s: &CometSample, rgb: u32, x: f32, y: f32| BeamVertex {
                     x,
                     y: y + dy,
@@ -950,19 +963,16 @@ pub(crate) fn lay_dark_bed(
                     let (a, b) = (run[start - 1], run[start]);
                     tube.push(vertex(&b, ink[start], 0.5 * (a.x + b.x), 0.5 * (a.y + b.y)));
                 }
-                tube.extend(
-                    stretch
-                        .iter()
-                        .zip(&ink[start..i])
-                        .map(|(s, &rgb)| vertex(s, rgb, s.x, s.y)),
-                );
+                for (s, &rgb) in stretch.iter().zip(&ink[start..i]) {
+                    tube.push(vertex(s, rgb, s.x, s.y));
+                }
                 if i < run.len() {
                     let (a, b) = (run[i - 1], run[i]);
                     tube.push(vertex(&a, ink[i - 1], 0.5 * (a.x + b.x), 0.5 * (a.y + b.y)));
                 }
                 if tube.len() >= 2 && shape.dim > 0.0 {
                     let (a, b) = (tube[0], tube[tube.len() - 1]);
-                    let len = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+                    let len = crate::color_math::hypot_f32(b.x - a.x, b.y - a.y);
                     let f = (cwf * 0.5 / len.max(1.0)).min(0.3);
                     let at = |k: f32, cov: u8| BeamVertex {
                         x: a.x + (b.x - a.x) * k,
@@ -1093,19 +1103,24 @@ fn wedge_runs(
             } else {
                 (cells * 4.0).ceil().max(1.0) as usize
             };
-            let cov = piece.iter().map(|s| s.cov).max().unwrap_or(head.cov);
+            let mut cov = head.cov;
+            for s in piece {
+                cov = cov.max(s.cov);
+            }
             lengths.push(cells);
             let span = cells * cwf;
             let inv_knots = 1.0 / knots as f32;
-            out[at].extend((0..=knots).rev().map(|k| {
+            let dst = &mut out[at];
+            dst.reserve(knots + 1);
+            for k in (0..=knots).rev() {
                 let u = k as f32 * inv_knots;
-                CometSample {
+                dst.push(CometSample {
                     x: head.x + back * (span * u),
                     y: head.y,
                     cov,
                     pos: 1.0 - u,
-                }
-            }));
+                });
+            }
             start = end;
         }
     }
@@ -1302,16 +1317,31 @@ pub(crate) fn bridge_word_gaps(
             if lettered(row, col) {
                 continue;
             }
-            let left = (1..=reach)
-                .map(|d| col - d)
-                .find(|&c| c >= 0 && lettered(row, c));
-            let right = (1..=reach).map(|d| col + d).find(|&c| lettered(row, c));
-            let (Some(a), Some(b)) = (left, right) else {
+            let mut left = None;
+            for d in 1..=reach {
+                let c = col - d;
+                if c < 0 {
+                    break;
+                }
+                if lettered(row, c) {
+                    left = Some(c);
+                    break;
+                }
+            }
+            let Some(a) = left else {
                 continue;
             };
-            if b - a - 1 > BED_WORD_GAP_COLS {
-                continue;
+            let max_b = (col + reach).min(a + 1 + BED_WORD_GAP_COLS);
+            let mut right = None;
+            for c in col + 1..=max_b {
+                if lettered(row, c) {
+                    right = Some(c);
+                    break;
+                }
             }
+            let Some(b) = right else {
+                continue;
+            };
             let on = |c: i32| run.iter().position(|q| cell_of(q) == (row, c));
             let (Some(ja), Some(jb)) = (on(a), on(b)) else {
                 continue;

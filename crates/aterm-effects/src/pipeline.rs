@@ -617,10 +617,11 @@ impl EffectsPipeline {
 
     /// Register one text-blind keystroke for cursor-wake ignition.
     #[inline]
-    pub fn note_keystroke(&mut self) {
-        self.pending_keys = self.pending_keys.saturating_add(1).min(64);
+    pub const fn note_keystroke(&mut self) {
+        let next = self.pending_keys.saturating_add(1);
+        self.pending_keys = if next < 64 { next } else { 64 };
         self.rain_material_editing = true;
-        if let Some(rain) = self.rain.as_deref_mut() {
+        if let Some(rain) = &mut self.rain {
             rain.note_keystroke();
         }
     }
@@ -734,19 +735,19 @@ impl EffectsPipeline {
 
     /// Embedded host observed wheel/PgUp while an alternate-screen tui is active.
     #[inline]
-    pub fn note_matrix_rain_alt_scroll(&mut self) {
-        if let Some(rain) = self.rain.as_deref_mut() {
+    pub const fn note_matrix_rain_alt_scroll(&mut self) {
+        if let Some(rain) = &mut self.rain {
             rain.note_alt_scroll();
         }
     }
 
     /// Payload-free observable agent/tool choreography.
     #[inline]
-    pub fn note_matrix_rain_signal(&mut self, code: u32, weight: u32) {
+    pub const fn note_matrix_rain_signal(&mut self, code: u32, weight: u32) {
         if code == crate::matrix_rain::RainSignal::TurnStart as u32 {
             self.rain_material_editing = false;
         }
-        if let Some(rain) = self.rain.as_deref_mut() {
+        if let Some(rain) = &mut self.rain {
             rain.note_signal(code, weight);
         }
     }

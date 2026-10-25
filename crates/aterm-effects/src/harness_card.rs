@@ -706,13 +706,15 @@ impl Default for LineInks {
 }
 
 impl LineInks {
+    const INV_LINE_INK_STEPS: f32 = 1.0 / LINE_INK_STEPS as f32;
+
     #[inline]
     fn solve(&mut self, palette: CardPalette, ground: u32) {
         if self.key == Some((palette, ground)) {
             return;
         }
         for (i, ink) in self.ink.iter_mut().enumerate() {
-            *ink = palette.text_at(i as f32 / LINE_INK_STEPS as f32, ground);
+            *ink = palette.text_at(i as f32 * Self::INV_LINE_INK_STEPS, ground);
         }
         self.key = Some((palette, ground));
     }
@@ -726,7 +728,7 @@ impl LineInks {
         } else {
             #[cfg(any(test, debug_assertions))]
             LINE_INK_SOLVES.with(|n| n.set(n.get() + 1));
-            palette.text_at(step as f32 / LINE_INK_STEPS as f32, ground)
+            palette.text_at(step as f32 * Self::INV_LINE_INK_STEPS, ground)
         }
     }
 }
@@ -847,11 +849,10 @@ impl CardPalette {
     #[inline]
     const fn stripe(self, k: usize, dark: bool) -> u32 {
         let k = k % TRAIL_STOPS.len();
-        let even = k as f32 / (TRAIL_STOPS.len() - 1) as f32;
         match (self, dark) {
             (Self::Cruise, true) => spectrum_stop(TRAIL_STOPS[k]),
-            (Self::Land, true) => sunset(even),
-            (Self::Off, true) => moonbow(even),
+            (Self::Land, true) => sunset(k as f32 / (TRAIL_STOPS.len() - 1) as f32),
+            (Self::Off, true) => moonbow(k as f32 / (TRAIL_STOPS.len() - 1) as f32),
             (Self::Cruise, false) => PRINT_CRUISE[k],
             (Self::Land, false) => PRINT_LAND[k],
             (Self::Off, false) => PRINT_OFF[k],
@@ -862,8 +863,8 @@ impl CardPalette {
     const fn mark(self, k: usize) -> u32 {
         match self {
             Self::Cruise => spectrum_stop(k % 7),
-            Self::Land => SUNSET[k % SUNSET.len()],
-            Self::Off => MOONBOW[k % MOONBOW.len()],
+            Self::Land => SUNSET[k & (SUNSET.len() - 1)],
+            Self::Off => MOONBOW[k & (MOONBOW.len() - 1)],
         }
     }
 
@@ -893,12 +894,18 @@ impl CardPalette {
 #[inline]
 const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
     let y_bg = relative_luminance(ground & 0x00FF_FFFF);
+    let y_bg_plus = y_bg + 0.05;
     #[inline]
-    const fn holds(y_bg: f32, c: u32) -> bool {
+    const fn holds(y_bg: f32, y_bg_plus: f32, c: u32) -> bool {
         let y = relative_luminance(c);
-        (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= PAPER_MARK_CONTRAST
+        let (num, den) = if y >= y_bg {
+            (y + 0.05, y_bg_plus)
+        } else {
+            (y_bg_plus, y + 0.05)
+        };
+        num / den >= PAPER_MARK_CONTRAST
     }
-    if holds(y_bg, rgb) {
+    if holds(y_bg, y_bg_plus, rgb) {
         return rgb;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -912,7 +919,7 @@ const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
         } else if mid_rgb == hi_rgb {
             false
         } else {
-            holds(y_bg, mid_rgb)
+            holds(y_bg, y_bg_plus, mid_rgb)
         };
         if passes {
             lo = mid;
@@ -1874,7 +1881,7 @@ fn glint_spots_at(
         .clamp(1, GLINTS_MAX);
     let stripes = TRAIL_STOPS.len() as i64;
     let two_stripes = 2 * stripes;
-    let first = (mix(seed ^ 0x474C_494E) % 4) as usize;
+    let first = (mix(seed ^ 0x474C_494E) & 3) as usize;
     let span_f = (room.x1 - room.x0) as f32;
     let n_f = n as f32;
     let th = t.y1 - t.y0;
@@ -1882,7 +1889,7 @@ fn glint_spots_at(
     for (i, spot) in out.spots[..n].iter_mut().enumerate() {
         let at = (i as f32 + 0.2 + 0.6 * unit(seed, 0x474C_0000 | i as u64)) / n_f;
         let x = room.x0 + (span_f * at) as i64;
-        let k = 1 + [0i64, 2, 1, 3][(first + i) % 4];
+        let k = 1 + [0i64, 2, 1, 3][(first + i) & 3];
         let centre = t.y0 + th * (2 * k + 1) / two_stripes;
         let mut y = centre.clamp(room.y0, room.y1 - 1);
         if row_of(y - m) != row_of(y + m) {
@@ -1960,7 +1967,7 @@ fn field_spots_at(
     let chf = g.ch as f32;
     let mut n = 0;
     for i in 0..want {
-        let ratio = STAR_RATIOS[i % STAR_RATIOS.len()] * tax;
+        let ratio = STAR_RATIOS[i & (STAR_RATIOS.len() - 1)] * tax;
         let arm = i64::from(star_arm_px(star_arm(chf, ratio)));
         let m = arm + 1;
         let room = Rect {
@@ -3213,14 +3220,14 @@ impl<'a> Emit<'a> {
                     let e = twinkle_env(t_sec, s.phase);
                     let e = (e + (STAR_STEADY_ENV - e) * settle) * up;
                     let e = (e + (1.0 - STAR_STEADY_ENV) * ring).min(1.0);
-                    (e, s.gold || (i % 2 == 0 && twinkle_peak(e)) || ring >= 0.5)
+                    (e, s.gold || (i & 1 == 0 && twinkle_peak(e)) || ring >= 0.5)
                 }
                 None => (
                     STAR_STEADY_ENV + (1.0 - STAR_STEADY_ENV) * ring,
                     s.gold || ring >= 0.5,
                 ),
             };
-            let light_rgb = if i % 2 == 0 { even_rgb } else { odd_rgb };
+            let light_rgb = if i & 1 == 0 { even_rgb } else { odd_rgb };
             lay(StarCall {
                 clip: region,
                 centre: (s.x, s.y),

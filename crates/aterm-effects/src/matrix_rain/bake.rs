@@ -130,8 +130,9 @@ impl RainBaker {
     #[must_use]
     #[inline]
     pub fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
+        const _: () = assert!(ROM_GLYPHS.is_power_of_two());
         self.tiles
-            .get(usize::from(glyph) % ROM_GLYPHS)
+            .get(usize::from(glyph) & (ROM_GLYPHS - 1))
             .and_then(Option::as_ref)
     }
 

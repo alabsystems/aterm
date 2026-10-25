@@ -25,6 +25,7 @@ use super::upgrade_drive::{
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
 pub use crate::supervise::policy::turn_end::Restart;
+use crate::supervise::policy::turn_end::TurnEndReading;
 use crate::supervise::screen::HumanInput;
 
 /// A relaunch planned from the live process.
@@ -2971,7 +2972,7 @@ pub(super) fn restart_as(
             && k.terminal(snap.pid)
                 .as_ref()
                 .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
-            && screen(&mut c, &tab).is_some_and(|scr| composer_empty(&mut c, &tab, &scr))
+            && screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
             && live_background(snap.pid).is_empty()
             && !held(&mut c, &tab, opts.human_grace_s);
         if !still {
@@ -3018,6 +3019,20 @@ pub(super) fn restart_as(
     let r = relaunch(opts, r, &mut st, &mut c, &session, k);
     save(opts, &session, &st);
     r
+}
+
+/// Whether the tab's screen lets [`restart_as`] signal its agent: the composer empty, or, for an
+/// account move, a sign-in menu drawn in the composer's place
+/// ([`TurnEndReading::sign_in_menu_drawn`], read as Claude Code's, the one agent whose accounts
+/// move), where nothing typed stands to lose and the login the move leaves is the menu's own.
+fn at_rest_for(why: &Restart, c: &mut Client, tab: &str, scr: &Screen) -> bool {
+    composer_empty(c, tab, scr)
+        || (matches!(why, Restart::Account { .. })
+            && TurnEndReading::sign_in_menu_drawn(
+                Some(aterm_phase::Program::Claude.name()),
+                &scr.rows,
+                scr.cursor.map(|(_, col)| col),
+            ))
 }
 
 /// What a relaunch needs, read while the agent runs (argv, parent and start time go with the process).

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use aterm_agent::harness::disk::{self, Hog, Level, ask};
+use aterm_agent::supervise::Guard;
 use aterm_phase::Program;
 
 use crate::task_record::TaskState;
@@ -63,7 +64,12 @@ fn now_ms() -> i64 {
 /// volume short against this process's own floor ([`disk::Thresholds::short_below`]); the lease
 /// holds an open episode to the floor it recorded ([`ask::Entry::floor`]), so a look here that
 /// reads it clear of this process's floor steps the episode on until it clears that one too, and
-/// records the floor it held it to, which the line and the owner's note then say.
+/// records the floor it held it to, which the line and the owner's note then say. A look that
+/// reads the volume clear takes no lock only when the lease has no episode open there and holds
+/// every line this process typed on it ([`ask::rests`]): a line whose record a full disk kept from
+/// the lease, and whose episode another host then ended as the space came back, is still recorded
+/// ([`ask::typed_unrecorded`]), so its cooldown starts and the next shortage types no second line
+/// within it.
 pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: &NoteFn) {
     let Some(thresholds) = looked.thresholds else {
         return;
@@ -82,12 +88,9 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     let key = reading.key.spelled();
     let host = ask::HostId::this();
     let now = now_ms();
-    if level < Level::Short
-        && ask::read(&state)
-            .entry(&key)
-            .is_none_or(|e| e.episode_ms.is_none())
-    {
-        // At or above the floor with no episode open: nothing to step, no lock to take.
+    if look_rests(&state, &key, level) {
+        // At or above the floor with no episode open, and no line of this process's that the
+        // lease has yet to record: nothing to step, no lock to take.
         crate::disk_board::publish(|b| {
             b.asks.retain(|_, o| o.key != key);
             b.unfit.retain(|sid, _| sids.contains(sid));
@@ -241,6 +244,15 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     }
 }
 
+/// Whether a look that reads volume `key` at `level` leaves the lease in `state` as it is, its lock
+/// untaken ([`after_look`]): the volume is at or above this process's floor, no episode is open
+/// there, and the lease holds the last line this process typed on it ([`ask::rests`] of
+/// [`typed_last`]). A line whose record a full disk kept from the lease, and whose episode another
+/// host then ended as the space came back, so steps the lease at this look, which records it.
+fn look_rests(state: &Path, key: &str, level: Level) -> bool {
+    level < Level::Short && ask::rests(&ask::read(state), key, typed_last(key).map(|t| t.at_ms))
+}
+
 /// Journal `said` when it moved the episode, or when its standing word changed here.
 fn journal(
     state: &Path,
@@ -286,7 +298,8 @@ struct Facts {
     program: Option<Program>,
     /// Its task record's state.
     task: Option<TaskState>,
-    /// Why its worker found it unfit at its last turn break (`Board::unfit`).
+    /// Why its worker found it unfit at its last turn break (`Board::unfit`), as that finding
+    /// holds now ([`crate::disk_board::Unfit::bars`]).
     unfit: Option<&'static str>,
     /// Whether the board places its directory on the volume asked about; `None`: its directory,
     /// or the volume it is on, was not read.
@@ -308,9 +321,10 @@ enum Judged {
 }
 
 /// The seat rule: a supervised Claude Code (the line is written for its composer) working on the
-/// volume, whose task is not done or exited ([`task_bar_of`]) and whose worker did not find it
-/// unfit at its last turn break ([`super::WorkerIdle`]: its task finished or landed, it has none,
-/// or its Autopilot is Off). The task record bars a session whether or not it is still
+/// volume, with no task record that stands ([`task_bar_of`]: done, exited, or a manager's
+/// worker's) and whose worker did not find it unfit at its last turn break
+/// ([`super::WorkerIdle`]: its task finished or landed, it has none, its Autopilot is Off, or it
+/// is the person's own exchange). The task record bars a session whether or not it is still
 /// supervised, so an agent that exited, and left the supervised roster, is released, not handed
 /// on as undelivered.
 fn judge(f: &Facts) -> Judged {
@@ -343,12 +357,16 @@ fn judge(f: &Facts) -> Judged {
 }
 
 /// Why the seat rule bars a session by its task record: its task is done (it landed) or
-/// exited. `None`: it has no task record, or its task goes on.
+/// exited, or it goes on, so the session is a manager's worker (`managed`, as its loop's guard
+/// reads the same record at its first turn break: `Guards::theirs`). This is read at every look,
+/// so a managed worker is barred from its first look on, mid-turn or not, and in a seamless
+/// update's successor before any turn break of its own; no finding of its worker's need stand
+/// for it. `None`: it has no task record.
 fn task_bar_of(state: Option<TaskState>) -> Option<&'static str> {
     match state? {
         TaskState::Done => Some("task-done"),
         TaskState::Exited => Some("task-exited"),
-        TaskState::Working | TaskState::Stalled => None,
+        TaskState::Working | TaskState::Stalled => Some(Guard::Managed.word()),
     }
 }
 
@@ -363,6 +381,8 @@ struct Read {
     cwd: Option<PathBuf>,
     /// It rests at a turn break.
     at_break: bool,
+    /// Its agent reads busy: it works.
+    working: bool,
 }
 
 /// This process's live sessions (`only`: that one alone), each as [`Read`] says; `sids` are the
@@ -415,13 +435,17 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
                 task,
                 cwd,
                 at_break: word == "idle",
+                working: word == "busy",
             }
         })
         .collect()
 }
 
 /// The seat rule ([`judge`]) over `read` on volume `key` (its spelling), as the board places
-/// each session and says what its worker found.
+/// each session and says what its worker found at its last turn break, as that holds now: all of
+/// it until the session works again, and only whose it is (the person's own exchange, a manager's
+/// wait) while its agent reads busy ([`crate::disk_board::Unfit::bars`]), so a session given
+/// something to do since is seated again.
 fn judged(read: Vec<Read>, key: &str) -> Vec<(Read, Judged)> {
     let b = crate::disk_board::SHELF.board_lock();
     read.into_iter()
@@ -430,7 +454,7 @@ fn judged(read: Vec<Read>, key: &str) -> Vec<(Read, Judged)> {
                 supervised: r.supervised,
                 program: r.program,
                 task: r.task,
-                unfit: b.unfit.get(&r.sid).copied(),
+                unfit: b.unfit.get(&r.sid).and_then(|u| u.bars(r.working)),
                 on_volume: r
                     .cwd
                     .as_ref()
@@ -759,24 +783,31 @@ mod tests {
         let seat = Facts {
             supervised: true,
             program: Some(Program::Claude),
-            task: Some(TaskState::Working),
+            task: None,
             unfit: None,
             on_volume: Some(true),
         };
-        assert_eq!(judge(&seat), Judged::Seat);
         assert_eq!(
-            judge(&Facts { task: None, ..seat }),
+            judge(&seat),
             Judged::Seat,
             "no task record: the worker's finding decides"
         );
-        assert_eq!(
-            judge(&Facts {
-                task: Some(TaskState::Stalled),
-                ..seat
-            }),
-            Judged::Seat
-        );
         for (facts, why) in [
+            (
+                Facts {
+                    task: Some(TaskState::Working),
+                    ..seat
+                },
+                "managed",
+            ),
+            (
+                Facts {
+                    task: Some(TaskState::Stalled),
+                    supervised: false,
+                    ..seat
+                },
+                "managed",
+            ),
             (
                 Facts {
                     task: Some(TaskState::Done),
@@ -862,18 +893,20 @@ mod tests {
                 .expect("unfenced");
         };
         // 0: its task landed; 1: its agent exited, so it left the supervised roster; 2: its
-        // worker found it unfit; 3 and 4: working, supervised or not.
+        // worker found it unfit; 3: a manager's worker, its task working, its turn break not yet
+        // found; 4: no task record, not supervised.
         mark(0, TaskState::Done);
         mark(1, TaskState::Exited);
-        for i in 2..5 {
-            mark(i, TaskState::Working);
-        }
+        mark(3, TaskState::Working);
         let sids = [sid(0), sid(2), sid(3)];
         let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
-        crate::disk_board::SHELF
-            .board_lock()
-            .unfit
-            .insert(sid(2), "finished");
+        crate::disk_board::SHELF.board_lock().unfit.insert(
+            sid(2),
+            crate::disk_board::Unfit {
+                own: None,
+                theirs: Some("exchange"),
+            },
+        );
         let key = "fsid:9000";
         let found = rule(&store, &sids, key, &[]);
         let bars: Vec<Option<&'static str>> =
@@ -881,7 +914,7 @@ mod tests {
         crate::disk_board::SHELF.board_lock().unfit.remove(&sid(2));
         let mut barred = found.barred.clone();
         barred.sort();
-        let mut want = vec![sid(0), sid(1), sid(2)];
+        let mut want = vec![sid(0), sid(1), sid(2), sid(3)];
         want.sort();
         assert_eq!(barred, want, "what the look releases an owed line of");
         assert!(
@@ -896,8 +929,8 @@ mod tests {
             [
                 Some("task-done"),
                 Some("task-exited"),
-                Some("finished"),
-                None,
+                Some("exchange"),
+                Some("managed"),
                 None
             ],
             "the turn break bars what the look bars"
@@ -1082,6 +1115,130 @@ mod tests {
                 Some(ask::Phase::Owed { .. })
             ),
             "released"
+        );
+    }
+
+    /// What a session's worker found of the session itself at its last turn break (its task
+    /// finished, nobody gave it one) holds only until it works again, as a session that works was
+    /// given something to do: a look while its agent reads busy seats it. Whose it is (the
+    /// person's own exchange, a manager's wait) holds across its turns until its next turn break.
+    /// A finding kept mid-turn barred a tab through the whole of the turn its first task started,
+    /// so an episode that opened then found nobody to ask, said only the owner could free the
+    /// space, and stayed out for its cooldown.
+    #[test]
+    fn a_finding_of_the_session_itself_holds_until_it_works_and_whose_it_is_across_turns() {
+        use crate::disk_board::Unfit;
+        let own = |why| Unfit {
+            own: Some(why),
+            theirs: None,
+        };
+        for why in ["taskless", "finished", "autopilot-off"] {
+            assert_eq!(
+                own(why).bars(false),
+                Some(why),
+                "resting, or held at a wall"
+            );
+            assert_eq!(own(why).bars(true), None, "{why} while it works: seated");
+        }
+        let theirs = Unfit {
+            own: None,
+            theirs: Some("exchange"),
+        };
+        assert_eq!(theirs.bars(false), Some("exchange"));
+        assert_eq!(theirs.bars(true), Some("exchange"), "theirs while it works");
+        let both = Unfit {
+            own: Some("taskless"),
+            theirs: Some("managed"),
+        };
+        assert_eq!(both.bars(false), Some("taskless"));
+        assert_eq!(both.bars(true), Some("managed"));
+        assert_eq!(Unfit::default().bars(false), None);
+        // Through the look: the same tab found taskless, at rest and then working.
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_100);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        let key = "fsid:9100";
+        let reads = |word: &'static str, seq: u64| {
+            h.ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .publish_agent(
+                    word,
+                    None,
+                    None,
+                    Some(Program::Claude),
+                    crate::session_timeline::AgentStamp {
+                        generation: crate::control::ScreenGen { epoch: 1, seq },
+                        fp: seq,
+                    },
+                );
+            bar_at(&store, &sid, key)
+        };
+        crate::disk_board::SHELF
+            .board_lock()
+            .unfit
+            .insert(sid.clone(), own("taskless"));
+        let resting = reads("idle", 1);
+        let working = reads("busy", 2);
+        crate::disk_board::SHELF.board_lock().unfit.remove(&sid);
+        assert_eq!(working, None, "given a task since, it may be asked");
+        assert_eq!(resting, Some("taskless"), "resting where it was found");
+    }
+
+    /// A look that reads the volume clear takes no lock only while the lease holds the last line
+    /// this process typed on it ([`look_rests`]). A line whose record a full disk lost, and whose
+    /// episode another host ended as the space came back, steps the lease at this process's next
+    /// look, which records it, so its cooldown holds the next shortage shut. The look before
+    /// rested on such a lease, as no episode was open, and the next shortage asked a second agent
+    /// inside the cooldown.
+    #[test]
+    fn a_clear_look_steps_a_lease_that_lacks_this_processs_last_line_and_rests_once_it_holds_it() {
+        let state = aterm_tempfile::TempDir::new().expect("owned lease dir");
+        let key = "dev:rests-unrecorded";
+        let host = ask::HostId {
+            pid: 1,
+            start: String::new(),
+        };
+        let at = 1_000_000;
+        assert!(look_rests(state.path(), key, Level::Ok), "nothing to step");
+        assert!(!look_rests(state.path(), key, Level::Short), "short");
+        TYPED.lock().unwrap_or_else(PoisonError::into_inner).insert(
+            key.to_owned(),
+            Typed {
+                sid: "s-a".to_owned(),
+                at_ms: at,
+                free: 0,
+            },
+        );
+        // An earlier line of the volume's, its episode ended: no episode open, the lease still
+        // without the line this process typed since.
+        ask::transact(state.path(), &ask::LOCK_LADDER, |l| {
+            ask::typed(l, key, &host, "s-b", at - 60_000, 0);
+        })
+        .expect("written")
+        .expect("locked");
+        let lacks = look_rests(state.path(), key, Level::Ok);
+        ask::transact(state.path(), &ask::LOCK_LADDER, |l| {
+            ask::typed_unrecorded(l, key, &host, "s-a", at, 0)
+        })
+        .expect("written")
+        .expect("locked");
+        let holds = look_rests(state.path(), key, Level::Ok);
+        TYPED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
+        assert!(!lacks, "the lease lacks the line: the look steps it");
+        assert!(holds, "recorded: the look rests");
+        assert_eq!(
+            ask::read(state.path())
+                .entry(key)
+                .and_then(|e| e.last_ask_ms),
+            Some(at),
+            "its cooldown runs from the lost line"
         );
     }
 }

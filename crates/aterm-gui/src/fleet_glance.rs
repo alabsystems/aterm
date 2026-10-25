@@ -92,7 +92,7 @@ pub(crate) struct FleetMac {
     pub(crate) left_out: usize,
     /// Its needs.
     pub(crate) needs: Vec<FleetNeed>,
-    /// Its sessions this Mac holds over the fleet, whatever their need: a hold is never a need, and stands until this Mac hands it back.
+    /// Its sessions this Mac holds over the fleet, whatever their need: a hold is never a need.
     pub(crate) held_here: Vec<FleetHeld>,
     /// Its managers.
     pub(crate) managers: Vec<FleetManager>,

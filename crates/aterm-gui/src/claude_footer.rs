@@ -4342,7 +4342,7 @@ fn write_edits<'a>(
     let shifted_before = scratch.shifted_fill_seq;
     let cluster_rows_before = scratch.clusters.len();
     let combining_rows_before = scratch.combining.len();
-    let restamp = scratch.shifted_fill_seq != 0 && scratch.host_prepend_blessing();
+    let restamp = scratch.shifted_fill_seq != 0 && scratch.host_prepend_blessing().keeps_lane();
     slot.write = None;
     slot.live = 0;
     slot.glass.clear();
@@ -4895,6 +4895,10 @@ impl App {
                 else {
                     continue;
                 };
+                // A rewound pane shows the past: no live glass over it, and no reading of it.
+                if self.pool.is_rewound(session) {
+                    continue;
+                }
                 let Some(entry) = self.pool.get(session) else {
                     continue;
                 };
@@ -12101,7 +12105,7 @@ mod tests {
         let mut s = engine_fill(3);
         let engine_cells = s.cells.clone();
         let blessed = s.host_prepend_blessing();
-        assert!(blessed);
+        assert!(blessed.keeps_lane());
         s.cells.insert(0, row_of("strip", [7, 7, 7]));
         s.clusters.insert(0, Vec::new());
         s.combining.insert(0, Vec::new());

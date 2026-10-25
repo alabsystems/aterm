@@ -29,8 +29,8 @@ const USAGE: &str = "usage: aos [status|ls|attach [code=<name>]|pause|repair [co
                      publish plan=<24 hex>|bundle|resume|detach|trace [hex]|export [kept=<n>]|\
                      check <file>]";
 
-/// The largest trace file `aos check` reads.
-const CHECK_MAX_BYTES: usize = 32 << 20;
+/// The largest trace file `aos check` reads, refused past it before it is decoded: at least twice the largest a window exports.
+const CHECK_MAX_BYTES: usize = aterm_effects::aos_momentum::MOMENTUM_TRACE_MAX_BYTES;
 
 /// The directory under the state dir that `aos export` writes and a bare `aos check` name reads.
 const EXPORT_DIR: &str = "aos";
@@ -470,17 +470,59 @@ pub(crate) fn export_line(e: &Exported, file: &str) -> String {
 
 /// Writes `bytes` as a new private (0600) file `name` in `root`'s export directory and returns its path.
 /// # Errors
-/// The directory is not private and ours, or the file exists or did not write.
+/// The directory is a link or not a directory, is not ours or not private, or the file exists or did not write.
 pub(crate) fn write_export(
     root: &std::path::Path,
     name: &str,
     bytes: &[u8],
 ) -> std::io::Result<std::path::PathBuf> {
-    let dir = root.join(EXPORT_DIR);
-    aterm_types::fs_restricted::ensure_private_dir(&dir)?;
-    let pinned = crate::pinned_dir::PinnedDir::open_resolved(&dir)?;
-    pinned.write_new_private(std::ffi::OsStr::new(name), bytes)?;
-    Ok(pinned.path().join(name))
+    let dir = export_dir(root)?;
+    dir.write_new_private(std::ffi::OsStr::new(name), bytes)?;
+    Ok(dir.path().join(name))
+}
+
+/// `root`'s export directory opened with no link followed (made 0700 when absent), its owner checked and its mode set to 0700 through the opened directory, never through a path.
+/// # Errors
+/// The leaf is a link or not a directory, belongs to another user, or cannot be made or opened.
+fn export_dir(root: &std::path::Path) -> std::io::Result<crate::pinned_dir::PinnedDir> {
+    use std::io::{Error, ErrorKind};
+    aterm_types::fs_restricted::create_dir_restricted(root)?;
+    let state = crate::pinned_dir::PinnedDir::open_resolved(root)?;
+    let leaf = std::ffi::OsStr::new(EXPORT_DIR);
+    let dir = match state.child(leaf) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == ErrorKind::NotFound => state.create_child(leaf)?,
+        Err(e) => {
+            let path = root.join(EXPORT_DIR);
+            let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+            return Err(if link {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "{}: is a symbolic link; aos export writes only into a real directory",
+                        path.display()
+                    ),
+                )
+            } else {
+                Error::new(e.kind(), format!("{}: {e}", path.display()))
+            });
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = dir.leaf_metadata()?;
+        if meta.uid() != aterm_uds::peer::our_uid() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{}: belongs to another user", dir.path().display()),
+            ));
+        }
+        if meta.mode() & 0o7777 != 0o700 {
+            dir.restrict_to_owner()?;
+        }
+    }
+    Ok(dir)
 }
 
 /// A fresh export file name: the window, the log epoch, the wall clock and a per-process count.
@@ -591,8 +633,16 @@ pub(crate) fn cmd(
     #[cfg(not(debug_assertions))]
     let ask = Ask::Asked(asked);
     match crate::control::control_media::call_main(proxy, |reply| crate::Wake::Aos { ask, reply }) {
-        Ok(Ok(line)) => format!("OK {line}\n"),
-        Ok(Err(e)) => format!("ERR {e}\n"),
+        Ok(answer) => main_reply(asked, answer),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// The wire reply to the main thread's answer to `asked`: `ls`'s rows as its Lines framing reads them (`OK <n>`, then the n rows), any other form's answer as one status line.
+pub(crate) fn main_reply(asked: Asked, answer: Result<String, String>) -> String {
+    match answer {
+        Ok(rows) if asked == Asked::Ls => format!("OK {}\n{rows}\n", rows.lines().count()),
+        Ok(line) => format!("OK {line}\n"),
         Err(e) => format!("ERR {e}\n"),
     }
 }

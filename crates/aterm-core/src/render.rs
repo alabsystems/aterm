@@ -1217,6 +1217,26 @@ pub struct RenderInput {
     pub composed_fill_seq: u64,
 }
 
+/// What a host row prepend keeps of the snapshot it lands on: read before the prepend ([`RenderInput::host_prepend_blessing`]) and recorded after it ([`RenderInput::note_host_row_prepend`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrependBlessing {
+    /// No engine fill stamped the snapshot, or a host wrote into it since: the prepend disowns the revision lane and cannot be undone.
+    Disowned,
+    /// The snapshot is an engine fill shifted down by host rows, but its revision lane does not vouch for its rows (a scrolled-back fill, one taken under whole-grid damage): the prepend drops the lane and can still be undone ([`RenderInput::undo_host_row_prepend`]).
+    Shift,
+    /// An engine fill shifted down by host rows whose revision lane vouches for every row: the prepend keeps the lane and can be undone.
+    Lane,
+}
+
+impl PrependBlessing {
+    /// Whether the prepend keeps the revision lane.
+    #[must_use]
+    #[inline]
+    pub const fn keeps_lane(self) -> bool {
+        matches!(self, Self::Lane)
+    }
+}
+
 /// The column order the last engine fill left a [`RenderInput`]'s rows in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowOrder {
@@ -1735,19 +1755,21 @@ impl RenderInput {
         self.composed_fill_seq = 0;
     }
 
-    /// Record that a host just prepended `prepended` rows, after every per-row channel shifted and after the `snapshot_seq` bump.
+    /// Record that a host just prepended `prepended` rows, after every per-row channel shifted and after the `snapshot_seq` bump; `blessed` is what [`host_prepend_blessing`](Self::host_prepend_blessing) said before the prepend.
     #[inline]
-    pub fn note_host_row_prepend(&mut self, prepended: usize, blessed: bool) {
+    pub fn note_host_row_prepend(&mut self, prepended: usize, blessed: PrependBlessing) {
         self.row_shift = self.row_shift.saturating_add(prepended);
         self.composed_fill_seq = 0;
-        if blessed {
+        if blessed.keeps_lane() {
             self.row_rev.splice(0..0, (0..prepended).map(|_| 0u64));
-            self.shifted_fill_seq = self.snapshot_seq;
         } else {
             self.row_rev_lane = 0;
             self.row_rev.clear();
-            self.shifted_fill_seq = 0;
         }
+        self.shifted_fill_seq = match blessed {
+            PrependBlessing::Disowned => 0,
+            PrependBlessing::Shift | PrependBlessing::Lane => self.snapshot_seq,
+        };
     }
 
     /// Bless this snapshot as a committed composed frame, so the next compose may retain rows nothing changed.
@@ -1763,18 +1785,25 @@ impl RenderInput {
         self.composed_fill_seq != 0 && self.snapshot_seq == self.composed_fill_seq
     }
 
-    /// Whether a host row prepend may keep the revision lane.
+    /// What a host row prepend on this snapshot may keep: the revision lane and its inverse, only its inverse (an engine fill whose lane is off), or neither.
     #[must_use]
     #[inline]
-    pub const fn host_prepend_blessing(&self) -> bool {
-        self.row_rev_lane != 0
-            && self.row_rev.len() == self.rows
-            && self.cells.len() == self.rows
-            && self.snapshot_seq == self.shifted_fill_seq
-            && (self.row_shift > 0 || self.snapshot_seq == self.engine_fill_seq)
+    pub const fn host_prepend_blessing(&self) -> PrependBlessing {
+        if self.cells.len() != self.rows
+            || self.snapshot_seq != self.shifted_fill_seq
+            || (self.row_shift == 0 && self.snapshot_seq != self.engine_fill_seq)
+        {
+            PrependBlessing::Disowned
+        } else if self.row_rev_lane != 0 && self.row_rev.len() == self.rows {
+            PrependBlessing::Lane
+        } else if self.terminal_id != 0 {
+            PrependBlessing::Shift
+        } else {
+            PrependBlessing::Disowned
+        }
     }
 
-    /// Undo a blessed host row prepend, restoring the engine fill it was made from, so a tab-strip window's scratch can take the damage-scoped arm of [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into).
+    /// Undo a blessed host row prepend ([`PrependBlessing::Shift`] or [`PrependBlessing::Lane`]), restoring the engine fill it was made from, so a tab-strip or message-band window's scratch can take a damage-scoped arm of [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into), scrolled back or not.
     pub fn undo_host_row_prepend(
         &mut self,
         engine_rows: usize,
@@ -3904,8 +3933,8 @@ mod selection_clip_tests {
 #[cfg(test)]
 mod rain_channel_tests {
     use super::{
-        CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput,
-        SceneAtlas,
+        CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, PrependBlessing, RainHalo,
+        RenderInput, SceneAtlas,
     };
     use std::sync::Arc;
 
@@ -4022,14 +4051,17 @@ mod rain_channel_tests {
             "a row rebuild must revoke the blessing"
         );
 
-        for blessed in [false, true] {
+        for blessed in [
+            PrependBlessing::Disowned,
+            PrependBlessing::Shift,
+            PrependBlessing::Lane,
+        ] {
             let mut spliced = input.clone();
             spliced.note_host_row_prepend(1, blessed);
             assert!(
                 !spliced.composed_fill_intact(),
-                "a {} row prepend must revoke the blessing — composed row `r` is \
-                 no longer the row a ledger indexed",
-                if blessed { "blessed" } else { "disowned" }
+                "a {blessed:?} row prepend must revoke the blessing — composed row `r` is \
+                 no longer the row a ledger indexed"
             );
         }
 
@@ -4043,9 +4075,9 @@ mod rain_channel_tests {
         unspliced.snapshot_seq = 7;
         unspliced.engine_fill_seq = 7;
         unspliced.shifted_fill_seq = 7;
-        assert!(unspliced.host_prepend_blessing());
+        assert_eq!(unspliced.host_prepend_blessing(), PrependBlessing::Lane);
         unspliced.snapshot_seq = 8;
-        unspliced.note_host_row_prepend(1, true);
+        unspliced.note_host_row_prepend(1, PrependBlessing::Lane);
         unspliced.cells.insert(0, Vec::new());
         unspliced.clusters.insert(0, Vec::new());
         unspliced.combining.insert(0, Vec::new());

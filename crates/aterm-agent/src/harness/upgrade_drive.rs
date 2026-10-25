@@ -2289,8 +2289,15 @@ fn turn_takes_cap(c: &mut Client) -> bool {
 
 const NOTICE_KEYS: &str = "typed=1 cadence=2 cap=4096 ";
 
-const PRESSED_DIGIT_MS: u64 = 150;
+/// How long one of a pressed text's echoes may lag its keys' pace before the turn's deadline
+/// cuts it. The host waits before each digit, and before the guarded submit, until the agent
+/// has drawn the key before it, and gives each wait back to the deadline once it ends, so a
+/// starved agent that keeps drawing is never cut: this is a hang detector for one echo, never a
+/// render budget nor one for their sum (a host older than that give-back holds their sum to
+/// it). A cut leaves aterm's words in the prompt for a person to clear, and the upgrade waits.
+const PRESSED_ECHO_HANG: Duration = Duration::from_secs(60);
 
+/// The `idle= timeout=` words of a turn that types `text` with `keys` ([`TURN_WAIT`] for a paste).
 fn turn_wait(keys: &str, text: &str) -> String {
     if keys.is_empty() {
         return TURN_WAIT.to_string();
@@ -2303,10 +2310,10 @@ fn turn_wait(keys: &str, text: &str) -> String {
     };
     let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     let pressed = count(text.chars().count()).min(value(keys, "cap="));
-    let digits = count(text.chars().filter(char::is_ascii_digit).count());
+    let echoes = u64::try_from(PRESSED_ECHO_HANG.as_millis()).unwrap_or(u64::MAX);
     let timeout = value(TURN_WAIT, "timeout=")
         .saturating_add(pressed.saturating_mul(value(keys, "cadence=")))
-        .saturating_add(digits.saturating_mul(PRESSED_DIGIT_MS));
+        .saturating_add(echoes);
     TURN_WAIT
         .split_whitespace()
         .map(|w| {

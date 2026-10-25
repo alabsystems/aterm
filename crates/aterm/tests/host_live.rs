@@ -1705,6 +1705,14 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
     );
 }
 
+/// How long the fake stalls on each digit it reads while its `starved-<version>` file stands.
+#[cfg(target_os = "macos")]
+const STARVED_S: usize = 2;
+
+/// How long it stalls on each `;` then: past the host's own settle for a typed text's echo, 5 s.
+#[cfg(target_os = "macos")]
+const STARVED_TAIL_S: usize = 6;
+
 #[cfg(target_os = "macos")]
 fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
     assert!(
@@ -1779,6 +1787,10 @@ fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
          cr=$(printf '\\r'); nl=$(printf '\\n.'); nl=${{nl%.}}\n\
          draw\n\
          while IFS= read -r -n 1 -d '' c; do\n\
+         \x20 [ -e \"$tmp/starved-$VERSION\" ] && case \"$c\" in\n\
+         \x20 [0-9]) echo >> \"$tmp/stalled-$VERSION\"; sleep {STARVED_S} ;;\n\
+         \x20 ';') printf '%s\\n' \"$buf\" >> \"$tmp/stalled-tail-$VERSION\"; sleep {STARVED_TAIL_S} ;;\n\
+         \x20 esac\n\
          \x20 case \"$c\" in\n\
          \x20 \"$cr\"|\"$nl\") take \"$buf\"; draw ;;\n\
          \x20 ' ') buf=\"$buf \"; word=\n\
@@ -1896,11 +1908,12 @@ fn upgrade_until<T>(
     }
 }
 
+/// A session the host supervises under `upgrade_ask`: the fake 2.1.281 under bash, its first
+/// launch read, the activation wake armed, and the 2.1.282 build staged for [`land`].
 #[cfg(target_os = "macos")]
-#[test]
-fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
+fn at_the_notice(tag: &str) -> (Instance, PathBuf) {
     let inst = boot_upgrade(
-        "v",
+        tag,
         "relaunch = false\nupgrade_ask = true\n",
         Some(SHORT_SETTLE_S),
     );
@@ -1937,6 +1950,13 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         || harness_lines(&inst),
         |l| l.contains("harness: the activation wake is armed"),
     );
+    (inst, newer)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
+    let (inst, newer) = at_the_notice("v");
     land(&inst, &newer);
     let got = upgrade_until(
         &inst,
@@ -1979,6 +1999,66 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         "the tab's upgrade= column, headless",
         || status(&inst),
         |s| field(s, "upgrade").is_some_and(|v| v.starts_with("done/2.1.282/")),
+    );
+}
+
+/// A notice typed into an agent the machine starves still lands whole and upgrades the session.
+/// The fake stalls on each digit it reads, as a loaded machine stalls a real agent between
+/// renders, and on each `;`, one of which ends the notice past its last digit. The turn's
+/// timeout is a hang detector for an echo, never a render budget that cuts the notice part-way
+/// and leaves aterm's words in the prompt for a person to clear (2026-10-24, load 46), and the
+/// host waits before the guarded Enter for the last key to be drawn. The controls: the digits'
+/// stalls outlast the render budget the turn was given before (150 ms a digit), and a stall
+/// longer than the host's own echo settle came after the last digit, where only the submit's
+/// wait covers it. The stalls add up to less than the timeout, so the host's giving each wait's
+/// time back to it is held by the control tests' starved program, on its fake clock, not here.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_notice_typed_into_a_starved_agent_lands_whole_and_upgrades_it() {
+    let (inst, newer) = at_the_notice("vs");
+    std::fs::write(inst.tmp.join("starved-2.1.281"), "").expect("starve the running build");
+    land(&inst, &newer);
+    let got = upgrade_until(
+        &inst,
+        Instant::now(),
+        || launches(&inst),
+        |got| got.len() >= 2,
+    );
+    assert_eq!(
+        got.len(),
+        2,
+        "relaunched once: {got:?}\nharness log:\n{}\njournal:\n{}",
+        harness_lines(&inst),
+        journal(&inst)
+    );
+    assert_eq!(
+        got[1].1,
+        format!("2.1.282 --model opus --resume {CONVERSATION}"),
+        "the new build, its flags kept, its conversation resumed"
+    );
+    let read = |name: &str| std::fs::read_to_string(inst.tmp.join(name)).unwrap_or_default();
+    let typed = read("typed.log");
+    let notice = typed
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(_, line)| line))
+        .find(|line| line.contains(aterm_agent::harness::upgrade::READY_PREFIX))
+        .expect("the notice the fake took");
+    let digits = notice.chars().filter(char::is_ascii_digit).count();
+    let stalls = read("stalled-2.1.281").lines().count();
+    let budget_ms = 10_000 + 2 * notice.chars().count() + 150 * digits;
+    assert!(
+        stalls * STARVED_S * 1000 > budget_ms,
+        "the fake stalled {stalls} times of {STARVED_S} s: not past the {budget_ms} ms render \
+         budget"
+    );
+    let tail = read("stalled-tail-2.1.281");
+    assert!(
+        tail.lines().any(|before| {
+            notice
+                .strip_prefix(before)
+                .is_some_and(|rest| !rest.chars().any(|ch| ch.is_ascii_digit()))
+        }),
+        "no stall of {STARVED_TAIL_S} s past the notice's last digit: {tail:?} in {notice:?}"
     );
 }
 

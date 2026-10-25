@@ -3188,12 +3188,23 @@ impl App {
             Result<crate::native_config_service::PreparedConfigObservation, String>,
         >,
     ) -> Result<(), String> {
+        let reduction = self
+            .native_documents
+            .persistence
+            .complete(document, generation, result);
+        if matches!(
+            &reduction,
+            Ok(crate::native_document_io::SaveReduction::Stale)
+        ) {
+            // An obsolete reply owns neither the current save nor its edit or
+            // shutdown notifications. An error here would cancel a pending Quit.
+            return Ok(());
+        }
         let landed = self.land_native_document_save(
             document,
             source_view,
-            generation,
             saved_bytes,
-            result,
+            reduction,
             config_observation,
         );
         self.edit_document_saved(document, landed.as_ref().err().map(String::as_str));
@@ -3204,20 +3215,18 @@ impl App {
         &mut self,
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
-        generation: crate::native_document_io::SaveGeneration,
         saved_bytes: std::sync::Arc<[u8]>,
-        result: crate::native_document_io::AtomicSaveResult,
+        reduction: Result<
+            crate::native_document_io::SaveReduction,
+            crate::native_document_host::PersistenceError,
+        >,
         config_observation: Option<
             Result<crate::native_config_service::PreparedConfigObservation, String>,
         >,
     ) -> Result<(), String> {
         self.note_document_settling(document);
         self.native_documents.inflight.remove(&document);
-        let reduction = match self
-            .native_documents
-            .persistence
-            .complete(document, generation, result)
-        {
+        let reduction = match reduction {
             Ok(reduction) => reduction,
             Err(error) => {
                 aterm_log::warn!("could not finish document save: {error:?}");
@@ -4582,6 +4591,9 @@ impl App {
         {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.tab_set.switch_to(tab);
+                if let Some(target) = ws.tab_set.active_mut() {
+                    target.set_focus(view);
+                }
                 ws.last_present = None;
             }
             self.resync_active_or_window(wid);
@@ -8108,13 +8120,91 @@ mod tests {
     fn markdown_edit_action_completes_its_reader_status_after_editor_focus() {
         let dir = fresh_dir("aterm-app-edit-handoff");
         let path = dir.join("handoff.md");
-        fs::write(&path, "# Handoff\n\nBody\n").unwrap();
+        let source = "# Handoff\n\nBody\n";
+        fs::write(&path, source).unwrap();
         let uri = file_uri(&path);
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.open_document_tab(AppKind::Markdown, &uri).unwrap();
-        let (markdown_instance, _) = app.active_native_view(wid).unwrap();
+        let (markdown_instance, markdown_view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(markdown_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("markdown/select-all"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let reader_state = |app: &App| {
+            let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(markdown_view)
+            else {
+                panic!("the original Markdown reader remains attached");
+            };
+            (
+                state.history.clone(),
+                state.source_anchor,
+                state.visual_row,
+                state.selection.clone(),
+                state.mode,
+            )
+        };
+        let before_reader = reader_state(&app);
+        assert_eq!(before_reader.3, Some(0..source.len()));
+        let before_document = app.document_store.snapshot(document).unwrap();
+        let before_tabs = app.windows[&wid].tab_set.tabs().to_vec();
+        let before_views = app.view_store.len();
+        let before_generation = app.native_runtime.view_generation(markdown_view);
+        fs::remove_file(&path).unwrap();
 
+        let failure = app
+            .dispatch_native_event(
+                wid,
+                AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new("markdown/edit"),
+                    value: None,
+                }),
+            )
+            .expect_err("Edit must still report the missing-file admission failure to its caller");
+        assert!(failure.contains("handoff.md"), "{failure}");
+
+        let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(markdown_view)
+        else {
+            panic!("the failed handoff must leave its reader available");
+        };
+        let failed_notice = state.notice.clone();
+        let failure_reason = failure.split(':').next().unwrap();
+        let terminal_failure_notice = failed_notice.as_deref().is_some_and(|notice| {
+            notice != "Opening editor…"
+                && notice != "Editor opened"
+                && notice.contains(failure_reason)
+        });
+        assert_eq!(
+            app.active_native_view(wid),
+            Some((markdown_instance, markdown_view))
+        );
+        assert_eq!(app.windows[&wid].tab_set.tabs(), before_tabs);
+        assert_eq!(app.view_store.len(), before_views);
+        assert_eq!(
+            app.native_runtime.view_generation(markdown_view),
+            before_generation
+        );
+        assert_eq!(app.document_store.view_count(document), Some(1));
+        assert!(
+            app.native_runtime
+                .instance_for_document(AppKind::Editor, document)
+                .is_none()
+        );
+        assert_eq!(reader_state(&app), before_reader);
+        let after_failure = app.document_store.snapshot(document).unwrap();
+        assert_eq!(
+            (after_failure.seq, after_failure.text),
+            (before_document.seq, before_document.text.clone())
+        );
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert!(!path.exists());
+
+        fs::write(&path, source).unwrap();
         app.dispatch_native_event(
             wid,
             AppEvent::Action(crate::native_app::ActionInvocation {
@@ -8131,9 +8221,33 @@ mod tests {
         );
         assert_eq!(
             app.native_runtime.document_id(active_instance),
-            app.native_runtime.document_id(markdown_instance)
+            Some(document)
         );
+        let Some(AppViewState::Markdown(state)) = app.native_runtime.view_state(markdown_view)
+        else {
+            panic!("the completed handoff still owns its original reader");
+        };
+        assert_eq!(state.notice.as_deref(), Some("Editor opened"));
+        assert_eq!(reader_state(&app), before_reader);
+        assert_eq!(
+            app.native_runtime.view_generation(markdown_view),
+            before_generation
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), before_tabs.len() + 1);
+        assert_eq!(app.view_store.len(), before_views + 1);
+        assert_eq!(app.document_store.view_count(document), Some(2));
+        let after_retry = app.document_store.snapshot(document).unwrap();
+        assert_eq!(
+            (after_retry.seq, after_retry.text),
+            (before_document.seq, before_document.text)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        assert!(app.structural_invariants_ok());
         let _ = fs::remove_dir_all(dir);
+        assert!(
+            terminal_failure_notice,
+            "the reader must finish the failed handoff with its actual reason: notice={failed_notice:?}, failure={failure:?}"
+        );
     }
 
     #[test]
@@ -8787,17 +8901,15 @@ mod tests {
         let bytes = std::sync::Arc::clone(&first.plan.bytes);
         finish_inflight_save_for_test(&mut app, document, view, first);
 
-        let error = app
-            .finish_native_document_save(
-                document,
-                view,
-                generation,
-                bytes,
-                crate::native_document_io::AtomicSaveResult::Cancelled,
-                None,
-            )
-            .unwrap_err();
-        assert!(error.contains("stale"), "{error}");
+        app.finish_native_document_save(
+            document,
+            view,
+            generation,
+            std::sync::Arc::clone(&bytes),
+            crate::native_document_io::AtomicSaveResult::Cancelled,
+            None,
+        )
+        .unwrap();
         let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
             panic!("editor view");
         };
@@ -8809,7 +8921,117 @@ mod tests {
             .find(|tab| tab.root.leaves().contains(&view))
             .expect("document tab");
         assert!(!tab.presentation.indicators.attention);
+
+        commit(&mut app, wid, "newer ");
+        let held = begin_inflight_save_for_test(&mut app, document);
+        assert_ne!(held.plan.generation, generation);
+        commit(&mut app, wid, "latest ");
+        let latest = app.document_store.snapshot(document).unwrap();
+        app.save_document_checkpoint(document, view).unwrap();
+        let queued = app.native_documents.pending_saves[&document];
+        assert_eq!(queued.seq, latest.seq);
+        assert_eq!(queued.source_view, view);
+        let checkpoint_before = app.document_store.checkpoint_seq(document);
+        let observed_before = app.native_documents.persistence.observed(document);
+        let disk_before = fs::read(&path).unwrap();
+        assert!(app.native_documents.inflight.contains(&document));
+        assert!(app.native_documents.persistence.save_in_flight(document));
+        let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+            panic!("editor app");
+        };
+        assert!(editor.checkpoint_pending);
+        assert!(!app.can_save_document(wid));
+        assert!(!app.prepare_quit_document_shutdown_inner(false).unwrap());
+        let quit_before = app
+            .native_documents
+            .pending_quit
+            .clone()
+            .expect("Quit is waiting");
+        let phase_before = app.document_store.phase(document);
+        assert_eq!(
+            phase_before,
+            Some(crate::document_store::DocumentPhase::Closing {
+                requested: latest.seq
+            })
+        );
+
+        // An obsolete completion at the host boundary cannot take ownership of
+        // the newer save or the later explicit Save waiting behind it.
+        app.finish_native_document_save(
+            document,
+            view,
+            generation,
+            bytes,
+            crate::native_document_io::AtomicSaveResult::Cancelled,
+            None,
+        )
+        .unwrap();
+        let mut failures = Vec::new();
+        if !app.native_documents.inflight.contains(&document) {
+            failures.push("obsolete result cleared the newer host inflight latch");
+        }
+        assert!(
+            app.native_documents.persistence.save_in_flight(document),
+            "the persistence reducer retains its newer plan"
+        );
+        let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+            panic!("editor app");
+        };
+        if !editor.checkpoint_pending || app.can_save_document(wid) {
+            failures.push("obsolete result cleared the newer editor Saving state");
+        }
+        if app.native_documents.pending_saves.get(&document) != Some(&queued) {
+            failures.push("obsolete result removed the later explicit Save intent");
+        }
+        assert_eq!(
+            app.document_store.checkpoint_seq(document),
+            checkpoint_before
+        );
+        assert_eq!(
+            app.native_documents.persistence.observed(document),
+            observed_before
+        );
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, latest.seq);
+        assert_eq!(after.text, latest.text);
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        assert_eq!(fs::read(&path).unwrap(), disk_before);
+        assert_eq!(
+            app.native_documents.pending_quit.as_ref(),
+            Some(&quit_before)
+        );
+        assert_eq!(app.document_store.phase(document), phase_before);
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![])
+        );
+        assert_eq!(
+            app.native_documents.pending_quit.as_ref(),
+            Some(&quit_before)
+        );
+
+        // Landing this exact held generation also proves it remained the
+        // reducer's current plan, then drains the later Save through the host.
+        finish_inflight_save_for_test(&mut app, document, view, held);
+        if fs::read_to_string(&path).unwrap() != latest.text.as_ref() {
+            failures.push("the later explicitly saved text did not reach disk");
+        }
+        if app.document_store.checkpoint_seq(document) != Some(latest.seq)
+            || app.document_store.dirty(document) != Some(false)
+        {
+            failures.push("the later Save did not checkpoint the latest draft");
+        }
+        assert!(!app.native_documents.inflight.contains(&document));
+        assert!(!app.native_documents.persistence.save_in_flight(document));
+        assert!(!app.native_documents.pending_saves.contains_key(&document));
+        let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+            panic!("editor app");
+        };
+        assert!(!editor.checkpoint_pending);
+        assert_eq!(app.take_ready_document_shutdowns().unwrap(), (true, vec![]));
+        assert!(app.native_documents.pending_quit.is_none());
         let _ = fs::remove_dir_all(dir);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

@@ -590,6 +590,96 @@ fn picker_rows_height(rows: &[PickerRow], gap: f32) -> f32 {
     rows.iter().map(picker_row_height).sum::<f32>() + rows.len().saturating_sub(1) as f32 * gap
 }
 
+/// A picker's last screen seated with its last row on the list's bottom edge
+/// ([`picker_flush_seat`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PickerFlushSeat {
+    /// The caption pinned over the rows (`None`: the list's top is the rows' top).
+    pinned: Option<&'static str>,
+    /// The first row laid out: the topmost row that shows, or the row in the gap over it.
+    from: usize,
+    /// The topmost row that shows.
+    shown: usize,
+    /// How far the rows from `from` on are scrolled under the caption, or the list's top.
+    scrolled: f32,
+}
+
+/// THE LAST SCREEN ENDS ON THE LIST'S BOTTOM EDGE ONLY WHERE ITS TOP SAYS WHAT IT SHOWS.
+///
+/// Seated with its last row on the bottom edge of a list `room` tall, the screen's topmost
+/// row that shows is either a heading, whole, with the list's top for the screen's top, or a
+/// row of cells drawn with its name whole (`drawn(row, cut)`, cut `cut` points under its
+/// top) under the caption of its own section (`section`), pinned at the list's top (or under
+/// no caption where no caption names its section). `None` where neither stands: a caption
+/// over the section after it would name none of its rows, a heading cut by the edge would
+/// show as a sliver, and a row the edge left without its name would leave a band of blank
+/// over the rows (DARK over LIGHT at 150x48, LIGHT over the user theme with YOURS cut to a
+/// point at 102x29, LIGHT over THEME FILES cut to 6pt at 167x30). The screen then starts
+/// whole at its window's first row and the room it cannot fill lies under the list's end,
+/// where nothing follows.
+fn picker_flush_seat(
+    rows: &[PickerRow],
+    room: f32,
+    gap: f32,
+    section: impl Fn(&PickerRow) -> Option<&'static str>,
+    drawn: impl Fn(usize, f32) -> bool,
+) -> Option<PickerFlushSeat> {
+    let mut tops = Vec::with_capacity(rows.len());
+    let mut at = 0.0_f32;
+    for row in rows {
+        tops.push(at);
+        at += picker_row_height(row) + gap;
+    }
+    let end = at - gap;
+    // The topmost row a screen whose top is `top` shows any of, where it shows as it must:
+    // a heading whole, a row of cells with its name.
+    let topmost = |top: f32| {
+        let first =
+            (0..rows.len()).find(|row| tops[*row] + picker_row_height(&rows[*row]) > top + 0.5)?;
+        let cut = (top - tops[first]).max(0.0);
+        let shown = match rows[first] {
+            PickerRow::Heading(_) => cut <= 0.5,
+            PickerRow::Cells(_) => drawn(first, cut),
+        };
+        shown.then_some(first)
+    };
+    // The row laid out first for a screen whose top is `top` (the one in the gap over the
+    // topmost row that shows, where the top falls in that gap), so no scroll is negative.
+    let seat = |pinned, shown: usize, top: f32| {
+        let from = if top + 0.01 < tops[shown] {
+            shown - 1
+        } else {
+            shown
+        };
+        PickerFlushSeat {
+            pinned,
+            from,
+            shown,
+            scrolled: (top - tops[from]).max(0.0),
+        }
+    };
+    let top = end - room;
+    if top > 0.5
+        && let Some(shown) = topmost(top)
+        && match &rows[shown] {
+            PickerRow::Heading(_) => true,
+            cells => section(cells).is_none(),
+        }
+    {
+        return Some(seat(None, shown, top));
+    }
+    let top = end - (room - picker_heading_height() - gap);
+    if top <= 0.5 {
+        return None;
+    }
+    let shown = topmost(top)?;
+    let pinned = match &rows[shown] {
+        PickerRow::Heading(_) => None,
+        cells => section(cells),
+    }?;
+    Some(seat(Some(pinned), shown, top))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PickerMeasure(u32);
 
@@ -938,6 +1028,7 @@ impl ChoicePicker {
         first..first + self.rows_fitting(rows, first)
     }
 
+    #[cfg(test)]
     fn visible_cells(&self) -> Vec<PickerCell> {
         let rows = self.rows();
         rows[self.window(&rows)]
@@ -954,6 +1045,7 @@ impl ChoicePicker {
             .collect()
     }
 
+    #[cfg(test)]
     fn visible_indices(&self) -> Vec<usize> {
         self.visible_cells()
             .into_iter()
@@ -969,12 +1061,18 @@ impl ChoicePicker {
         self.visible_indices().contains(&index)
     }
 
-    fn visible_sections(&self) -> Vec<ThemeSection> {
+    /// The sections the options of `rows` belong to, in order, without repeats (theme picker
+    /// only): what a screen that draws them live shows.
+    fn sections_of(&self, rows: &[PickerRow]) -> Vec<ThemeSection> {
         let mut sections = Vec::new();
-        for index in self.visible_indices() {
-            if let Some(section) = self.options[index]
-                .theme
-                .as_ref()
+        for position in rows.iter().flat_map(|row| match row {
+            PickerRow::Cells(cells) => cells.clone(),
+            PickerRow::Heading(_) => 0..0,
+        }) {
+            if let Some(section) = self
+                .shown
+                .get(position)
+                .and_then(|index| self.options[*index].theme.as_ref())
                 .map(|theme| theme.section)
                 && !sections.contains(&section)
             {
@@ -7981,7 +8079,7 @@ const fn projection_reply(event: &AppEvent) -> bool {
         | AppEvent::MessagesChanged { .. }
         | AppEvent::HarnessChanged { .. }
         | AppEvent::DocumentChanged { .. }
-        | AppEvent::DocumentEditorOpened { .. }
+        | AppEvent::DocumentEditorFinished { .. }
         | AppEvent::ConfigEditorFinished { .. }
         | AppEvent::ConfigPatchFinished { .. }
         | AppEvent::ExternalOpenFinished { .. }
@@ -16647,6 +16745,27 @@ const fn picker_host_preview_height(least: f32, natural: f32, room: f32) -> f32 
     room.min(natural).max(least)
 }
 
+/// Whether `node` is the page's heading or its subtitle.
+fn is_page_heading(node: &UiNode) -> bool {
+    let key = node.key.as_str();
+    key.starts_with("settings/page-heading/") || key.starts_with("settings/page-subtitle/")
+}
+
+/// A PICKER'S HOST KEEPS IT ITS LEAST FORM: where the page's heading in `out` leaves the
+/// preview less than its `least` over the picker's least form (`room_under` measures the room
+/// the preview has under what `out` holds), the page sheds its heading, as a compact page
+/// does (the picker names the setting). At 167x26 the heading left the theme picker's list
+/// 28pt, its DARK caption over none of its themes.
+fn shed_heading_for_picker(
+    out: &mut Vec<UiNode>,
+    least: f32,
+    room_under: impl Fn(&[UiNode]) -> f32,
+) {
+    if room_under(out) + 0.5 < least && out.iter().any(is_page_heading) {
+        out.retain(|node| !is_page_heading(node));
+    }
+}
+
 impl ChoicePickerFit {
     fn stacked(
         state: &SettingsViewState,
@@ -16790,75 +16909,110 @@ fn choice_picker_card(
             .children(tiles)
         }
     };
-    let carried = picker.carried_heading(&rows, window.start);
+    // A LIST TOO SHORT FOR A CAPTION OVER A ROW draws its window's rows alone: where the room
+    // cannot hold a section's heading over its first row drawn, a caption would stand over
+    // nothing to choose. The rows keep their sections and the spoken name says them.
+    let heading_over_row = picker_heading_height() + gap + row_height;
+    let captions = rows_height + 0.5 >= heading_over_row
+        || window
+            .clone()
+            .find(|row| matches!(rows[*row], PickerRow::Cells(_)))
+            .is_some_and(|row| {
+                picker_row_drawn(
+                    &row_node(row, &rows[row]),
+                    row_height,
+                    0.0,
+                    heading_over_row - rows_height,
+                )
+            });
+    // THE WINDOW'S ROWS ARE WHOLE AND LIVE, under the heading a window scrolled into a section
+    // carries, so a section's choices are never on screen without its name. The rows after the
+    // window are drawn on to the list's bottom as its PEEK, a picture fading out and never live
+    // (a heading too), as the page's own list draws the card after its screen, so no screen
+    // ends on blank while the list goes on; a press there scrolls the tile into the window. On
+    // the LAST screen the window's end is the list's: it ends on the list's bottom edge where
+    // its top can say what it shows ([`picker_flush_seat`]), else it starts whole at its
+    // window's first row and the room it cannot fill lies under the list's end.
+    let carried = picker
+        .carried_heading(&rows, window.start)
+        .filter(|_| captions);
     let window_used = picker_rows_height(&rows[window.clone()], gap)
         + carried.map_or(0.0, |_| picker_heading_height() + gap);
     let last_screen =
-        window.start > 0 && window.end == rows.len() && window_used + 0.5 < rows_height;
-    let mut pinned = None;
-    let mut scrolled = 0.0;
+        captions && window.start > 0 && window.end == rows.len() && window_used + 0.5 < rows_height;
+    let flush = last_screen
+        .then(|| {
+            picker_flush_seat(
+                &rows,
+                rows_height,
+                gap,
+                |row| match row {
+                    PickerRow::Cells(cells) => picker
+                        .cell_section(cells.start)
+                        .filter(|heading| picker.headed() && section_captioned(heading)),
+                    PickerRow::Heading(_) => None,
+                },
+                |row, cut| picker_row_drawn(&row_node(row, &rows[row]), row_height, cut, 0.0),
+            )
+        })
+        .flatten();
     let mut option_rows = Vec::new();
-    let peeks = if last_screen {
-        let caption_of = |first: usize| {
-            let cells = (first..rows.len())
-                .find(|row| matches!(rows[*row], PickerRow::Cells(_)))
-                .unwrap_or(first);
-            picker.carried_heading(&rows, cells)
-        };
-        let drawn_from = |first: usize| match rows[first] {
-            PickerRow::Heading(_) if caption_of(first).is_some() => first + 1,
-            _ => first,
-        };
-        let inner_of = |first: usize| {
-            rows_height - caption_of(first).map_or(0.0, |_| picker_heading_height() + gap)
-        };
-        let mut first = window.start;
-        while first > 0
-            && picker_rows_height(&rows[drawn_from(first)..], gap) + 0.5 < inner_of(first)
-        {
-            first -= 1;
+    // The rows the screen draws live, and how tall what it draws live stands where a peek
+    // follows it.
+    let (live_rows, peek_from) = match flush {
+        Some(seat) => {
+            option_rows.extend(
+                rows.iter()
+                    .enumerate()
+                    .skip(seat.from)
+                    .map(|(row, cells)| row_node(row - seat.from, cells)),
+            );
+            (seat.shown..rows.len(), None)
         }
-        pinned = caption_of(first);
-        let from = drawn_from(first);
-        scrolled = (picker_rows_height(&rows[from..], gap) - inner_of(first)).max(0.0);
-        option_rows.extend(
-            rows.iter()
-                .enumerate()
-                .skip(from)
-                .map(|(row, cells)| row_node(row - from, cells)),
-        );
-        true
-    } else {
-        option_rows.extend(carried.map(|heading| picker_heading_node(picker, heading)));
-        option_rows.extend(
-            rows[window.clone()]
-                .iter()
-                .enumerate()
-                .map(|(row, cells)| row_node(row, cells)),
-        );
-        let mut used = window_used;
-        for (row, cells) in rows.iter().enumerate().skip(window.end) {
-            if used + gap >= rows_height - 4.0 {
-                break;
-            }
-            if matches!(cells, PickerRow::Heading(_))
-                && used + gap + picker_heading_height() + gap >= rows_height - 4.0
-            {
-                break;
-            }
-            option_rows.push(row_node(row - window.start, cells));
-            used += gap + picker_row_height(cells);
+        None if !captions => {
+            option_rows.extend(
+                rows[window.clone()]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cells)| matches!(cells, PickerRow::Cells(_)))
+                    .map(|(row, cells)| row_node(row, cells)),
+            );
+            (window.clone(), None)
         }
-        used > rows_height + 0.5
+        None => {
+            option_rows.extend(carried.map(|heading| picker_heading_node(picker, heading)));
+            option_rows.extend(
+                rows[window.clone()]
+                    .iter()
+                    .enumerate()
+                    .map(|(row, cells)| row_node(row, cells)),
+            );
+            let mut used = window_used;
+            let mut peeks = false;
+            for (row, cells) in rows.iter().enumerate().skip(window.end) {
+                let top = used + gap;
+                if rows_height - top + 0.5
+                    < crate::native_ui::LIST_PEEK_MIN.min(picker_row_height(cells))
+                {
+                    break;
+                }
+                option_rows.push(row_node(row - window.start, cells));
+                used = top + picker_row_height(cells);
+                peeks = true;
+            }
+            (window.clone(), peeks.then_some(window_used))
+        }
     };
+    let (pinned, scrolled) = flush.map_or((None, 0.0), |seat| (seat.pinned, seat.scrolled));
+    let extra = if no_match { row_height + gap } else { 0.0 };
     if no_match {
         option_rows.insert(0, theme_no_match_node(picker));
     }
-    let rows_height = rows_height + if no_match { row_height + gap } else { 0.0 };
+    let rows_height = rows_height + extra;
     let list = UiNode::new(
         format!("settings/choice-list/{}", picker.key),
         UiContent::Group(GroupSpec {
-            label: Some(theme_list_label(picker, field_label)),
+            label: Some(theme_list_label(picker, field_label, &rows[live_rows])),
             role: if scrolls {
                 SemanticRole::List
             } else {
@@ -16874,11 +17028,14 @@ fn choice_picker_card(
             .gap(gap);
         match pinned {
             Some(_) => layout.clipped(),
-            None if peeks => layout.scrolled(scrolled).clipped(),
+            None if scrolls => layout.scrolled(scrolled).clipped(),
             None => layout,
         }
     })
-    .room(rows_height, false)
+    .room(
+        peek_from.map_or(rows_height, |live| (live + extra).min(rows_height)),
+        peek_from.is_some(),
+    )
     .children(match pinned {
         Some(caption) => {
             let inner = (rows_height - picker_heading_height() - gap).max(0.0);
@@ -17050,8 +17207,10 @@ fn choice_picker_card(
     )
 }
 
-fn theme_list_label(picker: &ChoicePicker, field_label: &str) -> String {
-    let sections = picker.visible_sections();
+/// The list's spoken name: a theme picker names the sections of the rows its screen draws
+/// live, `shown`, so what is said and what is drawn name the same sections.
+fn theme_list_label(picker: &ChoicePicker, field_label: &str, shown: &[PickerRow]) -> String {
+    let sections = picker.sections_of(shown);
     if sections.is_empty() {
         format!("{field_label} options")
     } else {
@@ -17481,6 +17640,40 @@ fn theme_no_match_node(picker: &ChoicePicker) -> UiNode {
             .width(Length::Fill)
             .height(Length::Fixed(scaled_control_height())),
     )
+}
+
+/// Whether picker row `row` (`height` tall) still names what it is where the list's top
+/// edge cuts `top` points into it and its bottom edge `bottom`: a heading only whole, a row
+/// of tiles where at least [`crate::native_ui::LIST_PEEK_MIN`] of it shows and every tile's
+/// words and icons lie whole between the edges ([`crate::native_ui::words_band`]); an edge
+/// through a tile's name draws the tile not at all.
+fn picker_row_drawn(row: &UiNode, height: f32, top: f32, bottom: f32) -> bool {
+    fn tiles<'a>(node: &'a UiNode, out: &mut Vec<&'a UiNode>) {
+        if matches!(node.content, UiContent::Button(_)) {
+            out.push(node);
+        } else {
+            for child in &node.children {
+                tiles(child, out);
+            }
+        }
+    }
+    let (top, bottom) = (top.max(0.0), bottom.max(0.0));
+    if matches!(row.content, UiContent::Text(_)) {
+        return top <= 0.5 && bottom <= 0.5;
+    }
+    if top <= 0.01 && bottom <= 0.01 {
+        return true;
+    }
+    if height - top - bottom + 0.01 < crate::native_ui::LIST_PEEK_MIN.min(height) {
+        return false;
+    }
+    let mut found = Vec::new();
+    tiles(row, &mut found);
+    !found.is_empty()
+        && found.iter().all(|tile| {
+            crate::native_ui::words_band(&tile.key, &tile.content, height)
+                .is_none_or(|(from, to)| from >= top - 0.01 && to <= height - bottom + 0.01)
+        })
 }
 
 fn picker_heading_node(picker: &ChoicePicker, heading: &str) -> UiNode {
@@ -19963,6 +20156,7 @@ fn cursor_styles_card(
         padding: Insets::all(12.0),
         gap: 6.0,
         head,
+        repeat: Vec::new(),
         rows,
     }
 }
@@ -20386,6 +20580,7 @@ fn top_split_card(
         padding: Insets::all(12.0),
         gap: 6.0,
         head: vec![(heading, heading_height)],
+        repeat: Vec::new(),
         rows: body,
     }
 }
@@ -20484,6 +20679,7 @@ fn page_group_card(
         padding: Insets::all(SETTINGS_GROUP_CARD_INSET),
         gap: 4.0,
         head: vec![(heading, label_height)],
+        repeat: Vec::new(),
         rows,
     }
 }
@@ -20956,22 +21152,24 @@ fn top_settings_page(
             .filter(|key| top_picker_previews(key))
         {
             let gap = settings_page_gap(state, width, cx.viewport);
-            let used: f32 = out
-                .iter()
-                .map(|node| match node.layout.height {
-                    Length::Fixed(height) => height + gap,
-                    _ => gap,
-                })
-                .sum();
             let themed = state
                 .choice_picker
                 .as_ref()
                 .is_some_and(|picker| picker.themes.is_some());
-            let room = settings_list_body_height(state, width, cx.viewport)
-                - plain_status_extra(state, width, cx.viewport)
-                - used
-                - gap
-                - choice_picker_floor(themed, width);
+            let room_under = |out: &[UiNode]| {
+                let used: f32 = out
+                    .iter()
+                    .map(|node| match node.layout.height {
+                        Length::Fixed(height) => height + gap,
+                        _ => gap,
+                    })
+                    .sum();
+                settings_list_body_height(state, width, cx.viewport)
+                    - plain_status_extra(state, width, cx.viewport)
+                    - used
+                    - gap
+                    - choice_picker_floor(themed, width)
+            };
             let natural = renderer_preview_height(width).min(132.0);
             if let Some(mut preview) = top_preview(
                 state,
@@ -20985,8 +21183,9 @@ fn top_settings_page(
                     UiContent::SettingsPreview(spec) => spec.minimum_height(48.0),
                     _ => 48.0,
                 };
+                shed_heading_for_picker(&mut out, least, room_under);
                 preview.layout.height =
-                    Length::Fixed(picker_host_preview_height(least, natural, room));
+                    Length::Fixed(picker_host_preview_height(least, natural, room_under(&out)));
                 out.push(preview);
             }
         }
@@ -21520,6 +21719,7 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
                 MANUAL_ONLY_GROUP,
                 group_width,
             )],
+            repeat: Vec::new(),
             rows,
         }));
     }
@@ -22564,6 +22764,7 @@ fn settings_fields_page(
                 padding: Insets::all(12.0),
                 gap: 6.0,
                 head: Vec::new(),
+                repeat: Vec::new(),
                 rows,
             })
         })
@@ -22693,29 +22894,30 @@ fn settings_fields_page(
         // The picker is a complete transient decision surface: the list waits behind it at its
         // exact scroll and the preview stays the evidence for the highlighted choice. A compact
         // page sheds its heading (the picker names the setting), and a short one shows the
-        // preview at its least height, leaving the choices the room.
+        // preview at its least height, leaving the choices the room; one too short for its
+        // heading, the preview's least and the picker's least form sheds its heading too.
         if width == SettingsWidth::Compact {
-            out.retain(|node| {
-                !node.key.as_str().starts_with("settings/page-heading/")
-                    && !node.key.as_str().starts_with("settings/page-subtitle/")
-            });
-            used = 0.0;
+            out.retain(|node| !is_page_heading(node));
         }
         let themed = state
             .choice_picker
             .as_ref()
             .is_some_and(|picker| picker.themes.is_some());
-        let room = body - used - gap - choice_picker_floor(themed, width);
+        let room_under = |out: &[UiNode]| {
+            let used: f32 = out.iter().map(|node| fixed_height(node) + gap).sum();
+            body - used - gap - choice_picker_floor(themed, width)
+        };
         let mut preview = preview_for(renderer_preview_height(width));
         if let Some(preview) = preview.as_mut() {
             let least = match &preview.content {
                 UiContent::SettingsPreview(spec) => spec.minimum_height(48.0),
                 _ => 48.0,
             };
+            shed_heading_for_picker(&mut out, least, room_under);
             preview.layout.height = Length::Fixed(picker_host_preview_height(
                 least,
                 fixed_height(preview),
-                room,
+                room_under(&out),
             ));
         }
         out.extend(preview);
@@ -38018,6 +38220,7 @@ fn packages_page(
         padding: Insets::symmetric(PACKAGES_HERO_PAD_X, 20.0),
         gap: 8.0,
         head: Vec::new(),
+        repeat: Vec::new(),
         rows: hero_rows,
     };
 
@@ -38106,6 +38309,7 @@ fn packages_page(
         padding: Insets::all(20.0),
         gap: 8.0,
         head: vec![(consent_heading, consent_heading_height)],
+        repeat: Vec::new(),
         rows: consent_rows,
     };
 
@@ -38120,6 +38324,7 @@ fn packages_page(
             "PROGRAMS",
             consent_text_width,
         )],
+        repeat: Vec::new(),
         rows: packages_program_lines(packages, width)
             .iter()
             .map(|line| packages_program_line_row(line, row_height, consent_text_width))
@@ -38149,6 +38354,7 @@ fn packages_page(
             activity_heading_height,
             consent_text_width,
         )],
+        repeat: Vec::new(),
         rows: activity_rows,
     };
 

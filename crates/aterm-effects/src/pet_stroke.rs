@@ -56,13 +56,20 @@ impl StrokeDetector {
         point: Option<(f32, f32)>,
         body_width: f32,
     ) -> bool {
-        let Some(point) = point.filter(|(x, y)| {
-            x.is_finite() && y.is_finite() && body_width.is_finite() && body_width > 0.0
-        }) else {
+        let Some(point) = point else {
             self.last = None;
             self.travel = 0.0;
             return false;
         };
+        if !(point.0.is_finite()
+            && point.1.is_finite()
+            && body_width.is_finite()
+            && body_width > 0.0)
+        {
+            self.last = None;
+            self.travel = 0.0;
+            return false;
+        }
         let Some(previous) = self.last else {
             self.last = Some(Sample {
                 point,
@@ -83,16 +90,16 @@ impl StrokeDetector {
             point,
             moved_at: now,
         });
-        if elapsed.is_zero() || elapsed > MAX_GAP {
+        if elapsed.is_zero()
+            || elapsed > MAX_GAP
+            || self.cooldown_until.is_some_and(|until| now < until)
+        {
             self.travel = 0.0;
             return false;
         }
         let distance = (point.0 - previous.point.0).hypot(point.1 - previous.point.1) / body_width;
         let speed = distance / elapsed.as_secs_f32();
-        if !speed.is_finite()
-            || !(MIN_SPEED..=MAX_SPEED).contains(&speed)
-            || self.cooldown_until.is_some_and(|until| now < until)
-        {
+        if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
             self.travel = 0.0;
             return false;
         }

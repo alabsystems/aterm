@@ -22,8 +22,8 @@ use aterm_agent::supervise::policy::login::{
 use aterm_agent::supervise::policy::notice::{LOGIN_BACK_DIALOG, LOGIN_RENEWED_DIALOG};
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
-    AccountAdvice, AccountAt, RULE_CONTINUE, RULE_LOGIN, RULE_LOGIN_BACK, Restart, TurnEndAction,
-    TurnEndReading, TurnEndState, decide_turn_end,
+    AccountAdvice, AccountAt, Composer, RULE_CONTINUE, RULE_LOGIN, RULE_LOGIN_BACK, Restart,
+    TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
 };
 use aterm_json::Value;
 use aterm_models_harness::harness_login_wall_model;
@@ -468,9 +468,34 @@ fn earlier(s: &S) -> S {
 }
 
 fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
+    supervisor_drawn(s, &|r| r, false)
+}
+
+/// [`supervisor_at`] with each reading the wall's state is decided on drawn by `drawn`, and,
+/// with `moved`, the tab relaunched onto the row by a move made at a wall before it (the wall the
+/// state reads is then the moved-to process's own), each answer of that move a point gives told
+/// before the point is decided, as the loop tells it (`account_tells`).
+fn supervisor_drawn(
+    s: &S,
+    drawn: &dyn Fn(TurnEndReading) -> TurnEndReading,
+    moved: bool,
+) -> (TurnEndAction, Option<Exception>, PickerGate) {
     let cfg = SupervisorConfig::default();
     let t0 = Instant::now() + Duration::from_secs(10 * 3600);
     let mut st = TurnEndState::default();
+    if moved {
+        let move_to = Restart::Account {
+            to: LABEL.to_string(),
+            at: AccountAt::Wall,
+        };
+        let before = reading(&with_tail(&[WALL_ROW]), None);
+        st.restarted(&move_to, true, &before, t0 - Duration::from_secs(60));
+    }
+    let tell = |st: &mut TurnEndState, r: &TurnEndReading| {
+        if let Some(answer) = st.account_answer(r) {
+            st.account_told(answer);
+        }
+    };
     let long = Some(Duration::from_secs(180));
     let mut from = t0;
     let then = earlier(s);
@@ -496,7 +521,8 @@ fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
         None
     } else if s["done"] == 1 && s["wall"] == 1 {
         let r = first_wall(s, &mut st);
-        let r = hosted(s, &st, s["renewed"] == 1, r);
+        let r = drawn(hosted(s, &st, s["renewed"] == 1, r));
+        tell(&mut st, &r);
         st.observe(&r, t0);
         let r = advised(&st, s["renewed"] == 1, r);
         return (
@@ -508,7 +534,13 @@ fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
         long
     };
     let now = from + Duration::from_secs(60);
-    let r = hosted(s, &st, s["renewed"] == 1, reading(&screen_of(s), worked));
+    let r = drawn(hosted(
+        s,
+        &st,
+        s["renewed"] == 1,
+        reading(&screen_of(s), worked),
+    ));
+    tell(&mut st, &r);
     st.observe(&r, now);
     let r = advised(&st, s["renewed"] == 1, r);
     (
@@ -929,5 +961,77 @@ fn the_real_code_conforms_to_the_login_wall_model() {
     assert!(
         uncaught.is_empty(),
         "the real code has these defects: {uncaught:?}"
+    );
+}
+
+/// A roster row's wall drawn as a sign-in menu in place of the composer
+/// (`TurnEndReading::at_sign_in_menu`: no point, so nothing is typed into it), bound to the model
+/// where the composer's wall is, but for the typed acts a menu cannot take: no `/login`
+/// (`NoRosterRowSignedInByAPerson`), no person told (no `TellNow` or `TellClose` is enabled
+/// there) and no badge, and the relaunch onto the renewed row exactly where `Relaunch` is
+/// enabled, which the host's advice, asked at the menu, makes. Each state is decided twice: on
+/// a tab that made no move, and on one relaunched onto the row by a move made at a wall, whose
+/// menu is the moved-to login's own (`Relaunch` then `Expire` in the model), never the wall the
+/// session left. Not where the login is back in another tab (`elsewhere` = 2), whose act is the
+/// composer's typed continuation.
+#[test]
+fn a_roster_rows_sign_in_menu_conforms_to_the_login_wall_model() {
+    let model = harness_login_wall_model();
+    let menu = |r: TurnEndReading| TurnEndReading {
+        composer: Composer::Absent,
+        ..r
+    };
+    let mut seen = BTreeSet::new();
+    let mut taken = BTreeSet::new();
+    for s in reachable(&model) {
+        if !(s["rostered"] == 1
+            && s["wall"] == 1
+            && s["track"] == 0
+            && s["left"] == 0
+            && s["elsewhere"] != 2)
+        {
+            continue;
+        }
+        let only: S = SUPERVISOR_VARS.iter().map(|&k| (k, s[k])).collect();
+        if !seen.insert(only.clone()) {
+            continue;
+        }
+        for act in ["TypeLogin", "TellNow", "TellClose"] {
+            assert!(!model.action_enabled(act, &s), "{act} at {s:?}");
+        }
+        for moved in [false, true] {
+            let (decided, exception, _) = supervisor_drawn(&only, &menu, moved);
+            assert!(
+                !matches!(
+                    decided,
+                    TurnEndAction::Escalate { .. }
+                        | TurnEndAction::Type { .. }
+                        | TurnEndAction::TypeCommand { .. }
+                ),
+                "at {only:?}, moved {moved}: {decided:?}"
+            );
+            assert_eq!(
+                tells_now(exception.as_ref()),
+                None,
+                "at {only:?}, moved {moved}: {exception:?}"
+            );
+            let relaunched = supervisor_action(&decided) == Some("Relaunch");
+            assert_eq!(
+                relaunched,
+                model.action_enabled("Relaunch", &s),
+                "at {only:?}, moved {moved}: {decided:?}"
+            );
+            taken.insert((moved, if relaunched { "Relaunch" } else { "waits" }));
+        }
+    }
+    assert_eq!(
+        taken,
+        BTreeSet::from([
+            (false, "Relaunch"),
+            (false, "waits"),
+            (true, "Relaunch"),
+            (true, "waits"),
+        ]),
+        "the menu both waits and relaunches somewhere, with a move made before it and without"
     );
 }

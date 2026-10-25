@@ -35,6 +35,8 @@ pub mod abrew;
 pub mod activate;
 #[cfg(target_os = "macos")]
 pub mod activation_notice;
+/// verify's, `ship trust run`'s and the lab VM boots' disk, claimed before the run starts.
+pub mod admit_disk;
 /// Whether this machine consents to the unattended adoption of the ALab toolset.
 pub mod adoption;
 pub mod alab;

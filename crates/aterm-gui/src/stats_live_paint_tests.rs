@@ -257,10 +257,13 @@ fn the_strips_glide_left_by_the_part_of_the_period_run() {
         let still = paint(&snap, form, w, s, DeckLive::STILL);
         let slots = row_cells(&still, &d, s);
         assert_eq!(slots.len(), strip.cols as usize, "CONTROL");
+        // The strips' clips: the gauge left of the names clips its own bands.
         let clips = |prims: &[DrawPrim]| {
             prims
                 .iter()
-                .filter(|p| matches!(p, DrawPrim::ClipPush { .. }))
+                .filter(
+                    |p| matches!(p, DrawPrim::ClipPush { x, .. } if *x >= px(strip.x - 20.0, s)),
+                )
                 .count()
         };
         assert_eq!(clips(&still), 0, "{s}x: a still strip needs no clip");

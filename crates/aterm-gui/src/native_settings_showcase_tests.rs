@@ -415,12 +415,28 @@ fn own_top(compiled: &crate::native_ui::CompiledUi, node: &crate::native_ui::Sem
         .map_or(node.rect.y, |paint| paint.rect.y)
 }
 
+/// EVERY THEMES SCREEN NAMES THE SECTION IT STARTS IN: a screen that starts inside a captioned
+/// section repeats its caption over its first row there, the open Community section too (its
+/// rows under no caption past its first screen read as BUILT IN's: Tokyo Night Day beside the
+/// built-in Tokyo Night), whose head is its disclosure, never stacked over a COMMUNITY caption
+/// saying the same word.
 #[test]
 fn every_themes_screen_names_the_section_it_starts_in() {
     let mut inside = 0;
-    for (width, height) in [(584.0, 350.0), (738.0, 418.0), (1_074.0, 684.0)] {
+    let mut community = 0;
+    for (width, height, pack) in [
+        (584.0, 350.0, false),
+        (738.0, 418.0, false),
+        (1_074.0, 684.0, false),
+        (584.0, 350.0, true),
+        (738.0, 418.0, true),
+        (1_074.0, 684.0, true),
+    ] {
         let cx = view_cx_at(width, height);
         let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        if pack {
+            let _ = act(&mut runtime, instance, view, "settings/showcase/pack", None);
+        }
         let cards = state(&runtime, view).showcase.cards.clone();
         each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let list = rect_of(compiled, "settings/showcase/list");
@@ -443,23 +459,38 @@ fn every_themes_screen_names_the_section_it_starts_in() {
             let Some(caption) = card.section.caption() else {
                 return;
             };
+            let drawn = |node: &&crate::native_ui::SemanticNode| {
+                !node.offscreen && node.rect.y <= first.rect.y
+            };
+            let disclosure = compiled
+                .semantics
+                .iter()
+                .filter(drawn)
+                .any(|node| node.key.as_str() == "settings/showcase/pack");
             if card.section == Section::Community {
-                return;
+                community += 1;
             }
-            let heading = compiled.semantics.iter().find(|node| {
-                node.role == SemanticRole::Heading
-                    && !node.offscreen
-                    && node.label == caption
-                    && node.rect.y <= first.rect.y
-            });
+            let heading = compiled
+                .semantics
+                .iter()
+                .filter(drawn)
+                .any(|node| node.role == SemanticRole::Heading && node.label == caption);
             assert!(
-                heading.is_some(),
+                heading || card.section == Section::Community && disclosure,
                 "{width}x{height} screen {top}: {slug} with no {caption} over it"
+            );
+            assert!(
+                !(heading && disclosure && card.section == Section::Community),
+                "{width}x{height} screen {top}: Community over COMMUNITY"
             );
             inside += 1;
         });
     }
     assert!(inside > 0, "some screen starts inside a captioned section");
+    assert!(
+        community > 0,
+        "some screen starts inside the open Community section"
+    );
 
     let mut inside = 0;
     for (width, height) in [(584.0, 350.0), (738.0, 418.0)] {
@@ -5734,9 +5765,6 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
                 let Some(card) = cards.iter().find(|card| card.slug == slug) else {
                     continue;
                 };
-                if card.section == Section::Community {
-                    continue;
-                }
                 let Some(over) = captions
                     .iter()
                     .filter(|caption| caption.rect.y <= row.rect.y)
@@ -7873,3 +7901,134 @@ fn palette_chips_stand_a_target_apart() {
 /// The settings list's keeping rules, swept.
 #[path = "native_settings_showcase_keeping_tests.rs"]
 mod keeping;
+
+/// A light theme file of the person's own, listed under YOURS.
+const PAPER_THEME: &str =
+    "name = Paper\nappearance = light\nforeground = #24292f\nbackground = #ffffff\n";
+
+/// THE CHOOSER'S END SITS ON ITS LIST'S BOTTOM EDGE: every stop of the Themes list stands on
+/// whole rows (a theme row, a caption band, the Community disclosure, a name on two lines), as
+/// the room does, so its last screen ends on the list's bottom edge, at 1× and 2× text, with
+/// Community closed and open and with a theme of the person's own, wherever the panel pins its
+/// filter over the list; short of it only by whole rows the stop before the screen could not
+/// bring with the caption it repeats. Negative
+/// control: a 40pt disclosure under 32pt rows left the end 24pt short at every size at 1×, and
+/// 44pt caption bands under 56pt rows 32pt to 48pt at 2×.
+#[test]
+fn the_choosers_end_sits_on_its_lists_bottom_edge() {
+    let mut sizes = vec![
+        (584.0, 350.0),
+        (738.0, 418.0),
+        (1_074.0, 684.0),
+        (1_564.0, 854.0),
+    ];
+    for width in [738.0, 1_074.0] {
+        sizes.extend((330..=900).step_by(19).map(|height| (width, height as f32)));
+    }
+    super::at_each_text_scale(&[1.0, 2.0], "chooser end", |scale| {
+        let row = showcase_page::chooser_row_height();
+        let mut ends = 0;
+        let mut faults = Vec::new();
+        for &(width, height) in &sizes {
+            for (yours, pack) in [(false, false), (true, false), (false, true)] {
+                let cx = view_cx_at(width, height);
+                let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+                let dir = aterm_tempfile::tempdir().expect("a themes folder");
+                if yours {
+                    std::fs::write(dir.path().join("paper.conf"), PAPER_THEME).unwrap();
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.showcase = ShowcaseState::new(
+                        &crate::app_config::ThemeCatalog::discover_in(dir.path()),
+                    );
+                }
+                if pack {
+                    let _ = act(&mut runtime, instance, view, "settings/showcase/pack", None);
+                }
+                let _ = compile_settings_view(&runtime, instance, view, &cx);
+                let Some(plan) = state(&runtime, view).scroll_plan() else {
+                    continue;
+                };
+                let limit = plan.limit();
+                if limit == 0 {
+                    continue;
+                }
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.scroll_page_to(limit);
+                    state.page_reveal = None;
+                }
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let state = state(&runtime, view);
+                let Some(plan) = state.scroll_plan() else {
+                    continue;
+                };
+                let Some(list) = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "settings/showcase/list")
+                    .map(|node| node.rect)
+                else {
+                    continue;
+                };
+                let lowest = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        let key = node.key.as_str();
+                        key.starts_with("settings/showcase/")
+                            && !key.starts_with("settings/showcase/list")
+                            && node.clip.height > 0.5
+                            && node.clip.y >= list.y - 0.5
+                            && node.clip.bottom() <= list.bottom() + 0.5
+                            && node.clip.x >= list.x - 0.5
+                            && node.clip.right() <= list.right() + 0.5
+                    })
+                    .map(|node| node.clip.bottom())
+                    .fold(list.y, f32::max);
+                // A chooser too short for its filter over a row lists the filter too: its room
+                // is all the panel has, no whole number of rows (2× text in an 80x24 window).
+                let filter_pinned = compiled.paint.iter().any(|node| {
+                    node.key.as_str() == "settings/showcase/filter"
+                        && node.rect.bottom() <= list.y + 0.5
+                });
+                if !filter_pinned {
+                    continue;
+                }
+                let band = list.bottom() - lowest;
+                ends += 1;
+                if band <= 0.5 {
+                    continue;
+                }
+                let n = plan.len();
+                let first = plan.screen(limit).view.start;
+                let takes = plan.span(first.saturating_sub(1)..n) - plan.span(first..n);
+                let rows = band / row;
+                let context = format!(
+                    "{scale}× {width}x{height} yours {yours} community {pack}: the end {band:.0}pt \
+                     over the list's bottom"
+                );
+                if (rows - rows.round()).abs() > 0.02 {
+                    faults.push(format!("{context}, not a whole number of {row}pt rows"));
+                } else if first > 0 && band + 0.5 >= takes {
+                    faults.push(format!(
+                        "{context}, though the stop before the screen takes {takes:.0}pt"
+                    ));
+                }
+            }
+        }
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(
+            ends > 50,
+            "{scale}×: the chooser scrolls at these sizes ({ends} ends)"
+        );
+    });
+}

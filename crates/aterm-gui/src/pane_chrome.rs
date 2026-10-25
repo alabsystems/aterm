@@ -1018,6 +1018,10 @@ impl App {
         let Some((facts, _, _, hit)) = self.scrollbar_at(wid, x, y) else {
             return false;
         };
+        if self.pool.is_rewound(facts.session) {
+            self.note_rewind_withheld(facts.session);
+            return true;
+        }
         match hit {
             scrollbar::Hit::Thumb { grab } => {
                 if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1110,6 +1114,9 @@ impl App {
     /// and wake the fade. The facts take the new offset at once, so the next
     /// pointer event in the same frame hit-tests the thumb where it now is.
     fn scroll_pane(&mut self, wid: WindowId, session: u64, to: impl FnOnce(usize) -> usize) {
+        if self.pool.is_rewound(session) {
+            return;
+        }
         let Some(term) = self.pool.get(session).map(|s| s.live_term().clone()) else {
             return;
         };

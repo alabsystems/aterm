@@ -1261,6 +1261,141 @@ fn recursive_editor_restore_clamps_utf8_view_offsets() {
 }
 
 #[test]
+fn reopening_a_restored_document_focuses_its_leaf_before_revealing_a_line() {
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-restored-document-reopen-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path_a = dir.join("a.md");
+    let path_b = dir.join("b.md");
+    let text_a = "alpha first\nalpha second\nalpha third\n";
+    let text_b = "bravo first\nbravo second\nbravo third\n";
+    std::fs::write(&path_a, text_a).unwrap();
+    std::fs::write(&path_b, text_b).unwrap();
+    let uri_a = file_uri(&path_a);
+    let uri_b = file_uri(&path_b);
+    let editor_state = |app: &App, view: crate::tab_model::ViewId| {
+        let Some(crate::native_app::AppViewState::Editor(editor)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("restored document must be an Editor view");
+        };
+        editor.as_ref().clone()
+    };
+    let document_state = |app: &App, view: crate::tab_model::ViewId| {
+        let document = editor_state(app, view).buffer.unwrap().document;
+        let snapshot = app.document_store.snapshot(document).unwrap();
+        (
+            document,
+            snapshot.seq,
+            snapshot.text,
+            app.document_store.checkpoint_seq(document),
+            app.document_store.dirty(document),
+        )
+    };
+    let mut failures = Vec::new();
+    for zoomed in [false, true] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let mut a = restore::NativeLeafRestore::document("editor", uri_a.clone());
+        a.editor_selections = vec![restore::RestoreSelection { anchor: 1, head: 1 }];
+        let mut b = restore::NativeLeafRestore::document("editor", uri_b.clone());
+        b.editor_selections = vec![restore::RestoreSelection { anchor: 3, head: 3 }];
+        app.restore_into_window(
+            wid,
+            restore::WindowLayout {
+                restored_tabs: vec![restore::RestoredTab {
+                    root: split_of(native_leaf(a), native_leaf(b)),
+                    focused_path: vec![restore::RestoreBranch::Second],
+                    zoomed,
+                }],
+                ..single_leaf_window(bare_leaf())
+            },
+        );
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        let tab_id = tab.id;
+        let root = tab.root.clone();
+        let leaves = root.leaves();
+        assert_eq!(leaves.len(), 2, "two native leaves restored");
+        let (view_a, view_b) = (leaves[0], leaves[1]);
+        assert_eq!(tab.focus, view_b, "the sibling initially owns focus");
+        assert_eq!(tab.zoomed, zoomed);
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+        let view_count = app.view_store.len();
+        let before_b = editor_state(&app, view_b);
+        assert_eq!(
+            before_b.buffer.as_ref().unwrap().selections,
+            vec![crate::native_editor::Selection::caret(3)]
+        );
+        let before_documents = [view_a, view_b].map(|view| document_state(&app, view));
+        assert_eq!(before_documents[0].2.as_ref(), text_a);
+        assert_eq!(before_documents[1].2.as_ref(), text_b);
+
+        app.open_document_tab_at(
+            wid,
+            crate::native_app::AppKind::Editor,
+            &uri_a,
+            Some(3),
+            Some(3),
+        )
+        .expect("the already-restored document reopens");
+
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        if tab.focus != view_a {
+            failures.push(format!(
+                "zoomed={zoomed}: reopened A did not receive focus: {:?}",
+                tab.focus
+            ));
+        }
+        let a_selections = editor_state(&app, view_a).buffer.unwrap().selections;
+        let expected_caret = vec![crate::native_editor::Selection::caret(
+            "alpha first\nalpha second\nal".len(),
+        )];
+        if a_selections != expected_caret {
+            failures.push(format!(
+                "zoomed={zoomed}: A caret {a_selections:?}, expected {expected_caret:?}"
+            ));
+        }
+        let after_b = editor_state(&app, view_b);
+        if after_b != before_b {
+            failures.push(format!(
+                "zoomed={zoomed}: B view changed: before {before_b:?}, after {after_b:?}"
+            ));
+        }
+        assert_eq!(tab.id, tab_id, "the existing tab is reused");
+        assert_eq!(
+            tab.root, root,
+            "the split topology and view identities stay"
+        );
+        assert_eq!(tab.zoomed, zoomed, "reopen preserves the zoom state");
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+        assert_eq!(
+            app.windows[&wid].layouts.len(),
+            0,
+            "the native split stays canonical"
+        );
+        assert_eq!(
+            app.view_store.len(),
+            view_count,
+            "no duplicate view is opened"
+        );
+        assert_eq!(
+            [view_a, view_b].map(|view| document_state(&app, view)),
+            before_documents,
+            "reveal changes neither document text, sequence, nor checkpoint"
+        );
+        assert_eq!(std::fs::read_to_string(&path_a).unwrap(), text_a);
+        assert_eq!(std::fs::read_to_string(&path_b).unwrap(), text_b);
+        assert!(app.structural_invariants_ok());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
     let carry = |src: &str, dst: &str, op: &str| crate::session_store::ConnectionCarry {
         src: src.to_string(),
@@ -7133,56 +7268,201 @@ fn a_handoff_s_close_regrids_each_handed_over_tab_its_window_moved_under() {
     );
 }
 
+/// What a restore's close leaves window `wid` when its OS window has a size still to bring.
+fn owe_restore_regrid(app: &mut App, wid: WindowId, fullscreen: bool, at: std::time::Instant) {
+    app.windows
+        .get_mut(&wid)
+        .expect("the window")
+        .restore_regrid_owed = Some(super::RestoreRegridOwed {
+        closed: at,
+        since: at,
+        fullscreen,
+    });
+}
+
+/// Draw window `wid` through the real redraw path on a scripted CPU surface.
+fn present_scripted(app: &mut App, wid: WindowId) {
+    app.windows.get_mut(&wid).expect("the window").present = Some(crate::PresentTarget::Cpu {
+        surface: crate::present::CpuSurface::Scripted(Default::default()),
+    });
+}
+
 #[test]
-fn a_window_awaiting_its_maximize_leaves_its_handed_over_tabs_to_the_size_that_lands() {
+fn a_window_owing_its_restore_regrid_lays_out_every_tab_when_the_os_size_lands() {
+    for fullscreen in [false, true] {
+        let (mut new, handed) = handoff_into_moved_window((27, 80));
+        let wid = WindowId(0);
+        owe_restore_regrid(&mut new, wid, fullscreen, std::time::Instant::now());
+        let size = new.window_frame_px_for(wid, 40, 120);
+        new.apply_window_resized_grid(wid, size);
+        assert_eq!(
+            (new.windows[&wid].rows, new.windows[&wid].cols),
+            (40, 120),
+            "PRECONDITION: the size reached the grid"
+        );
+        for id in [0, handed[0], handed[1]] {
+            assert_eq!(
+                grid_of(&new, id),
+                (40, 120),
+                "fullscreen={fullscreen}: shell {id}"
+            );
+        }
+        for id in &handed {
+            assert_eq!(
+                resize_sites(&new, *id).len(),
+                1,
+                "fullscreen={fullscreen}: shell {id} is resized once, to the landed size"
+            );
+        }
+        let ws = &new.windows[&wid];
+        assert!(
+            ws.restore_regrid_owed.is_none(),
+            "fullscreen={fullscreen}: the grid commit paid it"
+        );
+        assert!(
+            !ws.panes_stale,
+            "fullscreen={fullscreen}: every tab was laid out, not only the front one"
+        );
+    }
+}
+
+/// A carried full screen still to enter: the close owes the re-grid, a size that lands before the
+/// full screen does not pay it, and the wait for the full screen's own size starts at its entry,
+/// however long the window went undrawn before.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_carried_full_screen_s_tabs_wait_for_its_size_from_its_entry() {
+    use crate::window_show::{CarriedShow, ShowLane, ShowOp, plan};
     let (mut new, handed) = handoff_into_moved_window((27, 80));
     let wid = WindowId(0);
     let parked = grid_of(&new, handed[0]);
-    // What `note_restored_show` records for a maximized row in a windowed app.
+    let show = restore::WindowShow {
+        fullscreen: Some(true),
+        ..Default::default()
+    };
+    new.carried_window_show = Some(CarriedShow::new(
+        ShowLane::Cold,
+        plan(&[(wid, show)], ShowLane::Cold),
+        Some(wid),
+    ));
+    new.close_restore_pass(&[]);
+    let owed = new.windows[&wid]
+        .restore_regrid_owed
+        .expect("the close owes the re-grid");
+    assert!(owed.fullscreen);
+    let waiting = |new: &App, when: &str| {
+        for id in &handed {
+            assert_eq!(grid_of(new, *id), parked, "{when}: shell {id}");
+            assert!(resize_sites(new, *id).is_empty(), "{when}: shell {id}");
+        }
+        assert!(
+            new.windows[&wid].restore_regrid_owed.is_some(),
+            "{when}: still owed"
+        );
+    };
+    waiting(&new, "at the close");
+
+    let size = new.window_frame_px_for(wid, 30, 90);
+    new.apply_window_resized_grid(wid, size);
+    assert_eq!(
+        (new.windows[&wid].rows, new.windows[&wid].cols),
+        (30, 90),
+        "PRECONDITION: a size landed before the full screen"
+    );
+    waiting(&new, "a size before the full screen");
+
+    // The window drew nothing for a settle's length, then aterm came to the front.
+    let idle = std::time::Instant::now()
+        .checked_sub(super::RESTORE_SHOW_SETTLE)
+        .expect("a clock past the settle");
+    owe_restore_regrid(&mut new, wid, true, idle);
+    {
+        let carried = new.carried_window_show.as_mut().expect("still carried");
+        (carried.stacked, carried.committed) = (true, true);
+    }
+    new.windows.get_mut(&wid).expect("the window").focused = true;
+    assert_eq!(
+        new.carried_window_show_focus_event(wid),
+        [ShowOp::EnterFullScreen(wid)],
+        "PRECONDITION: the full screen is entered"
+    );
+    present_scripted(&mut new, wid);
+    new.redraw_window_at(wid, std::time::Instant::now());
+    waiting(&new, "a frame just after the entry");
+
+    // The full screen's size, well after the throttle let the last one through.
     new.windows
         .get_mut(&wid)
         .expect("the window")
-        .restore_show_awaited = true;
-    new.close_restore_pass(&[]);
-    for id in &handed {
-        assert_eq!(
-            grid_of(&new, *id),
-            parked,
-            "shell {id} waits for the OS's size"
-        );
-        assert!(resize_sites(&new, *id).is_empty(), "shell {id}");
-    }
-    let ws = &new.windows[&wid];
-    assert!(ws.panes_stale, "the window's panes are left stale");
-    assert!(!ws.restore_show_awaited, "the close took the note");
-
-    // A show that keeps the grid: the tab brought on screen is re-gridded at its redraw.
-    let shown = new.windows[&wid].tab_set.tabs()[1].id;
-    new.switch_tab_in(wid, 1);
-    assert_eq!(
-        new.windows[&wid].tab_set.active_id(),
-        Some(shown),
-        "PRECONDITION: tab 1 came forward"
-    );
-    new.resize_panes_scoped(wid, true);
-    assert_eq!(grid_of(&new, handed[0]), (27, 80));
-    assert_eq!(
-        grid_of(&new, handed[1]),
-        parked,
-        "a tab off screen still waits"
-    );
-
-    // The size the maximize brings re-grids every tab once.
-    assert!(new.apply_term_resize(wid, 40, 120));
+        .last_resize_at = None;
+    let size = new.window_frame_px_for(wid, 40, 120);
+    new.apply_window_resized_grid(wid, size);
     for id in [0, handed[0], handed[1]] {
         assert_eq!(grid_of(&new, id), (40, 120), "shell {id}");
     }
-    assert_eq!(
-        resize_sites(&new, handed[1]).len(),
-        1,
-        "one resize, to the landed size"
+    for id in &handed {
+        assert_eq!(
+            resize_sites(&new, *id).len(),
+            1,
+            "shell {id} is resized once, to the full screen's size"
+        );
+    }
+    assert!(new.windows[&wid].restore_regrid_owed.is_none());
+}
+
+#[test]
+fn a_window_owing_its_restore_regrid_pays_it_at_a_frame_once_nothing_is_to_land() {
+    let (mut new, handed) = handoff_into_moved_window((27, 80));
+    let wid = WindowId(0);
+    present_scripted(&mut new, wid);
+    let t0 = std::time::Instant::now();
+    owe_restore_regrid(&mut new, wid, false, t0);
+    new.redraw_window_at(wid, t0);
+    for id in &handed {
+        assert_eq!(grid_of(&new, *id), (27, 80), "shell {id}");
+        assert_eq!(resize_sites(&new, *id), ["site=restore"], "shell {id}");
+    }
+    assert!(new.windows[&wid].restore_regrid_owed.is_none());
+}
+
+#[test]
+fn a_full_screen_s_restore_regrid_waits_for_its_size_until_the_settle_runs_out() {
+    let (mut new, handed) = handoff_into_moved_window((27, 80));
+    let wid = WindowId(0);
+    present_scripted(&mut new, wid);
+    let parked = grid_of(&new, handed[0]);
+    let t0 = std::time::Instant::now();
+    owe_restore_regrid(&mut new, wid, true, t0);
+    new.redraw_window_at(wid, t0 + super::RESTORE_SHOW_SETTLE / 2);
+    for id in &handed {
+        assert_eq!(grid_of(&new, *id), parked, "shell {id} waits for the size");
+        assert!(resize_sites(&new, *id).is_empty(), "shell {id}");
+    }
+    new.redraw_window_at(wid, t0 + super::RESTORE_SHOW_SETTLE);
+    for id in &handed {
+        assert_eq!(grid_of(&new, *id), (27, 80), "shell {id}");
+        assert_eq!(resize_sites(&new, *id), ["site=restore"], "shell {id}");
+    }
+    assert!(new.windows[&wid].restore_regrid_owed.is_none());
+}
+
+#[test]
+fn a_size_has_landed_once_the_grid_took_it_and_an_asked_maximize_shows() {
+    use super::size_unlanded;
+    assert!(!size_unlanded((24, 80), (24, 80), false, false));
+    assert!(
+        size_unlanded((30, 80), (24, 80), false, false),
+        "rows still to reach the grid"
     );
-    assert!(!new.windows[&wid].panes_stale);
+    assert!(
+        size_unlanded((24, 100), (24, 80), false, false),
+        "columns still to reach the grid"
+    );
+    assert!(
+        size_unlanded((24, 80), (24, 80), true, false),
+        "a maximize asked for and not shown yet"
+    );
+    assert!(!size_unlanded((24, 80), (24, 80), true, true));
 }
 
 #[test]
@@ -7202,14 +7482,29 @@ fn a_headless_maximized_row_is_regridded_at_the_close() {
             },
         )),
     ]);
-    layout.maximized = Some(true);
     layout.show.fullscreen = Some(true);
+    let show = layout.show;
     app.restore_into_window(wid, layout);
+    // What `restore_window` and the restore's end record for a maximized, full-screen row.
+    app.windows
+        .get_mut(&wid)
+        .expect("the window")
+        .restore_maximize_asked = true;
+    app.record_carried_window_show(&[(wid, show)], Some(wid));
     assert!(
-        !app.windows[&wid].restore_show_awaited,
-        "no OS will bring a headless window a size"
+        app.carried_window_show.is_none(),
+        "PRECONDITION: a headless instance carries no show"
     );
     app.close_restore_pass(&[]);
+    let ws = &app.windows[&wid];
+    assert!(
+        ws.restore_regrid_owed.is_none(),
+        "a window with no OS window has no size to wait for"
+    );
+    assert!(
+        !ws.restore_maximize_asked,
+        "the re-grid drops the asked maximize"
+    );
     for tab in app.windows[&wid].tab_set.tabs() {
         let id = app
             .view_store
@@ -7226,7 +7521,7 @@ fn a_reopened_split_tab_fits_each_pane_to_its_share_of_the_window() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     // A fresh shell per leaf: a live id would show session 0 twice, and a shared session re-grids
-    // the window at every sync.
+    // the window at every sync, which would hide a missing layout pass.
     let leaf = || {
         restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
             restore::TerminalLeafRestore {
@@ -7235,19 +7530,13 @@ fn a_reopened_split_tab_fits_each_pane_to_its_share_of_the_window() {
             },
         ))
     };
-    let mut records = window_of(vec![leaf(), split_of(leaf(), leaf())]).restored_tabs;
-    // A second tab brings the tab strip, and the grid change that brings re-grids every tab.
-    app.restore_closed_tab_into_window(wid, &records[0], 1)
-        .expect("reopened");
+    let record = window_of(vec![split_of(leaf(), leaf())])
+        .restored_tabs
+        .remove(0);
     let window = (app.windows[&wid].rows, app.windows[&wid].cols);
     let tab = app
-        .restore_closed_tab_into_window(wid, &records.remove(1), 2)
+        .restore_closed_tab_into_window(wid, &record, 1)
         .expect("reopened");
-    assert_eq!(
-        (app.windows[&wid].rows, app.windows[&wid].cols),
-        window,
-        "PRECONDITION: the third tab leaves the window's grid as it was"
-    );
     let panes: Vec<u64> = app.windows[&wid]
         .tab_set
         .tabs()

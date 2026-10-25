@@ -33,6 +33,11 @@ mod imp {
         if want == state.engaged {
             return Ok(());
         }
+        if cfg!(test) {
+            // A test process never reaches the window server: the inert arm keeps only the count.
+            state.engaged = want;
+            return Ok(());
+        }
         // SAFETY: plain Carbon calls with no arguments or pointers; the OS refcounts them, and the
         // lock keeps this process's contribution balanced at 0 or 1.
         let status = unsafe {

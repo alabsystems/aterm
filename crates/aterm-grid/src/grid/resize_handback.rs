@@ -498,17 +498,6 @@ impl Grid {
         }
     }
 
-    /// Whether nothing a later resize reads from the hand-back stands: no rows owed, and no split pass's offer, lift, plan, fill or skew ([`Grid::replay_fork`] copies none of them).
-    pub(super) fn handback_idle(&self) -> bool {
-        let hb = self.storage.handback;
-        self.handback_owed(true) == Edge::None
-            && HandBack {
-                edge: hb.edge,
-                at: hb.at,
-                ..HandBack::default()
-            } == hb
-    }
-
     /// Record `edge` owed as of now, after the rows-only resize that moved the counter for its own trims and appends.
     pub(super) fn set_handback(&mut self, edge: Edge) {
         self.storage.handback = HandBack {

@@ -307,16 +307,21 @@ fn foreign_of(
 
 /// Accounts v2's view of the serving Claude row: the active row when it is ready here, else the
 /// own row when it is, else the first ready row, else the own row. A refused roster yields only
-/// its refusal ([`ClaudeAccounts::refused`]); a `state.json` that cannot be read drops only the
-/// lifecycle words. `None` with no harness state root, or where `logins.json` cannot be read as
-/// this build's.
+/// its refusal ([`ClaudeAccounts::refused`]), as does unreadable state or login bindings.
+/// `None` with no harness state root.
 fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     use crate::harness::accounts;
     let store = accounts::Store::at(m.harness_state.as_ref()?);
     let loaded = m.roster.as_ref().map(|p| accounts::Roster::load(p));
+    let cache = store
+        .load(m.now)
+        .and_then(|(state, _)| store.load_logins(m.now).map(|(logins, _)| (state, logins)));
     let refused = match &loaded {
         Some(Err(why)) => Some(crate::harness::one_line(why, 160)),
-        _ => None,
+        _ => cache
+            .as_ref()
+            .err()
+            .map(|why| crate::harness::one_line(why, 160)),
     };
     if refused.is_some() {
         return Some(ClaudeAccounts {
@@ -340,9 +345,8 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     };
     let listed = listed_roster.is_some();
     let roster = listed_roster.unwrap_or_else(accounts::Roster::own);
-    let (logins, _) = store.load_logins(m.now).ok()?;
+    let (state, logins) = cache.ok()?;
     let bound = accounts::bound(&roster, &logins);
-    let state = store.load(m.now).map(|(s, _)| s).unwrap_or_default();
     let enrolled = accounts::enrolled(&bound);
     let own_row = bound
         .row_for_login(None)
@@ -577,22 +581,27 @@ pub fn pool_for(m: &Machine<'_>, cli: crate::harness::accounts::Cli) -> Option<C
             });
         }
     };
-    let store = match (m.harness_state.as_deref(), m.home.as_deref()) {
-        (Some(state), Some(home)) => Some(accounts::Store::at_for(state, cli, home)),
-        _ => None,
+    let cache = match (m.harness_state.as_deref(), m.home.as_deref()) {
+        (Some(state), Some(home)) => {
+            let store = accounts::Store::at_for(state, cli, home);
+            store
+                .load(m.now)
+                .and_then(|(state, _)| store.load_logins(m.now).map(|(logins, _)| (state, logins)))
+        }
+        _ => Err("account store is unavailable".to_owned()),
     };
-    let logins = store
-        .as_ref()
-        .and_then(|s| s.load_logins(m.now).ok())
-        .map(|(logins, _)| logins)
-        .unwrap_or_default();
+    let (state, logins) = match cache {
+        Ok(cache) => cache,
+        Err(why) => {
+            return Some(CliAccounts {
+                roster: roster_path,
+                refused: Some(why),
+                ..CliAccounts::default()
+            });
+        }
+    };
     let bound = accounts::bound(&roster, &logins);
     let enrolled = accounts::enrolled_for(cli, &bound);
-    let state = store
-        .as_ref()
-        .and_then(|s| s.load(m.now).ok())
-        .map(|(state, _)| state)
-        .unwrap_or_default();
     let with_email = || bound.rows.iter().filter(|r| r.email.is_some());
     let due = accounts::renew_due(&bound, &logins, &state, &enrolled, m.now);
     let next = with_email()

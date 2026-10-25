@@ -589,10 +589,14 @@ fn ai_accounts_others_only(env: &aterm_agent::harness::cli::Env) -> bool {
 /// The other CLIs' pools beside Claude Code's roster in one phrase (`codex 1, kimi 1`,
 /// `accounts_sync::cli_pools_words`); `None` where this machine keeps none.
 #[cfg(target_os = "macos")]
-fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<String> {
+fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<Result<String, String>> {
     use aterm_agent::harness::accounts_sync::{cli_pools, cli_pools_words};
     let (config, home) = (env.config.as_deref()?, env.home.as_deref()?);
-    cli_pools_words(&cli_pools(config, &env.state, home, env.now))
+    let pools = cli_pools(config, &env.state, home, env.now);
+    if let Some(why) = pools.iter().find_map(|pool| pool.rows.as_ref().err()) {
+        return Some(Err(why.clone()));
+    }
+    cli_pools_words(&pools).map(Ok)
 }
 
 /// `base.ai.accounts`' probe over `env`: Claude Code's pool, as it always read
@@ -602,8 +606,10 @@ fn ai_accounts_pools(env: &aterm_agent::harness::cli::Env) -> Option<String> {
 fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
     use aterm_converge::Probe;
     let claude = ai_accounts_claude_probe(env);
-    let Some(pools) = ai_accounts_pools(env) else {
-        return claude;
+    let pools = match ai_accounts_pools(env) {
+        Some(Ok(pools)) => pools,
+        Some(Err(why)) => return Probe::Unusable { why },
+        None => return claude,
     };
     let others = format!("other CLIs: {pools}");
     match claude {
@@ -655,9 +661,14 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
         && configured_source(Some(&config_path), Some(&roster_path)).is_some()
         && !needs_init_accounts_sync(home, &env.state, &roster_path, env.now)
     {
-        let bound = store.bound(&raw, env.now).unwrap_or(raw);
+        let (bound, state) = match store
+            .bound(&raw, env.now)
+            .and_then(|bound| store.load(env.now).map(|(state, _)| (bound, state)))
+        {
+            Ok(read) => read,
+            Err(why) => return Probe::Unusable { why },
+        };
         let enrolled = accounts::enrolled(&bound);
-        let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
         let ready = bound
             .rows
             .iter()

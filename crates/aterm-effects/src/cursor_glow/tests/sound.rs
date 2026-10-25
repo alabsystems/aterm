@@ -312,7 +312,7 @@ fn a_keyless_hop_the_in_flight_pool_cannot_pay_for_lights_no_landing() {
         "the two never-judged presses dangle on the ring"
     );
     assert!(
-        !glow.type_hint.any_fresh(flood, CursorGlow::TYPE_HINT_FRESH),
+        !glow.type_hint.any_fresh(flood, TYPE_HINT_FRESH_DUR),
         "no stamp is fresh at the flood"
     );
     glow.tick(Some((3, 16)), flood, &c, g, &mut out);

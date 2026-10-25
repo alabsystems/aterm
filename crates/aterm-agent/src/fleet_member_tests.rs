@@ -2204,9 +2204,10 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
     );
     let hold = format!(
         "aterm fleet leave:\n  hold       {sid} on 127.0.0.1:{port} stays held by this machine, \
-         which reaches that Mac no more once it has left: that Mac's person lifts it (Take Over, \
-         or `aterm fleet peers rm {}` there), and so does `aterm ctl --host 127.0.0.1:{port} \
-         hold {sid} off` here once this machine joins again\n  removed    ",
+         which reaches that Mac no more once it has left: that Mac lifts the hold when its \
+         person takes the tab (Take Over), runs `aterm fleet peers rm {}` there, or lowers \
+         `aterm fleet allow` there (to content or facts), and so does `aterm ctl --host \
+         127.0.0.1:{port} hold {sid} off` here once this machine joins again\n  removed    ",
         &node[..8]
     );
     assert!(left.starts_with(&hold), "{left}");
@@ -2252,8 +2253,9 @@ fn a_join_of_another_fleet_names_each_tab_this_machine_holds_in_the_old_one() {
     let joined = ok(join(&member.places, &opts, &other_code));
     let hold = format!(
         "  hold       {sid} on 127.0.0.1:{port} stays held by this machine, which reaches that \
-         Mac no more now that it holds another fleet's key: that Mac's person lifts it (Take \
-         Over, or `aterm fleet peers rm {}` there), and so does `aterm ctl --host \
+         Mac no more now that it holds another fleet's key: that Mac lifts the hold when its \
+         person takes the tab (Take Over), runs `aterm fleet peers rm {}` there, or lowers \
+         `aterm fleet allow` there (to content or facts), and so does `aterm ctl --host \
          127.0.0.1:{port} hold {sid} off` here once this machine joins that fleet again\n",
         &node[..8]
     );
@@ -2328,8 +2330,9 @@ fn an_issuers_leave_names_no_join_again_for_a_tab_it_holds() {
     let left = ok(leave(&issuer.places, &[]));
     let hold = format!(
         "aterm fleet leave:\n  hold       {sid} on 127.0.0.1:{port} stays held by this machine, \
-         which reaches that Mac no more once it has left: that Mac's person lifts it (Take Over, \
-         or `aterm fleet peers rm {}` there)\n  removed    ",
+         which reaches that Mac no more once it has left: that Mac lifts the hold when its \
+         person takes the tab (Take Over), runs `aterm fleet peers rm {}` there, or lowers \
+         `aterm fleet allow` there (to content or facts)\n  removed    ",
         &node[..8]
     );
     assert!(left.starts_with(&hold), "{left}");
@@ -2388,6 +2391,48 @@ fn peers_add_rm_and_leave() {
         world.config().trim(),
         "theme = \"Nord\"",
         "nothing to leave changes nothing"
+    );
+}
+
+#[test]
+fn a_leave_says_only_what_its_write_ended() {
+    const UNLISTENS: &str = "stops listening";
+    const UNTOLD: &str = "The issuer is not told";
+    let by_hand = World::new("leave-said-by-hand");
+    ok(peers(&by_hand.places, &args(&["add", "127.0.0.1:7101"])));
+    let left = ok(leave(&by_hand.places, &[]));
+    assert!(
+        left.contains("(the book of peers)") && !left.contains(UNLISTENS) && !left.contains(UNTOLD),
+        "{left}"
+    );
+
+    let (issuer, code, _serving) = issuing("leave-said-issuer");
+    let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    let opts = Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    let member = World::new("leave-said-member");
+    ok(join(&member.places, &opts, &code));
+    std::fs::remove_file(member.places.state.join(KEY_FILE)).unwrap();
+    let left = ok(leave(&member.places, &[]));
+    assert!(
+        !left.contains(UNLISTENS) && left.contains(UNTOLD),
+        "a key gone before the leave: {left}"
+    );
+    ok(join(&member.places, &opts, &code));
+    ok(peers(&member.places, &args(&["rm", &issuer_node])));
+    let left = ok(leave(&member.places, &[]));
+    assert!(
+        left.contains(UNLISTENS) && !left.contains(UNTOLD),
+        "a book that names no issuer: {left}"
+    );
+    ok(join(&member.places, &opts, &code));
+    member.write_config("[fleet]\nlisten = \"\"\n");
+    let left = ok(leave(&member.places, &[]));
+    assert!(
+        left.contains("[fleet] listen") && !left.contains(UNLISTENS),
+        "a blank listen is no listener: {left}"
     );
 }
 
@@ -2980,6 +3025,92 @@ fn a_drive_to_a_copied_node_another_answers_for_names_the_issuers_rm() {
             "{serves:?}: {refused:?}"
         );
     }
+}
+
+#[test]
+fn a_member_reaches_a_member_that_joined_after_its_last_read() {
+    let (_issuer, code, _serving) = issuing("late-member-issuer");
+    let opts = || Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    let early = World::new("late-member-early");
+    ok(join(&early.places, &opts(), &code));
+    let joined_after = |tag: &str| {
+        let late = World::new(tag);
+        ok(join(&late.places, &opts(), &code));
+        let node = member::node_id(&late.places.state).unwrap();
+        assert!(
+            !member::bound_peers(&early.places.state)
+                .iter()
+                .any(|peer| peer.node.as_deref() == Some(node.as_str())),
+            "no read since its join"
+        );
+        node
+    };
+    let late = joined_after("late-member-late");
+    let refused = drive_fleet_in(&early.places, &late, HANG)
+        .err()
+        .expect("nothing listens at its place");
+    assert!(
+        refused.left.is_none() && !refused.why.contains("no Mac this machine's book records"),
+        "{refused:?}"
+    );
+    assert!(
+        member::bound_peers(&early.places.state)
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(late.as_str())),
+        "the drive kept the book it read"
+    );
+    let later = joined_after("late-member-later");
+    let read = survey_fleet_in(
+        &early.places,
+        &aterm_ctl::FleetAsk {
+            host: Some(&later),
+            within: HANG,
+        },
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(
+        read.peers
+            .iter()
+            .map(|row| row.node.as_deref())
+            .collect::<Vec<_>>(),
+        [Some(later.as_str())],
+        "{:?}",
+        read.peers
+    );
+}
+
+#[test]
+fn a_survey_reads_its_issuers_book_again_within_its_own_deadline() {
+    let (_issuer, code, serving) = issuing("survey-within-issuer");
+    let member = World::new("survey-within-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let silent = serving.take();
+    silent.set_nonblocking(true).unwrap();
+    let elsewhere = format!("127.0.0.1:{}", closed_port());
+    let read = survey_fleet_in(
+        &member.places,
+        &aterm_ctl::FleetAsk {
+            host: Some(&elsewhere),
+            within: Duration::ZERO,
+        },
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    assert!(
+        read.peers.iter().all(|row| row.answer.is_err()),
+        "{:?}",
+        read.peers
+    );
+    assert!(
+        matches!(silent.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "a survey whose deadline is spent dialled the issuer"
+    );
 }
 
 #[test]
@@ -3716,6 +3847,24 @@ fn a_join_of_another_fleet_keeps_no_drive_grant() {
         (table.level(), table.drive_from),
         (Some("content"), Vec::new())
     );
+}
+
+#[test]
+fn a_level_that_takes_no_drive_away_says_no_drive_was_cut() {
+    const CUT: &str = "refuses each new drive";
+    let world = World::new("level-uncut");
+    ok(init(&world.places, &racing_init()));
+    for level in ["facts", "content", "content", "facts"] {
+        let said = ok(allow(&world.places, &args(&[level])));
+        assert!(!said.contains(CUT), "{level}: {said}");
+    }
+    let granted = World::new("level-cut");
+    granting_issuer(&granted.places);
+    let said = ok(allow(&granted.places, &args(&["content"])));
+    assert!(said.contains(CUT), "a grant taken out: {said}");
+    granted.write_config(&granted.config().replace("\"content\"", "\"drive\""));
+    let said = ok(allow(&granted.places, &args(&["facts"])));
+    assert!(said.contains(CUT), "drive lowered with no grant: {said}");
 }
 
 #[test]

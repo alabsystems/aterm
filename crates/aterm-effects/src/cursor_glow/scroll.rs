@@ -232,7 +232,7 @@ impl CursorGlow {
     /// Whether a recent key press or erase still awaits its terminal echo.
     #[inline]
     pub(super) fn key_in_flight(&self, now: Instant) -> bool {
-        self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
+        self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR)
             || self.type_press_ring.any_within(now)
             || self.last_erase.is_some_and(|erase| erase.owed_at(now))
     }
@@ -246,11 +246,15 @@ impl CursorGlow {
         if let Some((_, Some((row, _)))) = &mut self.v2_stop {
             *row = map(*row);
         }
-        for probe in self
-            .row_prev_meta
-            .iter_mut()
-            .chain(self.row_shown_meta.iter_mut())
-            .filter(|probe| probe.row == from)
+        if let Some(probe) = self.row_prev_meta.as_mut()
+            && probe.row == from
+        {
+            probe.row = to;
+            probe.above = NbrProbe::Unprobed;
+            probe.below = NbrProbe::Unprobed;
+        }
+        if let Some(probe) = self.row_shown_meta.as_mut()
+            && probe.row == from
         {
             probe.row = to;
             probe.above = NbrProbe::Unprobed;
@@ -314,12 +318,15 @@ impl CursorGlow {
             self.fire_meteors
                 .retain_mut(|meteor| px.span(&mut meteor.y0, &mut meteor.y1));
             self.bolts.retain_mut(|bolt| {
-                let n = bolt.pts.iter().filter(|&&(_, y)| px.inside(y)).count();
-                if n == 0 {
+                let Some(&(_, y0)) = bolt.pts.first() else {
                     return true;
-                }
-                if n != bolt.pts.len() {
+                };
+                let first_in = px.inside(y0);
+                if bolt.pts[1..].iter().any(|&(_, y)| px.inside(y) != first_in) {
                     return false;
+                }
+                if !first_in {
+                    return true;
                 }
                 let mut keep = true;
                 for (_, y) in &mut bolt.pts {

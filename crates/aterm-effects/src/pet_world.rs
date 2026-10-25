@@ -577,6 +577,27 @@ impl PetWorld {
             overlays,
             ink: reserved_ink,
         } = reserve;
+        const fn all_valid(rects: &[PetRect]) -> bool {
+            let mut i = 0;
+            while i < rects.len() {
+                if !rects[i].valid() {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        const fn span_contains(spans: &[(usize, usize)], col: usize) -> bool {
+            let mut i = 0;
+            while i < spans.len() {
+                let (lo, hi) = spans[i];
+                if lo <= col && col < hi {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
         let s = facts.stamp.surface;
         if s.terminal_id == 0
             || input.terminal_id != s.terminal_id
@@ -599,11 +620,11 @@ impl PetWorld {
                 .is_none_or(|n| n > input.cols)
             || input.selections.len() > MAX_REGIONS
             || exclusions.len() > MAX_REGIONS
-            || exclusions.iter().any(|r| !r.valid())
+            || !all_valid(exclusions)
             || overlays.len() > MAX_REGIONS
-            || overlays.iter().any(|r| !r.valid())
+            || !all_valid(overlays)
             || reserved_ink.len() > MAX_REGIONS
-            || reserved_ink.iter().any(|r| !r.valid())
+            || !all_valid(reserved_ink)
         {
             return false;
         }
@@ -821,18 +842,12 @@ impl PetWorld {
                     PetGlyph::Substantive
                 });
                 let lasting = line != LineSize::SingleWidth
-                    || spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi)
+                    || span_contains(spans, local_c)
                     || scan.image(frame_c).is_some();
-                let transient = selected
-                    || overlay_spans
-                        .iter()
-                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
+                let transient = selected || span_contains(overlay_spans, local_c);
                 let others = lasting || transient;
-                let hull_ink = (glyph && !speck)
-                    || bg != default_bg
-                    || typed_spans
-                        .iter()
-                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
+                let hull_ink =
+                    (glyph && !speck) || bg != default_bg || span_contains(typed_spans, local_c);
                 let painted = hull_ink || speck;
                 if hull_ink {
                     hull_lo = hull_lo.min(c as u16);
@@ -941,9 +956,11 @@ impl PetWorld {
                     }
                     let row_base = r * MAX_WORLD_COLS;
                     let row_glyphs = &self.glyphs[row_base..row_base + cols];
-                    for (c, glyph) in row_glyphs.iter().enumerate().rev() {
+                    let mut c = cols;
+                    while c > 0 {
+                        c -= 1;
                         if matches!(
-                            glyph,
+                            row_glyphs[c],
                             Some(PetGlyph::Speck | PetGlyph::Substantive | PetGlyph::Letter)
                         ) {
                             absolute_row = abs;
@@ -2192,6 +2209,267 @@ impl PetWorld {
     }
 }
 
+/// How the host filled the cells it hands a console observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PetFill {
+    /// The host refilled the scratch this frame with a damage-consuming fill
+    /// (`Terminal::cell_frame_damage_scoped_into`) that re-extracted rows, or
+    /// left it as it was (the redraw's snapshot reuse): a scratch with the
+    /// stamps of one already read holds its cells, so that reading is kept
+    /// ([`PetReading`]).
+    Consumed,
+    /// A damage-consuming fill that re-extracted no row
+    /// (`FrameRefill::Scoped { rows_refilled: 0 }`) of a scratch whose
+    /// extraction generation was `prior` before it: its rows are byte for
+    /// byte those of the fill that stamped `prior` (the scoped arm's
+    /// continuity invariant, which refuses a scratch another consumer's
+    /// `take_damage` or a host write left behind), so a reading of that fill
+    /// is kept. Built by [`Self::after_refill`].
+    Retained {
+        /// The scratch's `extract_gen` before this fill.
+        prior: u64,
+    },
+    /// Any other fill. A fill that leaves the damage in place
+    /// (`Terminal::cell_frame_into`) stamps the same epoch across a palette
+    /// change made through the API, so every observation reads.
+    Unconsumed,
+}
+
+impl PetFill {
+    /// What `refill` (a `Terminal::cell_frame_damage_scoped_into` of a scratch
+    /// whose `extract_gen` was `prior` before it) handed the pet:
+    /// [`Self::Retained`] when it re-extracted no row, else
+    /// [`Self::Consumed`].
+    #[inline]
+    #[must_use]
+    pub const fn after_refill(prior: u64, refill: aterm_core::render::FrameRefill) -> Self {
+        match refill {
+            aterm_core::render::FrameRefill::Scoped { rows_refilled: 0 } => {
+                Self::Retained { prior }
+            }
+            aterm_core::render::FrameRefill::Scoped { .. }
+            | aterm_core::render::FrameRefill::Full { .. } => Self::Consumed,
+        }
+    }
+}
+
+/// What a console reading was taken from, so a frame that hands the pet the
+/// same screen reads none of it again
+/// ([`crate::kitty_pet::PetBrain::observe_console_with_reserve`]).
+///
+/// The cells are named by the engine fill they are ([`PetFill::Consumed`]):
+/// each damage-consuming fill stamps a new extraction generation, and every
+/// fill stamps the damage epoch, the content generation and the parser's
+/// batch counters. A fill that re-extracted no row ([`PetFill::Retained`])
+/// names the cells of the fill before it, so a host that refills every frame
+/// (a split's focused pane, a window with chrome rows) keeps its reading too;
+/// a kept reading takes the scratch's new generation, so the next such fill
+/// names it. A host write bumps `snapshot_seq` off `engine_fill_seq`, so a
+/// scratch a host wrote into is never taken as a fill. Beside the fill, the
+/// key holds everything else a reading reads: the caret, the scroll fences,
+/// the size, the theme, the selections, the facts, the pane, the host's
+/// reserve, and the held centre where it can move the coverage window.
+#[derive(Debug)]
+pub(crate) struct PetReading {
+    key: Option<ReadingKey>,
+    selection: TextSelection,
+    selections: Vec<aterm_core::render::PaneSelection>,
+    protected: Vec<PetRect>,
+    overlays: Vec<PetRect>,
+    ink: Vec<PetRect>,
+    /// Whether the last observation kept this reading instead of taking one.
+    kept: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadingKey {
+    terminal_id: u64,
+    extract_gen: u64,
+    snapshot_seq: u64,
+    content_seq: u64,
+    process_sequence: u32,
+    screen_mutations: u64,
+    engine_alt: bool,
+    rows: usize,
+    cols: usize,
+    lines: usize,
+    display_offset: i32,
+    base_y: i64,
+    absolute_row_revision: u64,
+    history_renumber_epoch: u64,
+    cursor: (usize, usize, bool),
+    default_bg: u32,
+    default_fg: u32,
+    implicit_blank: RenderCell,
+    selection_clip: Option<SelectionClip>,
+    facts: PetWorldFacts,
+    pane: PetPane,
+    held_center: Option<(u32, u32)>,
+}
+
+impl ReadingKey {
+    #[inline]
+    const fn of(
+        input: &RenderInput,
+        fill: PetFill,
+        facts: &PetWorldFacts,
+        pane: PetPane,
+        held_center: Option<(f32, f32)>,
+    ) -> Option<Self> {
+        if matches!(fill, PetFill::Unconsumed)
+            || input.terminal_id == 0
+            || input.snapshot_seq != input.engine_fill_seq
+        {
+            return None;
+        }
+        // The coverage window is the whole pane unless the pane is past the
+        // budget, and only then does a centre move it.
+        let centred = pane.rows > MAX_WORLD_ROWS || pane.cols > MAX_WORLD_COLS;
+        let held_center = if centred {
+            match held_center {
+                Some((row, col)) => Some((row.to_bits(), col.to_bits())),
+                None => None,
+            }
+        } else {
+            None
+        };
+        Some(Self {
+            terminal_id: input.terminal_id,
+            extract_gen: input.extract_gen,
+            snapshot_seq: input.snapshot_seq,
+            content_seq: input.content_seq,
+            process_sequence: input.process_sequence,
+            screen_mutations: input.screen_mutations,
+            engine_alt: input.engine_alt,
+            rows: input.rows,
+            cols: input.cols,
+            lines: input.cells.len(),
+            display_offset: input.display_offset,
+            base_y: input.base_y,
+            absolute_row_revision: input.absolute_row_revision,
+            history_renumber_epoch: input.history_renumber_epoch,
+            cursor: (input.cursor_row, input.cursor_col, input.cursor_visible),
+            default_bg: input.default_bg,
+            default_fg: input.default_fg,
+            implicit_blank: input.implicit_blank,
+            selection_clip: input.selection_clip,
+            facts: *facts,
+            pane,
+            held_center,
+        })
+    }
+}
+
+/// Whether two rectangle lists are the same, bit for bit.
+#[inline]
+const fn same_rects(kept: &[PetRect], now: &[PetRect]) -> bool {
+    if kept.len() != now.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < kept.len() {
+        let a = kept[i];
+        let b = now[i];
+        if a.row.to_bits() != b.row.to_bits()
+            || a.col.to_bits() != b.col.to_bits()
+            || a.rows.to_bits() != b.rows.to_bits()
+            || a.cols.to_bits() != b.cols.to_bits()
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl PetReading {
+    /// Hold no reading.
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            key: None,
+            selection: TextSelection::new(),
+            selections: Vec::new(),
+            protected: Vec::new(),
+            overlays: Vec::new(),
+            ink: Vec::new(),
+            kept: false,
+        }
+    }
+
+    /// Whether this reading is the one `input` and the host's arguments would
+    /// give.
+    pub(crate) fn holds(
+        &self,
+        (input, fill): (&RenderInput, PetFill),
+        facts: &PetWorldFacts,
+        pane: PetPane,
+        reserve: PetReserve<'_>,
+        held_center: Option<(f32, f32)>,
+    ) -> bool {
+        let Some(mut now) = ReadingKey::of(input, fill, facts, pane, held_center) else {
+            return false;
+        };
+        if let PetFill::Retained { prior } = fill {
+            // The rows are those of the fill that stamped `prior`.
+            now.extract_gen = prior;
+        }
+        self.key == Some(now)
+            && self.selection == input.selection
+            && self.selections == input.selections
+            && same_rects(&self.protected, reserve.protected)
+            && same_rects(&self.overlays, reserve.overlays)
+            && same_rects(&self.ink, reserve.ink)
+    }
+
+    /// Remember what a reading just taken was taken from (nothing, for an
+    /// unconsumed fill or a scratch a host wrote into).
+    pub(crate) fn note(
+        &mut self,
+        (input, fill): (&RenderInput, PetFill),
+        facts: &PetWorldFacts,
+        pane: PetPane,
+        reserve: PetReserve<'_>,
+        held_center: Option<(f32, f32)>,
+    ) {
+        self.kept = false;
+        self.key = ReadingKey::of(input, fill, facts, pane, held_center);
+        if self.key.is_some() {
+            self.selection.clone_from(&input.selection);
+            self.selections.clone_from(&input.selections);
+            self.protected.clear();
+            self.protected.extend_from_slice(reserve.protected);
+            self.overlays.clear();
+            self.overlays.extend_from_slice(reserve.overlays);
+            self.ink.clear();
+            self.ink.extend_from_slice(reserve.ink);
+        }
+    }
+
+    /// Hold no reading: the next observation takes one.
+    pub(crate) const fn forget(&mut self) {
+        self.key = None;
+        self.kept = false;
+    }
+
+    /// Mark the last observation as one that kept this reading of `input`,
+    /// which now names it: a [`PetFill::Retained`] fill moved the scratch's
+    /// extraction generation and kept its rows, so the next such fill names
+    /// this one as its `prior`.
+    pub(crate) const fn keep(&mut self, input: &RenderInput) {
+        if let Some(key) = &mut self.key {
+            key.extract_gen = input.extract_gen;
+        }
+        self.kept = true;
+    }
+
+    /// Whether the last observation kept this reading.
+    #[must_use]
+    pub(crate) const fn kept(&self) -> bool {
+        self.kept
+    }
+}
+
 /// One row fetch and one cursor per sidecar instead of a search per cell.
 struct RowScan<'a> {
     input: &'a RenderInput,
@@ -2279,12 +2557,13 @@ impl<'a, T> SparseRow<'a, T> {
                 .ok()
                 .map(|i| &items[i].1);
         }
-        while items.get(self.cursor).is_some_and(|(c, _)| *c < col) {
+        while self.cursor < items.len() && items[self.cursor].0 < col {
             self.cursor += 1;
         }
-        match items.get(self.cursor) {
-            Some((c, v)) if *c == col => Some(v),
-            _ => None,
+        if self.cursor < items.len() && items[self.cursor].0 == col {
+            Some(&items[self.cursor].1)
+        } else {
+            None
         }
     }
 }
@@ -2394,18 +2673,20 @@ impl<'a> RowScan<'a> {
         match &mut self.bg {
             BgRow::Uniform(bg) => *bg,
             BgRow::Spans { spans, cursor } => {
-                while spans.get(*cursor).is_some_and(|s| s.end_col <= col) {
+                while *cursor < spans.len() && spans[*cursor].end_col <= col {
                     *cursor += 1;
                 }
-                spans
-                    .get(*cursor)
-                    .filter(|s| {
-                        s.start_col < s.end_col
-                            && s.end_col <= input.cols
-                            && s.start_col <= col
-                            && col < s.end_col
-                    })
-                    .map_or(input.default_bg, |s| s.default_bg)
+                if *cursor < spans.len() {
+                    let s = &spans[*cursor];
+                    if s.start_col < s.end_col
+                        && s.end_col <= input.cols
+                        && s.start_col <= col
+                        && col < s.end_col
+                    {
+                        return s.default_bg;
+                    }
+                }
+                input.default_bg
             }
             BgRow::Unordered => input.default_bg_at(self.row, col),
         }
@@ -2417,13 +2698,16 @@ impl<'a> RowScan<'a> {
         match &mut self.line {
             LineRow::Uniform(size) => *size,
             LineRow::Runs { spans, cursor } => {
-                while spans.get(*cursor).is_some_and(|s| s.start_col <= col) {
+                while *cursor < spans.len() && spans[*cursor].start_col <= col {
                     *cursor += 1;
                 }
-                match cursor.checked_sub(1).map(|i| &spans[i]) {
-                    Some(s) if s.start_col == col || col < s.end_col => s.line_size,
-                    _ => LineSize::SingleWidth,
+                if *cursor > 0 {
+                    let s = &spans[*cursor - 1];
+                    if s.start_col == col || col < s.end_col {
+                        return s.line_size;
+                    }
                 }
+                LineSize::SingleWidth
             }
             LineRow::Unordered => input.line_size_run_at(self.row, col).0,
         }
@@ -2563,12 +2847,15 @@ fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
     if input.selections.is_empty() {
         project(&input.selection, input.display_offset, input.selection_clip)
     } else {
-        input
-            .selections
-            .iter()
-            .take(MAX_REGIONS)
-            .filter(|s| !s.inactive)
-            .find_map(|s| project(&s.selection, 0, Some(s.clip)))
+        let limit = input.selections.len().min(MAX_REGIONS);
+        for s in &input.selections[..limit] {
+            if !s.inactive
+                && let Some(pos) = project(&s.selection, 0, Some(s.clip))
+            {
+                return Some(pos);
+            }
+        }
+        None
     }
 }
 
@@ -4018,5 +4305,225 @@ mod tests {
         world.retire();
         assert_eq!(world.cells.as_ptr(), cells_ptr);
         assert_eq!(world.ground_blocked_prefix.as_ptr(), ground_ptr);
+    }
+
+    #[test]
+    fn every_source_a_reading_reads_moves_its_key() {
+        let mut term = Terminal::new(20, 80);
+        term.process(b"\x1b[3;1Hhello\x1b[5;3H");
+        let (input, facts) = snapshot(&mut term);
+        let pane = PetPane::full(&input);
+        let rect = [PetRect::new(1.0, 2.0, 1.0, 3.0)];
+        let reserve = PetReserve {
+            protected: &rect,
+            overlays: &rect,
+            ink: &rect,
+        };
+        const fn consumed(i: &RenderInput) -> (&RenderInput, PetFill) {
+            (i, PetFill::Consumed)
+        }
+        let mut reading = PetReading::new();
+        reading.note(consumed(&input), &facts, pane, reserve, None);
+        assert!(
+            reading.holds(consumed(&input), &facts, pane, reserve, Some((3.0, 4.0))),
+            "the same screen is the same reading (a centre moves no window of a pane in budget)"
+        );
+        type Edit = fn(&mut RenderInput, &mut PetWorldFacts);
+        let edits: [(&str, Edit); 25] = [
+            ("a consuming fill", |i, _| i.extract_gen += 1),
+            ("new damage", |i, _| {
+                i.snapshot_seq += 1;
+                i.engine_fill_seq += 1;
+            }),
+            ("a host write", |i, _| i.snapshot_seq += 1),
+            ("new content", |i, _| i.content_seq += 1),
+            ("a parser batch", |i, _| i.process_sequence += 1),
+            ("a screen mutation", |i, _| i.screen_mutations += 1),
+            ("another terminal", |i, _| i.terminal_id += 1),
+            ("the other screen", |i, _| i.engine_alt = !i.engine_alt),
+            ("the rows", |i, _| i.rows += 1),
+            ("the columns", |i, _| i.cols += 1),
+            ("the row count", |i, _| {
+                i.cells.pop();
+            }),
+            ("a scroll", |i, _| i.display_offset += 1),
+            ("the base", |i, _| i.base_y += 1),
+            ("the row revision", |i, _| i.absolute_row_revision += 1),
+            ("a renumbering", |i, _| i.history_renumber_epoch += 1),
+            ("the caret's row", |i, _| i.cursor_row += 1),
+            ("the caret's column", |i, _| i.cursor_col += 1),
+            ("the caret's visibility", |i, _| {
+                i.cursor_visible = !i.cursor_visible
+            }),
+            ("the theme's background", |i, _| i.default_bg ^= 1),
+            ("the theme's foreground", |i, _| i.default_fg ^= 1),
+            ("the blank cell", |i, _| i.implicit_blank.bg[0] ^= 1),
+            ("a selection", |i, _| {
+                i.selection
+                    .start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
+            }),
+            ("a selection clip", |i, _| {
+                i.selection_clip = Some(SelectionClip::new(0, 1, 0, 1));
+            }),
+            ("a pane's selection", |i, _| {
+                i.selections.push(aterm_core::render::PaneSelection {
+                    selection: TextSelection::new(),
+                    clip: SelectionClip::new(0, 1, 0, 1),
+                    bg: 0,
+                    fg: 0,
+                    inactive: false,
+                });
+            }),
+            ("the facts", |_, f| f.completed_seq += 1),
+        ];
+        for (what, edit) in edits {
+            let (mut changed, mut changed_facts) = (input.clone(), facts);
+            edit(&mut changed, &mut changed_facts);
+            assert!(
+                !reading.holds(consumed(&changed), &changed_facts, pane, reserve, None),
+                "{what} moves the reading"
+            );
+        }
+        let narrower = PetPane {
+            cols: pane.cols - 1,
+            ..pane
+        };
+        assert!(
+            !reading.holds(consumed(&input), &facts, narrower, reserve, None),
+            "the pane moves the reading"
+        );
+        let other = [PetRect::new(1.0, 2.0, 1.0, 4.0)];
+        for (what, moved) in [
+            (
+                "protected",
+                PetReserve {
+                    protected: &other,
+                    ..reserve
+                },
+            ),
+            (
+                "overlays",
+                PetReserve {
+                    overlays: &other,
+                    ..reserve
+                },
+            ),
+            (
+                "typed ink",
+                PetReserve {
+                    ink: &other,
+                    ..reserve
+                },
+            ),
+        ] {
+            assert!(
+                !reading.holds(consumed(&input), &facts, pane, moved, None),
+                "the host's {what} move the reading"
+            );
+        }
+        assert!(
+            !reading.holds((&input, PetFill::Unconsumed), &facts, pane, reserve, None),
+            "an unconsumed fill is always read"
+        );
+        let retained = |prior| PetFill::Retained { prior };
+        let mut refilled = input.clone();
+        refilled.extract_gen += 1;
+        assert!(
+            reading.holds(
+                (&refilled, retained(input.extract_gen)),
+                &facts,
+                pane,
+                reserve,
+                None
+            ),
+            "a fill that re-extracted no row of the cells read keeps the reading"
+        );
+        assert!(
+            !reading.holds(
+                (&refilled, retained(input.extract_gen + 1)),
+                &facts,
+                pane,
+                reserve,
+                None
+            ),
+            "a fill that re-extracted no row of other cells moves the reading"
+        );
+        let mut kept = PetReading::new();
+        kept.note(consumed(&input), &facts, pane, reserve, None);
+        kept.keep(&refilled);
+        let mut next = refilled.clone();
+        next.extract_gen += 1;
+        assert!(
+            kept.holds(
+                (&next, retained(refilled.extract_gen)),
+                &facts,
+                pane,
+                reserve,
+                None
+            ),
+            "a kept reading is named by the fill that kept it"
+        );
+        assert!(
+            !kept.holds(
+                (&next, retained(input.extract_gen)),
+                &facts,
+                pane,
+                reserve,
+                None
+            ),
+            "a kept reading is no longer named by the fill it was taken from"
+        );
+        let mut host_wrote_after = refilled.clone();
+        host_wrote_after.snapshot_seq += 1;
+        assert!(
+            !reading.holds(
+                (&host_wrote_after, retained(input.extract_gen)),
+                &facts,
+                pane,
+                reserve,
+                None
+            ),
+            "a retained scratch a host wrote into is read"
+        );
+        {
+            use aterm_core::render::{FrameRefill, FullRefillCause};
+            assert_eq!(
+                PetFill::after_refill(7, FrameRefill::Scoped { rows_refilled: 0 }),
+                retained(7),
+                "a fill that re-extracted no row names the fill before it"
+            );
+            assert_eq!(
+                PetFill::after_refill(7, FrameRefill::Scoped { rows_refilled: 1 }),
+                PetFill::Consumed,
+                "a fill that re-extracted a row names only itself"
+            );
+            assert_eq!(
+                PetFill::after_refill(
+                    7,
+                    FrameRefill::Full {
+                        cause: FullRefillCause::DamageTaken
+                    }
+                ),
+                PetFill::Consumed,
+                "a full refill names only itself"
+            );
+        }
+        let mut host_wrote = input.clone();
+        host_wrote.snapshot_seq += 1;
+        reading.note(consumed(&host_wrote), &facts, pane, reserve, None);
+        assert!(
+            !reading.holds(consumed(&host_wrote), &facts, pane, reserve, None),
+            "a scratch a host wrote into is never kept"
+        );
+
+        let mut tall = Terminal::new(70, 80);
+        let (input, facts) = snapshot(&mut tall);
+        let pane = PetPane::full(&input);
+        reading.note(consumed(&input), &facts, pane, reserve, Some((30.0, 4.0)));
+        assert!(reading.holds(consumed(&input), &facts, pane, reserve, Some((30.0, 4.0))));
+        assert!(
+            !reading.holds(consumed(&input), &facts, pane, reserve, Some((31.0, 4.0))),
+            "past the budget, the held centre moves the window"
+        );
     }
 }

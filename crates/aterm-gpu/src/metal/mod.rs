@@ -2106,11 +2106,7 @@ mod tests {
                     false,
                 ),
             ];
-            fixtures.push((
-                "sprites",
-                input,
-                &[S::FxLinearUnder, S::GlyphKnock, S::FxLinearOver],
-            ));
+            fixtures.push(("sprites", input, &[S::FxKnockUnder, S::FxLinearOver]));
         }
 
         {
@@ -2192,7 +2188,7 @@ mod tests {
             S::Glyph,
             S::RainAdd,
             S::RainAddOver,
-            S::FxLinearUnder,
+            S::FxKnockUnder,
             S::FxLinearOver,
             S::CursorBlock,
         ];

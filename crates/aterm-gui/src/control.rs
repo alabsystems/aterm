@@ -9239,7 +9239,7 @@ fn serve_session_verb(
         }
         "cast" => control_session::cmd_cast(&ctx.cast),
         "temporal" => control_session::cmd_temporal(ctx, term, rest),
-        "rewind" => crate::rewind_verb::cmd(proxy, session, rest),
+        "rewind" => crate::rewind_verb::cmd(proxy, ctx, session, rest),
         "history" => control_session::cmd_history(ctx, rest),
         "meta" => serve_meta_wired(
             rest,

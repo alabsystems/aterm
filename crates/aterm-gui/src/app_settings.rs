@@ -1294,6 +1294,7 @@ impl App {
         let chips = self.claude_chips_a11y(wid);
         let menu = self.autopilot_grid_menu(wid);
         let stats = self.stats_a11y(wid);
+        let rewind = self.rewind_a11y(wid);
         let window_title = self
             .windows
             .get(&wid)
@@ -1311,6 +1312,7 @@ impl App {
                 chips: &chips,
                 menu: menu.as_ref(),
                 stats: stats.as_ref(),
+                rewind: rewind.as_ref(),
                 window_title,
             },
         ))
@@ -1320,7 +1322,10 @@ impl App {
     /// area, in physical pixels (the space the AT-SPI adapter reports root bounds in),
     /// from the window's own metrics.
     #[cfg(a11y_tree)]
-    fn grid_a11y_geometry(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridGeometry> {
+    pub(crate) fn grid_a11y_geometry(
+        &self,
+        wid: crate::WindowId,
+    ) -> Option<crate::a11y_tree::GridGeometry> {
         // An unknown window would fall back to the shared backend metrics, another
         // window's geometry; fail closed instead.
         if !self.windows.contains_key(&wid) {
@@ -1861,6 +1866,17 @@ impl App {
                 && let Some((session, chip)) = crate::a11y_tree::chip_for(req.target_node)
             {
                 self.press_claude_chip_for_reader(wid, session, chip);
+                return;
+            }
+            if req.target_node == crate::a11y_tree::REWIND
+                && let Some(session) = self.rewound_front(wid)
+            {
+                let delta = match req.action {
+                    aterm_a11y::model::Action::Increment => 1,
+                    aterm_a11y::model::Action::Decrement => -1,
+                    _ => return,
+                };
+                let _ = self.rewind_step(session, crate::rewind::StepBy::Slice(delta), None);
                 return;
             }
             if req.action == aterm_a11y::model::Action::Click

@@ -92,19 +92,29 @@ pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
         return 0;
     }
     let span = hi - lo;
-    const fn pure(c: f32, lo: f32, span: f32) -> f32 {
-        if span <= 1e-3 { 1.0 } else { (c - lo) / span }
+    let inv_span = if span <= 1e-3 { 0.0 } else { 1.0 / span };
+    const fn pure(c: f32, lo: f32, inv_span: f32) -> f32 {
+        if inv_span == 0.0 {
+            1.0
+        } else {
+            (c - lo) * inv_span
+        }
     }
-    let (pr, pg, pb) = (pure(r, lo, span), pure(g, lo, span), pure(b, lo, span));
+    let (pr, pg, pb) = (
+        pure(r, lo, inv_span),
+        pure(g, lo, inv_span),
+        pure(b, lo, inv_span),
+    );
     let y0 = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
-    let yt = LIGHT_INK_BOLD_MAX_LUMA / 255.0;
-    let vmax = LIGHT_INK_BOLD_MAX_CHANNEL / 255.0;
+    const YT: f32 = LIGHT_INK_BOLD_MAX_LUMA / 255.0;
+    const VMAX: f32 = LIGHT_INK_BOLD_MAX_CHANNEL / 255.0;
+    const ONE_MINUS_YT_OVER_VMAX: f32 = 1.0 - YT / VMAX;
     let s = if y0 >= 1.0 - 1e-4 {
         0.0
     } else {
-        ((1.0 - yt / vmax) / (1.0 - y0)).clamp(0.0, 1.0)
+        (ONE_MINUS_YT_OVER_VMAX / (1.0 - y0)).clamp(0.0, 1.0)
     };
-    let v = (yt / (1.0 - s + s * y0)).min(vmax);
+    let v = (YT / (1.0 - s + s * y0)).min(VMAX);
     const fn ch(v: f32, s: f32, c: f32) -> u32 {
         ((255.0 * v * (1.0 - s + s * c)) + 0.5).clamp(0.0, 255.0) as u32
     }
@@ -1076,31 +1086,45 @@ pub(crate) const fn tinted_dark_page(page: u32) -> Option<u32> {
 /// a few degrees of its reference gold at every coverage from a quarter up,
 /// and a full one reads as on the reference.
 #[must_use]
-pub(crate) fn page_matched(rgb: u32, a: u8, page: u32) -> (u32, u8) {
+pub(crate) const fn page_matched(rgb: u32, a: u8, page: u32) -> (u32, u8) {
     if a == 0 {
         return (0, 0);
     }
-    let af = f32::from(a) * (1.0 / 255.0);
-    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+    let af = a as f32 * (1.0 / 255.0);
+    #[inline]
+    const fn ch(c: u32, sh: u32) -> f32 {
+        ((c >> sh) & 0xff) as f32
+    }
+    #[inline]
+    const fn pack(c: [f32; 3]) -> u32 {
+        #[inline]
+        const fn q(v: f32) -> u32 {
+            v.round().clamp(0.0, 255.0) as u32
+        }
+        (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
+    }
     let light = [ch(rgb, 16), ch(rgb, 8), ch(rgb, 0)];
     let pg = [ch(page, 16), ch(page, 8), ch(page, 0)];
-    let rf = [
+    const RF: [f32; 3] = [
         ch(REF_DARK_PAGE, 16),
         ch(REF_DARK_PAGE, 8),
         ch(REF_DARK_PAGE, 0),
     ];
-    let pack = |c: [f32; 3]| {
-        let q = |v: f32| v.round().clamp(0.0, 255.0) as u32;
-        (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
-    };
-    let on_ref: [f32; 3] = std::array::from_fn(|i| (rf[i] + light[i] * af).min(255.0));
-    let on_page_v = (0..3)
-        .map(|i| (pg[i] + light[i] * af).min(255.0))
-        .fold(0.0f32, f32::max);
+    let on_ref = [
+        (RF[0] + light[0] * af).min(255.0),
+        (RF[1] + light[1] * af).min(255.0),
+        (RF[2] + light[2] * af).min(255.0),
+    ];
+    let on_page_v = (pg[0] + light[0] * af)
+        .min(255.0)
+        .max((pg[1] + light[1] * af).min(255.0))
+        .max((pg[2] + light[2] * af).min(255.0));
     let (h, s, _) = crate::color_math::rgb2hsv(pack(on_ref));
     let want = crate::color_math::hsv2rgb(h, s, on_page_v * (1.0 / 255.0));
     let d = [ch(want, 16), ch(want, 8), ch(want, 0)];
-    let need = (0..3).fold(0.0f32, |m, i| {
+    let mut need = 0.0f32;
+    let mut i = 0;
+    while i < 3 {
         let k = if d[i] > pg[i] {
             (d[i] - pg[i]) / (255.0 - pg[i]).max(1.0)
         } else if d[i] < pg[i] {
@@ -1108,14 +1132,20 @@ pub(crate) fn page_matched(rgb: u32, a: u8, page: u32) -> (u32, u8) {
         } else {
             0.0
         };
-        m.max(k)
-    });
+        need = need.max(k);
+        i += 1;
+    }
     let alpha = (need.clamp(0.0, 1.0) * 255.0).ceil();
     if alpha <= 0.0 {
         return (0, 0);
     }
-    let k = alpha / 255.0;
-    let c: [f32; 3] = std::array::from_fn(|i| (pg[i] + (d[i] - pg[i]) / k).clamp(0.0, 255.0) * k);
+    let k = alpha * (1.0 / 255.0);
+    let inv_k = 1.0 / k;
+    let c = [
+        (pg[0] + (d[0] - pg[0]) * inv_k).clamp(0.0, 255.0) * k,
+        (pg[1] + (d[1] - pg[1]) * inv_k).clamp(0.0, 255.0) * k,
+        (pg[2] + (d[2] - pg[2]) * inv_k).clamp(0.0, 255.0) * k,
+    ];
     (pack(c), alpha as u8)
 }
 
@@ -1357,7 +1387,8 @@ pub(super) const fn bolt_flash(u: f32) -> f32 {
     if u < BOLT_HOLD {
         1.0
     } else {
-        1.0 - BOLT_FADE * smoothstep01((u - BOLT_HOLD) / (1.0 - BOLT_HOLD))
+        const INV_SPAN: f32 = 1.0 / (1.0 - BOLT_HOLD);
+        1.0 - BOLT_FADE * smoothstep01((u - BOLT_HOLD) * INV_SPAN)
     }
 }
 
@@ -1374,7 +1405,8 @@ pub(super) const fn beam_power(frac: f32) -> f32 {
     if frac < 0.40 {
         1.0
     } else {
-        let (_, c) = crate::supernova::sin_cos_f32(std::f32::consts::PI * (frac - 0.40) / 0.60);
+        const PI_OVER_SPAN: f32 = std::f32::consts::PI / 0.60;
+        let (_, c) = crate::supernova::sin_cos_f32((frac - 0.40) * PI_OVER_SPAN);
         0.5 * (1.0 + c)
     }
 }

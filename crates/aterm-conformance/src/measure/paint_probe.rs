@@ -41,6 +41,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     row.validate()?;
+    let bench_band = super::instance::Band::take_own();
     super::instance::first_exec(&rig.fake_tui);
     let started = Instant::now();
     let budget = Budget::from_now(BUDGET_SECS);
@@ -88,6 +89,7 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         typed_gap_ms: take.typed_gap_ms,
         driven_ms: take.driven_ms,
         band: take.band,
+        bench_band,
     })
 }
 

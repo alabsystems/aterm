@@ -1029,15 +1029,29 @@ fn run_startup_setup(mut widened: Option<Widened>) {
             sent.inherit_widened(&prepared, widened);
         }
         let recovery = recovered.then(|| sent.take_recovery());
-        with_setup_watch(
-            false,
-            || run_prepared_setup(prepared, password, sent),
-            maintain_setup_watch,
-        );
+        run_prepared_startup_with(prepared, password, sent, maintain_setup_watch);
         recovery
     });
     drop(running);
     read_again_if_unread();
+}
+
+/// A cancelled review ends its attempt; other outcomes retain their watch maintenance.
+#[cfg(target_os = "macos")]
+fn run_prepared_startup_with(
+    prepared: PreparedSetup<StartupClaim>,
+    password: Option<aterm_secrets::SecretBytes>,
+    sent: StartupSent,
+    maintain: impl FnMut(WatchMaintenance),
+) {
+    if matches!(prepared, PreparedSetup::Cancelled) {
+        return;
+    }
+    with_setup_watch(
+        false,
+        || run_prepared_setup(prepared, password, sent),
+        maintain,
+    );
 }
 
 /// A repair ends its bound review, releasing all its leases before another
@@ -1559,9 +1573,6 @@ impl StartupSent {
     /// Own any publication before a repair can write. Even without a Begin, a
     /// Stop must wait for that attempt to identify or abandon its checkpoint.
     fn begin_repair(&mut self) {
-        if self.preparing.is_some() {
-            return;
-        }
         let mut guard = self
             .under_way
             .lock()
@@ -1572,21 +1583,28 @@ impl StartupSent {
             *guard = Some(UnderWay::new(self.sent));
         }
         let uncertain = guard.as_ref().or(repair).unwrap().begin_publication();
-        self.preparing = Some(RepairPublication {
-            temporary,
-            uncertain,
-        });
+        if let Some(publication) = &mut self.preparing {
+            // A newer admission may have retired the previous error. Every
+            // actual attempt rearms debt using the live ledger as its fallback.
+            publication.uncertain = uncertain;
+        } else {
+            self.preparing = Some(RepairPublication {
+                temporary,
+                uncertain,
+            });
+        }
     }
 
     fn no_repair(&mut self) {
-        if let Some(publication) = self.preparing.take() {
+        if let Some(mut publication) = self.preparing.take() {
             let mut guard = self
                 .under_way
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(guard) = guard.as_ref().or(self.repair.as_ref()) {
-                guard.restore_publication(publication.uncertain);
-            }
+            publication.uncertain = guard
+                .as_ref()
+                .or(self.repair.as_ref())
+                .is_some_and(|guard| guard.restore_publication(publication.uncertain));
             if publication.temporary && !publication.uncertain {
                 guard.take();
             }
@@ -1746,18 +1764,17 @@ trait SetupStartup {
     /// Bring forward a setup a Restore ended before any run was admitted here (an older
     /// aterm's), so this launch's offer gives it aterm's own permissions with its Mac preference
     /// groups left as is (System State design §3.4). It runs once the person is resolved and
-    /// before the records are bound. `false` while another pass holds the profile lock past
-    /// the bring-forward's own wait, or a write fails: the startup waits and asks again, so the
-    /// permissions get their run in this launch. A busy lock is quiet; a failure uses the
-    /// ordinary startup retry note.
-    fn bring_forward(&mut self) -> bool {
-        true
+    /// before the records are bound. `Ok(false)` while another pass holds the profile lock past
+    /// the bring-forward's own wait: the startup waits quietly and asks again. Temporary
+    /// errors use the ordinary startup retry note; a newer aterm's records end this attempt.
+    fn bring_forward(&mut self) -> Result<bool, String> {
+        Ok(true)
     }
 
     /// Set aside the saved setup records that are corrupt for good, so the restored setup
-    /// brought forward and the records bound are fresh ones (System State design §3.5). An
-    /// error (a read that failed for another reason, the records another setup holds) is tried
-    /// again.
+    /// brought forward and the records bound are fresh ones (System State design §3.5). A
+    /// temporary error (a read that failed for another reason, the records another setup holds)
+    /// is tried again. A newer aterm's records are left as they are.
     fn set_aside(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -1843,6 +1860,8 @@ struct LiveSetupStartup<F> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupAnswerKind {
     Automatic,
+    /// The page's answer with no press, of a plan that is not aterm's provisional one.
+    Offered,
     Person,
     Join,
 }
@@ -1870,15 +1889,16 @@ impl<F> LiveSetupStartup<F> {
     fn answer_kind(&self, plan: &aterm_types::macos_setup::Plan) -> StartupAnswerKind {
         if self.vault_typed {
             StartupAnswerKind::Join
-        } else if !self.chosen
-            && self
-                .offered
-                .as_ref()
-                .is_some_and(|(offered, provisional)| *provisional && offered == plan)
+        } else if self.chosen {
+            StartupAnswerKind::Person
+        } else if self
+            .offered
+            .as_ref()
+            .is_some_and(|(offered, provisional)| *provisional && offered == plan)
         {
             StartupAnswerKind::Automatic
         } else {
-            StartupAnswerKind::Person
+            StartupAnswerKind::Offered
         }
     }
 }
@@ -1924,11 +1944,12 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
         }
     }
 
-    fn bring_forward(&mut self) -> bool {
-        let result = self.sent.observe_repair_with(|published| {
-            aterm_cli::macos_doctor::bring_forward_restored_setup_observing(published)
-        });
-        bring_forward_ready(result, |why| self.report_failure(why))
+    fn bring_forward(&mut self) -> Result<bool, String> {
+        self.sent
+            .observe_repair_with(|published| {
+                aterm_cli::macos_doctor::bring_forward_restored_setup_observing(published)
+            })
+            .map(|outcome| !matches!(outcome, aterm_cli::macos_doctor::BroughtForward::Busy))
     }
 
     fn send(&mut self) {
@@ -2016,14 +2037,17 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
             .ok_or("the startup review has no bound authorization")?;
         let observed = match kind {
             StartupAnswerKind::Automatic => authorization.persist_automatic_observed(plan),
+            StartupAnswerKind::Offered => authorization.persist_offered_observed(plan),
             StartupAnswerKind::Person => authorization.persist_observed(plan),
             StartupAnswerKind::Join => authorization.persist_join_observed(plan),
         };
         self.observation = observed.observation;
         self.sent.record_publication(authorization.stop_target());
+        let not_joined = authorization.join_unread();
         let revision = observed.result?;
         if revision.is_some() {
             self.sent.admitted();
+            note_vault_not_joined(not_joined);
             clear_initial_setup_rows();
             if let Some(receipt) = self.receipt.take() {
                 receipt.accept();
@@ -2116,6 +2140,19 @@ mod startup_answer_tests {
         );
     }
 
+    /// The page's answer with no press, of a plan aterm did not choose by itself (the plan a
+    /// set-aside or a Restore's bring-forward left for the offer), chooses nothing: it is the
+    /// offered admission, never a person's, so a set-aside's note stays.
+    #[test]
+    fn an_unpressed_answer_of_a_persons_plan_is_the_offered_admission() {
+        let mut host = answered(false, false);
+        host.offered = Some((Plan::default(), false));
+        assert_eq!(
+            host.answer_kind(&Plan::default()),
+            StartupAnswerKind::Offered
+        );
+    }
+
     #[test]
     fn a_startup_join_uses_the_explicit_admission_path() {
         assert_eq!(
@@ -2125,41 +2162,62 @@ mod startup_answer_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
+use aterm_cli::macos_doctor::setup_is_newer;
+
+/// Off macOS no setup is saved, so none is a newer aterm's (the retry tests run everywhere).
+#[cfg(all(test, not(target_os = "macos")))]
+fn setup_is_newer(_why: &str) -> bool {
+    false
+}
+
 #[cfg(any(target_os = "macos", test))]
 enum PreparedSetup<C> {
     Authorized { claim: C, revision: u64 },
     Finished,
+    Cancelled,
     Unavailable,
 }
 
-/// Whether the bring-forward has finished its pre-bind work. A busy profile
-/// waits quietly; a write failure reports the ordinary retry note and waits.
-#[cfg(target_os = "macos")]
-fn bring_forward_ready(
-    result: Result<aterm_cli::macos_doctor::BroughtForward, String>,
-    failed: impl FnOnce(&str),
-) -> bool {
-    match result {
-        Ok(outcome) => !matches!(outcome, aterm_cli::macos_doctor::BroughtForward::Busy),
-        Err(why) => {
-            failed(&why);
-            false
-        }
-    }
+/// A startup step finished, or Stop retired its review without another attempt.
+#[cfg(any(target_os = "macos", test))]
+enum SetupStep<T> {
+    Ready(T),
+    Stopped,
 }
 
-/// Retry a step of state I/O on the window's background worker, reporting each failure and
-/// backing off, until it succeeds.
+/// Retry state I/O on the window's background worker until it succeeds or Stop
+/// retires the review. A newer aterm's records end the attempt without another read.
+/// A mutator records its publication evidence before returning.
 #[cfg(any(target_os = "macos", test))]
 fn retry_setup_step<H: SetupStartup, T>(
     host: &mut H,
     mut step: impl FnMut(&mut H) -> Result<T, String>,
-) -> T {
+) -> Result<SetupStep<T>, String> {
     loop {
+        if host.stopped() {
+            return Ok(SetupStep::Stopped);
+        }
         match step(host) {
-            Ok(value) => return value,
+            Ok(value) => {
+                return Ok(if host.stopped() {
+                    SetupStep::Stopped
+                } else {
+                    SetupStep::Ready(value)
+                });
+            }
             Err(why) => {
+                if host.stopped() {
+                    return Ok(SetupStep::Stopped);
+                }
+                if setup_is_newer(&why) {
+                    host.report_rejection(&why);
+                    return Err(why);
+                }
                 host.report_failure(&why);
+                if host.stopped() {
+                    return Ok(SetupStep::Stopped);
+                }
                 host.backoff();
             }
         }
@@ -2167,14 +2225,31 @@ fn retry_setup_step<H: SetupStartup, T>(
 }
 
 /// A bound review retries local read errors, but never adopts records repaired
-/// since it bound. The caller releases its claim before asking for recovery.
+/// since it bound. The caller releases its claim before asking for recovery. A newer aterm's
+/// records end it: reading them again changes nothing, so nothing is tried again.
 #[cfg(any(target_os = "macos", test))]
-fn report_bound_setup_read_error<H: SetupStartup>(host: &mut H, why: &str) -> Result<(), String> {
+fn report_bound_setup_read_error<H: SetupStartup>(
+    host: &mut H,
+    why: &str,
+) -> Result<SetupStep<()>, String> {
+    if host.stopped() {
+        return Ok(SetupStep::Stopped);
+    }
+    if setup_is_newer(why) {
+        host.report_rejection(why);
+        return Err(why.to_owned());
+    }
     host.report_failure(why);
-    if host.recover_after_read_error().unwrap_or(false) {
+    if host.stopped() {
+        return Ok(SetupStep::Stopped);
+    }
+    let repaired = host.recover_after_read_error().unwrap_or(false);
+    if host.stopped() {
+        Ok(SetupStep::Stopped)
+    } else if repaired {
         Err(why.to_owned())
     } else {
-        Ok(())
+        Ok(SetupStep::Ready(()))
     }
 }
 
@@ -2182,12 +2257,26 @@ fn report_bound_setup_read_error<H: SetupStartup>(host: &mut H, why: &str) -> Re
 fn retry_bound_setup_read<H: SetupStartup, T>(
     host: &mut H,
     mut read: impl FnMut(&mut H) -> Result<T, String>,
-) -> Result<T, String> {
+) -> Result<SetupStep<T>, String> {
     loop {
+        if host.stopped() {
+            return Ok(SetupStep::Stopped);
+        }
         match read(host) {
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                return Ok(if host.stopped() {
+                    SetupStep::Stopped
+                } else {
+                    SetupStep::Ready(value)
+                });
+            }
             Err(why) => {
-                report_bound_setup_read_error(host, &why)?;
+                if matches!(
+                    report_bound_setup_read_error(host, &why)?,
+                    SetupStep::Stopped
+                ) {
+                    return Ok(SetupStep::Stopped);
+                }
                 host.backoff();
             }
         }
@@ -2206,26 +2295,26 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
     }
     // An unavailable home can look like empty setup records. Wait for the account to resolve
     // before binding its one review.
-    if !retry_setup_step(host, H::scope_ready) {
+    if !matches!(
+        retry_setup_step(host, H::scope_ready)?,
+        SetupStep::Ready(true)
+    ) {
         return Ok(PreparedSetup::Unavailable);
     }
     // A record corrupt for good is set aside first, so what is brought forward and bound is a
     // fresh record (§3.5); a set-aside that fails is tried again by itself.
-    retry_setup_step(host, H::set_aside);
+    if matches!(retry_setup_step(host, H::set_aside)?, SetupStep::Stopped) {
+        return Ok(PreparedSetup::Unavailable);
+    }
     // Finish a bring-forward before binding: another pass's lock and transient
     // writes both wait here. Stop retires this review before another attempt or
     // before it can adopt records a later manual choice published.
     loop {
-        if host.stopped() {
-            return Ok(PreparedSetup::Unavailable);
+        match retry_setup_step(host, H::bring_forward)? {
+            SetupStep::Ready(true) => break,
+            SetupStep::Ready(false) => host.backoff(),
+            SetupStep::Stopped => return Ok(PreparedSetup::Unavailable),
         }
-        if host.bring_forward() {
-            break;
-        }
-        if host.stopped() {
-            return Ok(PreparedSetup::Unavailable);
-        }
-        host.backoff();
     }
     if host.stopped() {
         return Ok(PreparedSetup::Unavailable);
@@ -2249,12 +2338,17 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
         Superseded,
     }
     loop {
-        let Some(claim) = retry_bound_setup_read(host, H::claim)? else {
-            if retry_bound_setup_read(host, H::finished)? {
-                return Ok(PreparedSetup::Finished);
+        let claim = match retry_bound_setup_read(host, H::claim)? {
+            SetupStep::Ready(Some(claim)) => claim,
+            SetupStep::Ready(None) => {
+                match retry_bound_setup_read(host, H::finished)? {
+                    SetupStep::Ready(true) => return Ok(PreparedSetup::Finished),
+                    SetupStep::Ready(false) => host.backoff(),
+                    SetupStep::Stopped => return Ok(PreparedSetup::Unavailable),
+                }
+                continue;
             }
-            host.backoff();
-            continue;
+            SetupStep::Stopped => return Ok(PreparedSetup::Unavailable),
         };
         let ready = (|| {
             if host.revision()? != revision {
@@ -2275,6 +2369,9 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             }
             host.initial().map(BeforeOffer::Initial)
         })();
+        if host.stopped() {
+            return Ok(PreparedSetup::Unavailable);
+        }
         let initial = match ready {
             Ok(BeforeOffer::Initial(initial)) => initial,
             Ok(BeforeOffer::Resume(revision)) => {
@@ -2284,7 +2381,12 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             Ok(BeforeOffer::Superseded) => return Ok(PreparedSetup::Unavailable),
             Err(why) => {
                 drop(claim);
-                report_bound_setup_read_error(host, &why)?;
+                if matches!(
+                    report_bound_setup_read_error(host, &why)?,
+                    SetupStep::Stopped
+                ) {
+                    return Ok(PreparedSetup::Unavailable);
+                }
                 host.backoff();
                 continue;
             }
@@ -2306,12 +2408,14 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
                 host.answered();
                 return Ok(finish_setup_choice(host, claim, plan));
             }
+            WorkstationSetupDecision::Cancelled => return Ok(PreparedSetup::Cancelled),
             WorkstationSetupDecision::Unavailable => {
                 drop(claim);
-                if retry_bound_setup_read(host, H::finished)? {
-                    return Ok(PreparedSetup::Finished);
+                match retry_bound_setup_read(host, H::finished)? {
+                    SetupStep::Ready(true) => return Ok(PreparedSetup::Finished),
+                    SetupStep::Ready(false) => host.backoff(),
+                    SetupStep::Stopped => return Ok(PreparedSetup::Unavailable),
                 }
-                host.backoff();
             }
         }
     }
@@ -2340,12 +2444,15 @@ fn finish_setup_choice<H: SetupStartup>(
             match host.claim() {
                 Ok(Some(held)) => claim = Some(held),
                 Ok(None) => match retry_bound_setup_read(host, H::finished) {
-                    Ok(true) => return PreparedSetup::Finished,
-                    Ok(false) => host.backoff(),
-                    Err(_) => return PreparedSetup::Unavailable,
+                    Ok(SetupStep::Ready(true)) => return PreparedSetup::Finished,
+                    Ok(SetupStep::Ready(false)) => host.backoff(),
+                    Ok(SetupStep::Stopped) | Err(_) => return PreparedSetup::Unavailable,
                 },
                 Err(why) => {
-                    if report_bound_setup_read_error(host, &why).is_err() {
+                    if !matches!(
+                        report_bound_setup_read_error(host, &why),
+                        Ok(SetupStep::Ready(()))
+                    ) {
                         return PreparedSetup::Unavailable;
                     }
                     host.backoff();
@@ -2360,7 +2467,7 @@ fn finish_setup_choice<H: SetupStartup>(
                 // A changed publication already retired this ticket, but its
                 // unreadable replacement may still need recovery. Readable
                 // supersession never starts a new review from the old ticket.
-                if host.authorization_read_failed() {
+                if host.authorization_read_failed() && !host.stopped() {
                     let _ = host.recover_after_read_error();
                 }
                 return PreparedSetup::Unavailable;
@@ -2374,15 +2481,26 @@ fn finish_setup_choice<H: SetupStartup>(
                 };
             }
             Err(why) => {
+                // The first delivered Begin still saved its intent and Stop
+                // evidence. A covered failure retires without another write,
+                // recovery attempt, wait, or rejection note.
+                if host.stopped() {
+                    return PreparedSetup::Unavailable;
+                }
                 if host.authorization_read_failed() {
                     // Recovery may replace the bound records. No accepted review
                     // keeps the automatic claim while that replacement is made.
                     drop(held);
-                    if report_bound_setup_read_error(host, &why).is_err() {
+                    if !matches!(
+                        report_bound_setup_read_error(host, &why),
+                        Ok(SetupStep::Ready(()))
+                    ) {
                         return PreparedSetup::Unavailable;
                     }
                     if !host.authorization_pending() || host.stopped() {
-                        host.report_rejection(&why);
+                        if !host.stopped() {
+                            host.report_rejection(&why);
+                        }
                         return PreparedSetup::Unavailable;
                     }
                     host.backoff();
@@ -2393,7 +2511,6 @@ fn finish_setup_choice<H: SetupStartup>(
                     return PreparedSetup::Unavailable;
                 }
                 if host.stopped() {
-                    host.report_rejection(&why);
                     return PreparedSetup::Unavailable;
                 }
                 host.report_failure(&why);
@@ -2455,7 +2572,7 @@ fn run_prepared_setup(
             // hold up the watch for the ALab vault that starts once this returns.
             (setup_io().start_follow_up)();
         }
-        PreparedSetup::Unavailable => {}
+        PreparedSetup::Cancelled | PreparedSetup::Unavailable => {}
     }
 }
 
@@ -4487,15 +4604,20 @@ impl UnderWay {
         std::mem::replace(&mut debt.unconfirmed, true)
     }
 
-    fn restore_publication(&self, uncertain: bool) {
-        if let Some(debt) = stop_saves()
+    fn restore_publication(&self, uncertain: bool) -> bool {
+        let retained = if let Some(debt) = stop_saves()
             .under_way
             .iter_mut()
             .find(|debt| debt.sent == self.0)
         {
-            debt.unconfirmed = uncertain;
-        }
+            // Retirement during the attempt wins over its earlier fallback.
+            debt.unconfirmed &= uncertain;
+            debt.unconfirmed
+        } else {
+            false
+        };
         STOP_SAVES_MOVED.notify_all();
+        retained
     }
 
     /// A write attempt's evidence for Stop, never permission to execute or write again.
@@ -4762,6 +4884,9 @@ struct SetupIo {
     start_startup: fn() -> bool,
     /// Continue startup on a worker that has released its previous operation's leases.
     start_startup_inline: fn(),
+    /// Whether another setup holds this Mac's setup records now
+    /// (`aterm_cli::macos_doctor::setup_records_held`).
+    records_held: fn() -> bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -4781,6 +4906,7 @@ impl SetupIo {
         probe_lan: aterm_cli::macos_doctor::probe_local_network_again,
         start_startup: start_startup_again,
         start_startup_inline: || run_startup_setup(None),
+        records_held: aterm_cli::macos_doctor::setup_records_held,
     };
 }
 
@@ -5666,6 +5792,10 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
     ) {
         heal_unread_setup();
     }
+    set_aside_as_read(
+        snapshot.as_ref().ok().map(|snapshot| snapshot.recovered),
+        aterm_gui::clear_setup_set_aside,
+    );
     let busy = INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire);
     let mut status = match INITIAL_SETUP_ROWS.lock() {
         Ok(last) => initial_setup_status_with(snapshot, busy, &last),
@@ -5677,7 +5807,48 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
     let startup_retrying = STARTUP_RETRY.lock().is_ok_and(|retry| retry.retrying());
     add_startup_retry(&mut status, startup_retrying);
     add_setup_readings(&mut status);
+    add_vault_not_joined(
+        &mut status,
+        SETUP_VAULT_NOT_JOINED.load(std::sync::atomic::Ordering::Acquire),
+    );
     status
+}
+
+/// The launch's answer to its offer was a Join that aterm admitted without the Join, since it
+/// cannot read this Mac's vault settings
+/// ([`aterm_cli::macos_doctor::InitialSetupAuthorization::join_unread`]): set as that answer is
+/// admitted, cleared as the next one, or a person's next choice, is, or as a Join pressed since
+/// is refused for the same settings, whose own line says so ([`setup_error_row`]).
+#[cfg(target_os = "macos")]
+static SETUP_VAULT_NOT_JOINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Note whether the answer or choice admitted now left its Join undone
+/// ([`SETUP_VAULT_NOT_JOINED`]).
+#[cfg(target_os = "macos")]
+fn note_vault_not_joined(not_joined: bool) {
+    SETUP_VAULT_NOT_JOINED.store(not_joined, std::sync::atomic::Ordering::Release);
+}
+
+/// While the launch's Join waits unjoined (`not_joined`) and the Secrets row still reads that
+/// aterm cannot read this Mac's vault settings, the page says in one calm line that the vault
+/// was not joined and why ([`aterm_gui::VAULT_NOT_JOINED_NOTE`]): no failure, since a press
+/// changes nothing until those settings read, when the typed vault is the person's to Join.
+#[cfg(target_os = "macos")]
+fn add_vault_not_joined(status: &mut aterm_gui::SetupStatus, not_joined: bool) {
+    use aterm_types::macos_setup::{Setting, Subject};
+    if not_joined
+        && status.plan.is_some()
+        && status.observed.iter().any(|observation| {
+            observation.subject == Subject::Setting(Setting::Secrets)
+                && observation.note.as_deref()
+                    == Some(aterm_cli::macos_doctor::VAULT_SETTINGS_UNREAD)
+        })
+    {
+        status
+            .rows
+            .push(aterm_gui::calm_setup_row(aterm_gui::VAULT_NOT_JOINED_NOTE));
+    }
 }
 
 /// While the launch's setup tries a step again by itself (`startup_retrying`, System State
@@ -5830,7 +6001,24 @@ fn note_setup_set_aside(set: &aterm_cli::macos_doctor::SetAside) {
     aterm_log::warn!(
         "System State: saved setup records could not be read and were set aside as {kept}"
     );
+    SET_ASIDE_SAID.store(true, std::sync::atomic::Ordering::Release);
     aterm_gui::note_setup_set_aside(&kept);
+}
+
+/// The exceptions digest may hold the set-aside fact ([`note_setup_set_aside`]): at launch, one
+/// an earlier launch raised, and since, one this launch raised.
+#[cfg(target_os = "macos")]
+static SET_ASIDE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The saved setup read just now, `recovered` as its snapshot says (`None`: it could not be
+/// read). Once it reads with no set-aside to say (a person chose, or Restore ran, since aterm set
+/// it aside, or it never did), the digest's entry goes with the page's note (System State design
+/// §3.5): `clear` runs once, until aterm sets a saved setup aside again.
+#[cfg(target_os = "macos")]
+fn set_aside_as_read(recovered: Option<bool>, clear: impl FnOnce()) {
+    if recovered == Some(false) && SET_ASIDE_SAID.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        clear();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -5889,6 +6077,10 @@ fn initial_setup_status_with(
                 }
                 aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_) => {
                     aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)
+                }
+                // A newer aterm's setup: this one leaves it as it is, and reads nothing again.
+                aterm_cli::macos_doctor::InitialSetupSnapshotError::Newer => {
+                    aterm_gui::calm_setup_row(aterm_gui::NEWER_SETUP_NOTE)
                 }
             }],
             None,
@@ -5993,6 +6185,19 @@ fn initial_setup_error(
     publish_initial_setup_error(detail, None, observation);
 }
 
+/// Whether `detail` names a newer aterm's saved setup
+/// ([`aterm_cli::macos_doctor::setup_is_newer`]). An update is needed to read those records,
+/// so the page uses its calm line ([`aterm_gui::NEWER_SETUP_NOTE`]); the log keeps the detail.
+#[cfg(target_os = "macos")]
+fn refused_for_newer_setup(detail: &str) -> bool {
+    if !aterm_cli::macos_doctor::setup_is_newer(detail) {
+        return false;
+    }
+    aterm_log::info!("System State: {detail}");
+    aterm_gui::publish_initial_setup_status(initial_setup_status());
+    true
+}
+
 /// Publish a setup run, or a Check of `checked_plan`, that failed as a whole: the page says so
 /// in its own words (System State design §3.6), and the log keeps `detail`, which can name a
 /// file, a process or an error the page never shows.
@@ -6002,23 +6207,42 @@ fn publish_initial_setup_error(
     checked_plan: Option<&aterm_types::macos_setup::Plan>,
     observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
 ) {
-    let (name, said) = if checked_plan.is_some() {
+    if refused_for_newer_setup(&detail) {
+        return;
+    }
+    let row = setup_error_row(&detail, checked_plan.is_some());
+    if row.status == "failed" {
+        aterm_log::warn!("System State: {} failed: {detail}", row.name);
+    } else {
+        aterm_log::info!("System State: Join refused: {detail}");
+        // This press's line says it: the launch's word that its Join went unjoined goes.
+        note_vault_not_joined(false);
+    }
+    publish_initial_setup_rows(vec![row], checked_plan, observation);
+}
+
+/// The page's row for a setup run, or a Check (`check`), that failed as a whole with `detail`
+/// ([`publish_initial_setup_error`]). A Join refused because aterm cannot read this Mac's vault
+/// settings changed nothing, and pressing anything again meets the same settings: one calm line
+/// says so ([`aterm_gui::VAULT_UNREAD_NOTE`]), never a failure, with no Set up now, menu line
+/// or tab attention, and the page keeps the typed vault for a Join once they read.
+#[cfg(target_os = "macos")]
+fn setup_error_row(detail: &str, check: bool) -> aterm_gui::SetupStatusRow {
+    if !check && aterm_cli::macos_doctor::vault_config_unread(detail) {
+        return aterm_gui::calm_setup_row(aterm_gui::VAULT_UNREAD_NOTE);
+    }
+    let (name, said) = if check {
         ("Check", aterm_gui::CHECK_FAILED_NOTE)
     } else {
         // Set up now starts it again, as the page's note says; while the run retries by
         // itself, the note says that instead.
         (aterm_gui::SETUP_ROW, "")
     };
-    aterm_log::warn!("System State: {name} failed: {detail}");
-    publish_initial_setup_rows(
-        vec![aterm_gui::SetupStatusRow {
-            name: name.into(),
-            status: "failed".into(),
-            detail: said.into(),
-        }],
-        checked_plan,
-        observation,
-    );
+    aterm_gui::SetupStatusRow {
+        name: name.into(),
+        status: "failed".into(),
+        detail: said.into(),
+    }
 }
 
 /// Publish a Restore that failed as a whole, as [`publish_initial_setup_error`] does a run: the
@@ -6029,6 +6253,9 @@ fn restore_initial_setup_error(
     detail: String,
     observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
 ) {
+    if refused_for_newer_setup(&detail) {
+        return;
+    }
     aterm_log::warn!("System State: Restore failed: {detail}");
     publish_initial_setup_rows(vec![restore_failed_row(&detail)], None, observation);
 }
@@ -6235,6 +6462,11 @@ fn admit_setup_change(
         aterm_cli::macos_doctor::InitialSetupRestart::default()
     }
     .changing(receipt.changed());
+    // A choice that finds this Mac's setup records held by another setup waits from that moment
+    // (System State design §3.3): the page says so at once, never a run going for the ten
+    // seconds that wait can last.
+    let generation = choice.generation;
+    let restart = restart.noting_wait(move || queue_setup_press(generation));
     let mut host = LiveSetupRestart {
         restart,
         vault_typed,
@@ -6460,6 +6692,7 @@ impl SetupRestartHost for LiveSetupRestart {
         );
         drop(self.under_way.take());
         unqueue_setup_press(self.generation);
+        note_vault_not_joined(false);
         clear_initial_setup_rows();
         receipt.accept();
         aterm_gui::publish_initial_setup_status(initial_setup_status());
@@ -6469,6 +6702,8 @@ impl SetupRestartHost for LiveSetupRestart {
     }
 
     fn failure(&mut self, why: &str) {
+        // A press that failed waits for no other setup now.
+        unqueue_setup_press(self.generation);
         initial_setup_error(why.into(), self.observation.clone());
     }
 
@@ -6982,39 +7217,74 @@ impl Drop for PreferenceReadings {
 #[cfg(target_os = "macos")]
 fn restore_initial_setup() -> bool {
     spawn_initial_setup_operation("aterm-setup-restore", |busy| {
-        run_setup_restore(busy, || {
-            aterm_cli::macos_doctor::run_observed(aterm_cli::macos_doctor::Action::Restore)
+        run_setup_restore(busy, |waits, holding| {
+            aterm_cli::macos_doctor::restore_observed(waits, holding)
         });
     })
 }
 
+/// Run System State's Restore previous settings holding the setup slot (`busy`). `restore`
+/// takes the Restore's two hooks: the first says its own attempt found the records held by
+/// another setup, the second runs once it holds them, before its first write, and says whether
+/// it goes on (`aterm_cli::macos_doctor::restore_observed`).
 #[cfg(target_os = "macos")]
 fn run_setup_restore(
     busy: InitialSetupBusy,
-    mut restore: impl FnMut() -> aterm_cli::macos_doctor::InitialSetupObserved<
-        aterm_cli::macos_doctor::Report,
+    mut restore: impl FnMut(
+        &mut dyn FnMut(),
+        &mut dyn FnMut() -> bool,
+    ) -> aterm_cli::macos_doctor::InitialSetupObserved<
+        Option<aterm_cli::macos_doctor::Report>,
     >,
 ) {
+    // A choice made after this Restore was pressed is the person's latest intent.
+    let pressed = SETUP_APPLY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let observed = loop {
-        let observed = with_restore_readings(&mut restore);
-        // Another setup held this Mac's setup records past the Restore's wait for them: the
-        // Restore waits on, holding the slot, and runs when that setup finishes (System
-        // State design §3.4).
-        if observed
-            .result
-            .as_ref()
-            .is_err_and(|why| why == aterm_cli::macos_doctor::SETUP_BUSY)
-        {
-            queue_setup_press(RESTORE_QUEUED);
-            std::thread::sleep(QUEUED_ASK_EVERY);
-            continue;
+        if !(setup_io().records_held)() {
+            // Each attempt is the Restore going, not one waiting: the page says it waits again
+            // only once this attempt finds the records held. A group pressed while it waited
+            // has replaced it.
+            unqueue_setup_press(RESTORE_QUEUED);
+            if setup_choice_overtaken(pressed) {
+                break None;
+            }
+            let observed = with_restore_readings(|| {
+                restore(&mut || queue_setup_press(RESTORE_QUEUED), &mut || {
+                    // It holds the records and has written nothing: the page shows it
+                    // restoring from now, its groups and Check again as during a run, unless a
+                    // group press overtook it, which it gives way to having changed nothing.
+                    unqueue_setup_press(RESTORE_QUEUED);
+                    !setup_choice_overtaken(pressed)
+                })
+            });
+            // One that took the records past the Restore's own wait for them, since it asked,
+            // is waited for as one that held them.
+            match observed.result {
+                Ok(None) => break None,
+                Err(why) if why == aterm_cli::macos_doctor::SETUP_BUSY => {}
+                Ok(Some(report)) => break Some((Ok(report), observed.observation)),
+                Err(why) => break Some((Err(why), observed.observation)),
+            }
         }
-        break observed;
+        // Another setup holds this Mac's setup records (another aterm, `aterm doctor` in a
+        // terminal): the Restore waits on quietly, holding the slot, and reads no row until it
+        // runs, when that setup finishes (System State design §3.4), unless a choice made
+        // meanwhile replaces it, as a later choice replaces one waiting: it is let go, having
+        // changed nothing, and the choice takes the slot.
+        queue_setup_press(RESTORE_QUEUED);
+        if !wait_while_queued(|| setup_choice_overtaken(pressed)) {
+            break None;
+        }
     };
     unqueue_setup_press(RESTORE_QUEUED);
-    match observed.result {
-        Ok(report) => remember_initial_setup_rows(&report, None, observed.observation),
-        Err(why) => restore_initial_setup_error(why, observed.observation),
+    let Some((result, observation)) = observed else {
+        aterm_log::info!("System State: a later choice replaced the waiting Restore");
+        drop(busy);
+        return;
+    };
+    match result {
+        Ok(report) => remember_initial_setup_rows(&report, None, observation),
+        Err(why) => restore_initial_setup_error(why, observation),
     }
     drop(busy);
     offer_again_after_restore();
@@ -7076,6 +7346,15 @@ mod initial_setup_result_tests {
     #[path = "startup_recovery_tests.rs"]
     mod startup_recovery_tests;
 
+    #[path = "startup_cancel_watch_tests.rs"]
+    mod startup_cancel_watch_tests;
+
+    #[path = "startup_repair_debt_tests.rs"]
+    mod startup_repair_debt_tests;
+
+    #[path = "queued_press_tests.rs"]
+    mod queued_press_tests;
+
     #[path = "progress_publication_tests.rs"]
     mod progress_publication_tests;
 
@@ -7084,6 +7363,12 @@ mod initial_setup_result_tests {
 
     #[path = "bind_stop_tests.rs"]
     mod bind_stop_tests;
+
+    #[path = "startup_stop_retry_tests.rs"]
+    mod startup_stop_retry_tests;
+
+    #[path = "startup_newer_tests.rs"]
+    mod startup_newer_tests;
 
     use super::*;
     use aterm_cli::macos_doctor::{
@@ -7525,6 +7810,9 @@ mod initial_setup_result_tests {
         persists: usize,
         /// Admissions wait while this is set.
         persist_hold: bool,
+        /// Each admission first finds this Mac's setup records held by another setup, as the
+        /// profile lock's wait does ([`aterm_cli::macos_doctor::InitialSetupRestart::noting_wait`]).
+        persist_finds_lock_held: bool,
         /// What each admission does in turn: admits its choice as this
         /// revision, or refuses it (`None`, and when none is left).
         admits: VecDeque<Option<u64>>,
@@ -7572,6 +7860,8 @@ mod initial_setup_result_tests {
         startup_spawns: VecDeque<bool>,
         /// Startup continuations on a released Restore worker.
         startups_inline: usize,
+        /// The answers, one an ask, to whether another setup holds the records (none: no).
+        records_held: VecDeque<bool>,
         /// The widened mark ([`SETUP_WIDENED`]) as each run started.
         widened: Vec<u64>,
     }
@@ -7590,6 +7880,7 @@ mod initial_setup_result_tests {
             claim_hold: false,
             persists: 0,
             persist_hold: false,
+            persist_finds_lock_held: false,
             admits: VecDeque::new(),
             registers: None,
             runs: Vec::new(),
@@ -7611,6 +7902,7 @@ mod initial_setup_result_tests {
             startups: 0,
             startup_spawns: VecDeque::new(),
             startups_inline: 0,
+            records_held: VecDeque::new(),
             widened: Vec::new(),
         };
     }
@@ -7714,6 +8006,7 @@ mod initial_setup_result_tests {
                     script.startup_spawns.pop_front().unwrap_or(true)
                 },
                 start_startup_inline: || change(|script| script.startups_inline += 1),
+                records_held: || script().records_held.pop_front().unwrap_or(false),
             };
             reset_worker_state();
             Self { _claims: claims }
@@ -7770,10 +8063,13 @@ mod initial_setup_result_tests {
         }
 
         fn persist(
-            _: &mut aterm_cli::macos_doctor::InitialSetupRestart,
+            restart: &mut aterm_cli::macos_doctor::InitialSetupRestart,
             _: &Plan,
             _: bool,
         ) -> aterm_cli::macos_doctor::InitialSetupObserved<Option<u64>> {
+            if script().persist_finds_lock_held {
+                restart.finds_lock_held_for_test();
+            }
             let mut script = script();
             script.persists += 1;
             SCRIPT_MOVED.notify_all();
@@ -8232,6 +8528,7 @@ mod initial_setup_result_tests {
             let outcome = match &prepared {
                 Ok(PreparedSetup::Authorized { .. }) => "authorized",
                 Ok(PreparedSetup::Finished) => "finished",
+                Ok(PreparedSetup::Cancelled) => "cancelled",
                 Ok(PreparedSetup::Unavailable) => "unavailable",
                 Err(_) => "failed",
             };
@@ -8525,6 +8822,77 @@ mod initial_setup_result_tests {
             [aterm_gui::calm_setup_row(aterm_gui::STATE_UNREAD_NOTE)]
         );
         assert!(status.rows.iter().all(|row| row.status != "failed"));
+    }
+
+    /// A newer aterm's saved setup is one calm line that says so, no failure, and no read again
+    /// by itself: this aterm leaves that setup as it is.
+    #[test]
+    fn a_newer_aterms_saved_setup_is_one_calm_line_read_no_more() {
+        let status = initial_setup_status_with(
+            Err(InitialSetupSnapshotError::Newer),
+            false,
+            &InitialSetupRows::default(),
+        );
+        assert!(status.plan.is_none() && status.permissions.is_none());
+        assert_eq!(
+            status.rows,
+            [aterm_gui::calm_setup_row(aterm_gui::NEWER_SETUP_NOTE)]
+        );
+        assert!(aterm_cli::macos_doctor::setup_is_newer(
+            &InitialSetupSnapshotError::Newer.to_string()
+        ));
+    }
+
+    /// A Join refused because aterm cannot read this Mac's vault settings is one calm line that
+    /// says so, never a failure with Set up now: pressing it again meets the same settings. Any
+    /// other setup error, and a Check's, is still the failure it was.
+    #[test]
+    fn a_join_refused_for_unread_vault_settings_is_one_calm_line() {
+        let refused = "cannot read which vault this Mac is in: source.toml: Permission denied";
+        assert_eq!(
+            setup_error_row(refused, false),
+            aterm_gui::calm_setup_row(aterm_gui::VAULT_UNREAD_NOTE)
+        );
+        assert_eq!(setup_error_row(refused, true).status, "failed");
+        let other = setup_error_row("the plan could not be saved", false);
+        assert_eq!(
+            (other.name.as_str(), other.status.as_str()),
+            (aterm_gui::SETUP_ROW, "failed")
+        );
+    }
+
+    /// The launch's Join that aterm admitted without the Join is said in one calm line while
+    /// the Secrets row still reads that aterm cannot read this Mac's vault settings, and only
+    /// then: once they read, the row says how the vault stands, and the typed vault is the
+    /// person's to Join.
+    #[test]
+    fn a_startup_join_left_unjoined_is_said_while_the_vault_settings_stay_unread() {
+        use aterm_types::macos_setup::{Observation, Setting, Subject};
+        let secrets = |note: Option<&str>| Observation {
+            note: note.map(str::to_owned),
+            ..Observation::unknown(Subject::Setting(Setting::Secrets))
+        };
+        let status = |observed: Vec<Observation>| aterm_gui::SetupStatus {
+            plan: Some(Plan::default()),
+            observed,
+            ..aterm_gui::SetupStatus::default()
+        };
+        let unread = aterm_cli::macos_doctor::VAULT_SETTINGS_UNREAD;
+        let mut said = status(vec![secrets(Some(unread))]);
+        add_vault_not_joined(&mut said, true);
+        assert_eq!(
+            said.rows,
+            [aterm_gui::calm_setup_row(aterm_gui::VAULT_NOT_JOINED_NOTE)]
+        );
+        for (not_joined, observed) in [
+            (false, vec![secrets(Some(unread))]),
+            (true, vec![secrets(None)]),
+            (true, Vec::new()),
+        ] {
+            let mut quiet = status(observed);
+            add_vault_not_joined(&mut quiet, not_joined);
+            assert!(quiet.rows.is_empty());
+        }
     }
 
     /// A step of the launch's setup that failed is tried again by itself: the page says so in
@@ -11085,7 +11453,7 @@ mod tests {
 
     mod setup_startup {
         use super::super::{PreparedSetup, SetupAdmission, SetupStartup, prepare_setup};
-        use aterm_gui::WorkstationSetupDecision::{self, Begin, Unavailable};
+        use aterm_gui::WorkstationSetupDecision::{self, Begin, Cancelled, Unavailable};
         use aterm_types::macos_setup::{Plan, Selection};
         use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
@@ -11232,6 +11600,28 @@ mod tests {
             fn report_failure(&mut self, why: &str) {
                 self.failures.push(why.to_owned());
             }
+        }
+
+        #[test]
+        fn cancelling_a_startup_review_releases_its_claim_without_applying_or_retrying() {
+            let mut host = Host {
+                claims: [Ok(true)].into(),
+                finished: [Ok(false)].into(),
+                offers: [Cancelled].into(),
+                ..Host::default()
+            };
+            assert!(matches!(
+                prepare_setup(&mut host).unwrap(),
+                PreparedSetup::Cancelled
+            ));
+            assert_eq!(
+                (host.bind_calls, host.claim_calls, host.offer_calls),
+                (1, 1, 1)
+            );
+            assert_eq!(host.active.get(), 0);
+            assert!(host.authorized.is_empty());
+            assert!(host.held_during_backoff.is_empty());
+            assert!(host.failures.is_empty());
         }
 
         #[test]

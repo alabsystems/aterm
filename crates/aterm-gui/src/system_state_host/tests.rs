@@ -15,6 +15,9 @@ use crate::native_ui::{ActionId, UiKey};
 use crate::system_state::{Admission, fixture_status};
 use crate::tab_model::ViewId;
 
+#[path = "credential_receipt_tests.rs"]
+mod credential_receipt_tests;
+
 thread_local! {
     static APPLY_RECEIPTS: RefCell<Vec<InitialSetupApplyReceipt>> = const {
         RefCell::new(Vec::new())
@@ -298,6 +301,16 @@ fn fresh(app: &mut App, status: SetupStatus) {
     app.receive_system_state_status(Some(app.system_state_host.generation), status);
 }
 
+/// Reach automatic admission through this offer's full active review time,
+/// leaving its action queued so the caller can exercise delivery races.
+fn expire_startup_review(app: &mut App, active: bool, view: ViewId) -> bool {
+    let now = Instant::now();
+    app.native_runtime
+        .tick_system_state_at(now, active, true, &[view]);
+    app.native_runtime
+        .tick_system_state_at(now + Duration::from_secs(30), active, true, &[view])
+}
+
 /// A read of a setup run going for the default plan.
 fn running() -> SetupStatus {
     SetupStatus {
@@ -545,7 +558,7 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
     let active = app.system_state_presented_active(instance);
     assert!(active, "the real presentation permits automatic admission");
     let before_apply = app.system_state_host.generation;
-    assert!(app.native_runtime.tick_system_state(active, true, &[view]));
+    assert!(expire_startup_review(&mut app, active, view));
     assert!(indicators(&app, instance, view).busy);
     assert!(request.pending());
     assert!(receive.try_recv().is_err());
@@ -608,7 +621,7 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
         assert!(app.commit_glassless_native_frame(wid));
         let active = app.system_state_presented_active(instance);
         assert!(active);
-        assert!(app.native_runtime.tick_system_state(active, true, &[view]));
+        assert!(expire_startup_review(&mut app, active, view));
         app.drain_system_state_actions();
         let mut answer = receive.try_recv().unwrap();
         assert_eq!(
@@ -673,7 +686,7 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
     assert!(app.commit_glassless_native_frame(wid));
     let active = app.system_state_presented_active(instance);
     assert!(active);
-    assert!(app.native_runtime.tick_system_state(active, true, &[view]));
+    assert!(expire_startup_review(&mut app, active, view));
     assert!(request.pending());
     drop(receive);
     let before_apply = app.system_state_host.generation;
@@ -752,6 +765,7 @@ fn withdrawn_system_state_offer_cannot_release_a_newer_local_decision() {
     });
     let previous = app.system_state_host.generation;
     press(&mut app, wid, view, "system-state/group/1/leave");
+    press(&mut app, wid, view, "system-state/apply");
     let mut answer = receive.try_recv().unwrap();
     let receipt = answer.receipt.take().expect("a choice answers the offer");
     // A late completion of that old channel cannot retire the newer
@@ -794,6 +808,7 @@ fn a_restore_holds_no_access_step() {
             let (send, _receive) = mpsc::channel();
             app.attach_system_state_offer(Request::new(Plan::default(), send));
             assert!(app.workstation_setup.suppresses_permissions());
+            press(&mut app, wid, view, "system-state/cancel");
         }
         press(&mut app, wid, view, "system-state/restore");
         assert_eq!(calls(), ["restore"], "offered={offered}");
@@ -1012,25 +1027,471 @@ fn check_again_reads_every_row_for_the_pages_plan_and_says_when_it_did_not_start
 }
 
 #[test]
-fn restore_lets_the_first_run_offer_go_for_good() {
+fn startup_review_must_end_before_restore_can_start() {
     let mut app = App::headless_for_test();
     let (wid, _, view) = page(&mut app);
     let (send, receive) = mpsc::channel();
     app.attach_system_state_offer(Request::new(Plan::default(), send));
     app.set_system_state_handlers_for_test(handlers());
     press(&mut app, wid, view, "system-state/restore");
+    assert!(
+        receive.try_recv().is_err(),
+        "Restore cannot bypass Apply or take its claim"
+    );
+    assert!(calls().is_empty());
+    press(&mut app, wid, view, "system-state/cancel");
     assert_eq!(
         receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
+        WorkstationSetupDecision::Cancelled
     );
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(Plan::default()),
+            ..SetupStatus::default()
+        },
+    );
+    press(&mut app, wid, view, "system-state/restore");
     assert_eq!(calls(), ["restore"]);
     assert!(app.system_state_host.pending.is_none());
     fresh(&mut app, SetupStatus::default());
     app.native_runtime.tick_system_state(true, true, &[view]);
     assert!(
         app.native_runtime.take_system_state_action().is_none(),
-        "no later tick applies an offer Restore let go"
+        "no later tick applies the ended review"
     );
+}
+
+#[test]
+fn startup_review_cancel_discards_drafts_without_closing_or_stopping_and_manual_apply_still_works()
+{
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_system_state_tab());
+    let (instance, view) = app.active_native_view(wid).unwrap();
+    app.set_system_state_handlers_for_test(handlers());
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::new(Plan::default(), send));
+    press(&mut app, wid, view, "system-state/group/2/leave");
+    type_into(
+        &mut app,
+        wid,
+        view,
+        "system-state/url",
+        "http://discard.local:7484/v1/test",
+    );
+    type_into(
+        &mut app,
+        wid,
+        view,
+        "system-state/password",
+        "synthetic-discarded-secret",
+    );
+    assert!(calls().is_empty(), "review edits start no worker");
+    press(&mut app, wid, view, "system-state/cancel");
+    assert_eq!(
+        receive.try_recv().unwrap().decision,
+        WorkstationSetupDecision::Cancelled
+    );
+    assert!(receive.try_recv().is_err(), "the offer is resolved once");
+    assert!(
+        calls().is_empty(),
+        "Cancel neither applies nor stops nor restores"
+    );
+    assert_eq!(app.active_native_view(wid), Some((instance, view)));
+    assert!(app.system_state_host.pending.is_none());
+    assert!(app.system_state_host.pending_apply.is_none());
+    let NativeApp::SystemState(state) = app.native_runtime.app(instance).unwrap() else {
+        unreachable!()
+    };
+    assert!(
+        !state.plan_known(),
+        "no saved plan has arrived on this fresh install"
+    );
+    let mut selection = aterm_types::macos_setup::Selection::none();
+    selection.set(Setting::Permissions, true);
+    let saved = Plan {
+        selection,
+        vault_url: "http://saved.local:7484/v1/team".into(),
+    };
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(saved.clone()),
+            ..SetupStatus::default()
+        },
+    );
+    let NativeApp::SystemState(state) = app.native_runtime.app(instance).unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(state.reviewed_plan(), saved);
+    assert!(
+        state
+            .field_projection("system-state/password")
+            .unwrap()
+            .text
+            .is_empty()
+    );
+    let now = Instant::now();
+    app.native_runtime
+        .tick_system_state_at(now, true, true, &[view]);
+    app.native_runtime
+        .tick_system_state_at(now + Duration::from_secs(60), true, true, &[view]);
+    app.drain_system_state_actions();
+    assert!(
+        calls().is_empty(),
+        "a cancelled review never restarts itself"
+    );
+    press(&mut app, wid, view, "system-state/group/1/set-up");
+    assert!(
+        app.system_state_host.pending_apply.is_some(),
+        "a later manual choice starts normally"
+    );
+    assert!(
+        app.system_state_host
+            .pending_apply
+            .as_ref()
+            .unwrap()
+            .plan
+            .selection
+            .contains(Setting::CapsLock)
+    );
+    receipt().accept();
+    app.resolve_system_state_apply();
+}
+
+#[test]
+fn startup_review_keeps_previous_permission_policy_held_and_allows_only_check() {
+    let mut app = App::headless_for_test();
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    let (wid, _, view) = page(&mut app);
+    let mut status = fixture_status("sync-off").unwrap();
+    status.permissions = Some(crate::InitialSetupPermissionPolicy {
+        revision: 5,
+        allowed: true,
+    });
+    for row in &mut status.observed {
+        if row.subject == aterm_types::macos_setup::Subject::Access(Access::FullDiskAccess) {
+            row.standing = aterm_types::macos_setup::Standing::NeedsYou;
+            row.now = Some("Off".into());
+        }
+    }
+    fresh(&mut app, status.clone());
+    assert!(!app.workstation_setup.suppresses_permissions());
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.attach_system_state_offer(request.clone());
+    fresh(&mut app, status);
+    app.set_system_state_handlers_for_test(handlers());
+    for key in [
+        "system-state/row/full-disk-access/open",
+        "system-state/row/secrets/sync-on",
+        "system-state/restore",
+    ] {
+        press(&mut app, wid, view, key);
+    }
+    assert!(calls().is_empty());
+    assert!(app.workstation_setup.suppresses_permissions());
+    assert!(app.admitted_access().is_none());
+    assert!(request.pending() && receive.try_recv().is_err());
+    press(&mut app, wid, view, "system-state/check");
+    assert_eq!(
+        calls(),
+        [
+            format!("check {}", Plan::default().vault_url),
+            format!("observe {}", Plan::default().vault_url)
+        ]
+    );
+    assert!(app.system_state_host.pending_apply.is_none());
+    assert!(request.pending());
+    assert!(app.workstation_setup.suppresses_permissions());
+}
+
+#[test]
+fn startup_review_focus_return_does_not_charge_time_without_an_inactive_tick() {
+    let mut app = App::headless_for_test();
+    let (wid, _, _) = page(&mut app);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.attach_system_state_offer(request.clone());
+    assert!(app.commit_glassless_native_frame(wid));
+    let start = Instant::now();
+    app.tick_system_state(start);
+    assert!(request.pending());
+
+    app.window_focus_event(wid, false);
+    // The real window_event tail publishes visibility before the event loop
+    // can sleep. Its throttled tick need not reach the model while inactive.
+    app.publish_system_state_front();
+    app.tick_system_state(start + Duration::from_millis(100));
+    app.window_focus_event(wid, true);
+    app.publish_system_state_front();
+    app.tick_system_state(start + Duration::from_secs(60));
+    assert!(
+        request.pending(),
+        "focus loss must pause before the next model tick"
+    );
+    assert!(receive.try_recv().is_err());
+    app.tick_system_state(start + Duration::from_secs(89));
+    assert!(
+        request.pending(),
+        "the review still needs thirty active seconds"
+    );
+    app.tick_system_state(start + Duration::from_secs(90));
+    let mut answer = receive
+        .try_recv()
+        .expect("active time resumes the same countdown");
+    assert!(matches!(
+        answer.decision,
+        WorkstationSetupDecision::Begin(_)
+    ));
+    assert_eq!(
+        answer.receipt.as_ref().unwrap().admission(),
+        Admission::Automatic
+    );
+    answer.receipt.take().unwrap().accept();
+    app.resolve_system_state_apply();
+}
+
+#[test]
+fn startup_review_real_pointer_motion_does_not_stop_but_click_and_key_do() {
+    use crate::app_mouse::{NativePointerTarget, PointerAction};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    for click in [true, false] {
+        let mut app = App::headless_for_test();
+        let (wid, _, view) = page(&mut app);
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        app.attach_system_state_offer(request.clone());
+        let now = Instant::now();
+        app.native_runtime
+            .tick_system_state_at(now, true, true, &[view]);
+        app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+            "system-state/group/1/leave".into(),
+        )))
+        .unwrap();
+        app.native_runtime
+            .tick_system_state_at(now + Duration::from_secs(29), true, true, &[view]);
+        assert_eq!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&UiKey::new("system-state/apply"))
+                .unwrap()
+                .label,
+            "Apply (1)"
+        );
+        if click {
+            app.pointer_cmd(PointerAction::Click).unwrap();
+            assert!(
+                app.compiled_native_ui(wid)
+                    .unwrap()
+                    .semantic(&UiKey::new("system-state/group/1/leave"))
+                    .unwrap()
+                    .state
+                    .is_some_and(|state| state.selected),
+                "the first click both stops the timer and changes the draft"
+            );
+        } else {
+            app.native_input_event(
+                wid,
+                &crate::input::InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    layout_text: None,
+                    event_type: KeyEventType::Press,
+                },
+            );
+        }
+        app.native_runtime
+            .tick_system_state_at(now + Duration::from_secs(60), true, true, &[view]);
+        app.native_runtime.tick_system_state_at(
+            now + Duration::from_secs(120),
+            true,
+            true,
+            &[view],
+        );
+        app.drain_system_state_actions();
+        assert!(request.pending());
+        assert!(receive.try_recv().is_err());
+        assert_eq!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&UiKey::new("system-state/apply"))
+                .unwrap()
+                .label,
+            "Apply"
+        );
+    }
+}
+
+#[test]
+fn startup_review_first_pointer_apply_submits_without_an_intervening_frame() {
+    use crate::app_mouse::{NativePointerTarget, PointerAction};
+    let mut app = App::headless_for_test();
+    let (wid, _, _) = page(&mut app);
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::new(Plan::default(), send));
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    let rect = compiled
+        .semantic(&UiKey::new("system-state/apply"))
+        .unwrap()
+        .rect;
+    app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Point(
+        rect.x + rect.width - 2.0,
+        rect.y + rect.height / 2.0,
+    )))
+    .unwrap();
+    app.pointer_cmd(PointerAction::Click).unwrap();
+    let mut answer = receive
+        .try_recv()
+        .expect("one click stops the timer and submits Apply without needing another frame");
+    assert!(matches!(
+        answer.decision,
+        WorkstationSetupDecision::Begin(_)
+    ));
+    app.pointer_cmd(PointerAction::Click).unwrap();
+    assert!(receive.try_recv().is_err());
+    answer.receipt.take().unwrap().accept();
+    app.resolve_system_state_apply();
+}
+
+#[test]
+fn startup_review_first_pointer_cancel_ends_the_review_without_an_intervening_frame() {
+    use crate::app_mouse::{NativePointerTarget, PointerAction};
+    let mut app = App::headless_for_test();
+    let (wid, instance, view) = page(&mut app);
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::new(Plan::default(), send));
+    app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+        "system-state/cancel".into(),
+    )))
+    .unwrap();
+    app.pointer_cmd(PointerAction::Click).unwrap();
+    assert_eq!(
+        receive
+            .try_recv()
+            .expect("one click cancels the review")
+            .decision,
+        WorkstationSetupDecision::Cancelled
+    );
+    assert_eq!(app.active_native_view(wid), Some((instance, view)));
+    assert!(receive.try_recv().is_err());
+}
+
+#[test]
+fn startup_review_apply_survives_the_press_repaint_at_its_right_edge() {
+    use crate::app_mouse::{NativePointerTarget, PointerAction};
+    use aterm_window::event::{ElementState, MouseButton};
+
+    let mut app = App::headless_for_test();
+    let (wid, _, _) = page(&mut app);
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::new(Plan::default(), send));
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    let apply = compiled
+        .semantic(&UiKey::new("system-state/apply"))
+        .unwrap();
+    assert_eq!(apply.label, "Apply (30)");
+    let rect = apply.rect;
+    app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Point(
+        rect.x + rect.width - 2.0,
+        rect.y + rect.height / 2.0,
+    )))
+    .unwrap();
+    app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+    assert!(app.commit_glassless_native_frame(wid));
+    assert_eq!(
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantic(&UiKey::new("system-state/apply"))
+            .unwrap()
+            .label,
+        "Apply"
+    );
+    assert!(receive.try_recv().is_err(), "press only stops the timer");
+    app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+    let mut answer = receive
+        .try_recv()
+        .expect("release still lands on the same Apply button after repaint");
+    assert!(matches!(
+        answer.decision,
+        WorkstationSetupDecision::Begin(_)
+    ));
+    app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+    assert!(receive.try_recv().is_err());
+    answer.receipt.take().unwrap().accept();
+    app.resolve_system_state_apply();
+}
+
+#[test]
+fn startup_review_apply_hands_the_complete_draft_and_credentials_once() {
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    let (send, receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.attach_system_state_offer(request.clone());
+    press(&mut app, wid, view, "system-state/group/2/leave");
+    type_into(
+        &mut app,
+        wid,
+        view,
+        "system-state/url",
+        "http://review.local:7484/v1/team",
+    );
+    type_into(
+        &mut app,
+        wid,
+        view,
+        "system-state/password",
+        "synthetic-reviewed-secret",
+    );
+    assert!(calls().is_empty());
+    let now = Instant::now();
+    app.native_runtime
+        .tick_system_state_at(now, true, true, &[view]);
+    app.native_runtime
+        .tick_system_state_at(now + Duration::from_secs(60), true, true, &[view]);
+    app.drain_system_state_actions();
+    assert!(
+        request.pending(),
+        "editing permanently stopped automatic Apply"
+    );
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    assert!(
+        compiled
+            .semantic(&UiKey::new("system-state/vault/join"))
+            .is_none()
+    );
+    assert!(
+        compiled
+            .semantic(&UiKey::new("system-state/restore"))
+            .is_none()
+    );
+    press(&mut app, wid, view, "system-state/apply");
+    let mut answer = receive.try_recv().unwrap();
+    let WorkstationSetupDecision::Begin(plan) = &answer.decision else {
+        panic!("Apply begins")
+    };
+    assert!(!plan.selection.contains(Setting::Dock));
+    assert!(plan.selection.contains(Setting::CapsLock));
+    assert_eq!(plan.vault_url, "http://review.local:7484/v1/team");
+    assert_eq!(
+        answer.password.as_ref().unwrap().as_slice(),
+        b"synthetic-reviewed-secret"
+    );
+    assert!(answer.chosen && answer.vault_typed);
+    assert_eq!(answer.changed, None);
+    assert!(
+        calls().is_empty(),
+        "the startup receives the draft, not a second manual worker"
+    );
+    press(&mut app, wid, view, "system-state/apply");
+    assert!(receive.try_recv().is_err());
+    answer.receipt.take().unwrap().accept();
+    app.resolve_system_state_apply();
 }
 
 #[test]
@@ -1047,6 +1508,12 @@ fn the_first_run_offer_applies_once_presented_and_waits_for_its_run() {
     assert!(request.pending(), "not before the page reached glass");
     assert!(app.commit_glassless_native_frame(wid));
     app.tick_system_state(start + Duration::from_secs(1));
+    assert!(
+        request.pending(),
+        "the presented review starts its thirty seconds"
+    );
+    assert!(receive.try_recv().is_err());
+    app.tick_system_state(start + Duration::from_secs(31));
     let mut answer = receive.try_recv().unwrap();
     assert_eq!(
         answer.decision,
@@ -1066,7 +1533,7 @@ fn the_first_run_offer_applies_once_presented_and_waits_for_its_run() {
     assert!(indicators(&app, instance, view).busy);
     fresh(&mut app, SetupStatus::default());
     assert!(!indicators(&app, instance, view).busy);
-    app.tick_system_state(start + Duration::from_secs(2));
+    app.tick_system_state(start + Duration::from_secs(32));
     assert!(!request.pending());
     assert!(receive.try_recv().is_err(), "the offer is answered once");
 }
@@ -1815,6 +2282,73 @@ fn queued_offer_cannot_take_a_reopened_restore_before_its_first_tick() {
     );
 }
 
+/// A dev scenario keeps the operation it names, so a Restore waiting for another setup can be
+/// shown; the worker's own status names none, and the window's own operation stands for it.
+#[test]
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+fn a_development_scenario_keeps_the_operation_it_names() {
+    let mut app = App::headless_for_test();
+    let waiting = fixture_status("queued-restore").unwrap();
+    app.system_state_host.fixture = Some(waiting.clone());
+    app.system_state_host.fixture_read = true;
+    let (shown, _) = app.project_system_state_status(waiting.clone());
+    assert_eq!(shown.operation, Some(SetupOperation::Restore));
+    app.system_state_host.fixture = None;
+    let (shown, _) = app.project_system_state_status(waiting);
+    assert_eq!(shown.operation, None);
+}
+
+/// Check again beside a Restore waiting for another setup reads the rows and leaves the Restore
+/// as it is (design §3.4): the worker held for the Restore starts no check of its own, and the
+/// page still says the Restore waits.
+#[test]
+fn check_again_beside_a_waiting_restore_keeps_the_restore() {
+    let mut app = App::headless_for_test();
+    let (wid, instance, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        check: |_| {
+            note("check".to_owned());
+            CheckStarted {
+                reading: true,
+                check: false,
+            }
+        },
+        ..handlers()
+    });
+    press(&mut app, wid, view, "system-state/restore");
+    assert_eq!(calls(), ["restore"]);
+    let waiting = SetupStatus {
+        busy: true,
+        queued: true,
+        plan: Some(Plan::default()),
+        ..SetupStatus::default()
+    };
+    fresh(&mut app, waiting.clone());
+    press(&mut app, wid, view, "system-state/check");
+    let after = calls();
+    assert_eq!(
+        after.first().map(String::as_str),
+        Some("check"),
+        "{after:?}"
+    );
+    assert!(
+        !after.iter().any(|call| call == "restore"),
+        "Check again does not press Restore again: {after:?}"
+    );
+    assert_eq!(
+        app.system_state_host.operation,
+        Some(SetupOperation::Restore)
+    );
+    fresh(&mut app, waiting);
+    let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+        panic!("the page is open");
+    };
+    assert_eq!(
+        model.headline().text,
+        "Waiting to restore previous settings…"
+    );
+}
+
 #[test]
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 fn intent_handoff_keeps_development_scenarios_inert() {
@@ -2156,6 +2690,56 @@ mod observation_start {
         assert!(!state.can_open_access(Access::DeveloperTools));
         assert_eq!(app.access_revision(), None);
         assert!(app.admitted_access().is_none());
+    }
+
+    /// While the GitHub repositories need a person, their remedy is the vault's (a token
+    /// renewed there and synced here), which tells the page nothing: a shown page reads its
+    /// rows again by itself once a minute, and stops once the row no longer needs anyone
+    /// (System State design §3.6).
+    #[test]
+    fn a_shown_page_reads_github_again_while_it_needs_a_person() {
+        use aterm_types::macos_setup::{Observation, Standing, Subject};
+
+        let (mut app, _, _, _, mut saved) = setup(true);
+        saved.selection.set(Setting::Repositories, true);
+        let reading = |standing: Standing| SetupStatus {
+            plan: Some(saved.clone()),
+            observed_vault_url: Some(saved.vault_url.clone()),
+            observed: vec![Observation {
+                subject: Subject::Setting(Setting::Repositories),
+                standing,
+                now: Some("Needs sign-in".into()),
+                after_login: None,
+                wanted: Setting::Repositories.wanted().into(),
+                note: Some("GitHub refuses your token: renew it in the vault".into()),
+                detail: None,
+            }],
+            ..SetupStatus::default()
+        };
+        fresh(&mut app, reading(Standing::NeedsYou));
+        let start = Instant::now();
+        tick(&mut app, start);
+        assert_eq!(reads().len(), 1, "showing the page reads it");
+        for seconds in [1, 30, 59] {
+            tick(&mut app, start + Duration::from_secs(seconds));
+        }
+        assert_eq!(reads().len(), 1, "no sooner than a minute");
+        tick(&mut app, start + PERSON_REREAD);
+        assert_eq!(reads().len(), 2, "a minute on, it reads again");
+        tick(&mut app, start + PERSON_REREAD + Duration::from_secs(1));
+        assert_eq!(reads().len(), 2);
+        tick(&mut app, start + PERSON_REREAD * 2);
+        assert_eq!(reads().len(), 3);
+        // The renewed token synced: the row is in place, and nothing reads it again by itself.
+        fresh(&mut app, reading(Standing::InPlace));
+        for minutes in 3..=6 {
+            tick(&mut app, start + PERSON_REREAD * minutes);
+        }
+        assert_eq!(
+            reads().len(),
+            3,
+            "a settled row is read on focus and Check again alone"
+        );
     }
 
     #[test]
@@ -2994,11 +3578,12 @@ fn refused_actions_show_one_note_and_identical_reads_do_not_repaint() {
     app.attach_system_state_offer(Request::new(Plan::default(), send));
     let completed = fixture_status("set-up").unwrap();
     app.publish_system_state(completed.clone());
+    press(&mut app, wid, view, "system-state/cancel");
     press(&mut app, wid, view, "system-state/restore");
     // Library tests install no handlers: Restore cannot start.
     assert_eq!(
         receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
+        WorkstationSetupDecision::Cancelled
     );
     assert!(app.system_state_host.pending.is_none());
     let refusal = app.system_state_host.action_refusal.clone().unwrap();
@@ -3203,6 +3788,158 @@ fn closing_the_page_never_cancels_and_never_holds_an_update() {
     assert!(app.structural_invariants_ok());
 }
 
+mod closed_startup_review {
+    use super::*;
+    use crate::app_control::ActRequest;
+
+    fn saved_plan() -> Plan {
+        let mut plan = Plan {
+            vault_url: "http://saved.local:7484/v1/team".into(),
+            ..Plan::default()
+        };
+        plan.selection.set(Setting::Dock, false);
+        plan
+    }
+
+    fn changed_plan() -> Plan {
+        let mut plan = saved_plan();
+        plan.selection.set(Setting::Messages, false);
+        plan.selection.set(Setting::FaceTime, false);
+        plan
+    }
+
+    fn act(app: &mut App, view: ViewId, key: &str) -> Result<String, String> {
+        app.act_app(ActRequest {
+            view,
+            ui_key: key.into(),
+            action: key.into(),
+            value: None,
+        })
+    }
+
+    fn review() -> (
+        App,
+        WindowId,
+        AppInstanceId,
+        ViewId,
+        Request,
+        Receiver<crate::SetupAnswer>,
+    ) {
+        let mut app = App::headless_for_test();
+        let (wid, instance, view) = page(&mut app);
+        app.set_system_state_handlers_for_test(InitialSetupHandlers {
+            apply: |plan, typed, password, receipt| {
+                assert_eq!(plan, changed_plan());
+                assert!(!typed && password.is_none());
+                assert_eq!(receipt.admission(), Admission::Client);
+                assert!(receipt.chosen());
+                note("manual apply".into());
+                APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
+                true
+            },
+            ..handlers()
+        });
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(saved_plan(), send);
+        app.attach_system_state_offer(request.clone());
+        // The ordinary status poll can complete while the first-launch review
+        // is still pending. A reopened manual page knows this saved plan at once.
+        fresh(
+            &mut app,
+            SetupStatus {
+                plan: Some(saved_plan()),
+                ..SetupStatus::default()
+            },
+        );
+        assert!(request.pending());
+        (app, wid, instance, view, request, receive)
+    }
+
+    fn close_reopen_and_choose(tick_before_choice: bool) {
+        let (mut app, wid, old_instance, _, request, receive) = review();
+        app.close_active_native_tab(wid).unwrap();
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Unavailable
+        );
+        assert!(!request.pending());
+        assert!(app.native_runtime.app(old_instance).is_none());
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        assert_ne!(instance, old_instance);
+        if tick_before_choice {
+            app.tick_system_state(Instant::now());
+        }
+        calls(); // A shown page's prompt-free read is not a choice.
+
+        // Use the supported controller route before any further host tick.
+        // Its freshly compiled enabled control belongs to this manual page.
+        act(&mut app, view, "system-state/group/3/leave").unwrap();
+        assert_eq!(
+            calls(),
+            ["manual apply"],
+            "the new controller's first choice reaches the manual handler"
+        );
+        act(&mut app, view, "system-state/group/3/leave").unwrap();
+        assert!(
+            calls().is_empty(),
+            "the selected choice is not submitted twice"
+        );
+        assert!(receive.try_recv().is_err(), "the old offer stays ended");
+        receipt().accept();
+        app.resolve_system_state_apply();
+        assert!(app.system_state_host.pending_apply.is_none());
+        assert_eq!(
+            app.system_state_host.latest_status.plan,
+            Some(changed_plan())
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn immediate_reopen_routes_a_fresh_manual_choice_after_final_close() {
+        close_reopen_and_choose(false);
+    }
+
+    #[test]
+    fn a_host_tick_before_the_reopened_choice_is_not_required() {
+        close_reopen_and_choose(true);
+    }
+
+    #[test]
+    fn closing_one_copy_keeps_the_remaining_review_and_its_single_apply() {
+        let (mut app, wid, instance, first, request, receive) = review();
+        let (_, second) = app.stage_system_state_tab(wid).unwrap();
+        assert_ne!(first, second);
+        app.close_active_native_tab(wid).unwrap();
+        assert!(request.pending());
+        assert!(receive.try_recv().is_err());
+        assert_eq!(app.active_native_view(wid), Some((instance, first)));
+
+        act(&mut app, first, "system-state/group/3/leave").unwrap();
+        assert!(calls().is_empty(), "a review's group choice stays a draft");
+        assert!(receive.try_recv().is_err());
+        act(&mut app, first, "system-state/apply").unwrap();
+        let answer = receive.try_recv().unwrap();
+        assert_eq!(
+            answer.decision,
+            WorkstationSetupDecision::Begin(changed_plan())
+        );
+        assert!(answer.chosen);
+        assert!(!answer.vault_typed && answer.password.is_none());
+        answer.receipt.unwrap().accept();
+        app.resolve_system_state_apply();
+        assert!(!request.pending());
+        assert!(act(&mut app, first, "system-state/apply").is_err());
+        assert!(receive.try_recv().is_err());
+        assert!(
+            calls().is_empty(),
+            "the answer uses the original startup channel"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+}
+
 #[test]
 fn shutdown_lets_an_unanswered_offer_go() {
     let mut app = App::headless_for_test();
@@ -3311,6 +4048,7 @@ fn idle_ticks_keep_the_shown_frame() {
     assert!(app.commit_glassless_native_frame(wid));
     let start = Instant::now();
     app.tick_system_state(start);
+    app.tick_system_state(start + Duration::from_secs(30));
     let mut answer = receive.try_recv().unwrap();
     assert!(matches!(
         answer.decision,
@@ -3329,7 +4067,7 @@ fn idle_ticks_keep_the_shown_frame() {
         .presentation_revision;
     // Idle ticks with identical worker snapshots and no input keep the shown frame.
     for tick in 1..=40 {
-        app.tick_system_state(start + Duration::from_millis(tick * 250));
+        app.tick_system_state(start + Duration::from_secs(30) + Duration::from_millis(tick * 250));
         app.publish_system_state(status.clone());
         assert!(app.retained_native_leaf_artifact(wid, view, true).is_some());
         assert_eq!(

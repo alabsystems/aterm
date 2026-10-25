@@ -5,7 +5,7 @@
 //! OSC 133 / OSC 633 shell-integration capability-nonce authority.
 
 /// Host-side authorization state for the OSC 133/633 capability nonce.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct ShellIntegrationAuth {
     /// Host-authorized nonce, or `None` if not yet authorized.
     nonce: Option<[u8; 32]>,

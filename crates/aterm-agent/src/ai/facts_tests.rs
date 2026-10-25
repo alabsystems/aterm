@@ -386,3 +386,52 @@ fn a_clis_own_roster_beside_accounts_toml_is_its_pool_and_names_the_row_to_sign_
         "Claude Code's pool is its accounts view"
     );
 }
+
+#[test]
+fn unreadable_account_state_or_bindings_yield_no_actionable_facts() {
+    use crate::harness::accounts::{Cli, Store};
+    for cli in [Cli::Claude, Cli::Kimi] {
+        for damaged in ["state", "logins"] {
+            let b = machine(&[]);
+            let config = b.dir.path().join("config");
+            std::fs::create_dir_all(&config).unwrap();
+            let path = config.join(cli.accounts().roster_file);
+            std::fs::write(&path,
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"main@example.test\"\n"
+            ).unwrap();
+            let store = Store::at_for(&b.state, cli, &b.home);
+            store.ensure().unwrap();
+            let path = if damaged == "state" {
+                store.state_file()
+            } else {
+                store.logins_file()
+            };
+            std::fs::write(&path, "{").unwrap();
+            let var = |_: &str| None;
+            let m = Machine {
+                now: 1_800_000_000,
+                home: Some(b.home.clone()),
+                var: &var,
+                pkg: Some(b.pkg.clone()),
+                exclude: Vec::new(),
+                records: Records::default(),
+                harness_state: Some(b.state.clone()),
+                roster: Some(config.join("accounts.toml")),
+            };
+            if cli == Cli::Claude {
+                let view = claude_accounts(&m).unwrap();
+                assert!(view.refused.is_some());
+                assert!(view.login.is_none());
+                assert!(!view.made && !view.renews);
+                assert!(view.next_sign_in.is_none());
+            } else {
+                let view = pool_for(&m, cli).unwrap();
+                assert!(view.refused.is_some());
+                assert_eq!(view.rows, 0);
+                assert_eq!(view.enrolled, 0);
+                assert!(view.next.is_none() && view.due.is_empty());
+            }
+            assert_eq!(std::fs::read(path).unwrap(), b"{");
+        }
+    }
+}

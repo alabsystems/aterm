@@ -16,8 +16,8 @@ use aterm_aos::{Digest, TaskIdentity};
 use aterm_time::Instant;
 
 use super::{
-    MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema, NoStrandedLight,
-    PrebuiltMomentum, momentum_identity,
+    MOMENTUM_HOST_MAX_EVENTS, MOMENTUM_MAX_EVENTS, MomentumCode, MomentumEvent, MomentumSchema,
+    NoStrandedLight, PrebuiltMomentum, momentum_identity,
 };
 
 /// The bytes that open a momentum trace file.
@@ -27,6 +27,9 @@ pub const TRACE_FILE_MAGIC: [u8; 8] = *b"AOSMTR\0\x01";
 pub const TRACE_FILE_DOMAIN: &[u8] = b"aterm-aos-momentum-trace-file-v1\0";
 
 const SEAL_LEN: usize = 32;
+
+/// The most bytes a reader that checks traces reads, before it decodes one: at least twice a trace file of one full host log epoch ([`MOMENTUM_HOST_MAX_EVENTS`] inputs and its checkpoint).
+pub const MOMENTUM_TRACE_MAX_BYTES: usize = 1 << 21;
 
 /// An exported trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,6 +296,11 @@ impl MomentumTrace {
     /// [`TraceFault::Checkpoint`], [`TraceFault::Log`], or [`TraceFault::Tail`] for a torn or
     /// unsealed log.
     pub fn read(&self, epoch: Instant) -> Result<ReadTrace, TraceFault> {
+        self.read_at_most(epoch, MOMENTUM_MAX_EVENTS)
+    }
+
+    /// [`Self::read`] refusing, before it decodes an event, a log of more than `max_events` inputs.
+    fn read_at_most(&self, epoch: Instant, max_events: usize) -> Result<ReadTrace, TraceFault> {
         let schema = MomentumSchema::new(epoch);
         let checkpoint = Checkpoint::decode(&self.checkpoint).map_err(TraceFault::Checkpoint)?;
         let (log, tail) = EventLog::decode(
@@ -300,7 +308,7 @@ impl MomentumTrace {
             &self.log,
             &self.identity,
             &checkpoint.digest(),
-            MOMENTUM_MAX_EVENTS,
+            max_events,
         )
         .map_err(TraceFault::Log)?;
         if tail != Tail::Clean {
@@ -328,14 +336,14 @@ impl MomentumTrace {
         )
     }
 
-    /// Refuses a trace whose identity this build does not run ([`TraceFault::Identity`]), then replays it as [`Self::replay`] does and judges the run by the identity's contract.
+    /// Refuses a trace whose identity this build does not run ([`TraceFault::Identity`]) or whose log holds more inputs than one host log epoch ([`MOMENTUM_HOST_MAX_EVENTS`]), then replays it as [`Self::replay`] does and judges the run by the identity's contract.
     /// # Errors
-    /// [`TraceFault::Identity`], then any of [`Self::replay`]'s.
+    /// [`TraceFault::Identity`], [`TraceFault::Log`] for a log past one host epoch, then any of [`Self::replay`]'s.
     pub fn check(&self, epoch: Instant, build: &str) -> Result<TraceCheck, TraceFault> {
         if let Some(m) = self.identity_mismatch(build) {
             return Err(TraceFault::Identity(m));
         }
-        let (read, replay, run) = self.replayed(epoch, build)?;
+        let (read, replay, run) = self.replayed(epoch, build, MOMENTUM_HOST_MAX_EVENTS)?;
         let verdict = NoStrandedLight::new().judge(&read.schema, read.log.inputs(), &run);
         Ok(TraceCheck { replay, verdict })
     }
@@ -347,16 +355,18 @@ impl MomentumTrace {
     /// [`TraceFault::Restore`], [`TraceFault::Refused`], [`TraceFault::State`] or
     /// [`TraceFault::Chain`], in that order.
     pub fn replay(&self, epoch: Instant, build: &str) -> Result<TraceReplay, TraceFault> {
-        self.replayed(epoch, build).map(|(_, replay, _)| replay)
+        self.replayed(epoch, build, MOMENTUM_MAX_EVENTS)
+            .map(|(_, replay, _)| replay)
     }
 
-    /// [`Self::replay`], with the trace it read and the run.
+    /// [`Self::replay`] of a log of at most `max_events` inputs, with the trace it read and the run.
     fn replayed(
         &self,
         epoch: Instant,
         build: &str,
+        max_events: usize,
     ) -> Result<(ReadTrace, TraceReplay, Run<MomentumSchema>), TraceFault> {
-        let read = self.read(epoch)?;
+        let read = self.read_at_most(epoch, max_events)?;
         if let Some(why) = read.log.broken() {
             return Err(TraceFault::Broken { why });
         }

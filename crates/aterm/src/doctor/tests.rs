@@ -1342,6 +1342,28 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         )
     );
 
+    for cli in [
+        aterm_agent::harness::accounts::Cli::Claude,
+        aterm_agent::harness::accounts::Cli::Kimi,
+    ] {
+        for damaged in ["state", "logins"] {
+            let mut unknown = env.clone();
+            unknown.state = root.join(format!("unknown-{cli:?}-{damaged}"));
+            let store = aterm_agent::harness::accounts::Store::at_for(&unknown.state, cli, &home);
+            store.ensure().unwrap();
+            let path = if damaged == "state" {
+                store.state_file()
+            } else {
+                store.logins_file()
+            };
+            std::fs::write(&path, "{").unwrap();
+            assert!(matches!(
+                super::ai_accounts_probe(&unknown),
+                Probe::Unusable { .. }
+            ));
+            assert_eq!(std::fs::read(path).unwrap(), b"{");
+        }
+    }
     std::fs::remove_file(config.join("accounts.toml")).unwrap();
     std::fs::remove_file(config.join("fleet-accounts.toml")).unwrap();
     assert!(matches!(

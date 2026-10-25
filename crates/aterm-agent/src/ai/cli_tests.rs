@@ -593,7 +593,8 @@ fn unknown_inheritance_stops_before_the_real_cli_collects_or_runs() {
 #[test]
 fn login_of_a_pool_cli_that_is_no_connection_runs_its_pools_renewal() {
     let b = machine(&["codex"]);
-    let env = env_of(&b, ONLY_CODEX, &[], true);
+    let mut env = env_of(&b, ONLY_CODEX, &[], true);
+    env.harness_state = Some(b.state.clone());
     let runner = FakeRunner::quiet();
     let (code, out, err) = run_cli(&env, &runner, &["login", "kimi"]);
     assert_eq!(code, 2, "{out}{err}");
@@ -606,6 +607,11 @@ fn login_of_a_pool_cli_that_is_no_connection_runs_its_pools_renewal() {
          email = \"kimi-one@example.com\"\nregion = \"global\"\n",
     )
     .expect("roster");
+    let mut unavailable = env.clone();
+    unavailable.harness_state = None;
+    let (code, out, err) = run_cli(&unavailable, &runner, &["login", "kimi"]);
+    assert_eq!(code, 2, "{out}{err}");
+    assert!(runner.calls().is_empty(), "unknown store starts no login");
     let (code, out, err) = run_cli(&env, &runner, &["login", "kimi"]);
     assert_eq!(code, 0, "{out}{err}");
     let calls = runner.calls();

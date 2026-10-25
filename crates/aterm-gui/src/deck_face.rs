@@ -390,6 +390,8 @@ pub(crate) enum BoxKind {
     Swatch,
     /// A cluster's squares.
     Core,
+    /// The strain gauge's dial, its face's square.
+    Gauge,
 }
 
 /// The boxes a deck painter records while a test asks for them (`Boxes::record`): outside

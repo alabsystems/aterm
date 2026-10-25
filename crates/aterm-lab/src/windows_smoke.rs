@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::linux::Out;
 use crate::linux_proof::{ECHO, dims_are, drew_on_gpu, field, present_summary, reply};
 use crate::paths::paths;
-use crate::windows::{self, Layout, Up, lane_lock, not_run};
+use crate::windows::{self, Layout, Up, not_run};
 use crate::windows_guest::{self as guest, Arch};
 use crate::{Fail, LAB, Res};
 
@@ -223,7 +223,7 @@ type Row = (String, Result<String, String>);
 fn arch_rows(up: &Up, arch: Arch, repo: &Path, results: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
     let name = |what: &str| format!("{} {what}", arch.name());
-    let mut env = guest::cargo_env(arch);
+    let mut env = up.cargo_env(arch);
     env.extend(windows::build_facts(repo));
     let build = [
         "cargo",
@@ -322,7 +322,7 @@ fn version_names_build(text: &str, ok: bool, epoch: &str) -> Result<String, Stri
 pub fn cmd_smoke(args: &[String]) -> Res {
     let arches = parse_args(args)?;
     let l = Layout::find()?;
-    let _lock = lane_lock(&l)?;
+    let _lock = windows::boot_lane(&l)?;
     let results = state_dir()?;
     let up = windows::bring_up(false)?;
     let repo = crate::paths::physical(&paths().repo);

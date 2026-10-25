@@ -110,6 +110,9 @@ pub fn for_each_ngram_bucket_chars(
     use aterm_hash::{FNV64_OFFSET, fnv1a_64_extend};
     /// Per-order salt (odd constant × order) so n-gram orders occupy distinct hash streams.
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+    const SEED_1: u64 = FNV64_OFFSET ^ ORDER_SALT;
+    const SEED_2: u64 = FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2);
+    const SEED_3: u64 = FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3);
 
     #[inline]
     const fn fold(h: u64, cb: [u8; 4]) -> u64 {
@@ -148,7 +151,7 @@ pub fn for_each_ngram_bucket_chars(
             raw
         };
         let cb = (c as u32).to_le_bytes();
-        f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, cb)));
+        f(bucket(fold(SEED_1, cb)));
         count += 1;
         if let Some(h2_p1) = prev1_h2 {
             f(bucket(fold(h2_p1, cb)));
@@ -159,8 +162,8 @@ pub fn for_each_ngram_bucket_chars(
             }
         }
         prev2_h3 = prev1_h3.map(|h3_p1| fold(h3_p1, cb));
-        prev1_h3 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3), cb));
-        prev1_h2 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2), cb));
+        prev1_h3 = Some(fold(SEED_3, cb));
+        prev1_h2 = Some(fold(SEED_2, cb));
     }
     count
 }
@@ -569,12 +572,14 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
     assert_eq!(w2.len(), W2_LEN);
     assert_eq!(b2.len(), TONE_COUNT);
     fn scale_of(t: &[f32]) -> f32 {
+        const INV_127: f32 = 1.0 / 127.0;
         let mx = t.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        if mx > 0.0 { mx / 127.0 } else { 1.0 / 127.0 }
+        if mx > 0.0 { mx * INV_127 } else { INV_127 }
     }
     fn quant(out: &mut Vec<u8>, t: &[f32], scale: f32) {
+        let inv_scale = 1.0 / scale;
         for &x in t {
-            let q = (x / scale).round().clamp(-127.0, 127.0) as i8;
+            let q = (x * inv_scale).round().clamp(-127.0, 127.0) as i8;
             out.push(q as u8);
         }
     }

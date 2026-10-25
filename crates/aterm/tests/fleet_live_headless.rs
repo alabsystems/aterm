@@ -1129,13 +1129,12 @@ fn hold_ends(inst: &Instance, sid: &str) {
     assert!(ended.is_some(), "the remote hold never ended: {last}");
 }
 
-#[test]
-fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
+fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
     let issuer = headless_boot::boot_with(
-        "afri",
+        tags.0,
         |tmp, cmd| {
             fleet_ok(
                 tmp,
@@ -1161,7 +1160,7 @@ fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
     drop(holder);
     let member_port_word = member_port.to_string();
     let member = headless_boot::boot_with(
-        "afrm",
+        tags.1,
         |tmp, cmd| {
             fleet_ok(
                 tmp,
@@ -1177,13 +1176,63 @@ fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
     );
     let (_, worker) = boot_session(&member);
     fleet_reads(&member, &worker, "listening");
-    let target = format!("127.0.0.1:{member_port}");
+    (issuer, member, worker, format!("127.0.0.1:{member_port}"))
+}
+
+#[test]
+fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
+    let (issuer, member, worker, target) = driven_pair(("afri", "afrm"));
     let (took, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "on"]);
     assert_eq!(took.trim(), "OK hold=1", "{took}");
     unloadable(&member.tmp.join("cfg/aterm/aterm.toml"), true);
     fleet_ok(&member.tmp, &["allow", "content"], None);
     hold_ends(&member, &worker);
     drive_refused(&issuer.tmp, &target, &[&format!("@{worker}"), "status"]);
+}
+
+#[test]
+fn a_remote_turn_into_a_shell_with_no_integration_is_submitted_by_one_enter() {
+    let (issuer, member, worker, target) = driven_pair(("afti", "aftm"));
+    let at = format!("@{worker}");
+    assert_eq!(
+        field(&status(&member, &worker), "integration"),
+        Some("off"),
+        "a shell that marks no command block"
+    );
+    // A press window of most of the drive's 20 s turn, and a command silent past it: only the
+    // cursor's move shows the press, however late the echo is read.
+    let (_, verdict) = drive_ok(
+        &issuer.tmp,
+        &target,
+        &[
+            &at,
+            "turn",
+            "submit_window=15000",
+            "sleep 18; echo slow-$((6*7))",
+        ],
+    );
+    assert!(
+        verdict.contains("submitted=1") && !verdict.contains("pressed="),
+        "{verdict}"
+    );
+    ctl_ok(
+        &member,
+        &[&at, "await", "match", "^slow-42", "timeout=60000"],
+    );
+    let after = ctl_ok(
+        &member,
+        &[&at, "turn", "timeout=60000", "echo after-$((6*7))"],
+    );
+    let rows: Vec<&str> = after.lines().collect();
+    let slow = rows
+        .iter()
+        .position(|row| row.starts_with("slow-42"))
+        .unwrap_or_else(|| panic!("the command ran: {after}"));
+    assert!(
+        rows.get(slow + 1)
+            .is_some_and(|row| row.ends_with("echo after-$((6*7))")),
+        "one Enter went in, so no empty prompt follows the command's own: {after}"
+    );
 }
 
 #[test]

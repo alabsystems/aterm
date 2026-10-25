@@ -292,10 +292,19 @@ fn drawn_rows_ref(
                     let sx = texel(x - bx0, aw, w, flip_x).clamp(0, aw_max) as usize;
                     drawn(art.texel(sx, sy))
                 };
-                let span = (lo..hi).find(|&x| opaque(x)).map(|first| {
-                    let last = (first + 1..hi).rev().find(|&x| opaque(x)).unwrap_or(first);
-                    (first, last + 1)
-                });
+                let mut first = lo;
+                while first < hi && !opaque(first) {
+                    first += 1;
+                }
+                let span = if first < hi {
+                    let mut last = hi - 1;
+                    while last > first && !opaque(last) {
+                        last -= 1;
+                    }
+                    Some((first, last + 1))
+                } else {
+                    None
+                };
                 prev_sy = Some((sy, span));
                 span
             }

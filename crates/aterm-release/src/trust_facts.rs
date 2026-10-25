@@ -782,8 +782,8 @@ impl Measured {
                     m.peak = p;
                 }
             }
-            for i in find_all(line, "trust-verify-memory-ceiling-bytes") {
-                let at = i + "trust-verify-memory-ceiling-bytes".len();
+            for i in find_all(line, CEILING_FLAG) {
+                let at = i + CEILING_FLAG.len();
                 if matches!(line.as_bytes().get(at), Some(b'=' | b' ')) {
                     let d = digits_at(line, at + 1);
                     if let Ok(b) = d.parse() {
@@ -1019,11 +1019,22 @@ fn ram_above(x: f64) -> u64 {
     (8.0 * x + 1e-9).trunc() as u64 + 1
 }
 
+/// The `-Z` flag through which `targo trust` gives a verifier its memory ceiling: a prover
+/// whose `trustc -Z help` lists it has one (321aaeda7, store build 9192), and one whose does
+/// not has none (20565c325, store build 15698, which descends from the upstream deletion of
+/// the ceiling).
+pub const CEILING_FLAG: &str = "trust-verify-memory-ceiling-bytes";
+
 /// Host RAM and unknown-process state sampled at the start of a verification run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Host {
     pub mem: u64,
     pub memtotal: bool,
+    /// The prover's trustc takes no memory ceiling ([`CEILING_FLAG`]; the plan's
+    /// `driver-ceiling no`): the RAM / 8 model refuses nothing, and a library is refused up
+    /// front only when its recorded peak, with the margin its check claims, is not below the
+    /// RAM ([`peak_seen`]). A record or plan from before the probe has the ceiling.
+    pub uncapped: bool,
 }
 
 impl Host {
@@ -1037,16 +1048,18 @@ impl Host {
         }
     }
 
-    /// Formats the per-verifier memory ceiling (`RAM / 8` in GiB to one decimal place).
+    /// Formats the per-verifier memory ceiling (`RAM / 8` in GiB to one decimal place): none
+    /// when the RAM is unread or the prover takes no ceiling ([`Host::uncapped`]).
     #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn ceiling(&self) -> Option<String> {
-        (self.mem > 0).then(|| one((self.mem / 8) as f64 / GIB))
+        (self.mem > 0 && !self.uncapped).then(|| one((self.mem / 8) as f64 / GIB))
     }
 
     fn desc(&self) -> String {
         match self.ceiling() {
             Some(c) => format!("{} GiB RAM, verifier ceiling {c} GiB", self.ram_gib()),
+            None if self.mem > 0 => format!("{} GiB RAM, no verifier ceiling", self.ram_gib()),
             None => "memory unreadable".into(),
         }
     }
@@ -1444,6 +1457,78 @@ pub(crate) fn memory_refusal(
     None
 }
 
+/// The [`Seen::outcome`] of a library refused because its last recorded check's peak, with
+/// the margin its check claims, is not below this host's RAM ([`peak_seen`]): its `peak` is
+/// that peak in bytes, its `when` the cost history's stamp.
+pub const PEAK: &str = "peak";
+
+/// A check claims its library's last recorded peak plus a fifth of it, and at least
+/// [`MARGIN_MIN`] more ([`peak_claim`]): one library's recorded peaks moved by 14% between
+/// two runs on one prover (aterm-render, 13.2 GB on 2026-10-22 and 15.0 GB on 2026-10-21).
+const MARGIN_DIV: u64 = 5;
+
+/// The least margin a claim adds to a recorded peak ([`MARGIN_DIV`]).
+const MARGIN_MIN: u64 = 1 << 30;
+
+/// The memory a check of a library whose last recorded check peaked at `maxrss` bytes claims
+/// at the launch gate: that peak and its margin ([`MARGIN_DIV`], [`MARGIN_MIN`]).
+#[must_use]
+pub fn peak_claim(maxrss: u64) -> u64 {
+    maxrss.saturating_add((maxrss / MARGIN_DIV).max(MARGIN_MIN))
+}
+
+/// A library whose last recorded check peaked at `maxrss` bytes (the cost history's largest
+/// process, stamped `when`) so near this host's RAM that its claim ([`peak_claim`]) is not
+/// below it: what is available never reaches all of the RAM, so the launch gate could never
+/// admit it ([`aterm_capacity::never`]), and a peak above the RAM cannot fit at all. It is
+/// refused up front whatever the prover's ceiling. `None` when its claim is below the RAM,
+/// or the RAM is unread.
+#[must_use]
+pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
+    (host.mem > 0 && peak_claim(maxrss) >= host.mem).then(|| Seen {
+        outcome: PEAK.into(),
+        ceil: "-".into(),
+        peak: maxrss.to_string(),
+        when: if when.is_empty() {
+            "-".into()
+        } else {
+            when.into()
+        },
+    })
+}
+
+/// The one line a [`PEAK`] refusal says: the peak, its date and this host's RAM, and the
+/// claim when the peak itself is below the RAM. Its token is the claim, the RAM a host
+/// needs to admit it. `None` for any other [`Seen`].
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refusal> {
+    let peak: u64 = seen.peak.parse().ok().filter(|_| seen.outcome == PEAK)?;
+    let claim = peak_claim(peak);
+    let gb = |b: u64| b as f64 / 1e9;
+    let on = match seen.when.get(..10) {
+        Some(day) if seen.when != "-" => format!(" on {day}"),
+        _ => String::new(),
+    };
+    let ram = format!("{:.1} GB ({} GiB) of RAM", gb(host.mem), host.ram_gib());
+    let why = if peak > host.mem {
+        format!(
+            "its last check peaked at {:.2} GB{on}, above this host's {ram}",
+            gb(peak)
+        )
+    } else {
+        format!(
+            "its last check peaked at {:.2} GB{on}, and with its margin it claims {:.2} GB, not below this host's {ram}, which the launch gate never has available",
+            gb(peak),
+            gb(claim)
+        )
+    };
+    Some(Refusal {
+        line: format!("{name} not verified here: {why}"),
+        token: format!("~{}", one(claim as f64 / GIB)),
+        sure: None,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 struct Census {
     peak: Option<String>,
@@ -1718,6 +1803,10 @@ impl Facts {
             "host-mem-os {}\n",
             if self.host.memtotal { "MemTotal" } else { "-" }
         ));
+        out.push_str(&format!(
+            "driver-ceiling {}\n",
+            if self.host.uncapped { "no" } else { "yes" }
+        ));
         out.push_str(&format!("measured-at {}\n", one_line(&self.measured_at)));
         for v in &self.vanished {
             out.push_str(&format!("vanished {}\n", one_line(v)));
@@ -1853,6 +1942,7 @@ impl Facts {
                         _ => return None,
                     };
                 }
+                "driver-ceiling" => f.host.uncapped = ceiling_word(v)?,
                 "measured-at" => f.measured_at = v.to_string(),
                 "vanished" => f.vanished.push(v.to_string()),
                 "ambiguous" => {
@@ -2281,6 +2371,8 @@ pub fn judge(
     let (mut queued_what, mut skipped_what) = (String::new(), String::new());
     let (mut mem_what, mut memory) = (String::new(), Vec::new());
     let (mut mem_ram, mut mem_ram_unknown) = (None::<u64>, false);
+    // Those refused for a peak above this host's RAM, whose fitting RAM no ceiling says.
+    let mut peak_n = 0usize;
     let mut note_ram = |sure: Option<u64>| match sure {
         None => mem_ram_unknown = true,
         Some(r) => mem_ram = Some(mem_ram.map_or(r, |m: u64| m.max(r))),
@@ -2295,7 +2387,10 @@ pub fn judge(
             Decision::Memory(seen) => {
                 mem_what.push_str(&format!(" {}", c.name));
                 skipped_what.push_str(&format!(" {} (memory)", c.name));
-                let r = memory_refusal(&host, &c.name, true, &c.memory, seen.as_ref())
+                let peak = seen.as_ref().and_then(|s| peak_refusal(&host, &c.name, s));
+                let by_peak = peak.is_some();
+                let r = peak
+                    .or_else(|| memory_refusal(&host, &c.name, true, &c.memory, seen.as_ref()))
                     .unwrap_or_else(|| Refusal {
                         line: format!(
                             "{} not verified here: this host gives {} ({})",
@@ -2309,7 +2404,11 @@ pub fn judge(
                     });
                 mem_notes.push(format!("MEMORY: {}", r.line));
                 memory.push((c.name.clone(), r.token, r.sure));
-                note_ram(r.sure);
+                if by_peak {
+                    peak_n += 1;
+                } else {
+                    note_ram(r.sure);
+                }
             }
             Decision::Gate(_) => gated += 1,
             Decision::NoLib | Decision::Ambiguous => {}
@@ -2872,6 +2971,10 @@ pub fn judge(
             "HOST: {} GiB RAM, verifier ceiling {c} GiB per library (targo trust: RAM / 8)\n",
             host.ram_gib()
         )),
+        None if host.mem > 0 => out.push_str(&format!(
+            "HOST: {} GiB RAM, no verifier ceiling (this prover's trustc takes none): refused up front only for a recorded peak whose claim is not below the RAM\n",
+            host.ram_gib()
+        )),
         None => out.push_str("HOST: memory unreadable, nothing refused up front\n"),
     }
     if gated > 0 {
@@ -2987,18 +3090,41 @@ pub fn judge(
             format!("VERDICT: COULD NOT RUN — {}", said.join("; and ")),
         )
     } else if memory_n > 0 {
-        let ram_all = match (mem_ram, mem_ram_unknown) {
-            (None, _) if memory_n == 1 => {
-                "no RAM is known to verify it (its floor records no ceiling)".to_string()
+        let ceiling_n = memory_n.saturating_sub(peak_n);
+        let by_ceiling = match (mem_ram, mem_ram_unknown) {
+            _ if ceiling_n == 0 => None,
+            (None, _) if ceiling_n == 1 => {
+                Some("no RAM is known to verify it (its floor records no ceiling)".to_string())
             }
-            (None, _) => "no RAM is known to verify them (no floor of theirs records its ceiling)"
-                .to_string(),
-            (Some(r), true) => {
-                format!("{r} GiB of RAM verifies those whose floor records its ceiling")
-            }
-            (Some(r), false) if memory_n == 1 => format!("{r} GiB of RAM verifies it"),
-            (Some(r), false) => format!("{r} GiB of RAM verifies them all"),
+            (None, _) => Some(
+                "no RAM is known to verify them (no floor of theirs records its ceiling)"
+                    .to_string(),
+            ),
+            (Some(r), true) => Some(format!(
+                "{r} GiB of RAM verifies those whose floor records its ceiling"
+            )),
+            (Some(r), false) if ceiling_n == 1 => Some(format!("{r} GiB of RAM verifies it")),
+            (Some(r), false) => Some(format!("{r} GiB of RAM verifies them all")),
         };
+        let by_peak = match peak_n {
+            0 => None,
+            1 if ceiling_n == 0 => Some(
+                "it needs a host with more RAM than its recorded peak and its margin".to_string(),
+            ),
+            1 => Some(
+                "the one refused for its peak needs a host with more RAM than that peak and its margin"
+                    .to_string(),
+            ),
+            _ => Some(
+                "each refused for its peak needs a host with more RAM than that peak and its margin"
+                    .to_string(),
+            ),
+        };
+        let ram_all = [by_ceiling, by_peak]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
         let fit = if gated_n > 0 {
             "; nothing that fit failed"
         } else {
@@ -3217,6 +3343,16 @@ pub fn facts_key(tree_sans_floors: &str, prover: &str, lane: &str) -> String {
     hex(&Sha256::digest(material.as_bytes()))
 }
 
+/// Whether a `driver-ceiling` word says the prover takes no memory ceiling
+/// ([`Host::uncapped`]): `yes` it takes one, `no` it does not.
+fn ceiling_word(v: &str) -> Option<bool> {
+    match v {
+        "yes" => Some(false),
+        "no" => Some(true),
+        _ => None,
+    }
+}
+
 /// Parsed `.plan` file written at the start of a verification lane run.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
@@ -3283,6 +3419,9 @@ impl Plan {
                 "remeasure" => p.remeasure = v == "1",
                 "host-mem" => p.facts.host.mem = v.parse().map_err(|_| bad())?,
                 "host-mem-os" => p.facts.host.memtotal = v == "MemTotal",
+                "driver-ceiling" => p.facts.host.uncapped = ceiling_word(v).ok_or_else(bad)?,
+                // The host's one-minute load as the run began and as it ended: provenance only.
+                "load-start" | "load-end" => {}
                 "now" => p.facts.measured_at = v.into(),
                 "memory" => {
                     let f: Vec<&str> = v.split('\t').collect();
@@ -3357,7 +3496,14 @@ impl Plan {
     }
 
     /// Evaluates up-front memory admission for all crates and returns the rewritten plan text.
-    pub fn admit(&self) -> std::result::Result<(String, Vec<(String, String)>), String> {
+    /// `peaks` is each library's last recorded check from the cost history: its largest
+    /// process's peak RSS in bytes and when it was recorded. A peak whose claim is not below
+    /// this host's RAM is refused whatever the prover ([`peak_seen`]); the RAM / 8 model
+    /// refuses only under a prover that takes a ceiling ([`Host::uncapped`]).
+    pub fn admit(
+        &self,
+        peaks: &BTreeMap<String, (u64, String)>,
+    ) -> std::result::Result<(String, Vec<(String, String)>), String> {
         let shown = self.memory.display().to_string();
         let text = fs::read_to_string(&self.memory)
             .map_err(|_| format!("memory record {shown} is missing"))?;
@@ -3381,6 +3527,19 @@ impl Plan {
                 lines.push_str(&format!("memory {}\t{}\n", one_line(&c.name), row.fields()));
             }
             if !matches!(c.decision, Decision::Gate(_)) || self.try_refused {
+                continue;
+            }
+            if let Some(seen) = peaks
+                .get(&c.name)
+                .and_then(|(rss, when)| peak_seen(&self.facts.host, *rss, when))
+                && let Some(r) = peak_refusal(&self.facts.host, &c.name, &seen)
+            {
+                lines.push_str(&format!(
+                    "refused {}\t{}\n",
+                    one_line(&c.name),
+                    seen.fields()
+                ));
+                refused.push((c.name.clone(), r.line));
                 continue;
             }
             let floor = floor_of(ratchet.as_deref(), &c.name)
@@ -3663,10 +3822,27 @@ pub fn remeasured(base: &Facts, again: &Facts) -> std::result::Result<Facts, Str
         ));
     }
     if again.host != base.host {
-        return Err(format!(
-            "the stored record was measured on a host with {} bytes of memory, and this run on one with {}",
-            base.host.mem, again.host.mem
-        ));
+        let ceiling = |h: &Host| {
+            if h.uncapped {
+                "no verifier ceiling"
+            } else {
+                "a verifier ceiling"
+            }
+        };
+        return Err(
+            if again.host.mem == base.host.mem && again.host.uncapped != base.host.uncapped {
+                format!(
+                    "the stored record was measured under a prover with {}, and this run under one with {}",
+                    ceiling(&base.host),
+                    ceiling(&again.host)
+                )
+            } else {
+                format!(
+                    "the stored record was measured on a host with {} bytes of memory, and this run on one with {}",
+                    base.host.mem, again.host.mem
+                )
+            },
+        );
     }
     if again.driver_id != base.driver_id {
         return Err(format!(
@@ -5547,7 +5723,7 @@ mod tests {
             };
             f.host = Host {
                 mem: 8 * 1_073_741_824,
-                memtotal: false,
+                ..Host::default()
             };
             f.measured_at = "2026-09-30T00:00:00Z".into();
             judge(&f, Some(&floor), None, "R", "M", reason)
@@ -6447,6 +6623,13 @@ mod tests {
         let mut other_host = again.clone();
         other_host.host.mem = 1;
         assert!(remeasured(&base, &other_host).unwrap_err().contains("host"));
+        let mut other_ceiling = again.clone();
+        other_ceiling.host.uncapped = !again.host.uncapped;
+        assert!(
+            remeasured(&base, &other_ceiling)
+                .unwrap_err()
+                .contains("verifier ceiling")
+        );
         let mut other_driver = again.clone();
         other_driver.driver_id = "targo 2".into();
         assert!(
@@ -6468,7 +6651,7 @@ mod tests {
     fn host(gib: u64) -> Host {
         Host {
             mem: gib * 1_073_741_824,
-            memtotal: false,
+            ..Host::default()
         }
     }
 
@@ -6678,6 +6861,19 @@ mod tests {
         assert_eq!(Facts::parse(&text), Some(f.clone()));
         assert_eq!(
             Facts::parse(&text.replace(FACTS_MAGIC, "aterm-trust facts 4")),
+            None
+        );
+        // Whether the prover took a ceiling is kept; a record from before the probe had one.
+        assert!(text.contains("\ndriver-ceiling yes\n"), "{text}");
+        let mut open = f.clone();
+        open.host.uncapped = true;
+        assert_eq!(Facts::parse(&open.to_record()), Some(open));
+        assert_eq!(
+            Facts::parse(&text.replace("driver-ceiling yes\n", "")),
+            Some(f.clone())
+        );
+        assert_eq!(
+            Facts::parse(&text.replace("driver-ceiling yes", "driver-ceiling maybe")),
             None
         );
         let v = judge(

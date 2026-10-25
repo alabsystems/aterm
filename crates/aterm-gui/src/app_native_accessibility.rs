@@ -1074,8 +1074,7 @@ mod tests {
             Standing::Differs | Standing::Failed => repositories.now = Some("3 of 12".into()),
             Standing::Waiting => {
                 repositories.now = None;
-                repositories.note =
-                    Some("Waits for your GitHub token from the Secrets vault".into());
+                repositories.note = Some("Waits for the vault to finish syncing this Mac".into());
             }
             _ => {}
         }
@@ -1419,6 +1418,17 @@ mod tests {
             for setting in Group::Input.settings() {
                 expected.selection.set(*setting, false);
             }
+            let apply = if by_offer {
+                assert!(
+                    APPLIED.with(|applied| applied.borrow().is_empty()),
+                    "the current offer's group press edits only its review draft"
+                );
+                let apply = publish_vault_action(&mut app, wid, view, "system-state/apply", None);
+                app.on_native_accessibility_action(wid, apply.clone());
+                Some(apply)
+            } else {
+                None
+            };
             assert_eq!(
                 APPLIED.with(|applied| std::mem::take(&mut *applied.borrow_mut())),
                 [expected.clone()],
@@ -1431,6 +1441,9 @@ mod tests {
                 ..crate::SetupStatus::default()
             });
             app.on_native_accessibility_action(wid, fresh);
+            if let Some(apply) = apply {
+                app.on_native_accessibility_action(wid, apply);
+            }
             assert!(
                 APPLIED.with(|applied| applied.borrow().is_empty()),
                 "a press already taken cannot submit a second time"

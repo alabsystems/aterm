@@ -172,6 +172,7 @@ impl CursorGlow {
         let ft = &self.frame_text;
         let mut rows = std::mem::take(&mut self.keep_rows_scratch);
         rows.clear();
+        let mut last_ground: Option<(u32, bool)> = None;
         for i in 0..ft.rows.len() {
             let row = ft.lo + i as i32;
             if Some(row) == caret_row {
@@ -184,30 +185,25 @@ impl CursorGlow {
                 .unwrap_or_default();
             let mut run: Option<i32> = None;
             let mut span: Option<(i32, i32)> = None;
-            let mut last_ground: Option<(u32, bool)> = None;
-            let end = ft.col0 + ft.cols as i32;
-            for col in ft.col0..=end {
-                let held = row_pairs
-                    .get((col - ft.col0) as usize)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|(ink, ground)| {
-                        if ink.is_some() {
-                            return true;
+            for (idx, pair) in row_pairs.iter().copied().enumerate() {
+                let col = ft.col0 + idx as i32;
+                let held = pair.is_some_and(|(ink, ground)| {
+                    if ink.is_some() {
+                        return true;
+                    }
+                    let g = ground & 0x00FF_FFFF;
+                    if g == page {
+                        return false;
+                    }
+                    match last_ground {
+                        Some((prev_g, prev_held)) if prev_g == g => prev_held,
+                        _ => {
+                            let h = !super::emit::reads_as_page(g, page);
+                            last_ground = Some((g, h));
+                            h
                         }
-                        let g = ground & 0x00FF_FFFF;
-                        if g == page {
-                            return false;
-                        }
-                        match last_ground {
-                            Some((prev_g, prev_held)) if prev_g == g => prev_held,
-                            _ => {
-                                let h = !super::emit::reads_as_page(g, page);
-                                last_ground = Some((g, h));
-                                h
-                            }
-                        }
-                    });
+                    }
+                });
                 match (held, run) {
                     (true, None) => run = Some(col),
                     (false, Some(c0)) => {
@@ -217,6 +213,11 @@ impl CursorGlow {
                     }
                     _ => {}
                 }
+            }
+            if let Some(c0) = run {
+                let col = ft.col0 + row_pairs.len() as i32;
+                boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
+                span = Some(span.map_or((c0, col), |(a, _)| (a, col)));
             }
             // For a dark train the span reaches a cell past the row's last
             // letter, where its caret stood when it was typed: a Return's

@@ -8,12 +8,30 @@ use aterm_machines::items::Ctx;
 use aterm_machines::model::Mode;
 use aterm_machines::port::System;
 
+/// Why aterm sets up no repositories on this Mac, whatever it tries again: it sets them up for
+/// the one user account a Mac has, and this one has another number of them. In the page's
+/// words, which `aterm doctor` prints too.
+const ONE_USER: &str = "aterm sets up GitHub repositories only on a Mac with one user account.";
+
+/// Whether the repositories failed for good on this Mac ([`ONE_USER`]): no retry, no vault and
+/// no sign-in changes the number of its user accounts.
+fn failed_for_good(ctx: &Ctx) -> bool {
+    ctx.users.len() != 1
+}
+
 pub(super) fn run(
     sys: &dyn System,
     ctx: &Ctx,
     vault: Option<&Plan>,
     mode: Mode,
 ) -> Result<Vec<Row>, String> {
+    if failed_for_good(ctx) {
+        return Ok(vec![Row {
+            name: Stage::Repositories.name().into(),
+            status: aterm_types::macos_setup::FAILED_FOR_GOOD.into(),
+            detail: ONE_USER.into(),
+        }]);
+    }
     Ok(match items(sys, ctx, vault, mode)? {
         Some(rows) => item_rows(rows),
         None => vec![readiness_row(
@@ -30,6 +48,13 @@ pub(super) fn observe(
     vault: Option<&Plan>,
 ) -> Result<aterm_types::macos_setup::Observation, String> {
     use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
+    if failed_for_good(ctx) {
+        return Ok(Observation {
+            standing: Standing::Failed,
+            detail: Some(ONE_USER.into()),
+            ..Observation::unknown(Subject::Setting(Setting::Repositories))
+        });
+    }
     Ok(match items(sys, ctx, vault, Mode::Plan)? {
         Some(rows) => aterm_machines::init_observe::observation(
             Setting::Repositories,
@@ -265,7 +290,9 @@ mod tests {
             };
             sys.stat_fails(missing.to_str().unwrap(), std::io::ErrorKind::NotFound);
             let seen = observe(&sys, &ctx, Some(&plan)).unwrap();
-            assert_eq!(seen.standing, Standing::Waiting, "{wait:?}");
+            // Each needs a person (a token in the vault, Apple's tools): never a wait the run
+            // retries (System State design §3.6).
+            assert_eq!(seen.standing, Standing::NeedsYou, "{wait:?}");
             assert_eq!(seen.note.as_deref(), Some(wait.note()), "{wait:?}");
             assert!(
                 !sys.calls()
@@ -275,5 +302,91 @@ mod tests {
                 sys.calls()
             );
         }
+    }
+
+    /// A token GitHub refuses is a person's to renew in the vault, never a wait the run retries
+    /// (System State design §3.6): the row needs you, signing in, with the remedy as its note,
+    /// and the run's row for it parks the run instead of trying it again a minute later.
+    #[test]
+    fn a_token_github_refuses_needs_you_and_parks_the_run() {
+        use aterm_machines::init_observe::Wait;
+        use aterm_machines::port::GithubFailure;
+        use aterm_types::macos_setup::Standing;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        joined(&home, &root.path().join("team.secrets"));
+        let (sys, ctx) = fake(&home);
+        sys.fail_github_api(&ctx.users[0], "/user", GithubFailure::Unauthenticated);
+        // GitHub signs the token in once, then refuses it: it expired between two reads.
+        let first = observe(&sys, &ctx, None).unwrap();
+        assert_ne!(first.standing, Standing::NeedsYou, "{first:?}");
+        assert!(
+            sys.calls()
+                .iter()
+                .any(|call| call.ends_with(" agh GET /user")),
+            "{:?}",
+            sys.calls()
+        );
+        let seen = observe(&sys, &ctx, None).unwrap();
+        assert_eq!(
+            (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
+            (
+                Standing::NeedsYou,
+                Some("Needs sign-in"),
+                Some(Wait::TokenRefused.note())
+            )
+        );
+        let rows = run(&sys, &ctx, None, Mode::Plan).unwrap();
+        assert!(
+            !rows.is_empty() && rows.iter().all(|row| row.status == super::super::WAITING),
+            "{rows:?}"
+        );
+        assert_eq!(
+            super::super::SetupNext::of(&rows),
+            super::super::SetupNext::Park
+        );
+    }
+
+    /// A Mac with another number of user accounts than one is no Mac aterm sets repositories
+    /// up on, whatever it tries again (System State design §3.6): the run says it failed for
+    /// good, which parks it, and the row reads failed with the same words, asking nothing of
+    /// GitHub or the vault.
+    #[test]
+    fn a_mac_with_two_user_accounts_fails_the_repositories_for_good() {
+        use aterm_types::macos_setup::{FAILED_FOR_GOOD, FailureKind, Standing};
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        joined(&home, &root.path().join("team.secrets"));
+        let (sys, mut ctx) = fake(&home);
+        let other = User {
+            name: "other".into(),
+            uid: 502,
+            home: root.path().join("other").to_string_lossy().into_owned(),
+            ..ctx.users[0].clone()
+        };
+        ctx.users.push(other);
+        let rows = run(&sys, &ctx, None, Mode::Apply).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
+                .collect::<Vec<_>>(),
+            [("GitHub repositories", FAILED_FOR_GOOD, ONE_USER)]
+        );
+        assert_eq!(
+            FailureKind::of_status(&rows[0].status),
+            Some(FailureKind::ForGood)
+        );
+        let seen = observe(&sys, &ctx, None).unwrap();
+        assert_eq!(
+            (seen.standing, seen.detail.as_deref()),
+            (Standing::Failed, Some(ONE_USER))
+        );
+        assert!(
+            sys.calls().iter().all(|call| !call.contains(" agh ")),
+            "{:?}",
+            sys.calls()
+        );
     }
 }

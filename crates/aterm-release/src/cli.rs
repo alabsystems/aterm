@@ -185,7 +185,7 @@ USAGE
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
         [--update-ratchet] [--try-refused] [--obligations|--no-obligations] [--stop-if-narrowed]
-        [--no-wait]
+        [--no-wait] [--admit wait|now]
                            the Trust lane: `targo trust check -p <lib> --lib
                            --allow-l0-gaps` over the named libraries (-p <lib>
                            also selects its <lib>+<feature> rows, one for each
@@ -193,16 +193,33 @@ USAGE
                            every workspace library and vendored fork
                            (--whole-tree), or what this tree's stored facts
                            left undecided (--remeasure). Each check runs in its
-                           own slot (--jobs; default sized from cores and
-                           memory) under --target-root (default
+                           own slot (--jobs; default one per 6 cores) under
+                           --target-root (default
                            <repo>/target-trust.noindex, else a per-user cache
                            directory; one run at a time: another run on it
                            waits for the one that holds it, naming its pid,
                            scope, checkout and since when, as the wait starts
                            and once a minute, and --no-wait is COULD NOT RUN at
-                           once instead, naming it), is ended OVER-BUDGET at
+                           once instead, naming it; the run then claims the
+                           disk its runs there write, what the last ones wrote
+                           else 6 GiB less what the root holds, and waits for
+                           room, a line a minute naming the need and the
+                           holders, unless --admit now), is ended OVER-BUDGET at
                            --crate-budget (default 21600 s), and is held to
-                           crates/aterm-release/trust/floors.tsv. --prover names
+                           crates/aterm-release/trust/floors.tsv. A check starts
+                           once the capacity ledger admits its memory
+                           claim (its library's last recorded peak and a fifth
+                           more, at least 1 GiB more; with none recorded
+                           16 GiB, or half the RAM where that is less): until
+                           then it waits, naming the shortfall and each holder
+                           once a minute (`aterm pkg capacity` lists the
+                           claims), and --admit now starts it at once. A
+                           library whose claim is not below the RAM, which is
+                           never all available, is refused up front, and under
+                           --try-refused its check starts at once, holding its
+                           claim; the RAM / 8 ceiling model refuses only under a
+                           prover whose `trustc -Z help` lists the ceiling
+                           flag. --prover names
                            another toolchain's bin/ (an absolute path). A
                            whole-tree run on a clean checkout files the facts
                            `trust judge` reads. --update-ratchet raises the floors

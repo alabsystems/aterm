@@ -734,12 +734,18 @@ impl Terminal {
     /// Rebuild a fully-living [`Terminal`] from a checkpoint.
     #[must_use]
     pub fn from_checkpoint(c: &TerminalCheckpoint) -> Terminal {
+        Self::from_checkpoint_onto(c, None)
+    }
+
+    /// [`Self::from_checkpoint`] with the main grid's tiered store unbounded (`store_lines` `None`) or kept to `store_lines` lines.
+    fn from_checkpoint_onto(c: &TerminalCheckpoint, store_lines: Option<usize>) -> Terminal {
         let on_alt = c.modes.alternate_screen;
-        let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
+        let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt, store_lines);
         active_grid.continue_absolute_numbering(c.absolute_row_counter);
         let saved_grid = match (&c.alt_grid, &c.alt_cursor) {
             (Some(alt_bytes), Some(alt_cursor)) => {
-                let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);
+                let mut saved =
+                    restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt, store_lines);
                 saved.continue_absolute_numbering(c.alt_absolute_row_counter);
                 Some(saved)
             }
@@ -752,6 +758,14 @@ impl Terminal {
     #[must_use]
     pub fn replay_from_checkpoint(c: &TerminalCheckpoint) -> Terminal {
         let mut terminal = Self::from_checkpoint(c);
+        terminal.holder_carried_at = None;
+        terminal
+    }
+
+    /// [`Self::replay_from_checkpoint`] with the main grid's tiered store kept to `store_lines` lines past its ring, so [`Self::replay_fork`] copies it in bounded time.
+    #[must_use]
+    pub fn replay_from_checkpoint_bounded(c: &TerminalCheckpoint, store_lines: usize) -> Terminal {
+        let mut terminal = Self::from_checkpoint_onto(c, Some(store_lines));
         terminal.holder_carried_at = None;
         terminal
     }
@@ -780,6 +794,8 @@ impl Terminal {
         let mut fork = Self::restored(&scalars, active, inactive);
         fork.program_state = self.program_state;
         fork.holder_fence.clone_from(&self.holder_fence);
+        fork.shell_integration_auth
+            .clone_from(&self.shell_integration_auth);
         let since = |at: u64| t.screen_mutations.wrapping_sub(at);
         fork.holder_carried_at = self
             .holder_carried_at
@@ -843,12 +859,12 @@ impl Terminal {
         let configured_scrollback_limit = self.scrollback_line_limit();
         self.release_search_index();
         let on_alt = c.modes.alternate_screen;
-        self.grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
+        self.grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt, None);
         self.grid
             .continue_absolute_numbering(c.absolute_row_counter);
         self.alt_grid = match (&c.alt_grid, &c.alt_cursor) {
             (Some(alt_bytes), Some(alt_cursor)) => {
-                let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);
+                let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt, None);
                 saved.continue_absolute_numbering(c.alt_absolute_row_counter);
                 Some(saved)
             }
@@ -1224,7 +1240,14 @@ const fn main_counter(c: &TerminalCheckpoint) -> u64 {
     }
 }
 
-fn restore_grid(rows: u16, cols: u16, bytes: &[u8], cursor: &GridCursorRepr, is_alt: bool) -> Grid {
+fn restore_grid(
+    rows: u16,
+    cols: u16,
+    bytes: &[u8],
+    cursor: &GridCursorRepr,
+    is_alt: bool,
+    store_lines: Option<usize>,
+) -> Grid {
     let lines = deserialize_lines(bytes);
     let visible_start = lines.len().saturating_sub(rows as usize);
     let (scrollback_lines, visible_lines) = lines.split_at(visible_start);
@@ -1235,7 +1258,7 @@ fn restore_grid(rows: u16, cols: u16, bytes: &[u8], cursor: &GridCursorRepr, is_
         Grid::with_scrollback(rows, cols, 0)
     } else {
         let mut scrollback = Scrollback::with_defaults();
-        scrollback.set_line_limit(None);
+        scrollback.set_line_limit(store_lines);
         for line in scrollback_lines {
             // push_line is infallible for the in-memory tier.
             scrollback.push_line(line.clone());

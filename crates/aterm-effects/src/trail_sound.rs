@@ -1756,7 +1756,8 @@ impl TrailSynth {
 
     #[inline]
     const fn open_next_phrase(&mut self) {
-        self.phrase_idx = (self.phrase_idx + 1) % (SONG_FORM.len() as u8 - 1);
+        const _: () = assert!((SONG_FORM.len() - 1).is_power_of_two());
+        self.phrase_idx = (self.phrase_idx + 1) & (SONG_FORM.len() as u8 - 2);
         self.theme_pos = SONG_FORM[self.phrase_idx as usize];
     }
 
@@ -2121,7 +2122,7 @@ impl TrailSynth {
                 lp_cut: 4200.0,
                 ..Voice::default()
             };
-            let pan = ev.pan + 0.22 * if i % 2 == 0 { -1.0 } else { 1.0 };
+            let pan = ev.pan + 0.22 * if i & 1 == 0 { -1.0 } else { 1.0 };
             self.spawn(v, g * (0.5 - 0.12 * i as f32), pan);
         }
         let low = self.melody_hz(LAND_ANCHOR_HZ * 0.25, self.walk);
@@ -2607,8 +2608,9 @@ impl TrailSynth {
             }
         }
         self.last_riff_sig = Some(sig);
+        const _: () = assert!(CELEBRATION_PHRASE_BARS.is_power_of_two());
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
-        let idx = usize::from(bar) % CELEBRATION_PHRASE_BARS;
+        let idx = usize::from(bar) & (CELEBRATION_PHRASE_BARS - 1);
         let phrase = &celebration_bar_degrees(sig, idx);
         let bass_bar = &CELEBRATION_BASS[idx];
         let shift = celebration_root(sig) + celebration_mode(sig);

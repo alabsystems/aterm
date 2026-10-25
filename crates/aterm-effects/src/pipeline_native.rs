@@ -1079,8 +1079,11 @@ impl EffectsPipeline {
     /// The rain engine, when one is built.
     #[inline]
     #[must_use]
-    pub fn rain(&self) -> Option<&MatrixRain> {
-        self.rain.as_deref()
+    pub const fn rain(&self) -> Option<&MatrixRain> {
+        match &self.rain {
+            Some(rain) => Some(&**rain),
+            None => None,
+        }
     }
 
     /// The rain engine, built with `cfg` unless one exists.
@@ -1092,8 +1095,11 @@ impl EffectsPipeline {
     /// The rain engine, for the host's notes into it (a config reload, the agent-output and focus
     /// notes).
     #[inline]
-    pub fn rain_mut(&mut self) -> Option<&mut MatrixRain> {
-        self.rain.as_deref_mut()
+    pub const fn rain_mut(&mut self) -> Option<&mut MatrixRain> {
+        match &mut self.rain {
+            Some(rain) => Some(&mut **rain),
+            None => None,
+        }
     }
 
     /// A layout re-grid: the rain keeps its engine (so opening a split does not kill the window's
@@ -1216,8 +1222,11 @@ impl EffectsPipeline {
     /// The single grid's output-streak engine, when one is built.
     #[inline]
     #[must_use]
-    pub fn streak(&self) -> Option<&OutputStreak> {
-        self.streak.as_deref()
+    pub const fn streak(&self) -> Option<&OutputStreak> {
+        match &self.streak {
+            Some(streak) => Some(&**streak),
+            None => None,
+        }
     }
 
     /// Prism wake on one grid, appended to the window's nova channel after the word pass (the

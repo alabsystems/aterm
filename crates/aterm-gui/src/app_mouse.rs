@@ -1651,8 +1651,8 @@ impl App {
         // to text: rows are trailing-trimmed, so a painted selection over blank cells
         // resolves to `None`, and falling through would copy a sibling pane the user never
         // touched (on every drag, with `copy_on_select` on).
-        if let Some(terminal) = self.front_terminal(wid) {
-            let term = term_lock(&terminal.term);
+        if let Some((term, _)) = self.front_shown(wid) {
+            let term = term_lock(&term);
             if term.text_selection().has_selection() {
                 return term.selection_to_string();
             }
@@ -1664,10 +1664,10 @@ impl App {
             else {
                 continue;
             };
-            let Some(session) = self.pool.get(view.session) else {
+            let Some(term) = self.pool.shown_term(view.session) else {
                 continue;
             };
-            let term = term_lock(&session.term);
+            let term = term_lock(&term);
             if term.text_selection().has_selection() {
                 return term.selection_to_string();
             }
@@ -3034,6 +3034,10 @@ impl App {
         let window_row = window_cell.0;
         let cell_is_under_pointer = self.pointer_is_inside_focused_pane(wid)
             && !self.chrome_owns_terminal_row(wid, usize::from(window_row));
+        if self.rewound_front(wid).is_some() {
+            self.set_hover_cursor(wid, CursorIcon::Text, false, true);
+            return Resolved(None);
+        }
         let Some((term, session)) = self
             .front_terminal(wid)
             .map(|terminal| (terminal.term.clone(), terminal.session))
@@ -3542,10 +3546,7 @@ impl App {
 
     /// Mid-drag: grow the selection to the hovered viewport cell.
     pub(crate) fn drag_selection(&mut self, wid: WindowId, row: u16, col: u16) {
-        let Some(term) = self
-            .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
-        else {
+        let Some((term, _)) = self.front_shown(wid) else {
             return;
         };
         let Some(fws) = self.windows.get_mut(&wid) else {
@@ -3874,10 +3875,7 @@ impl App {
 
     /// Single press with mouse tracking off.
     pub(crate) fn begin_selection(&mut self, wid: WindowId, kind: SelectionType) {
-        let Some(term) = self
-            .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
-        else {
+        let Some((term, _)) = self.front_shown(wid) else {
             return;
         };
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -3939,10 +3937,7 @@ impl App {
         wid: WindowId,
         suppress_copy_on_select: bool,
     ) -> bool {
-        let Some(term) = self
-            .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
-        else {
+        let Some((term, _)) = self.front_shown(wid) else {
             return false;
         };
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -3987,6 +3982,9 @@ impl App {
     }
 
     fn sourced_link_under_pointer(&self, wid: WindowId) -> Option<(String, bool)> {
+        if self.rewound_front(wid).is_some() {
+            return None;
+        }
         let ws = self.windows.get(&wid)?;
         let (row, col) = ws.last_mouse_cell;
         let window_row = usize::from(ws.last_mouse_window_cell.0);
@@ -4013,6 +4011,9 @@ impl App {
         &self,
         wid: WindowId,
     ) -> Option<crate::path_link::PathTarget> {
+        if self.rewound_front(wid).is_some() {
+            return None;
+        }
         let ws = self.windows.get(&wid)?;
         let (row, col) = ws.last_mouse_cell;
         let window_row = usize::from(ws.last_mouse_window_cell.0);
@@ -4938,7 +4939,9 @@ impl App {
             return;
         }
         if let Some(session) = self.rewound_front(wid) {
-            if pressed {
+            if button == WinitMouseButton::Left {
+                self.rewind_press(wid, session, pressed);
+            } else if pressed {
                 self.note_rewind_withheld(session);
             }
             return;
@@ -5163,7 +5166,12 @@ impl App {
         if !(seam_owned || palette || overview || native_page)
             && let Some(session) = self.rewound_under_pointer(wid)
         {
-            self.note_rewind_withheld(session);
+            let (dy, px) = match delta {
+                MouseScrollDelta::LineDelta(_, y) => (f64::from(y), false),
+                MouseScrollDelta::PixelDelta(p) => (p.y, true),
+            };
+            let cell_h = self.win_cell_size(wid).1 as f64;
+            self.rewind_wheel(session, dy, px, cell_h);
             return;
         }
         let (dx, dy) = match delta {
@@ -5398,11 +5406,11 @@ impl App {
         if ws.search.is_some() {
             return;
         }
-        let Some(terminal) = ws.front_terminal() else {
+        let Some((shown, _)) = self.front_shown(wid) else {
             return;
         };
         {
-            let mut term = term_lock(&terminal.term);
+            let mut term = term_lock(&shown);
             let last = i32::from(term.grid().rows().saturating_sub(1));
             let max_col = term.grid().cols().saturating_sub(1);
             let off = term.grid().display_offset() as i32;

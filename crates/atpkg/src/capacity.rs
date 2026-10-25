@@ -39,7 +39,10 @@ pub(crate) fn verb(rest: &[String]) -> ExitCode {
     };
     let trees = match &claims {
         Ok(c) if !c.is_empty() => Live.procs().map(|p| {
-            let pids: Vec<u32> = c.iter().map(|r| r.pid).collect();
+            let pids: Vec<u32> = c
+                .iter()
+                .flat_map(|r| std::iter::once(r.pid).chain(r.credit.iter().copied()))
+                .collect();
             p.trees(&pids)
         }),
         _ => None,
@@ -124,6 +127,17 @@ fn lines(
     out
 }
 
+/// What the processes `c` is credited with ([`Record::credit`]) use: `None` without a sweep.
+fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<u64> {
+    trees.map(|t| {
+        c.credit
+            .iter()
+            .filter_map(|p| t.get(p))
+            .map(|u| u.footprint)
+            .sum()
+    })
+}
+
 /// One claim's line; its holder's tree ([`aterm_capacity::Procs::trees`]) is the same for every claim that process holds.
 fn claim_line(c: &Record, trees: Option<&HashMap<u32, TreeUse>>, now: u64) -> String {
     let mut parts = vec![format!(
@@ -134,13 +148,20 @@ fn claim_line(c: &Record, trees: Option<&HashMap<u32, TreeUse>>, now: u64) -> St
     )];
     if c.need.mem > 0 {
         let using = trees.map(|t| t.get(&c.pid).map_or(0, |u| u.footprint));
+        let vm = credited(c, trees).filter(|_| !c.credit.is_empty());
         parts.push(format!(
             "mem {}{}",
             gib(c.need.mem),
-            using.map_or_else(String::new, |u| format!(
-                " (its holder's tree uses {})",
-                gib(u)
-            ))
+            match (using, vm) {
+                (Some(u), Some(v)) => format!(
+                    " (its holder's tree uses {}, the {} processes credited to it {})",
+                    gib(u),
+                    c.credit.len(),
+                    gib(v)
+                ),
+                (Some(u), None) => format!(" (its holder's tree uses {})", gib(u)),
+                (None, _) => String::new(),
+            }
         ));
     }
     if c.need.cores > 0 {
@@ -243,6 +264,14 @@ fn json_of(
                     m.insert(
                         "tree_footprint".to_owned(),
                         Value::from(used.map(|u| u.footprint)),
+                    );
+                    m.insert(
+                        "credit".to_owned(),
+                        Value::Array(c.credit.iter().map(|p| Value::from(*p)).collect()),
+                    );
+                    m.insert(
+                        "credited_footprint".to_owned(),
+                        Value::from(credited(c, trees)),
                     );
                     Value::Object(m)
                 })

@@ -513,7 +513,13 @@ fn run_worker_launch(work: &Launch) {
         return;
     };
     let (caller, found) = worker_starter_of(work, cli);
-    let caller = pooled_starter(caller, cli, work.local);
+    let caller = match pooled_starter(caller, cli, work.local) {
+        Ok(caller) => caller,
+        Err(why) => {
+            stall(work, &why);
+            return;
+        }
+    };
     let here = trusted_here(
         cli.trust_flag.is_some(),
         work.trusted_cwd.as_deref(),
@@ -878,10 +884,10 @@ fn pooled_starter(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
     local: u64,
-) -> aterm_agent::harness::worker::Starter {
+) -> Result<aterm_agent::harness::worker::Starter, String> {
     use aterm_agent::harness::{accounts, accounts_pool};
     let Some(pool) = accounts::Cli::of(cli.agent).filter(|c| *c != accounts::Cli::Claude) else {
-        return starter;
+        return Ok(starter);
     };
     let (Some(config), Some(state), Some(home), Some(now)) = (
         aterm_types::dirs::aterm_config_path(),
@@ -889,10 +895,10 @@ fn pooled_starter(
         aterm_types::dirs::home_dir(),
         aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()),
     ) else {
-        return starter;
+        return Ok(starter);
     };
     let Some(config_dir) = config.parent() else {
-        return starter;
+        return Ok(starter);
     };
     let seat = accounts_pool::Seat {
         config_dir,
@@ -909,7 +915,7 @@ pub(crate) fn pooled_starter_in(
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
     read: aterm_agent::harness::accounts_pool::ReadUsage<'_>,
     local: u64,
-) -> aterm_agent::harness::worker::Starter {
+) -> Result<aterm_agent::harness::worker::Starter, String> {
     use aterm_agent::harness::{accounts, accounts_pool};
     let pairs: Vec<(&str, &str)> = starter
         .env
@@ -918,36 +924,42 @@ pub(crate) fn pooled_starter_in(
         .collect();
     let who = accounts::ProcessLogin::of_env_for(pool, pairs.iter().copied());
     if !who.default_home || !who.stored_login {
-        return starter;
+        return Ok(starter);
     }
     let var = pool.accounts().seam.var();
     if starter.env.iter().any(|(name, _)| name == var) {
-        let Ok(roster) = seat.bound_roster(pool) else {
-            return starter;
-        };
+        let roster = seat.bound_roster(pool)?;
         if accounts::judged_label(&roster, &who).is_none() {
-            return starter;
-        }
-    }
-    if let Some(pick) = accounts_pool::launch_env(seat, pool, read) {
-        match pool_onto(starter.clone(), pool, &pick, seat.home) {
-            Ok(onto) => {
-                aterm_log::info!(
-                    "worker session {local}: starts under {} account {}",
-                    pool.id(),
-                    pick.label
-                );
-                return onto;
+            if let Some(login) = who.login.as_deref() {
+                let root = seat.store(pool).logins_dir();
+                let path = Path::new(login);
+                let owned = path.starts_with(&root)
+                    || path
+                        .canonicalize()
+                        .ok()
+                        .zip(root.canonicalize().ok())
+                        .is_some_and(|(path, root)| path.starts_with(root));
+                if owned {
+                    return Err(format!(
+                        "{} login {} has no current account binding",
+                        pool.id(),
+                        path.display()
+                    ));
+                }
             }
-            Err(why) => aterm_log::warn!(
-                "worker session {local}: not started under {} account {} ({why}); its starter's \
-                 login stays",
-                pool.id(),
-                pick.label
-            ),
+            return Ok(starter);
         }
     }
-    starter
+    if let Some(pick) = accounts_pool::launch_env(seat, pool, read)? {
+        let onto = pool_onto(starter, pool, &pick, seat.home)?;
+        aterm_log::info!(
+            "worker session {local}: starts under {} account {}",
+            pool.id(),
+            pick.label
+        );
+        return Ok(onto);
+    }
+    Ok(starter)
 }
 
 /// `starter` onto `pool`'s login `pick` ([`pooled_starter`]): the variables

@@ -226,6 +226,32 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         result
     }
 
+    /// The startup review's answer, a Join of the vault at `vault_url` with the Secrets group
+    /// on, written while this Mac's vault configuration cannot be read (a root-owned
+    /// `source.toml`), and whether the ticket admitted it without its Join
+    /// ([`InitialSetupAuthorization::join_unread`]).
+    pub fn persist_join_over_unread_vault(
+        &mut self,
+        vault_url: &str,
+    ) -> (Result<Option<u64>, String>, bool) {
+        self.plan.selection.set(Setting::Secrets, true);
+        self.plan.vault_url = vault_url.to_owned();
+        let Owner::Startup(ticket) = &mut self.owner else {
+            panic!("the scratch owner is a choice, not a startup review");
+        };
+        let result = observe_mutation_at(self.root, None, Err("busy".into()), |root| {
+            ticket.persist_join_with(
+                root,
+                &self.plan,
+                || Err("source.toml: Permission denied".into()),
+                |step, root| step.persist(root),
+                |root| observation_at(root).map_err(|error| error.to_string()),
+            )
+        })
+        .result;
+        (result, ticket.join_unread())
+    }
+
     pub fn snapshot(&self) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
         snapshot_at(self.root, Plan::default())
     }

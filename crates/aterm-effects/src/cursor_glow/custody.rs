@@ -11,6 +11,12 @@ pub(crate) fn hint_fresh(hint: Option<Instant>, now: Instant, window: f32) -> bo
     hint.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
 }
 
+/// Whether a one-shot hint stamped at `hint` is still inside its `window` at `now`.
+#[inline]
+pub(crate) fn hint_fresh_dur(hint: Option<Instant>, now: Instant, window: Duration) -> bool {
+    hint.is_some_and(|t| now.saturating_duration_since(t) <= window)
+}
+
 /// Spend a one-shot hint: take it only while fresh ([`hint_fresh`]).
 #[inline]
 pub(crate) fn take_hint_fresh(
@@ -19,6 +25,16 @@ pub(crate) fn take_hint_fresh(
     window: f32,
 ) -> Option<Instant> {
     hint.take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= window)
+}
+
+/// Spend a one-shot hint: take it only while fresh ([`hint_fresh_dur`]).
+#[inline]
+pub(crate) fn take_hint_fresh_dur(
+    hint: &mut Option<Instant>,
+    now: Instant,
+    window: Duration,
+) -> Option<Instant> {
+    hint.take_if(|t| now.saturating_duration_since(*t) <= window)
 }
 
 /// Cap of the exact content witness for the last adjacent typed echo run.
@@ -67,6 +83,31 @@ const _: () = assert!(TYPED_STAMP_DEPTH == u128::BITS as usize);
 
 /// The in-flight patience (seconds).
 pub(crate) const IN_FLIGHT_PATIENCE_S: f32 = 10.0;
+pub(crate) const IN_FLIGHT_PATIENCE_DUR: Duration =
+    Duration::from_secs(IN_FLIGHT_PATIENCE_S as u64);
+pub(crate) const TYPE_HINT_FRESH_DUR: Duration =
+    Duration::from_nanos((CursorGlow::TYPE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+pub(crate) const QUENCH_HINT_FRESH_DUR: Duration =
+    Duration::from_nanos((CursorGlow::QUENCH_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+pub(crate) const NAV_HINT_FRESH_DUR: Duration =
+    Duration::from_nanos((CursorGlow::NAV_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+pub(crate) const RETURN_HINT_FRESH_DUR: Duration =
+    Duration::from_nanos((CursorGlow::RETURN_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+pub(crate) const USER_GESTURE_HINT_FRESH_DUR: Duration = Duration::from_nanos(
+    (CursorGlow::USER_GESTURE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64,
+);
+pub(super) const INSERT_HINT_FRESH_DUR: Duration =
+    Duration::from_secs(CursorGlow::INSERT_HINT_FRESH as u64);
+pub(super) const INSERT_GESTURE_HINT_FRESH_DUR: Duration =
+    Duration::from_secs(CursorGlow::INSERT_GESTURE_HINT_FRESH as u64);
+pub(super) const INSERT_REWRITE_FRESH_DUR: Duration =
+    Duration::from_secs(CursorGlow::INSERT_REWRITE_FRESH as u64);
+pub(super) const INSERT_RETRO_FRESH_DUR: Duration =
+    Duration::from_nanos((CursorGlow::INSERT_RETRO_FRESH as f64 * 1_000_000_000.0).round() as u64);
+pub(super) const POOF_PROBE_STALE_DUR: Duration =
+    Duration::from_secs(CursorGlow::POOF_PROBE_STALE as u64);
+pub(super) const BLINK_HINT_FRESH_DUR: Duration =
+    Duration::from_nanos((CursorGlow::BLINK_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
 
 /// Capacity of [`CursorGlow::anchor_rows`].
 pub(super) const ANCHOR_ROWS: usize = 16;
@@ -165,7 +206,10 @@ impl TypedStamps {
         let mut kept = Self::EMPTY;
         let mut later = Self::EMPTY;
         let (mut nk, mut nl) = (0, 0);
-        for t in self.slots.into_iter().map_while(|s| s) {
+        for slot in &self.slots {
+            let Some(t) = *slot else {
+                break;
+            };
             if t <= at {
                 kept.slots[nk] = Some(t);
                 nk += 1;
@@ -245,35 +289,49 @@ impl TypedStamps {
 
     /// Whether any banked stamp is still within `window` of `now`.
     #[inline]
-    pub(crate) fn any_fresh(&self, now: Instant, window: f32) -> bool {
-        self.slots
-            .iter()
-            .map_while(|s| *s)
-            .any(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
+    pub(crate) fn any_fresh(&self, now: Instant, window: Duration) -> bool {
+        for slot in &self.slots {
+            let Some(t) = *slot else {
+                break;
+            };
+            if now.saturating_duration_since(t) <= window {
+                return true;
+            }
+        }
+        false
     }
 
     /// Drop only stamps older than `window`.
     #[inline]
-    pub(crate) fn retire_stale(&mut self, now: Instant, window: f32) {
-        self.retain(|t| now.saturating_duration_since(t).as_secs_f32() <= window);
+    pub(crate) fn retire_stale(&mut self, now: Instant, window: Duration) {
+        self.retain(|t| now.saturating_duration_since(t) <= window);
     }
 
     /// The oldest still-fresh stamp, left in place.
     #[inline]
-    pub(crate) fn peek_fresh(&self, now: Instant, window: f32) -> Option<Instant> {
-        self.slots
-            .iter()
-            .map_while(|s| *s)
-            .find(|t| now.saturating_duration_since(*t).as_secs_f32() <= window)
+    pub(crate) fn peek_fresh(&self, now: Instant, window: Duration) -> Option<Instant> {
+        for slot in &self.slots {
+            let t = (*slot)?;
+            if now.saturating_duration_since(t) <= window {
+                return Some(t);
+            }
+        }
+        None
     }
 
     /// Consume the oldest still-fresh stamp.
-    pub(crate) fn take_fresh(&mut self, now: Instant, window: f32) -> Option<Instant> {
-        let idx = self
-            .slots
-            .iter()
-            .map_while(|s| *s)
-            .position(|t| now.saturating_duration_since(t).as_secs_f32() <= window)?;
+    pub(crate) fn take_fresh(&mut self, now: Instant, window: Duration) -> Option<Instant> {
+        let mut idx = 0;
+        loop {
+            if idx >= TYPED_STAMP_DEPTH {
+                return None;
+            }
+            let t = self.slots[idx]?;
+            if now.saturating_duration_since(t) <= window {
+                break;
+            }
+            idx += 1;
+        }
         let taken = self.slots[idx];
         self.slots.copy_within(idx + 1.., idx);
         self.slots[TYPED_STAMP_DEPTH - 1] = None;
@@ -346,7 +404,7 @@ impl PressCredits {
     #[inline]
     pub(super) fn payable(&self, at: Instant, credits: u8, now: Instant) -> bool {
         credits > 0
-            && now.saturating_duration_since(at).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
+            && now.saturating_duration_since(at) <= IN_FLIGHT_PATIENCE_DUR
             && (self.admit_held || !self.held(at))
     }
 
@@ -417,17 +475,16 @@ impl PressCredits {
 
     /// Whether an unpaid press stamped exactly `glyph` within `freshness_s`.
     #[inline]
-    pub(super) fn fresh_glyph(&self, now: Instant, freshness_s: f32, glyph: char) -> bool {
-        self.within(now).any(|(at, _, g)| {
-            g == Some(glyph) && now.saturating_duration_since(at).as_secs_f32() <= freshness_s
-        })
+    pub(super) fn fresh_glyph(&self, now: Instant, freshness: Duration, glyph: char) -> bool {
+        self.within(now)
+            .any(|(at, _, g)| g == Some(glyph) && now.saturating_duration_since(at) <= freshness)
     }
 
     /// The oldest fresh press's exact glyph, in ring order.
     pub(super) fn oldest_fresh_glyph(
         &self,
         now: Instant,
-        freshness_s: f32,
+        freshness: Duration,
     ) -> Option<(usize, char)> {
         let mut mask = self.occupied.rotate_right(self.head as u32);
         while mask != 0 {
@@ -436,7 +493,7 @@ impl PressCredits {
             let i = (self.head + k) & STAMP_RING_MASK;
             if let Some((at, credits, glyph)) = self.slots[i]
                 && self.payable(at, credits, now)
-                && now.saturating_duration_since(at).as_secs_f32() <= freshness_s
+                && now.saturating_duration_since(at) <= freshness
             {
                 return glyph.map(|glyph| (i, glyph));
             }
@@ -464,12 +521,7 @@ impl PressCredits {
         previous_probe_at: Instant,
         glyphs: &[char],
     ) -> Option<usize> {
-        self.exact_unpaid_run_with_tail_window(
-            now,
-            previous_probe_at,
-            glyphs,
-            CursorGlow::TYPE_HINT_FRESH,
-        )
+        self.exact_unpaid_run_with_tail_window(now, previous_probe_at, glyphs, TYPE_HINT_FRESH_DUR)
     }
 
     /// The same proof with a caller-selected tail age.
@@ -478,7 +530,7 @@ impl PressCredits {
         now: Instant,
         previous_probe_at: Instant,
         glyphs: &[char],
-        tail_window_s: f32,
+        tail_window: Duration,
     ) -> Option<usize> {
         if self.occupied == 0 || glyphs.is_empty() || glyphs.len() > EXACT_COALESCED_PREFIX_MAX {
             return None;
@@ -513,7 +565,7 @@ impl PressCredits {
                 });
                 if exact {
                     let (_, last_at, _, _) = live[start + glyphs.len() - 1]?;
-                    if now.saturating_duration_since(last_at).as_secs_f32() <= tail_window_s {
+                    if now.saturating_duration_since(last_at) <= tail_window {
                         return live[start].map(|(slot, _, _, _)| slot);
                     }
                 }
@@ -521,7 +573,7 @@ impl PressCredits {
             let (_, at, _, _) = live[start]?;
             if start >= EXACT_COALESCED_STALE_PREFIX_MAX
                 || at > previous_probe_at
-                || now.saturating_duration_since(at).as_secs_f32() <= CursorGlow::TYPE_HINT_FRESH
+                || now.saturating_duration_since(at) <= TYPE_HINT_FRESH_DUR
             {
                 return None;
             }
@@ -628,7 +680,7 @@ impl PressCredits {
 
     /// Drop every press past [`IN_FLIGHT_PATIENCE_S`].
     pub(super) fn retire_stale(&mut self, now: Instant) {
-        self.blank_where(|t| now.saturating_duration_since(t).as_secs_f32() > IN_FLIGHT_PATIENCE_S);
+        self.blank_where(|t| now.saturating_duration_since(t) > IN_FLIGHT_PATIENCE_DUR);
     }
 
     /// Revoke the press banked at `at`, for a dispatch that never reached the child.
@@ -890,8 +942,7 @@ impl EraseWitness {
     /// Whether a retreat is still owed at `now`, within the press patience.
     #[inline]
     pub(super) fn owed_at(&self, now: Instant) -> bool {
-        self.owed > 0
-            && now.saturating_duration_since(self.at).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
+        self.owed > 0 && now.saturating_duration_since(self.at) <= IN_FLIGHT_PATIENCE_DUR
     }
 
     /// The retired glyphs still to echo.
@@ -936,10 +987,8 @@ pub(super) struct HeldPark {
 }
 
 impl HeldPark {
-    const CROSS_ROW_PATIENCE: Duration =
-        Duration::from_nanos((IN_FLIGHT_PATIENCE_S as f64 * 1_000_000_000.0).round() as u64);
-    const SAME_ROW_PATIENCE: Duration =
-        Duration::from_nanos((CursorGlow::TYPE_HINT_FRESH as f64 * 1_000_000_000.0).round() as u64);
+    const CROSS_ROW_PATIENCE: Duration = IN_FLIGHT_PATIENCE_DUR;
+    const SAME_ROW_PATIENCE: Duration = TYPE_HINT_FRESH_DUR;
 
     #[inline]
     pub(super) const fn patience(&self) -> Duration {
@@ -1089,9 +1138,9 @@ impl InsertSeam {
         self.tally.delivered += 1;
         self.undo.last_cells = self.tally.last_cells;
         self.tally.last_cells = cells;
-        let prior = self.armed.filter(|prev| {
-            at.saturating_duration_since(prev.at).as_secs_f32() <= CursorGlow::INSERT_HINT_FRESH
-        });
+        let prior = self
+            .armed
+            .filter(|prev| at.saturating_duration_since(prev.at) <= INSERT_HINT_FRESH_DUR);
         let armed = match prior {
             Some(prev) if prev.breaks || breaks => InsertLicence {
                 at,
@@ -1141,11 +1190,11 @@ impl InsertSeam {
     pub(super) fn fresh(&self, now: Instant) -> Option<InsertLicence> {
         self.armed.filter(|i| {
             let window = if i.known {
-                CursorGlow::INSERT_HINT_FRESH
+                INSERT_HINT_FRESH_DUR
             } else {
-                CursorGlow::INSERT_GESTURE_HINT_FRESH
+                INSERT_GESTURE_HINT_FRESH_DUR
             };
-            now.saturating_duration_since(i.at).as_secs_f32() <= window
+            now.saturating_duration_since(i.at) <= window
         })
     }
 
@@ -1174,10 +1223,10 @@ impl InsertSeam {
             orphans.site = None;
         }
         self.orphan_exact = None;
-        for ins in [&mut self.armed, &mut self.undo.licence]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(ins) = self.armed.as_mut() {
+            ins.row = ins.row.and_then(&map);
+        }
+        if let Some(ins) = self.undo.licence.as_mut() {
             ins.row = ins.row.and_then(&map);
         }
     }
@@ -1190,7 +1239,7 @@ impl InsertSeam {
         dispatched_at: Option<Instant>,
     ) -> Option<PendingHop> {
         let hop = self.pending_hop.take()?;
-        (at.saturating_duration_since(hop.at).as_secs_f32() <= CursorGlow::INSERT_RETRO_FRESH
+        (at.saturating_duration_since(hop.at) <= INSERT_RETRO_FRESH_DUR
             && dispatched_at.is_none_or(|dispatched| hop.at >= dispatched)
             && Self::retro_hop_is_the_inserts(hop, armed.cells, armed.known, armed.row))
         .then_some(hop)
@@ -1221,8 +1270,7 @@ impl InsertSeam {
             span.row == row
                 && col >= span.col0
                 && col <= span.col1
-                && now.saturating_duration_since(span.laid_at).as_secs_f32()
-                    <= CursorGlow::INSERT_REWRITE_FRESH
+                && now.saturating_duration_since(span.laid_at) <= INSERT_REWRITE_FRESH_DUR
         })
     }
 
@@ -1252,12 +1300,10 @@ impl InsertSeam {
     /// Once an unknown insert's hop is old enough for any next-frame echo to have spent its own.
     pub(super) fn retire_orphans(&mut self, now: Instant) -> Option<UnknownInsertOrphans> {
         let orphans = self.orphans?;
-        (now.saturating_duration_since(orphans.laid_at).as_secs_f32()
-            > CursorGlow::INSERT_REWRITE_FRESH)
-            .then(|| {
-                self.orphans = None;
-                orphans
-            })
+        (now.saturating_duration_since(orphans.laid_at) > INSERT_REWRITE_FRESH_DUR).then(|| {
+            self.orphans = None;
+            orphans
+        })
     }
 }
 
@@ -1540,6 +1586,7 @@ impl CursorGlow {
             for entry in self.anchor_rows.iter_mut().flatten() {
                 if entry.row == hop.row {
                     entry.tainted = false;
+                    break;
                 }
             }
             self.lay_insert(hop.row, hop.col0, hop.row, hop.col1, ins, at);
@@ -1586,9 +1633,7 @@ impl CursorGlow {
             return Some(row);
         }
         self.last_licensed_row
-            .filter(|(_, at)| {
-                now.saturating_duration_since(*at).as_secs_f32() <= rk::ribbon::CHAIN_GAP_MAX
-            })
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= rk::ribbon::CHAIN_GAP_MAX_DUR)
             .map(|(row, _)| row)
             .or(established)
     }
@@ -1703,9 +1748,9 @@ impl CursorGlow {
         ins: InsertLicence,
         now: Instant,
     ) -> bool {
-        if hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+        if hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
             || hint_fresh(self.reflow_hint, now, Self::REFLOW_HINT_FRESH)
-            || (hint_fresh(self.user_gesture_hint, now, Self::USER_GESTURE_HINT_FRESH)
+            || (hint_fresh_dur(self.user_gesture_hint, now, USER_GESTURE_HINT_FRESH_DUR)
                 && self.user_gesture_hint != Some(ins.at))
         {
             return true;
@@ -1719,10 +1764,10 @@ impl CursorGlow {
     /// Whether a keyed erase class is fresh (Backspace, kill chord, navigation).
     #[inline]
     pub(super) fn erase_key_fresh(&self, now: Instant) -> bool {
-        hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH)
+        hint_fresh_dur(self.quench_hint, now, QUENCH_HINT_FRESH_DUR)
             || hint_fresh(self.kill_hint, now, Self::KILL_HINT_FRESH)
             || hint_fresh(self.bs_poof_hint, now, Self::KILL_HINT_FRESH)
-            || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+            || hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
     }
 
     /// Whether the row probe, when it speaks for `row` this frame.
@@ -1731,9 +1776,7 @@ impl CursorGlow {
         let Some(meta) = self.row_cur_meta else {
             return true;
         };
-        if meta.row != row
-            || now.saturating_duration_since(meta.at).as_secs_f32() > Self::POOF_PROBE_STALE
-        {
+        if meta.row != row || now.saturating_duration_since(meta.at) > POOF_PROBE_STALE_DUR {
             return true;
         }
         meta.fill <= col
@@ -1784,7 +1827,7 @@ impl CursorGlow {
                 .type_press_ring
                 .spend_counting(now, surplus.min(credits));
             for _ in 0..presses {
-                let _ = self.type_hint.take_fresh(now, Self::TYPE_HINT_FRESH);
+                let _ = self.type_hint.take_fresh(now, TYPE_HINT_FRESH_DUR);
             }
         }
         if !ins.known && self.type_press_ring.cells_where(now, |t| t <= ins.at) > 0 {
@@ -1964,9 +2007,7 @@ impl CursorGlow {
         let Some(meta) = self.row_cur_meta else {
             return 0;
         };
-        if meta.row != row
-            || now.saturating_duration_since(meta.at).as_secs_f32() > Self::POOF_PROBE_STALE
-        {
+        if meta.row != row || now.saturating_duration_since(meta.at) > POOF_PROBE_STALE_DUR {
             return 0;
         }
         let lo = usize::from(from_col);
@@ -2035,7 +2076,8 @@ impl CursorGlow {
     /// The alt-screen blink discriminator.
     #[inline]
     pub(super) fn blink_fresh(&self, now: Instant) -> bool {
-        hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH)
+        self.blink_hint
+            .is_some_and(|t| now.saturating_duration_since(t) <= BLINK_HINT_FRESH_DUR)
     }
 
     /// The focused pane's `(first column, width)` under the host's pane columns.
@@ -2105,7 +2147,7 @@ impl CursorGlow {
             && (self.row_prev[origin] == glyph
                 || !self
                     .type_press_ring
-                    .fresh_glyph(now, Self::TYPE_HINT_FRESH, glyph))
+                    .fresh_glyph(now, TYPE_HINT_FRESH_DUR, glyph))
         {
             return None;
         }
@@ -2122,62 +2164,96 @@ impl CursorGlow {
     }
 
     /// Whether the forward echo from a soft-wrapped caret's landing carried the wrap key's word.
-    pub(super) fn carried_word_left(&self, sw: rk::ribbon::SoftWrap, cr: u16, cc: u16) -> bool {
+    pub(super) const fn carried_word_left(
+        &self,
+        sw: rk::ribbon::SoftWrap,
+        cr: u16,
+        cc: u16,
+    ) -> bool {
         let Some(cur) = self.row_cur_meta else {
             return false;
         };
         if cur.row != cr
             || cur.caret != cc
-            || cur.above != NbrProbe::Probed
-            || sw.origin.0.checked_add(1) != Some(cr)
+            || !matches!(cur.above, NbrProbe::Probed)
+            || !matches!(sw.origin.0.checked_add(1), Some(r) if r == cr)
         {
             return false;
         }
-        (sw.word_col0..=sw.origin.1).all(|col| {
-            self.row_above_cur
-                .get(usize::from(col))
-                .is_none_or(|&g| g == ' ')
-        })
+        let above = self.row_above_cur.as_slice();
+        let mut col = sw.word_col0 as usize;
+        let end = sw.origin.1 as usize;
+        while col <= end && col < above.len() {
+            if above[col] != ' ' {
+                return false;
+            }
+            col += 1;
+        }
+        true
     }
 
     /// The lifted word (the reverse re-wrap).
-    pub(super) fn lifted_word(&self, pr: u16, pc: u16, cr: u16, cc: u16) -> Option<u16> {
-        let cur = self.row_cur_meta?;
-        let prev = self.row_prev_meta?;
+    pub(super) const fn lifted_word(&self, pr: u16, pc: u16, cr: u16, cc: u16) -> Option<u16> {
+        let Some(cur) = self.row_cur_meta else {
+            return None;
+        };
+        let Some(prev) = self.row_prev_meta else {
+            return None;
+        };
         if cr != pr
             || cc >= pc
             || cur.row != cr
             || cur.caret != cc
-            || cur.above != NbrProbe::Probed
+            || !matches!(cur.above, NbrProbe::Probed)
             || prev.row != pr
             || prev.caret != pc
-            || prev.above != NbrProbe::Probed
+            || !matches!(prev.above, NbrProbe::Probed)
         {
             return None;
         }
-        let unit = rk::witness::unit_at;
+        let row_prev = self.row_prev.as_slice();
+        let row_cur = self.row_cur.as_slice();
         let mut any_changed = false;
-        for c in cc..pc {
-            let prev_u = unit(&self.row_prev, c);
+        let mut c = cc;
+        while c < pc {
+            let prev_u = rk::witness::unit_at(row_prev, c);
             if prev_u.is_blank() {
                 return None;
             }
-            any_changed |= unit(&self.row_cur, c) != prev_u;
+            any_changed |= !rk::witness::unit_at(row_cur, c).eq(prev_u);
+            c += 1;
         }
         if !any_changed {
             return None;
         }
-        let end = u16::try_from(self.ink_end_in_pane(&self.row_above_cur)).ok()?;
-        let dst = end.checked_sub(pc - cc)?;
-        let before = dst.checked_sub(1)?;
-        if !unit(&self.row_above_cur, before).is_blank() {
+        let row_above_cur = self.row_above_cur.as_slice();
+        let end = self.ink_end_in_pane(row_above_cur);
+        if end > u16::MAX as usize {
             return None;
         }
-        let arrived = (cc..pc).zip(dst..end).all(|(src, now)| {
-            unit(&self.row_above_cur, now) == unit(&self.row_prev, src)
-                && unit(&self.row_above_prev, now).is_blank()
-        });
-        arrived.then_some(dst)
+        let end = end as u16;
+        let Some(dst) = end.checked_sub(pc - cc) else {
+            return None;
+        };
+        let Some(before) = dst.checked_sub(1) else {
+            return None;
+        };
+        if !rk::witness::unit_at(row_above_cur, before).is_blank() {
+            return None;
+        }
+        let row_above_prev = self.row_above_prev.as_slice();
+        let mut src = cc;
+        let mut now_col = dst;
+        while src < pc && now_col < end {
+            if !rk::witness::unit_at(row_above_cur, now_col).eq(rk::witness::unit_at(row_prev, src))
+                || !rk::witness::unit_at(row_above_prev, now_col).is_blank()
+            {
+                return None;
+            }
+            src += 1;
+            now_col += 1;
+        }
+        Some(dst)
     }
 
     /// The tight fold shape.
@@ -2371,12 +2447,12 @@ impl CursorGlow {
         if self.held_park.is_some_and(|p| !p.fresh(now)) {
             self.flush_held_park();
         }
-        self.type_hint.retire_stale(now, Self::TYPE_HINT_FRESH);
+        self.type_hint.retire_stale(now, TYPE_HINT_FRESH_DUR);
         if self.insert.fresh(now).is_none() {
             self.insert.clear();
         }
         self.quench_hint = None;
-        if !hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH) {
+        if !hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR) {
             self.nav_hint = None;
         }
         self.return_hint = None;
@@ -2386,7 +2462,7 @@ impl CursorGlow {
         self.type_press_ring.retire_stale(now);
         if self
             .last_committed_type
-            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > Self::TYPE_HINT_FRESH)
+            .is_some_and(|t| now.saturating_duration_since(t) > TYPE_HINT_FRESH_DUR)
         {
             self.last_committed_type = None;
         }

@@ -862,7 +862,7 @@ impl CompanionOwner {
         )
     }
 
-    /// [`Self::observe_console_with_overlays`], with the person's typed glyphs (the predicted echo, the IME preedit) reserved as ink ([`crate::pet_world::PetReserve`]): what the native host observes.
+    /// [`Self::observe_console_with_overlays`], with the person's typed glyphs (the predicted echo, the IME preedit) reserved as ink ([`crate::pet_world::PetReserve`]): what the native host observes, read in full every time ([`Self::observe_console_filled`] keeps a redraw's reading).
     #[inline]
     pub fn observe_console_reserved(
         &mut self,
@@ -871,8 +871,27 @@ impl CompanionOwner {
         pane: crate::pet_world::PetPane,
         reserve: crate::pet_world::PetReserve<'_>,
     ) -> usize {
+        self.observe_console_filled(
+            input,
+            crate::pet_world::PetFill::Unconsumed,
+            facts,
+            pane,
+            reserve,
+        )
+    }
+
+    /// [`Self::observe_console_reserved`] of cells the host filled as `fill` says: a redraw's [`crate::pet_world::PetFill::Consumed`] or [`crate::pet_world::PetFill::Retained`] scratch keeps the reading the pet holds of the same cells, and the count is then 0.
+    #[inline]
+    pub fn observe_console_filled(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        fill: crate::pet_world::PetFill,
+        facts: &crate::pet_world::PetWorldFacts,
+        pane: crate::pet_world::PetPane,
+        reserve: crate::pet_world::PetReserve<'_>,
+    ) -> usize {
         self.pet
-            .observe_console_with_reserve(input, facts, pane, reserve);
+            .observe_console_with_reserve(input, facts, pane, reserve, fill);
         self.pet.observed_cells()
     }
 
@@ -1124,21 +1143,37 @@ impl CompanionOwner {
         Some(key)
     }
 
+    #[inline]
+    const fn clear_own_glass_offers(&mut self) -> bool {
+        let mut any = false;
+        let mut i = 0;
+        while i < self.own_glass.len() {
+            if let Some(own) = &mut self.own_glass[i] {
+                own.offered = false;
+                any = true;
+            }
+            i += 1;
+        }
+        any
+    }
+
     /// The host's terminal panes on glass this frame, offered before [`Self::tick`]: records whether each pending or own ghost glass is among them exactly as drawn.
     #[inline]
     pub fn offer_glass(&mut self, glass: impl IntoIterator<Item = PetGlass>) {
-        if self.resight_frame.is_none() && self.own_glass.iter().all(Option::is_none) {
+        let any_own = self.clear_own_glass_offers();
+        if self.resight_frame.is_none() && !any_own {
             return;
         }
         let pending = self.resight_frame.map(|f| f.glass);
         self.resight_offered = false;
-        for own in self.own_glass.iter_mut().flatten() {
-            own.offered = false;
-        }
         for g in glass {
             self.resight_offered |= pending == Some(g);
-            for own in self.own_glass.iter_mut().flatten() {
-                own.offered |= own.frame.glass == g;
+            let mut i = 0;
+            while i < self.own_glass.len() {
+                if let Some(own) = &mut self.own_glass[i] {
+                    own.offered |= own.frame.glass == g;
+                }
+                i += 1;
             }
         }
     }
@@ -1180,17 +1215,25 @@ impl CompanionOwner {
                 self.pet.forget_resight();
             } else if drawn.origin == frame_px.origin {
                 // The same glass, a new surface on it.
-            } else if offered
-                && drawn.glass.origin != frame_px.glass.origin
-                && let Some(free) = self.own_glass.iter().position(Option::is_none)
-            {
-                self.glass_key = self.glass_key.wrapping_add(1).max(1);
-                self.pet.displace_resight(self.glass_key);
-                self.own_glass[free] = Some(OwnGlass {
-                    key: self.glass_key,
-                    frame: drawn,
-                    offered: false,
-                });
+            } else if offered && drawn.glass.origin != frame_px.glass.origin {
+                let mut free = None;
+                for (i, slot) in self.own_glass.iter().enumerate() {
+                    if slot.is_none() {
+                        free = Some(i);
+                        break;
+                    }
+                }
+                if let Some(free) = free {
+                    self.glass_key = self.glass_key.wrapping_add(1).max(1);
+                    self.pet.displace_resight(self.glass_key);
+                    self.own_glass[free] = Some(OwnGlass {
+                        key: self.glass_key,
+                        frame: drawn,
+                        offered: false,
+                    });
+                } else {
+                    self.pet.forget_resight();
+                }
             } else {
                 self.pet.forget_resight();
             }
@@ -1221,14 +1264,22 @@ impl CompanionOwner {
                 *slot = None;
             }
         }
-        let glass = pet_frame.departures.map(|d| {
-            let key = d.filter(|d| d.own_glass)?.glass;
-            self.own_glass
-                .iter()
-                .flatten()
-                .find(|own| own.key == key)
-                .map(|own| own.frame.glass)
-        });
+        let mut glass = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
+        for (dst, dep) in glass.iter_mut().zip(&pet_frame.departures) {
+            if let Some(d) = dep
+                && d.own_glass
+            {
+                let key = d.glass;
+                for slot in &self.own_glass {
+                    if let Some(own) = slot
+                        && own.key == key
+                    {
+                        *dst = Some(own.frame.glass);
+                        break;
+                    }
+                }
+            }
+        }
         let companion = cursor_companion_on_glass(duty, t.painted_caret, None, body_px);
         CompanionFrame {
             pet: pet_frame,
@@ -1482,9 +1533,7 @@ impl CompanionOwner {
             self.pet.retire_coordinate_space();
         }
         self.resight_offered = false;
-        for own in self.own_glass.iter_mut().flatten() {
-            own.offered = false;
-        }
+        self.clear_own_glass_offers();
         self.hit_rect = None;
         self.last_alpha = 0;
         self.last_visible = false;

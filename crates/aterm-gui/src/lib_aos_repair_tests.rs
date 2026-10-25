@@ -53,8 +53,42 @@ pub(super) fn momentum_app_on(mut app: App, light: bool) -> App {
     if light {
         feed(&app, b"\x1b[?5h");
     }
-    feed(&app, b"$ ");
+    sign_prompt(&app);
     app
+}
+
+/// The nonce of the fixture's integrated shell.
+const PROMPT_NONCE: [u8; 32] = [0x5A; 32];
+
+/// Puts a prompt of aterm's own integrated shell in front, so the keys typed at it are ones the recording may hold.
+pub(super) fn sign_prompt(app: &App) {
+    let term = app
+        .front_terminal(WID)
+        .expect("front terminal")
+        .term
+        .clone();
+    let id = aterm_core::terminal::ShellIntegrationNonce(PROMPT_NONCE).to_hex();
+    let mut t = crate::term_lock(&term);
+    t.authorize_shell_integration(PROMPT_NONCE);
+    t.set_require_shell_integration_nonce(true);
+    t.process(format!("\x1b]133;A;id={id}\x07$ \x1b]133;B;id={id}\x07").as_bytes());
+    assert!(
+        t.prompt_in_front().is_some(),
+        "the signed prompt is in front"
+    );
+}
+
+/// The fixture's shell runs the line it read (mark C), so no prompt is in front.
+pub(super) fn leave_prompt(app: &App) {
+    let term = app
+        .front_terminal(WID)
+        .expect("front terminal")
+        .term
+        .clone();
+    let id = aterm_core::terminal::ShellIntegrationNonce(PROMPT_NONCE).to_hex();
+    let mut t = crate::term_lock(&term);
+    t.process(format!("\r\n\x1b]133;C;id={id}\x07").as_bytes());
+    assert_eq!(t.prompt_in_front(), None, "no prompt is in front");
 }
 
 /// One printable key as the keyboard sends it.

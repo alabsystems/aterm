@@ -743,17 +743,52 @@ impl ScrollPlan {
         while start > 0 && self.span(start..n) + 0.5 < anchor {
             start -= 1;
         }
-        let bottom = self.span(start..n);
-        let offset = (bottom - anchor).max(0.0);
-        let height = (bottom - offset).min(reach).max(self.room.min(bottom));
-        let bare = start == top && (self.starts_bare(start) || offset > self.ink_top[start] + 0.01);
-        let caption = self
-            .top_caption(start..n, offset)
-            .map(|caption| TopCaption {
+        let seat = |start: usize| {
+            let flush = (self.span(start..n) - anchor).max(0.0);
+            let bare =
+                start == top && (self.starts_bare(start) || flush > self.ink_top[start] + 0.01);
+            let caption = self.top_caption(start..n, flush).map(|caption| TopCaption {
                 kept: caption.kept && !bare,
                 ..caption
             });
+            (flush, bare, caption)
+        };
+        let (flush, mut bare, caption) = seat(start);
+        // NO BAND OF BLANK OVER THE LAST SCREEN'S ROWS: seated with its end on the room's edge,
+        // its top can fall inside the caption of the run it starts in, which a hard edge never
+        // cuts: hidden, it left a band of blank over the whole rows under it (Packages' ACTIVITY
+        // and its Open Log at 102x45 and 150x47, 33pt and 40pt over the first row). Past it, the
+        // caption kept over the rows scrolling under it cut the first of them, whose cut lines
+        // then drew nothing (Harness' UPDATES at 1074x485 over 17pt of a row, Appearance's
+        // EFFECTS at 2x text over 54pt of Matrix rain's). The stop before the screen's own first
+        // that filled the seat gives it up: the stop after it starts the screen whole under the
+        // caption its run repeats over every screen of its rows, and the room it cannot fill
+        // lies under the list's end, where nothing follows. Under a cut caption the screen's
+        // first stop may instead start whole at the list's top, its caption scrolled off (a whole
+        // row beats a kept caption, and names itself), where that leaves less room unfilled:
+        // ACTIVITY's 64pt head stays over its 32pt rows at 150x47, 8pt to spare rather than 40pt,
+        // and the Sound page's bonks, rows of 66pt under a 40pt caption, start whole at the top
+        // at 102x29, 5pt to spare rather than 31pt.
+        let group = self.groups[start].is_some();
+        let cut = group && matches!(caption, Some(caption) if !caption.kept);
+        let kept = group && matches!(caption, Some(caption) if caption.kept);
+        let headed = start < top
+            && (kept
+                || cut
+                    && self.span(start + 1..n) + 0.5 >= self.span(start..n) - self.lead_of(start));
+        let (offset, caption) = if headed {
+            start += 1;
+            let (flush, after, caption) = seat(start);
+            bare = after;
+            (flush, caption)
+        } else if cut {
+            (self.lead_of(start), None)
+        } else {
+            (flush, caption)
+        };
         let drawn = start..n;
+        let bottom = self.span(drawn.clone());
+        let height = (bottom - offset).min(reach).max(self.room.min(bottom));
         Screen {
             view: top..n,
             live: self.live_on(&drawn, offset, caption, self.room),
@@ -2909,6 +2944,14 @@ impl SettingsViewState {
 
     /// Handle a pointer press on a control preview picture in the list strip.
     pub(super) fn press_list_picture(&mut self, key: UiKey) -> bool {
+        // A tile an open picker draws in its fading peek scrolls into the picker's window and
+        // chooses nothing, as a control in the page list's peek does.
+        if let Some(picker) = self.choice_picker.as_ref()
+            && let Some(position) = picker.focus_position(&key)
+        {
+            picker.scroll_to(Some(position));
+            return true;
+        }
         let listed = self
             .scroll_plan()
             .is_some_and(|plan| plan.stop_holding(&key).is_some());
@@ -3937,6 +3980,11 @@ pub(super) struct SplitCard {
     pub(super) padding: Insets,
     pub(super) gap: f32,
     pub(super) head: Vec<(UiNode, f32)>,
+    /// What leads a run of its rows that starts past its first in the head's place, as tall as
+    /// the head (empty: the head itself): the caption of a head that is a control, as Themes'
+    /// open Community disclosure, which stays one control, the keyboard's on the card's first
+    /// stop.
+    pub(super) repeat: Vec<(UiNode, f32)>,
     pub(super) rows: Vec<(UiNode, f32)>,
 }
 
@@ -3984,6 +4032,7 @@ impl SplitCard {
             padding: node.layout.padding,
             gap: node.layout.gap,
             head,
+            repeat: Vec::new(),
             rows,
         })
     }
@@ -4182,8 +4231,13 @@ impl SplitCard {
             })
     }
 
-    /// The card holding `rows`, its head over them.
+    /// The card holding `rows`, its head over them ([`Self::repeat`] past its first row).
     pub(super) fn node(&self, rows: Range<usize>) -> UiNode {
+        let head = if rows.start > 0 && !self.repeat.is_empty() {
+            &self.repeat
+        } else {
+            &self.head
+        };
         UiNode::new(self.key.clone(), UiContent::Group(self.spec.clone()))
             .layout(
                 Layout::column()
@@ -4194,8 +4248,7 @@ impl SplitCard {
                     .clipped(),
             )
             .children(
-                self.head
-                    .iter()
+                head.iter()
                     .map(|(node, _)| node.clone())
                     .chain(self.rows[rows].iter().map(|(node, _)| node.clone()))
                     .collect(),
@@ -4272,6 +4325,11 @@ impl SplitCard {
             spec: self.spec.clone(),
             padding: self.padding,
             gap: self.gap,
+            repeat: if starved {
+                Vec::new()
+            } else {
+                self.repeat.clone()
+            },
             head,
             rows: Vec::new(),
         };
@@ -4533,14 +4591,18 @@ fn plan_items_measured(
                     plan.set_caption(group, top, bottom);
                 }
                 for (part, rows) in card.stops(room).into_iter().enumerate() {
+                    // A head that is a control (Themes' open Community disclosure) is the
+                    // keyboard's on the card's first stop, reached and revealed as every stop is.
                     plan.row(
                         group,
                         card.rows[rows.clone()]
                             .iter()
                             .map(|(_, height)| height + card.gap)
                             .sum(),
-                        card.rows[rows.clone()]
+                        card.head
                             .iter()
+                            .filter(|_| part == 0)
+                            .chain(&card.rows[rows.clone()])
                             .flat_map(|(node, _)| keys(node))
                             .collect(),
                     );
@@ -4742,8 +4804,15 @@ impl SeatedList {
                     };
                     let first = stops.get(rows.start)?.1.clone()?.start;
                     let last = stops.get(rows.end - 1)?.1.clone()?.end;
+                    // Off the screen a part lists its rows alone, but for a head that is a control
+                    // over its first row, which stays in the tree with it as every control does.
                     let part = SplitCard {
-                        head: Vec::new(),
+                        head: if first == 0 && !card.repeat.is_empty() {
+                            card.head.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        repeat: Vec::new(),
                         ..card.clone()
                     };
                     let mut node = part.node(first..last).offscreen();
@@ -5032,6 +5101,7 @@ mod tests {
             padding: Insets::all(20.0),
             gap: 8.0,
             head: vec![(text("head"), 22.0)],
+            repeat: Vec::new(),
             rows: (0..5)
                 .map(|row| (text(&format!("row/{row}")), 30.0))
                 .collect(),
@@ -5070,6 +5140,7 @@ mod tests {
                     } else {
                         Vec::new()
                     },
+                    repeat: Vec::new(),
                     rows: (0..4)
                         .map(|row| (text(&format!("row/{row}")), 24.0))
                         .collect(),
@@ -5131,6 +5202,7 @@ mod tests {
             padding: Insets::all(10.0),
             gap: 5.0,
             head: Vec::new(),
+            repeat: Vec::new(),
             rows: vec![
                 (words("description"), 20.0),
                 (control("first"), 40.0),
@@ -5214,6 +5286,7 @@ mod tests {
             padding: Insets::all(10.0),
             gap: 5.0,
             head: Vec::new(),
+            repeat: Vec::new(),
             rows,
         };
         let shared = card(vec![
@@ -5264,6 +5337,7 @@ mod tests {
             padding: Insets::all(10.0),
             gap: 5.0,
             head: Vec::new(),
+            repeat: Vec::new(),
             rows: vec![
                 (control, 40.0),
                 (
@@ -5305,6 +5379,7 @@ mod tests {
             padding: Insets::all(10.0),
             gap: 5.0,
             head: Vec::new(),
+            repeat: Vec::new(),
             rows: (0..4)
                 .map(|row| (words(&format!("fact/{row}")), 20.0))
                 .collect(),
@@ -5328,6 +5403,7 @@ mod tests {
             padding: Insets::all(10.0),
             gap: 5.0,
             head: Vec::new(),
+            repeat: Vec::new(),
             rows: vec![
                 (words("wheel"), 100.0),
                 (UiNode::new("brightness", UiContent::Slider(slider)), 40.0),

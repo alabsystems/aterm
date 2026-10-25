@@ -292,6 +292,7 @@ fn the_card_key_and_the_layers_follow_what_moved() {
 const TEXT: HeaderText<'static> = HeaderText {
     tab: "Tab 2",
     machine: "this Mac",
+    over: true,
 };
 
 fn head_of(form: DeckForm, w: f64, m: &FaceMetrics) -> Option<(HeaderPlan, Strip)> {
@@ -440,7 +441,7 @@ fn the_time_scale_at_the_mockups_widths() {
             (10, vec![60, 120, 300]),
             (10, vec![60, 120, 300]),
             (10, vec![60, 300]),
-            (20, vec![300]),
+            (10, vec![60, 300]),
             (30, vec![60]),
             (20, vec![60, 300]),
         ]

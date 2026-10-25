@@ -257,6 +257,31 @@ pub const fn canonical(raw: &str) -> Option<&'static str> {
     }
 }
 
+const fn alias_row_indices<const N: usize>() -> [usize; N] {
+    let mut out = [0; N];
+    let mut ai = 0;
+    while ai < N {
+        let (_, target) = TRAIL_STYLE_ALIASES[ai];
+        let mut ri = 0;
+        let mut found = None;
+        while ri < TRAIL_STYLES.len() {
+            if eq_ascii_ci(target.as_bytes(), TRAIL_STYLES[ri].name) {
+                found = Some(ri);
+                break;
+            }
+            ri += 1;
+        }
+        out[ai] = match found {
+            Some(ri) => ri,
+            None => panic!("alias target not in TRAIL_STYLES"),
+        };
+        ai += 1;
+    }
+    out
+}
+
+const TRAIL_STYLE_ALIAS_ROWS: [usize; TRAIL_STYLE_ALIASES.len()] = alias_row_indices();
+
 /// The [`TRAIL_STYLES`] row a spelling resolves to.
 #[inline]
 #[must_use]
@@ -271,16 +296,9 @@ pub const fn row(raw: &str) -> Option<&'static TrailStyleRow> {
     }
     let mut ai = 0;
     while ai < TRAIL_STYLE_ALIASES.len() {
-        let (alias, target) = TRAIL_STYLE_ALIASES[ai];
+        let (alias, _) = TRAIL_STYLE_ALIASES[ai];
         if eq_ascii_ci(raw, alias) {
-            let mut ri = 0;
-            while ri < TRAIL_STYLES.len() {
-                if eq_ascii_ci(target.as_bytes(), TRAIL_STYLES[ri].name) {
-                    return Some(&TRAIL_STYLES[ri]);
-                }
-                ri += 1;
-            }
-            return None;
+            return Some(&TRAIL_STYLES[TRAIL_STYLE_ALIAS_ROWS[ai]]);
         }
         ai += 1;
     }

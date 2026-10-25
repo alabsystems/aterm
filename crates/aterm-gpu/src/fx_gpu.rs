@@ -66,10 +66,13 @@ pub(crate) enum FxStream {
     Over,
     /// Linear layers at Over.
     LinearOver,
+    /// Linear knock layers at Under (the companions' bodies under the text): `G_BASE_FG`'s
+    /// first draw, over the under-glyph light, under the ink, before the glyph knock-out.
+    KnockUnder,
 }
 
 /// How many [`FxStream`]s exist.
-pub(crate) const FX_STREAM_COUNT: usize = FxStream::LinearOver as usize + 1;
+pub(crate) const FX_STREAM_COUNT: usize = FxStream::KnockUnder as usize + 1;
 
 impl FxStream {
     /// The stream a layer draws into, or `None` for the one placement the engine refuses (a
@@ -83,6 +86,16 @@ impl FxStream {
             (FxSlot::Under, FxBlend::Linear) => Some(Self::LinearUnder),
             (FxSlot::Over, FxBlend::Linear) => Some(Self::LinearOver),
             (FxSlot::Glow, FxBlend::Linear) => None,
+        }
+    }
+
+    /// The stream `layer` draws into: [`Self::of`] its slot and blend, a knock layer's
+    /// Linear Under in [`Self::KnockUnder`].
+    #[inline]
+    pub(crate) const fn of_layer(layer: &FxLayer) -> Option<Self> {
+        match Self::of(layer.slot, layer.blend) {
+            Some(Self::LinearUnder) if layer.knock => Some(Self::KnockUnder),
+            s => s,
         }
     }
 }
@@ -658,8 +671,6 @@ pub(crate) struct FxGpu {
     /// The bloom layers' source quads, and their scratch.
     bloom_src: Vec<GlowQuad>,
     bloom_cols: aterm_render::SpriteCols,
-    /// The knock-out's rects ([`Self::knock_rects`]), kept across frames.
-    pub(crate) knocks: Vec<[i32; 4]>,
 }
 
 impl FxGpu {
@@ -743,24 +754,12 @@ impl FxGpu {
             f,
             layers,
             occluders,
-            |l| FxStream::of(l.slot, l.blend).is_some(),
+            |l| FxStream::of_layer(l).is_some(),
             band_open,
             &mut self.slicer,
             &mut sink,
         );
         self.refused = sink.refused + self.slicer.budget().refused_items();
-    }
-
-    /// The knock-out's bodies ([`aterm_render::knock_rects`]) of `layers`
-    /// into `out`, sliced on the frame's one slicer.
-    pub(crate) fn knock_rects(
-        &mut self,
-        f: &FxFrame,
-        layers: &[FxLayer],
-        occluders: &[aterm_core::render::PxRect],
-        out: &mut Vec<[i32; 4]>,
-    ) {
-        aterm_render::knock_rects(f, layers, occluders, &mut self.slicer, out);
     }
 
     /// The bloom source: `cursor_glow_add` and then this frame's `bloom` layers' quads, or
@@ -851,7 +850,7 @@ struct FxBuild<'s, 'a> {
 impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
     fn item(&mut self, layer: &'a FxLayer, item: &'a FxItem, origin: (i64, i64)) -> bool {
         self.cur = None;
-        let Some(stream) = FxStream::of(layer.slot, layer.blend) else {
+        let Some(stream) = FxStream::of_layer(layer) else {
             return false;
         };
         let len = layer.content.palette().len() as u64;
@@ -1249,12 +1248,10 @@ mod tests {
         struct Rig {
             fx: FxGpu,
             out: [Vec<FxInstance>; FX_STREAM_COUNT],
-            knocks: Vec<[i32; 4]>,
         }
         let mut rig = Rig {
             fx: FxGpu::default(),
             out: Default::default(),
-            knocks: Vec::new(),
         };
         let f = FxFrame {
             w: 800,
@@ -1264,11 +1261,9 @@ mod tests {
             cell_h: 16,
             rows: 4,
         };
-        // In the renderer's order: the knock-out's bodies before the
-        // admission, the bloom source after the build.
+        // In the renderer's order: the admission, the build, then the bloom source.
         let frame = |rig: &mut Rig, layers: &[FxLayer]| {
             let _ = aterm_render::test_counters::take_budget_rulings();
-            rig.fx.knock_rects(&f, layers, &[], &mut rig.knocks);
             rig.fx.admit(layers, &[], FX_ATLAS_CAP);
             rig.fx.build(&f, layers, &[], |_| true, &mut rig.out);
             let input = RenderInput {
@@ -1298,10 +1293,9 @@ mod tests {
             1,
             "a frame with a knock and a bloom layer is ruled once"
         );
-        assert_eq!(
-            rig.knocks,
-            [[0, 20, 8, 28]],
-            "the knock-out read the ruling"
+        assert!(
+            !rig.out[FxStream::KnockUnder as usize].is_empty(),
+            "the knock layer drew from the ruling"
         );
         assert_eq!(frame(&mut rig, &all), 0, "and not at all while it stands");
         let fresh = knock_and_bloom(&[art(12, 12, 9)]);

@@ -7,13 +7,19 @@
 use super::*;
 use crate::commons::{
     ENTRY,
-    binding::Possession,
+    binding::{Binding, Possession},
     bootstrap::Bootstrap,
     constraints::Fact,
     journal::Journal,
     node::Node,
     roster::{Grant, Role},
 };
+
+// A local plan is never retained across peer I/O or exposed as a grant.
+enum Candidate {
+    Retained(Node),
+    New { host: String, grants: Vec<Grant> },
+}
 
 pub(super) fn include_approved(
     doc: &Document,
@@ -56,6 +62,103 @@ pub(super) fn include_approved(
 }
 
 impl Admin {
+    /// Check current local eligibility before issuing a possession challenge.
+    /// This signs nothing and grants no authority. Reopen the admin snapshot and
+    /// journal after the peer replies; enrollment repeats every policy check.
+    pub fn check_commons_enrollment(
+        &self,
+        bootstrap: &Bootstrap,
+        journal: &Journal,
+        binding: &Binding,
+    ) -> crate::Result<()> {
+        self.enrollment_candidate(bootstrap, journal, binding)?;
+        Ok(())
+    }
+
+    fn enrollment_candidate(
+        &self,
+        bootstrap: &Bootstrap,
+        journal: &Journal,
+        binding: &Binding,
+    ) -> crate::Result<Candidate> {
+        if bootstrap.trust() != journal.trust() {
+            return Err(Error::new("Commons enrollment has another local root"));
+        }
+        if !self
+            .admissions
+            .permits(journal.trust(), &binding.recipient())
+        {
+            return Err(Error::new(
+                "Commons enrollment needs authenticated admission evidence",
+            ));
+        }
+        let machines = self.published_doc.machines();
+        let host = machines
+            .iter()
+            .find(|m| Recipient::parse(&m.recipient).ok() == Some(binding.recipient()))
+            .ok_or_else(|| Error::new("Commons enrollment recipient is not admitted"))?
+            .name
+            .clone();
+        crate::commons::membership::check_candidate(
+            &self.commons_seed,
+            journal,
+            &self.commons_eligibility,
+            &host,
+            binding,
+        )?;
+        let access = bootstrap
+            .access_in(journal)?
+            .ok_or_else(|| Error::new("Commons enrollment needs a current local roster"))?;
+        if let Some(member) = access
+            .members()
+            .iter()
+            .find(|member| member.binding().recipient() == binding.recipient())
+        {
+            if member.binding() != binding {
+                return Err(Error::new(
+                    "Commons enrollment cannot replace an existing device",
+                ));
+            }
+            return std::iter::once(access.basis())
+                .chain(journal.inventory())
+                .filter_map(|id| journal.node(id))
+                .find(|node| {
+                    node.facts()
+                        .iter()
+                        .any(|fact| matches!(fact, Fact::Bind { binding: b } if b == binding))
+                })
+                .cloned()
+                .map(Candidate::Retained)
+                .ok_or_else(|| Error::new("Commons enrolled device has no retained witness"));
+        }
+        access.check_addition(binding, Role::Writer)?;
+        let mut grants = Vec::new();
+        for member in access.members() {
+            let name = machines
+                .iter()
+                .find(|m| Recipient::parse(&m.recipient).ok() == Some(member.binding().recipient()))
+                .ok_or_else(|| {
+                    Error::new("retire the removed Commons member before enrolling another device")
+                })?
+                .name
+                .clone();
+            if !self
+                .commons_eligibility
+                .includes(&name, member.binding().recipient())
+            {
+                return Err(Error::new(
+                    "current Commons member is outside the control audience",
+                ));
+            }
+            grants.push(Grant::recorded(
+                name,
+                member.binding().clone(),
+                member.role(),
+            ));
+        }
+        Ok(Candidate::New { host, grants })
+    }
+
     /// Enroll a jointly proven, durably approved device as a Commons writer.
     /// Preserve all current members and roles, refusing key replacement or an
     /// unavailable/forked roster. The returned authority witness is durable in
@@ -67,58 +170,12 @@ impl Admin {
         journal: &mut Journal,
         possession: Possession,
     ) -> crate::Result<Node> {
-        if bootstrap.trust() != journal.trust() {
-            return Err(Error::new("Commons enrollment has another local root"));
-        }
         let binding = possession.binding().clone();
-        let machines = self.published_doc.machines();
-        let host = machines
-            .iter()
-            .find(|m| Recipient::parse(&m.recipient).ok() == Some(binding.recipient()))
-            .ok_or_else(|| Error::new("Commons enrollment recipient is not admitted"))?
-            .name
-            .clone();
+        let (host, mut grants) = match self.enrollment_candidate(bootstrap, journal, &binding)? {
+            Candidate::Retained(node) => return Ok(node),
+            Candidate::New { host, grants } => (host, grants),
+        };
         let certificate = self.auto_approve_commons_member(journal, &host, possession)?;
-        let access = bootstrap
-            .access_in(journal)?
-            .ok_or_else(|| Error::new("Commons enrollment needs a current local roster"))?;
-        if let Some(member) = access
-            .members()
-            .iter()
-            .find(|m| m.binding().recipient() == binding.recipient())
-        {
-            if member.binding() != &binding {
-                return Err(Error::new(
-                    "Commons enrollment cannot replace an existing device",
-                ));
-            }
-            return std::iter::once(access.basis())
-                .chain(journal.inventory())
-                .filter_map(|id| journal.node(id))
-                .find(|node| {
-                    node.facts()
-                        .iter()
-                        .any(|fact| matches!(fact, Fact::Bind { binding: b } if b == &binding))
-                })
-                .cloned()
-                .ok_or_else(|| Error::new("Commons enrolled device has no retained witness"));
-        }
-        let mut grants = Vec::new();
-        for member in access.members() {
-            let name = machines
-                .iter()
-                .find(|m| Recipient::parse(&m.recipient).ok() == Some(member.binding().recipient()))
-                .ok_or_else(|| {
-                    Error::new("retire the removed Commons member before enrolling another device")
-                })?
-                .name
-                .clone();
-            grants.push(Grant::recorded(
-                name,
-                member.binding().clone(),
-                member.role(),
-            ));
-        }
         grants.push(Grant::certified(host, certificate, Role::Writer));
         let node = self.prepare_commons_rotation(journal, grants)?;
         journal.ingest(node.bytes())?;

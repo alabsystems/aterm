@@ -707,6 +707,50 @@ fn continue_readable_permissions_inline() {
     change(|script| script.startups_inline += 1);
 }
 
+/// A Restore pressed while another setup holds this Mac's setup records waits quietly, its
+/// press queued: it reads no row while it waits and runs once, with its readings, when that
+/// setup lets go.
+#[test]
+fn a_restore_waits_quietly_while_another_setup_holds_the_records() {
+    use aterm_cli::macos_doctor::{Action, InitialSetupObserved, Report};
+    let _globals = globals();
+    let _io = TestIo::install();
+    let _healing = Healing::idle();
+    change(|script| script.records_held.extend([true, true, true]));
+    let root = CLAIM_ROOT.lock().unwrap().clone().unwrap();
+    let busy = take_initial_setup_slot().unwrap();
+    let mut restores = 0;
+    run_setup_restore(busy, |_, holding| {
+        restores += 1;
+        assert!(
+            script().records_held.is_empty(),
+            "it ran only once they were let go"
+        );
+        assert!(script().reads.is_empty(), "no row read while it waited");
+        assert!(!SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
+        assert!(holding(), "nothing pressed meanwhile");
+        InitialSetupObserved {
+            result: Ok(Some(Report {
+                action: Action::Restore,
+                rows: Vec::new(),
+                manual_steps: Vec::new(),
+                backup: root.join("inert-backup"),
+                restore: None,
+                page: None,
+            })),
+            observation: None,
+        }
+    });
+    assert_eq!(restores, 1);
+    assert_eq!(
+        SETUP_QUEUED.load(Ordering::Acquire),
+        0,
+        "its press waits no more"
+    );
+    assert!(!INITIAL_SETUP_BUSY.load(Ordering::Acquire));
+    wait_until("the Restore's fresh readings", observe_idle);
+}
+
 #[test]
 fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refused() {
     use aterm_cli::macos_doctor::{
@@ -725,22 +769,23 @@ fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refu
         let root = CLAIM_ROOT.lock().unwrap().clone().unwrap();
         let busy = take_initial_setup_slot().unwrap();
         let mut restores = 0;
-        run_setup_restore(busy, || {
+        run_setup_restore(busy, |_, holding| {
             restores += 1;
             assert!(INITIAL_SETUP_BUSY.load(Ordering::Acquire));
             assert!(!SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
             let _claim = aterm_cli::macos_doctor::claim_initial_setup_rerun_at(&root)
                 .unwrap()
                 .unwrap();
+            assert!(holding(), "nothing pressed meanwhile");
             InitialSetupObserved {
-                result: Ok(Report {
+                result: Ok(Some(Report {
                     action: Action::Restore,
                     rows: Vec::new(),
                     manual_steps: Vec::new(),
                     backup: root.join("inert-backup"),
                     restore: None,
                     page: None,
-                }),
+                })),
                 observation: None,
             }
         });
@@ -758,4 +803,35 @@ fn startup_recovery_restore_falls_back_on_its_released_worker_when_spawn_is_refu
         assert!(script().runs.is_empty(), "no OS stage runs in this fixture");
         wait_until("the Restore's fresh readings", observe_idle);
     }
+}
+
+/// The exceptions digest's set-aside entry goes with the page's note (System State design §3.5):
+/// while the saved setup reads as set aside, or cannot be read, it stays; once it reads with
+/// nothing set aside (the person chose, or Restore ran), it is cleared, once, and a later
+/// set-aside raises it again. At launch an earlier launch's entry may stand, so it is cleared
+/// at the first reading with nothing set aside.
+#[test]
+fn the_set_aside_digest_entry_goes_once_the_person_chooses() {
+    let _globals = globals();
+    let clears = std::cell::Cell::new(0_usize);
+    let read = |recovered| set_aside_as_read(recovered, || clears.set(clears.get() + 1));
+    SET_ASIDE_SAID.store(true, Ordering::Release);
+    read(Some(true));
+    read(None);
+    assert_eq!(clears.get(), 0, "the set-aside still stands");
+    read(Some(false));
+    read(Some(false));
+    assert_eq!(clears.get(), 1, "cleared once the person chose");
+    note_setup_set_aside(&aterm_cli::macos_doctor::SetAside {
+        kept: vec!["first-run.json.unreadable".to_owned()],
+        stop_target: 1,
+    });
+    read(Some(true));
+    assert_eq!(clears.get(), 1);
+    read(Some(false));
+    assert_eq!(
+        clears.get(),
+        2,
+        "a later set-aside's entry goes the same way"
+    );
 }

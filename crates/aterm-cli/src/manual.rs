@@ -101,10 +101,13 @@ aterm finds the ALab signal, in the same launch or a later one, it widens the pl
 chose by itself and says so on the page, and a Stop while it widens puts that plan
 back as yours, never widened again; a plan you shaped, or a Restore left, is never
 changed, and pressing any group,
-even to what it already is, makes the plan yours. Setup starts as soon as the tab is
-shown, with no countdown. A group's Set up / Leave as is takes effect at once, and
-Stop, beside the headline while a run is going, ends that run between steps. Closing
-the tab never cancels. System State remains available to rerun setup or to press
+even to what it already is, makes the plan yours. The first launch shows Apply and
+Cancel: setup applies after 30 seconds while the tab is active and visible, but
+interaction stops that countdown, group and vault edits wait for Apply, and Cancel
+ends the offer without applying. Outside that review, a group's Set up / Leave as is
+takes effect at once. Stop, beside the headline while a run is going, ends that run
+between steps. Closing the tab never cancels accepted setup. System State remains
+available to rerun setup or to press
 Restore previous settings. Terminal and ssh sessions, -e commands, headless runs,
 private lab homes and utilities never start setup.
 
@@ -125,13 +128,25 @@ Approved setup resumes unfinished steps on later launches, silently, and so does
 choice cut short by a quit or a crash, which still sets only what it changed. A choice
 made while another setup holds the records (another aterm, or aterm doctor in a
 terminal) waits for it and is applied when it finishes, as is a Restore; a later choice
-replaces it, and the page says it waits, with no failure. A saved setup record that
+replaces it until it starts writing, and the page says it waits, with no failure. A saved setup record that
 cannot be parsed twice in a row is kept beside itself as <name>.unreadable, and setup
 goes on as from a fresh one: your Mac settings left as they are, aterm's permissions
-set up. A row that waits for you is not retried until you act, press Check again, or
+set up, and on an ALab Mac the vault and repositories too, unless your Stop or Cancel
+holds them. Setup a newer aterm saved is left as it is, a damaged record beside it too,
+and System State says so in one line. A row that waits for you is not retried until you act, press Check again, or
 launch aterm again; a vault approval waits the same way, and the run goes on once an
-admin Mac approves. A join turns sync on; with sync turned off since, the join lands
+admin Mac approves. A step that fails for a passing reason (GitHub or the vault not
+answering, a change that did not take) is tried again by itself, and System State shows
+it waiting meanwhile, saying Failed only once those tries are spent. One only you can
+fix (a GitHub token to renew in the vault, Apple's Command Line Tools to install) reads
+Needs you with what to do, and System State reads it again every minute while shown and
+whenever you return to it. One no retry changes (GitHub repositories on a Mac with more
+than one user account) reads Failed at once; aterm doctor says why. A join turns sync on; with sync turned off since, the join lands
 once you turn it on again (`aterm secrets agent on`), and the run does not wait for it.
+While aterm cannot read this Mac's vault settings (`aterm secrets status` says why), Join
+joins nothing and System State says so calmly: the first launch's answer goes ahead
+without it, aterm's permissions and every other group included, and the vault you typed
+stays in its field for a Join once the settings read.
 While the vault is at Set up and no Stop holds the run, each launch and every 30
 minutes after quietly installs again a sync process whose copy of aterm is gone, or one
 a join could not install, never over sync turned off. Rows are read without changing
@@ -141,13 +156,13 @@ may use the local network: Local Network reads On once aterm reached the LAN, Of
 macOS refused it (your answer, which aterm leaves), and otherwise shows — with a short
 note, so System State never waits on it. The newest answer wins: a later Local Network
 question aterm raised, or a later look, replaces an old refusal, and Check again looks
-again without ever asking. Completed setup preserves later local changes:
-a group turned to Set up later sets only its own preferences, and a Join or a group
-turned to Leave as is sets none. So it is after an older aterm's setup: its plan gains
-aterm's permissions, and a choice never resets its Dock or signs out again. Rust in
-Spotlight keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out
-by itself (the toolchain it is using moves at its next update, which the row notes);
-your projects' build folders Spotlight indexes are yours, counted in the row's note and
+again without ever asking. Completed setup preserves later local changes: a group
+turned to Set up later sets only its own preferences, and a Join or a group turned to
+Leave as is sets none. So it is after an older aterm's setup: its plan gains aterm's
+permissions, and a choice never resets its Dock or signs out again. Rust in Spotlight
+keeps aterm's own build caches out, and aterm keeps its own Rust toolchain out by
+itself (the toolchain it is using moves at its next update, which the row notes); your
+projects' build folders Spotlight indexes are yours, counted in the row's note and
 never moved.
 
 Only changed preference keys are backed up (no credentials). Restore previous settings
@@ -231,7 +246,8 @@ REWIND
   to live; meanwhile keys and clicks reach no program, and its output keeps arriving
   underneath. The band says whether a live witness checked that state (`faithful`,
   `may differ from what was on screen`, or `unchecked`). It needs Settings > Terminal >
-  Rewind (`temporal_recording = true`) turned on before the tab opens.
+  Rewind (`temporal_recording = true`) turned on before the tab opens. Its other keys,
+  find, copy and export: `aterm help rewind`.
 
 GOTCHAS
   * `aterm <tool>` for an uninstalled store tool exits 127 with `atpkg: <tool> is not
@@ -493,6 +509,62 @@ EXIT STATUS
 ON THE WIRE
   aterm ctl @self edit <file-uri> [line=L[:C]]
   aterm ctl @self await edit ticket=<t>"#,
+        ),
+    },
+    Topic {
+        name: "rewind",
+        tagline: "a pane's past screens: step, find, copy, when a cell changed, export",
+        body: Some(
+            r#"rewind — a pane's past screens (View > Rewind Pane, Cmd-Shift-R).
+
+WHAT IT DOES
+  A tab opened with Settings > Terminal > Rewind on (`temporal_recording = true`)
+  keeps, in memory and within a per-session budget, the bytes its program wrote and
+  keyframes of its screen. Rewind replays them into a separate screen and shows it in
+  the pane, inside an accent border, over a track and a band. The program is not
+  rewound: its output keeps arriving underneath (`live +N KB` on the band), and a
+  person's keys and clicks reach no program while the pane is rewound.
+
+KEYS (while the pane is rewound)
+  Left / Right            one recorded state
+  Option-Left / Right     one second, and at least one state
+  Shift-Left / Right      the previous or next command start (OSC 133 marks, from
+                          shell integration); the band says when there is none
+  Cmd-Left / Right        the oldest or the newest kept state (also Home / End)
+  scroll, Page Up / Down  the past screen's own scrollback, up to 2048 lines
+  drag, then Cmd-C        copy from the past screen (Cmd-A selects all of it)
+  Cmd-F                   find over the past screen
+  click a cell, then B    the state that last changed that cell; B again, the change
+                          before it. The band says, for example, `row 18 col 42
+                          changed 12.4 s ago: 37 bytes "\e[18;42Hx"`, with every
+                          control byte escaped
+  Esc or Cmd-Shift-R      back to live
+  A step never lands inside a synchronized frame (mode 2026) a program had not
+  finished drawing.
+
+THE BAND AND THE TRACK
+  The band gives the state's clock time, how long ago it was, its place (`state
+  803/1412`), and what the live witnesses say of it: `faithful` (a capture of the live
+  screen matched the replay), `may differ from what was on screen` (one did not), or
+  `unchecked`. The track above it spans the kept history: the block is the shown
+  state, and hatched stretches cannot be rebuilt or did not match. Hosted effects on
+  the window (`aos`) pause while it is rewound and resume after; the band says so.
+
+ELSEWHERE
+  Right-click a tab: its timeline rows open Rewind at their instant.
+  View > Export Pane History… (macOS) writes the kept history as an asciicast v2
+  file, mode 0600, where a save panel says; nothing is written without it.
+  A screen reader sees the band as a slider (Increment and Decrement step).
+
+ON THE WIRE (`aterm ctl help rewind`)
+  aterm ctl rewind [status] | open [ago=<secs>|at=<tick>] | step <+-n> [by=sec|cmd]
+                   | changed <row>,<col> | text [trim] | export | close
+  `rewind changed` takes a 0-based cell; `rewind export` writes the file, mode 0600,
+  under the state directory's `rewind/` folder.
+
+LIMITS
+  Images and the child process are not rewound. Nothing before the oldest kept
+  keyframe, or across a stretch the recorder lost, is shown."#,
         ),
     },
     Topic {

@@ -232,11 +232,21 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
     fn turn_ran(&self) {}
+    /// The loop decided a turn break (an idle or limited point), told once at the decision,
+    /// before the host is asked whether it [`Self::wants`] a step there; the wait's later looks at
+    /// the same point are not told. `theirs` is whose the session is for as long as they keep it,
+    /// as [`IdlePoint::theirs`] says. A host that keeps a finding of the session as of its last
+    /// turn break (the `disk-free@v1` seat rule's) makes it here, so the finding is never older
+    /// than the turn break the session rests at, whether or not the host owes a step there.
+    fn turn_break(&self, theirs: Option<Guard>) {
+        let _ = theirs;
+    }
     fn usage_tap(&self) {}
     /// The agent is mid-turn (a busy read): its usage tap's newest reading may be recorded,
     /// as at a decided idle turn end ([`Self::usage_tap`]) but never judged silent, so what
     /// the accounts store holds keeps up with a turn that runs for hours. The host bounds
-    /// how often it reads.
+    /// how often it reads. A host whose finding of the session at its last turn break holds only
+    /// while the session rests there ([`Self::turn_break`]) drops it here.
     fn busy_tap(&self) {}
     fn tap_window(
         &self,

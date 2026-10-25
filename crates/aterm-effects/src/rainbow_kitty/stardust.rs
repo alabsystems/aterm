@@ -27,8 +27,8 @@ use crate::cursor_glow::{
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_CORE_ADD, STAR_GLINT,
     STAR_GLINT_COV, STAR_OVER_CENTRE_LAYS, STAR_OVER_LAYS, STAR_TAPER_BODY, STAR_WAIST,
-    TWINKLE_GLINT_FRAC, TWINKLE_OMEGA, push_fx_rect, push_twinkle_star, star_arm, star_body_px,
-    twinkle_env, twinkle_peak,
+    TWINKLE_GLINT_FRAC, TWINKLE_OMEGA, mix_rgb, push_fx_rect, push_twinkle_star, star_arm,
+    star_body_px, twinkle_env, twinkle_peak,
 };
 use crate::rainbow_kitty::meteor::{LandingWalk, tri};
 use crate::rainbow_kitty::ribbon::{
@@ -1499,7 +1499,7 @@ impl GlyphProbe {
         let r = &mut self.rows[slot];
         for (col, &on) in occupied.iter().enumerate() {
             if on {
-                r.ink[col / 64] |= 1u64 << (col % 64);
+                r.ink[col >> 6] |= 1u64 << (col & 63);
             }
         }
     }
@@ -1511,13 +1511,13 @@ impl GlyphProbe {
         let slot = self.slot_for(row, cells.len());
         let r = &mut self.rows[slot];
         for (col, &cell) in cells.iter().enumerate() {
-            let bit = 1u64 << (col % 64);
+            let bit = 1u64 << (col & 63);
             match cell {
                 CellInk::Blank => {}
-                CellInk::Glyph => r.ink[col / 64] |= bit,
+                CellInk::Glyph => r.ink[col >> 6] |= bit,
                 CellInk::Rule => {
-                    r.ink[col / 64] |= bit;
-                    r.rule[col / 64] |= bit;
+                    r.ink[col >> 6] |= bit;
+                    r.rule[col >> 6] |= bit;
                 }
             }
         }
@@ -1529,13 +1529,13 @@ impl GlyphProbe {
         let slot = self.slot_for(row, chars.len());
         let r = &mut self.rows[slot];
         for (col, &ch) in chars.iter().enumerate() {
-            let bit = 1u64 << (col % 64);
+            let bit = 1u64 << (col & 63);
             match cell_ink(ch) {
                 CellInk::Blank => {}
-                CellInk::Glyph => r.ink[col / 64] |= bit,
+                CellInk::Glyph => r.ink[col >> 6] |= bit,
                 CellInk::Rule => {
-                    r.ink[col / 64] |= bit;
-                    r.rule[col / 64] |= bit;
+                    r.ink[col >> 6] |= bit;
+                    r.rule[col >> 6] |= bit;
                 }
             }
         }
@@ -1637,8 +1637,8 @@ impl GlyphProbe {
             return Some((false, false));
         }
         let i = col as usize;
-        let word = i / 64;
-        let shift = i % 64;
+        let word = i >> 6;
+        let shift = i & 63;
         let ink = r.ink.as_slice();
         let inked = word < ink.len() && (ink[word] >> shift) & 1 == 1;
         let rule = r.rule.as_slice();
@@ -1669,9 +1669,9 @@ impl GlyphProbe {
             return false;
         }
         let (lo, hi) = (lo as usize, hi as usize);
-        let (w0, w1) = (lo / 64, hi / 64);
-        let low_mask = u64::MAX << (lo % 64);
-        let high_mask = u64::MAX >> (63 - (hi % 64));
+        let (w0, w1) = (lo >> 6, hi >> 6);
+        let low_mask = u64::MAX << (lo & 63);
+        let high_mask = u64::MAX >> (63 - (hi & 63));
         let rule = r.rule.as_slice();
         if w0 == w1 {
             return w0 < rule.len() && (rule[w0] & low_mask & high_mask) != 0;
@@ -1854,8 +1854,13 @@ impl SkyMark {
             return None;
         }
         let k0 = keys.len() as u32;
-        keys.extend(quads.iter().map(sky_quad_key));
-        keys.extend(halos.iter().map(sky_halo_key));
+        keys.reserve(quads.len() + halos.len());
+        for q in quads {
+            keys.push(sky_quad_key(q));
+        }
+        for h in halos {
+            keys.push(sky_halo_key(h));
+        }
         Some(Self {
             at,
             reach,
@@ -2211,7 +2216,10 @@ impl Stardust {
                 continue;
             }
             let arms = class.arms(ch);
-            for star in self.stars.iter().filter(|s| s.class == class) {
+            for star in &self.stars {
+                if star.class != class {
+                    continue;
+                }
                 let turn = i;
                 i += 1;
                 if !star.inks(ctx.cfg) {
@@ -2622,9 +2630,14 @@ impl Stardust {
             return;
         }
         if self.stars.len() + EXHAUST_HEADROOM > STAR_CAP {
-            let live = self.stars.iter().filter(|s| s.finish.is_none()).count();
-            if live + EXHAUST_HEADROOM > STAR_CAP {
-                return;
+            let mut live = 0usize;
+            for s in &self.stars {
+                if s.finish.is_none() {
+                    live += 1;
+                    if live + EXHAUST_HEADROOM > STAR_CAP {
+                        return;
+                    }
+                }
             }
         }
         let (row, col) = ctx.caret;
@@ -2640,12 +2653,13 @@ impl Stardust {
         };
         let want = stream_travel_px(wind).min(WALK_FAST_CELLS * cw) * stream_unit(EXHAUST_THROW_MS);
         let rise = EXHAUST_RISE_CH * g.ch as f32 * (0.5 + 0.5 * hash01(mix32(seed ^ 3)));
-        let rows = px_row(y - rise, g)..=px_row(y, g);
-        if !col.checked_sub(1).is_some_and(|c| {
-            rows.into_iter()
-                .all(|r| self.probe.sky_at(r, c, g.rows) == Some(false))
-        }) {
+        let Some(c) = col.checked_sub(1) else {
             return;
+        };
+        for r in px_row(y - rise, g)..=px_row(y, g) {
+            if self.probe.sky_at(r, c, g.rows) != Some(false) {
+                return;
+            }
         }
         let reach = self.blank_frontier_px(x, (y - rise, y), want, ctx);
         if reach < 0.5 {
@@ -2913,15 +2927,17 @@ impl Stardust {
             (-1.0, 1.0),
             (1.0, 1.0),
         ];
-        NUDGE
-            .iter()
-            .map(|&(dx, dy)| (x + dx, y + dy))
-            .find(|&(nx, ny)| {
-                (x_lo..=x_hi).contains(&nx)
-                    && (y_lo..=y_hi).contains(&ny)
-                    && glass(nx, ny)
-                    && !self.pixel_taken(nx, ny)
-            })
+        for (dx, dy) in NUDGE {
+            let (nx, ny) = (x + dx, y + dy);
+            if (x_lo..=x_hi).contains(&nx)
+                && (y_lo..=y_hi).contains(&ny)
+                && glass(nx, ny)
+                && !self.pixel_taken(nx, ny)
+            {
+                return Some((nx, ny));
+            }
+        }
+        None
     }
 
     #[inline]
@@ -3061,13 +3077,12 @@ impl Stardust {
             }
             return true;
         }
-        if let Some(p) = NUDGE
-            .iter()
-            .map(|&(dx, dy)| (rest.0 + dx, rest.1 + dy))
-            .find(|&p| clear(p))
-        {
-            star.aim(p, k);
-            return true;
+        for (dx, dy) in NUDGE {
+            let p = (rest.0 + dx, rest.1 + dy);
+            if clear(p) {
+                star.aim(p, k);
+                return true;
+            }
         }
         if !fixed {
             return false;
@@ -3075,17 +3090,20 @@ impl Stardust {
         let (dx, dy) = ((rest.0 - origin.0) as f32, (rest.1 - origin.1) as f32);
         let steps = dx.hypot(dy).ceil().max(1.0) as i32;
         let inv_steps = 1.0 / steps as f32;
-        let p = (0..steps)
-            .rev()
-            .map(|i| {
-                let t = i as f32 * inv_steps;
-                (
-                    origin.0 + (dx * t).round() as i32,
-                    origin.1 + (dy * t).round() as i32,
-                )
-            })
-            .find(|&p| clear(p))
-            .unwrap_or(origin);
+        let mut p = origin;
+        let mut i = steps - 1;
+        while i >= 0 {
+            let t = i as f32 * inv_steps;
+            let cand = (
+                origin.0 + (dx * t).round() as i32,
+                origin.1 + (dy * t).round() as i32,
+            );
+            if clear(cand) {
+                p = cand;
+                break;
+            }
+            i -= 1;
+        }
         star.aim(p, k);
         true
     }
@@ -3229,14 +3247,16 @@ impl Stardust {
             self.stars[idx].finish_by(now, EVICT_FINISH_MS / 1000.0);
         }
         if self.stars.len() >= STAR_POOL_MAX {
-            let nearest_end = self
-                .stars
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| s.finish.map(|f| (i, f.u(now))))
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map_or(0, |(i, _)| i);
-            self.stars.remove(nearest_end);
+            let mut nearest_end: Option<(usize, f32)> = None;
+            for (i, s) in self.stars.iter().enumerate() {
+                if let Some(f) = s.finish {
+                    let u = f.u(now);
+                    if nearest_end.is_none_or(|(_, best)| u.total_cmp(&best).is_ge()) {
+                        nearest_end = Some((i, u));
+                    }
+                }
+            }
+            self.stars.remove(nearest_end.map_or(0, |(i, _)| i));
         }
     }
 
@@ -4223,18 +4243,6 @@ pub const fn veil_gain(birth_disp: f32) -> f32 {
 
 #[inline]
 #[must_use]
-const fn mix_rgb(a: u32, b: u32, k: f32) -> u32 {
-    #[inline]
-    const fn ch(a: u32, b: u32, k: f32, sh: u32) -> u32 {
-        let (x, y) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
-        (x + (y - x) * k).round().clamp(0.0, 255.0) as u32
-    }
-    let k = clamp01(k);
-    (ch(a, b, k, 16) << 16) | (ch(a, b, k, 8) << 8) | ch(a, b, k, 0)
-}
-
-#[inline]
-#[must_use]
 const fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
     if gold || tint == TINT_WHITE_RGB {
         return tint;
@@ -4604,11 +4612,17 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         return;
     }
     let table = relative_luminance_table();
-    let own_at_max = |(x, y): (i32, i32)| -> (u32, u32, u8) {
+    let star_quads = &frame.out[q0..];
+    let maskable = star_quads.len() <= u32::BITS as usize;
+    let own_at_max = |(x, y): (i32, i32)| -> (u32, u32, u32, u8) {
         let mut own = 0u32;
-        for q in &frame.out[q0..] {
+        let mut qmask = 0u32;
+        for (idx, q) in star_quads.iter().enumerate() {
             if quad_covers(q, x, y) {
                 own = add_sat(own, q.color & 0x00FF_FFFF);
+                if maskable {
+                    qmask |= 1u32 << idx;
+                }
             }
         }
         let mut halo_color = 0u32;
@@ -4622,16 +4636,16 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
                 break;
             }
         }
-        (own, halo_color, halo_wt)
+        (own, qmask, halo_color, halo_wt)
     };
-    let mut over = [((0i32, 0i32), 0u32, 0u32, 0u8); SETTLE_PIXELS];
+    let mut over = [((0i32, 0i32), 0u32, 0u32, 0u32, 0u8); SETTLE_PIXELS];
     let mut over_len = 0usize;
     for &(p, ground) in watch {
-        let (own, halo_color, halo_wt) = own_at_max(p);
+        let (own, qmask, halo_color, halo_wt) = own_at_max(p);
         if !under_ceil_with(table, add_sat(ground, own))
             && let Some(slot) = over.get_mut(over_len)
         {
-            *slot = (p, ground, halo_color, halo_wt);
+            *slot = (p, ground, qmask, halo_color, halo_wt);
             over_len += 1;
         }
     }
@@ -4639,11 +4653,19 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         return;
     }
     let over = &over[..over_len];
-    let own_at = |k: u8, (x, y): (i32, i32), halo_color: u32, halo_wt: u8| -> u32 {
+    let own_at = |k: u8, (x, y): (i32, i32), mut qmask: u32, halo_color: u32, halo_wt: u8| -> u32 {
         let mut own = 0u32;
-        for q in &frame.out[q0..] {
-            if quad_covers(q, x, y) {
-                own = add_sat(own, premul_rgb(q.color, k));
+        if maskable {
+            while qmask != 0 {
+                let idx = qmask.trailing_zeros() as usize;
+                qmask &= qmask - 1;
+                own = add_sat(own, premul_rgb(star_quads[idx].color, k));
+            }
+        } else {
+            for q in star_quads {
+                if quad_covers(q, x, y) {
+                    own = add_sat(own, premul_rgb(q.color, k));
+                }
             }
         }
         if halo_wt > 0 {
@@ -4652,8 +4674,11 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         own
     };
     let fits = |k: u8| {
-        over.iter().all(|&(p, ground, halo_color, halo_wt)| {
-            under_ceil_with(table, add_sat(ground, own_at(k, p, halo_color, halo_wt)))
+        over.iter().all(|&(p, ground, qmask, halo_color, halo_wt)| {
+            under_ceil_with(
+                table,
+                add_sat(ground, own_at(k, p, qmask, halo_color, halo_wt)),
+            )
         })
     };
     let k = fit_byte(u8::MAX - 1, fits);

@@ -8,6 +8,7 @@ pub mod frame;
 pub mod instance;
 pub mod paint;
 pub mod paint_probe;
+pub mod rewind;
 pub mod scan;
 pub mod spin;
 pub mod starvation;

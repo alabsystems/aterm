@@ -143,6 +143,21 @@ impl InkLedger {
     pub(super) const FEATHER_Y: f32 = 0.35;
     const FEATHER_STEP: i32 = 2;
 
+    /// The `(slot_index, first_col, end_col)` of the held line on `row`.
+    #[inline]
+    const fn line_slot(&self, row: i32) -> Option<(usize, i32, i32)> {
+        let mut i = 0;
+        while i < self.lines.len() {
+            if let Some((r, first, end)) = self.lines[i]
+                && r == row
+            {
+                return Some((i, first, end));
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// The account index of band 0 of text cell `(row, col)`, or `None` for a
     /// cell the account does not hold (off every line, past the grid, or the
     /// caret's own).
@@ -154,16 +169,11 @@ impl InkLedger {
         {
             return None;
         }
-        let mut i = 0;
-        while i < self.lines.len() {
-            if let Some((r, first, end)) = self.lines[i]
-                && r == row
-                && col >= first
-                && col < end
-            {
-                return Some((i * self.stride + col as usize) * Self::BANDS);
-            }
-            i += 1;
+        if let Some((i, first, end)) = self.line_slot(row)
+            && col >= first
+            && col < end
+        {
+            return Some((i * self.stride + col as usize) * Self::BANDS);
         }
         None
     }
@@ -235,8 +245,9 @@ impl InkLedger {
             return;
         };
         let under = self.under.as_mut_slice();
-        if crate::color_math::relative_luminance(rgb)
-            > crate::color_math::relative_luminance(under[cell])
+        let table = crate::color_math::relative_luminance_table();
+        if crate::color_math::relative_luminance_with(table, rgb)
+            > crate::color_math::relative_luminance_with(table, under[cell])
         {
             under[cell] = rgb;
         }
@@ -300,14 +311,18 @@ impl InkLedger {
     #[inline]
     const fn reads_with(ink: [f32; 3], ground: [f32; 3], lift: [f32; 3], floor: f32) -> bool {
         #[inline]
-        const fn lum(base: [f32; 3], lift: [f32; 3]) -> f32 {
+        const fn lum(
+            table: &crate::color_math::RelativeLuminanceTable,
+            base: [f32; 3],
+            lift: [f32; 3],
+        ) -> f32 {
             let r = (base[0] + lift[0]).min(255.0) as usize;
             let g = (base[1] + lift[1]).min(255.0) as usize;
             let b = (base[2] + lift[2]).min(255.0) as usize;
-            let table = crate::color_math::relative_luminance_table();
             crate::color_math::relative_luminance_rgb(table, r, g, b)
         }
-        let (ink, ground) = (lum(ink, lift), lum(ground, lift));
+        let table = crate::color_math::relative_luminance_table();
+        let (ink, ground) = (lum(table, ink, lift), lum(table, ground, lift));
         ink.max(ground) + 0.05 >= floor * (ink.min(ground) + 0.05)
     }
 
@@ -465,7 +480,10 @@ impl InkLedger {
         ];
         let mut n_spans = 0usize;
         let mut share = 1.0f32;
-        'probe: for line in self.lines.iter().flatten().copied() {
+        'probe: for &line in &self.lines {
+            let Some(line) = line else {
+                continue;
+            };
             let (row, cols) = reached(line);
             if cols.is_empty() {
                 continue;
@@ -521,7 +539,10 @@ impl InkLedger {
         if cwi <= 0 || chi <= 0 {
             return false;
         }
-        let lit = |q: &&GlowQuad| q.alpha == 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
+        #[inline]
+        const fn is_lit_additive(q: &GlowQuad) -> bool {
+            q.alpha == 0 && (q.color | q.color2) & 0x00FF_FFFF != 0
+        }
         let mut reached = std::mem::take(&mut self.reached);
         let (inv_cw, inv_ch) = (1.0 / cwi as f32, 1.0 / chi as f32);
         let span = |lo: f32, len: u16, o: f32, inv_size: f32| {
@@ -530,15 +551,13 @@ impl InkLedger {
             first..=last
         };
         let stride_limit = i32::try_from(self.stride).unwrap_or(i32::MAX);
-        for q in quads.iter().filter(lit) {
+        for q in quads {
+            if !is_lit_additive(q) {
+                continue;
+            }
             let cols = span(f32::from(q.x), q.w.max(1), ox, inv_cw);
             for row in span(f32::from(q.y), q.h.max(1), oy, inv_ch) {
-                let Some((slot_i, (_, first, end))) = self
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, &l)| l.filter(|&(r, _, _)| r == row).map(|l| (i, l)))
-                else {
+                let Some((slot_i, first, end)) = self.line_slot(row) else {
                     continue;
                 };
                 let c0 = (*cols.start()).max(first).max(0);
@@ -563,7 +582,10 @@ impl InkLedger {
         let mut px = std::mem::take(&mut self.px);
         px.clear();
         px.resize(reached.len() * area, [0.0; 3]);
-        for q in quads.iter().filter(lit) {
+        for q in quads {
+            if !is_lit_additive(q) {
+                continue;
+            }
             let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
             let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
             let w = i32::from(q.w).max(1);
@@ -1045,8 +1067,10 @@ impl InkLedger {
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch * (1.0 / Self::BANDS as f32);
         let (inv_cw, inv_rx, inv_ry) = (1.0 / cw, 1.0 / rx, 1.0 / ry);
-        for line in self.lines.into_iter().flatten() {
-            let (row, first, end) = line;
+        for line in self.lines {
+            let Some((row, first, end)) = line else {
+                continue;
+            };
             let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
             if !(cy + ry > y0 && cy - ry < y1) {
                 continue;
@@ -1179,19 +1203,26 @@ impl CursorGlow {
             *slot = Some(line);
         }
         if let Some((row, col)) = cur.map(|(r, c)| (i32::from(r), i32::from(c))) {
-            let typed = self
-                .sparks
-                .iter()
-                .filter(|s| s.typing && i32::from(s.row) == row)
-                .map(|s| i32::from(s.col))
-                .fold(None, |acc: Option<(i32, i32)>, c| {
-                    Some(acc.map_or((c, c), |(lo, hi)| (lo.min(c), hi.max(c))))
-                });
+            let mut typed: Option<(i32, i32)> = None;
+            for s in &self.sparks {
+                if s.typing && i32::from(s.row) == row {
+                    let c = i32::from(s.col);
+                    typed = Some(typed.map_or((c, c), |(lo, hi)| (lo.min(c), hi.max(c))));
+                }
+            }
             let mut add = |line: (i32, i32, i32)| {
-                if !lines.iter().flatten().any(|l| l.0 == line.0)
-                    && let Some(free) = lines.iter_mut().find(|l| l.is_none())
-                {
-                    *free = Some(line);
+                let mut i = 0;
+                let mut free = None;
+                while i < lines.len() {
+                    match lines[i] {
+                        Some(l) if l.0 == line.0 => return,
+                        None if free.is_none() => free = Some(i),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if let Some(idx) = free {
+                    lines[idx] = Some(line);
                 }
             };
             if let Some((first, last)) = typed {
@@ -1377,24 +1408,48 @@ impl CursorGlow {
                 (x1 - 1 - ox).div_euclid(cw),
             )
         };
-        let touches = |h: &RainHalo| {
-            let (row, _, _, c0, c1) = span(h);
-            h.w > 0 && (c0..=c1).any(|c| filled(row, c))
+        let first_filled_col = |row: i32, c0: i32, c1: i32| -> Option<i32> {
+            let mut c = c0;
+            while c <= c1 {
+                if filled(row, c) {
+                    return Some(c);
+                }
+                c += 1;
+            }
+            None
         };
-        if !halos.iter().any(touches) {
+        if !halos.iter().any(|h| {
+            let (row, _, _, c0, c1) = span(h);
+            h.w > 0 && first_filled_col(row, c0, c1).is_some()
+        }) {
             return;
         }
         let mut all = std::mem::take(&mut self.ink_ledger.halo_pieces);
         all.clear();
         std::mem::swap(&mut all, halos);
         for h in all.drain(..) {
-            if !touches(&h) {
+            if h.w == 0 {
                 halos.push(h);
                 continue;
             }
             let (row, x0, x1, c0, c1) = span(&h);
+            let Some(cf) = first_filled_col(row, c0, c1) else {
+                halos.push(h);
+                continue;
+            };
+            if cf > c0 {
+                let a = x0.max(ox + c0 * cw);
+                let b = x1.min(ox + cf * cw);
+                if b > a {
+                    halos.push(RainHalo {
+                        x: a as u16,
+                        w: (b - a) as u16,
+                        ..h
+                    });
+                }
+            }
             let mut start: Option<i32> = None;
-            for c in c0..=c1 + 1 {
+            for c in cf + 1..=c1 + 1 {
                 let keep = c <= c1 && !filled(row, c);
                 match (keep, start) {
                     (true, None) => start = Some(c),
@@ -1459,7 +1514,10 @@ impl CursorGlow {
         let inv_fx = 1.0 / fx;
         let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
         let mut print = 0u64;
-        for q in quads.iter_mut().filter(|q| q.alpha == 0 && q.h > 0) {
+        for q in quads.iter_mut() {
+            if q.alpha != 0 || q.h == 0 {
+                continue;
+            }
             let ym = f32::from(q.y) + 0.5 * f32::from(q.h);
             let (inside, across) = if ym < mid_y {
                 (ym - top, cr - 1)

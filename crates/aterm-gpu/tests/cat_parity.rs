@@ -147,7 +147,7 @@ fn an_under_text_cat_under_an_opaque_sixel_is_hidden_on_both_backends() {
     let gpu_cat = gpu.render_input(&mut win, &input, None);
     assert_eq!(
         gpu_base.pixels, gpu_cat.pixels,
-        "GPU: an opaque sixel must hide an under-text sprite (FxLinearUnder \
+        "GPU: an opaque sixel must hide an under-text sprite (FxKnockUnder \
          draws before the images)"
     );
 

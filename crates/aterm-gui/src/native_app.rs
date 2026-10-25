@@ -1822,9 +1822,10 @@ pub(crate) enum AppEvent {
         document: DocumentId,
         revision: u64,
     },
-    /// The host successfully focused or installed the editor for a Markdown document.
-    DocumentEditorOpened {
+    /// The result of focusing or installing the editor for a Markdown document.
+    DocumentEditorFinished {
         document: DocumentId,
+        outcome: Result<(), String>,
     },
     ConfigEditorFinished {
         operation: OperationId,
@@ -2774,11 +2775,29 @@ impl NativeRuntime {
     /// pane included) drew it walking at its last render. A view nobody sees
     /// never decides it, whatever size it last rendered at.
     pub(crate) fn tick_system_state(&mut self, active: bool, shown: bool, seen: &[ViewId]) -> bool {
+        self.tick_system_state_at(std::time::Instant::now(), active, shown, seen)
+    }
+
+    /// Pause at a visibility event boundary without repainting or submitting.
+    pub(crate) fn pause_system_state_review(&mut self) {
+        self.update_system_state(|state| {
+            state.pause_review();
+            false
+        });
+    }
+
+    pub(crate) fn tick_system_state_at(
+        &mut self,
+        now: std::time::Instant,
+        active: bool,
+        shown: bool,
+        seen: &[ViewId],
+    ) -> bool {
         let walks = seen.iter().any(|view| {
             matches!(self.views.get(view), Some(AppViewState::SystemState(state))
                 if state.village_walks())
         });
-        self.update_system_state(|state| state.tick(active, shown, walks))
+        self.update_system_state(|state| state.tick_at(now, active, shown, walks))
     }
 
     pub(crate) fn offer_system_state(
@@ -2804,6 +2823,15 @@ impl NativeRuntime {
             changed
         });
         if replaced {
+            self.retire_system_state_review();
+        }
+        changed
+    }
+
+    pub(crate) fn forget_accepted_system_state_password(&mut self) -> bool {
+        let changed =
+            self.update_system_state(crate::system_state::SystemStateApp::forget_accepted_password);
+        if changed {
             self.retire_system_state_review();
         }
         changed
@@ -2854,14 +2882,17 @@ impl NativeRuntime {
     }
 
     /// Note whose gesture System State handles next (a person's, or a control
-    /// client's). It changes nothing the page shows, so no view repaints.
-    pub(crate) fn system_state_gesture(&mut self, by_person: bool) {
-        if let Some(state) = self.instances.values_mut().find_map(|app| match app {
-            NativeApp::SystemState(state) => Some(state.as_mut()),
-            _ => None,
-        }) {
-            state.gesture(by_person);
-        }
+    /// client's), and permanently stop this startup offer's automatic Apply.
+    /// Only its label changes; the host dirties its views without retiring
+    /// the presented control that this same press will release on.
+    pub(crate) fn system_state_gesture(&mut self, by_person: bool) -> bool {
+        self.instances
+            .values_mut()
+            .find_map(|app| match app {
+                NativeApp::SystemState(state) => Some(state.gesture(by_person)),
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn document_id(&self, instance: AppInstanceId) -> Option<DocumentId> {
@@ -4079,8 +4110,13 @@ impl NativeAppModel for MarkdownApp {
                     view.common.presentation_revision.saturating_add(1);
                 EventResult::Handled
             }
-            AppEvent::DocumentEditorOpened { document } if document == self.document => {
-                view.notice = Some("Editor opened".to_string());
+            AppEvent::DocumentEditorFinished { document, outcome } if document == self.document => {
+                view.notice = Some(match outcome {
+                    Ok(()) => "Editor opened".to_string(),
+                    Err(message) => {
+                        bounded_markdown_text(&format!("Could not open editor: {message}"), 160)
+                    }
+                });
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
                 EventResult::Handled

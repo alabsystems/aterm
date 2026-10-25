@@ -21,7 +21,7 @@ pub(super) use view::{
     demo_font_candidate, demo_spec, laid_last, list_laid, list_room, themes_page,
 };
 #[cfg(test)]
-pub(super) use view::{list_blocks, section_items};
+pub(super) use view::{list_blocks, row_height as chooser_row_height, section_items};
 
 /// Every action the page mints starts with this.
 pub(super) const SHOWCASE_ACTION_PREFIX: &str = "settings/showcase/";

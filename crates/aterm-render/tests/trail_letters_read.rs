@@ -6,7 +6,11 @@
 // the real renderer, every 16 ms frame, each lettered cell judged as `aterm-lab trail-contrast`
 // judges a gallery frame: the lower of the whole cell's median ink against its median ground and
 // the worst pixel row's lower median of each solid ink pixel against its nearest ring of ground
-// (`local_contrast`).
+// (`local_contrast`). A letter that lies on a companion's body (a knock layer: the pet, the dog,
+// the kitty cursor, a word-cat) is judged as the lab judges a companion, by that ring alone: the
+// body stands on the trail's light, opaque, and the knock-out cuts it away round the letter's ink
+// so the letter reads against what lies under it (`companion_knock_out.rs`), so the cell's median
+// ground is the coat, not a ground the trail lays.
 
 use crate::wcag::{contrast, luma};
 use aterm_core::render::RenderInput;
@@ -124,6 +128,8 @@ pub struct Letter {
     pub ch: char,
     pub cell: f64,
     pub local: f64,
+    /// Most of the cell lies on a companion's body.
+    pub on_body: bool,
     /// Its clean twin judged the same way, its own reading, when the replay reads it
     /// ([`Replay::own`]); infinite otherwise.
     pub own: f64,
@@ -131,7 +137,11 @@ pub struct Letter {
 
 impl Letter {
     pub fn judged(&self) -> f64 {
-        self.cell.min(self.local)
+        if self.on_body {
+            self.local
+        } else {
+            self.cell.min(self.local)
+        }
     }
 }
 
@@ -256,6 +266,7 @@ impl Pair<'_> {
             ch,
             cell,
             local: worst_row,
+            on_body: false,
             own: f64::INFINITY,
         })
     }
@@ -474,6 +485,16 @@ impl Replay {
             )
             .expect("the frame blooms");
         }
+        let place = self.rend.fx_frame(frame.width, frame.height, rows);
+        let mut bodies = Vec::new();
+        aterm_render::knock_rects(
+            &place,
+            &input.fx_layers,
+            &input.fx_occluders,
+            &mut aterm_render::FxSlicer::default(),
+            &mut aterm_render::SpriteCols::default(),
+            &mut bodies,
+        );
         if let Some(i) = self.dump.iter().position(|(at, _)| *at == self.ms) {
             let (_, path) = self.dump.remove(i);
             std::fs::write(&path, frame.to_png()).expect("dump");
@@ -498,6 +519,19 @@ impl Replay {
                 }
                 let span = if c.wide { 2 } else { 1 };
                 if let Some(mut l) = pair.letter(row, col, span, c.ch) {
+                    let (x0, y0) = (
+                        (place.pad + col * cw) as i32,
+                        (place.grid_top + row * ch) as i32,
+                    );
+                    let (x1, y1) = (x0 + (span * cw) as i32, y0 + ch as i32);
+                    let covered: i32 = bodies
+                        .iter()
+                        .map(|b| {
+                            (b.x1.min(x1) - b.x0.max(x0)).max(0)
+                                * (b.y1.min(y1) - b.y0.max(y0)).max(0)
+                        })
+                        .sum();
+                    l.on_body = 2 * covered >= (x1 - x0) * (y1 - y0);
                     if self.own {
                         l.own = pair.own(row, col, span, c.ch).unwrap_or(f64::INFINITY);
                     }

@@ -155,10 +155,36 @@ pub(crate) fn approve(
     host: &str,
     possession: super::binding::Possession,
 ) -> Result<Certificate> {
+    use ring::signature::Ed25519KeyPair;
+    let binding = possession.binding();
+    check_candidate(seed, journal, eligibility, host, binding)?;
+    let signer = Ed25519KeyPair::from_seed_unchecked(seed)
+        .map_err(|_| Error::new("invalid Commons authority seed"))?;
+    let mut wire = b"AMC1".to_vec();
+    wire.extend_from_slice(&binding.bytes());
+    wire.extend_from_slice(&journal.constraints()?.head());
+    let mut signed = DOMAIN.to_vec();
+    signed.extend_from_slice(&wire);
+    wire.extend_from_slice(signer.sign(&signed).as_ref());
+    Certificate::verify(&wire, journal.trust().network, journal.trust().authority)
+}
+
+/// Read-only policy check. Only `approve` consumes joint possession and signs a
+/// certificate; success here grants no membership or reusable permission.
+#[cfg(unix)]
+pub(crate) fn check_candidate(
+    seed: &[u8; 32],
+    journal: &super::journal::Journal,
+    eligibility: &Eligibility,
+    host: &str,
+    binding: &Binding,
+) -> Result<()> {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     let trust = journal.trust();
     let constraints = journal.constraints()?;
-    let binding = possession.binding();
+    if constraints.head() == [0; 32] {
+        return Err(Error::new("Commons certificate has another trust context"));
+    }
     let signer = Ed25519KeyPair::from_seed_unchecked(seed)
         .map_err(|_| Error::new("invalid Commons authority seed"))?;
     let authority = signer.public_key().as_ref() == trust.authority
@@ -171,13 +197,7 @@ pub(crate) fn approve(
             "Commons approval requires its pinned authority, eligible recipient and active writer",
         ));
     }
-    let mut wire = b"AMC1".to_vec();
-    wire.extend_from_slice(&binding.bytes());
-    wire.extend_from_slice(&constraints.head());
-    let mut signed = DOMAIN.to_vec();
-    signed.extend_from_slice(&wire);
-    wire.extend_from_slice(signer.sign(&signed).as_ref());
-    Certificate::verify(&wire, trust.network, trust.authority)
+    Ok(())
 }
 
 #[cfg(all(test, unix))]

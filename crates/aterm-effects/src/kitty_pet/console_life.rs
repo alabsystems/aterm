@@ -6,7 +6,8 @@
 use super::*;
 use crate::pet_world::TaskbarProgress;
 use crate::pet_world::{
-    PetAnchor, PetPane, PetRect, PetReserve, PetWorld, PetWorldFacts, PetWorldStamp,
+    PetAnchor, PetFill, PetPane, PetReading, PetRect, PetReserve, PetWorld, PetWorldFacts,
+    PetWorldStamp,
 };
 use aterm_core::terminal::BlockState;
 
@@ -55,7 +56,10 @@ const INPUT_HOLD_DUR: Duration = dur_from_secs_f32(INPUT_HOLD);
 const EDIT_HOLD_DUR: Duration = dur_from_secs_f32(EDIT_HOLD);
 const CONTACT_HOLD_DUR: Duration = dur_from_secs_f32(CONTACT_HOLD);
 const RESULT_HOLD_DUR: Duration = dur_from_secs_f32(RESULT_HOLD);
+const REACTION_TTL_DUR: Duration = Duration::from_secs(REACTION_TTL as u64);
 const PERCH_DWELL_DUR: Duration = dur_from_secs_f32(PERCH_DWELL);
+const VETO_DWELL_DUR: Duration = dur_from_secs_f32(VETO_DWELL);
+const VETO_BLIND_DUR: Duration = dur_from_secs_f32(VETO_BLIND);
 const Z_DWELL_DUR: Duration = dur_from_secs_f32(Z_DWELL);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,14 +116,14 @@ impl VisibilityHold {
             }
             None => {
                 let since = *self.blind_since.get_or_insert(now);
-                (now.saturating_duration_since(since).as_secs_f32() >= VETO_BLIND).then_some(false)
+                (now.saturating_duration_since(since) >= VETO_BLIND_DUR).then_some(false)
             }
         };
         match observed {
             Some(observed) if observed == self.shown => self.contrary_since = None,
             Some(_) => {
                 let since = *self.contrary_since.get_or_insert(now);
-                if now.saturating_duration_since(since).as_secs_f32() >= VETO_DWELL {
+                if now.saturating_duration_since(since) >= VETO_DWELL_DUR {
                     self.shown = !self.shown;
                     self.contrary_since = None;
                 }
@@ -366,6 +370,8 @@ pub(super) struct ConsoleLife {
     pub(super) rest_seated: std::cell::Cell<bool>,
     row_sig: Vec<u64>,
     row_sig_prev: Vec<u64>,
+    /// What [`Self::world`] and the row signatures were read from.
+    reading: PetReading,
 }
 
 impl Default for ConsoleLife {
@@ -451,6 +457,7 @@ impl ConsoleLife {
             rest_seated: std::cell::Cell::new(false),
             row_sig: Vec::new(),
             row_sig_prev: Vec::new(),
+            reading: PetReading::new(),
         }
     }
 
@@ -592,10 +599,13 @@ impl PetBrain {
         self.observe_console_with_exclusions(input, facts, pane, &[]);
     }
 
-    /// Cells the last world observation classified (at most `MAX_WORLD_ROWS` × `MAX_WORLD_COLS` per presented frame), so a running product can report the cost.
+    /// Cells the last world observation classified (at most `MAX_WORLD_ROWS` × `MAX_WORLD_COLS` per presented frame, none when it kept the reading it held), so a running product can report the cost.
     #[inline]
     #[must_use]
     pub const fn observed_cells(&self) -> usize {
+        if self.console.reading.kept() {
+            return 0;
+        }
         match &self.console.world {
             Some(world) => world.examined_cells(),
             None => 0,
@@ -610,7 +620,13 @@ impl PetBrain {
         pane: PetPane,
         exclusions: &[PetRect],
     ) {
-        self.observe_console_with_reserve(input, facts, pane, PetReserve::protected(exclusions));
+        self.observe_console_with_reserve(
+            input,
+            facts,
+            pane,
+            PetReserve::protected(exclusions),
+            PetFill::Unconsumed,
+        );
     }
 
     /// As [`Self::observe_console_with_exclusions`], with the host's transient overlays apart (`overlays`: the Autopilot menu, the find bar; [`PetWorld::observe_with_overlays`]).
@@ -632,16 +648,18 @@ impl PetBrain {
                 overlays,
                 ink: &[],
             },
+            PetFill::Unconsumed,
         );
     }
 
-    /// The host's late overlays told apart ([`PetReserve`]): its chrome and its transient overlays protected, the person's typed glyphs (the predicted echo, the IME preedit) as ink.
+    /// The host's late overlays told apart ([`PetReserve`]): its chrome and its transient overlays protected, the person's typed glyphs (the predicted echo, the IME preedit) as ink. Of a [`PetFill::Consumed`] fill, the reading already held of the same cells is kept ([`PetReading`]).
     pub fn observe_console_with_reserve(
         &mut self,
         input: &aterm_core::render::RenderInput,
         facts: &PetWorldFacts,
         pane: PetPane,
         reserve: PetReserve<'_>,
+        fill: PetFill,
     ) {
         let held_center = self
             .console
@@ -657,6 +675,23 @@ impl PetBrain {
                         .is_some_and(|prior| facts.stamp.preserves_cursor_home(prior))
             })
             .map(|body| (body.row + body.rows * 0.5, body.col + body.cols * 0.5));
+        // Taking the reading held again ([`PetReading`]) would leave the
+        // world, the observation count, the row signatures, the faux caret and
+        // the contact as they stand: the same cells give the same world, whose
+        // stamp, selection, progress and ink by the body are those it holds.
+        if self
+            .console
+            .world
+            .as_ref()
+            .is_some_and(|w| w.stamp().is_some())
+            && self
+                .console
+                .reading
+                .holds((input, fill), facts, pane, reserve, held_center)
+        {
+            self.console.reading.keep(input);
+            return;
+        }
         let world = self
             .console
             .world
@@ -724,6 +759,18 @@ impl PetBrain {
         } else {
             None
         };
+        if self
+            .console
+            .world
+            .as_ref()
+            .is_some_and(|w| w.stamp().is_some())
+        {
+            self.console
+                .reading
+                .note((input, fill), facts, pane, reserve, held_center);
+        } else {
+            self.console.reading.forget();
+        }
     }
 
     fn note_row_signatures(
@@ -1373,7 +1420,7 @@ impl PetBrain {
         if self
             .console
             .completion
-            .is_some_and(|(at, _)| age(at) >= REACTION_TTL)
+            .is_some_and(|(at, _)| sense.now.saturating_duration_since(at) >= REACTION_TTL_DUR)
             || input_live
         {
             self.console.completion = None;
@@ -1524,9 +1571,13 @@ impl PetBrain {
             && ((self.pending_room.is_some()
                 && self.room_at.is_some_and(|at| age(at) <= ROOM_CUE_TTL))
                 || (self.pending_bat.is_some()
-                    && self.bat_at.is_some_and(|at| age(at) <= BAT_TTL))
+                    && self
+                        .bat_at
+                        .is_some_and(|at| sense.now.saturating_duration_since(at) <= BAT_TTL_DUR))
                 || (self.pending_look.is_some()
-                    && self.look_at.is_some_and(|at| age(at) <= LOOK_TTL))
+                    && self.look_at.is_some_and(|at| {
+                        sense.now.saturating_duration_since(at) <= LOOK_TTL_DUR
+                    }))
                 || self
                     .pending_perk
                     .is_some_and(|at| sense.now >= at && age(at) <= V2_PERK_LATE)
@@ -1551,17 +1602,18 @@ impl PetBrain {
             return;
         }
 
-        let executing = world
-            .anchors()
-            .iter()
-            .flatten()
-            .find(|a| a.state == BlockState::Executing)
-            .copied();
+        let mut executing = None;
+        for a in world.anchors().iter().flatten() {
+            if a.state == BlockState::Executing {
+                executing = Some(*a);
+                break;
+            }
+        }
         let completion = self
             .console
             .completion
             .take()
-            .filter(|(at, _)| age(*at) < REACTION_TTL);
+            .filter(|(at, _)| sense.now.saturating_duration_since(*at) < REACTION_TTL_DUR);
         if let Some((_, failed)) = completion {
             self.console.result_at = Some((sense.now, failed));
             self.console.source_seq = self.console.completion_seq;
@@ -1670,23 +1722,18 @@ impl PetBrain {
             self.console.still = true;
         } else if let Some(anchor) = self.console.anchor.and_then(|a| {
             world.resolve(a).or_else(|| {
-                world
-                    .anchors()
-                    .iter()
-                    .flatten()
-                    .find(|current| current.surface == a.surface && current.block_id == a.block_id)
-                    .copied()
+                for current in world.anchors().iter().flatten() {
+                    if current.surface == a.surface && current.block_id == a.block_id {
+                        return Some(*current);
+                    }
+                }
+                None
             })
         }) {
             // One content anchor may survive a completed command; no timer
             // grants another excursion. The perch is a visit, not a tenancy:
             // [`PERCH_DWELL`] bounds it and `console_deadline` offers its end.
-            if sense
-                .now
-                .saturating_duration_since(settled_since)
-                .as_secs_f32()
-                < PERCH_DWELL
-            {
+            if sense.now.saturating_duration_since(settled_since) < PERCH_DWELL_DUR {
                 self.console.perched_since = Some(settled_since);
                 self.console.attention = PetAttention::Exploring;
                 self.console.reason = "content-perch";
@@ -1757,13 +1804,10 @@ impl PetBrain {
                         if let Some(look) = self.adopted_look.as_mut() {
                             look.seat.1 -= dy;
                         }
-                        for d in self
-                            .departures
-                            .iter_mut()
-                            .flatten()
-                            .filter(|d| d.still && !d.resight && d.own_glass.is_none())
-                        {
-                            d.row -= dy;
+                        for d in self.departures.iter_mut().flatten() {
+                            if d.still && !d.resight && d.own_glass.is_none() {
+                                d.row -= dy;
+                            }
                         }
                     }
                     leaving_view = dy > 0.0 && (target.row < 2.0 || scrolled_off_top);
@@ -2468,7 +2512,10 @@ impl PetBrain {
             && (self.col - desired.0).abs() > ARRIVED
             && Self::stand_clearance(world, body, false) == Some(false)
         {
-            let here = Self::console_stand_rect((self.col, desired.1), sense_dims.0, width);
+            let here = PetRect {
+                col: self.col,
+                ..body
+            };
             if Self::stand_clearance(world, here, true) != Some(false) {
                 return Some((self.col, desired.1));
             }
@@ -2488,19 +2535,22 @@ impl PetBrain {
             let steps = (REST_REACH * INV_STEP) as usize;
             let here = Self::console_stand_rect((self.col, self.row), sense_dims.0, width);
             let may = |c: f32| {
-                let rect = Self::console_stand_rect((c, desired.1), sense_dims.0, width);
+                let rect = PetRect { col: c, ..body };
                 Self::stand_clearance(world, rect, false) == Some(true)
                     && !Self::console_walled(world, here, rect, true)
             };
-            if let Some(seat) = (1..=steps)
-                .flat_map(|k| [desired.0 - STEP * k as f32, desired.0 + STEP * k as f32])
-                .filter(|&c| (0.0..=limit).contains(&c))
-                .find(|&c| may(c))
-                .map(|c| (c, desired.1))
-            {
-                self.console.rest_seat.set(Some(seat));
-                self.console.rest_seated.set(true);
-                return Some(seat);
+            let mut k = 1;
+            while k <= steps {
+                let offset = STEP * k as f32;
+                for c in [desired.0 - offset, desired.0 + offset] {
+                    if (0.0..=limit).contains(&c) && may(c) {
+                        let seat = (c, desired.1);
+                        self.console.rest_seat.set(Some(seat));
+                        self.console.rest_seated.set(true);
+                        return Some(seat);
+                    }
+                }
+                k += 1;
             }
         }
         if !walled && {
@@ -2516,7 +2566,7 @@ impl PetBrain {
         if let Some((col, _)) = resting.filter(|&(_, row)| {
             on_the_line(row) && held_seat.is_none_or(|(_, seat_row)| on_the_line(seat_row))
         }) {
-            let at = |c: f32| Self::console_stand_rect((c, desired.1), sense_dims.0, width);
+            let at = |c: f32| PetRect { col: c, ..body };
             let may = |c: f32| {
                 let rect = at(c);
                 Self::stand_clearance(world, rect, escorting) == Some(true)
@@ -2527,10 +2577,16 @@ impl PetBrain {
                 const INV_STEP: f32 = 1.0 / STEP;
                 let toward = STEP * (col - desired.0).signum();
                 let steps = ((desired.0 - col).abs() * INV_STEP).floor() as usize;
-                let wait = (1..=steps)
-                    .map(|k| desired.0 + toward * k as f32)
-                    .find(|&c| may(c))
-                    .unwrap_or(col);
+                let mut wait = col;
+                let mut k = 1;
+                while k <= steps {
+                    let c = desired.0 + toward * k as f32;
+                    if may(c) {
+                        wait = c;
+                        break;
+                    }
+                    k += 1;
+                }
                 let seat = (wait, desired.1);
                 self.console.rest_seat.set(Some(seat));
                 self.console.rest_seated.set(true);
@@ -3153,35 +3209,39 @@ impl PetBrain {
         if !self.console.presentable {
             return None;
         }
-        let input = self.console.input.map(|e| e.at + INPUT_HOLD_DUR);
-        let contact_recover = self
-            .console
-            .contact_at
-            .map(|at| at + Duration::from_millis(140));
-        let contact = self.console.contact_at.map(|at| at + CONTACT_HOLD_DUR);
-        let result = self.console.result_at.map(|(at, _)| at + RESULT_HOLD_DUR);
-        let progress = self
-            .console
-            .progress_at
-            .map(|at| at + Duration::from_millis(350));
-        let perch = self.console.perched_since.map(|at| at + PERCH_DWELL_DUR);
         let floor = self.last_now.unwrap_or(now);
-        [
-            input,
-            contact_recover,
-            contact,
-            result,
-            progress,
-            perch,
-            self.console.z.deadline(),
-            self.console.repair_until,
-            self.console.failure_quiet_until,
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|at| *at > floor)
-        .min()
-        .map(|at| at.max(now + ARM_MIN))
+        let mut earliest: Option<Instant> = None;
+        let mut offer = |cand: Option<Instant>| {
+            if let Some(at) = cand
+                && at > floor
+            {
+                earliest = Some(earliest.map_or(at, |prev| prev.min(at)));
+            }
+        };
+        if let Some(e) = self.console.input {
+            offer(Some(e.at + INPUT_HOLD_DUR));
+        }
+        if let Some(at) = self.console.contact_at {
+            let recover = at + Duration::from_millis(140);
+            offer(Some(if recover > floor {
+                recover
+            } else {
+                at + CONTACT_HOLD_DUR
+            }));
+        }
+        if let Some((at, _)) = self.console.result_at {
+            offer(Some(at + RESULT_HOLD_DUR));
+        }
+        if let Some(at) = self.console.progress_at {
+            offer(Some(at + Duration::from_millis(350)));
+        }
+        if let Some(at) = self.console.perched_since {
+            offer(Some(at + PERCH_DWELL_DUR));
+        }
+        offer(self.console.z.deadline());
+        offer(self.console.repair_until);
+        offer(self.console.failure_quiet_until);
+        earliest.map(|at| at.max(now + ARM_MIN))
     }
 
     #[inline]
@@ -7414,5 +7474,448 @@ mod tests {
         assert_eq!(s.pet.console.target.unwrap().row, 7.0);
         let trip = s.pet.console.trip.unwrap();
         assert_eq!((trip.from.1, trip.to.1), (8.0, 9.0));
+    }
+
+    /// How a host fills the scratch it hands the pet each frame.
+    #[derive(Clone, Copy, Debug)]
+    enum Host {
+        /// The single-pane window redraw without chrome rows
+        /// (`App::redraw_window_with_layout`): the snapshot reused while it is
+        /// the terminal's current frame, else a damage-consuming refill.
+        Reuse,
+        /// A split's focused pane: a damage-consuming refill every frame.
+        Refill,
+        /// A window with a chrome row (a tab strip, the message band): the
+        /// last frame's row prepend undone, a damage-consuming refill, and the
+        /// row prepended again once the pet has observed the engine rows
+        /// ([`Twin::observe`]).
+        Banded,
+    }
+
+    /// The host's fill of `scratch`, and what it tells the pet of it.
+    fn redraw_fill(
+        term: &mut Terminal,
+        scratch: &mut aterm_core::render::RenderInput,
+        host: Host,
+    ) -> PetFill {
+        let rows = usize::from(term.grid().rows());
+        let cols = usize::from(term.grid().cols());
+        let epoch = term.damage_epoch();
+        let current = !term.has_damage()
+            && scratch.terminal_id == term.render_identity()
+            && scratch.snapshot_seq == epoch
+            && scratch.engine_fill_seq == scratch.snapshot_seq
+            && scratch.process_sequence == term.pipeline_timestamps().process_sequence
+            && scratch.rows == rows
+            && scratch.cols == cols
+            && scratch.cells.len() == rows
+            && i64::from(scratch.display_offset)
+                == i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX)
+            && scratch.base_y == i64::try_from(term.grid().base_y()).unwrap_or(i64::MAX)
+            && scratch.absolute_row_revision == term.absolute_row_revision()
+            && scratch.selection == *term.text_selection();
+        if matches!(host, Host::Reuse) && current {
+            return PetFill::Consumed;
+        }
+        if scratch.row_shift > 0 && !scratch.undo_host_row_prepend(rows, &mut Vec::new(), 1) {
+            scratch.cells.truncate(rows);
+        }
+        let prior = scratch.extract_gen;
+        let refill = term.cell_frame_damage_scoped_into(scratch, rows, cols);
+        PetFill::after_refill(prior, refill)
+    }
+
+    /// One screen handed each frame to a brain that keeps its reading and to
+    /// one that forgets it before every observation.
+    struct Twin {
+        host: Host,
+        term: Terminal,
+        scratch: aterm_core::render::RenderInput,
+        kept: PetBrain,
+        fresh: PetBrain,
+        now: Instant,
+        kept_frames: usize,
+        frames: usize,
+    }
+
+    impl Twin {
+        fn new(host: Host) -> Self {
+            let mut term = Terminal::new(20, 80);
+            term.process(
+                b"\x1b]11;#000000\x07$ make\r\n\x1b[41m  \x1b[0m built 3 crates\r\n$ \x1b[3;3H",
+            );
+            let now = Instant::now();
+            let brain = || PetBrain {
+                col: 20.0,
+                row: 5.0,
+                alpha: 1.0,
+                action: PetAction::Sit,
+                quiet: 2.0,
+                last_caret: Some((2, 2)),
+                last_now: Some(now),
+                ..PetBrain::default()
+            };
+            Self {
+                host,
+                term,
+                scratch: aterm_core::render::RenderInput::default(),
+                kept: brain(),
+                fresh: brain(),
+                now,
+                kept_frames: 0,
+                frames: 0,
+            }
+        }
+
+        /// The host fills, both brains observe, and what each holds is equal.
+        fn observe(&mut self, what: &str, reserve: PetReserve<'_>) {
+            let host = self.host;
+            let fill = redraw_fill(&mut self.term, &mut self.scratch, host);
+            let facts = PetWorldFacts::read(&self.term, 17);
+            let pane = PetPane::full(&self.scratch);
+            self.kept
+                .observe_console_with_reserve(&self.scratch, &facts, pane, reserve, fill);
+            self.fresh.console.reading.forget();
+            self.fresh
+                .observe_console_with_reserve(&self.scratch, &facts, pane, reserve, fill);
+            assert!(!self.fresh.console.reading.kept());
+            if matches!(host, Host::Banded) {
+                let band = vec![
+                    aterm_core::terminal::RenderCell {
+                        ch: '!',
+                        ..aterm_core::terminal::RenderCell::default()
+                    };
+                    self.scratch.cols
+                ];
+                self.scratch.prepend_host_rows(
+                    1,
+                    std::iter::once(band.as_slice()),
+                    20,
+                    0,
+                    &mut Vec::new(),
+                    aterm_core::render::HostRowPixels::Placed,
+                );
+            }
+            self.frames += 1;
+            self.kept_frames += usize::from(self.kept.console.reading.kept());
+            let (k, f) = (&self.kept.console, &self.fresh.console);
+            assert_eq!(
+                format!("{:?}", k.world),
+                format!("{:?}", f.world),
+                "{host:?} {what}: the world"
+            );
+            assert_eq!(k.row_sig, f.row_sig, "{host:?} {what}: the row signatures");
+            assert_eq!(
+                k.row_sig_prev, f.row_sig_prev,
+                "{host:?} {what}: the rows before"
+            );
+            assert_eq!(
+                k.faux_caret, f.faux_caret,
+                "{host:?} {what}: the faux caret"
+            );
+            assert_eq!(
+                k.observed_seq, f.observed_seq,
+                "{host:?} {what}: the observation count"
+            );
+            assert_eq!(
+                k.contact_changed, f.contact_changed,
+                "{host:?} {what}: the contact"
+            );
+        }
+
+        /// Both brains tick and draw the same frame.
+        fn tick(&mut self, what: &str) {
+            self.now += Duration::from_millis(16);
+            let c = self.term.cursor();
+            let sense = PetSense {
+                caret_drawn: true,
+                now: self.now,
+                caret: (self.term.cursor_visible() && self.term.grid().display_offset() == 0)
+                    .then_some((c.row, c.col)),
+                wrapped: false,
+                rows: self.term.grid().rows(),
+                cols: self.term.grid().cols(),
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+            };
+            self.kept.set_console_presentable(true);
+            self.fresh.set_console_presentable(true);
+            let (a, b) = (self.kept.tick(sense), self.fresh.tick(sense));
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "{:?} {what}: the frame drawn",
+                self.host
+            );
+        }
+
+        fn frame(&mut self, what: &str, reserve: PetReserve<'_>) {
+            self.observe(what, reserve);
+            self.tick(what);
+        }
+
+        fn frames(&mut self, what: &str, n: usize) {
+            for _ in 0..n {
+                self.frame(what, PetReserve::default());
+            }
+        }
+
+        /// `n` frames, of which at least `n - 1` keep the reading.
+        fn kept_frames_of(&mut self, what: &str, n: usize) {
+            let before = self.kept_frames;
+            self.frames(what, n);
+            assert!(
+                self.kept_frames - before + 1 >= n,
+                "{:?} {what}: an unchanged screen keeps its reading ({} of {n})",
+                self.host,
+                self.kept_frames - before
+            );
+        }
+    }
+
+    #[test]
+    fn a_kept_console_reading_draws_what_a_fresh_one_does() {
+        for host in [Host::Reuse, Host::Refill, Host::Banded] {
+            let mut t = Twin::new(host);
+            t.frames("idle", 8);
+            for key in b"ls -la" {
+                t.term.process(&[*key]);
+                t.frames("typing", 3);
+            }
+            t.term.process(b"\r\nCargo.toml  src\r\n$ ");
+            t.frames("output", 4);
+            t.term
+                .set_palette_color(1, aterm_types::Rgb { r: 0, g: 0, b: 0 });
+            t.frames("a palette entry", 3);
+            t.term.set_default_background(aterm_types::Rgb {
+                r: 12,
+                g: 14,
+                b: 16,
+            });
+            t.frames("the theme's background", 3);
+            // Another consumer takes the damage of a palette change (the red
+            // cells now wear the default background) without reading the
+            // epoch: no stamp but the extraction generation moves.
+            t.term.set_palette_color(
+                1,
+                aterm_types::Rgb {
+                    r: 12,
+                    g: 14,
+                    b: 16,
+                },
+            );
+            t.term.take_damage();
+            t.frames("another consumer took the damage", 3);
+            // The same, and the host's next fill is one the pet does not
+            // observe, so the fill after it re-extracts no row of cells the
+            // reading held was not taken from.
+            t.term
+                .set_palette_color(1, aterm_types::Rgb { r: 200, g: 0, b: 0 });
+            t.term.take_damage();
+            let _ = redraw_fill(&mut t.term, &mut t.scratch, host);
+            t.frames("a taken damage the pet did not see", 3);
+            t.term.text_selection_mut().start_selection(
+                1,
+                4,
+                SelectionSide::Left,
+                SelectionType::Simple,
+            );
+            t.term
+                .text_selection_mut()
+                .update_selection(1, 12, SelectionSide::Right);
+            t.frames("a selection", 3);
+            t.term.text_selection_mut().clear();
+            t.frames("no selection", 3);
+            t.term.process(b"\x1b[2;5H");
+            t.frames("a caret move", 3);
+            t.term.process(b"\x1b[?25l");
+            t.frames("a hidden caret", 4);
+            // Claude Code's composer: the caret hidden on the last row below
+            // a prompt row that draws its own block caret.
+            t.term
+                .process("\x1b[2J\x1b[19;1H> abc\u{2588}\x1b[20;1H".as_bytes());
+            t.kept_frames_of("a composer's faux caret", 5);
+            assert_eq!(
+                t.kept.console.faux_caret,
+                Some((18, 5)),
+                "{host:?}: the composer's drawn caret is read"
+            );
+            t.term.process(b"\x1b[?25h\x1b[3;3H");
+            t.frames("the caret shown", 3);
+            // New ink by the body is contact; a second observation of the
+            // same screen before the tick keeps it.
+            for brain in [&mut t.kept, &mut t.fresh] {
+                brain.console.last_body = Some(PetRect::new(9.3, 40.0, 1.7, 5.6));
+            }
+            t.term.process(b"\x1b[11;42HX\x1b[3;3H");
+            t.observe("ink by the body", PetReserve::default());
+            assert!(
+                t.kept.console.contact_changed,
+                "{host:?}: new ink by the body is contact"
+            );
+            let before = t.kept_frames;
+            t.observe("ink by the body, seen again", PetReserve::default());
+            assert_eq!(
+                t.kept_frames,
+                before + 1,
+                "{host:?}: the second observation keeps the reading"
+            );
+            assert!(t.kept.console.contact_changed);
+            t.tick("ink by the body");
+            t.frames("after contact", 3);
+            // A fill the pet does not observe (a frame it was not console
+            // owned) names cells the reading it holds was not taken from.
+            t.term.process(b"\x1b[12;1Hunseen");
+            let _ = redraw_fill(&mut t.term, &mut t.scratch, host);
+            t.frames("a frame the pet did not see", 3);
+            t.term.process(b"\x1b[?25h\x1b[20;1H");
+            for line in 0..30 {
+                t.term.process(format!("line {line}\r\n").as_bytes());
+            }
+            t.frames("a scrolled page", 3);
+            t.term.scroll_display(3);
+            t.frames("history", 3);
+            t.term.scroll_to_bottom();
+            t.frames("the live bottom", 3);
+            let rect = [PetRect::new(4.0, 30.0, 2.0, 12.0)];
+            for (what, reserve) in [
+                ("chrome", PetReserve::protected(&rect)),
+                (
+                    "an overlay",
+                    PetReserve {
+                        overlays: &rect,
+                        ..PetReserve::default()
+                    },
+                ),
+                (
+                    "typed ink",
+                    PetReserve {
+                        ink: &rect,
+                        ..PetReserve::default()
+                    },
+                ),
+                ("no reserve", PetReserve::default()),
+            ] {
+                for _ in 0..3 {
+                    t.frame(what, reserve);
+                }
+            }
+            t.term.resize(24, 90);
+            t.frames("a resize", 3);
+            t.term.process(b"\x1b[?1049hfull screen\x1b[5;9H");
+            t.frames("the other screen", 3);
+            t.term.process(b"\x1b[?1049l");
+            t.frames("back", 3);
+            assert!(
+                t.kept_frames * 2 > t.frames,
+                "{host:?}: the frames repeat a screen more often than not ({} of {})",
+                t.kept_frames,
+                t.frames
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_screen_is_read_once() {
+        for host in [Host::Reuse, Host::Refill, Host::Banded] {
+            let mut t = Twin::new(host);
+            t.frames("first", 1);
+            let world = format!("{:?}", t.kept.console.world);
+            assert_eq!(
+                t.kept.observed_cells(),
+                20 * 80,
+                "{host:?}: the first frame reads the pane"
+            );
+            for _ in 0..12 {
+                t.frames("unchanged", 1);
+                assert_eq!(
+                    t.kept.observed_cells(),
+                    0,
+                    "{host:?}: an unchanged frame reads no cell"
+                );
+                assert!(t.kept.console.reading.kept());
+                assert_eq!(format!("{:?}", t.kept.console.world), world);
+            }
+            assert_eq!(t.kept_frames, 12);
+            let facts = PetWorldFacts::read(&t.term, 17);
+            let input = t.term.cell_frame(20, 80);
+            t.kept
+                .observe_console(&input, &facts, PetPane::full(&input));
+            assert_eq!(
+                t.kept.observed_cells(),
+                20 * 80,
+                "{host:?}: an unconsumed fill of the same screen is read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pet_faded_out_in_history_reads_no_cell_until_the_screen_moves_and_reads_afresh_back_live()
+    {
+        for host in [Host::Reuse, Host::Refill, Host::Banded] {
+            let mut t = Twin::new(host);
+            t.term.process(b"\x1b[20;1H");
+            for line in 0..40 {
+                t.term.process(format!("line {line}\r\n").as_bytes());
+            }
+            t.frames("a scrolled page", 3);
+            t.term.scroll_display(3);
+            t.frames("parked: the pet fades out", 60);
+            assert!(
+                !t.kept.is_active(),
+                "{host:?}: precondition: no caret in history, so the pet faded out"
+            );
+            for i in 0..12 {
+                t.frames("parked, unchanged", 1);
+                assert_eq!(
+                    t.kept.observed_cells(),
+                    0,
+                    "{host:?}: an unchanged parked frame reads no cell (frame {i})"
+                );
+                assert!(!t.kept.is_active(), "{host:?}: still faded out");
+            }
+            // What the pet reads while it is not drawn: a selection in history
+            // wakes it to read along, so an inactive pet still classifies a
+            // screen that moved.
+            t.term.text_selection_mut().start_selection(
+                -2,
+                0,
+                SelectionSide::Left,
+                SelectionType::Simple,
+            );
+            t.term
+                .text_selection_mut()
+                .update_selection(-2, 6, SelectionSide::Right);
+            t.frames("a selection in history", 1);
+            assert_eq!(
+                t.kept.observed_cells(),
+                20 * 80,
+                "{host:?}: a selection made while the pet is not drawn is read"
+            );
+            t.frames("reading the selection", 30);
+            assert!(
+                t.kept.is_active(),
+                "{host:?}: the selection read while faded out brought the pet back"
+            );
+            t.term.text_selection_mut().clear();
+            t.frames("parked, the selection gone", 60);
+            assert!(!t.kept.is_active(), "{host:?}: faded out again");
+            t.frames("parked, unchanged again", 1);
+            assert_eq!(t.kept.observed_cells(), 0, "{host:?}: no cell read");
+            t.term.scroll_to_bottom();
+            t.frames("back to the live bottom", 1);
+            assert_eq!(
+                t.kept.observed_cells(),
+                20 * 80,
+                "{host:?}: the frame the pet comes back on reads the screen afresh"
+            );
+            assert!(
+                t.kept.is_active(),
+                "{host:?}: the caret is back, so is the pet"
+            );
+        }
     }
 }

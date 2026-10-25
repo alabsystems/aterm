@@ -226,7 +226,8 @@ impl CursorPhaser {
             }
         };
 
-        let charge = COV_IDLE / COV_MAX * (0.45 + PULSE_DEPTH * breath) + e;
+        const COV_IDLE_OVER_MAX: f32 = COV_IDLE / COV_MAX;
+        let charge = COV_IDLE_OVER_MAX * (0.45 + PULSE_DEPTH * breath) + e;
         if dark_theme
             && let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
@@ -265,13 +266,13 @@ impl CursorPhaser {
         cfg: &PhaserConfig,
         out: &mut Vec<GlowQuad>,
     ) {
+        const WING_COV_CEILING: f32 = WING_STACK_BUDGET / WING_STACK_OVERLAP;
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let cell_l = i32::from(geom.origin_x) + cc as i32 * geom.cw as i32;
         let cell_r = cell_l + geom.cw as i32;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.5) * ch;
         let reach = (REACH_IDLE + (REACH_MAX - REACH_IDLE) * e) * cw;
-        let cov_core =
-            (COV_MAX * charge * cfg.intensity).min(WING_STACK_BUDGET / WING_STACK_OVERLAP);
+        let cov_core = (COV_MAX * charge * cfg.intensity).min(WING_COV_CEILING);
 
         let slab = ((ch * 0.125) as i32).max(2);
         let cy_i32 = cy as i32;

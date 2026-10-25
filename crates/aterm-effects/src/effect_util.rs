@@ -595,6 +595,14 @@ impl std::ops::Deref for StarPieces {
 #[must_use]
 #[inline]
 pub(crate) const fn star_pieces(arm: i32, gold: bool) -> StarPieces {
+    if let Some(cached) = star_pieces_cached(arm, gold) {
+        return *cached;
+    }
+    build_star_pieces(arm, gold)
+}
+
+#[inline]
+const fn star_pieces_cached(arm: i32, gold: bool) -> Option<&'static StarPieces> {
     const CACHED_ARMS: usize = 16;
     const CACHE: [[StarPieces; 2]; CACHED_ARMS] = {
         let none = StarPiece {
@@ -618,9 +626,10 @@ pub(crate) const fn star_pieces(arm: i32, gold: bool) -> StarPieces {
         table
     };
     if arm >= 1 && arm <= CACHED_ARMS as i32 {
-        return CACHE[(arm - 1) as usize][gold as usize];
+        Some(&CACHE[(arm - 1) as usize][gold as usize])
+    } else {
+        None
     }
-    build_star_pieces(arm, gold)
 }
 
 #[must_use]
@@ -754,13 +763,22 @@ pub(crate) fn push_twinkle_star(
     if cov == 0 || arm < 1 {
         return true;
     }
-    let at = |share: f32| premul_rgb(color, (f32::from(cov) * share) as u8);
+    let cov_f = f32::from(cov);
+    let at = |share: f32| premul_rgb(color, (cov_f * share) as u8);
     let body_paint = premul_rgb(color, cov);
     let core_paint = at(STAR_CORE_ADD);
     let glint_paint = if gold { at(STAR_GLINT_COV) } else { 0 };
     let mut last_tip: Option<(u8, u32)> = None;
     let mut ended = false;
-    for (i, p) in star_pieces(arm, gold).iter().enumerate() {
+    let fallback;
+    let pieces = match star_pieces_cached(arm, gold) {
+        Some(cached) => cached.as_slice(),
+        None => {
+            fallback = build_star_pieces(arm, gold);
+            fallback.as_slice()
+        }
+    };
+    for (i, p) in pieces.iter().enumerate() {
         let paint = match p.part {
             StarPart::Body => body_paint,
             StarPart::Core => core_paint,

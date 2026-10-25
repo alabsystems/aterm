@@ -12,7 +12,8 @@ use std::{net::TcpListener, thread};
 pub(crate) struct Lab {
     pub(crate) root: aterm_tempfile::TempDir,
     pub(crate) paths: [Paths; 2],
-    source: std::path::PathBuf,
+    pub(super) source: std::path::PathBuf,
+    pub(super) signer: String,
 }
 impl Lab {
     pub(crate) fn new(qualified: bool) -> Self {
@@ -66,6 +67,7 @@ impl Lab {
             root,
             paths,
             source,
+            signer: created.signer,
         }
     }
     pub(crate) fn bootstrap(&self, n: usize) -> Bootstrap {

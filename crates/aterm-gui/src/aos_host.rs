@@ -38,6 +38,36 @@ pub(crate) const NO_ECHO_KEY: &str = "no-echo key";
 /// Why a press or a config change detached the recording: Secure Keyboard Entry is on.
 pub(crate) const SECURE_ENTRY: &str = "secure keyboard entry";
 
+/// Why a press detached the recording: a program reads it raw, or the tty's mode is unreadable, and it is not typed at a prompt of aterm's own integrated shell, so it may be a password.
+pub(crate) const RAW_KEY: &str = "raw key";
+
+/// Why the watcher left a segment unjudged: its host worker did not start.
+pub(crate) const WATCHER_DID_NOT_RUN: &str = "the watcher's host worker did not run";
+
+/// The name of the one-shot thread a repair's prepare runs on.
+pub(crate) const REPAIR_THREAD: &str = "aterm-aos-repair";
+
+/// The watcher's host worker thread's name.
+pub(crate) const WATCH_THREAD: &str = "aterm-aos-watch";
+
+/// Why a typed key may expose a secret if recorded, or `None` when aterm sees it go where it is echoed (the tty echoes it, or it is typed at an open prompt of aterm's own shell); `echo` reads the tty only when that decides.
+pub(crate) fn key_privacy(
+    swallows: bool,
+    secure: bool,
+    at_prompt: bool,
+    echo: impl FnOnce() -> Option<aterm_pty::TtyEcho>,
+) -> Option<&'static str> {
+    if swallows {
+        Some(NO_ECHO_KEY)
+    } else if secure {
+        Some(SECURE_ENTRY)
+    } else if at_prompt || echo().is_some_and(|e| e.echo) {
+        None
+    } else {
+        Some(RAW_KEY)
+    }
+}
+
 /// What the verb keeps per window between its calls.
 #[derive(Debug, Default)]
 pub(crate) struct AosWindow {
@@ -62,6 +92,29 @@ pub(crate) struct AosWindow {
     repairing: Option<PendingRepair>,
     /// Repairs started so far; each one's token is the count including it.
     repairs: u64,
+    /// Whether a key the recording may not hold reached the glow since it last started from rest, so the next attach starts it from rest.
+    tainted: bool,
+    /// The prompt each session last submitted a line from, by session: a key typed there since goes to whatever reads after the line, not to the prompt.
+    submitted: std::collections::HashMap<u64, u64>,
+}
+
+impl AosWindow {
+    /// Notes that `session` submitted a line from its prompt `prompt`.
+    pub(crate) fn note_submitted(&mut self, session: u64, prompt: u64) {
+        self.submitted.insert(session, prompt);
+    }
+
+    /// Whether a key typed to `session` while its prompt `prompt` is in front reaches that prompt's line editor: no line was submitted from it; a submission from an earlier prompt is forgotten.
+    pub(crate) fn prompt_open(&mut self, session: u64, prompt: u64) -> bool {
+        match self.submitted.get(&session) {
+            Some(&p) if p == prompt => false,
+            Some(_) => {
+                self.submitted.remove(&session);
+                true
+            }
+            None => true,
+        }
+    }
 }
 
 /// Where an `aos` ask's answer goes.
@@ -289,6 +342,9 @@ impl App {
         if ws.fx.cursor().momentum.light_vivid() {
             return Err(AosRefusal::VividInk);
         }
+        if std::mem::take(&mut ws.aos.tainted) {
+            ws.fx.cursor_mut().momentum.reset();
+        }
         ws.aos.attaches = ws.aos.attaches.saturating_add(1);
         ws.aos.epoch = Some(now);
         #[cfg(debug_assertions)]
@@ -393,7 +449,7 @@ impl App {
         match self.aos_repair_stage(code, now, reply) {
             Ok((id, token, job)) => {
                 let spawned = std::thread::Builder::new()
-                    .name("aterm-aos-repair".into())
+                    .name(REPAIR_THREAD.into())
                     .spawn(move || {
                         crate::qos::set_self(crate::qos::Role::Responsive);
                         let prepared = job.prepare();
@@ -537,6 +593,19 @@ impl App {
 
     /// The online watcher's main-thread half, run as the loop parks: notes each detach a glow made by itself as a timeline row, takes each window's retired segments and hands them to a host worker to judge, one worker per window at a time; with no event-loop proxy (a test app) it judges them in place.
     pub(crate) fn aos_watch(&mut self) {
+        let post = self.proxy.clone().map(|proxy| {
+            move |worked: Worked| {
+                let _ = proxy.send_event(crate::Wake::AosWorked(Box::new(worked)));
+            }
+        });
+        self.aos_watch_via(post);
+    }
+
+    /// [`Self::aos_watch`] with each worker's judgements handed to `post` for the main thread, or with no `post` judged in place; segments a worker that did not run leaves are timeline rows unjudged, never lost.
+    pub(crate) fn aos_watch_via<P>(&mut self, post: Option<P>)
+    where
+        P: Fn(Worked) + Clone + Send + 'static,
+    {
         for ws in self.windows.values_mut() {
             if let Some(why) = ws.fx.cursor_mut().momentum.aos_take_detached() {
                 ws.aos.epoch = None;
@@ -563,27 +632,33 @@ impl App {
             };
             let mut segments = std::mem::take(&mut ws.aos.orphans);
             segments.extend(ws.fx.cursor_mut().momentum.aos_take_retired());
-            let Some(proxy) = self.proxy.clone() else {
+            let Some(post) = post.clone() else {
                 let judged = segments.into_iter().map(Segment::judge).collect();
                 self.aos_watch_fold(id, judged);
                 continue;
             };
-            ws.aos.watching = true;
-            let spawned = std::thread::Builder::new()
-                .name("aterm-aos-watch".into())
-                .spawn(move || {
-                    crate::qos::set_self(crate::qos::Role::Background);
-                    let judged = segments.into_iter().map(Segment::judge).collect();
-                    let _ = proxy.send_event(crate::Wake::AosWorked(Box::new(Worked::Watch {
-                        window: id,
-                        judged,
-                    })));
-                });
-            if spawned.is_err() {
-                ws.aos.watching = false;
-                ws.aos.timeline.push(Row::Detached {
-                    why: "the watcher's host worker did not run",
-                });
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<Segment>>();
+            let spawned = spawn_watcher(move || {
+                crate::qos::set_self(crate::qos::Role::Background);
+                let Ok(segments) = rx.recv() else {
+                    return;
+                };
+                let judged = segments.into_iter().map(Segment::judge).collect();
+                post(Worked::Watch { window: id, judged });
+            });
+            let unsent = match spawned {
+                Ok(_) => tx.send(segments).err().map(|e| e.0),
+                Err(_) => Some(segments),
+            };
+            match unsent {
+                None => ws.aos.watching = true,
+                Some(segments) => {
+                    let judged = segments
+                        .into_iter()
+                        .map(|s| s.unjudged(WATCHER_DID_NOT_RUN))
+                        .collect();
+                    self.aos_watch_fold(id, judged);
+                }
             }
         }
     }
@@ -907,10 +982,35 @@ impl App {
     }
 }
 
+/// Starts the watcher's host worker thread running `work`.
+fn spawn_watcher<F: FnOnce() + Send + 'static>(
+    work: F,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if WATCH_SPAWN_REFUSED.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("a test refused the watcher's thread"));
+    }
+    std::thread::Builder::new()
+        .name(WATCH_THREAD.into())
+        .spawn(work)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether a test makes the watcher's thread fail to start, as a host out of threads would.
+    pub(crate) static WATCH_SPAWN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// Whether a test turned the privacy detach off, the negative control's switch.
     pub(crate) static PRIVACY_DETACH_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Notes a typed key the recording may not hold (`why`, from [`key_privacy`]) before the glow sees it: the glow is tainted until an attach starts it from rest, and a recording of it stops ([`privacy_detach`]).
+pub(crate) fn private_key(ws: &mut crate::WindowState, why: &'static str) {
+    ws.aos.tainted = true;
+    privacy_detach(ws, why);
 }
 
 /// Stops recording `ws`'s glow for privacy before the press `why` names reaches it, so no event of the press is logged: a timeline row, and the recording's retired segments go to the watcher.

@@ -159,7 +159,7 @@ impl Args {
                 "--allow-legacy-metric" => a.allow_legacy_metric = true,
                 "--warm" => a.warm = true,
                 "--dev-smoke" => a.dev_smoke = true,
-                "--no-windows" => {}
+                "--no-windows" | "--admit" => {}
                 other => return Err(format!("internal: `{other}` has no parser")),
             }
         }

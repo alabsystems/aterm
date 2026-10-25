@@ -4797,6 +4797,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.limit_after(&point, deadline, handled, review)?;
             }
             self.decision_owed = true;
+            self.tell_break(opts, &point);
             if self.host_steps_here(&point, opts, &mut false, review)? {
                 self.probe_shut(&point, ProbeGate::HostWants, None, review)?;
                 state.gone_first = false;
@@ -6377,6 +6378,20 @@ impl<C: Ctl> Session<'_, C> {
             self.host_passed = key.filter(|_| (stood || !typed) && self.host_follows.is_none());
         }
         Ok(idle)
+    }
+
+    /// The turn break `point` rests at, just decided, told to the host before it is asked
+    /// whether it wants a step there ([`IdleHost::turn_break`]), so what the host finds of the
+    /// session there (the `disk-free@v1` seat rule's finding, which every host's disk look reads)
+    /// is made at every decided turn break, not only at one where the host owes a step. It is
+    /// told once per decision: the wait's later looks at the same point find nothing new, and the
+    /// host's finding reads the session's records. A point mid-turn (a box) is no turn break.
+    fn tell_break(&self, opts: &SuperviseOpts, point: &Turn) {
+        if let Some(host) = opts.idle_host.as_ref()
+            && matches!(point.phase, Phase::Idle | Phase::Limited { .. })
+        {
+            host.turn_break(self.occupancy_theirs());
+        }
     }
 
     fn policy_limit_holds(&self) -> bool {

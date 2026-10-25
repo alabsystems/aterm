@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use aterm_capacity::Machine as _;
+
 #[cfg(unix)]
 mod aos;
 #[cfg(unix)]
@@ -622,6 +624,13 @@ const OPTIONS: &[OptSpec] = &[
         lanes: &Lane::ALL,
         help: "skip every lane that opens a window (the arena lanes); run the rest",
     },
+    OptSpec {
+        flag: "--admit",
+        value: Some("wait|now"),
+        lanes: &Lane::ALL,
+        help: "wait for a quiet machine before each lane (default wait, saying why once a \
+               minute), or start each at once (now)",
+    },
 ];
 
 /// A parsed command line.
@@ -829,6 +838,21 @@ fn main(args: &[String]) -> ExitCode {
         print!("{}", list());
         return ExitCode::SUCCESS;
     }
+    let admit = match cli
+        .options
+        .get("--admit")
+        .map(|w| (w, aterm_capacity::Admit::parse(w)))
+    {
+        None => aterm_capacity::Admit::Wait,
+        Some((_, Some(mode))) => mode,
+        Some((word, None)) => {
+            eprintln!(
+                "verify perf: `--admit` takes wait or now, not `{word}`\n\n{}",
+                usage()
+            );
+            return ExitCode::from(2);
+        }
+    };
     #[cfg(unix)]
     let (arena_args, fabric_args) = match lane_args(&cli) {
         Ok(a) => a,
@@ -851,11 +875,14 @@ fn main(args: &[String]) -> ExitCode {
 
     let mut ran: Vec<(Lane, LaneRun, f64)> = Vec::new();
     for lane in &cli.lanes {
-        let started = Instant::now();
         let record = cli.record.contains(lane);
         eprintln!("--- {} ---", lane.name());
+        let skip = no_windows && lane.opens_windows();
+        let quiet = (!skip).then(|| quiet(*lane, admit)).flatten();
+        let started = Instant::now();
+        let from = aterm_capacity::Live.read(None);
         let run = match lane {
-            lane if no_windows && lane.opens_windows() => LaneRun::skip(
+            _ if skip => LaneRun::skip(
                 "it opens a window on the desktop (--no-windows)",
                 "run it without --no-windows when the desktop is free",
             ),
@@ -899,6 +926,11 @@ fn main(args: &[String]) -> ExitCode {
                 "run it on macOS or Linux",
             ),
         };
+        if quiet.is_some() {
+            let to = aterm_capacity::Live.read(None);
+            eprintln!("  machine: {}", aterm_capacity::between(&from, &to));
+        }
+        drop(quiet);
         ran.push((*lane, run, started.elapsed().as_secs_f64()));
     }
 
@@ -935,6 +967,33 @@ fn main(args: &[String]) -> ExitCode {
         crate::exit::PASS => ExitCode::SUCCESS,
         crate::exit::COULD_NOT_RUN => ExitCode::from(3),
         _ => ExitCode::FAILURE,
+    }
+}
+
+/// The quiet machine for one lane (`docs/DESIGN-adaptive-build-2026-10-24.md`, QUIET-ADMIT):
+/// admitted alone among quiet claims once the load is low (saying once a minute what it waits
+/// for), or at once under `--admit now`; its own build runs under it too. A ledger that cannot be
+/// used is said, and the lane runs unadmitted.
+fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Option<aterm_capacity::Claim> {
+    let need = aterm_capacity::Need::timing(format!("verify perf {}", lane.name()));
+    match aterm_capacity::admit(need, mode) {
+        Ok(claim) => {
+            let to = aterm_capacity::Live.read(None);
+            eprintln!(
+                "  quiet machine: admitted{} at {}",
+                if claim.waited().as_secs() > 0 {
+                    format!(" after {}", aterm_capacity::span(claim.waited()))
+                } else {
+                    String::new()
+                },
+                to.brief()
+            );
+            Some(claim)
+        }
+        Err(e) => {
+            eprintln!("  {e}; the lane runs unadmitted");
+            None
+        }
     }
 }
 
@@ -1134,7 +1193,7 @@ mod tests {
     fn every_lane_family_parses_only_its_own_options_before_anything_runs() {
         let cli = parse(&args(
             "fabric --scenario pingpong --latency-samples 7 --burst 200 --pingpong-rounds 30 --attach-sessions 1,4 \
-             --attach-rounds 2 --durability relaxed --json-out /tmp/f.json --no-windows",
+             --attach-rounds 2 --durability relaxed --json-out /tmp/f.json --no-windows --admit now",
         ))
         .expect("parses");
         let (_, fabric_args) = lane_args(&cli).expect("both parsers take it");

@@ -4378,10 +4378,10 @@ fn work_walks() -> Vec<WorkWalk> {
             nord(Keyboard::On(IMPORT)),
             at((1_411, 151), 1, true, false),
             vec![
-                (None, [5, 5, 0, 0]),
-                (step(Window((1_410, 151))), [5, 5, 0, 0]),
-                (step(Window((1_409, 151))), [5, 5, 0, 0]),
-                (step(Window((1_408, 151))), [5, 5, 0, 0]),
+                (None, [5, 6, 0, 0]),
+                (step(Window((1_410, 151))), [5, 6, 0, 0]),
+                (step(Window((1_409, 151))), [5, 6, 0, 0]),
+                (step(Window((1_408, 151))), [5, 6, 0, 0]),
                 (redraw, [1, 0, 0, 0]),
                 (redraw, [1, 0, 0, 0]),
             ],
@@ -4494,8 +4494,8 @@ fn work_walks() -> Vec<WorkWalk> {
             mocha(),
             at((244, 440), 1, true, false),
             vec![
-                (None, [7, 6, 0, 0]),
-                (step(Window((243, 440))), [7, 6, 0, 0]),
+                (None, [7, 7, 0, 0]),
+                (step(Window((243, 440))), [7, 7, 0, 0]),
             ],
         ),
         (

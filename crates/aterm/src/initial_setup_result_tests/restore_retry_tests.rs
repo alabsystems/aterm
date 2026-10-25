@@ -41,7 +41,7 @@ impl SetupStartup for Startup<'_> {
         stop_covers(self.sent.sent)
     }
 
-    fn bring_forward(&mut self) -> bool {
+    fn bring_forward(&mut self) -> Result<bool, String> {
         self.brought += 1;
         assert!(
             self.brought <= 2,
@@ -72,7 +72,7 @@ impl SetupStartup for Startup<'_> {
                 stop_initial_setup();
             }
         }
-        bring_forward_ready(result, |why| self.failures.push(why.to_owned()))
+        result.map(|outcome| !matches!(outcome, aterm_cli::macos_doctor::BroughtForward::Busy))
     }
 
     fn backoff(&mut self) {
@@ -224,7 +224,7 @@ fn startup_restore_retry_stop_retires_the_retry_and_leaves_a_later_manual_choice
             (1 + usize::from(stop == StopAt::Success), 0, 0, 0)
         );
         assert_eq!(host.backoffs, usize::from(stop != StopAt::Error));
-        assert_eq!(host.failures.len(), 1);
+        assert_eq!(host.failures.len(), usize::from(stop != StopAt::Error));
         let held = host.setup.snapshot().unwrap();
         run_prepared_setup(prepared, None, std::mem::take(&mut host.sent));
         wait_until("the Stop saver finishes its queued IO", || {

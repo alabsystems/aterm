@@ -51,6 +51,8 @@ pub(crate) struct SessionChromeInput {
     pub agent: AgentMenu,
     /// THE SESSION LOG'S CLAUSE (phase 3B, plan §5; addendum A12; on by default since D6).
     pub clause: Option<ClauseLine>,
+    /// The session keeps screen history, so each timeline row opens Rewind at its instant.
+    pub rewind: bool,
 }
 
 /// The facts the tab menu's AGENT section is composed from.
@@ -185,6 +187,8 @@ pub(crate) enum TabMenuEntry {
     Header(String),
     /// A disabled timeline row: its event in a person's words and when it happened ([`crate::turn_ledger::now_ms`]'s clock).
     Event { words: String, at_ms: u64 },
+    /// A timeline row of a session that keeps screen history: a click opens Rewind at `at_ms`.
+    RewindTo { words: String, at_ms: u64 },
     /// A native separator.
     Separator,
     /// A command row: the `NSMenuItem` carries `action`'s tag, so the click dispatches through the menu bar's tag→[`MenuAction`] decode.
@@ -453,9 +457,19 @@ fn timeline_rows(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
         .iter()
         .filter(|n| timeline_row_shown(n.kind))
         .take(TIMELINE_TAIL)
-        .map(|n| TabMenuEntry::Event {
-            words: event_words(n.kind).to_string(),
-            at_ms: n.at_ms,
+        .map(|n| {
+            let words = event_words(n.kind).to_string();
+            if input.rewind {
+                TabMenuEntry::RewindTo {
+                    words,
+                    at_ms: n.at_ms,
+                }
+            } else {
+                TabMenuEntry::Event {
+                    words,
+                    at_ms: n.at_ms,
+                }
+            }
         })
         .collect()
 }
@@ -469,6 +483,13 @@ impl TabMenuEntry {
                 "{words} \u{b7} {}",
                 relative_age(now_ms.saturating_sub(*at_ms))
             )),
+            Self::RewindTo { words, at_ms } => Self::RewindTo {
+                words: format!(
+                    "{words} \u{b7} {}",
+                    relative_age(now_ms.saturating_sub(*at_ms))
+                ),
+                at_ms: *at_ms,
+            },
             other => other.clone(),
         }
     }
@@ -715,6 +736,7 @@ pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
     match entry {
         TabMenuEntry::Header(t) => t.clone(),
         TabMenuEntry::Event { words, .. } => words.clone(),
+        TabMenuEntry::RewindTo { words, .. } => format!("{words} (rewind)"),
         TabMenuEntry::Separator => "---".to_string(),
         TabMenuEntry::Action { label, enabled, .. } => {
             format!("{label}{}", disabled_suffix(*enabled))
@@ -870,6 +892,7 @@ mod tests {
             sid: None,
             agent: AgentMenu::default(),
             clause: None,
+            rewind: false,
         }
     }
 
@@ -990,7 +1013,9 @@ mod tests {
                 .all(|line| { !crate::session_timeline::metadata_has_forbidden_formatting(line) })
         );
         assert!(compose_tab_menu(&input).iter().all(|entry| match entry {
-            TabMenuEntry::Header(label) | TabMenuEntry::Event { words: label, .. } =>
+            TabMenuEntry::Header(label)
+            | TabMenuEntry::Event { words: label, .. }
+            | TabMenuEntry::RewindTo { words: label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Action { label, .. }
             | TabMenuEntry::ConnectionAction { label, .. }
@@ -1133,6 +1158,49 @@ mod tests {
             .filter(|e| matches!(e, TabMenuEntry::Header(h) if h.starts_with("state changed")))
             .count();
         assert_eq!(headers, TIMELINE_TAIL);
+    }
+
+    #[test]
+    fn a_recording_sessions_timeline_rows_open_rewind_and_a_plain_ones_stay_disabled() {
+        let mut input = full_input();
+        let plain = menu_shown_at(&compose_tab_menu(&input), NOW);
+        assert!(
+            !plain
+                .iter()
+                .any(|e| matches!(e, TabMenuEntry::RewindTo { .. })),
+            "negative control: no history, no Rewind rows: {plain:?}"
+        );
+        assert!(plain.contains(&TabMenuEntry::Header(
+            "changed directory \u{b7} 2m ago".into()
+        )));
+        input.rewind = true;
+        let rows = menu_shown_at(&compose_tab_menu(&input), NOW);
+        let rewind: Vec<_> = rows
+            .iter()
+            .filter_map(|e| match e {
+                TabMenuEntry::RewindTo { words, at_ms } => Some((words.as_str(), *at_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rewind,
+            [
+                ("details changed \u{b7} just now", NOW - 3_000),
+                ("changed directory \u{b7} 2m ago", NOW - 125_000),
+                ("started \u{b7} 2h ago", NOW - 7_200_000),
+            ]
+        );
+        assert!(
+            rows.iter()
+                .filter(|e| crate::tab_menu::is_selectable(e))
+                .count()
+                >= 3
+        );
+        assert!(
+            tab_menu_chrome_line(0, &compose_tab_menu(&input), NOW)
+                .contains("\"changed directory \u{b7} 2m ago (rewind)\""),
+            "the mirror says which rows rewind"
+        );
     }
 
     #[test]

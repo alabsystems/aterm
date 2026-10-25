@@ -587,13 +587,13 @@ fn release(open: &mut usize, ids: &mut BTreeMap<u64, String>, watch: &mut Option
 
 impl Files {
     /// The watches held.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) const fn open(&self) -> usize {
         self.open
     }
 
     /// The ids of the watches held.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn watch_ids(&self) -> Vec<u64> {
         self.ids.keys().copied().collect()
     }
@@ -976,6 +976,18 @@ impl Arms<'_> {
     }
 }
 
+/// This account's own home as the account database has it, whatever `$HOME` says.
+fn account_home() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        aterm_uds::account::home()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// A link met on the way (`ELOOP`).
 fn met_link(error: &io::Error) -> bool {
     #[cfg(unix)]
@@ -1105,13 +1117,9 @@ impl WakeFs for Disk {
 
     fn protected(&self, home: &Path) -> Option<Vec<PathBuf>> {
         let owner = privacy()?;
-        let mut homes = vec![home.to_path_buf()];
-        #[cfg(unix)]
-        if let Some(account) = aterm_uds::account::home()
-            && account != home
-        {
-            homes.push(account);
-        }
+        let homes: Vec<PathBuf> = std::iter::once(home.to_path_buf())
+            .chain(account_home().filter(|account| account != home))
+            .collect();
         Some(guarded_roots(&homes, &owner))
     }
 

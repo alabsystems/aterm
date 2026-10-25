@@ -119,6 +119,41 @@ impl Terminal {
         rebase
     }
 
+    /// Draw in `config`'s colours and colour policy and change nothing else, so every mode the program set (cursor shape and visibility among them) stays.
+    pub fn apply_config_colors(&mut self, config: &crate::config::TerminalConfig) {
+        let rebase = self.rebase_colors_inner(
+            &ColorBaseline::of_config(config),
+            config.allow_palette_reconfigure,
+        );
+        let policy = self.apply_style_policy(config);
+        if rebase.cursor_changed || rebase.colors_changed || policy {
+            self.grid.damage_mut().mark_full();
+        }
+    }
+
+    /// Take `config`'s bold-is-bright, faint opacity and indexed contrast floor: whether any moved.
+    fn apply_style_policy(&mut self, config: &crate::config::TerminalConfig) -> bool {
+        let new_faint = if config.faint_opacity.is_finite() {
+            config.faint_opacity.clamp(0.0, 1.0)
+        } else {
+            aterm_types::DIM_FACTOR
+        };
+        let new_floor = if config.indexed_minimum_contrast.is_finite() {
+            config.indexed_minimum_contrast.clamp(1.0, 21.0)
+        } else {
+            1.0
+        };
+        let moved = self.color.bold_is_bright != config.bold_is_bright
+            || (self.color.faint_opacity - new_faint).abs() > f32::EPSILON
+            || (self.color.indexed_minimum_contrast - new_floor).abs() > f32::EPSILON;
+        if moved {
+            self.color.bold_is_bright = config.bold_is_bright;
+            self.color.faint_opacity = new_faint;
+            self.color.indexed_minimum_contrast = new_floor;
+        }
+        moved
+    }
+
     fn rebase_colors_inner(&mut self, b: &ColorBaseline, palette_gate: bool) -> ColorRebase {
         let before = LiveColors::of(&self.color);
         let overrides = self.color.capture_overrides();
@@ -265,23 +300,7 @@ impl Terminal {
             changes.push(ConfigChange::AmbiguousWidth);
         }
 
-        let new_faint = if config.faint_opacity.is_finite() {
-            config.faint_opacity.clamp(0.0, 1.0)
-        } else {
-            aterm_types::DIM_FACTOR
-        };
-        let new_floor = if config.indexed_minimum_contrast.is_finite() {
-            config.indexed_minimum_contrast.clamp(1.0, 21.0)
-        } else {
-            1.0
-        };
-        if self.color.bold_is_bright != config.bold_is_bright
-            || (self.color.faint_opacity - new_faint).abs() > f32::EPSILON
-            || (self.color.indexed_minimum_contrast - new_floor).abs() > f32::EPSILON
-        {
-            self.color.bold_is_bright = config.bold_is_bright;
-            self.color.faint_opacity = new_faint;
-            self.color.indexed_minimum_contrast = new_floor;
+        if self.apply_style_policy(config) {
             changes.push(ConfigChange::StylePolicy);
             visual_repaint = true;
         }
@@ -845,5 +864,36 @@ mod tests {
             }
         }
         assert!(saw_change, "the configs must move the colours");
+    }
+
+    #[test]
+    fn apply_config_colors_takes_the_colours_and_policy_and_leaves_the_programs_modes() {
+        use crate::terminal::CursorStyle;
+        let config = TerminalConfig {
+            default_background: rgb(250, 250, 240),
+            bold_is_bright: false,
+            auto_wrap: false,
+            ..TerminalConfig::default()
+        };
+        let program = |t: &mut Terminal| t.process(b"\x1b[?25l\x1b[6 q");
+        let modes = |t: &Terminal| (t.cursor_visible(), t.cursor_style(), t.modes().auto_wrap);
+        let mut colors = Terminal::new(4, 16);
+        program(&mut colors);
+        let set = modes(&colors);
+        assert_eq!(set, (false, CursorStyle::SteadyBar, true), "fixture");
+        colors.take_damage();
+        colors.apply_config_colors(&config);
+        assert_eq!(modes(&colors), set, "the program's modes stay");
+        assert_eq!(colors.default_background(), rgb(250, 250, 240));
+        assert!(!colors.color.bold_is_bright, "the colour policy is taken");
+        assert!(colors.has_damage(), "a colour move repaints");
+        let mut whole = Terminal::new(4, 16);
+        program(&mut whole);
+        whole.apply_config(&config);
+        assert_ne!(
+            modes(&whole),
+            set,
+            "negative control: the whole config moves the program's modes"
+        );
     }
 }

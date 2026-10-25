@@ -246,6 +246,37 @@ pub(crate) fn captured_frame(
     }
 }
 
+/// Whether an OS window's size has still to reach its grid: its inner size gives another grid
+/// than the one it holds, or it does not show a maximize the restore asked for.
+const fn size_unlanded(
+    inner_grid: (u16, u16),
+    grid: (u16, u16),
+    maximize_asked: bool,
+    maximized: bool,
+) -> bool {
+    inner_grid.0 != grid.0 || inner_grid.1 != grid.1 || (maximize_asked && !maximized)
+}
+
+/// How long a window owing its restore re-grid waits for its OS size once nothing more is to be
+/// asked of the OS ([`App::pay_restore_regrid_if_due`]).
+pub(crate) const RESTORE_SHOW_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest a window owes its restore re-grid, whatever is still to come.
+pub(crate) const RESTORE_SHOW_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The re-grid a restore's close left a window owing, for the size its OS window had still to bring
+/// ([`App::regrid_restored_windows`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RestoreRegridOwed {
+    /// When the restore closed.
+    pub(crate) closed: std::time::Instant,
+    /// When the wait for the size began: the close, the last frame a carried full screen was
+    /// still to enter, or its entry (`App::enter_carried_fullscreen_if_due`).
+    pub(crate) since: std::time::Instant,
+    /// Whether that size was a carried full screen's.
+    pub(crate) fullscreen: bool,
+}
+
 /// Provenance of `local_id`s in a restore descriptor (`HandedOff` from a predecessor or `SameProcess`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LeafIds {
@@ -1250,37 +1281,99 @@ impl App {
     /// was, so it would keep that grid until something laid out the whole window. Booked
     /// `site=restore`; a pane already at its size books nothing.
     ///
-    /// A window the restore asked the OS to maximize or put in full screen is not re-gridded here:
-    /// its grid may still be the one it was made at, and moving its tabs to that grid before the
-    /// OS's size lands would resize each of them twice. Its panes are marked stale instead, as a
-    /// live drag leaves them: the next full layout pass (the grid that size commits) re-grids every
-    /// tab, and until one runs each redraw re-grids the tab on screen, so a show that leaves the
-    /// size as it was strands no tab.
+    /// A window whose OS window has a size still to bring is not re-gridded here: a resize still
+    /// queued, a maximize the restore asked for that it does not show yet, or a carried full screen
+    /// still to enter ([`Self::restore_size_unlanded`], [`Self::carried_fullscreen_owed`]). Its tabs
+    /// would be resized to a grid the window is leaving and then again. It owes the re-grid
+    /// instead ([`RestoreRegridOwed`]): the grid that size commits lays out every tab
+    /// ([`Self::apply_term_resize`]), and a frame pays it once nothing is to land or the wait runs
+    /// out ([`Self::pay_restore_regrid_if_due`]).
     fn regrid_restored_windows(&mut self) {
         let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Restore);
+        let now = std::time::Instant::now();
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
         for wid in windows {
-            let awaited = self.windows.get_mut(&wid).is_some_and(|ws| {
-                let awaited = std::mem::take(&mut ws.restore_show_awaited);
-                ws.panes_stale |= awaited;
-                awaited
-            });
-            if !awaited {
-                self.resize_panes(wid);
+            let fullscreen = self.carried_fullscreen_owed(wid);
+            if fullscreen || self.restore_size_unlanded(wid) {
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.restore_regrid_owed = Some(RestoreRegridOwed {
+                        closed: now,
+                        since: now,
+                        fullscreen,
+                    });
+                }
+            } else {
+                self.settle_restore_regrid(wid);
             }
         }
     }
 
-    /// Note that `wl` asks the OS for window `wid`'s size: a maximized or full-screen row is
-    /// re-entered once the window exists, and the size it brings arrives as a later resize. A
-    /// headless app shows no window, so nothing arrives and it awaits nothing.
-    fn note_restored_show(&mut self, wid: WindowId, wl: &restore::WindowLayout) {
-        if !self.headless
-            && (wl.maximized == Some(true) || wl.show.fullscreen == Some(true))
-            && let Some(ws) = self.windows.get_mut(&wid)
-        {
-            ws.restore_show_awaited = true;
+    /// Whether window `wid`'s OS window has a size its grid has not taken yet: a resize still to
+    /// reach the grid, or a maximize the restore asked for that it does not show yet. A window
+    /// with no OS window (a headless app) has none.
+    pub(crate) fn restore_size_unlanded(&self, wid: WindowId) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let Some(w) = ws.os_window.as_ref() else {
+            return false;
+        };
+        size_unlanded(
+            self.grid_dims_for(wid, w.inner_size()),
+            (ws.rows, ws.cols),
+            ws.restore_maximize_asked,
+            ws.restore_maximize_asked && w.is_maximized(),
+        )
+    }
+
+    /// Whether the carried show state still has window `wid` to re-enter full screen (only macOS
+    /// carries one).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn carried_fullscreen_owed(&self, wid: WindowId) -> bool {
+        self.carried_fullscreen_pending(wid)
+    }
+
+    /// Whether the carried show state still has window `wid` to re-enter full screen (only macOS
+    /// carries one).
+    #[cfg(not(target_os = "macos"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the macOS arm reads the carried show state"
+    )]
+    pub(crate) const fn carried_fullscreen_owed(&self, _wid: WindowId) -> bool {
+        false
+    }
+
+    /// At a frame of window `wid`, pay the re-grid the restore's close left it
+    /// ([`Self::regrid_restored_windows`]) once nothing is to land, or once it has waited
+    /// [`RESTORE_SHOW_SETTLE`] (counted from when a carried full screen was entered) or
+    /// [`RESTORE_SHOW_CAP`] in all. Booked `site=restore`.
+    pub(crate) fn pay_restore_regrid_if_due(&mut self, wid: WindowId, now: std::time::Instant) {
+        let Some(owed) = self.windows.get(&wid).and_then(|ws| ws.restore_regrid_owed) else {
+            return;
+        };
+        let capped = now.saturating_duration_since(owed.closed) >= RESTORE_SHOW_CAP;
+        if !capped && owed.fullscreen && self.carried_fullscreen_owed(wid) {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.restore_regrid_owed = Some(RestoreRegridOwed { since: now, ..owed });
+            }
+            return;
         }
+        let waited = now.saturating_duration_since(owed.since) >= RESTORE_SHOW_SETTLE;
+        if capped || waited || (!owed.fullscreen && !self.restore_size_unlanded(wid)) {
+            let _site =
+                crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Restore);
+            self.settle_restore_regrid(wid);
+        }
+    }
+
+    /// Lay out every tab of window `wid` once and drop what the restore noted of its show.
+    pub(crate) fn settle_restore_regrid(&mut self, wid: WindowId) {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.restore_regrid_owed = None;
+            ws.restore_maximize_asked = false;
+        }
+        self.resize_panes_scoped(wid, false);
     }
 
     /// Executes one bounded time slice of [`RestoreDrain`], returning whether more work remains.
@@ -1361,7 +1454,6 @@ impl App {
         wid: WindowId,
         wl: restore::WindowLayout,
     ) -> Option<FillingWindow> {
-        self.note_restored_show(wid, &wl);
         if wl.restored_tabs.len() < 2
             || !wl
                 .restored_tabs
@@ -1961,6 +2053,7 @@ impl App {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 let frame = crate::app_window::CarriedFrame::of(&wl);
                 ws.take_carried_frame(frame.map(|frame| frame.inner_px));
+                ws.restore_maximize_asked = maximized == Some(true);
             }
             #[cfg(any(windows, target_os = "linux"))]
             self.stage_restore_placement(wid, outer, maximized);
@@ -2018,6 +2111,9 @@ impl App {
             }
             return std::ops::ControlFlow::Break(());
         };
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.restore_maximize_asked = maximized == Some(true);
+        }
         if !cfg!(windows)
             && let (Some(x), Some(y)) = outer
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
@@ -2186,7 +2282,6 @@ impl App {
 
     /// Populates window `wid` from a validated [`restore::WindowLayout`] record.
     pub(crate) fn restore_into_window(&mut self, wid: WindowId, wl: restore::WindowLayout) {
-        self.note_restored_show(wid, &wl);
         if !wl.restored_tabs.is_empty() {
             self.restore_recursive_into_window(wid, wl);
             return;
@@ -3862,7 +3957,6 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return Err("closed-tab target window disappeared".to_string());
         }
-        self.frontmost_window = Some(wid);
         let mut reusable = None;
         let (tab, layout) =
             self.build_recursive_restore_tab(wid, record, &mut reusable, LeafIds::Live)?;

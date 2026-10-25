@@ -2000,7 +2000,6 @@ pub(crate) enum DrawPipe {
     FireOver,
     DecoOver,
     DecoAdd,
-    KnockOver,
     Fx,
     FxLinear,
     FxStore,
@@ -2023,7 +2022,6 @@ impl DrawPipe {
             Self::FireOver => Pipeline::FireOver,
             Self::DecoOver => Pipeline::DecoOver,
             Self::DecoAdd => Pipeline::DecoAdd,
-            Self::KnockOver => Pipeline::KnockOver,
             Self::Wallpaper => Pipeline::SpriteOver,
             Self::Fx => Pipeline::Fx,
             Self::FxLinear => Pipeline::FxLinear,
@@ -2055,12 +2053,12 @@ pub(crate) enum StreamId {
     ImageBelowBg,
     ImageBgCover,
     FxLinearUnder,
-    GlyphKnock,
     Trail,
     GlowUnder,
     FxUnder,
     FireAdd,
     FireOver,
+    FxKnockUnder,
     ImageUnder,
     GlyphHalo,
     Glyph,
@@ -2096,12 +2094,12 @@ impl StreamId {
         Self::ImageBelowBg,
         Self::ImageBgCover,
         Self::FxLinearUnder,
-        Self::GlyphKnock,
         Self::Trail,
         Self::GlowUnder,
         Self::FxUnder,
         Self::FireAdd,
         Self::FireOver,
+        Self::FxKnockUnder,
         Self::ImageUnder,
         Self::GlyphHalo,
         Self::Glyph,
@@ -2131,7 +2129,12 @@ impl StreamId {
     pub(crate) const fn is_fx(self) -> bool {
         matches!(
             self,
-            Self::FxLinearUnder | Self::FxUnder | Self::FxGlow | Self::FxOver | Self::FxLinearOver
+            Self::FxLinearUnder
+                | Self::FxUnder
+                | Self::FxKnockUnder
+                | Self::FxGlow
+                | Self::FxOver
+                | Self::FxLinearOver
         )
     }
 
@@ -2144,6 +2147,7 @@ impl StreamId {
             Self::ImageBelowBg => "image_below_bg",
             Self::ImageBgCover => "image_bg_cover",
             Self::FxLinearUnder => "fx_linear_under",
+            Self::FxKnockUnder => "fx_knock_under",
             Self::Trail => "trail",
             Self::GlowUnder => "glow_under",
             Self::FxUnder => "fx_under",
@@ -2151,7 +2155,6 @@ impl StreamId {
             Self::FireOver => "fire_over",
             Self::ImageUnder => "image_under",
             Self::GlyphHalo => "glyph_halo",
-            Self::GlyphKnock => "glyph_knock",
             Self::Glyph => "glyph",
             Self::Color => "color",
             Self::Image => "image",
@@ -2485,22 +2488,13 @@ pub(crate) fn build_frame_plan(
         );
     }
     push(G_BASE_BG, StreamId::ImageBgCover, DrawPipe::Bg, None);
-    // The Linear layers under the text: the rain's rows, then the companions
-    // on it (lane B7 of `docs/DESIGN-card-engine-2026-10-19.md`).
+    // The Linear layers under the text but the companions: the rain's rows (lane B7 of
+    // `docs/DESIGN-card-engine-2026-10-19.md`), under the trail and its light.
     push(
         G_BASE_BG,
         StreamId::FxLinearUnder,
         DrawPipe::FxLinear,
         Some(DrawAtlas::Fx),
-    );
-    // The knock-out (`aterm_render::KNOCK_DILATE_OFFSETS`): a knock layer's (`FxLayer::knock`)
-    // letters cut its body, drawn under the text, to the page before any trail draws,
-    // recolouring the body and keeping the page's alpha.
-    push(
-        G_BASE_BG,
-        StreamId::GlyphKnock,
-        DrawPipe::KnockOver,
-        Some(DrawAtlas::Mono),
     );
     push(G_BASE_BG, StreamId::Trail, DrawPipe::Bg, None);
     if under_store {
@@ -2523,6 +2517,18 @@ pub(crate) fn build_frame_plan(
     }
     push(G_GLOW_UNDER, StreamId::FireAdd, DrawPipe::FireAdd, None);
     push(G_GLOW_UNDER, StreamId::FireOver, DrawPipe::FireOver, None);
+
+    // The companions' bodies (the knock layers) open the base-fg group: they stand on the
+    // trail's light, under the ink, each cut where its letters lie
+    // (`aterm_render::Renderer::cut_knock_layers`). Drawn before the light, a cat whose head
+    // reached into the typed row wore the rainbow ribbon's colours, and the trail's bed cut a
+    // band out of a cat on the typed row. An sRGB group, so the pass count is unchanged.
+    push(
+        G_BASE_FG,
+        StreamId::FxKnockUnder,
+        DrawPipe::FxLinear,
+        Some(DrawAtlas::Fx),
+    );
 
     if ctx.has_image_plane {
         push(
@@ -2727,7 +2733,6 @@ impl FrameRes<'_> {
                     DrawPipe::FireOver => r.effects.get(EffectPipeline::FireOver),
                     DrawPipe::DecoOver => r.effects.get(EffectPipeline::DecoOver),
                     DrawPipe::DecoAdd => r.effects.get(EffectPipeline::DecoAdd),
-                    DrawPipe::KnockOver => r.effects.get(EffectPipeline::KnockOver),
                     DrawPipe::Wallpaper => r.effects.get(EffectPipeline::SpriteOver),
                     DrawPipe::Fx => r.effects.get(EffectPipeline::Fx),
                     DrawPipe::FxLinear => r.effects.get(EffectPipeline::FxLinear),
@@ -5931,7 +5936,6 @@ struct Instances {
     image: Vec<GlyphInstance>,
     glyph: Vec<GlyphInstance>,
     glyph_halo: Vec<GlyphInstance>,
-    glyph_knock: Vec<GlyphInstance>,
     color: Vec<GlyphInstance>,
     cursor: Vec<BgInstance>,
     deco: Vec<BgInstance>,
@@ -5972,8 +5976,8 @@ impl Instances {
             StreamId::Bg => stream!(bg),
             StreamId::ImageBelowBg => stream!(image_below_bg),
             StreamId::ImageBgCover => stream!(image_bg_cover),
-            StreamId::GlyphKnock => stream!(glyph_knock),
             StreamId::FxLinearUnder => self.fx_stream(fx_gpu::FxStream::LinearUnder),
+            StreamId::FxKnockUnder => self.fx_stream(fx_gpu::FxStream::KnockUnder),
             StreamId::Trail => stream!(trail),
             StreamId::GlowUnder => stream!(glow_under),
             StreamId::FxUnder => self.fx_stream(fx_gpu::FxStream::Under),
@@ -6025,7 +6029,6 @@ impl Instances {
         self.image.clear();
         self.glyph.clear();
         self.glyph_halo.clear();
-        self.glyph_knock.clear();
         self.color.clear();
         self.cursor.clear();
         self.deco.clear();
@@ -6076,12 +6079,12 @@ impl VertexBuffers {
             "aterm-gpu below-cell-background image instances",
             "aterm-gpu image background-cover instances",
             "aterm-gpu fx linear under instances",
-            "aterm-gpu glyph knock-out instances",
             "aterm-gpu cursor trail instances",
             "aterm-gpu emberforge glow-under instances",
             "aterm-gpu fx under instances",
             "aterm-gpu emberforge fire add instances",
             "aterm-gpu emberforge fire over instances",
+            "aterm-gpu fx knock under instances",
             "aterm-gpu behind-text image instances",
             "aterm-gpu glyph contrast-halo instances",
             "aterm-gpu glyph instances",
@@ -6676,12 +6679,11 @@ pub enum EffectPipeline {
     SpriteOver = 8,
     Fx = 9,
     FxLinear = 10,
-    KnockOver = 11,
-    FxStore = 12,
+    FxStore = 11,
 }
 
 /// How many effect pipelines exist.
-pub const EFFECT_PIPELINE_COUNT: usize = 13;
+pub const EFFECT_PIPELINE_COUNT: usize = 12;
 
 /// Names of the [`EFFECT_PIPELINE_COUNT`] slots, in [`EffectPipeline`] order.
 pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
@@ -6696,7 +6698,6 @@ pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
     "sprite_over",
     "fx",
     "fx_linear",
-    "knock_over",
     "fx_store",
 ];
 
@@ -6713,7 +6714,6 @@ pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
     EffectPipeline::SpriteOver,
     EffectPipeline::Fx,
     EffectPipeline::FxLinear,
-    EffectPipeline::KnockOver,
     EffectPipeline::FxStore,
 ];
 
@@ -6859,7 +6859,6 @@ fn frame_effect_pipelines(
     want[EffectPipeline::DecoOver as usize] =
         !inst.glyph_halo.is_empty() || !inst.curl.is_empty() || !inst.wdeco_over.is_empty();
     want[EffectPipeline::DecoAdd as usize] = !inst.wdeco_add.is_empty();
-    want[EffectPipeline::KnockOver as usize] = !inst.glyph_knock.is_empty();
     want[EffectPipeline::SpriteOver as usize] = !inst.wallpaper.is_empty();
     let (fx, linear, store) = fx_effect_demand(inst, fx_gpu::under_draws_opaque(input));
     want[EffectPipeline::Fx as usize] = fx;
@@ -6878,7 +6877,9 @@ fn fx_effect_demand(inst: &Instances, under_opaque: bool) -> (bool, bool, bool) 
     let stored = under_opaque && inst.glow_under.is_empty();
     (
         (under && !stored) || fx(fx_gpu::FxStream::Glow) || fx(fx_gpu::FxStream::Over),
-        fx(fx_gpu::FxStream::LinearUnder) || fx(fx_gpu::FxStream::LinearOver),
+        fx(fx_gpu::FxStream::LinearUnder)
+            || fx(fx_gpu::FxStream::KnockUnder)
+            || fx(fx_gpu::FxStream::LinearOver),
         under && under_opaque,
     )
 }
@@ -6905,7 +6906,6 @@ fn build_effect_pipeline(
         EffectPipeline::SpriteOver => (Pipeline::SpriteOver, &layouts.glyph),
         EffectPipeline::Fx => (Pipeline::Fx, fx()),
         EffectPipeline::FxLinear => (Pipeline::FxLinear, fx()),
-        EffectPipeline::KnockOver => (Pipeline::KnockOver, &layouts.glyph),
         EffectPipeline::FxStore => (Pipeline::FxStore, fx()),
     };
     crate::pipeline_table::build_wgpu(row.spec(), device, shader, layout, targets)
@@ -12595,8 +12595,11 @@ impl GpuRenderer {
     #[cfg(windows)]
     #[cfg(wgpu_arm)]
     fn dx12_swap_chain(surface: &wgpu::Surface) -> Option<aterm_win32::com::Com> {
-        // SAFETY: `swap_chain()` returns an `AddRef`'d `IDXGISwapChain3` pointer adopted and
-        // released once by `Com`.
+        // SAFETY: the hal-surface guard borrows the live surface only for this scope and destroys
+        // nothing through it. `swap_chain()` returns wgpu-hal's `windows` `IDXGISwapChain3` by
+        // value, an `AddRef`'d clone: one non-null interface pointer, `#[repr(transparent)]`,
+        // whose drop does nothing but release it, which `Com` takes over and releases once
+        // instead. The surface keeps its own reference.
         unsafe {
             let hal_surf = surface.as_hal::<wgpu::hal::api::Dx12>()?;
             Some(aterm_win32::com::Com::from_interface(
@@ -16172,20 +16175,9 @@ impl GpuRenderer {
 
         let backdrop_margins_active = self.backdrop_margins_active();
         let backdrop_margin_alpha_byte = (self.backdrop_margin_alpha() * 255.0).round() as u8;
-        // The knock-out's bodies (`aterm_render::knock_rects`): the slices the
-        // knock layers draw, cut as the CPU composite cuts them.
-        let mut knocks = std::mem::take(&mut self.fx.knocks);
-        if self.cpu.knock_out_on() {
-            let f = self.fx_frame_for(input);
-            self.fx
-                .knock_rects(&f, &input.fx_layers, &input.fx_occluders, &mut knocks);
-        } else {
-            knocks.clear();
-        }
         let bg_inst = &mut self.inst.bg;
         let glyph_inst = &mut self.inst.glyph;
         let glyph_halo_inst = &mut self.inst.glyph_halo;
-        let glyph_knock_inst = &mut self.inst.glyph_knock;
         let fire_present = !input.fire_patch.is_empty();
         let halo_rgb = {
             let rgb = aterm_render::HALO_IN_FIRE_RGB;
@@ -16597,16 +16589,6 @@ impl GpuRenderer {
             let raster_split = input.chrome_raster(r).and_then(|m| m.split);
             let windowed = win != (i32::MIN, i32::MAX);
             let mut ink_top = i32::MAX;
-            let (knock_y0, knock_y1) = (
-                (grid_top + r * ch) as i32 - 1,
-                (grid_top + (r + 1) * ch) as i32 + 1,
-            );
-            let row_has_knocks =
-                !knocks.is_empty() && knocks.iter().any(|k| k[1] < knock_y1 && k[3] > knock_y0);
-            let has_pane_defaults = input
-                .default_bg_spans
-                .get(r)
-                .is_some_and(|spans| !spans.is_empty());
             type FgMemo = ((u32, [u8; 3], Option<usize>), ([u8; 4], [u8; 4]));
             let mut fg_memo: Option<FgMemo> = None;
             for (c, cell) in cells.iter().take(cols).enumerate() {
@@ -16701,42 +16683,6 @@ impl GpuRenderer {
                     }
                 };
                 let quad = slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah));
-                if row_has_knocks {
-                    let (x0, x1) = ((pad + cx) as i32 - 1, (pad + cx + ccw) as i32 + 1);
-                    let on_body = knocks
-                        .iter()
-                        .any(|k| k[0] < x1 && k[2] > x0 && k[1] < knock_y1 && k[3] > knock_y0);
-                    let page = || {
-                        if cell_selected {
-                            return Some(bg_under);
-                        }
-                        let cell_bg = aterm_render::rgb_to_u32(cell.bg);
-                        let default_bg = if has_pane_defaults {
-                            aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg)
-                        } else {
-                            frame_bg
-                        };
-                        (!(wallpaper_on && cell_bg == default_bg)).then_some(bg_under)
-                    };
-                    if on_body && let Some(page) = page() {
-                        for &(dx, dy) in &aterm_render::KNOCK_DILATE_OFFSETS {
-                            if let Some((rect, uv)) = slot.quad(
-                                (pad + cx) as f32 + dx as f32,
-                                anchor_y + dy,
-                                baseline,
-                                scale,
-                                (aw, ah),
-                            ) {
-                                glyph_knock_inst.push(GlyphInstance {
-                                    rect,
-                                    uv,
-                                    color: [page[0], page[1], page[2], 255],
-                                    bg: [0, 0, 0, 0],
-                                });
-                            }
-                        }
-                    }
-                }
                 if quad.is_none() && !windowed {
                     continue;
                 }
@@ -16851,7 +16797,6 @@ impl GpuRenderer {
         }
         self.row_plans = row_plans;
         self.key_scratch = key_scratch;
-        self.fx.knocks = knocks;
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
             let Some(win) = glyph_win[r] else {
                 continue;
@@ -17295,11 +17240,19 @@ impl GpuRenderer {
         self.fx.refused = 0;
         if fx_ok && !(input.fx_layers.is_empty() && input.fx_prefetch.is_empty()) {
             let cap = self.fx_atlas_cap();
-            self.fx.admit(&input.fx_layers, &input.fx_prefetch, cap);
+            // The companions' bodies cut where their letters lie, as the CPU composite draws
+            // them (`aterm_render::Renderer::cut_knock_layers`).
+            let cut = self.cpu.cut_knock_layers(input, w as usize, h as usize);
+            let layers = if cut {
+                self.cpu.cut_layers()
+            } else {
+                input.fx_layers.as_slice()
+            };
+            self.fx.admit(layers, &input.fx_prefetch, cap);
             let f = self.cpu.fx_frame(w as usize, h as usize, rows);
             self.fx.build(
                 &f,
-                &input.fx_layers,
+                layers,
                 &input.fx_occluders,
                 row_active,
                 &mut self.inst.fx,

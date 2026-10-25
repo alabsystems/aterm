@@ -46,6 +46,11 @@ aterm-sysprobe = { workspace = true }
 # The trust lane's run lock: a lock file that names its holder, and the wait on a held one
 # (`named_lock`). Std only, and already in the graph through atpkg.
 aterm-toolchain = { workspace = true }
+# Each Trust lane check takes a memory claim in the machine's capacity ledger before it
+# starts, and waits while its recorded peak does not fit beside the claims already held
+# (docs/DESIGN-adaptive-build-2026-10-24.md TRUST-MEM). Workspace crate; first-party
+# dependencies only, already in the graph through atpkg.
+aterm-capacity = { workspace = true }
 # The cutter builds with the toolchain atpkg installs, so it resolves the store the
 # same way atpkg does rather than guessing at a path.
 atpkg = { workspace = true }

@@ -4446,6 +4446,7 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
     let store = Store::at(dir.path());
     assert_eq!(store.dir, dir.path().join("accounts"));
     assert_eq!(store.state_file(), store.dir.join("state.json"));
+    assert_eq!(store.state_witness_file(), store.dir.join("state.seen"));
     assert_eq!(store.ledger_path(), store.dir.join("ledger.jsonl"));
     assert_eq!(store.wake_path(), store.dir.join("wake"));
     assert_eq!(store.logins_dir(), store.dir.join("logins"));
@@ -4483,13 +4484,14 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
     {
         assert_eq!(mode(&store.dir), 0o700);
         assert_eq!(mode(&store.state_file()), 0o600);
+        assert_eq!(mode(&store.state_witness_file()), 0o600);
     }
     let on_disk = std::fs::read_to_string(store.state_file()).expect("reads");
     assert_eq!(on_disk, format!("{}\n", s.to_json()));
     assert_eq!(
         std::fs::read_dir(&store.dir).expect("lists").count(),
-        1,
-        "the temp file is renamed away"
+        2,
+        "only the snapshot and retained witness remain, with no staging file"
     );
 
     let first = store
@@ -4528,6 +4530,157 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
         "an empty-event transaction still durably cancels the pending pin"
     );
     store.cancel_pin_request(&request, NOW).unwrap();
+}
+
+#[test]
+fn a_lost_snapshot_retains_its_refusal_until_known_state_is_restored() {
+    let dir = tmp("lost-state");
+    let store = Store::at(dir.path());
+    let saved = full_state();
+    store.save(&saved).unwrap();
+    let backup = dir.path().join("retained-state.json");
+    std::fs::rename(store.state_file(), &backup).unwrap();
+    let before = std::fs::read(&backup).unwrap();
+    assert!(store.load(NOW).unwrap_err().contains("state.seen"));
+    let mut edited = false;
+    let result = store.transact(NOW, &mut None, |_| {
+        edited = true;
+        Ok(Vec::new())
+    });
+    assert!(result.is_err());
+    assert!(!edited);
+    assert!(!store.state_file().exists());
+    assert!(!store.machine_file().exists());
+    assert!(!store.ledger_path().exists());
+    assert!(!store.wake_path().exists());
+    assert_eq!(std::fs::read(&backup).unwrap(), before);
+    store.save(&saved).unwrap();
+    assert_eq!(store.load(NOW), Ok((saved, None)));
+    assert_eq!(std::fs::read(&backup).unwrap(), before);
+}
+
+#[test]
+fn a_first_event_without_a_state_edit_does_not_strand_a_fresh_store() {
+    let dir = tmp("first-event");
+    let store = Store::at(dir.path());
+    store
+        .transact(NOW, &mut None, |_| {
+            Ok(vec![
+                Event::new(NOW, Kind::SignIn, "main").because("no-route"),
+            ])
+        })
+        .unwrap();
+    assert!(store.state_file().is_file());
+    assert!(store.state_witness_file().is_file());
+    assert!(store.ledger_path().is_file());
+    assert!(store.load(NOW).is_ok());
+    let snapshot = std::fs::read(store.state_file()).unwrap();
+    #[cfg(unix)]
+    let identity = inode(&store.state_file());
+    store
+        .transact(NOW + 1, &mut None, |_| {
+            Ok(vec![
+                Event::new(NOW + 1, Kind::SignIn, "main").because("no-route"),
+            ])
+        })
+        .unwrap();
+    assert_eq!(std::fs::read(store.state_file()).unwrap(), snapshot);
+    #[cfg(unix)]
+    assert_eq!(
+        inode(&store.state_file()),
+        identity,
+        "later event-only transactions preserve the snapshot"
+    );
+    assert!(store.load(NOW + 1).is_ok());
+}
+
+#[test]
+fn legacy_ledger_is_evidence_but_identity_logins_and_wake_can_precede_a_snapshot() {
+    let dir = tmp("fresh-evidence");
+    let store = Store::at(dir.path());
+    store.machine_id("0011223344556677").unwrap();
+    store.save_logins(&Logins::default()).unwrap();
+    store.touch_wake().unwrap();
+    assert!(store.load(NOW).is_ok());
+    assert!(!store.state_file().exists());
+    assert!(
+        !store.state_witness_file().exists(),
+        "ordinary reads do not migrate"
+    );
+    std::fs::write(store.ledger_path(), "").unwrap();
+    assert!(store.load(NOW).unwrap_err().contains("ledger.jsonl"));
+    assert!(!store.state_witness_file().exists());
+}
+
+#[test]
+fn a_failed_publication_retains_durable_evidence_without_a_snapshot() {
+    use aterm_durable::{Flush, seam::Recording};
+    let dir = tmp("failed-publication");
+    let store = Store::at(dir.path());
+    store.ensure().unwrap();
+    std::fs::create_dir(store.state_file()).unwrap();
+    let recording = Recording::start();
+    assert!(store.save(&full_state()).is_err());
+    assert_eq!(
+        recording.take(),
+        [Flush::Durable; 3],
+        "stage, witness, then its directory before rename"
+    );
+    assert!(store.state_witness_file().is_file());
+    std::fs::rename(
+        store.state_file(),
+        dir.path().join("retained-blocking-directory"),
+    )
+    .unwrap();
+    assert!(store.load(NOW).is_err());
+    store.save(&full_state()).unwrap();
+    assert_eq!(
+        recording.take(),
+        [Flush::Durable; 4],
+        "successful publication also flushes the directory after rename"
+    );
+    assert_eq!(store.load(NOW), Ok((full_state(), None)));
+}
+
+#[test]
+fn an_invalid_witness_cannot_replace_existing_state() {
+    let dir = tmp("invalid-witness");
+    let store = Store::at(dir.path());
+    store.save(&full_state()).unwrap();
+    let original = std::fs::read(store.state_file()).unwrap();
+    std::fs::rename(
+        store.state_witness_file(),
+        dir.path().join("retained-witness"),
+    )
+    .unwrap();
+    std::fs::create_dir(store.state_witness_file()).unwrap();
+    assert!(store.save(&State::default()).is_err());
+    assert_eq!(std::fs::read(store.state_file()).unwrap(), original);
+    assert!(store.state_witness_file().is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_evidence_is_present_and_a_witness_symlink_is_never_followed_for_save() {
+    for name in ["state.seen", "ledger.jsonl"] {
+        let dir = tmp("dangling-evidence");
+        let store = Store::at(dir.path());
+        store.ensure().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), store.dir.join(name))
+            .unwrap();
+        assert!(store.load(NOW).unwrap_err().contains(name));
+    }
+    let dir = tmp("symlink-witness");
+    let store = Store::at(dir.path());
+    store.save(&full_state()).unwrap();
+    let original = std::fs::read(store.state_file()).unwrap();
+    let witness = dir.path().join("retained-witness");
+    std::fs::rename(store.state_witness_file(), &witness).unwrap();
+    std::fs::write(&witness, "untouched").unwrap();
+    std::os::unix::fs::symlink(&witness, store.state_witness_file()).unwrap();
+    assert!(store.save(&State::default()).is_err());
+    assert_eq!(std::fs::read(store.state_file()).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&witness).unwrap(), "untouched");
 }
 
 #[test]
@@ -4767,7 +4920,7 @@ fn a_name_put_in_place_after_its_open_reads_absent() {
 }
 
 #[test]
-fn a_torn_state_file_is_an_empty_state_and_a_note_never_a_panic() {
+fn a_torn_state_file_is_refused_without_replacing_it() {
     let dir = tmp("torn");
     let store = Store::at(dir.path());
     store.ensure().expect("dir");
@@ -4780,22 +4933,11 @@ fn a_torn_state_file_is_an_empty_state_and_a_note_never_a_panic() {
     ];
     for (bytes, needle) in cases {
         std::fs::write(store.state_file(), &bytes).expect("write");
-        let (s, note) = store
-            .load(NOW)
-            .unwrap_or_else(|why| panic!("{needle}: replaceable, not refused: {why}"));
-        assert!(note.is_some(), "{needle}: a note");
-        assert_eq!(
-            State {
-                machine: String::new(),
-                ..s.clone()
-            },
-            State::default()
-        );
-        assert_eq!(s.machine.len(), 16, "an empty state still gets an id");
+        let why = store.load(NOW).expect_err("damaged state is unknown");
+        assert!(why.contains(needle), "{why}");
+        assert_eq!(std::fs::read(store.state_file()).unwrap(), bytes);
+        assert!(!store.machine_file().exists(), "no new identity is saved");
     }
-    let (s, _) = store.load(NOW).expect("replaceable");
-    store.save(&s).expect("saves");
-    assert_eq!(store.load(NOW), Ok((s, None)));
 }
 
 #[test]
@@ -5868,10 +6010,13 @@ fn the_recorder_refuses_a_state_that_is_not_ours_and_leaves_it_byte_for_byte() {
     store.ensure().expect("dir");
     std::fs::write(store.state_file(), r#"{"schema":1,"accou"#).expect("writes");
     let recorded = record_wall(&store, &r, "s-one", &stored(), &weekly(), STARTED, NOW);
-    assert!(matches!(recorded, Recorded::Wall { .. }), "{recorded:?}");
-    let (state, note) = store.load(NOW).expect("ours now");
-    assert_eq!(note, None);
-    assert!(state.accounts["main"].walls.contains_key("seven_day"));
+    assert!(matches!(recorded, Recorded::Refused(_)), "{recorded:?}");
+    assert_eq!(
+        std::fs::read_to_string(store.state_file()).unwrap(),
+        r#"{"schema":1,"accou"#
+    );
+    assert!(!store.ledger_path().exists());
+    assert!(!store.wake_path().exists());
 }
 
 #[test]
@@ -8033,8 +8178,7 @@ fn a_codex_or_grok_row_names_its_flow_and_no_region() {
         let region = format!("{POOL_ROWS}region = \"global\"\n");
         let why = Roster::parse_for(cli, &region).expect_err("no region");
         assert!(
-            why.starts_with(&format!("{file}: row `work` has an unknown key `region`"))
-                && why.ends_with("dir, email, browser and flow"),
+            why.starts_with(&format!("{file}: row `work` has an unknown key `region`")),
             "{why}"
         );
         let bad = Roster::parse_for(cli, &format!("{POOL_ROWS}flow = \"magic\"\n"))

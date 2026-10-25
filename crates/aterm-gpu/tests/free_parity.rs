@@ -513,3 +513,89 @@ fn a_scaled_sprite_samples_the_cpus_texel_at_every_scale() {
         common::assert_arm(arm, &gpu);
     }
 }
+
+/// A COMPANION STANDS IN FRONT OF THE LIGHT UNDER THE WORDS, ON BOTH BACKENDS. A knock layer's
+/// body sits on the under-glyph light (`glow_under`: the rainbow ribbon's body, the meteor's
+/// train, the fire's flame body), never in it, and under the ink; its letters' knock-out ring
+/// of page lies on the body only. The GPU's `FxKnockUnder` and `GlyphKnock` open its base-fg
+/// group after the Unorm interpose, as the CPU draws them after `draw_fire_patch`. Drawn under
+/// that light, a cat whose head reached into the typed row wore the ribbon's colours (GitHub
+/// Light, round 14's open K5 item).
+#[test]
+fn a_companion_sits_on_the_under_glyph_light_both_backends() {
+    use crate::common::sprites::art_of;
+    use aterm_core::render::GlowQuad;
+    let theme = Theme::default();
+    for (arm, mut cpu, mut gpu) in common::arms(18.0, theme) {
+        gpu.set_bloom(false);
+        gpu.set_shimmer(false);
+        let mut win = aterm_gpu::WindowGpu::new();
+        let (cw, ch) = cpu.cell_size();
+        let (rows, cols) = (3usize, 8usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // A full block at col 0 and a letter at col 1, both in the body's box.
+        term.process("\x1b[?25l█x".as_bytes());
+        let red = 0x00C8_2020u32;
+        // The body's box spans cols 0..4 of row 0; its art is clear over col 1.
+        let art = art_of((4 * cw) as u16, ch as u16, |x, _| {
+            if (cw..2 * cw).contains(&usize::from(x)) {
+                [0, 0, 0, 0]
+            } else {
+                [0xC8, 0x20, 0x20, 255]
+            }
+        });
+        let mut input = term.cell_frame(rows, cols);
+        // The ribbon's body across row 0: source-over as light themes lay it, and additive.
+        for (alpha, color) in [(160u8, 0x0040_C0A0u32), (0, 0x0060_6000)] {
+            let premul = aterm_render::premul_rgb(color, if alpha == 0 { 200 } else { alpha });
+            input.glow_under.push(GlowQuad {
+                row: 0,
+                x: 0,
+                y: 0,
+                w: (cols * cw) as u16,
+                h: ch as u16,
+                color: premul,
+                alpha,
+                color2: premul,
+                alpha2: alpha,
+            });
+        }
+        let lit = gpu.render_input(&mut win, &input, None).pixels.clone();
+        put(&mut input, &[under(0, 0, art)]);
+        let cpu_f = cpu.render_input(&input);
+        let gpu_f = gpu.render_input(&mut win, &input, None);
+        common::assert_arm(arm, &gpu);
+        let w = gpu_f.width;
+        let cell = |px: &[u32], col: usize| -> Vec<u32> {
+            (0..ch)
+                .flat_map(|y| (col * cw..(col + 1) * cw).map(move |x| px[y * w + x]))
+                .collect()
+        };
+        let body = cell(&gpu_f.pixels, 3);
+        let off = body
+            .iter()
+            .map(|&g| {
+                (rr(g) - rr(red))
+                    .abs()
+                    .max((gg(g) - gg(red)).abs())
+                    .max((bb(g) - bb(red)).abs())
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            off <= 2,
+            "{arm}: GPU body over the under-glyph light: max delta {off} from its own colour"
+        );
+        let clear = max_channel_delta(&cell(&gpu_f.pixels, 1), &cell(&lit, 1));
+        assert!(
+            clear <= 2,
+            "{arm}: where the art is clear the letter keeps the light round it on the GPU: \
+             max delta {clear}"
+        );
+        let delta = max_channel_delta(&cpu_f.pixels, &gpu_f.pixels);
+        assert!(
+            delta <= 2,
+            "{arm}: and the backends agree over the whole frame: max delta {delta}"
+        );
+    }
+}

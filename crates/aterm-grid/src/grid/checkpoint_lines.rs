@@ -4,7 +4,7 @@
 
 //! Line-level grid checkpoint projection and visible-row restoration.
 
-use aterm_scrollback::Line;
+use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
 
 use super::Grid;
 
@@ -85,21 +85,24 @@ impl Grid {
     #[must_use]
     pub fn replay_fork(&self) -> Option<Grid> {
         let storage = &self.storage;
-        if storage.scrollback.is_some()
-            || storage.scrollback_detached_for_reflow
+        if storage.scrollback_detached_for_reflow
             || storage.resize_undo.is_some()
-            || !self.handback_idle()
+            || storage.compress_offload_active
+            || storage.staged_width_stale
         {
             return None;
         }
         let (rows, cols) = (self.rows(), self.cols());
         let lines = self.checkpoint_lines_bounded(usize::MAX);
         let (history, visible) = lines.split_at(lines.len().saturating_sub(usize::from(rows)));
-        let mut fork = Grid::with_scrollback(rows, cols, storage.max_scrollback);
-        for line in history {
-            fork.fill_row_from_line(0, line, cols);
-            fork.scroll_up(1);
-        }
+        let mut fork = match storage.scrollback.as_ref() {
+            None => {
+                let mut fork = Grid::with_scrollback(rows, cols, storage.max_scrollback);
+                fork.scroll_in(history);
+                fork
+            }
+            Some(store) => self.tiered_fork(store, history)?,
+        };
         fork.restore_visible_from_lines(visible);
         let from = &storage.cursor_state;
         let to = &mut fork.storage.cursor_state;
@@ -116,7 +119,42 @@ impl Grid {
         fork.storage.any_double_width = storage.any_double_width;
         fork.storage.resize_law = storage.resize_law;
         fork.continue_absolute_numbering(self.absolute_row_counter());
+        fork.storage.handback = storage.handback;
         Some(fork)
+    }
+
+    /// A tiered grid laid out as this one is: its store's lines in a store with the same limits, its staged lines staged, and its ring's lines in the ring.
+    fn tiered_fork(&self, store: &ScrollbackStorage, history: &[Line]) -> Option<Grid> {
+        let stored = store.line_count();
+        let staged = stored.checked_add(self.storage.lazy_buffer_lines())?;
+        if staged.checked_add(self.storage.ring_buffer_scrollback()) != Some(history.len()) {
+            return None;
+        }
+        let mut copy = Scrollback::with_defaults();
+        copy.set_line_limit(store.line_limit());
+        copy.set_memory_budget(store.memory_budget()).ok()?;
+        for line in &history[..stored] {
+            copy.push_line(line.clone());
+        }
+        let (rows, cols) = (self.rows(), self.cols());
+        let mut fork = Grid::with_tiered_scrollback(rows, cols, self.storage.max_scrollback, copy);
+        for line in &history[stored..staged] {
+            let (row, extras) = fork.build_scrollback_row(line, cols);
+            fork.storage.lazy_buffer.push_row(&row, extras);
+            // SAFETY: build_scrollback_row allocated this temporary row in fork.storage.pages, and the lazy buffer owns its copied cell data.
+            unsafe { row.recycle(&mut fork.storage.pages) };
+        }
+        fork.scroll_in(&history[staged..]);
+        Some(fork)
+    }
+
+    /// Scrolls `lines` (oldest first) through the top row into history.
+    fn scroll_in(&mut self, lines: &[Line]) {
+        let cols = self.cols();
+        for line in lines {
+            self.fill_row_from_line(0, line, cols);
+            self.scroll_up(1);
+        }
     }
 }
 

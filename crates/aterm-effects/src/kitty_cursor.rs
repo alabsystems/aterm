@@ -30,6 +30,7 @@ const LOW: f32 = 0.14;
 const REVIVE_GATE: f32 = 0.35;
 const FADE_IN: f32 = 0.35;
 const FADE_OUT: f32 = 0.75;
+const FADE_OUT_DUR: Duration = Duration::from_millis(750);
 
 const EXIT_FACE_FADE: f32 = 0.25;
 /// Total wall-clock time of the classic cursor kitty's off-glass line-fold seam.
@@ -1342,7 +1343,7 @@ impl CursorCat {
                     }
                 }
                 State::FadeOut(t0) => {
-                    if now.saturating_duration_since(t0).as_secs_f32() >= FADE_OUT {
+                    if now.saturating_duration_since(t0) >= FADE_OUT_DUR {
                         self.state = State::Hidden;
                     }
                 }
@@ -1770,11 +1771,12 @@ pub fn resample_nearest_into(
         out.resize(total_bytes, 0);
         return;
     }
-    out.resize(total_bytes, 0);
     if sw == tw && sh == th {
-        out.copy_from_slice(&src[..total_bytes]);
+        out.clear();
+        out.extend_from_slice(&src[..total_bytes]);
         return;
     }
+    out.resize(total_bytes, 0);
     let y_step = sh / th;
     let y_rem = sh % th;
     let x_step = sw / tw;

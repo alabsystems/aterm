@@ -12,7 +12,6 @@ use std::sync::{Mutex, PoisonError};
 
 use aterm_sysprobe::volumes::{self, Table, Unread};
 
-#[cfg(any(test, debug_assertions))]
 use crate::floor::GIB;
 
 /// One volume, as a [`Reading`] holds it.
@@ -78,6 +77,63 @@ impl Reading {
         Live.read(Some(path))
     }
 
+    /// The reading in one line, as a log carries it: `load 3.2 on 14 cores, 30.1 GiB of 48 GiB
+    /// available, swap 0.3 GiB`; a figure this OS does not report is left out.
+    #[must_use]
+    pub fn brief(&self) -> String {
+        between(self, self)
+    }
+}
+
+/// Two readings of one machine in one line, `from` then `to`, a figure shown once where it held:
+/// `load 3.2→5.1 on 14 cores, 30.1→29.8 GiB of 48 GiB available, swap 0.3 GiB`. What a run's
+/// log says the machine did while a step ran, so a step refused as starved explains itself.
+#[must_use]
+pub fn between(from: &Reading, to: &Reading) -> String {
+    let pair = |a: String, b: String| if a == b { a } else { format!("{a}→{b}") };
+    let load = |r: &Reading| {
+        r.load1
+            .map_or_else(|| "?".to_owned(), |l| format!("{l:.1}"))
+    };
+    let gib = |b: Option<u64>| b.map_or_else(|| "?".to_owned(), |b| format!("{:.1}", tenths(b)));
+    let mut parts = vec![format!(
+        "load {} on {} cores",
+        pair(load(from), load(to)),
+        to.cores
+    )];
+    if from.available.is_some() || to.available.is_some() {
+        let of = to
+            .physical
+            .map(|p| format!(" of {}", crate::gib(p)))
+            .unwrap_or_default();
+        parts.push(format!(
+            "{} GiB{of} available",
+            pair(gib(from.available), gib(to.available))
+        ));
+    }
+    if from.swap_used.is_some() || to.swap_used.is_some() {
+        parts.push(format!(
+            "swap {} GiB",
+            pair(gib(from.swap_used), gib(to.swap_used))
+        ));
+    }
+    parts.join(", ")
+}
+
+/// `bytes` in GiB to a tenth.
+fn tenths(bytes: u64) -> f64 {
+    (bytes as f64 / GIB as f64 * 10.0).round() / 10.0
+}
+
+/// This machine's logical cores, at least one.
+#[must_use]
+pub fn cores() -> u32 {
+    u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+impl Reading {
     /// A reading of `physical` GiB with `available` GiB of it available, `cores` cores and no load: what a test sets.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
@@ -128,6 +184,22 @@ impl Procs {
     #[must_use]
     pub fn of(procs: Vec<Proc>) -> Procs {
         Procs { procs }
+    }
+
+    /// The processes `pid` descends from, its parent first, as far as the sweep holds them.
+    #[must_use]
+    pub fn ancestors(&self, pid: u32) -> Vec<u32> {
+        let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
+        let mut out = Vec::new();
+        let mut at = pid;
+        while let Some(&up) = parent.get(&at) {
+            if up == at || up == pid || out.contains(&up) {
+                break;
+            }
+            out.push(up);
+            at = up;
+        }
+        out
     }
 
     /// The use of `pid` and every process descended from it.
@@ -210,9 +282,7 @@ pub struct Live;
 
 impl Machine for Live {
     fn read(&self, path: Option<&Path>) -> Reading {
-        let cores = u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
-            .unwrap_or(u32::MAX)
-            .max(1);
+        let cores = cores();
         let load = aterm_sysprobe::load_average();
         let detail = aterm_sysprobe::memory_detail();
         let physical = aterm_sysprobe::physical_memory_mib()

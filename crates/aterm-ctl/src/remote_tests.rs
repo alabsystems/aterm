@@ -209,12 +209,13 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
         .to_string();
     assert_eq!(
         off,
-        "this machine is in no fleet now, so it reaches lab-mini no more to hand s-a1 back: a \
-         hold it took there before it left stands until that Mac's person takes the tab (Take \
-         Over) or runs `aterm fleet peers rm 496e9154` there; if this machine left a fleet it \
-         joined, `aterm ctl --host lab-mini hold s-a1 off` hands it back once it joins that \
-         fleet again (a fleet it issued went with its leave)"
+        "this machine is in no fleet; if this machine took s-a1 on lab-mini, that Mac lifts the \
+         hold when its person takes the tab (Take Over), runs `aterm fleet peers rm 496e9154` \
+         there, or lowers `aterm fleet allow` there (to content or facts), and `aterm ctl --host \
+         lab-mini hold s-a1 off` from here works once this machine is in that fleet again (a \
+         fleet it issued went with its leave)"
     );
+    assert!(!off.contains("stands until"), "{off}");
     for other in ["hold s-a1 on", "@s-a1 status"] {
         let said = run("lab-mini", &words(other), None, &local)
             .expect_err(other)
@@ -236,11 +237,11 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
         .to_string();
     assert_eq!(
         off,
-        "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on a Mac \
-         its book records no more (it joined another fleet since, or a `peers rm` took that Mac \
-         out), that Mac's person lifts the hold (Take Over, or `aterm fleet peers rm 496e9154` \
-         there), and so does `aterm ctl --host lab-mnii hold s-a1 off` once this machine's book \
-         records that Mac again"
+        "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on \
+         lab-mnii, that Mac lifts the hold when its person takes the tab (Take Over), runs \
+         `aterm fleet peers rm 496e9154` there, or lowers `aterm fleet allow` there (to content \
+         or facts), and `aterm ctl --host lab-mnii hold s-a1 off` from here works once this \
+         machine's book records that Mac again"
     );
     let on = run("lab-mnii", &words("hold s-a1 on"), None, &local)
         .expect_err("no such Mac in the book")

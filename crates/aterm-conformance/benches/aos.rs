@@ -4,6 +4,9 @@
 //! The release binary's aos repair matrix, run explicitly by `verify measure`.
 
 #[cfg(unix)]
+#[path = "support/quiet.rs"]
+mod quiet;
+#[cfg(unix)]
 mod support;
 
 #[cfg(unix)]
@@ -54,7 +57,7 @@ mod measuring {
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     {
-        measuring::run()
+        quiet::run("aos", measuring::run)
     }
     #[cfg(not(unix))]
     {

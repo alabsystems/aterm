@@ -282,6 +282,8 @@ pub const CHAIN_KEYS: f32 = 4.5;
 
 /// The ribbon chains across any plausible rhythm, even one key every five seconds.
 pub const CHAIN_GAP_MAX: f32 = 5.0;
+pub(crate) const CHAIN_GAP_MAX_DUR: std::time::Duration =
+    std::time::Duration::from_secs(CHAIN_GAP_MAX as u64);
 
 /// Fade margin added to the chained life, seconds.
 pub const CHAIN_MARGIN: f32 = 0.10;
@@ -321,6 +323,8 @@ pub const RETRACT_FADE_S: f32 = 0.24;
 
 /// The fold flow's whole life.
 pub const FLOW_TOTAL_S: f32 = 1.50;
+const FLOW_TOTAL_DUR: std::time::Duration =
+    std::time::Duration::from_millis((FLOW_TOTAL_S * 1000.0) as u64);
 const _: () = assert!(FLOW_TOTAL_S < SWOOSH_TOTAL_S);
 
 /// The flow's far-first lead.
@@ -1002,13 +1006,7 @@ const fn scale_rgb(rgb: u32, k: f32) -> u32 {
 
 #[inline]
 const fn toward_white(rgb: u32, w: f32) -> u32 {
-    let r0 = ((rgb >> 16) & 0xff) as f32;
-    let g0 = ((rgb >> 8) & 0xff) as f32;
-    let b0 = (rgb & 0xff) as f32;
-    let r = ((r0 + w * (255.0 - r0)) + 0.5).clamp(0.0, 255.0) as u32;
-    let g = ((g0 + w * (255.0 - g0)) + 0.5).clamp(0.0, 255.0) as u32;
-    let b = ((b0 + w * (255.0 - b0)) + 0.5).clamp(0.0, 255.0) as u32;
-    (r << 16) | (g << 8) | b
+    crate::effect_util::lerp_rgb(rgb, 0x00FF_FFFF, w)
 }
 
 #[inline]
@@ -1174,17 +1172,7 @@ const fn dark_hue_bent(rgb: u32) -> u32 {
     if v <= 0.0 || s <= 0.0 || !(h >= 0.0 && h < 90.0) {
         return rgb;
     }
-    let mut bent = h;
-    let mut i = 0;
-    while i + 1 < DARK_HUE_BEND.len() {
-        let (x0, y0) = DARK_HUE_BEND[i];
-        let (x1, y1) = DARK_HUE_BEND[i + 1];
-        if h >= x0 && h < x1 {
-            bent = y0 + (y1 - y0) * (h - x0) / (x1 - x0);
-            break;
-        }
-        i += 1;
-    }
+    let bent = bent_hue(h, &DARK_HUE_BEND);
     if bent == h { rgb } else { hsv2rgb(bent, s, v) }
 }
 
@@ -1239,6 +1227,7 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
         InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
     };
     let bg_lab = oklab(bg);
+    let weight_sq = weight * weight;
     let hi0 = (lerp_rgb(bg, full, cap), lerp_rgb(bg, full, 1.0));
     let lab0 = oklab(hi0.0);
     let (dl0, da0, db0) = (
@@ -1246,7 +1235,7 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
         lab0[1] - bg_lab[1],
         lab0[2] - bg_lab[2],
     );
-    let hi0_ok = crate::color_math::sqrt_f32(dl0 * dl0 + da0 * da0 + db0 * db0) <= weight
+    let hi0_ok = dl0 * dl0 + da0 * da0 + db0 * db0 <= weight_sq
         && match bar {
             Some(bar) => ratio(worst_lum(table, hi0.1, bg, cap), y_fg) >= bar,
             None => true,
@@ -1276,7 +1265,7 @@ pub(crate) const fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 
         } else {
             let lab = oklab(pair.0);
             let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
-            let ok = crate::color_math::sqrt_f32(dl * dl + da * da + db * db) <= weight
+            let ok = dl * dl + da * da + db * db <= weight_sq
                 && match bar {
                     Some(bar) => ratio(worst_lum(table, pair.1, bg, cap), y_fg) >= bar,
                     None => true,
@@ -1357,13 +1346,19 @@ const fn paper_vivid_ink_bent(rgb: u32, bg: u32, bar: f32, bend: &[(f32, f32)]) 
     }
     let h = bent_hue(h, bend);
     let full = hsv2rgb(h, s, 1.0);
-    let y_bg = relative_luminance(bg & 0x00FF_FFFF);
+    let table = crate::color_math::relative_luminance_table();
+    let y_bg = crate::color_math::relative_luminance_with(table, bg);
     #[inline]
-    const fn holds(y_bg: f32, bar: f32, cand: u32) -> bool {
-        let y = relative_luminance(cand);
+    const fn holds(
+        table: &crate::color_math::RelativeLuminanceTable,
+        y_bg: f32,
+        bar: f32,
+        cand: u32,
+    ) -> bool {
+        let y = crate::color_math::relative_luminance_with(table, cand);
         (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= bar
     }
-    if holds(y_bg, bar, full) {
+    if holds(table, y_bg, bar, full) {
         return full;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -1378,7 +1373,7 @@ const fn paper_vivid_ink_bent(rgb: u32, bg: u32, bar: f32, bend: &[(f32, f32)]) 
         };
         if mid_rgb == hi_rgb {
             hi = mid;
-        } else if same_lo || holds(y_bg, bar, mid_rgb) {
+        } else if same_lo || holds(table, y_bg, bar, mid_rgb) {
             lo = mid;
             lo_rgb = Some(mid_rgb);
         } else {
@@ -1436,10 +1431,11 @@ pub(crate) const fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
 #[inline]
 #[must_use]
 const fn seen_floor(ink: u32, bg: u32) -> f32 {
+    let linear = &crate::color_math::relative_luminance_table().linear;
     let mut a = 255u16;
     while a >= 1 {
         let alpha = a as u8;
-        if !seen(over_premul(bg, premul_rgb(ink, alpha), alpha), bg) {
+        if !seen_with(linear, over_premul(bg, premul_rgb(ink, alpha), alpha), bg) {
             return (alpha as f32) + 1.0;
         }
         a -= 1;
@@ -2185,6 +2181,8 @@ struct Relocate {
 
 /// How long a [`Relocate`] waits for the caret to reveal the moved word.
 pub const RELOCATE_PATIENCE_S: f32 = 2.0;
+const RELOCATE_PATIENCE_DUR: std::time::Duration =
+    std::time::Duration::from_secs(RELOCATE_PATIENCE_S as u64);
 
 /// The soft-wrapped caret (`CursorGlow::soft_wrapped_caret`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3023,25 +3021,36 @@ impl Ribbon {
 
     fn flow_target(&self, coh: &Cohort) -> (Option<u16>, bool, f32) {
         let below = self.caret.is_some_and(|(row, _)| coh.row > row);
-        let (lo, hi) = self
-            .cells
-            .iter()
-            .filter(|c| c.row == coh.row && c.cohort == coh.id && !c.leaving())
-            .fold((u16::MAX, 0u16), |(lo, hi), c| {
-                (lo.min(c.col), hi.max(c.col))
-            });
+        let mut lo = u16::MAX;
+        let mut hi = 0u16;
+        for c in &self.cells {
+            if c.row == coh.row && c.cohort == coh.id && !c.leaving() {
+                if c.col < lo {
+                    lo = c.col;
+                }
+                if c.col > hi {
+                    hi = c.col;
+                }
+            }
+        }
         let (lo, hi) = if lo > hi {
             (coh.col0, coh.col1.saturating_sub(1).max(coh.col0))
         } else {
             (lo, hi)
         };
         let edge = if below { lo } else { hi };
-        let disp = self
-            .cells
-            .iter()
-            .filter(|c| c.row == coh.row && c.cohort == coh.id && c.col == edge)
-            .max_by(|a, b| a.born.cmp(&b.born))
-            .map_or(0.0, |c| c.birth_disp);
+        let mut best_born: Option<Instant> = None;
+        let mut disp = 0.0_f32;
+        for c in &self.cells {
+            if c.row == coh.row
+                && c.cohort == coh.id
+                && c.col == edge
+                && best_born.is_none_or(|b| c.born >= b)
+            {
+                best_born = Some(c.born);
+                disp = c.birth_disp;
+            }
+        }
         let heat = smoothstep01((disp - HOT_EDGE_DISP_MIN) * (1.0 / HOT_EDGE_DISP_SPAN));
         let kept = f32::from(hi - lo) + 1.0;
         let drift = (FLOW_DRIFT_MIN_CELLS + (FLOW_DRIFT_MAX_CELLS - FLOW_DRIFT_MIN_CELLS) * heat)
@@ -3632,7 +3641,7 @@ impl Ribbon {
         let n = src_end.saturating_sub(sw.word_col0);
         if n == 0
             || self.reflow != Some(sw)
-            || at.saturating_duration_since(wrapped_at).as_secs_f32() > RELOCATE_PATIENCE_S
+            || at.saturating_duration_since(wrapped_at) > RELOCATE_PATIENCE_DUR
             || to_col <= landing.saturating_add(n)
         {
             return;
@@ -3713,7 +3722,7 @@ impl Ribbon {
         if rel.row != row {
             return;
         }
-        if at.saturating_duration_since(rel.at).as_secs_f32() > RELOCATE_PATIENCE_S {
+        if at.saturating_duration_since(rel.at) > RELOCATE_PATIENCE_DUR {
             self.relocate = None;
             return;
         }
@@ -4246,8 +4255,7 @@ impl Ribbon {
 
     #[inline]
     fn wake_origin(&self, row: u16, landing: u16, at: Instant) -> (u16, WalkPos) {
-        let fresh =
-            |c: &&Cohort| at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX;
+        let fresh = |c: &&Cohort| at.saturating_duration_since(c.alive_at) <= CHAIN_GAP_MAX_DUR;
         if let Some(c) = freshest(self.cohorts.iter().filter(fresh).filter(|c| c.row == row)) {
             return (c.anchor_col, c.origin_walk());
         }
@@ -4271,7 +4279,7 @@ impl Ribbon {
                 && !c.abandoned
                 && col + 1 >= c.col0
                 && col <= c.col1
-                && at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX
+                && at.saturating_duration_since(c.alive_at) <= CHAIN_GAP_MAX_DUR
         }) {
             return i;
         }
@@ -4333,7 +4341,7 @@ impl Ribbon {
                 && col + 1 >= c.col0
                 && col <= c.col1
                 && (!c.abandoned || (rejoin.is_none() && c.rejoinable))
-                && at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX
+                && at.saturating_duration_since(c.alive_at) <= CHAIN_GAP_MAX_DUR
                 && self.stands(c)
             {
                 if !c.abandoned {
@@ -4352,7 +4360,7 @@ impl Ribbon {
         if let Some(rv) = self.revive.filter(|rv| rv.covers(row, col)) {
             return self.mint_cohort(row, col, rv.origin.anchor_col, rv.origin.walk(), at, false);
         }
-        let fresh = |t: Instant| at.saturating_duration_since(t).as_secs_f32() <= CHAIN_GAP_MAX;
+        let fresh = |t: Instant| at.saturating_duration_since(t) <= CHAIN_GAP_MAX_DUR;
         let continued = freshest(self.cohorts.iter().filter(|c| fresh(c.alive_at)));
         let walk = continued
             .map(|c| {
@@ -4416,7 +4424,7 @@ impl Ribbon {
     }
 
     fn fold_wakes_into_band(&mut self, idx: usize, row: u16, col: u16, at: Instant) -> usize {
-        let fresh = |t: Instant| at.saturating_duration_since(t).as_secs_f32() <= CHAIN_GAP_MAX;
+        let fresh = |t: Instant| at.saturating_duration_since(t) <= CHAIN_GAP_MAX_DUR;
         let joined = self.cohorts[idx];
         let band_id = if joined.wake {
             let Some(j) = self.cohorts.iter().position(|c| {
@@ -4739,11 +4747,12 @@ impl Ribbon {
             .release_parts
             .binary_search_by_key(&(id, stamp), |part| (part.cohort, part.stamp))
             .ok()?;
-        let resident = self
-            .cells
-            .iter()
-            .filter(|cell| cell.cohort == id && cell.released_at == Some(stamp))
-            .count();
+        let mut resident = 0usize;
+        for cell in &self.cells {
+            if cell.cohort == id && cell.released_at == Some(stamp) {
+                resident += 1;
+            }
+        }
         (resident == self.release_parts[index].cells).then_some(index)
     }
 
@@ -4762,7 +4771,13 @@ impl Ribbon {
                 let Some(saved) = self.cohorts[k].release_clock else {
                     continue;
                 };
-                if self.cells.iter().filter(|c| c.cohort == id).count() != saved.cells {
+                let mut count = 0usize;
+                for c in &self.cells {
+                    if c.cohort == id {
+                        count += 1;
+                    }
+                }
+                if count != saved.cells {
                     continue;
                 }
                 let coh = &mut self.cohorts[k];
@@ -5020,7 +5035,7 @@ impl Ribbon {
         self.retire(ctx);
         if self
             .seam
-            .is_some_and(|s| ctx.now.saturating_duration_since(s.at).as_secs_f32() >= FLOW_TOTAL_S)
+            .is_some_and(|s| ctx.now.saturating_duration_since(s.at) >= FLOW_TOTAL_DUR)
         {
             self.seam = None;
         }
@@ -5201,16 +5216,22 @@ impl Ribbon {
             let resident = if coh.flow.is_none() {
                 cells.iter().any(|cell| cell.cohort == coh.id)
             } else {
-                let (resident, lo, hi) = cells.iter().filter(|cell| cell.cohort == coh.id).fold(
-                    (false, u16::MAX, 0u16),
-                    |(_, lo, hi), cell| {
-                        if cell.leaving() {
-                            (true, lo, hi)
-                        } else {
-                            (true, lo.min(cell.col), hi.max(cell.col))
+                let mut resident = false;
+                let mut lo = u16::MAX;
+                let mut hi = 0u16;
+                for cell in cells {
+                    if cell.cohort == coh.id {
+                        resident = true;
+                        if !cell.leaving() {
+                            if cell.col < lo {
+                                lo = cell.col;
+                            }
+                            if cell.col > hi {
+                                hi = cell.col;
+                            }
                         }
-                    },
-                );
+                    }
+                }
                 if lo <= hi
                     && let Some(edge) = &mut coh.retract_col
                 {
@@ -5313,7 +5334,7 @@ impl Ribbon {
     }
 
     #[inline]
-    fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
+    const fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
         let prof = Self::body_profile(ctx.cfg);
         let ch = ctx.geom.ch as f32;
         let body = ((prof.up_ch + DN_TOP_CH) * ch).ceil().max(1.0) + 2.0;
@@ -5326,7 +5347,12 @@ impl Ribbon {
         let cells = cells + 1;
         let per_slab = (cells as f32 * rows).max(1.0);
         let fit = (RIBBON_QUAD_BUDGET as f32 / per_slab).floor();
-        (fit.max(1.0) as usize).clamp(1, SLABS_PER_CELL)
+        let n = fit.max(1.0) as usize;
+        if n > SLABS_PER_CELL {
+            SLABS_PER_CELL
+        } else {
+            n
+        }
     }
 
     fn build_runs(
@@ -5948,14 +5974,17 @@ impl Ribbon {
         if at_caret && ccol == col0 && live(col0) && coh.is_some_and(|k| k.wake) {
             return (col0, true, true, 1);
         }
-        let newest = run
-            .iter()
-            .filter_map(|e| self.cells.get(e.2 as usize))
-            .filter(|c| !c.leaving())
-            .max_by(|a, b| a.born.cmp(&b.born))
-            .map(|c| c.col);
+        let mut newest: Option<(Instant, u16)> = None;
+        for e in run {
+            if let Some(c) = self.cells.get(e.2 as usize)
+                && !c.leaving()
+                && newest.is_none_or(|(b, _)| c.born >= b)
+            {
+                newest = Some((c.born, c.col));
+            }
+        }
         match newest {
-            Some(col) => (col, at_caret, true, -1),
+            Some((_, col)) => (col, at_caret, true, -1),
             None => (col1, at_caret, false, -1),
         }
     }
@@ -5976,13 +6005,16 @@ impl Ribbon {
         let coh = self.cohorts.iter().find(|c| c.id == cohort);
         let slabs = self.slabs_per_cell();
         let (head_col, at_caret, wet, stream_dir) = self.head_col(ctx, run, coh);
-        let born = run
-            .iter()
-            .filter_map(|e| self.cells.get(e.2 as usize))
-            .filter(|c| c.typing)
-            .map(|c| c.born)
-            .max()
-            .unwrap_or(ctx.now);
+        let mut born_max: Option<Instant> = None;
+        for e in run {
+            if let Some(c) = self.cells.get(e.2 as usize)
+                && c.typing
+                && born_max.is_none_or(|b| c.born > b)
+            {
+                born_max = Some(c.born);
+            }
+        }
+        let born = born_max.unwrap_or(ctx.now);
         let inv_span = 1.0 / f32::from(col1 - col0).max(1.0);
         let cell_at = |col: u16| -> Option<&Cell> {
             let i = usize::from(col.checked_sub(col0)?);
@@ -6243,7 +6275,18 @@ impl Ribbon {
             .iter()
             .find(|run| run.at_caret)
             .map(|run| run.row)
-            .filter(|&row| runs.iter().filter(|run| run.row == row).take(2).count() > 1);
+            .filter(|&row| {
+                let mut count = 0usize;
+                for r in &runs {
+                    if r.row == row {
+                        count += 1;
+                        if count > 1 {
+                            return true;
+                        }
+                    }
+                }
+                false
+            });
         let pane_bot = self.pane_bot(ctx, chf);
         let dn_floor = DN_FLOOR_CH * chf;
         let rail_reach_max = RAIL_REACH_MAX_CH * chf;
@@ -6276,11 +6319,12 @@ impl Ribbon {
             let fine = stride.div_ceil(RUN_END_FINE_SPLIT).max(1);
             let end_windows = RUN_END_FINE_CELLS
                 * (ctx.geom.cw as f32 / fine as f32 - self.slabs_per_cell() as f32);
-            let tail_rows = runs
-                .iter()
-                .enumerate()
-                .filter(|(i, run)| !runs[..*i].iter().any(|r| r.row == run.row))
-                .count();
+            let mut tail_rows = 0usize;
+            for (i, run) in runs.iter().enumerate() {
+                if !runs[..i].iter().any(|r| r.row == run.row) {
+                    tail_rows += 1;
+                }
+            }
             (self.plan.len() as f32 + tail_rows as f32 * end_windows.max(0.0))
                 * FEATHER_ROOM_ROWS
                 * chf
@@ -6450,20 +6494,21 @@ impl Ribbon {
         self.emit_hot_edge(ctx, frame);
         let bg = ctx.cfg.theme_bg;
         let mut last_ink: Option<(u32, u8, bool)> = None;
-        self.ink_quads = frame.under[ink_from..]
-            .iter()
-            .filter(|q| {
-                if let Some((prev_c, prev_a, res)) = last_ink
-                    && prev_c == q.color
-                    && prev_a == q.alpha
-                {
-                    return res;
+        let mut ink_quads = 0usize;
+        for q in &frame.under[ink_from..] {
+            let res = match last_ink {
+                Some((prev_c, prev_a, res)) if prev_c == q.color && prev_a == q.alpha => res,
+                _ => {
+                    let res = reads_as_ink(over_premul(bg, q.color, q.alpha));
+                    last_ink = Some((q.color, q.alpha, res));
+                    res
                 }
-                let res = reads_as_ink(over_premul(bg, q.color, q.alpha));
-                last_ink = Some((q.color, q.alpha, res));
-                res
-            })
-            .count();
+            };
+            if res {
+                ink_quads += 1;
+            }
+        }
+        self.ink_quads = ink_quads;
     }
 
     /// The reach `up` of a body boundary at window x `x` standing on
@@ -6590,12 +6635,16 @@ impl Ribbon {
         if !run.wet || !(run.at_caret || left_lit) {
             return;
         }
-        let Some(head_cell) = self
-            .cells
-            .iter()
-            .filter(|c| c.row == run.row && c.col == run.head_col)
-            .max_by(|a, b| a.born.cmp(&b.born))
-        else {
+        let mut head_cell: Option<&Cell> = None;
+        for c in &self.cells {
+            if c.row == run.row
+                && c.col == run.head_col
+                && head_cell.is_none_or(|prev| c.born >= prev.born)
+            {
+                head_cell = Some(c);
+            }
+        }
+        let Some(head_cell) = head_cell else {
             return;
         };
         let base_gain = Self::hot_edge_gain(ctx.cfg, head_cell.birth_disp, head_cell.typing);
@@ -6962,8 +7011,12 @@ impl Ribbon {
                     ember_left,
                     coh.map(|c| c.swoosh_total() - c.idle_s(now)),
                 ];
-                for left in ends.into_iter().flatten() {
-                    cad.tail((left - reduced_fade_s).max(0.0));
+                let mut k = 0;
+                while k < ends.len() {
+                    if let Some(left) = ends[k] {
+                        cad.tail((left - reduced_fade_s).max(0.0));
+                    }
+                    k += 1;
                 }
                 continue;
             }

@@ -537,7 +537,12 @@ impl CursorRainbow {
             self.pulse = (self.pulse + dt * PULSE_HZ).fract();
         }
         if painted {
-            self.spin = (self.spin + dt_spin * RIM_SPIN_TURNS_PER_S * paint).rem_euclid(2.0);
+            let next_spin = self.spin + dt_spin * RIM_SPIN_TURNS_PER_S * paint;
+            self.spin = if (0.0..2.0).contains(&next_spin) {
+                next_spin
+            } else {
+                next_spin.rem_euclid(2.0)
+            };
         }
         let spectrum_phase = family
             .map(|(phase, _)| phase)

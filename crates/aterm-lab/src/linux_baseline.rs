@@ -4474,7 +4474,7 @@ impl Baseline {
             return Err(not_run(format!("IsEnabled: {}", enabled.tail(2))));
         }
         let lane = up.lane_dir();
-        let env = guest::cargo_env(Arch::Aarch64, &format!("{lane}/target"), false);
+        let env = up.cargo_env(Arch::Aarch64, &format!("{lane}/target"), false);
         for (what, package, target) in [
             ("lane-bus", "aterm-dbus", ["--bin", "lane-bus"]),
             ("lane-wl", "aterm-wayland", ["--example", "lane-wl"]),
@@ -4655,7 +4655,7 @@ impl Baseline {
 pub fn cmd_baseline(args: &[String]) -> Res {
     let ask = parse_baseline(args)?;
     crate::stop::install();
-    let _lock = linux::LaneLock::take()?;
+    let _lock = linux::LaneLock::boot()?;
     let repo = linux::repo();
     let results = linux::state_dir()?.join(format!(
         "baseline-{}",
@@ -4693,7 +4693,7 @@ pub fn cmd_baseline(args: &[String]) -> Res {
                         continue;
                     }
                 }
-                let env = guest::cargo_env(arch, &format!("{lane}/target"), false);
+                let env = up.cargo_env(arch, &format!("{lane}/target"), false);
                 let oracle = if ask.wgpu_oracle {
                     " (wgpu oracle)"
                 } else {

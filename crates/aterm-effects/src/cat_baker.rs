@@ -454,13 +454,11 @@ pub(crate) fn paint_dark_masked_disc(
         let row_base = (y as u32 * tile_w) as usize;
         for x in x0..x1 {
             let i = (row_base + x as usize) * 4;
-            let covered_by_eye = mask_px.get(i + 3).is_some_and(|&a| a != 0);
-            let dark_eye = covered_by_eye
-                && tile
-                    .pixels()
-                    .get(i..i + 4)
-                    .is_some_and(|p| p[3] == 255 && p[0] < 96 && p[1] < 96 && p[2] < 96);
-            if !dark_eye {
+            if mask_px[i + 3] == 0 {
+                continue;
+            }
+            let px = tile.pixels();
+            if px[i + 3] != 255 || px[i] >= 96 || px[i + 1] >= 96 || px[i + 2] >= 96 {
                 continue;
             }
             let dx0 = x as f32 + 0.125 - cx;
@@ -1145,7 +1143,8 @@ struct OpenEyeReflection {
     pcy: f32,
     echo_x: f32,
     echo_y: f32,
-    eye_bounds: (f32, f32, f32, f32),
+    eye_w_norm: f32,
+    eye_h_norm: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -1208,17 +1207,20 @@ impl GlyphMeta {
                     let (pcx, pcy) = ((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5);
                     if let Some((_, eye_bounds)) = closest_eye_bounds(eye_bounds_slice, pcx, pcy) {
                         let (ex0, ey0, ex1, ey1) = eye_bounds;
+                        let eye_w_norm = ex1 - ex0;
+                        let eye_h_norm = ey1 - ey0;
                         let (ecx, ecy) = ((ex0 + ex1) * 0.5, (ey0 + ey1) * 0.5);
                         let echo_x = (pcx + 1.55 * (ecx - pcx))
-                            .clamp(ex0 + 0.25 * (ex1 - ex0), ex1 - 0.25 * (ex1 - ex0));
+                            .clamp(ex0 + 0.25 * eye_w_norm, ex1 - 0.25 * eye_w_norm);
                         let echo_y = (pcy + 1.55 * (ecy - pcy))
-                            .clamp(ey0 + 0.25 * (ey1 - ey0), ey1 - 0.25 * (ey1 - ey0));
+                            .clamp(ey0 + 0.25 * eye_h_norm, ey1 - 0.25 * eye_h_norm);
                         reflections[reflection_count] = Some(OpenEyeReflection {
                             pcx,
                             pcy,
                             echo_x,
                             echo_y,
-                            eye_bounds,
+                            eye_w_norm,
+                            eye_h_norm,
                         });
                         reflection_count += 1;
                     }
@@ -1252,6 +1254,7 @@ static GLYPH_META: [GlyphMeta; GLYPHS.len()] = {
     meta
 };
 
+#[cfg(test)]
 const fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransform) -> bool {
     let (ex0, ey0, ex1, ey1) = bounds;
     let eye_w = (ex1 - ex0) * xform.scale_x;
@@ -1296,8 +1299,12 @@ fn paint_open_eye_reflections(
         .iter()
         .flatten()
     {
-        let eye_bounds = reflection.eye_bounds;
-        if !open_eye_reflection_eligible(eye_bounds, xform) {
+        let eye_w = reflection.eye_w_norm * xform.scale_x;
+        let eye_h = reflection.eye_h_norm * xform.scale_y;
+        let minor = eye_w.min(eye_h);
+        if minor < OPEN_EYE_REFLECTION_MIN_PX
+            || (eye_w > 0.0 && eye_h < OPEN_EYE_SHALLOW_ASPECT * eye_w)
+        {
             continue;
         }
         if !painted_mask {
@@ -1308,10 +1315,6 @@ fn paint_open_eye_reflections(
         let Some(eye_mask) = mask_scratch.as_ref() else {
             continue;
         };
-        let (ex0, ey0, ex1, ey1) = eye_bounds;
-        let eye_w = (ex1 - ex0) * xform.scale_x;
-        let eye_h = (ey1 - ey0) * xform.scale_y;
-        let minor = eye_w.min(eye_h);
 
         let primary_r = (minor * OPEN_EYE_PRIMARY_FRAC).clamp(
             OPEN_EYE_PRIMARY_MIN_RADIUS_PX,

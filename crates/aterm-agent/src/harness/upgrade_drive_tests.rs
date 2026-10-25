@@ -10310,8 +10310,33 @@ fn restart_saved_as(
     login: Option<&str>,
     roster: &crate::harness::accounts::Roster,
 ) -> (Report, Option<St>) {
+    restart_saved_on(
+        name,
+        why,
+        launch,
+        prior,
+        hand,
+        login,
+        roster,
+        Answers::default(),
+    )
+}
+
+/// [`restart_saved_as`] with the tab's stand-in answering as `answers` says (the screen it draws).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn restart_saved_on(
+    name: &str,
+    why: &Restart,
+    launch: &str,
+    prior: Option<&St>,
+    hand: Option<&str>,
+    login: Option<&str>,
+    roster: &crate::harness::accounts::Roster,
+    answers: Answers,
+) -> (Report, Option<St>) {
     let dir = scratch(name);
-    let (sock, _asked) = instance_with(&dir, Answers::default());
+    let (sock, _asked) = instance_with(&dir, answers);
     let opts = Opts {
         sock: Some(sock),
         only_sid: Some(TAB.to_string()),
@@ -10588,6 +10613,78 @@ fn an_account_move_types_the_rosters_login_and_a_label_nobody_lists_is_refused()
     ] {
         let (r, saved) = restart_saved_as(name, &to("pool-a"), launch, None, None, None, roster);
         assert_eq!(r.step, "refused:account-not-listed", "{name}");
+        assert_eq!(saved, None, "{name}");
+    }
+}
+
+/// AN ACCOUNT MOVE'S RELAUNCH IS MADE OVER A SIGN-IN MENU drawn where the composer was, as the
+/// supervisor reads one (`TurnEndReading::sign_in_menu_drawn`: Claude Code's launch card and its
+/// lost login, no composer under them): nothing typed stands there to lose, and the move is the
+/// way off that login, so the relaunch the policy decides there is made, not refused as a
+/// changed screen. CONTROL: a memory restart over the same menu, and the account move over a
+/// screen with no composer and no lost login, wait (`wait:changed`) and save nothing.
+#[cfg(unix)]
+#[test]
+fn an_account_move_is_relaunched_over_a_sign_in_menu() {
+    use crate::supervise::policy::turn_end::{AccountAt, TurnEndReading};
+    let rows = |rows: &[&str]| rows.iter().map(|r| (*r).to_string()).collect::<Vec<_>>();
+    let card = [
+        " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{258c}   Claude Code v2.1.303",
+        "\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259b}\u{2598}  Sonnet 5.5 \u{b7} Claude API",
+        "  \u{2598}\u{2598} \u{259d}\u{259d}    /tmp/p",
+        "",
+    ];
+    let menu = rows(
+        &[
+            &card[..],
+            &["\u{23fa} Not logged in \u{b7} Please run /login", ""],
+        ]
+        .concat(),
+    );
+    let unwalled = rows(&card);
+    let claude = Some(aterm_phase::Program::Claude.name());
+    assert!(
+        TurnEndReading::sign_in_menu_drawn(claude, &menu, None),
+        "PRECONDITION: the supervisor reads a sign-in menu"
+    );
+    assert!(!TurnEndReading::sign_in_menu_drawn(claude, &unwalled, None));
+    let drawn = |rows: &[String]| {
+        let rows: Vec<String> = rows.iter().map(|r| format!("{r:?}")).collect();
+        Answers {
+            screen: format!(
+                r#"{{"rows":[{}],"cursor":{{"row":{},"col":0}},"seq":77,"human_ms":null,"first":0}}"#,
+                rows.join(","),
+                rows.len() - 1
+            ),
+            ..Answers::default()
+        }
+    };
+    let roster = two_accounts();
+    let launch = "claude-fable-5-1";
+    let moved = Restart::Account {
+        to: "work-2".to_string(),
+        at: AccountAt::Wall,
+    };
+    let (r, saved) = restart_saved_on(
+        "account-over-sign-in-menu",
+        &moved,
+        launch,
+        None,
+        None,
+        None,
+        &roster,
+        drawn(&menu),
+    );
+    let saved = saved.unwrap_or_else(|| panic!("the move was not made: {r:?}"));
+    assert_eq!(saved.cause, "account:work-2", "{r:?}");
+    assert_ne!(r.step, "wait:changed");
+    for (name, why, rows) in [
+        ("memory-over-sign-in-menu", &Restart::Memory, &menu),
+        ("account-over-no-composer", &moved, &unwalled),
+    ] {
+        let (r, saved) =
+            restart_saved_on(name, why, launch, None, None, None, &roster, drawn(rows));
+        assert_eq!(r.step, "wait:changed", "{name}");
         assert_eq!(saved, None, "{name}");
     }
 }
@@ -15607,10 +15704,12 @@ fn only_the_agents_own_words_are_pressed_where_the_host_takes_cap() {
     );
 }
 
-/// A pressed notice's turn budget covers its keys and its digits.
+/// A pressed notice's turn waits its keys' pace, TURN_WAIT's own allowance and a minute's hang
+/// detector for an echo of the agent's, however many digits it holds: a render budget per digit
+/// cut the notice part-way on a loaded machine and left aterm's words in the prompt.
 #[cfg(unix)]
 #[test]
-fn a_pressed_notices_turn_budget_covers_its_keys_and_its_digits() {
+fn a_pressed_notices_turn_waits_out_a_late_echo_as_a_hang() {
     const SETTLED: &str = "OK 0 id=2 submitted=1 status=settled";
     let v = |s: &str| Version::parse(s).expect("version");
     let held: Vec<upgrade::Held> = (0..5u32)
@@ -15672,8 +15771,9 @@ fn a_pressed_notices_turn_budget_covers_its_keys_and_its_digits() {
         .find_map(|w| w.strip_prefix("timeout="))
         .and_then(|t| t.parse().ok())
         .expect("a timeout");
+    let hang = u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis()).expect("ms");
     assert!(
-        timeout >= keys * 2 + digits * 150 + 10_000,
+        timeout >= keys * 2 + 10_000 + hang,
         "timeout={timeout} keys={keys} digits={digits}"
     );
 }

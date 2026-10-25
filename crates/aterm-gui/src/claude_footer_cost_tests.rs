@@ -399,17 +399,6 @@ fn a_frame_at_rest_with_fact_targets_costs_nothing() {
     }
 }
 
-fn context_screen(left: u8) -> Vec<String> {
-    let mut rows = screen(&AT_REST);
-    let top = rows
-        .iter()
-        .position(|r| r.starts_with('\u{2500}'))
-        .expect("the composer's top rule");
-    let text = format!("{left}% until auto-compact");
-    rows[top - 1] = format!("{}{text}", " ".repeat(usize::from(COLS) - 2 - text.len()));
-    rows
-}
-
 #[test]
 fn a_context_reading_at_rest_costs_nothing() {
     let mut app = App::headless_for_test();

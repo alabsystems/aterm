@@ -422,6 +422,8 @@ pub struct PaintReport {
     pub driven_ms: Option<(i64, i64)>,
     /// The scheduling band the subject ran in.
     pub band: super::instance::Band,
+    /// The scheduling band the bench (the driver and the sampler) ran in.
+    pub bench_band: super::instance::Band,
 }
 
 impl std::fmt::Display for PaintReport {
@@ -438,7 +440,7 @@ impl std::fmt::Display for PaintReport {
              cat_missing={} cat_final_run={} companion_frames={} companion_stack={} \
              fx_under_frames={} typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} sched_ticks={} \
              sched_late_max_us={} sched_window_ticks={} sched_window_late_max_us={} qos={:?} \
-             subject_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?}",
+             subject_band={} bench_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?}",
             r.scene.name(),
             r.style.name(),
             r.companion,
@@ -485,6 +487,7 @@ impl std::fmt::Display for PaintReport {
             self.sched.win_late_max_us,
             self.sched.qos,
             self.band,
+            self.bench_band,
             self.starvation.label(),
             self.starvation,
             self.shape,

@@ -1683,13 +1683,14 @@ impl MatrixRain {
         } else {
             15
         };
+        const _: () = assert!(rom::ROM_GLYPHS.is_power_of_two());
         RainCell {
             row: row as u16,
             x: col.wrapping_mul(cw),
             y: (row as u16).wrapping_mul(ch),
             w: cw,
             h: ch,
-            glyph: (g % rom::ROM_GLYPHS as u32) as u8,
+            glyph: (g & (rom::ROM_GLYPHS as u32 - 1)) as u8,
             tint: ctx.ramp[ramp_ix],
             alpha,
             flip_x,
@@ -1876,34 +1877,44 @@ impl MatrixRain {
         }
     }
 
-    fn clear_occ_span(&mut self, row: usize, start_col: usize, end_col: usize) {
+    const fn clear_occ_span(&mut self, row: usize, start_col: usize, end_col: usize) {
         if row >= self.occ_rows || start_col > end_col || start_col >= self.occ_cols {
             return;
         }
-        let end_col = end_col.min(self.occ_cols - 1);
+        let max_col = self.occ_cols - 1;
+        let end_col = if end_col < max_col { end_col } else { max_col };
         let first_bit = row * self.occ_cols + start_col;
         let last_bit = row * self.occ_cols + end_col;
-        let first_word = first_bit / 64;
-        let last_word = last_bit / 64;
-        let first_mask = u64::MAX << (first_bit % 64);
-        let last_mask = u64::MAX >> (63 - (last_bit % 64));
+        let first_word = first_bit >> 6;
+        let last_word = last_bit >> 6;
+        let first_mask = u64::MAX << (first_bit & 63);
+        let last_mask = u64::MAX >> (63 - (last_bit & 63));
+        let occ = self.occ.as_mut_slice();
         if first_word == last_word {
-            self.occ[first_word] &= !(first_mask & last_mask);
+            occ[first_word] &= !(first_mask & last_mask);
             return;
         }
-        self.occ[first_word] &= !first_mask;
-        self.occ[first_word + 1..last_word].fill(0);
-        self.occ[last_word] &= !last_mask;
+        occ[first_word] &= !first_mask;
+        let mut w = first_word + 1;
+        while w < last_word {
+            occ[w] = 0;
+            w += 1;
+        }
+        occ[last_word] &= !last_mask;
     }
 
-    fn clear_occ_neighborhood_span(&mut self, row: usize, start_col: usize, end_col: usize) {
+    const fn clear_occ_neighborhood_span(&mut self, row: usize, start_col: usize, end_col: usize) {
         if self.occ_rows == 0 || self.occ_cols == 0 {
             return;
         }
         let r0 = row.saturating_sub(1);
-        let r1 = row.saturating_add(1).min(self.occ_rows - 1);
-        for r in r0..=r1 {
+        let max_r = self.occ_rows - 1;
+        let r1_raw = row.saturating_add(1);
+        let r1 = if r1_raw < max_r { r1_raw } else { max_r };
+        let mut r = r0;
+        while r <= r1 {
             self.clear_occ_span(r, start_col, end_col);
+            r += 1;
         }
     }
 
@@ -1917,7 +1928,7 @@ impl MatrixRain {
             return false;
         }
         let bit = r * self.occ_cols + c;
-        (self.occ.as_slice()[bit / 64] >> (bit % 64)) & 1 == 1
+        (self.occ.as_slice()[bit >> 6] >> (bit & 63)) & 1 == 1
     }
 
     /// Tier-A + Tier-B mask: occupancy bit, cursor band, live selection.

@@ -146,12 +146,6 @@ pub const fn landing_ink(t: f32) -> u32 {
     lerp_rgb(lut[i], lut[j], x - i as f32)
 }
 
-#[inline]
-#[must_use]
-const fn landing_ink_light(t: f32, bg: u32) -> u32 {
-    paper_mark_ink(spectrum(walk_pace(clamp01(t))), bg)
-}
-
 const LANDING_STOP_LUT: [u32; SPECTRUM_STOPS] = {
     let mut lut = [0u32; SPECTRUM_STOPS];
     let mut i = 0;
@@ -1258,9 +1252,16 @@ impl Landing {
             ms = ms.max(b.ms).max(FLASH_COLOUR_MS);
         }
         if self.sparks > 0 {
-            let max_spark = self.spark[..usize::from(self.sparks)]
-                .iter()
-                .fold(0.0_f32, |acc, s| acc.max(s.life));
+            let mut max_spark = 0.0_f32;
+            let n = usize::from(self.sparks).min(SPARK_N_MAX);
+            let mut i = 0;
+            while i < n {
+                let life = self.spark[i].life;
+                if life > max_spark {
+                    max_spark = life;
+                }
+                i += 1;
+            }
             ms = ms.max(max_spark * SPARK_CULL_U);
         }
         self.pin.at + Duration::from_secs_f32(ms * (1.0 / 1000.0))
@@ -1812,6 +1813,8 @@ impl Meteors {
         };
 
         let mut chained: Option<usize> = None;
+        let chain_reach = CHAIN_CELLS * cw;
+        let chain_reach_sq = chain_reach * chain_reach;
         for (i, old) in self.live.iter_mut().enumerate() {
             if old.retired_at.is_some()
                 || old.chained
@@ -1822,7 +1825,8 @@ impl Meteors {
                 continue;
             }
             let (hx, hy) = head_at(old, at);
-            if (x0 - hx).hypot(y0 - hy) <= CHAIN_CELLS * cw {
+            let (dx, dy) = (x0 - hx, y0 - hy);
+            if dx * dx + dy * dy <= chain_reach_sq {
                 if at < old.arrival() {
                     let t_ms = (old.t_flight.as_secs_f32() * 1000.0).max(1.0);
                     let flown = enter_at_speed(ms_since(old.t0, at) / t_ms);
@@ -1857,18 +1861,20 @@ impl Meteors {
         }
 
         if self.live.len() >= METEOR_POOL {
-            let victim = self
-                .live
-                .iter()
-                .enumerate()
-                .filter(|(_, x)| x.retired_at.is_some())
-                .min_by_key(|(_, x)| x.end())
-                .map_or(0, |(i, _)| i);
-            self.live.remove(victim);
+            let mut victim: Option<(usize, Instant)> = None;
+            for (i, x) in self.live.iter().enumerate() {
+                if x.retired_at.is_some() {
+                    let end = x.end();
+                    if victim.is_none_or(|(_, best)| end < best) {
+                        victim = Some((i, end));
+                    }
+                }
+            }
+            self.live.remove(victim.map_or(0, |(i, _)| i));
         }
         self.live.push(m);
 
-        let mut unretired = self.live.iter().filter(|x| x.retired_at.is_none()).count();
+        let mut unretired = self.live();
         while unretired > FLIGHT_MAX_LIVE {
             let mut fallback = None;
             let mut landed = None;
@@ -2665,6 +2671,8 @@ fn build_stations(
     let rows_off = (m.y1 - m.y0).abs();
     let gain = arc_gain(m.cells);
     let lay_step = (1.0 / cw) * WALK_LAY_RATE * gain;
+    let mut last_paper_rgb: Option<((u32, u32), u32)> = None;
+    let mut last_warm_gain: Option<(u32, f32)> = None;
     for s in head_zone.chain(body).chain(tail_zone) {
         let end_ease = ends(s);
         if end_ease <= 0.0 {
@@ -2708,12 +2716,32 @@ fn build_stations(
                         continue;
                     }
                     let stop = spectrum(walk_pace(tri(m.t_land - (f.to_go + s) * lay_step)));
-                    let rgb = if rail > 0.0 && warm {
-                        paper_thread_ink(paper_train_ink(stop, ctx.cfg.theme_bg), fade)
-                    } else if rail > 0.0 {
-                        paper_caret_ink(stop, ctx.cfg.theme_bg)
-                    } else {
-                        paper_ink(stop, ctx.cfg.theme_fg, ctx.cfg.theme_bg, InkRole::OverText)
+                    let key = (
+                        stop,
+                        if rail > 0.0 && warm {
+                            fade.to_bits()
+                        } else {
+                            0
+                        },
+                    );
+                    let rgb = match last_paper_rgb {
+                        Some((prev, cached)) if prev == key => cached,
+                        _ => {
+                            let solved = if rail > 0.0 && warm {
+                                paper_thread_ink(paper_train_ink(stop, ctx.cfg.theme_bg), fade)
+                            } else if rail > 0.0 {
+                                paper_caret_ink(stop, ctx.cfg.theme_bg)
+                            } else {
+                                paper_ink(
+                                    stop,
+                                    ctx.cfg.theme_fg,
+                                    ctx.cfg.theme_bg,
+                                    InkRole::OverText,
+                                )
+                            };
+                            last_paper_rgb = Some((key, solved));
+                            solved
+                        }
                     };
                     (rgb, cov, half)
                 } else {
@@ -2739,7 +2767,15 @@ fn build_stations(
                     }
                     let stop = spectrum(walk_pace(tri(m.t_land - (f.to_go + s) * lay_step)));
                     let cov = if warm && clean && !square {
-                        (cov * dark_warm_gain(stop)).min(255.0)
+                        let g = match last_warm_gain {
+                            Some((prev, cached)) if prev == stop => cached,
+                            _ => {
+                                let g = dark_warm_gain(stop);
+                                last_warm_gain = Some((stop, g));
+                                g
+                            }
+                        };
+                        (cov * g).min(255.0)
                     } else {
                         cov
                     };
@@ -3115,10 +3151,26 @@ const fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
 
 #[inline]
 #[must_use]
-const fn landing_ink_at(l: &Landing, x: f32, inv_cw: f32, page: Option<u32>) -> u32 {
+const fn landing_ink_at(
+    l: &Landing,
+    x: f32,
+    inv_cw: f32,
+    page: Option<u32>,
+    memo: &mut Option<(u32, u32)>,
+) -> u32 {
     let t = l.field((x - l.x) * inv_cw);
     match page {
-        Some(bg) => landing_ink_light(t, bg),
+        Some(bg) => {
+            let raw = spectrum(walk_pace(clamp01(t)));
+            match *memo {
+                Some((prev_raw, solved)) if prev_raw == raw => solved,
+                _ => {
+                    let solved = paper_mark_ink(raw, bg);
+                    *memo = Some((raw, solved));
+                    solved
+                }
+            }
+        }
         None => landing_ink(t),
     }
 }
@@ -3135,6 +3187,7 @@ fn burst_lance(
     cov: f32,
     step: usize,
     light: bool,
+    memo: &mut Option<(u32, u32)>,
 ) {
     let (ox, oy) = (l.x, l.y);
     let span = tip - root;
@@ -3144,7 +3197,6 @@ fn burst_lance(
     let clip = ctx.geom.beam_clip();
     let inv_cw = 1.0 / (ctx.geom.cw as f32).max(1.0);
     let page = light.then_some(ctx.cfg.theme_bg);
-    let hue_at_x = |px: f32| landing_ink_at(l, px, inv_cw, page);
     let inv_span = 1.0 / span;
     let inv_stations = 1.0 / (BURST_SEC_STATIONS - 1) as f32;
     let light_ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
@@ -3177,7 +3229,8 @@ fn burst_lance(
                     side,
                     side,
                 );
-                push_ink_rect(frame.out, ctx.geom, rect, hue_at_x(px), a);
+                let stop = landing_ink_at(l, px, inv_cw, page, memo);
+                push_ink_rect(frame.out, ctx.geom, rect, stop, a);
                 s += stride;
             }
         } else {
@@ -3191,7 +3244,7 @@ fn burst_lance(
                 frame.beams.push(BeamVertex {
                     x: px,
                     y: oy + dir.1 * s,
-                    color: hue_at_x(px),
+                    color: landing_ink_at(l, px, inv_cw, page, memo),
                     cov: (cov * (1.0 - BURST_TIP_FADE * t)).clamp(0.0, 255.0) as u8,
                 });
             }
@@ -3211,6 +3264,7 @@ fn burst_jet(
     tip: f32,
     cov: f32,
     light: bool,
+    memo: &mut Option<(u32, u32)>,
 ) {
     let Some(sky) = l.sky else {
         return;
@@ -3272,7 +3326,7 @@ fn burst_jet(
                 continue;
             }
             let px = l.x + dx;
-            let stop = landing_ink_at(l, px, inv_cw, page);
+            let stop = landing_ink_at(l, px, inv_cw, page, memo);
             if light {
                 let rect = (
                     px.round() as i32 - half_w,
@@ -3315,6 +3369,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         return;
     }
     let light = !ctx.cfg.dark_theme;
+    let mut light_ink_memo: Option<(u32, u32)> = None;
     let cap = frame.out.len() + BURST_QUAD_CAP;
     let rise_px = (FAN_RISE_MAX_CH * ch - 1.0).max(1.0);
     let n = usize::from(b.n).min(BURST_N_MAX);
@@ -3339,7 +3394,17 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
             continue;
         }
         burst_lance(
-            frame, ctx, l, dir, root, tip, sec_thick, cov, core_step, light,
+            frame,
+            ctx,
+            l,
+            dir,
+            root,
+            tip,
+            sec_thick,
+            cov,
+            core_step,
+            light,
+            &mut light_ink_memo,
         );
     }
 
@@ -3366,6 +3431,7 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 tip,
                 cov * JET_COV_SHARE,
                 light,
+                &mut light_ink_memo,
             );
         }
     }

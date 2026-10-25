@@ -920,9 +920,9 @@ pub struct FxLayer {
     pub blend: FxBlend,
     /// Also feed the GPU bloom source (GPU-only; the CPU ignores it).
     pub bloom: bool,
-    /// The knock-out: on a [`FxBlend::Linear`] layer at [`FxSlot::Under`], every glyph
-    /// on one of its sprites is cut back to the page under it, so the letters read
-    /// against the page, not the body under them (`aterm_render::knock_rects`).
+    /// The knock-out: on a [`FxBlend::Linear`] layer at [`FxSlot::Under`], the body is cut
+    /// away round every glyph on one of its sprites, so the letters read against what lies
+    /// under the body, not the body (`aterm_render::Renderer::cut_knock_layers`).
     pub knock: bool,
     /// Where the content's origin lands, in `space`.
     pub offset: (i32, i32),

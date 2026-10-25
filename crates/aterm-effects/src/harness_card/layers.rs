@@ -794,18 +794,19 @@ fn star(
     if b.is_empty() {
         return;
     }
+    let cov_floor = cov.floor();
     let mut covs = [0.0f32; STAR_PAINTS];
     let mut ended = false;
     for (id, c) in covs.iter_mut().enumerate() {
         *c = match id {
-            0 => cov.floor(),
+            0 => cov_floor,
             1 if added => (cov * STAR_CORE_ADD).floor(),
-            1 => cov.floor(),
+            1 => cov_floor,
             id if id == STAR_PAINTS - 1 => {
                 if added {
                     (cov * STAR_GLINT_COV).floor()
                 } else {
-                    cov.floor()
+                    cov_floor
                 }
             }
             id => {

@@ -127,7 +127,7 @@ pub(crate) enum SlashRefusal {
     Parked,
     /// Another driver's lease stands on the session.
     Driver,
-    /// No composer to type into: a box, a picker, a scrolled view, the `!` shell box.
+    /// No composer to type into: a box, a picker, a scrolled or rewound view, the `!` shell box.
     Covered,
     /// A turn is live.
     Busy,
@@ -572,6 +572,9 @@ impl App {
     }
 
     fn slash_engine_look(&self, session: u64) -> Result<EngineRead, SlashRefusal> {
+        if self.pool.is_rewound(session) {
+            return Err(SlashRefusal::Covered);
+        }
         let entry = self.pool.get(session).ok_or(SlashRefusal::Covered)?;
         let human = entry.ctx.human_input.seq();
         let t = crate::term_lock(&entry.term);

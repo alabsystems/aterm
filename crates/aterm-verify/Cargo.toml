@@ -68,6 +68,11 @@ aterm-time = { workspace = true }
 # follows (so the main lane's children share its cache) and the toolchain lease
 # a run holds: one std-only source with atpkg.
 aterm-toolchain = { workspace = true }
+# The timed stages and the perf lanes start on a quiet machine: a claim in the
+# per-user capacity ledger, and the machine's reading on each stage's time line
+# (docs/DESIGN-adaptive-build-2026-10-24.md, QUIET-ADMIT). Workspace crate;
+# first-party dependencies only, aterm-toolchain and aterm-sysprobe among them.
+aterm-capacity = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on

@@ -229,10 +229,22 @@ impl Band {
     /// Give `pid`, a child of this process, aterm.app's band.
     #[must_use]
     pub fn take(pid: u32) -> Self {
+        Self::take_role(pid)
+    }
+
+    /// Give this process, the bench, aterm.app's band: the driver and the sampler then run in the
+    /// subject's band, not the role-less one every other session's builds run in.
+    #[must_use]
+    pub fn take_own() -> Self {
+        Self::take_role(0)
+    }
+
+    /// `setpriority(PRIO_DARWIN_ROLE, who, UI_FOCAL)`; `who` 0 is this process.
+    fn take_role(who: u32) -> Self {
         #[cfg(target_os = "macos")]
         {
             // SAFETY: `setpriority` takes no pointers.
-            if unsafe { libc::setpriority(PRIO_DARWIN_ROLE, pid, ROLE_UI_FOCAL) } == 0 {
+            if unsafe { libc::setpriority(PRIO_DARWIN_ROLE, who, ROLE_UI_FOCAL) } == 0 {
                 Self::Focal
             } else {
                 Self::Refused(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
@@ -240,7 +252,7 @@ impl Band {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = pid;
+            let _ = who;
             Self::NoRoles
         }
     }
@@ -570,6 +582,31 @@ mod tests {
                     Band::Refused(errno)
                 );
                 assert_eq!(after, 0, "a refused child keeps no role");
+            }
+            Band::NoRoles => panic!("macOS has darwin roles"),
+        }
+    }
+
+    /// The bench takes aterm.app's band itself ([`Band::take_own`], the first thing
+    /// [`super::super::paint_probe::measure`] does): this process then holds `UI_FOCAL`, or the
+    /// kernel's refusal is named with the process still in the role it had.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_bench_takes_the_app_band_itself() {
+        // SAFETY: `getpriority` takes no pointers.
+        let role = || unsafe { libc::getpriority(PRIO_DARWIN_ROLE, 0) };
+        let before = role();
+        let band = Band::take_own();
+        let after = role();
+        match band {
+            Band::Focal => assert_eq!(after, ROLE_UI_FOCAL, "the bench holds UI_FOCAL"),
+            Band::Refused(errno) => {
+                assert!(
+                    errno == libc::EPERM || errno == libc::ENOTSUP,
+                    "the kernel's refusal, not a wrong request: {}",
+                    Band::Refused(errno)
+                );
+                assert_eq!(after, before, "a refused bench keeps its role");
             }
             Band::NoRoles => panic!("macOS has darwin roles"),
         }

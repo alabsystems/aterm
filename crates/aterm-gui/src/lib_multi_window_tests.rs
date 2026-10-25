@@ -1613,6 +1613,40 @@ fn live_drag_resize_scopes_to_active_tab_then_flushes_on_switch() {
 }
 
 #[test]
+fn a_stale_mixed_tab_is_regridded_at_its_frame() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (session, _) =
+        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    let (_, route) = app.active_visible_frame_layout(wid).expect("frame layout");
+    assert_eq!(
+        route,
+        crate::VisibleContentRoute::Heterogeneous,
+        "PRECONDITION: a Settings pane beside a shell"
+    );
+    let size = |app: &App| {
+        let t = term_lock(&app.pool.get(session).expect("the shell").term);
+        (t.rows(), t.cols())
+    };
+    app.resize_panes(wid);
+    let laid_out = size(&app);
+    // The grid a live drag left it at while the tab was off screen.
+    term_lock(&app.pool.get(session).expect("the shell").term)
+        .resize(laid_out.0 - 3, laid_out.1 - 5);
+    app.windows.get_mut(&wid).expect("the window").panes_stale = true;
+    app.windows.get_mut(&wid).expect("the window").present = Some(crate::PresentTarget::Cpu {
+        surface: crate::present::CpuSurface::Scripted(Default::default()),
+    });
+    app.redraw_window(wid);
+    assert_eq!(
+        size(&app),
+        laid_out,
+        "the frame re-grids the mixed tab's shell"
+    );
+}
+
+#[test]
 fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     use aterm_models_misc::focus_modifier_cache_model;
     #[cfg(unix)]

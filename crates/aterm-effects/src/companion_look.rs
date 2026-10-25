@@ -380,12 +380,7 @@ impl LookPolicy {
             .tenure
             .observe(self.claim.identity.as_ref(), now)
             .map(|i| i.look);
-        let (look, rung) = companion_precedence(favourite, app, launch);
-        self.rung = rung;
-        if rung != CompanionRung::Program {
-            self.tenure.note_non_program_verdict();
-        }
-        look
+        self.apply_verdict(favourite, app, launch)
     }
 
     /// The companion verdict: `raw` (the focused pane's claim) through the tenure gate, then [`companion_precedence`].
@@ -398,9 +393,19 @@ impl LookPolicy {
         now: Instant,
     ) -> KittyLook {
         let app = self.tenure.observe(raw, now).map(|i| i.look);
+        self.apply_verdict(favourite, app, launch)
+    }
+
+    #[inline]
+    const fn apply_verdict(
+        &mut self,
+        favourite: Option<KittyLook>,
+        app: Option<KittyLook>,
+        launch: KittyLook,
+    ) -> KittyLook {
         let (look, rung) = companion_precedence(favourite, app, launch);
         self.rung = rung;
-        if rung != CompanionRung::Program {
+        if !matches!(rung, CompanionRung::Program) {
             self.tenure.note_non_program_verdict();
         }
         look

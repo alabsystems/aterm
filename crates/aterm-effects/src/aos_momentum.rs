@@ -108,8 +108,8 @@ mod watch_tests;
 #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
 use plan::{PlanView, SchedulePlan};
 pub use trace::{
-    EventCounts, MomentumTrace, ReadTrace, TRACE_FILE_DOMAIN, TRACE_FILE_MAGIC, TraceCheck,
-    TraceFault, TraceReplay,
+    EventCounts, MOMENTUM_TRACE_MAX_BYTES, MomentumTrace, ReadTrace, TRACE_FILE_DOMAIN,
+    TRACE_FILE_MAGIC, TraceCheck, TraceFault, TraceReplay,
 };
 pub use watch::{Segment, SegmentJudgement};
 
@@ -1567,7 +1567,7 @@ pub struct MomentumHost {
     mode: HostMode,
     /// Whether the light-page glow wears its vivid ink, as the host last set it; a glow is never hosted while it does.
     light_vivid: bool,
-    /// Retired segments a detach the host made by itself took from its recording, oldest first, at most [`RETIRED_CAP`].
+    /// Retired segments of the recordings the host dropped (a detach or a re-attach), oldest first, at most [`RETIRED_CAP`].
     left: Vec<Segment>,
     /// Why the host last stopped recording by itself, until [`Self::aos_take_detached`] takes it.
     detached: Option<&'static str>,
@@ -1852,12 +1852,16 @@ impl MomentumHost {
 
     /// Stops recording for the reason `why`, keeping the recording's retired segments for the watcher.
     fn detach_by_itself(&mut self, why: &'static str) {
+        self.aos_detach();
+        self.detached = Some(why);
+    }
+
+    /// Moves the recording's undrained retired segments into the ones kept for [`Self::aos_take_retired`], the oldest dropped past [`RETIRED_CAP`].
+    fn keep_retired(&mut self) {
         let retired = self.aos_take_retired();
         self.left = retired;
         let over = self.left.len().saturating_sub(RETIRED_CAP);
         self.left.drain(..over);
-        self.aos_detach();
-        self.detached = Some(why);
     }
 
     /// One printable key (`MomentumGlow::on_key`).
@@ -2124,7 +2128,9 @@ impl MomentumHost {
         }));
     }
 
+    /// The glow out of the host, any recording dropped with its undrained retired segments kept for the watcher.
     fn take_glow(&mut self) -> MomentumGlow {
+        self.keep_retired();
         match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
             HostMode::Direct(g) => g,
             HostMode::Hosted(mut h) => {
@@ -2225,7 +2231,7 @@ impl MomentumHost {
             }
     }
 
-    /// Takes the retired log epochs, oldest first, for the online watcher ([`Segment::judge`]), with those a detach the host made by itself kept.
+    /// Takes the retired log epochs, oldest first, for the online watcher ([`Segment::judge`]), with those of the recordings the host dropped kept.
     pub fn aos_take_retired(&mut self) -> Vec<Segment> {
         let mut out = core::mem::take(&mut self.left);
         if let HostMode::Hosted(h) = &mut self.mode {

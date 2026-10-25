@@ -105,8 +105,20 @@ fn slab_column(state: &SettingsViewState, width: f32, narrow: bool) -> Option<f3
     (room + 0.01 >= name_floor(state, SemanticRole::Text, StyleRef::Primary)).then_some(slab)
 }
 
-fn row_height() -> f32 {
+pub(in crate::native_settings) fn row_height() -> f32 {
     32.0_f32.max(28.0 * settings_text_scale())
+}
+
+/// THE CHOOSER'S LIST IS ONE GRID: a stop `height` tall stands on the whole rows
+/// ([`row_height`]) that hold it (a theme row one, a section's caption band one, the Community
+/// disclosure one, a NEEDS ATTENTION row or a name on two lines as many as they take; a footer
+/// row is a field's height, one row), so the room, cut to whole rows ([`whole_rows_height`]),
+/// holds whole stops to its edge on the last screen too. (A 40pt Community disclosure under
+/// 32pt rows left the list's end 24pt short of the room's edge at every size at 1×, and a 44pt
+/// caption band against 56pt rows 32pt to 48pt at 2×.)
+fn on_grid(height: f32) -> f32 {
+    let row = row_height();
+    ((height - 0.5) / row).ceil().max(1.0) * row
 }
 
 /// The strip's words' height.
@@ -817,6 +829,7 @@ fn footer_item(rows: Vec<(UiNode, f32)>, width: f32) -> ListItem {
         padding: Insets::all(0.0),
         gap: 0.0,
         head: Vec::new(),
+        repeat: Vec::new(),
         rows,
     })
 }
@@ -847,6 +860,7 @@ fn lead_item(node: UiNode, height: f32, after: f32, width: f32) -> ListItem {
             },
             gap: node.layout.gap,
             head: Vec::new(),
+            repeat: Vec::new(),
             rows,
         });
     }
@@ -1854,9 +1868,12 @@ fn chooser_panel(
         (height - 2.0 * PANEL_INSET - chooser_pinned_height(state, pins)).max(0.0)
     };
     let footer = footer_rows(state, inner, narrow);
-    let footer_pins = footer
-        .iter()
-        .all(|(_, height)| *height <= field_height() + 0.01);
+    // The pinned footer is its two rows of a field each ([`footer_height`]): one whose words or
+    // links wrap to more rows is listed.
+    let footer_pins = footer.len() == 2
+        && footer
+            .iter()
+            .all(|(_, height)| *height <= field_height() + 0.01);
     let tallest_row = chooser_rows_tallest(state, inner, narrow);
     let rows = tallest_row.max(footer.iter().map(|(_, height)| *height).fold(0.0, f32::max));
     let lead_items: Vec<ListItem> = lead
@@ -1932,7 +1949,7 @@ fn chooser_panel(
             .page_rows
             .set(((room / row_height()).floor() as usize).max(1));
     }
-    let captions_from = caption_height() + SECTION_ABOVE + tallest_row.max(row_height());
+    let captions_from = on_grid(caption_height() + SECTION_ABOVE) + tallest_row.max(row_height());
     let captions = room + 0.5 >= captions_from;
     let led = lead_at(&lead);
     let items_at = |width: f32, painted: bool| {
@@ -2029,7 +2046,15 @@ fn sheet_list_room(height: f32) -> f32 {
     (height - 2.0 * PANEL_INSET - field_height() - PANEL_GAP).max(0.0)
 }
 
-/// The chooser's blocks as list items.
+/// The chooser's blocks as list items: each captioned section (NEEDS ATTENTION, ATERM, BUILT IN,
+/// YOURS, COMMUNITY) one card listed row by row under its caption ([`scroll::SplitCard`]), so a
+/// screen that starts inside a section repeats its caption over its first row there (with
+/// `captions`: where the list's room holds a caption over a row). The open Community section's
+/// head is its disclosure, still one control, and a screen that starts past its first row repeats
+/// COMMUNITY in its place, so its rows are never under no name (Tokyo Night Day read as a built-in
+/// beside Tokyo Night) nor under the disclosure and a caption saying the same word. Every other
+/// block (the signature rows leading the list, the closed disclosure, the footer, an empty
+/// filter's line) is a stop of its own.
 pub(in crate::native_settings) fn section_items(
     blocks: Vec<(UiNode, f32, Option<String>)>,
     row_width: f32,
@@ -2040,10 +2065,18 @@ pub(in crate::native_settings) fn section_items(
     let mut blocks = blocks.into_iter().peekable();
     while let Some((mut node, height, _)) = blocks.next() {
         node.layout.width = Length::Fixed(row_width);
+        let disclosure = matches!(node.key.as_str(), PACK | "settings/showcase/pack-row");
         let Some(word) = captions
             .then_some(&node)
-            .and_then(|node| node.key.as_str().strip_prefix(SECTION_PREFIX))
-            .and_then(|rest| rest.strip_suffix("/inset"))
+            .and_then(|node| {
+                if disclosure {
+                    return Some(Section::Community.word());
+                }
+                node.key
+                    .as_str()
+                    .strip_prefix(SECTION_PREFIX)?
+                    .strip_suffix("/inset")
+            })
             .map(str::to_string)
         else {
             items.push(ListItem::Card(Box::new(node), height));
@@ -2062,12 +2095,21 @@ pub(in crate::native_settings) fn section_items(
             items.push(ListItem::Card(Box::new(node), height));
             continue;
         }
+        let repeat = if disclosure {
+            let caption = Section::Community.caption().unwrap_or_default();
+            let (mut caption, _, _) = section_band(Section::Community, caption, height);
+            caption.layout.width = Length::Fixed(row_width);
+            vec![(caption, height)]
+        } else {
+            Vec::new()
+        };
         items.push(ListItem::Split(scroll::SplitCard {
             key: format!("settings/showcase/section-rows/{word}"),
             spec: GroupSpec::unlabeled(SemanticRole::Group),
             padding: Insets::all(0.0),
             gap: 0.0,
             head: vec![(node, height)],
+            repeat,
             rows,
         }));
     }
@@ -2399,7 +2441,11 @@ fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNo
     let beside = (width - TEXT_INSET - switch_width - 6.0).max(0.0);
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Plain);
     let measure = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
-    let over = !pieces_fit(visible, beside, &measure);
+    // On the list's grid ([`on_grid`]): the words beside the switch in one row where they fit
+    // one line there, else over it in a row of their own (wrapped beside it, a two-line label
+    // made a 72pt row under 56pt rows at 2× text, and the list's end fell 40pt short of its
+    // room's edge).
+    let over = measure(visible) > beside + crate::native_ui::TEXT_FIT_SLACK;
     let (label, label_height) = wrapped_words_node(
         "settings/showcase/footer/follow-label",
         visible,
@@ -2411,27 +2457,49 @@ fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNo
         },
         footer_line_height(),
     );
-    let (follow_height, layout) = if over {
-        (label_height + 4.0 + height, Layout::column().gap(4.0))
-    } else {
-        (height.max(label_height), Layout::row().gap(6.0))
-    };
-    let label = if !over && label_height < height {
-        label.layout(Layout::default().width(Length::Fill).height(Length::Fill))
-    } else {
-        label
-    };
-    let follow = UiNode::new(
-        "settings/showcase/footer/follow",
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(layout.height(Length::Fixed(follow_height)).padding(Insets {
+    let inset = Insets {
         top: 0.0,
         right: 0.0,
         bottom: 0.0,
         left: TEXT_INSET,
-    }))
-    .children(vec![label.paint_only(), switch]);
+    };
+    let group = || UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group));
+    let mut rows = Vec::new();
+    if over {
+        let band = on_grid(label_height);
+        rows.push((
+            UiNode::new("settings/showcase/footer/follow-words", group())
+                .layout(
+                    Layout::column()
+                        .height(Length::Fixed(band))
+                        .padding(Insets {
+                            top: band - label_height,
+                            ..inset
+                        }),
+                )
+                .children(vec![label.paint_only()]),
+            band,
+        ));
+        rows.push((
+            UiNode::new("settings/showcase/footer/follow", group())
+                .layout(Layout::row().height(Length::Fixed(height)).padding(inset))
+                .children(vec![switch]),
+            height,
+        ));
+    } else {
+        let label = label.layout(Layout::default().width(Length::Fill).height(Length::Fill));
+        rows.push((
+            UiNode::new("settings/showcase/footer/follow", group())
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(height))
+                        .gap(6.0)
+                        .padding(inset),
+                )
+                .children(vec![label.paint_only(), switch]),
+            height,
+        ));
+    }
     let folder_visual = if narrow { "Folder" } else { "Themes folder" };
     let import_visual = if narrow { "Import" } else { "Import\u{2026}" };
     let (links, links_height) = button_lines(
@@ -2473,7 +2541,22 @@ fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNo
             gap: 4.0,
         },
     );
-    vec![(follow, follow_height), (links, links_height)]
+    // Links that wrap stand a row a line, each on the grid as one line of them does.
+    if links_height > height + 0.01 && !links.children.is_empty() {
+        rows.extend(links.children.into_iter().map(|line| {
+            let tall = match line.layout.height {
+                Length::Fixed(tall) => tall,
+                _ => height,
+            };
+            (
+                line.layout(Layout::row().height(Length::Fixed(tall)).gap(4.0)),
+                tall,
+            )
+        }));
+    } else {
+        rows.push((links, links_height));
+    }
+    rows
 }
 
 fn footer_line_height() -> f32 {
@@ -2689,7 +2772,8 @@ fn build_list_blocks(
             width - TEXT_INSET,
             height,
         );
-        blocks.push((inset(key, words, 0.0, height), height, None));
+        let band = on_grid(height);
+        blocks.push((inset(key, words, 0.0, band), band, None));
     }
     blocks
 }
@@ -2699,8 +2783,15 @@ fn section_heading(
     caption: &str,
     after_rows: bool,
 ) -> (UiNode, f32, Option<String>) {
-    let above = if after_rows { SECTION_ABOVE } else { 0.0 };
-    let height = caption_height() + above;
+    // A band of whole rows ([`on_grid`]), its words at its foot, at least [`SECTION_ABOVE`]
+    // over them where it follows a row.
+    let height = on_grid(caption_height() + if after_rows { SECTION_ABOVE } else { 0.0 });
+    section_band(section, caption, height)
+}
+
+/// A section's caption in a band `height` tall, its words at its foot.
+fn section_band(section: Section, caption: &str, height: f32) -> (UiNode, f32, Option<String>) {
+    let above = (height - caption_height()).max(0.0);
     let key = format!("settings/showcase/section/{}", section.word());
     let words = line(
         key.clone(),
@@ -2761,7 +2852,13 @@ fn pack_row(
         crate::native_ui::disclosure_label_room(width),
         &crate::native_ui::native_button_label_width,
     );
-    let height = crate::native_ui::native_button_height_for_lines(lines.len(), row_height());
+    // It heads its section as a caption does: a band of whole rows ([`on_grid`]), the control
+    // all of it but the [`SECTION_ABOVE`] over it where it follows a row, as tall as its words
+    // take at least (they wrap to the room its chevron leaves, never cut: "Com…" at 2× text in
+    // a 22-column window).
+    let least = crate::native_ui::native_button_height_for_lines(lines.len(), caption_height());
+    let band = on_grid(least + above);
+    let height = band - above;
     let words = lines.join("\n");
     let mut control = control;
     control.spec.visual_label = Some(words);
@@ -2777,7 +2874,7 @@ fn pack_row(
         )
         .layout(
             Layout::column()
-                .height(Length::Fixed(height + above))
+                .height(Length::Fixed(band))
                 .padding(Insets {
                     top: above,
                     right: 0.0,
@@ -2787,7 +2884,7 @@ fn pack_row(
         )
         .children(vec![node]);
     }
-    (node, height + above, None)
+    (node, band, None)
 }
 
 /// A theme's row and its height; `painted`, with what it paints (its name, tags, slab and file
@@ -2881,7 +2978,9 @@ fn row_node(
     let tall = if one_line {
         height
     } else {
-        height.max(lines_height + 2.0 * ROW_NAME_PAD)
+        // A name on more lines than one makes the row as tall as they take, on the list's
+        // grid ([`on_grid`]), its lines and its slab centred in it.
+        on_grid(height.max(lines_height + 2.0 * ROW_NAME_PAD))
     };
     if !painted {
         return (row(tall), tall);
@@ -2911,7 +3010,7 @@ fn row_node(
     if yours {
         trailing.push(spacer(&format!("{key}/icons"), icons_width));
     }
-    let slab_pad = ((height - SLAB_HEIGHT) / 2.0).max(0.0);
+    let slab_pad = ((tall - SLAB_HEIGHT) / 2.0).max(0.0);
     trailing.extend(slab.map(|slab_width| {
         UiNode::new(
             format!("{key}/slab-frame"),
@@ -2972,7 +3071,7 @@ fn row_node(
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .padding(Insets {
-                    top: ROW_NAME_PAD,
+                    top: ((tall - lines_height) / 2.0).max(ROW_NAME_PAD),
                     ..Insets::default()
                 }),
         )
@@ -3105,8 +3204,14 @@ fn file_actions(
     .children(children)
 }
 
-fn attention_row_height() -> f32 {
+/// A NEEDS ATTENTION row's least height: two lines inside a 4pt margin over and under.
+fn attention_row_least() -> f32 {
     44.0_f32.max(40.0 * settings_text_scale())
+}
+
+/// A NEEDS ATTENTION row's height: the whole rows that hold its least ([`on_grid`]).
+fn attention_row_height() -> f32 {
+    on_grid(attention_row_least())
 }
 
 fn attention_row(state: &SettingsViewState, row: &AttentionRow, width: f32) -> UiNode {
@@ -3114,7 +3219,9 @@ fn attention_row(state: &SettingsViewState, row: &AttentionRow, width: f32) -> U
     let open_key = format!("{key}/{CARD_OPEN}");
     let height = attention_row_height();
     let pad = ((height - ICON_BUTTON) / 2.0).max(0.0);
-    let line_height = ((height - 8.0) / 2.0).max(0.0);
+    // Its two lines centred in the whole rows that hold them.
+    let line_height = ((attention_row_least() - 8.0) / 2.0).max(0.0);
+    let margin = ((height - 2.0 * line_height) / 2.0).max(0.0);
     let text_width = (width - TEXT_INSET - 6.0 - ICON_BUTTON - 8.0).max(0.0);
     let text_line = |suffix: &str, text: &str, role: SemanticRole, style: StyleRef| {
         UiNode::new(
@@ -3141,9 +3248,9 @@ fn attention_row(state: &SettingsViewState, row: &AttentionRow, width: f32) -> U
             .width(Length::Fixed(text_width))
             .height(Length::Fill)
             .padding(Insets {
-                top: 4.0,
+                top: margin,
                 right: 0.0,
-                bottom: 4.0,
+                bottom: margin,
                 left: 0.0,
             }),
     )

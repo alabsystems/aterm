@@ -71,6 +71,8 @@ impl CursorGlow {
     /// Re-solve the [`ForgeBand`] when the page under the caret changed (a theme switch, DECSCNM): one bisection per new ground, nothing per frame.
     #[inline]
     pub(super) const fn refresh_forge_band(&mut self, cfg: &GlowConfig) {
+        const REF_DARK_BAND: ForgeBand = ForgeBand::solve(CursorGlow::STREAK_REF_GROUND, true);
+        const REF_LIGHT_BAND: ForgeBand = ForgeBand::solve(0x00FF_FFFF, false);
         let ground = if cfg.theme_bg & 0xFF00_0000 != 0 {
             // No resolved page (`COLOR_UNSET`): the reference ground of the
             // ground's side.
@@ -87,7 +89,13 @@ impl CursorGlow {
             None => true,
         };
         if needs_solve {
-            self.forge_band = Some(ForgeBand::solve(ground, cfg.dark_theme));
+            self.forge_band = Some(if ground == Self::STREAK_REF_GROUND && cfg.dark_theme {
+                REF_DARK_BAND
+            } else if ground == 0x00FF_FFFF && !cfg.dark_theme {
+                REF_LIGHT_BAND
+            } else {
+                ForgeBand::solve(ground, cfg.dark_theme)
+            });
         }
     }
 
@@ -213,24 +221,25 @@ impl ForgeBand {
 
     /// Solve the band for `ground`, preferring the side `dark` names.
     pub(super) const fn solve(ground: u32, dark: bool) -> Self {
+        const LUM_TOP: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::TOP));
+        const LUM_COLD: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::COLD));
+        const LUM_ZERO: f32 = crate::color_math::relative_luminance(fire_ramp(0.0));
+        const LUM_HOT: f32 = crate::color_math::relative_luminance(fire_ramp(ForgeBand::HOT));
         #[inline]
-        const fn ratio(lum: f32, p: f32) -> f32 {
-            let l = crate::color_math::relative_luminance(fire_ramp(p));
+        const fn ratio_l(lum: f32, l: f32) -> f32 {
             (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
         }
         #[inline]
-        const fn lit_rgb(lum: f32, rgb: u32) -> bool {
-            let l = crate::color_math::relative_luminance(rgb);
+        const fn lit_l(lum: f32, l: f32) -> bool {
             l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST
         }
         #[inline]
-        const fn deep_ok_rgb(lum: f32, rgb: u32) -> bool {
-            let l = crate::color_math::relative_luminance(rgb);
+        const fn deep_ok_l(lum: f32, l: f32) -> bool {
             l < lum && (lum + 0.05) / (l + 0.05) >= ForgeBand::PAGE_CONTRAST
         }
         let lum = crate::color_math::relative_luminance(ground);
-        let bright = if lit_rgb(lum, fire_ramp(Self::TOP)) {
-            let lo = if lit_rgb(lum, fire_ramp(Self::COLD)) {
+        let bright = if lit_l(lum, LUM_TOP) {
+            let lo = if lit_l(lum, LUM_COLD) {
                 Self::COLD
             } else {
                 bisect_edge(lum, Self::COLD, Self::TOP, true).1
@@ -239,8 +248,8 @@ impl ForgeBand {
         } else {
             None
         };
-        let deep = if deep_ok_rgb(lum, fire_ramp(0.0)) {
-            let hi = if deep_ok_rgb(lum, fire_ramp(Self::HOT)) {
+        let deep = if deep_ok_l(lum, LUM_ZERO) {
+            let hi = if deep_ok_l(lum, LUM_HOT) {
                 Self::HOT
             } else {
                 bisect_edge(lum, 0.0, Self::HOT, false).0
@@ -270,7 +279,7 @@ impl ForgeBand {
             Some(pair) => pair,
             None => {
                 // Neither side reads: the ramp end that comes closest.
-                if ratio(lum, Self::TOP) >= ratio(lum, 0.0) {
+                if ratio_l(lum, LUM_TOP) >= ratio_l(lum, LUM_ZERO) {
                     (true, (Self::TOP, Self::TOP))
                 } else {
                     (false, (0.0, 0.0))
@@ -299,6 +308,7 @@ impl ForgeBand {
 /// fails at `hi`.
 #[inline]
 const fn bisect_edge(lum: f32, mut lo: f32, mut hi: f32, want_not_lit: bool) -> (f32, f32) {
+    let table = crate::color_math::relative_luminance_table();
     let (mut lo_rgb, mut hi_rgb) = (fire_ramp(lo), fire_ramp(hi));
     let mut i = 0;
     while i < 16 {
@@ -309,7 +319,7 @@ const fn bisect_edge(lum: f32, mut lo: f32, mut hi: f32, want_not_lit: bool) -> 
         } else if mid_rgb == hi_rgb {
             hi = mid;
         } else {
-            let l = crate::color_math::relative_luminance(mid_rgb);
+            let l = crate::color_math::relative_luminance_with(table, mid_rgb);
             let holds = if want_not_lit {
                 !(l > lum && (l + 0.05) / (lum + 0.05) >= ForgeBand::PAGE_CONTRAST)
             } else {

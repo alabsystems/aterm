@@ -983,10 +983,16 @@ pub fn boot_clock_now() -> Option<BootClock> {
 }
 
 /// Monotonic milliseconds since boot, counting through sleep.
+#[must_use]
+pub fn continuous_ms() -> Option<u64> {
+    continuous_ns().map(|ns| ns / 1_000_000)
+}
+
+/// Monotonic nanoseconds since boot, counting through sleep.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn continuous_ms() -> Option<u64> {
+pub fn continuous_ns() -> Option<u64> {
     #[repr(C)]
     struct Timebase {
         numer: u32,
@@ -1004,14 +1010,14 @@ pub fn continuous_ms() -> Option<u64> {
     // SAFETY: a side-effect-free getter with no arguments.
     let ticks = unsafe { mach_continuous_time() };
     let ns = u128::from(ticks) * u128::from(base.numer) / u128::from(base.denom);
-    u64::try_from(ns / 1_000_000).ok()
+    u64::try_from(ns).ok()
 }
 
 /// See the Apple twin.
 #[cfg(not(target_vendor = "apple"))]
 #[must_use]
-pub fn continuous_ms() -> Option<u64> {
-    boot_clock_now().map(|BootClock(ns)| ns / 1_000_000)
+pub fn continuous_ns() -> Option<u64> {
+    boot_clock_now().map(|BootClock(ns)| ns)
 }
 
 /// How long this machine has slept since it booted.
@@ -3385,8 +3391,21 @@ mod argv_tests {
     )
 ))]
 mod sleep_probe_tests {
-    use super::{asleep_since_boot, continuous_ms, last_sleep_ms};
-    use std::time::Duration;
+    use super::{asleep_since_boot, continuous_ms, continuous_ns, last_sleep_ms};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_continuous_clock_counts_at_least_the_awake_time_between_two_reads() {
+        let first = continuous_ns().expect("wired on this platform");
+        let awake = Instant::now();
+        while awake.elapsed() < Duration::from_millis(2) {}
+        let between = awake.elapsed();
+        let next = continuous_ns().expect("wired on this platform");
+        let counted = Duration::from_nanos(next.checked_sub(first).expect("it never runs back"));
+        assert!(counted >= between, "{counted:?} {between:?}");
+        let ms = continuous_ms().expect("wired on this platform");
+        assert!(ms >= next / 1_000_000, "{ms} {next}");
+    }
 
     #[test]
     fn the_sleep_since_boot_reads_and_never_runs_back() {
