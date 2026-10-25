@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Source selection and `security-posture` control verb for the Security page's macOS access block.
+//! Source selection and `security-posture` control verb for the Security page's macOS access
+//! posture: its MACOS ACCESS block, DEVELOPER TOOLS card and debugger row.
 
 use crate::native_settings::MacosAccess;
 
@@ -11,7 +12,8 @@ const INJECTION_ENABLED: bool = cfg!(any(debug_assertions, feature = "dev-seams"
 /// The usage line every junk form answers with.
 const USAGE: &str = "usage: security-posture [list|off|<name>]";
 
-/// The posture the Security page draws its MACOS ACCESS block from.
+/// The posture the Security page draws its MACOS ACCESS block, DEVELOPER TOOLS card and debugger
+/// row from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SecurityPostureSource {
     /// The windowed macOS host's probes ([`crate::App::publish_security_page`]).
@@ -183,8 +185,10 @@ mod tests {
     /// headless instance publishes no posture, so the MACOS ACCESS block had never
     /// been seen on a running aterm. Each catalog posture staged through the verb's
     /// main-thread half draws the block with its actions on Security, runs no
-    /// probe, and `off` takes it away. NEGATIVE CONTROLS: before any stage the block
-    /// is absent, and a windowed instance refuses the stage.
+    /// probe, and `off` takes it away. The DEVELOPER TOOLS card is drawn too, and says
+    /// the checks are switched off only under the postures that switch them off (every
+    /// posture once said so beside a checked block). NEGATIVE CONTROLS: before any stage
+    /// the block is absent, and a windowed instance refuses the stage.
     #[test]
     fn a_staged_posture_draws_the_security_block_on_a_headless_instance() {
         use crate::app_control::InspectRequest;
@@ -239,6 +243,20 @@ mod tests {
                 text.iter()
                     .any(|line| line.contains("key=\"settings/macos-access/heading\"")),
                 "{name}: the block's heading is drawn"
+            );
+            assert!(
+                text.iter()
+                    .any(|line| line.contains("key=\"settings/macos-access/devtools/state\"")),
+                "{name}: the DEVELOPER TOOLS card is drawn"
+            );
+            let says_off = text.iter().any(|line| {
+                line.contains("key=\"settings/macos-access/devtools/")
+                    && line.contains("switched off in aterm.toml")
+            });
+            assert_eq!(
+                says_off,
+                crate::security_fixtures::CHECKS_OFF.contains(name),
+                "{name}: the DEVELOPER TOOLS card says the checks are off only where they are"
             );
         }
         assert_eq!(

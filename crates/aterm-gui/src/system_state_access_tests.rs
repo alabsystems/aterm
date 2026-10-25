@@ -3128,6 +3128,817 @@ fn a_new_access_revision_in_this_process_brings_the_developer_tools_page_back() 
     assert_eq!(test_arms::opens(), first + 2, "the new approval asks again");
 }
 
+/// The window's own Full Disk Access page comes up once per revision even after a person's press
+/// while no revision stood (after Stop, during a decision hold), which used to rewrite the page's
+/// marker under the running version: the press keeps the revision's step, so a later launch under
+/// that revision (Set up keeps it) brings nothing, and a new revision still asks.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_press_while_no_revision_stands_keeps_the_full_disk_access_page_shown_for_its_revision() {
+    use crate::consent_card::PendingDecision;
+    use crate::devtools_helper::test_arms;
+    thread_local! {
+        static MARK: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    let fda_marked = test_arms::fda_marking(
+        || MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1))),
+        |word| MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned())),
+    );
+    let on_record = StepsReach {
+        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        frontmost: front,
+        ..stepping()
+    };
+    let launch = |revision: u64| {
+        let mut app = new_mac(test_arms::opening(), fda_marked);
+        app.access_steps.set_reach(on_record);
+        approve(&mut app, revision);
+        assert!(app.consent_card.begin_deciding(Instant::now()));
+        app.decide_macos_access_card(PendingDecision::launch(None));
+        app
+    };
+    let mark = || MARK.with(|mark| mark.borrow().clone());
+    set_front(true);
+    let opens = || test_arms::fda_counts().0;
+    let first = opens();
+    let mut t = Instant::now();
+
+    let mut app = launch(1);
+    parks(&mut app, &mut t, 2);
+    assert_eq!(opens(), first + 1, "revision 1's page");
+    let shown = mark().expect("its marker");
+    // Stop: no revision stands, and the person opens the page from its row.
+    app.observe_initial_setup_permissions(None);
+    assert!(app.open_access_from_system_state(Access::FullDiskAccess, true));
+    assert_eq!(opens(), first + 2, "the press opens the page");
+    assert_eq!(mark(), Some(shown), "the press keeps revision 1's step");
+    drop(app);
+
+    let mut app = launch(1);
+    parks(&mut app, &mut t, 4);
+    assert_eq!(opens(), first + 2, "revision 1 brought its page up already");
+    drop(app);
+
+    let mut app = launch(2);
+    parks(&mut app, &mut t, 4);
+    assert_eq!(opens(), first + 3, "the new approval asks again");
+}
+
+/// A Developer Tools reading that finds aterm missing asks for the window's own page only while
+/// the record holds no `handed` for the revision: `aterm doctor --fix` writes the one-line
+/// marker under the running version, so the marker alone would ask again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_developer_tools_reading_asks_for_the_page_only_while_the_record_holds_no_handed() {
+    use crate::consent_state::SlotKind;
+    use crate::devtools_helper::{Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    use aterm_containment::{DevToolProbe, DevToolProbeLabel, DevToolState, ProbeGate};
+    fn not_on(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+        DevToolProbe {
+            state: DevToolState::Unlisted,
+            label: DevToolProbeLabel::Observed,
+            requests: Some(1),
+            not_allowed: Some(1),
+            answered_at_ms: Some(1),
+        }
+    }
+    fn subject() -> Option<&'static str> {
+        Some(test_arms::SUBJECT)
+    }
+    let doctors = test_arms::marked(|| Some((aterm_types::version::app_version().to_owned(), 1)));
+    for (handed, asks) in [(false, true), (true, false)] {
+        set_front(true);
+        let mut app = new_mac(doctors, test_arms::fda_opening());
+        let handed_arm: fn(u64, Access) -> bool = if handed {
+            |revision, access| (revision, access) == (1, Access::DeveloperTools)
+        } else {
+            |_, _| false
+        };
+        app.access_steps.set_reach(StepsReach {
+            handed: handed_arm,
+            ..app.access_steps.reach
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut consent = reread(FdaState::Granted);
+        consent.set_devtools_arms_for_test(not_on, subject);
+        consent.set_slot_wake(std::sync::Arc::new(move |kind: SlotKind| {
+            if kind == SlotKind::Devtools {
+                let _ = tx.send(());
+            }
+        }));
+        app.consent = consent;
+        focus(&mut app, true);
+        app.set_privacy_for_test(switches(None));
+        app.read_devtools_list(Instant::now());
+        rx.recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("handed {handed}: the launch read runs"));
+        app.on_devtools_probe_ready();
+        assert_eq!(
+            app.devtools_helper.queued(),
+            asks.then_some(Origin::Automatic),
+            "handed {handed}"
+        );
+    }
+}
+
+/// A revision approved in this process brings the Developer Tools page back only while the
+/// record holds no `handed` for it: one whose page came up already stays down whatever the
+/// marker says.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_revision_whose_developer_tools_page_came_up_is_not_asked_again_in_this_process() {
+    use crate::devtools_helper::{Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    set_front(true);
+    let doctors = test_arms::marked(|| Some((aterm_types::version::app_version().to_owned(), 1)));
+    let mut app = new_mac(doctors, test_arms::fda_opening());
+    app.access_steps.set_reach(StepsReach {
+        handed: |revision, access| (revision, access) == (2, Access::DeveloperTools),
+        ..app.access_steps.reach
+    });
+    app.consent = reread(aterm_containment::consent::FdaState::Granted);
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+        Instant::now(),
+    );
+    app.settle_access_steps(Instant::now());
+    approve(&mut app, 2);
+    app.settle_access_steps(Instant::now());
+    assert_eq!(
+        app.devtools_helper.queued(),
+        None,
+        "revision 2's page came up already"
+    );
+    approve(&mut app, 3);
+    app.settle_access_steps(Instant::now());
+    assert_eq!(
+        app.devtools_helper.queued(),
+        Some(Origin::Automatic),
+        "revision 3 asks"
+    );
+}
+
+/// A Developer Tools hand-over asked while no revision stands (a reading after Stop) waits for
+/// one, and when the same revision is back it is judged again as the page would open: a page
+/// that revision already brought up stays down, and one it never brought up comes up.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_developer_tools_page_asked_with_no_revision_is_judged_again_when_the_revision_is_back() {
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    for (handed, more) in [(false, 1), (true, 0)] {
+        set_front(true);
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        let handed_arm: fn(u64, Access) -> bool = if handed {
+            |revision, access| (revision, access) == (1, Access::DeveloperTools)
+        } else {
+            |_, _| false
+        };
+        app.access_steps.set_reach(StepsReach {
+            handed: handed_arm,
+            ..app.access_steps.reach
+        });
+        app.consent = reread(aterm_containment::consent::FdaState::Granted);
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        let mut t = Instant::now();
+        app.settle_access_steps(t);
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued,
+            "handed {handed}: no revision, so it waits"
+        );
+        approve(&mut app, 1);
+        let opens = test_arms::opens();
+        parks(&mut app, &mut t, 3);
+        assert_eq!(test_arms::opens(), opens + more, "handed {handed}");
+    }
+}
+
+/// An ask the window's own Developer Tools step carried while it waited for a revision (a control
+/// client's `hand-over` before Set up, or its act on the row once Set up is back) is judged by its
+/// own rules when the same revision is back and refuses the step because it already brought the
+/// page up: the client gets the page it was answered `queued` for.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ask_the_waiting_developer_tools_step_carried_is_judged_when_the_step_is_refused() {
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    for ask in [
+        None,
+        Some(Origin::Ctl { now: false }),
+        Some(Origin::SystemStateAct),
+    ] {
+        set_front(true);
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.access_steps.set_reach(StepsReach {
+            handed: |revision, access| (revision, access) == (1, Access::DeveloperTools),
+            ..app.access_steps.reach
+        });
+        app.consent = reread(aterm_containment::consent::FdaState::Granted);
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        let mut t = Instant::now();
+        app.settle_access_steps(t);
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued
+        );
+        if ask == Some(Origin::Ctl { now: false }) {
+            assert_eq!(
+                app.hand_devtools_to_owner(Origin::Ctl { now: false }),
+                HandOver::Queued,
+                "the client is told it waits"
+            );
+        }
+        approve(&mut app, 1);
+        if ask == Some(Origin::SystemStateAct) {
+            assert!(
+                !app.open_access_from_system_state(Access::DeveloperTools, false),
+                "the act waits for the step moment"
+            );
+        }
+        let opens = test_arms::opens();
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            test_arms::opens(),
+            opens + u32::from(ask.is_some()),
+            "{ask:?}"
+        );
+    }
+}
+
+/// [`an_ask_the_waiting_developer_tools_step_carried_is_judged_when_the_step_is_refused`] for the
+/// Full Disk Access page: the window's own step waits with no revision, and a client's act on the
+/// row once Set up is back rides with it; revision 1 brought the page up already, which refuses
+/// the step only, so the act brings it up.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ask_the_waiting_full_disk_access_step_carried_is_judged_when_the_step_is_refused() {
+    use crate::devtools_helper::{HandOver, Moment, Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    let shown = test_arms::fda_marking(|| Some((atpkg::devtools::revision_key(1), 1)), |_| {});
+    let on_record = StepsReach {
+        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        frontmost: front,
+        ..stepping()
+    };
+    set_front(true);
+    for act in [false, true] {
+        let mut app = new_mac(test_arms::opening(), shown);
+        app.access_steps.set_reach(on_record);
+        let mut t = Instant::now();
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.fda_hand_over(Origin::Automatic, Moment::Asked, FdaState::Denied),
+            HandOver::Queued,
+            "no revision, so it waits"
+        );
+        approve(&mut app, 1);
+        if act {
+            assert!(
+                !app.open_access_from_system_state(Access::FullDiskAccess, false),
+                "the act waits for the step moment"
+            );
+        }
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            test_arms::fda_counts().0,
+            opens + u32::from(act),
+            "act {act}"
+        );
+    }
+}
+
+/// An ask the waiting Developer Tools step carried waits with it when the step waits again at
+/// its moment (its Full Disk Access reading still out), and is judged by its own rules once the
+/// step is refused: the window's own step needs Full Disk Access, a control verb's ask does not.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ask_the_developer_tools_step_carried_waits_with_it_when_it_waits_again() {
+    use crate::consent_state::ConsentState;
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    for ask in [false, true] {
+        set_front(true);
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.consent =
+            ConsentState::with_cached_probe_for_test(FdaProbe::refused(ProbeLabel::Pending));
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        let mut t = Instant::now();
+        app.settle_access_steps(t);
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued
+        );
+        if ask {
+            assert_eq!(
+                app.hand_devtools_to_owner(Origin::Ctl { now: false }),
+                HandOver::Queued
+            );
+        }
+        approve(&mut app, 1);
+        let opens = test_arms::opens();
+        parks(&mut app, &mut t, 2);
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens, Some(Origin::Automatic)),
+            "ask {ask}: the step waits for its Full Disk Access reading"
+        );
+        app.consent = reread(FdaState::Denied);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(test_arms::opens(), opens + u32::from(ask), "ask {ask}");
+    }
+}
+
+/// The control verb's ask that rides the waiting Developer Tools step keeps its own quiet moment:
+/// while the step waits for an approved revision (after Stop) the page comes up at the first quiet
+/// moment with a terminal tab in front, as it would for the ask alone. That page is not the
+/// revision's, so the step waits on: when the same revision is back it brings the page up, once
+/// the verb's page is ten minutes old ([`crate::devtools_helper::Lane::page_came_up`]); a look
+/// within them would find the page recent and spend the step. Where the record says that
+/// revision brought the page up already (`handed`, before the Stop), the step is refused as shown
+/// at once rather than holding the steps behind it for those ten minutes. No panel holds the
+/// step moment here (System Settings quit, say), so only the step's own wait does.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment() {
+    use crate::devtools_helper::{
+        DevToolsHelperArm, HandOver, Lane, Origin, RECHECK_EVERY, test_arms,
+    };
+    use aterm_containment::DevToolGrant;
+    use std::cell::Cell;
+    thread_local! {
+        static RECENT: Cell<bool> = const { Cell::new(false) };
+    }
+    let mut marking = test_arms::opening();
+    marking.note_opened = |_| RECENT.with(|recent| recent.set(true));
+    marking.opened_within = |_| RECENT.with(Cell::get).then_some(0);
+    for (ask, handed) in [(false, false), (true, false), (true, true)] {
+        set_front(false);
+        RECENT.with(|recent| recent.set(false));
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        if handed {
+            app.access_steps.set_reach(StepsReach {
+                handed: |revision, access| (revision, access) == (1, Access::DeveloperTools),
+                ..app.access_steps.reach
+            });
+        }
+        app.consent = reread(aterm_containment::consent::FdaState::Granted);
+        test_arms::stand_in(&mut app, marking);
+        app.devtools_helper = Lane::windowed_for_test(marking, DevToolsHelperArm::inert());
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        focus(&mut app, true);
+        app.user_input_recent = |within| within == crate::devtools_helper::PRESENT_WITHIN;
+        let t0 = Instant::now() + crate::consent_card::LAUNCH_SETTLE;
+        assert!(
+            app.devtools_moment_is_quiet(t0),
+            "precondition: a control verb's quiet moment, a terminal tab in front"
+        );
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued
+        );
+        if ask {
+            assert_eq!(
+                app.hand_devtools_to_owner(Origin::Ctl { now: false }),
+                HandOver::Queued
+            );
+        }
+        let opens = test_arms::opens();
+        for park in 0..3 {
+            app.tick_consent_lanes(t0 + RECHECK_EVERY * park);
+        }
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens + u32::from(ask), Some(Origin::Automatic)),
+            "ask {ask}: the step waits on for its revision"
+        );
+        set_front(true);
+        approve(&mut app, 1);
+        let mut t = t0 + RECHECK_EVERY * 3;
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens + 1, (ask && !handed).then_some(Origin::Automatic)),
+            "ask {ask}, handed {handed}: one page so far"
+        );
+        // Ten minutes on.
+        RECENT.with(|recent| recent.set(false));
+        let mut t = t0 + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens + 1 + u32::from(ask && !handed), None),
+            "ask {ask}, handed {handed}: the revision's own page, unless it came up already"
+        );
+    }
+}
+
+/// A control verb's `now` answered with no access revision standing leaves the window's own
+/// Developer Tools step waiting for its revision, as a page that comes up then does. The verb's
+/// asker brings that page up itself after the answer, behind its `spctl` run, and writes the
+/// marker only then: the step looks no sooner than ten minutes on, never within the verb's
+/// minute, and a marker written later than that allowed for (a slow asker) holds it on for the
+/// rest of its page's ten minutes rather than spending it as recent. Where the revision came to
+/// have brought the page up already by then, the step is refused as shown at once.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_now_panel_with_no_revision_leaves_the_step_waiting_out_the_verbs_page() {
+    use crate::devtools_helper::{DevToolsHelperArm, HandOver, Lane, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    use std::cell::Cell;
+    thread_local! {
+        static RECENT: Cell<bool> = const { Cell::new(false) };
+        static HANDED: Cell<bool> = const { Cell::new(false) };
+    }
+    let mut marking = test_arms::opening();
+    marking.opened_within = |_| RECENT.with(Cell::get).then_some(0);
+    set_front(true);
+    for handed in [false, true] {
+        RECENT.with(|recent| recent.set(false));
+        HANDED.with(|handed| handed.set(false));
+        let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+        app.access_steps.set_reach(StepsReach {
+            handed: |revision, access| {
+                HANDED.with(Cell::get) && (revision, access) == (1, Access::DeveloperTools)
+            },
+            ..app.access_steps.reach
+        });
+        app.consent = reread(aterm_containment::consent::FdaState::Granted);
+        test_arms::stand_in(&mut app, marking);
+        app.devtools_helper = Lane::windowed_for_test(marking, DevToolsHelperArm::inert());
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+            Instant::now(),
+        );
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued
+        );
+        let asked = Instant::now();
+        assert!(matches!(
+            app.hand_devtools_to_owner(Origin::Ctl { now: true }),
+            HandOver::Shown | HandOver::Unshown
+        ));
+        assert_eq!(
+            app.devtools_helper.queued(),
+            Some(Origin::Automatic),
+            "the step waits on for its revision"
+        );
+        approve(&mut app, 1);
+        let opens = test_arms::opens();
+        let mut t = Instant::now();
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens, Some(Origin::Automatic)),
+            "handed {handed}: within the verb's minute, the asker's page is to come"
+        );
+        // The asker's marker came late: within its ten minutes at the step's look.
+        RECENT.with(|recent| recent.set(true));
+        HANDED.with(|shown| shown.set(handed));
+        let mut t = asked + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens, (!handed).then_some(Origin::Automatic)),
+            "handed {handed}: a wait, not a refusal as recent"
+        );
+        if handed {
+            continue;
+        }
+        // Ten minutes after that look.
+        RECENT.with(|recent| recent.set(false));
+        let mut t = t + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::opens(), app.devtools_helper.queued()),
+            (opens + 1, None),
+            "the revision's own page"
+        );
+    }
+}
+
+/// A new access revision's Developer Tools step that waits out a page under ten minutes old
+/// keeps that wait through the window's own reading while its Full Disk Access probe is still
+/// out (`App::hold_devtools_for_fda_reading`): the hold's look a panel tick on is the reading's,
+/// and a look within the page's ten minutes would refuse the step as recent and spend it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_revisions_developer_tools_step_waits_out_a_recent_page_through_a_reading_still_out() {
+    use crate::devtools_helper::{DevToolsHelperArm, HandOver, Lane, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    use std::cell::Cell;
+    thread_local! {
+        static AGO: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    let mut marking = test_arms::opening();
+    marking.opened_within = |_| AGO.with(Cell::get);
+    set_front(true);
+    AGO.with(|ago| ago.set(None));
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.consent = reread(FdaState::Granted);
+    app.devtools_helper = Lane::windowed_for_test(marking, DevToolsHelperArm::inert());
+    app.devtools_helper.note_reading(
+        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
+        Instant::now(),
+    );
+    let opens = test_arms::opens();
+    let mut t = Instant::now();
+    approve(&mut app, 1);
+    parks(&mut app, &mut t, 1);
+    // A page aterm brought up 30 seconds ago (`aterm doctor`'s, say), then revision 2.
+    AGO.with(|ago| ago.set(Some(30)));
+    approve(&mut app, 2);
+    parks(&mut app, &mut t, 1);
+    assert_eq!(
+        (test_arms::opens(), app.devtools_helper.queued()),
+        (opens, Some(Origin::Automatic)),
+        "a wait, not a refusal"
+    );
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
+        FdaProbe::refused(ProbeLabel::Pending),
+    );
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Automatic),
+        HandOver::Queued,
+        "the Full Disk Access reading is still out"
+    );
+    app.consent = reread(FdaState::Granted);
+    parks(&mut app, &mut t, 3);
+    assert_eq!(
+        (test_arms::opens(), app.devtools_helper.queued()),
+        (opens, Some(Origin::Automatic)),
+        "the page's ten minutes still hold it"
+    );
+    AGO.with(|ago| ago.set(None));
+    let mut t = Instant::now() + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+    parks(&mut app, &mut t, 3);
+    assert_eq!(
+        (test_arms::opens(), app.devtools_helper.queued()),
+        (opens + 1, None),
+        "then revision 2's page"
+    );
+}
+
+/// [`the_control_verbs_ask_that_rides_the_step_keeps_its_own_quiet_moment`] for the Full Disk
+/// Access page: the window's own step waits for a revision, and a person's press on the row
+/// brings the page up meanwhile. The step waits on, and when the same revision is back it brings
+/// its own page up once the press's page is ten minutes old. Where that revision brought the
+/// page up already (the press keeps its word), the step is refused as shown at once instead of
+/// holding the steps behind it for those ten minutes. No panel holds the step moment here.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_press_with_no_revision_leaves_the_full_disk_access_step_waiting_for_it() {
+    use crate::devtools_helper::{DevToolsHelperArm, HandOver, Lane, Moment, Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static RECENT: Cell<bool> = const { Cell::new(false) };
+        static MARK: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    let mut marking = test_arms::fda_marking(
+        || MARK.with(|mark| mark.borrow().clone().map(|word| (word, 1))),
+        |word| {
+            RECENT.with(|recent| recent.set(true));
+            MARK.with(|mark| *mark.borrow_mut() = Some(word.to_owned()));
+        },
+    );
+    marking.opened_within = |_| RECENT.with(Cell::get).then_some(0);
+    set_front(true);
+    for shown in [false, true] {
+        RECENT.with(|recent| recent.set(false));
+        MARK.with(|mark| *mark.borrow_mut() = shown.then(|| atpkg::devtools::revision_key(1)));
+        let mut app = new_mac(test_arms::opening(), marking);
+        app.devtools_helper = Lane::windowed_with_fda_for_test(
+            test_arms::opening(),
+            marking,
+            DevToolsHelperArm::inert(),
+        );
+        app.access_steps.set_reach(StepsReach {
+            recorded: |_, access| {
+                (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered)
+            },
+            frontmost: front,
+            ..stepping()
+        });
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.fda_hand_over(Origin::Automatic, Moment::Asked, FdaState::Denied),
+            HandOver::Queued,
+            "no revision, so it waits"
+        );
+        let opens = test_arms::fda_counts().0;
+        assert!(app.open_access_from_system_state(Access::FullDiskAccess, true));
+        assert_eq!(
+            (test_arms::fda_counts().0, app.devtools_helper.fda_queued()),
+            (opens + 1, Some(Origin::Automatic)),
+            "shown {shown}: the press brings the page up, and the step waits on for its revision"
+        );
+        // The page asks for a new reading; it answers still off.
+        app.consent = reread(FdaState::Denied);
+        approve(&mut app, 1);
+        // Past the press's pane hold, within the page's ten minutes.
+        let mut t = Instant::now() + super::PANE_HOLD;
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::fda_counts().0, app.devtools_helper.fda_queued()),
+            if shown {
+                (opens + 1, None)
+            } else {
+                (opens + 1, Some(Origin::Automatic))
+            },
+            "shown {shown}: within the page's ten minutes"
+        );
+        // Ten minutes on.
+        RECENT.with(|recent| recent.set(false));
+        let mut t = Instant::now() + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (test_arms::fda_counts().0, app.devtools_helper.fda_queued()),
+            (opens + 1 + u32::from(!shown), None),
+            "shown {shown}: then revision 1's own page, unless it came up already"
+        );
+    }
+}
+
+/// An ask the waiting Developer Tools step carried waits for the step's `spctl` run too, and
+/// takes its answer. Here the run ends after the step moment passed. Either the step waits again
+/// with the act, or it is refused there (the record came to hold its revision's page), and the
+/// act, judged by its own rules as a run that ended then, waits for its own moment. Once the
+/// step is refused, the act brings the page up at that moment, with no run of its own.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ask_the_developer_tools_step_carried_waits_for_the_steps_spctl_run() {
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    use aterm_containment::DevToolGrant;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    thread_local! {
+        static HANDED: Cell<bool> = const { Cell::new(false) };
+    }
+    // `spctl` runs on the lane's worker thread.
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+    let mut counted = test_arms::opening();
+    counted.list_terminal = || {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    };
+    for refused_at_end in [false, true] {
+        set_front(true);
+        HANDED.with(|handed| handed.set(false));
+        RUNS.store(0, Ordering::SeqCst);
+        let mut app = new_mac(counted, test_arms::fda_opening());
+        app.access_steps.set_reach(StepsReach {
+            handed: |revision, access| {
+                HANDED.with(Cell::get) && (revision, access) == (1, Access::DeveloperTools)
+            },
+            ..app.access_steps.reach
+        });
+        app.consent = reread(aterm_containment::consent::FdaState::Granted);
+        app.devtools_helper.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(0)),
+            Instant::now(),
+        );
+        let mut t = Instant::now();
+        app.settle_access_steps(t);
+        set_front(false);
+        assert_eq!(
+            app.hand_devtools_to_owner(Origin::Automatic),
+            HandOver::Queued
+        );
+        assert!(
+            !app.open_access_from_system_state(Access::DeveloperTools, false),
+            "the act waits for the step moment"
+        );
+        set_front(true);
+        for park in 0.. {
+            assert!(park < 3, "the step moment came");
+            parks(&mut app, &mut t, 1);
+            if app.devtools_helper.listing().is_some() {
+                break;
+            }
+        }
+        set_front(false);
+        HANDED.with(|handed| handed.set(refused_at_end));
+        let opens = test_arms::opens();
+        let start = Instant::now();
+        while app.devtools_helper.listing().is_some() {
+            assert!(start.elapsed() < Duration::from_secs(60), "hang");
+            app.tick_devtools_hand_over(t);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            (
+                test_arms::opens(),
+                RUNS.load(Ordering::SeqCst),
+                app.devtools_helper.queued()
+            ),
+            if refused_at_end {
+                (opens, 1, Some(Origin::SystemStateAct))
+            } else {
+                (opens, 1, Some(Origin::Automatic))
+            },
+            "refused at its end {refused_at_end}: the moment passed, so nothing comes up"
+        );
+        HANDED.with(|handed| handed.set(true));
+        set_front(true);
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            (
+                test_arms::opens(),
+                RUNS.load(Ordering::SeqCst),
+                app.devtools_helper.queued()
+            ),
+            (opens + 1, 1, None),
+            "refused at its end {refused_at_end}: the act's page, with the step's run's answer"
+        );
+    }
+}
+
+/// The same for the Full Disk Access step, which waits again at its moment while the Developer
+/// Tools page is within its ten minutes: a client's act on the row rides with it, and once the
+/// step is refused (here `fda-pane-opened` comes to name revision 1 for this bundle and Mac) the
+/// act is judged by its own rules.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ask_the_full_disk_access_step_carried_waits_with_it_when_it_waits_again() {
+    use crate::devtools_helper::{HandOver, Moment, Origin, test_arms};
+    use aterm_containment::consent::FdaState;
+    use std::cell::Cell;
+    thread_local! {
+        static DEVTOOLS_AGO: Cell<Option<u64>> = const { Cell::new(None) };
+        static SHOWN: Cell<bool> = const { Cell::new(false) };
+    }
+    let reach =
+        test_arms::opened(|window| DEVTOOLS_AGO.with(Cell::get).filter(|ago| *ago < window));
+    let fda = test_arms::fda_marking(
+        || {
+            SHOWN
+                .with(Cell::get)
+                .then(|| (atpkg::devtools::revision_key(1), 1))
+        },
+        |_| {},
+    );
+    let on_record = StepsReach {
+        recorded: |_, access| (access == Access::LocalNetwork).then_some(AccessOutcome::Triggered),
+        frontmost: front,
+        ..stepping()
+    };
+    set_front(true);
+    for act in [false, true] {
+        DEVTOOLS_AGO.with(|ago| ago.set(Some(atpkg::devtools::REOPEN_AFTER_S - 1)));
+        SHOWN.with(|shown| shown.set(false));
+        let mut app = new_mac(reach, fda);
+        app.access_steps.set_reach(on_record);
+        let mut t = Instant::now();
+        app.observe_initial_setup_permissions(None);
+        assert_eq!(
+            app.fda_hand_over(Origin::Automatic, Moment::Asked, FdaState::Denied),
+            HandOver::Queued
+        );
+        approve(&mut app, 1);
+        if act {
+            assert!(!app.open_access_from_system_state(Access::FullDiskAccess, false));
+        }
+        let opens = test_arms::fda_counts().0;
+        parks(&mut app, &mut t, 2);
+        assert_eq!(
+            (test_arms::fda_counts().0, app.devtools_helper.fda_queued()),
+            (opens, Some(Origin::Automatic)),
+            "act {act}: the step waits out the Developer Tools page's minutes"
+        );
+        DEVTOOLS_AGO.with(|ago| ago.set(None));
+        SHOWN.with(|shown| shown.set(true));
+        parks(&mut app, &mut t, 3);
+        assert_eq!(
+            test_arms::fda_counts().0,
+            opens + u32::from(act),
+            "act {act}"
+        );
+    }
+}
+
 /// The `[privacy]` switches each test below turns off, one at a time.
 const SWITCHES: [&str; 3] = ["enabled", "check", "notice"];
 

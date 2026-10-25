@@ -336,26 +336,54 @@ fn a_co_viewed_session_names_each_window() {
     }
 }
 
+/// A FOOTERLESS AGENT'S CHIP LINE NAMES NO CHIP, AND THE RETIRED GEMINI CLI GETS NO LINE AT ALL:
+/// a tab running `gemini` is no agent (agy replaces it), so no chip line names it; the pane
+/// running Claude Code is drawn as its face; a codex-alab that proved its claim is an agent aterm
+/// admits whose program draws no footer, so its line reads `face=- drawn=- why=no-footer`.
 #[test]
-fn the_chip_line_names_no_chip_for_gemini() {
+fn the_chip_line_names_no_chip_for_a_footerless_agent_and_none_for_the_retired_gemini_cli() {
     let (mut app, wid, session, _reader) = app();
     let _host = host(&mut app);
-    set_program(&app, session, "gemini");
-    frame(&mut app, wid);
-    let line = line_of(&app, session);
-    let sid = app.pool.get(session).expect("session").ctx.self_id.clone();
-    assert_eq!(
-        line,
-        format!(
-            "autopilot sid={} window=0 program=gemini face=- drawn=- why=no-footer spoken=- \
-             description=- title=-",
-            sid.as_str()
-        )
-    );
+    for program in ["gemini", "gemini-cli"] {
+        set_program(&app, session, program);
+        frame(&mut app, wid);
+        assert!(
+            lines_of(&app, session).is_empty(),
+            "{program}: the retired Gemini CLI is no agent"
+        );
+    }
     claude(&app, session);
     frame(&mut app, wid);
     let line = line_of(&app, session);
     assert_eq!(token(&line, "face"), "cruise", "{line}");
+
+    set_program(&app, session, "codex");
+    frame(&mut app, wid);
+    assert!(
+        lines_of(&app, session).is_empty(),
+        "CONTROL: a codex with no proven claim is no agent aterm admits"
+    );
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the proven claim");
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(
+        line,
+        format!(
+            "autopilot sid={} window=0 program=codex face=- drawn=- why=no-footer spoken=- \
+             description=- title=-",
+            ctx.self_id.as_str()
+        )
+    );
 }
 
 #[test]

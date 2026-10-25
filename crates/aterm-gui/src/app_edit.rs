@@ -2334,6 +2334,27 @@ mod tests {
         ))
     }
 
+    fn edit_action_gates(app: &App, wid: WindowId, action: &str) -> (bool, bool) {
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let commands = app.native_runtime.commands(instance, view).unwrap();
+        let command = commands
+            .iter()
+            .find(|command| command.id.as_str() == action)
+            .unwrap();
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        let control = compiled
+            .semantic(&crate::native_ui::UiKey::new(action))
+            .unwrap();
+        (command.enabled, control.state.unwrap().enabled)
+    }
+
+    fn edit_buffer(app: &App, view: ViewId) -> &crate::native_editor::EditorBufferView {
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("an Editor view")
+        };
+        state.buffer.as_ref().unwrap()
+    }
+
     fn outcome(answer: &Receiver<String>) -> EditOutcome {
         EditOutcome::parse(&answer.try_recv().expect("answered")).unwrap()
     }
@@ -2567,6 +2588,76 @@ mod tests {
         );
 
         type_text(&mut app, wid, "fix ");
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let document = document_of(&app, edit_view);
+        let draft = app.document_store.snapshot(document).unwrap();
+        let mut capability_failures = Vec::new();
+        for prompt in [
+            crate::native_editor::EditorCommand::GotoLine,
+            crate::native_editor::EditorCommand::ExecuteCommand,
+            crate::native_editor::EditorCommand::SwitchBuffer,
+            crate::native_editor::EditorCommand::KillBuffer,
+            crate::native_editor::EditorCommand::IncrementalSearch,
+        ] {
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(prompt))
+                .unwrap();
+            type_text(&mut app, wid, "2");
+            assert!(edit_buffer(&app, edit_view).minibuffer_active());
+            let before = edit_buffer(&app, edit_view).clone();
+            for action in ["editor/finish", "editor/abort"] {
+                let gates = edit_action_gates(&app, wid, action);
+                if gates != (false, false) {
+                    capability_failures.push(format!(
+                        "{prompt:?}: {action} command/toolbar enabled: {gates:?}"
+                    ));
+                }
+                if app
+                    .act_app(crate::app_control::ActRequest {
+                        view: edit_view,
+                        ui_key: action.to_string(),
+                        action: action.to_string(),
+                        value: None,
+                    })
+                    .is_ok()
+                {
+                    capability_failures.push(format!("{prompt:?}: {action} act did not refuse"));
+                }
+                assert_eq!(edit_buffer(&app, edit_view), &before);
+                if app
+                    .activate_native_palette_target(&crate::palette::NativeCommandTarget {
+                        window: wid,
+                        instance,
+                        view: edit_view,
+                        generation: app.native_runtime.view_generation(edit_view).unwrap(),
+                        action: crate::native_ui::ActionId::new(action),
+                    })
+                    .is_ok()
+                {
+                    capability_failures
+                        .push(format!("{prompt:?}: {action} palette did not refuse"));
+                }
+                assert_eq!(edit_buffer(&app, edit_view), &before);
+                assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
+                assert_eq!(
+                    app.native_documents.edits.ticket_of_view(edit_view),
+                    Some(ticket)
+                );
+                assert!(!app.native_documents.edits.endings.contains_key(&edit_view));
+                let after = app.document_store.snapshot(document).unwrap();
+                assert_eq!((after.seq, after.text), (draft.seq, draft.text.clone()));
+                assert_eq!(app.document_store.dirty(document), Some(true));
+                assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "subject\n");
+            }
+            app.dispatch_native_event(
+                wid,
+                AppEvent::EditorCommand(crate::native_editor::EditorCommand::Abort),
+            )
+            .unwrap();
+            assert!(!edit_buffer(&app, edit_view).minibuffer_active());
+            for action in ["editor/finish", "editor/abort"] {
+                assert_eq!(edit_action_gates(&app, wid, action), (true, true));
+            }
+        }
         app.act_app(crate::app_control::ActRequest {
             view: edit_view,
             ui_key: "editor/finish".to_string(),
@@ -2582,6 +2673,8 @@ mod tests {
             app.view_store.get(mine).is_some(),
             "the person's view stays"
         );
+
+        assert!(capability_failures.is_empty(), "{capability_failures:#?}");
 
         select(&mut app, wid, caller_tab);
         let g = fixture("header-click", b"body\n");
@@ -2793,12 +2886,65 @@ mod tests {
         press(&mut app, wid, "C-c C-k");
         assert_eq!(status(&app, edit_view).as_deref(), Some(ABORT_SAVING));
         assert_eq!(buffer_text(&app, edit_view), "kept base\n");
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        assert!(app.document_save_owed(document));
+        let Some(crate::native_app::NativeApp::Editor(editor)) = app.native_runtime.app(instance)
+        else {
+            panic!("an Editor instance")
+        };
+        assert!(editor.checkpoint_pending);
+        assert!(!app.can_save_document(wid));
+        assert_eq!(edit_action_gates(&app, wid, "editor/finish"), (true, true));
+        let generation = app.native_runtime.view_generation(edit_view).unwrap();
+        let target = |action: &str| crate::palette::NativeCommandTarget {
+            window: wid,
+            instance,
+            view: edit_view,
+            generation,
+            action: crate::native_ui::ActionId::new(action),
+        };
+        app.activate_native_palette_target(&target("editor/finish"))
+            .unwrap();
+        let ending = app.native_documents.edits.endings.get(&edit_view).copied();
+        assert!(matches!(ending, Some(Ending::Finish { .. })));
+        let before = edit_buffer(&app, edit_view).clone();
+        let mut capability_failures = Vec::new();
+        let gates = edit_action_gates(&app, wid, "editor/abort");
+        if gates != (false, false) {
+            capability_failures.push(format!("saving: Abort command/toolbar enabled: {gates:?}"));
+        }
+        if app
+            .act_app(crate::app_control::ActRequest {
+                view: edit_view,
+                ui_key: "editor/abort".to_string(),
+                action: "editor/abort".to_string(),
+                value: None,
+            })
+            .is_ok()
+        {
+            capability_failures.push("saving: Abort act did not refuse".to_string());
+        }
+        assert_eq!(edit_buffer(&app, edit_view), &before);
+        if app
+            .activate_native_palette_target(&target("editor/abort"))
+            .is_ok()
+        {
+            capability_failures.push("saving: Abort palette did not refuse".to_string());
+        }
+        assert_eq!(edit_buffer(&app, edit_view), &before);
+        assert_eq!(
+            app.native_documents.edits.endings.get(&edit_view),
+            ending.as_ref()
+        );
+        assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "base\n");
         app.land_held_document_save_for_test(document, edit_view, held)
             .unwrap();
         let done = outcome(&answer);
         assert_eq!((done.result, done.saved), (EditResult::Finished, true));
         assert!(app.view_store.get(edit_view).is_none());
         assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "kept base\n");
+        assert!(capability_failures.is_empty(), "{capability_failures:#?}");
     }
 
     #[test]

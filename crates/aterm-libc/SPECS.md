@@ -18,8 +18,8 @@ the crate has no integration tests now. Nothing was compiled or run. The claims 
 reading the code.
 
 Result: **1 spec**, covering **no test**. A cell the gate does not admit stops at its
-`compile_error!` when that cell is built (`targo --unverified verify cells` builds each cell no
-fleet machine hosts), and atpkg's `every_published_triple_is_a_forge_cell` holds every shipped
+`compile_error!` when that cell is built (`targo --unverified verify cells` builds every cell but
+this machine's own), and atpkg's `every_published_triple_is_a_forge_cell` holds every shipped
 triple to a cell.
 
 ## 0. Notation used in the statements
@@ -44,7 +44,7 @@ must handle)`, `blocking gaps (audit §7 numbers)`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-LIBC-1	contract	aterm_forge::resolve::default_cells	ensures: ∀ c ∈ default_cells(): facts(c.triple) = Some(f) ∧ Admit(G, f). Every cell `targo --unverified verify cells` compiles decomposes into target_* cfgs and passes the aterm-libc target gate. This is a property of a compiled production function. The contract is stated in aterm-forge and cites the constant table G from aterm-libc. Today it holds only by compilation: a cell the gate does not admit stops at its compile_error! when that cell is built (`verify cells` builds each cell no fleet machine hosts).	-	MEDIUM: Vec<Cell> return value with String fields, a universal quantifier over the result, string split/compare inside facts(), a constant table cited from another crate	0, 1, 5, 12
+LIBC-1	contract	aterm_forge::resolve::default_cells	ensures: ∀ c ∈ default_cells(): facts(c.triple) = Some(f) ∧ Admit(G, f). Every cell `targo --unverified verify cells` compiles decomposes into target_* cfgs and passes the aterm-libc target gate. This is a property of a compiled production function. The contract is stated in aterm-forge and cites the constant table G from aterm-libc. Today it holds only by compilation: a cell the gate does not admit stops at its compile_error! when that cell is built (`verify cells` builds every cell but this machine's own).	-	MEDIUM: Vec<Cell> return value with String fields, a universal quantifier over the result, string split/compare inside facts(), a constant table cited from another crate	0, 1, 5, 12
 ```
 
 ## 2. Test → spec map

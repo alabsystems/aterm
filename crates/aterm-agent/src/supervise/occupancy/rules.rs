@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Built-in occupancy rules (`wait-nudge@v1` and `hold-room@v1`) and their pure decider [`decide`].
+//! Built-in occupancy rules (`wait-nudge@v1`, `hold-room@v1` and `wake@v1`) and their pure
+//! decider [`decide`], which a break's pick ranks ([`rank`]).
 
 use super::reading::OccupancyReading;
 use super::templates::{self, FactLine};
+use super::wakes::UNHEARD_MS;
+use super::wakes_seen::{WAKE_RULE, WakeSeen, WakeState, WakesSeen, head_key};
 use crate::harness::disk::Level;
 use crate::supervise::config::Autopilot;
 use crate::supervise::run::Guard;
@@ -66,14 +69,18 @@ pub enum RuleId {
     /// `hold>=2h and slots>=1 for=20m and avail>=8GiB and disk=ok and mem<critical`, in a
     /// session whose jobs held a build slot during this hold.
     HoldRoom,
+    /// A wake the agent declared in its session's book whose condition held and whose need
+    /// holds (design §4.1): once a wake ([`wake_opens`]).
+    Wake,
 }
 
 impl RuleId {
     /// How many rules there are: the length of every per-rule array ([`Self::index`]).
-    pub const COUNT: usize = 2;
+    pub const COUNT: usize = 3;
 
-    /// Every rule, in the order a break decides them (the first due is the one due).
-    pub const ALL: [RuleId; Self::COUNT] = [RuleId::WaitNudge, RuleId::HoldRoom];
+    /// Every rule, in [`Self::index`]'s order: the order a break decides them in. A recording
+    /// without slice 2's doors picks the first due ([`WakeSight::ranked`]); else [`rank`] picks.
+    pub const ALL: [RuleId; Self::COUNT] = [RuleId::WaitNudge, RuleId::HoldRoom, RuleId::Wake];
 
     /// Its name and revision, as rows and journal lines spell it. Stable: a successor loop books
     /// by it ([`would_rows_in`]).
@@ -82,6 +89,7 @@ impl RuleId {
         match self {
             RuleId::WaitNudge => "wait-nudge@v1",
             RuleId::HoldRoom => "hold-room@v1",
+            RuleId::Wake => WAKE_RULE,
         }
     }
 
@@ -91,11 +99,12 @@ impl RuleId {
         Self::ALL.into_iter().find(|rule| rule.name() == name)
     }
 
-    /// The kind of fact its line tells: both built-ins tell the hold's.
+    /// The kind of fact its line tells: the hold rules the hold's, a wake's its own.
     #[must_use]
     pub const fn kind(self) -> crate::supervise::facts::FactKind {
         match self {
             RuleId::WaitNudge | RuleId::HoldRoom => crate::supervise::facts::FactKind::Hold,
+            RuleId::Wake => crate::supervise::facts::FactKind::Wake,
         }
     }
 
@@ -105,6 +114,7 @@ impl RuleId {
     pub const fn slice1(self) -> bool {
         match self {
             RuleId::WaitNudge | RuleId::HoldRoom => true,
+            RuleId::Wake => false,
         }
     }
 
@@ -114,16 +124,18 @@ impl RuleId {
         match self {
             RuleId::WaitNudge => 0,
             RuleId::HoldRoom => 1,
+            RuleId::Wake => 2,
         }
     }
 
     /// Whether its line needs a free build slot and types the board's figures: its pace
     /// reserves the slot, and the host re-reads the board for the write
-    /// ([`super::PaceGrant::Room`]).
+    /// ([`super::PaceGrant::Room`]). A wake's line reserves one by its own need, through its
+    /// claim (the slice-2 plan's 2.8), never through this pace.
     #[must_use]
     pub const fn slot(self) -> bool {
         match self {
-            RuleId::WaitNudge => false,
+            RuleId::WaitNudge | RuleId::Wake => false,
             RuleId::HoldRoom => true,
         }
     }
@@ -272,13 +284,20 @@ impl Guards {
     }
 }
 
-/// The autopilots a rule's lines are for (§3.2: both built-ins are Cruise's).
+/// The autopilots a rule's lines are for (§3.2: the hold rules are Cruise's; a wake the agent
+/// declared is told under Land too).
 #[must_use]
 pub const fn modes(rule: RuleId) -> &'static [Autopilot] {
     match rule {
         RuleId::WaitNudge | RuleId::HoldRoom => &[Autopilot::Cruise],
+        RuleId::Wake => &[Autopilot::Cruise, Autopilot::Land],
     }
 }
+
+/// The most wake episodes [`Books`] keeps booked: the book holds at most
+/// [`super::wakes::MAX_WAKES`] live, and a loop prunes the rest to the live ones
+/// ([`Books::keep_wakes`]).
+pub const WAKES_BOOKED: usize = 64;
 
 /// WHAT THE SESSION WAS TOLD — or, under `observe`, would have been (`fact-would@v1`): the caps'
 /// and the pace's book, on the caller's milliseconds. A successor loop seeds it from its rows
@@ -293,7 +312,10 @@ pub struct Books {
     rooms: Vec<i64>,
     /// Each `wait-nudge` line within the last [`DAY_MS`], oldest first.
     nudges: Vec<i64>,
-    /// The last line of either rule.
+    /// Each wake episode whose line went (or would have), oldest first, at most
+    /// [`WAKES_BOOKED`].
+    wakes: Vec<u64>,
+    /// The last line of any rule.
     last_ms: Option<i64>,
 }
 
@@ -333,8 +355,34 @@ impl Books {
                     self.rooms.sort_unstable();
                 }
             }
+            // A wake's line is booked by its episode ([`Self::woke`]).
+            RuleId::Wake => {}
         }
         self.last_ms = Some(self.last_ms.map_or(at_ms, |last| last.max(at_ms)));
+    }
+
+    /// Wake episode `episode`'s line went (or would have) at `at_ms`: told once, and counted
+    /// toward the session's pace.
+    pub fn woke(&mut self, episode: u64, at_ms: i64) {
+        if !self.wakes.contains(&episode) {
+            self.wakes.push(episode);
+            let over = self.wakes.len().saturating_sub(WAKES_BOOKED);
+            self.wakes.drain(..over);
+        }
+        self.last_ms = Some(self.last_ms.map_or(at_ms, |last| last.max(at_ms)));
+    }
+
+    /// Whether wake episode `episode`'s line went (or would have).
+    #[must_use]
+    pub fn has_woke(&self, episode: u64) -> bool {
+        self.wakes.contains(&episode)
+    }
+
+    /// The booked wake episodes the book no longer holds live (`live`, as the loop last read it)
+    /// are forgotten: a wake told, taken or expired leaves the book, and so its episode.
+    pub fn keep_wakes(&mut self, live: &WakesSeen) {
+        self.wakes
+            .retain(|episode| live.wakes.iter().any(|w| w.episode() == *episode));
     }
 
     /// A line that is no rule's went at `at_ms` (the stuck fact's, §2.1's rank 4): it counts
@@ -349,6 +397,8 @@ impl Books {
         match rule {
             RuleId::WaitNudge => usize::from(self.nudged),
             RuleId::HoldRoom => self.rooms.len(),
+            // A wake's episode is its own, of no hold.
+            RuleId::Wake => 0,
         }
     }
 
@@ -374,8 +424,48 @@ pub enum Verdict {
         /// When the pace lets a line go.
         next_ms: i64,
     },
+    /// Due, and a line [`rank`] puts before it goes at this break: it stays due.
+    Outranked,
     /// Due: this line would go.
     Due(FactLine),
+}
+
+/// WHAT A BREAK READS OF THE SESSION'S BOOK OF WAKES ([`decide`]'s `wake@v1`), and how it picks
+/// among its due lines.
+#[derive(Clone, Copy)]
+pub struct WakeSight<'a> {
+    /// The book as the loop read it at this break: the empty one on a recording whose host had
+    /// no `host.wakes`, which never read it.
+    pub seen: &'a WakesSeen,
+    /// The break's wall clock, unix ms: the book's clocks are the host's.
+    pub wall_ms: i64,
+    /// Whether a wake episode was told already: typed, or answered by the agent's own
+    /// `await wake` and heard (the loop's `FactsState`). What would have gone, [`Books`] keeps.
+    pub told: &'a dyn Fn(u64) -> bool,
+    /// The break ranks its due lines ([`rank`], the slice-2 plan's D6): one goes, and every other
+    /// is [`Verdict::Outranked`]. Else slice 1's pick: the first due in [`RuleId::ALL`]'s order
+    /// goes, and the session's pace holds the rest.
+    pub ranked: bool,
+}
+
+fn never_told(_: u64) -> bool {
+    false
+}
+
+static NO_WAKES: WakesSeen = WakesSeen { wakes: Vec::new() };
+
+impl WakeSight<'static> {
+    /// Slice 1's break: no book, slice 1's pick. A recording without slice 2's doors replays
+    /// under it, and so does the ring, which holds no wakes.
+    #[must_use]
+    pub fn slice1() -> Self {
+        Self {
+            seen: &NO_WAKES,
+            wall_ms: 0,
+            told: &never_told,
+            ranked: false,
+        }
+    }
 }
 
 /// Whether a break at `now_ms` needs the board's reading: `hold-room` could be due by everything
@@ -414,6 +504,7 @@ fn holds_but_machine(
                 && !books.nudged
         }
         RuleId::HoldRoom => room_holds(hold, books, now_ms),
+        RuleId::Wake => false,
     }
 }
 
@@ -434,7 +525,80 @@ pub fn room_due_ms(since_ms: i64, last_ms: Option<i64>) -> i64 {
     })
 }
 
-/// Decide each rule's verdict at a break at `now_ms`.
+/// Whether a wake of the book stands ready with its need met at the book's last look: the
+/// session is ready while build slots stand idle (F14), as [`ready`] says of a hold.
+#[must_use]
+pub fn wake_met(seen: &WakesSeen) -> bool {
+    seen.wakes
+        .iter()
+        .any(|w| w.state == WakeState::Ready && w.need_met)
+}
+
+/// THE WAKE A BREAK WOULD TELL (`OccupancyDoor`'s `OpenWake`): of the book's wakes still to be
+/// told by a line (live, not time-only, and untold: by `told`, and not booked in `books`), the
+/// head ([`head_key`]: a critical one first, then the lowest ordinal), where its condition held —
+/// ready, or answered by the agent's own `await wake` and unheard [`UNHEARD_MS`] at the break's
+/// wall clock (the plan's S2: only a hosted session's book holds an answer unheard) — and its need
+/// held at the book's last look; else `None`. An `unless=` atom that held expired the wake, which
+/// left the book. A head not ready, answered but not yet unheard, or with its need unmet opens
+/// nothing: the wakes are told in the head's order.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "OccupancyDoor",
+        action = "OpenWake",
+        project = "conformance_occupancy::project"
+    )
+)]
+pub fn wake_opens<'a>(sight: &WakeSight<'a>, books: &Books) -> Option<&'a WakeSeen> {
+    let head = sight
+        .seen
+        .wakes
+        .iter()
+        .filter(|w| w.state.live() && !w.await_only)
+        .filter(|w| !matches!(w.state, WakeState::Pending))
+        .filter(|w| {
+            let episode = w.episode();
+            !books.has_woke(episode) && !(sight.told)(episode)
+        })
+        .min_by_key(|w| head_key(w.prio, w.ord))?;
+    let held = match head.state {
+        WakeState::Ready => true,
+        WakeState::Answered { at_ms } => sight.wall_ms.saturating_sub(at_ms) >= UNHEARD_MS,
+        _ => false,
+    };
+    (held && head.need_met).then_some(head)
+}
+
+/// A RULE'S RANK AT A BREAK (the slice-2 plan's D6, design §2.1): a wake's line first (the
+/// book's head, [`wake_opens`]: a critical wake before a ready one), then `wait-nudge`, then
+/// `hold-room`. The lower goes first.
+#[must_use]
+pub const fn rank_of(rule: RuleId) -> u8 {
+    match rule {
+        RuleId::Wake => 0,
+        RuleId::WaitNudge => 1,
+        RuleId::HoldRoom => 2,
+    }
+}
+
+/// THE BREAK'S PICK (D6): of the due lines in `verdicts`, the one [`rank_of`] puts first keeps its
+/// verdict, and every other due line is [`Verdict::Outranked`]: it stays due, unbooked.
+pub fn rank(verdicts: &mut [(RuleId, Verdict)]) {
+    let first = verdicts
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, Verdict::Due(_)))
+        .map(|(rule, _)| *rule)
+        .min_by_key(|rule| rank_of(*rule));
+    for (rule, verdict) in verdicts.iter_mut() {
+        if matches!(verdict, Verdict::Due(_)) && Some(*rule) != first {
+            *verdict = Verdict::Outranked;
+        }
+    }
+}
+
+/// Decide each rule's verdict at a break at `now_ms`, the book of wakes as `wakes` reads it.
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -459,28 +623,45 @@ pub fn decide(
     g: &Guards,
     nudge_after_ms: i64,
     now_ms: i64,
+    wakes: &WakeSight<'_>,
 ) -> [(RuleId, Verdict); RuleId::COUNT] {
     let mut due_seen = false;
-    RuleId::ALL.map(|rule| {
-        let verdict = match hold
-            .filter(|hold| holds_but_machine(rule, *hold, books, nudge_after_ms, now_ms))
-        {
+    let mut verdicts = RuleId::ALL.map(|rule| {
+        let opened = match rule {
+            RuleId::Wake => wake_opens(wakes, books).map(wake_line),
+            _ => match hold
+                .filter(|hold| holds_but_machine(rule, *hold, books, nudge_after_ms, now_ms))
+            {
+                None => None,
+                Some(_) if spent(rule, books, now_ms) => {
+                    return (rule, Verdict::Spent);
+                }
+                Some(hold) => line(rule, r, hold, now_ms),
+            },
+        };
+        let verdict = match opened {
             None => Verdict::Quiet,
-            Some(_) if spent(rule, books, now_ms) => Verdict::Spent,
-            Some(hold) => match line(rule, r, hold, now_ms) {
-                None => Verdict::Quiet,
-                Some(line) => match g.held(rule) {
-                    Some(guard) => Verdict::Held(guard),
-                    None => match paced(books, now_ms, due_seen) {
-                        Some(next_ms) => Verdict::Paced { next_ms },
-                        None => Verdict::Due(line),
-                    },
+            Some(line) => match g.held(rule) {
+                Some(guard) => Verdict::Held(guard),
+                None => match paced(books, now_ms, due_seen && !wakes.ranked) {
+                    Some(next_ms) => Verdict::Paced { next_ms },
+                    None => Verdict::Due(line),
                 },
             },
         };
         due_seen |= matches!(verdict, Verdict::Due(_));
         (rule, verdict)
-    })
+    });
+    if wakes.ranked {
+        rank(&mut verdicts);
+    }
+    verdicts
+}
+
+/// A wake's line as the decider books it: its ordinal, class and kinds; the clock and the slots
+/// are filled in by the write (the slice-2 plan's 2.8), which reads them.
+fn wake_line(wake: &WakeSeen) -> FactLine {
+    templates::wake(wake.ord, wake.class, &wake.kinds, None, None)
 }
 
 /// `rule`'s line on `hold` at `now_ms`, where the machine lets it go (`hold-room`'s terms on the
@@ -505,6 +686,8 @@ pub fn line(rule: RuleId, r: &OccupancyReading, hold: HoldSeen, now_ms: i64) -> 
             (slots.usable >= 1)
                 .then(|| templates::hold_room(held_ms, slots.usable, slots.n, free_ms, avail_mib))
         }
+        // A wake's line is no hold's ([`wake_opens`]).
+        RuleId::Wake => None,
     }
 }
 
@@ -512,6 +695,8 @@ fn spent(rule: RuleId, books: &Books, now_ms: i64) -> bool {
     match rule {
         RuleId::WaitNudge => books.nudges_today(now_ms) >= NUDGES_PER_DAY,
         RuleId::HoldRoom => books.rooms.len() >= HOLD_ROOM_PER_HOLD,
+        // Once a wake: a told one opens nothing ([`wake_opens`]).
+        RuleId::Wake => false,
     }
 }
 
@@ -638,6 +823,8 @@ pub struct WouldRow {
     pub row_ms: i64,
     /// How long the hold had held at it.
     pub held_ms: i64,
+    /// Its episode (`episode=<hex>`), where the row names one: a wake's books by it.
+    pub episode: Option<u64>,
 }
 
 /// THE LINES A LOOP BEFORE THIS ONE BOOKED for session `sid` in the ledger text `body`, oldest
@@ -679,11 +866,14 @@ pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
         }
         let mut rule = None;
         let mut held_ms = None;
+        let mut episode = None;
         for word in reason.split(' ') {
             if let Some(name) = word.strip_prefix("rule=") {
                 rule = RuleId::of_name(name);
             } else if let Some(n) = word.strip_prefix("held_ms=") {
                 held_ms = n.parse::<i64>().ok().filter(|n| *n >= 0);
+            } else if let Some(hex) = word.strip_prefix("episode=") {
+                episode = u64::from_str_radix(hex, 16).ok();
             }
         }
         if let (Some(rule), Some(held_ms)) = (rule, held_ms) {
@@ -691,6 +881,7 @@ pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
                 rule,
                 row_ms,
                 held_ms,
+                episode,
             });
         }
     }
@@ -698,7 +889,9 @@ pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
 }
 
 /// An episode's id: the rule, its revision (`builtin` for these), the hold it is of (by its
-/// start in unix ms) and its ordinal in that hold, hashed. Every successor that carries a hold
+/// start in unix ms) and its ordinal in that hold, hashed; a wake's, its declaration's stamp and
+/// its ordinal in the book ([`super::wakes_seen::wake_episode`] is `episode(RuleId::Wake,
+/// declared_ms, ord)`). Every successor that carries a hold
 /// keys it by the start its predecessor's row puts it at (the row's stamp less how long the
 /// hold had stood), so they name the same episodes; the loop that opened the hold keyed it by
 /// its own wall read at its start and its monotonic clock since, which agree with that row to

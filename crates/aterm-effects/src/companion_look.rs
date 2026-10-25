@@ -203,13 +203,24 @@ impl KittyTenure {
             return;
         };
         for s in &mut self.roster {
-            if s.as_ref().is_some_and(|h| {
-                h.greeted && h.id != id.id && now.saturating_duration_since(h.at) >= HOMECOMING
-            }) {
+            if let Some(h) = s.as_ref()
+                && h.greeted
+                && h.id != id.id
+                && now.saturating_duration_since(h.at) >= HOMECOMING
+            {
                 *s = None;
             }
         }
-        match self.roster.iter_mut().flatten().find(|h| h.id == id.id) {
+        let mut hit = None;
+        for entry in &mut self.roster {
+            if let Some(h) = entry
+                && h.id == id.id
+            {
+                hit = Some(h);
+                break;
+            }
+        }
+        match hit {
             Some(h) => {
                 h.at = now;
                 self.arrival = if h.greeted {
@@ -234,13 +245,9 @@ impl KittyTenure {
     /// [`HELLO_FLOOR`] ago; else `Quiet`, with the debt kept.
     #[inline]
     fn floor(&self, now: Instant) -> PetArrival {
-        if self
-            .last_hello
-            .is_none_or(|t| now.saturating_duration_since(t) >= HELLO_FLOOR)
-        {
-            PetArrival::Ceremony
-        } else {
-            PetArrival::Quiet
+        match self.last_hello {
+            Some(t) if now.saturating_duration_since(t) < HELLO_FLOOR => PetArrival::Quiet,
+            _ => PetArrival::Ceremony,
         }
     }
 
@@ -253,10 +260,15 @@ impl KittyTenure {
     /// Called by the render seam only when a ceremony was performed on glass (`companion_verdict` also runs for unfocused windows).
     #[inline]
     pub fn commit_hello(&mut self, now: Instant) {
-        if let Some(id) = self.worn.as_ref()
-            && let Some(h) = self.roster.iter_mut().flatten().find(|h| h.id == id.id)
-        {
-            h.greeted = true;
+        if let Some(id) = self.worn.as_ref() {
+            for entry in &mut self.roster {
+                if let Some(h) = entry
+                    && h.id == id.id
+                {
+                    h.greeted = true;
+                    break;
+                }
+            }
         }
         self.last_hello = Some(now);
         self.arrival = PetArrival::Quiet;
@@ -280,7 +292,11 @@ fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now
             slot = Some(i);
             break;
         };
-        if h.greeted && oldest_at.is_none_or(|oldest| h.at < oldest) {
+        let is_older = match oldest_at {
+            Some(oldest) => h.at < oldest,
+            None => true,
+        };
+        if h.greeted && is_older {
             oldest_at = Some(h.at);
             slot = Some(i);
         }

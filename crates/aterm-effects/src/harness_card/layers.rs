@@ -174,12 +174,10 @@ impl CardFrame {
             FxSpace::Grid,
             FxBlend::Exact,
         );
-        if let Some((x, y)) = self
-            .origin
-            .0
-            .checked_sub(grid.0)
-            .zip(self.origin.1.checked_sub(grid.1))
-        {
+        if let (Some(x), Some(y)) = (
+            self.origin.0.checked_sub(grid.0),
+            self.origin.1.checked_sub(grid.1),
+        ) {
             over.offset = (x, y);
             let edge = |e: i32, g: i32| {
                 if e == i32::MIN || e == i32::MAX {
@@ -301,7 +299,7 @@ impl CardFrames {
     /// Fill the ring's next pair with `cx`'s frame and hand it back.
     pub(super) fn fill(&mut self, cx: &Emit<'_>) -> (Arc<FxContent>, Arc<FxContent>) {
         let ch = cx.scene.ch;
-        if self.arts.as_ref().is_none_or(|a| a.ch != ch) {
+        if !matches!(self.arts.as_deref(), Some(a) if a.ch == ch) {
             self.arts = CardArts::for_cell(ch);
         }
         let Some(arts) = self.arts.as_deref() else {
@@ -485,12 +483,12 @@ impl CardArts {
         }
         static MEMO: Mutex<Vec<(u16, Weak<CardArts>)>> = Mutex::new(Vec::new());
         let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(live) = memo
-            .iter()
-            .find(|(c, _)| *c == ch)
-            .and_then(|(_, w)| w.upgrade())
-        {
-            return Some(live);
+        for (c, w) in memo.iter() {
+            if *c == ch
+                && let Some(live) = w.upgrade()
+            {
+                return Some(live);
+            }
         }
         memo.retain(|(_, w)| w.strong_count() > 0);
         let arts = Arc::new(Self::build(ch, dimensions));
@@ -610,20 +608,27 @@ impl Ramps for UnderItems<'_> {
             return;
         }
         let (x, w) = (c.x0 as i32, (c.x1 - c.x0) as u16);
-        let open = self.side.filter(|&i| {
-            matches!(&self.items[i], FxItem::Ramps(s)
-                if s.x == x && s.w == w && i64::from(s.y) + i64::from(s.h) == c.y0)
-        });
-        let i = open.unwrap_or_else(|| {
-            self.items.push(FxItem::Ramps(FxRamps {
-                x,
-                y: c.y0 as i32,
-                w,
-                h: 0,
-                ink: self.palette.len() as u32,
-            }));
-            self.items.len() - 1
-        });
+        let i = match self.side {
+            Some(idx)
+                if matches!(
+                    &self.items[idx],
+                    FxItem::Ramps(s)
+                        if s.x == x && s.w == w && i64::from(s.y) + i64::from(s.h) == c.y0
+                ) =>
+            {
+                idx
+            }
+            _ => {
+                self.items.push(FxItem::Ramps(FxRamps {
+                    x,
+                    y: c.y0 as i32,
+                    w,
+                    h: 0,
+                    ink: self.palette.len() as u32,
+                }));
+                self.items.len() - 1
+            }
+        };
         if let FxItem::Ramps(s) = &mut self.items[i] {
             s.h += (c.y1 - c.y0) as u16;
         }
@@ -691,11 +696,9 @@ fn kitty(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut 
     };
     let inks = KittyInk::new(cx.scene.coat, cx.scene.eye, cx.scene.dark);
     let base = palette.len() as u32;
-    palette.extend(
-        KITTY_PALETTE[1..]
-            .iter()
-            .map(|&c| FxInk::over(inks.of(c).unwrap_or(0), 255)),
-    );
+    for &c in &KITTY_PALETTE[1..] {
+        palette.push(FxInk::over(inks.of(c).unwrap_or(0), 255));
+    }
     items.push(FxItem::Sprite(FxSprite {
         x: r.x0 as i32,
         y: r.y0 as i32,
@@ -718,10 +721,10 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
     let r0 = at.rect;
     let centre = ((r0.x0 + r0.x1) as f32 * 0.5, (r0.y0 + r0.y1) as f32 * 0.5);
     let base = palette.len() as u32;
-    palette.extend(rim.mids.iter().map(|&(mx, my)| {
+    for &(mx, my) in &rim.mids {
         let mid = ((2 * r0.x0 + mx) as f32 * 0.5, (2 * r0.y0 + my) as f32 * 0.5);
-        fx_ink(cx.rim_paint(mid, centre))
-    }));
+        palette.push(fx_ink(cx.rim_paint(mid, centre)));
+    }
     let sprite = |clip: Rect| {
         FxItem::Sprite(FxSprite {
             x: (r0.x0 + rim.origin.0) as i32,
@@ -830,21 +833,25 @@ fn star(
     };
     if added {
         let base = palette.len() as u32;
-        let tones: [u32; STAR_PAINTS] = std::array::from_fn(|id| light(color, covs[id]).color);
-        palette.extend(p.classes().iter().map(|members| {
-            FxInk::add(members.iter().fold(0, |sum, &id| {
-                add_sat(sum, tones[usize::from(id)]) & 0x00FF_FFFF
-            }))
-        }));
+        let mut tones = [0u32; STAR_PAINTS];
+        for (id, tone) in tones.iter_mut().enumerate() {
+            *tone = light(color, covs[id]).color;
+        }
+        for members in p.classes() {
+            let mut sum = 0u32;
+            for &id in members {
+                sum = add_sat(sum, tones[usize::from(id)]) & 0x00FF_FFFF;
+            }
+            palette.push(FxInk::add(sum));
+        }
         items.push(sprite(folded, base, b));
         return;
     }
     let base = palette.len() as u32;
     for rgb in [color, WHITE] {
-        palette.extend(
-            covs.iter()
-                .map(|&c| fx_ink(ink(rgb, c * 255.0 / STAR_PRINT_FULL))),
-        );
+        for &c in &covs {
+            palette.push(fx_ink(ink(rgb, c * 255.0 / STAR_PRINT_FULL)));
+        }
     }
     tone_rects(b, on_trail, |r, white| {
         let ink = base + if white { STAR_PAINTS as u32 } else { 0 };

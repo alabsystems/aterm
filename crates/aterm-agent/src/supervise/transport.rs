@@ -19,6 +19,20 @@ use crate::RelayClient;
 const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(60);
 const AWAIT_MARGIN: Duration = Duration::from_secs(5);
 
+/// Whether `a` and `b` name one socket: their folders resolve to one folder, and their names
+/// agree.
+fn same_socket(a: &str, b: &str) -> bool {
+    let canonical = |p: &str| {
+        let p = std::path::Path::new(p);
+        Some(
+            std::fs::canonicalize(p.parent()?)
+                .ok()?
+                .join(p.file_name()?),
+        )
+    };
+    canonical(a).is_some_and(|a| canonical(b) == Some(a))
+}
+
 /// Where [`RelayCtl`] sends what no session's host answers: a named socket, or the one `aterm-ctl` would resolve (re-resolved at every dial).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
@@ -213,6 +227,7 @@ impl RelayCtl {
             .rendezvous
             .as_deref()
             .and_then(|dir| aterm_ctl::hosting_sock(dir, sid))
+            .map(|host| self.endpoint_spelling(host))
         {
             let own = |c: &Conn| c.sock == host && matches!(c.carries, Carries::Own { .. });
             if let Some(at) = self.conns.iter().position(own) {
@@ -236,6 +251,21 @@ impl RelayCtl {
         let sock = self.endpoint_sock()?;
         let client = self.dial(&sock).map_err(DialError::words)?;
         Ok(self.hold(sock, Carries::Relayed(s.to_string()), client))
+    }
+
+    /// `host` in the endpoint's own spelling when the two name one socket (`/tmp/…` and
+    /// `/private/tmp/…`: a graph entry is published canonical, a `--control-sock` is kept as
+    /// given), so a session the endpoint hosts rides the endpoint's connection, under the token
+    /// the endpoint was given; otherwise `host`.
+    fn endpoint_spelling(&self, host: String) -> String {
+        let own = match &self.endpoint {
+            Endpoint::Socket(s) => Some(s.as_str()),
+            Endpoint::Resolved { .. } => self.resolved.as_deref(),
+        };
+        match own {
+            Some(own) if own != host && same_socket(own, &host) => own.to_string(),
+            _ => host,
+        }
     }
 
     fn drop_conn(&mut self, at: usize) {
@@ -859,6 +889,36 @@ mod tests {
             host.finish(),
             [vec!["AUTH hosttok", "@s-ab meta", "who", "@s-ab meta"]]
         );
+    }
+
+    /// A session the endpoint hosts, its graph entry naming the endpoint's socket by another
+    /// spelling (the canonical one a graph entry is published under, the endpoint given through a
+    /// symlinked folder as `--control-sock` takes it), rides the endpoint's own connection under
+    /// the endpoint's token, never a second connection under the token beside the socket.
+    #[test]
+    fn a_session_the_endpoint_hosts_under_another_spelling_rides_the_endpoints_token() {
+        let dir = crate::supervise::ScratchDir::new("relayctl", "spelling");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("the folder");
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("a symlinked spelling");
+        let endpoint = instance(
+            real.join("aterm-1.sock"),
+            Stand {
+                name: "endpoint",
+                relays: None,
+                answers: usize::MAX,
+            },
+        );
+        std::fs::write(real.join("aterm-1.token"), "besidetok\n").expect("token");
+        publish(&real, "s-ab", &endpoint.sock);
+        let given = alias.join("aterm-1.sock").to_string_lossy().into_owned();
+        let mut c =
+            RelayCtl::new(Endpoint::Socket(given), Some("tok".to_string())).in_rendezvous(&real);
+        assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK endpoint\n");
+        assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
+        drop(c);
+        assert_eq!(endpoint.finish(), [vec!["AUTH tok", "@s-ab meta", "meta"]]);
     }
 
     #[test]

@@ -17,11 +17,6 @@ enum Launches {
     /// Claude Code: read by its relaunch's own reader
     /// (`relaunch::caller_claude`).
     Claude,
-    /// A CLI known by its image and argv (`is`), typed by its PATH word:
-    /// Gemini CLI, whose image is `node` running its script.
-    Word {
-        is: fn(Option<&Path>, &[String]) -> bool,
-    },
     /// A CLI whose image is named by its word: its own path, or — where
     /// `store_build` says it is a build in atpkg's store — atpkg's managed
     /// twin (the path its relaunch lane types), else the word.
@@ -46,10 +41,6 @@ pub struct WorkerCli {
     pub model_flag: &'static str,
     /// CLI flag that trusts the starting folder for this run alone ([`Fresh::trusted_here`]).
     pub trust_flag: Option<&'static str>,
-    /// Environment variable naming a per-worker trusted-folders file ([`Fresh::trust_file`]).
-    pub trust_file_env: Option<&'static str>,
-    /// CLI flag that starts a new session under [`Fresh::session`].
-    pub session_flag: Option<&'static str>,
     /// Environment pairs set on a fresh start and dropped first when tight on space.
     pub nicety: &'static [(&'static str, &'static str)],
     /// Starter environment variables naming directories that must be absolute when carried.
@@ -64,8 +55,7 @@ pub struct WorkerCli {
     flags: fn(&[String]) -> Result<Vec<String>, String>,
 }
 
-/// No flag of a starter's rides: Claude Code (whose relaunch reads none) and
-/// Gemini CLI (whose homes are its environment's).
+/// No flag of a starter's rides: Claude Code (whose relaunch reads none).
 const fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
@@ -139,15 +129,13 @@ fn codex_home_env(args: &ProcArgs, user: &Path) -> Vec<(String, String)> {
 }
 
 /// Every worker harness `spawn` can start, one row per harness.
-pub static WORKERS: [WorkerCli; 5] = [
+pub static WORKERS: [WorkerCli; 4] = [
     WorkerCli {
         agent: Program::Claude,
         word: "claude",
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: None,
-        trust_file_env: None,
-        session_flag: None,
         nicety: &super::relaunch::CLAUDE_LAUNCH_ENV,
         dirs: &[super::accounts::HOME_ENV, super::accounts::HOMEDIR_ENV],
         launches: Launches::Claude,
@@ -160,8 +148,6 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: None,
-        trust_file_env: None,
-        session_flag: None,
         nicety: &[],
         dirs: &[super::codex_alab::HOME_ENV],
         launches: Launches::Alab,
@@ -175,37 +161,11 @@ pub static WORKERS: [WorkerCli; 5] = [
         },
     },
     WorkerCli {
-        agent: Program::Gemini,
-        word: super::upgrade_gemini::PROGRAM,
-        operand: upgrade::TASK_PROMPT_INTERACTIVE,
-        model_flag: "--model",
-        trust_flag: None,
-        trust_file_env: Some(super::upgrade_gemini::TRUSTED_FOLDERS_ENV),
-        session_flag: Some("--session-id"),
-        nicety: &[],
-        dirs: &[
-            super::upgrade_gemini::HOME_ENV,
-            super::upgrade_gemini::CLI_HOME_ENV,
-        ],
-        launches: Launches::Word {
-            is: super::upgrade_gemini::is_gemini_process,
-        },
-        homes: |args, home| {
-            super::upgrade_gemini::relaunch_env(|n| args.env_var(n), home)
-                .into_iter()
-                .filter(|(name, _)| name != super::upgrade_gemini::TRUSTED_FOLDERS_ENV)
-                .collect()
-        },
-        flags: no_flags,
-    },
-    WorkerCli {
         agent: Program::Agy,
         word: super::upgrade_agy::PROGRAM,
         operand: upgrade::TASK_PROMPT_INTERACTIVE,
         model_flag: "--model",
         trust_flag: None,
-        trust_file_env: None,
-        session_flag: None,
         nicety: &[],
         dirs: &[super::upgrade_agy::HOME_ENV],
         launches: Launches::Image {
@@ -220,8 +180,6 @@ pub static WORKERS: [WorkerCli; 5] = [
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
         trust_flag: Some("--trust-workspace"),
-        trust_file_env: None,
-        session_flag: None,
         nicety: &[],
         dirs: &[
             super::upgrade_muse::DATA_ENV,
@@ -337,7 +295,6 @@ pub(crate) fn starter_of(
 ) -> Option<Starter> {
     let exe = match cli.launches {
         Launches::Claude => return None,
-        Launches::Word { is } => is(image, &args.argv).then(|| PathBuf::from(cli.word))?,
         Launches::Image { store_build } => {
             let image =
                 image.filter(|i| i.file_name().and_then(|n| n.to_str()) == Some(cli.word))?;
@@ -371,52 +328,14 @@ pub struct Fresh<'a> {
     pub model: Option<&'a str>,
     /// Whether the shell stands in the folder its starter trusted for it.
     pub trusted_here: bool,
-    /// Per-worker trusted-folders file passed via [`WorkerCli::trust_file_env`].
-    pub trust_file: Option<&'a Path>,
-    /// New session id passed via [`WorkerCli::session_flag`].
-    pub session: Option<&'a str>,
-}
-
-/// Render the JSON text of a worker's `trustedFolders.json` trusting `folder` alone.
-#[must_use]
-pub fn trusted_folders_text(folder: &str) -> String {
-    let mut map = std::collections::BTreeMap::new();
-    map.insert(folder, "TRUST_FOLDER");
-    aterm_json::to_string(&map).unwrap_or_else(|_| String::from("{}"))
-}
-
-/// Generate a random v4 UUID for [`Fresh::session`].
-///
-/// # Errors
-/// The system random source failed ([`aterm_uds::rand::fill`]).
-pub fn fresh_session_id() -> std::io::Result<String> {
-    let mut b = [0u8; 16];
-    aterm_uds::rand::fill(&mut b)?;
-    Ok(session_id_of(b))
-}
-
-/// [`fresh_session_id`] of the 16 random bytes `b`.
-#[must_use]
-pub(crate) fn session_id_of(mut b: [u8; 16]) -> String {
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let h = aterm_codec::hex::encode_lower(&b);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &h[..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..]
-    )
 }
 
 /// Format the shell command line a worker runs at its first prompt.
 ///
 /// # Errors
 /// The line exceeds its budget, a carried directory is relative, the starter's argv holds a flag
-/// no table knows, `model` starts with `-`, the trusted-folders file is not an absolute path, or
-/// a variable [`Starter::unset`] removes is one its environment sets.
+/// no table knows, `model` starts with `-`, or a variable [`Starter::unset`] removes is one its
+/// environment sets.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -488,38 +407,13 @@ pub(super) fn line_of(
         flags.push(cli.model_flag.to_string());
         flags.push(model.to_string());
     }
-    if let (Some(flag), Some(id)) = (cli.session_flag, fresh.session) {
-        flags.push(flag.to_string());
-        flags.push(id.to_string());
-    }
-    let trust = match (cli.trust_file_env, fresh.trust_file) {
-        (Some(name), Some(file)) => {
-            let file = file
-                .to_str()
-                .filter(|f| Path::new(f).has_root())
-                .ok_or_else(|| {
-                    format!(
-                        "the trusted-folders file {} is no absolute path",
-                        file.display()
-                    )
-                })?;
-            Some((name, file))
-        }
-        _ => None,
-    };
-    let env: Vec<(&str, &str)> = env
-        .iter()
-        .copied()
-        .filter(|(name, _)| Some(*name) != cli.trust_file_env)
-        .chain(trust)
-        .collect();
     let both: Vec<(&str, &str)> = env
         .iter()
         .copied()
         .chain(cli.nicety.iter().copied())
         .collect();
     upgrade::task_line_env_clear(dialect, &both, unset, exe, &flags, cli.operand)
-        .or_else(|_| upgrade::task_line_env_clear(dialect, &env, unset, exe, &flags, cli.operand))
+        .or_else(|_| upgrade::task_line_env_clear(dialect, env, unset, exe, &flags, cli.operand))
 }
 
 #[cfg(test)]

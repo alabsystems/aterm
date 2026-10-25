@@ -20,8 +20,6 @@ pub const STALLED_AFTER_S: u64 = upgrade::RUNG_LAND_S + LAND_GRACE_S;
 /// The grace past the ladder's Land rung before an unmoved upgrade reads `overdue`.
 pub const LAND_GRACE_S: u64 = 4 * 3_600;
 
-const NO_LANE_WORDS: &str = "no lane of aterm's moves this agent, so nothing is asked or typed";
-
 const QUIET_LANE_WORDS: &str = "aterm restarts this agent onto a newer build at a genuinely \
                                 idle point and types nothing into it";
 
@@ -908,7 +906,7 @@ impl Row {
         let gate_spent = match self.agent {
             upgrade::Agent::Claude => self.wait.starts_with("release:") && self.release.is_empty(),
             upgrade::Agent::Codex => false,
-            upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => return None,
+            upgrade::Agent::Muse | upgrade::Agent::Agy => return None,
         };
         if gate_spent {
             return None;
@@ -975,7 +973,6 @@ impl Row {
                     "it moves once they are sent or cleared in its tab"
                 }
                 upgrade::Agent::Muse | upgrade::Agent::Agy => QUIET_LANE_WORDS,
-                upgrade::Agent::Gemini => NO_LANE_WORDS,
             },
             w if w.starts_with("announce-refused:") => {
                 "it tries again at the next quiet moment: nothing to do"
@@ -1013,10 +1010,7 @@ impl Row {
         let owed = matches!(self.phase, Phase::Pending | Phase::Announced { .. });
         let footed = match self.agent {
             upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => false,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
         };
         if !(owed && footed && self.moving(now)) {
             return None;
@@ -1080,10 +1074,7 @@ impl Row {
     pub fn rests_on_own_work(&self) -> bool {
         let rearms_at_work_end = match self.agent {
             upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => false,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
         };
         self.quiet
             && rearms_at_work_end
@@ -1226,10 +1217,7 @@ impl Row {
     fn unreached_status(&mut self, holders: &[Holder], unproven_tab: bool, now: u64) -> bool {
         let has_status = match self.agent {
             upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => false,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
         };
         if !has_status
             || !matches!(self.phase, Phase::Pending | Phase::Announced { .. })
@@ -2522,13 +2510,6 @@ impl Row {
                 ),
                 Some("agy".to_string()),
             ),
-            (upgrade::Agent::Gemini, _) => (
-                cut(
-                    "Start Gemini CLI in that tab with this command, then /resume",
-                    NEED_THEN_MAX,
-                ),
-                Some("gemini".to_string()),
-            ),
             (upgrade::Agent::Claude, why) if self.fresh => {
                 let then = if why == "shell-gone" {
                     "Open a new tab and start Claude Code there with this command"
@@ -2934,10 +2915,7 @@ impl Row {
     fn resume_then(&self, then: &str) -> String {
         let named = match self.agent {
             upgrade::Agent::Claude => resume_login(&self.line).is_some(),
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => false,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
         };
         format!(
             "{then}{}",
@@ -2959,12 +2937,6 @@ impl Row {
                 return (
                     cut(&format!("{then}, then /resume"), NEED_THEN_MAX),
                     Some("agy".to_string()),
-                );
-            }
-            upgrade::Agent::Gemini => {
-                return (
-                    cut(&format!("{then}, then /resume"), NEED_THEN_MAX),
-                    Some("gemini".to_string()),
                 );
             }
         }
@@ -3175,50 +3147,37 @@ fn now_moves_past(wait: &str) -> bool {
 pub(in crate::harness) fn wait_words_of(agent: upgrade::Agent, wait: &str) -> Option<&'static str> {
     match agent {
         upgrade::Agent::Claude => claude_wait_words(wait),
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => relaunch_line_words(wait),
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => {
+            relaunch_line_words(wait)
+        }
     }
 }
 
 const fn reads_ready_clock(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 
 const fn types_release(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 
 const fn attended_is_person(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 
 const fn held_again_after_exit(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 
@@ -3322,7 +3281,7 @@ fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
     let after_exit = match agent {
         upgrade::Agent::Claude => None,
         upgrade::Agent::Codex => kind.strip_prefix("failed:").and_then(codex_failure),
-        upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => None,
+        upgrade::Agent::Muse | upgrade::Agent::Agy => None,
     };
     if let Some(words) = after_exit {
         return words.to_string();
@@ -3361,7 +3320,7 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
     let who = match agent {
         upgrade::Agent::Claude => "Claude",
         upgrade::Agent::Codex => "Codex",
-        upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => agent.product(),
+        upgrade::Agent::Muse | upgrade::Agent::Agy => agent.product(),
     };
     match why {
         "signal-refused" => format!("the system refused to stop the old {who}"),
@@ -3450,7 +3409,6 @@ pub(super) fn stuck_words(agent: upgrade::Agent, what: &str) -> &'static str {
             "the line that resumes it on the new build was typed, and the agy it started has not \
              taken its conversation yet; nothing is forced"
         }
-        (upgrade::Agent::Gemini, _) => NO_LANE_WORDS,
         (upgrade::Agent::Claude | upgrade::Agent::Codex, _) => {
             "the line that resumes it was typed, and the agent it started has not reached an \
              idle point, perhaps behind a box that waits on a person; nothing is forced"
@@ -3716,7 +3674,6 @@ fn holders(
             .flat_map(|agent| match agent {
                 upgrade::Agent::Muse => super::muse::holders(sessions, tabs),
                 upgrade::Agent::Agy => super::agy::holders(sessions, tabs),
-                upgrade::Agent::Gemini => super::gemini::holders(sessions, tabs),
                 upgrade::Agent::Codex | upgrade::Agent::Claude => Vec::new(),
             })
             .map(|h| Holder {
@@ -4008,9 +3965,7 @@ fn ask_within(
         let begun = match st.agent {
             upgrade::Agent::Claude => "once the agent is signalled",
             upgrade::Agent::Codex => "once its `/exit` is typed",
-            upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-                "by any lane: no lane moves this agent"
-            }
+            upgrade::Agent::Muse | upgrade::Agent::Agy => "by any lane: no lane moves this agent",
         };
         return Err(format!(
             "the restart in tab {sid} is already under way: it is not held or hurried {begun}"
@@ -4100,7 +4055,7 @@ fn ask_within(
                             word(why),
                             word(&session)
                         ),
-                        upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
+                        upgrade::Agent::Muse | upgrade::Agent::Agy => {
                             format!(
                                 "the upgrade in tab {sid} stopped ({}): no lane of aterm's moves \
                                  this agent, and `--skip` quiets this record",

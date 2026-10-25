@@ -736,7 +736,7 @@ fn each_lens_shows_its_sections() {
     let tokens = heard(&snap, pinned(Instrument::Tokens));
     let details = well(&tokens, "Details");
     assert!(details.contains("No current plan reading"), "{details}");
-    assert!(details.contains("Codex, Gemini and agy tabs are not counted"));
+    assert!(details.contains("Codex and agy tabs are not counted"));
     let gpu = heard(&snap, pinned(Instrument::Gpu));
     assert!(well(&gpu, "Details").contains("no per-app GPU figure on macOS"));
     assert!(well(&gpu, "Details").contains("not read"));

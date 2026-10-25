@@ -142,9 +142,25 @@ impl TrickFlash {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     const fn base_y_slice(&self) -> &[(Option<u64>, i64)] {
         self.base_y.split_at(self.base_y_len as usize).0
+    }
+
+    #[inline]
+    const fn lookup_base_y(&self, target: Option<u64>) -> Option<i64> {
+        let len = self.base_y_len as usize;
+        let mut idx = 0;
+        while idx < len {
+            if matches!((self.base_y[idx].0, target), (None, None))
+                || matches!((self.base_y[idx].0, target), (Some(a), Some(b)) if a == b)
+            {
+                return Some(self.base_y[idx].1);
+            }
+            idx += 1;
+        }
+        None
     }
 
     /// The host's declaration for the one rescan it is about to run in `scope`, which spends it.
@@ -178,21 +194,24 @@ impl TrickFlash {
         let mut w = 0usize;
         for r in 0..usize::from(self.base_y_len) {
             let entry = self.base_y[r];
-            if entry.0.is_none_or(&keep) {
+            let keep_entry = match entry.0 {
+                None => true,
+                Some(pane) => keep(pane),
+            };
+            if keep_entry {
                 self.base_y[w] = entry;
                 w += 1;
             }
         }
         self.base_y_len = w as u8;
-        if self
-            .declared
-            .is_some_and(|(pane, _)| pane.is_some_and(|pane| !keep(pane)))
+        if let Some((Some(pane), _)) = self.declared
+            && !keep(pane)
         {
             self.declared = None;
         }
-        if self
-            .slot
-            .is_some_and(|slot| slot.pane.is_some_and(|pane| !keep(pane)))
+        if let Some(slot) = &self.slot
+            && let Some(pane) = slot.pane
+            && !keep(pane)
         {
             self.slot = None;
         }
@@ -255,9 +274,8 @@ impl TrickFlash {
             return;
         };
         const MIN_ANIMATION_DUR: Duration = Duration::from_millis(MIN_ANIMATION_MS as u64);
-        if self
-            .last_start
-            .is_some_and(|started| now.saturating_duration_since(started) < MIN_ANIMATION_DUR)
+        if let Some(started) = self.last_start
+            && now.saturating_duration_since(started) < MIN_ANIMATION_DUR
         {
             return;
         }
@@ -285,11 +303,7 @@ impl TrickFlash {
         if len == 0 {
             return;
         }
-        let base_y = self
-            .base_y_slice()
-            .iter()
-            .find(|(key, _)| *key == pane.or(scope))
-            .map(|(_, y)| *y);
+        let base_y = self.lookup_base_y(pane.or(scope));
         self.slot = Some(Slot {
             at: now,
             pane,
@@ -370,10 +384,10 @@ impl TrickFlash {
         row_buf: &mut Vec<RenderCell>,
         mut load_row: impl FnMut(usize, &mut Vec<RenderCell>),
     ) {
-        let base_y_now = self
-            .declared
-            .take()
-            .and_then(|(declared_for, y)| (declared_for == scope).then_some(y));
+        let base_y_now = match self.declared.take() {
+            Some((declared_for, y)) if declared_for == scope => Some(y),
+            _ => None,
+        };
         if cursor.is_some() {
             self.remember_base_y(scope, base_y_now);
         }
@@ -389,7 +403,7 @@ impl TrickFlash {
         };
         let grid_cols = u16::try_from(cols).unwrap_or(u16::MAX);
         self.slot = match slot.located {
-            Some(loc) => follow(
+            Some(loc) => match follow(
                 &slot,
                 loc,
                 base_y_now,
@@ -397,11 +411,13 @@ impl TrickFlash {
                 grid_cols,
                 row_buf,
                 &mut load_row,
-            )
-            .map(|loc| {
-                slot.located = Some(loc);
-                slot
-            }),
+            ) {
+                Some(loc) => {
+                    slot.located = Some(loc);
+                    Some(slot)
+                }
+                None => None,
+            },
             None if millis_since(now, slot.at) > GIVE_UP_MS => None,
             None => match locate(
                 &slot,
@@ -467,7 +483,7 @@ impl TrickFlash {
                 0
             };
             let col = loc.cols[i];
-            let cell = if ink.last().is_none_or(|c| (c.row, c.col) < (loc.row, col)) {
+            let cell = if !matches!(ink.last(), Some(c) if (c.row, c.col) >= (loc.row, col)) {
                 let cell = InkCell {
                     row: loc.row,
                     col,
@@ -666,7 +682,12 @@ const fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
             let corner = corners[idx];
             let lum =
                 crate::color_math::relative_luminance_with(table, mix_rgb(fg, corner, strength));
-            let contrast = (lum.max(lum_bg) + 0.05) / (lum.min(lum_bg) + 0.05);
+            let (hi_lum, lo_lum) = if lum >= lum_bg {
+                (lum, lum_bg)
+            } else {
+                (lum_bg, lum)
+            };
+            let contrast = (hi_lum + 0.05) / (lo_lum + 0.05);
             if (lum >= lum_bg) != text_is_lighter || contrast < floor {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
@@ -735,40 +756,53 @@ fn find_in_row(
     let three_plus_two_back = 3 + two_back;
     let reach = i64::from(TYPED_EDIT_REACH_COLS) + two_back + 2;
     let cursor = cursor_col.map(i64::from);
-    let max_start =
-        usize::try_from(caret + reach).map_or(0, |m| m.saturating_add(1).min(cells.len()));
+    let max_start = match usize::try_from(caret + reach) {
+        Ok(m) => m.saturating_add(1).min(cells.len()),
+        Err(_) => 0,
+    };
     let mut best: Option<Hit> = None;
     for start in 0..max_start {
         if cells[start].wide || cells[start].ch != first {
             continue;
         }
-        let before = cells[..start].iter().rev().find(|cell| !cell.wide);
-        if before.is_some_and(|cell| is_word_char(cell.ch)) {
+        let mut prev = start;
+        let mut word_before = false;
+        while prev > 0 {
+            prev -= 1;
+            if !cells[prev].wide {
+                word_before = is_word_char(cells[prev].ch);
+                break;
+            }
+        }
+        if word_before {
             continue;
         }
         let mut cols = [0u16; MAX_CHARS];
         let mut at = start;
         let mut matched = true;
-        for (k, want) in seq.iter().enumerate() {
-            while cells.get(at).is_some_and(|cell| cell.wide) {
+        for k in 0..seq.len() {
+            let want = seq[k];
+            while at < cells.len() && cells[at].wide {
                 at += 1;
             }
-            match (cells.get(at), u16::try_from(at)) {
-                (Some(cell), Ok(col)) if cell.ch == *want => cols[k] = col,
-                _ => {
-                    matched = false;
-                    break;
-                }
+            if at < cells.len()
+                && cells[at].ch == want
+                && let Ok(col) = u16::try_from(at)
+            {
+                cols[k] = col;
+            } else {
+                matched = false;
+                break;
             }
             at += 1;
         }
         if !matched {
             continue;
         }
-        while cells.get(at).is_some_and(|cell| cell.wide) {
+        while at < cells.len() && cells[at].wide {
             at += 1;
         }
-        if cells.get(at).is_some_and(|cell| is_word_char(cell.ch)) {
+        if at < cells.len() && is_word_char(cells[at].ch) {
             continue;
         }
         let (start, end) = (start as i64, at as i64 - 1);
@@ -786,12 +820,12 @@ fn find_in_row(
             Anchor::Exact
         } else if (start - two_back..=end_1_two_back).contains(&caret) {
             Anchor::Inside
-        } else if cursor.is_some_and(|at| (end_1..=end + three_plus_two_back).contains(&at)) {
+        } else if matches!(cursor, Some(at) if (end_1..=end + three_plus_two_back).contains(&at)) {
             Anchor::Slack
         } else {
             continue;
         };
-        if best.is_none_or(|b| anchor >= b.anchor) {
+        if !matches!(best, Some(b) if anchor < b.anchor) {
             best = Some(Hit { cols, anchor });
         }
     }
@@ -816,7 +850,7 @@ fn find_word(
         cursor_col,
         exact_only,
     );
-    if !slot.rtl || typed.is_some_and(|h| h.anchor == Anchor::Exact) {
+    if !slot.rtl || matches!(typed, Some(h) if h.anchor == Anchor::Exact) {
         return typed.map(|hit| (hit, false));
     }
     let mut mirror = slot.chars;
@@ -865,7 +899,9 @@ fn locate(
 ) -> Option<Located> {
     let (expected, delta) = scrolled(slot.caret.0, slot.base_y, base_y_now);
     let mut found = None;
-    if let Some(row) = usize::try_from(expected).ok().filter(|row| *row < rows) {
+    if let Ok(row) = usize::try_from(expected)
+        && row < rows
+    {
         load_row(row, row_buf);
         let cursor_col = (usize::from(cursor.0) == row).then_some(cursor.1);
         found = find_word(slot, row_buf, cursor_col, false).map(|hit| (row, hit));
@@ -911,21 +947,28 @@ fn follow(
         return None;
     }
     let (row, _) = scrolled(loc.row, loc.base_y, base_y_now);
-    let row = usize::try_from(row).ok().filter(|row| *row < rows)?;
+    let Ok(row) = usize::try_from(row) else {
+        return None;
+    };
+    if row >= rows {
+        return None;
+    }
     load_row(row, row_buf);
     let n = usize::from(slot.len);
-    let still_there = (0..n).all(|i| {
+    for i in 0..n {
         let want = slot.chars[if loc.mirrored { n - 1 - i } else { i }];
-        row_buf
-            .get(usize::from(loc.cols[i]))
-            .is_some_and(|cell| !cell.wide && cell.ch == want)
-    });
-    if !still_there {
-        return None;
+        let col_idx = usize::from(loc.cols[i]);
+        if col_idx >= row_buf.len() || row_buf[col_idx].wide || row_buf[col_idx].ch != want {
+            return None;
+        }
     }
     loc.row = u16::try_from(row).ok()?;
     loc.base_y = base_y_now;
-    capture(&mut loc, n, row_buf).then_some(loc)
+    if capture(&mut loc, n, row_buf) {
+        Some(loc)
+    } else {
+        None
+    }
 }
 
 /// Capture what a frame needs from the located row: each lead cell's resolved fg

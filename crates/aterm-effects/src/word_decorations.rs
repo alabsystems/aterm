@@ -1341,7 +1341,10 @@ impl ScanMemo {
     fn matches(&self, text: &str) -> &[Match] {
         let m = self.hot.get(text);
         debug_assert!(m.is_some(), "touch_len() proved residency");
-        m.map_or(&[][..], Vec::as_slice)
+        match m {
+            Some(v) => v.as_slice(),
+            None => &[],
+        }
     }
 
     fn remember(&mut self, text: &str, matches: &[Match]) {
@@ -1355,13 +1358,11 @@ impl ScanMemo {
             self.install(text.to_owned(), matches.to_vec());
             return;
         }
-        let (mut key, mut value) = self.spare.pop().unwrap_or_else(|| {
-            #[cfg(test)]
-            {
-                self.fresh_buffers += 1;
-            }
-            (String::new(), Vec::new())
-        });
+        #[cfg(test)]
+        if self.spare.is_empty() {
+            self.fresh_buffers += 1;
+        }
+        let (mut key, mut value) = self.spare.pop().unwrap_or_default();
         key.clear();
         key.push_str(text);
         value.clear();
@@ -1581,9 +1582,9 @@ impl ParkedPane {
             let Some(end) = burst_mutex_end(ep) else {
                 continue;
             };
-            any = Some(any.map_or(end, |m: Instant| m.max(end)));
+            arm_until(&mut any, end);
             if matches!(ep.burst_kind, Some(BurstKind::SuperNova)) {
-                sup = Some(sup.map_or(end, |m: Instant| m.max(end)));
+                arm_until(&mut sup, end);
             }
         }
         (any, sup)
@@ -1648,9 +1649,11 @@ impl WordDecorations {
                 .iter()
                 .min_by_key(|&(key, resident)| (resident.last_seen, *key))
                 .map(|(key, resident)| (*key, resident.last_seen));
-            if oldest.is_none_or(|(oldest_ident, oldest_seen)| {
-                (ep.last_seen, ident) <= (oldest_seen, oldest_ident)
-            }) {
+            if !matches!(
+                oldest,
+                Some((oldest_ident, oldest_seen))
+                    if (ep.last_seen, ident) > (oldest_seen, oldest_ident)
+            ) {
                 self.mark_persist_departure(ident, &ep);
                 debug_assert!(self.persist.len() <= PERSIST_CAP);
                 return false;
@@ -1706,7 +1709,10 @@ impl WordDecorations {
                 }
             }
         }
-        let mut slot = self.parked.remove(&key).unwrap_or_else(ParkedPane::fresh);
+        let mut slot = match self.parked.remove(&key) {
+            Some(s) => s,
+            None => ParkedPane::fresh(),
+        };
         slot.swap(self);
         self.bound = Some(key);
     }
@@ -1729,7 +1735,7 @@ impl WordDecorations {
             match self.scan_session {
                 Some(prev) => self.park_live_state(prev),
                 None if self.have_scanned
-                    || session.is_none_or(|s| !self.parked.contains_key(&s)) =>
+                    || !matches!(session, Some(s) if self.parked.contains_key(&s)) =>
                 {
                     if let Some(s) = session {
                         self.parked.remove(&s);
@@ -1743,7 +1749,10 @@ impl WordDecorations {
         }
         self.scan_session = session;
         if let Some(next) = session {
-            let mut slot = self.parked.remove(&next).unwrap_or_else(ParkedPane::fresh);
+            let mut slot = match self.parked.remove(&next) {
+                Some(s) => s,
+                None => ParkedPane::fresh(),
+            };
             slot.swap(self);
         }
         self.have_scanned = false;
@@ -1776,8 +1785,8 @@ impl WordDecorations {
     pub fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
         self.trick_flash.retain_panes(&keep);
         self.parked.retain(|k, _| keep(*k));
-        let bound_gone = self.bound.is_some_and(|cur| !keep(cur));
-        let session_gone = self.scan_session.is_some_and(|cur| !keep(cur));
+        let bound_gone = matches!(self.bound, Some(cur) if !keep(cur));
+        let session_gone = matches!(self.scan_session, Some(cur) if !keep(cur));
         if bound_gone {
             self.bound = None;
             self.pane_px = (0, 0);
@@ -1909,14 +1918,14 @@ impl WordDecorations {
         for ep in self.persist.values_mut() {
             ep.appeared += d;
             ep.last_seen += d;
-            if let Some(s) = ep.nova_start {
-                ep.nova_start = Some(s + d);
+            if let Some(s) = &mut ep.nova_start {
+                *s += d;
             }
-            if let Some(s) = ep.phase_start {
-                ep.phase_start = Some(s + d);
+            if let Some(s) = &mut ep.phase_start {
+                *s += d;
             }
-            if let Some(s) = ep.peek_pause {
-                ep.peek_pause = Some(s + d);
+            if let Some(s) = &mut ep.peek_pause {
+                *s += d;
             }
         }
         for occ in &mut self.occ {
@@ -1925,17 +1934,17 @@ impl WordDecorations {
         for reservation in &mut self.ignitions {
             reservation.start += d;
         }
-        if let Some(a) = self.active_until {
-            self.active_until = Some(a + d);
+        if let Some(a) = &mut self.active_until {
+            *a += d;
         }
-        if let Some(s) = self.settle_until {
-            self.settle_until = Some(s + d);
+        if let Some(s) = &mut self.settle_until {
+            *s += d;
         }
-        if let Some(s) = self.super_until {
-            self.super_until = Some(s + d);
+        if let Some(s) = &mut self.super_until {
+            *s += d;
         }
-        if let Some(h) = self.burst_hint {
-            self.burst_hint = Some(h + d);
+        if let Some(h) = &mut self.burst_hint {
+            *h += d;
         }
     }
 
@@ -2099,13 +2108,13 @@ impl WordDecorations {
             cols: layout.geom.cols,
             source: self.kitty_gen,
         };
-        let stale = self
-            .kitty_cursor_placement
-            .last_emitted_at
-            .is_none_or(|at| {
+        let stale = match self.kitty_cursor_placement.last_emitted_at {
+            Some(at) => {
                 motion.sampled_at.saturating_duration_since(at)
                     >= crate::kitty_cursor::CURSOR_FOLD_DURATION
-            });
+            }
+            None => true,
+        };
         if self.kitty_cursor_placement.key != Some(key) || stale {
             self.kitty_cursor_placement.key = Some(key);
             self.kitty_cursor_placement.last_target = Some(target);
@@ -2147,18 +2156,21 @@ impl WordDecorations {
         }
         self.kitty_cursor_placement.last_target = Some(target);
 
-        let Some(active) = self
-            .kitty_cursor_placement
-            .active
-            .filter(|active| active.started == fold.started && active.direction == fold.direction)
-        else {
-            return Some(KittyCursorPlacement {
-                sample: target,
-                leg: KittyCursorPlacementLeg::Settled,
-                facing_left: motion.facing_left,
-                sampled_at: Some(motion.sampled_at),
-                drawn: None,
-            });
+        let active = match self.kitty_cursor_placement.active {
+            Some(active)
+                if active.started == fold.started && active.direction == fold.direction =>
+            {
+                active
+            }
+            _ => {
+                return Some(KittyCursorPlacement {
+                    sample: target,
+                    leg: KittyCursorPlacementLeg::Settled,
+                    facing_left: motion.facing_left,
+                    sampled_at: Some(motion.sampled_at),
+                    drawn: None,
+                });
+            }
         };
         let progress = if fold.progress.is_finite() {
             fold.progress.clamp(0.0, 1.0)
@@ -2290,29 +2302,36 @@ impl WordDecorations {
                     let bob_px = (bob * ch).round() as i32;
                     let rest = (base_x as f32, (footprint.y - bob_px) as f32);
                     let prev_at = self.kitty_cursor_placement.last_emitted_at;
-                    let fresh = prev_at.is_some_and(|prev| {
-                        at.saturating_duration_since(prev)
-                            < crate::kitty_cursor::CURSOR_FOLD_DURATION
-                    });
-                    let followed = settle
-                        .or_else(|| {
-                            fresh
-                                .then_some(self.kitty_cursor_placement.last_sprite)
-                                .flatten()
-                                .map(|(sx, sy)| {
-                                    ((sx - scale_dx) as f32, (sy - bob_px - scale_dy) as f32)
-                                })
-                        })
-                        .filter(|p| fresh && (rest.1 - p.1).abs() <= 2.0 * ch);
+                    let fresh = match prev_at {
+                        Some(prev) => {
+                            at.saturating_duration_since(prev)
+                                < crate::kitty_cursor::CURSOR_FOLD_DURATION
+                        }
+                        None => false,
+                    };
+                    let followed_cand = if let Some(s) = settle {
+                        Some(s)
+                    } else if fresh && let Some((sx, sy)) = self.kitty_cursor_placement.last_sprite
+                    {
+                        Some(((sx - scale_dx) as f32, (sy - bob_px - scale_dy) as f32))
+                    } else {
+                        None
+                    };
+                    let followed = match followed_cand {
+                        Some(p) if fresh && (rest.1 - p.1).abs() <= 2.0 * ch => Some(p),
+                        _ => None,
+                    };
                     match followed {
                         Some((mut px, mut py)) => {
-                            let dt = prev_at
-                                .map(|prev| at.saturating_duration_since(prev).as_secs_f32())
-                                .unwrap_or(0.0)
-                                .min(0.1);
+                            let dt = match prev_at {
+                                Some(prev) => {
+                                    at.saturating_duration_since(prev).as_secs_f32().min(0.1)
+                                }
+                                None => 0.0,
+                            };
                             if dt > 0.0 && (px != rest.0 || py != rest.1) {
                                 const INV_PLACE_TAU: f32 = 1.0 / WordDecorations::PLACE_TAU;
-                                let alpha = 1.0 - (-dt * INV_PLACE_TAU).exp();
+                                let alpha = 1.0 - crate::color_math::exp_f32(-dt * INV_PLACE_TAU);
                                 px += (rest.0 - px) * alpha;
                                 py += (rest.1 - py) * alpha;
                             }
@@ -2463,12 +2482,17 @@ impl WordDecorations {
                 h,
                 eyes: pose.eyes,
             };
-            let tile = self.cat_baker.get_v4(&key).or_else(|| {
-                [EyesFrame::Open, EyesFrame::Happy, EyesFrame::Blink]
-                    .into_iter()
-                    .filter(|&eyes| eyes != key.eyes)
-                    .find_map(|eyes| self.cat_baker.peek_v4(&BakeKeyV4 { eyes, ..key }))
-            });
+            let mut tile = self.cat_baker.get_v4(&key);
+            if tile.is_none() {
+                for eyes in [EyesFrame::Open, EyesFrame::Happy, EyesFrame::Blink] {
+                    if eyes != key.eyes {
+                        tile = self.cat_baker.peek_v4(&BakeKeyV4 { eyes, ..key });
+                        if tile.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
             let Some(tile) = tile else {
                 // Cached tile not yet baked.
                 return None;
@@ -2477,9 +2501,10 @@ impl WordDecorations {
         };
         let (nat_w, nat_h) = (w, h);
         let flip_x = placement.facing_left;
-        let draw = placement
-            .drawn
-            .unwrap_or_else(|| self.kitty_cursor_draw_geometry(geom, bob, pose, placement));
+        let draw = match placement.drawn {
+            Some(d) => d,
+            None => self.kitty_cursor_draw_geometry(geom, bob, pose, placement),
+        };
         let CatFootprint {
             x: sprite_x,
             y: sprite_y,
@@ -2524,7 +2549,10 @@ impl WordDecorations {
             let alpha_scale = f32::from(alpha) * INV_255 * sing;
             let cw_f = f32::from(geom.cell_w);
             let ch_f = f32::from(geom.cell_h);
-            for note in notes.iter().flatten() {
+            for note in &notes {
+                let Some(note) = note else {
+                    continue;
+                };
                 let a = (f32::from(note.alpha) * alpha_scale) as u8;
                 if a == 0 {
                     continue;
@@ -2612,63 +2640,69 @@ impl WordDecorations {
         let nat_h = (nat_h as i32).clamp(1, i32::from(u16::MAX)) as u16;
         let nat_w = (nat_w as i32).clamp(1, i32::from(u16::MAX)) as u16;
 
-        let sprite = pet
-            .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
-            .and_then(|(x0, x1, y0, y1)| {
-                let key = crate::pet_baker::PetBakeKey {
-                    pose: pet.pose,
-                    coat,
-                    iris,
-                    colors,
-                    w: nat_w,
-                    h: nat_h,
-                };
-                let host = key.host_id();
-                let resolved = self
-                    .pet_baker
-                    .tile(&key)
-                    .and_then(|rgba| self.cat_baker.host_tile(host, nat_w, nat_h, rgba))
-                    .or_else(|| self.cat_baker.host_peek(host))
-                    .map(|t| t.art);
-                let art = match resolved {
-                    Some(art) => {
-                        if !self.pet_last_tile.as_ref().is_some_and(
-                            |(held_art, pose, held_host, held_coat, held_iris)| {
-                                Arc::ptr_eq(held_art, &art)
-                                    && (*pose, *held_host, *held_coat, *held_iris)
-                                        == (key.pose, host, coat, iris)
-                            },
-                        ) {
-                            self.pet_last_tile =
-                                Some((Arc::clone(&art), key.pose, host, coat, iris));
+        let sprite = if let Some((x0, x1, y0, y1)) =
+            pet.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
+        {
+            let key = crate::pet_baker::PetBakeKey {
+                pose: pet.pose,
+                coat,
+                iris,
+                colors,
+                w: nat_w,
+                h: nat_h,
+            };
+            let host = key.host_id();
+            let resolved_tile = match self.pet_baker.tile(&key) {
+                Some(rgba) => match self.cat_baker.host_tile(host, nat_w, nat_h, rgba) {
+                    Some(t) => Some(t),
+                    None => self.cat_baker.host_peek(host),
+                },
+                None => self.cat_baker.host_peek(host),
+            };
+            let resolved_art = match resolved_tile {
+                Some(t) => {
+                    let art = t.art;
+                    let already_held = match &self.pet_last_tile {
+                        Some((held_art, pose, held_host, held_coat, held_iris)) => {
+                            Arc::ptr_eq(held_art, &art)
+                                && (*pose, *held_host, *held_coat, *held_iris)
+                                    == (key.pose, host, coat, iris)
                         }
-                        art
+                        None => false,
+                    };
+                    if !already_held {
+                        self.pet_last_tile = Some((Arc::clone(&art), key.pose, host, coat, iris));
                     }
-                    None => self
-                        .pet_last_tile
-                        .as_ref()
-                        .filter(|(.., held_coat, held_iris)| {
-                            (*held_coat, *held_iris) == (coat, iris)
-                        })
-                        .map(|(art, ..)| Arc::clone(art))?,
-                };
-                Some(FreeSprite {
-                    x: x0,
-                    y: y0,
-                    w: (x1 - x0).clamp(1, i32::from(u16::MAX)) as u16,
-                    h: (y1 - y0).clamp(1, i32::from(u16::MAX)) as u16,
-                    art,
-                    clip: PxRect::EVERYWHERE,
-                    tint: 0x00FF_FFFF,
-                    alpha: pet.alpha,
-                    flip_x: pet.facing_left,
-                    z: if pet.under_ink {
-                        FreeZ::UnderText
-                    } else {
-                        FreeZ::OverText
-                    },
-                })
-            });
+                    Some(art)
+                }
+                None => match &self.pet_last_tile {
+                    Some((art, _, _, held_coat, held_iris))
+                        if (*held_coat, *held_iris) == (coat, iris) =>
+                    {
+                        Some(Arc::clone(art))
+                    }
+                    _ => None,
+                },
+            };
+            resolved_art.map(|art| FreeSprite {
+                x: x0,
+                y: y0,
+                w: (x1 - x0).clamp(1, i32::from(u16::MAX)) as u16,
+                h: (y1 - y0).clamp(1, i32::from(u16::MAX)) as u16,
+                art,
+                clip: PxRect::EVERYWHERE,
+                tint: 0x00FF_FFFF,
+                alpha: pet.alpha,
+                flip_x: pet.facing_left,
+                z: if pet.under_ink {
+                    FreeZ::UnderText
+                } else {
+                    FreeZ::OverText
+                },
+            })
+        } else {
+            None
+        };
 
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [const { None }; crate::kitty_pet::PET_MOTES_MAX];
@@ -2693,10 +2727,9 @@ impl WordDecorations {
                 }
                 let bucket = Self::pet_mote_rot_bucket(m.rot);
                 let host = Self::pet_mote_host_id(m.kind, bucket, side);
-                let Some(tile) = self.cat_baker.host_peek(host).or_else(|| {
-                    if !self.cat_baker.can_bake() {
-                        return None;
-                    }
+                let tile = if let Some(t) = self.cat_baker.host_peek(host) {
+                    Some(t)
+                } else if self.cat_baker.can_bake() {
                     let side_u32 = u32::from(side);
                     let paint = match &mut self.mote_scratch {
                         Some(tile) => {
@@ -2707,8 +2740,15 @@ impl WordDecorations {
                     };
                     Self::paint_pet_mote(paint, m.kind, bucket, side);
                     self.cat_baker.host_tile(host, side, side, paint.pixels())
-                }) else {
+                } else {
+                    None
+                };
+                let Some(tile) = tile else {
                     continue;
+                };
+                let raw_tint = match m.rgb {
+                    Some(rgb) => rgb,
+                    None => Self::pet_mote_tint(m.kind, colors),
                 };
                 *slot = Some(FreeSprite {
                     x,
@@ -2717,11 +2757,7 @@ impl WordDecorations {
                     h: dest,
                     art: tile.art,
                     clip: PxRect::EVERYWHERE,
-                    tint: Self::pet_mote_on_page(
-                        m.kind,
-                        m.rgb.unwrap_or_else(|| Self::pet_mote_tint(m.kind, colors)),
-                        page,
-                    ),
+                    tint: Self::pet_mote_on_page(m.kind, raw_tint, page),
                     alpha,
                     flip_x: false,
                     z: FreeZ::OverText,
@@ -2731,9 +2767,12 @@ impl WordDecorations {
         let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
             [const { None }; crate::kitty_pet::PET_DEPARTURES_MAX];
         for (slot, d) in depart_sprites.iter_mut().zip(pet.departures) {
-            let Some(d) = d.filter(|d| !d.own_glass) else {
+            let Some(d) = d else {
                 continue;
             };
+            if d.own_glass {
+                continue;
+            }
             *slot = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h));
         }
         let mut fp = FNV64_OFFSET;
@@ -2826,23 +2865,31 @@ impl WordDecorations {
             h: nat_h,
         };
         let host = key.host_id();
-        let resolved = self
-            .pet_baker
-            .tile(&key)
-            .and_then(|rgba| self.cat_baker.host_tile(host, nat_w, nat_h, rgba))
-            .or_else(|| self.cat_baker.host_peek(host))
-            .map(|t| t.art);
-        let art = match resolved {
-            Some(art) => {
+        let resolved_tile = match self.pet_baker.tile(&key) {
+            Some(rgba) => match self.cat_baker.host_tile(host, nat_w, nat_h, rgba) {
+                Some(t) => Some(t),
+                None => self.cat_baker.host_peek(host),
+            },
+            None => self.cat_baker.host_peek(host),
+        };
+        let art = match resolved_tile {
+            Some(t) => {
+                let art = t.art;
                 self.hold_departure_tile(d.id, (&art, host), &pet.departures);
                 art
             }
-            None => self
-                .pet_depart_tiles
-                .iter()
-                .flatten()
-                .find(|(id, ..)| *id == d.id)
-                .map(|(_, art, _)| Arc::clone(art))?,
+            None => {
+                let mut held_art = None;
+                for slot in &self.pet_depart_tiles {
+                    if let Some((id, art, _)) = slot
+                        && *id == d.id
+                    {
+                        held_art = Some(Arc::clone(art));
+                        break;
+                    }
+                }
+                held_art?
+            }
         };
         Some(FreeSprite {
             x: x0,
@@ -2882,12 +2929,12 @@ impl WordDecorations {
         {
             return None;
         }
-        let d = pet
-            .departures
-            .get(slot)
-            .copied()
-            .flatten()
-            .filter(|d| d.own_glass)?;
+        let Some(Some(d)) = pet.departures.get(slot).copied() else {
+            return None;
+        };
+        if !d.own_glass {
+            return None;
+        }
         let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(geom.cell_h)).round();
         let nat_w = (nat_h * crate::kitty_pet::ART_ASPECT).round();
         let nat = (
@@ -3163,30 +3210,32 @@ impl WordDecorations {
             h,
         };
         let host = key.host_id();
-        let resolved = self
-            .dog_baker
-            .tile(&key)
-            .and_then(|rgba| self.cat_baker.host_tile(host, w, h, rgba))
-            .or_else(|| self.cat_baker.host_peek(host))
-            .map(|t| t.art);
-        let art =
-            match resolved {
-                Some(art) => {
-                    if !self.dog_last_tile.as_ref().is_some_and(
-                        |(held_art, held_host, held_look)| {
-                            Arc::ptr_eq(held_art, &art) && (*held_host, *held_look) == (host, look)
-                        },
-                    ) {
-                        self.dog_last_tile = Some((Arc::clone(&art), host, look));
+        let resolved_tile = match self.dog_baker.tile(&key) {
+            Some(rgba) => match self.cat_baker.host_tile(host, w, h, rgba) {
+                Some(t) => Some(t),
+                None => self.cat_baker.host_peek(host),
+            },
+            None => self.cat_baker.host_peek(host),
+        };
+        let art = match resolved_tile {
+            Some(t) => {
+                let art = t.art;
+                let already_held = match &self.dog_last_tile {
+                    Some((held_art, held_host, held_look)) => {
+                        Arc::ptr_eq(held_art, &art) && (*held_host, *held_look) == (host, look)
                     }
-                    art
+                    None => false,
+                };
+                if !already_held {
+                    self.dog_last_tile = Some((Arc::clone(&art), host, look));
                 }
-                None => self
-                    .dog_last_tile
-                    .as_ref()
-                    .filter(|(_, _, held)| *held == look)
-                    .map(|(art, ..)| Arc::clone(art))?,
-            };
+                art
+            }
+            None => match &self.dog_last_tile {
+                Some((art, _, held)) if *held == look => Arc::clone(art),
+                _ => return None,
+            },
+        };
 
         let cursor_left = i32::from(ccol).saturating_mul(cw);
         let trail = cw.saturating_mul(Self::DOG_TRAIL_NUM) / Self::DOG_TRAIL_DEN;
@@ -3245,21 +3294,20 @@ impl WordDecorations {
             } => {
                 let valid = w > 0
                     && h > 0
-                    && usize::from(w)
-                        .checked_mul(usize::from(h))
-                        .and_then(|pixels| pixels.checked_mul(4))
-                        == Some(rgba.len());
+                    && match usize::from(w).checked_mul(usize::from(h)) {
+                        Some(pixels) => pixels.checked_mul(4) == Some(rgba.len()),
+                        None => false,
+                    };
                 if !valid {
                     self.kitty_custom = None;
                     self.kitty_disabled = true;
                     self.kitty_gen = u64::MAX;
                     return;
                 }
-                let mut cache_rgba = self
-                    .kitty_custom
-                    .take()
-                    .map(|c| c.cache_rgba)
-                    .unwrap_or_default();
+                let mut cache_rgba = match self.kitty_custom.take() {
+                    Some(c) => c.cache_rgba,
+                    None => Vec::new(),
+                };
                 cache_rgba.clear();
                 self.kitty_custom = Some(KittyCustom {
                     source_fp,
@@ -3362,7 +3410,10 @@ impl WordDecorations {
         match pane {
             None => self.last_caret,
             Some(key) if self.bound.is_none() || self.bound == Some(key) => self.last_caret,
-            Some(key) => self.parked.get(&key).and_then(|parked| parked.last_caret),
+            Some(key) => match self.parked.get(&key) {
+                Some(parked) => parked.last_caret,
+                None => None,
+            },
         }
     }
 
@@ -3386,15 +3437,15 @@ impl WordDecorations {
     #[must_use]
     #[inline]
     pub fn typed_edit_witness(&self, now: Instant) -> bool {
-        self.typed_edit.is_some_and(|e| {
-            !e.spent
-                && now.saturating_duration_since(e.at)
-                    <= Duration::from_millis(TYPED_EDIT_WITNESS_MS)
-                && match (e.pane, self.scan_scope()) {
-                    (Some(typed_in), Some(scanning)) => typed_in == scanning,
-                    _ => true,
-                }
-        })
+        let Some(e) = self.typed_edit else {
+            return false;
+        };
+        !e.spent
+            && now.saturating_duration_since(e.at) <= Duration::from_millis(TYPED_EDIT_WITNESS_MS)
+            && match (e.pane, self.scan_scope()) {
+                (Some(typed_in), Some(scanning)) => typed_in == scanning,
+                _ => true,
+            }
     }
 
     #[inline]
@@ -3435,10 +3486,12 @@ impl WordDecorations {
         }
         let opts = cfg.scan_opts();
         self.scan_memo.fit(rows, scan_inputs_fp(lexicon, &opts));
-        let cursor = (term.grid().display_offset() == 0).then(|| {
+        let cursor = if term.grid().display_offset() == 0 {
             let cursor = term.cursor();
-            (cursor.row, cursor.col)
-        });
+            Some((cursor.row, cursor.col))
+        } else {
+            None
+        };
         if let Some(cell) = cursor {
             self.last_caret = Some(cell);
         }
@@ -3450,10 +3503,13 @@ impl WordDecorations {
             let pass_start = start_row;
             for r in pass_start..rows {
                 term.render_row_into(r, &mut row_cells);
-                let dec_line = u16::try_from(r)
-                    .ok()
-                    .and_then(|vr| term.grid().row(vr))
-                    .is_some_and(|row| row.line_size() != aterm_core::grid::LineSize::SingleWidth);
+                let dec_line = if let Ok(vr) = u16::try_from(r)
+                    && let Some(row) = term.grid().row(vr)
+                {
+                    row.line_size() != aterm_core::grid::LineSize::SingleWidth
+                } else {
+                    false
+                };
                 if !self.scan_row(
                     r,
                     &row_cells,
@@ -3584,18 +3640,23 @@ impl WordDecorations {
         let mut ink_full = false;
         let mut row_cells = std::mem::take(&mut self.scan_cells);
         let mut start_row = 0usize;
+        let (ctx_cells, ctx_geom, ctx_bg) = match context {
+            Some((geom, default_bg)) => (Some(cells), Some(geom), Some(default_bg)),
+            None => (None, None, None),
+        };
         'pass: loop {
             for (r, row_slice) in cells.iter().enumerate().take(rows).skip(start_row) {
-                let dec_line = line_sizes
-                    .get(r)
-                    .is_some_and(|ls| *ls != aterm_core::grid::LineSize::SingleWidth);
+                let dec_line = matches!(
+                    line_sizes.get(r),
+                    Some(ls) if *ls != aterm_core::grid::LineSize::SingleWidth
+                );
                 if !self.scan_row(
                     r,
                     row_slice,
                     cursor,
-                    context.map(|_| cells),
-                    context.map(|(geom, _)| geom),
-                    context.map(|(_, default_bg)| default_bg),
+                    ctx_cells,
+                    ctx_geom,
+                    ctx_bg,
                     dec_line,
                     lexicon,
                     &opts,
@@ -3899,21 +3960,24 @@ impl WordDecorations {
                 .get(m.end.saturating_sub(1))
                 .copied()
                 .unwrap_or(start_col);
-            let end_col = if row_cells.get(end_lead as usize + 1).is_some_and(|n| n.wide) {
+            let end_col = if matches!(row_cells.get(end_lead as usize + 1), Some(n) if n.wide) {
                 end_lead + 1
             } else {
                 end_lead
             };
-            if m.ambiguous
-                && cursor.is_some_and(|cell| caret_on_span(cell, r as u16, start_col, end_col))
-            {
+            let at_live_cursor = match cursor {
+                Some(cell) => caret_on_span(cell, r as u16, start_col, end_col),
+                None => false,
+            };
+            if m.ambiguous && at_live_cursor {
                 continue;
             }
-            let live_caret_completion = cursor.is_some_and(|(cursor_row, cursor_col)| {
-                cursor_row == r as u16 && cursor_col == end_col.saturating_add(1)
-            });
-            let at_live_cursor =
-                cursor.is_some_and(|cell| caret_on_span(cell, r as u16, start_col, end_col));
+            let live_caret_completion = match cursor {
+                Some((cursor_row, cursor_col)) => {
+                    cursor_row == r as u16 && cursor_col == end_col.saturating_add(1)
+                }
+                None => false,
+            };
             let ov = cfg.spec_table.override_for(m.form_hash).copied();
             if ov.is_none() {
                 match m.class {
@@ -3961,60 +4025,63 @@ impl WordDecorations {
                 }
                 _ => None,
             };
-            let (appeared, genome, cat_colors) = fast.unwrap_or_else(|| {
-                if !chars_ready {
-                    self.scan_chars.clear();
-                    self.scan_chars.extend(self.scan_text.chars());
-                    chars_ready = true;
-                    debug_assert_eq!(
-                        self.scan_chars.len(),
-                        self.scan_colmap.len(),
-                        "scan_chars must mirror scan_text before the match loop indexes it"
+            let (appeared, genome, cat_colors) = match fast {
+                Some(triple) => triple,
+                None => {
+                    if !chars_ready {
+                        self.scan_chars.clear();
+                        self.scan_chars.extend(self.scan_text.chars());
+                        chars_ready = true;
+                        debug_assert_eq!(
+                            self.scan_chars.len(),
+                            self.scan_colmap.len(),
+                            "scan_chars must mirror scan_text before the match loop indexes it"
+                        );
+                    }
+                    let ctx_fp = genome::simhash_ctx(
+                        &self.scan_chars,
+                        m.start,
+                        m.end,
+                        m.form_hash,
+                        &mut self.votes,
+                        &mut self.ctx_tok,
+                        &mut self.ctx_folded,
                     );
-                }
-                let ctx_fp = genome::simhash_ctx(
-                    &self.scan_chars,
-                    m.start,
-                    m.end,
-                    m.form_hash,
-                    &mut self.votes,
-                    &mut self.ctx_tok,
-                    &mut self.ctx_folded,
-                );
-                let genome = Genome {
-                    gkey: seed ^ ctx_fp,
-                    magic: mix(ctx_fp ^ m.form_hash ^ genome::MAGIC_SALT),
-                };
-                self.pending.push(PendingBirth {
-                    occ_idx: out.len() as u16,
-                    ctx_fp,
-                    live_caret_completion,
-                    at_live_cursor,
-                });
-                (
-                    now,
-                    genome,
-                    if spec.graphic.is_some() {
-                        match (context_cells, context_geom, context_default_bg) {
-                            (Some(cells), Some(geom), Some(default_bg)) => {
-                                cat_color_context_footprint(
-                                    cells,
-                                    geom,
-                                    r as u16,
-                                    start_col,
-                                    end_col,
-                                    genome,
-                                    cfg.feline_magic,
-                                    default_bg,
-                                )
+                    let genome = Genome {
+                        gkey: seed ^ ctx_fp,
+                        magic: mix(ctx_fp ^ m.form_hash ^ genome::MAGIC_SALT),
+                    };
+                    self.pending.push(PendingBirth {
+                        occ_idx: out.len() as u16,
+                        ctx_fp,
+                        live_caret_completion,
+                        at_live_cursor,
+                    });
+                    (
+                        now,
+                        genome,
+                        if spec.graphic.is_some() {
+                            match (context_cells, context_geom, context_default_bg) {
+                                (Some(cells), Some(geom), Some(default_bg)) => {
+                                    cat_color_context_footprint(
+                                        cells,
+                                        geom,
+                                        r as u16,
+                                        start_col,
+                                        end_col,
+                                        genome,
+                                        cfg.feline_magic,
+                                        default_bg,
+                                    )
+                                }
+                                _ => cat_color_context(row_cells, start_col, end_col),
                             }
-                            _ => cat_color_context(row_cells, start_col, end_col),
-                        }
-                    } else {
-                        CatColorKey::default()
-                    },
-                )
-            });
+                        } else {
+                            CatColorKey::default()
+                        },
+                    )
+                }
+            };
             let ink_bearing = cfg.ink_enabled && spec.ink.is_some();
             let mut ink_base = 0usize;
             let mut ink_cells = 0u16;
@@ -4072,9 +4139,10 @@ impl WordDecorations {
                 spec,
                 custom,
                 species: match m.class {
-                    Class::Animal => m
-                        .species
-                        .and_then(|s| animal_glyph_from_key(lexicon.species_code(s))),
+                    Class::Animal => match m.species {
+                        Some(s) => animal_glyph_from_key(lexicon.species_code(s)),
+                        None => None,
+                    },
                     Class::Canine => animal_glyph_from_key("dog"),
                     _ => None,
                 },
@@ -4100,7 +4168,8 @@ impl WordDecorations {
             self.settle_until = Some(now + Duration::from_millis(RESIZE_SETTLE_MS));
         }
         let returning = std::mem::take(&mut self.spend_next_births);
-        let born_settled = cols_changed || returning || self.settle_until.is_some_and(|t| now < t);
+        let born_settled =
+            cols_changed || returning || matches!(self.settle_until, Some(t) if now < t);
         if !born_settled {
             self.settle_until = None;
         }
@@ -4154,16 +4223,13 @@ impl WordDecorations {
         }
 
         self.occ = out;
-        if let Some(cell) = cursor
-            && let Some(ident) = self
-                .occ
-                .iter()
-                .find(|occ| caret_on_span(cell, occ.row, occ.start_col, occ.end_col))
-                .map(|occ| occ.ident)
-        {
-            self.caret_word = Some((ident, cell));
-        }
         if let Some(cell) = cursor {
+            for occ in &self.occ {
+                if caret_on_span(cell, occ.row, occ.start_col, occ.end_col) {
+                    self.caret_word = Some((occ.ident, cell));
+                    break;
+                }
+            }
             self.last_caret = Some(cell);
         }
         self.last_epoch = epoch;
@@ -4295,22 +4361,33 @@ impl WordDecorations {
                     }
                 }
                 matched[..self.align_old.len()].fill(false);
-                for &oi in winner[..group_len].iter().flatten() {
-                    matched[oi] = true;
+                for &oi in &winner[..group_len] {
+                    if let Some(oi) = oi {
+                        matched[oi] = true;
+                    }
                 }
             }
             let group_class = out[usize::from(pending[group[0]].occ_idx)].class;
-            let has_tainted_old = self.align_old.iter().any(|(_, ep)| ep.continuity_tainted);
-            let group_has_live_caret_completion = group
-                .iter()
-                .any(|&k| typed_here[k] && pending[k].live_caret_completion);
+            let mut has_tainted_old = false;
+            for (_, ep) in &self.align_old {
+                if ep.continuity_tainted {
+                    has_tainted_old = true;
+                    break;
+                }
+            }
+            let mut group_has_live_caret_completion = false;
             let mut typed_keys = [0u64; MAX_OCCURRENCES];
             let mut typed_keys_len = 0usize;
             for &k in group {
-                if typed_here[k] && pending[k].at_live_cursor && typed_keys_len < MAX_OCCURRENCES {
-                    let occ = &out[usize::from(pending[k].occ_idx)];
-                    typed_keys[typed_keys_len] = occ.ident ^ pending[k].ctx_fp;
-                    typed_keys_len += 1;
+                if typed_here[k] {
+                    if pending[k].live_caret_completion {
+                        group_has_live_caret_completion = true;
+                    }
+                    if pending[k].at_live_cursor && typed_keys_len < MAX_OCCURRENCES {
+                        let occ = &out[usize::from(pending[k].occ_idx)];
+                        typed_keys[typed_keys_len] = occ.ident ^ pending[k].ctx_fp;
+                        typed_keys_len += 1;
+                    }
                 }
             }
             let group_has_at_live_cursor = typed_keys_len > 0;
@@ -4440,7 +4517,10 @@ impl WordDecorations {
         free: &mut Vec<FreeSprite>,
         nova: &mut Vec<GlowQuad>,
     ) -> u64 {
-        let companion_at = companion.and_then(|c| c.cell);
+        let companion_at = match companion {
+            Some(c) => c.cell,
+            None => None,
+        };
         out.clear();
         ink.clear();
         free.clear();
@@ -4455,17 +4535,25 @@ impl WordDecorations {
             (None, _) => self.companion_claim = None,
             (Some(_), None) => {}
             (_, Some(cell)) => {
-                let live = self
-                    .occ
-                    .iter()
-                    .find(|occ| caret_on_span(cell, occ.row, occ.start_col, occ.end_col))
-                    .map(|occ| occ.ident)
-                    .or_else(|| {
-                        self.caret_word
-                            .filter(|&(_, at)| at.0 == cell.0 && at.1 <= cell.1)
-                            .map(|(id, _)| id)
-                            .filter(|id| self.occ.iter().any(|occ| occ.ident == *id))
-                    });
+                let mut live = None;
+                for occ in &self.occ {
+                    if caret_on_span(cell, occ.row, occ.start_col, occ.end_col) {
+                        live = Some(occ.ident);
+                        break;
+                    }
+                }
+                if live.is_none()
+                    && let Some((id, at)) = self.caret_word
+                    && at.0 == cell.0
+                    && at.1 <= cell.1
+                {
+                    for occ in &self.occ {
+                        if occ.ident == id {
+                            live = Some(id);
+                            break;
+                        }
+                    }
+                }
                 if live.is_some() {
                     self.companion_claim = live;
                 }
@@ -4540,7 +4628,10 @@ impl WordDecorations {
             animal_baker: &mut self.animal_baker,
             sightings: &mut self.sightings,
             peek_cues: &mut self.peek_cues,
-            companion_px: companion.map_or_else(CompanionFootprint::default, |c| c.footprint(geom)),
+            companion_px: match companion {
+                Some(c) => c.footprint(geom),
+                None => CompanionFootprint::default(),
+            },
         };
         let mut cats = 0usize;
         let mut animals = 0usize;
@@ -4610,24 +4701,30 @@ impl WordDecorations {
                     if occ.inert {
                         break 'graphic;
                     }
-                    let peek = PeekView {
-                        start: ep.map_or(Some(occ.appeared), |e| e.phase_start),
-                        peek_done: ep.is_some_and(|e| e.peek_done),
-                        arm: ep.and_then(|e| e.shown_as),
-                        unlogged: ep.is_some_and(|e| !e.logged),
+                    let peek = match ep {
+                        Some(e) => PeekView {
+                            start: e.phase_start,
+                            peek_done: e.peek_done,
+                            arm: e.shown_as,
+                            unlogged: !e.logged,
+                        },
+                        None => PeekView {
+                            start: Some(occ.appeared),
+                            peek_done: false,
+                            arm: None,
+                            unlogged: false,
+                        },
                     };
                     if peek.peek_done {
                         break 'graphic;
                     }
-                    let vetoed_by = |cell: Option<(u16, u16)>| {
-                        cell.is_some_and(|c| caret_on_span(c, occ.row, occ.start_col, occ.end_col))
-                    };
-                    if (companion_at.is_some() && claim == Some(occ.ident))
-                        || vetoed_by(companion_at)
+                    if let Some(c) = companion_at
+                        && (claim == Some(occ.ident)
+                            || caret_on_span(c, occ.row, occ.start_col, occ.end_col))
                     {
                         break 'graphic;
                     }
-                    if occ.spec.graphic.map(|g| g.collection) == Some(Collection::Animals) {
+                    if matches!(occ.spec.graphic, Some(g) if g.collection == Collection::Animals) {
                         let Some(species) = occ.species else {
                             break 'graphic;
                         };
@@ -4660,17 +4757,20 @@ impl WordDecorations {
                         break 'graphic;
                     }
                     let eligible = cat_eligible(occ, cfg, geom);
-                    let arm = peek.arm.unwrap_or_else(|| {
-                        if cfg.feline_style != FelineStyle::Cat {
-                            KittyShownAs::PawStyle
-                        } else if !eligible {
-                            KittyShownAs::PawFallbackFloor
-                        } else if cats < MAX_CATS {
-                            KittyShownAs::Cat
-                        } else {
-                            KittyShownAs::PawFallbackOverflow
+                    let arm = match peek.arm {
+                        Some(a) => a,
+                        None => {
+                            if cfg.feline_style != FelineStyle::Cat {
+                                KittyShownAs::PawStyle
+                            } else if !eligible {
+                                KittyShownAs::PawFallbackFloor
+                            } else if cats < MAX_CATS {
+                                KittyShownAs::Cat
+                            } else {
+                                KittyShownAs::PawFallbackOverflow
+                            }
                         }
-                    });
+                    };
                     if arm == KittyShownAs::Cat {
                         cats += 1;
                         if eligible {
@@ -4690,9 +4790,11 @@ impl WordDecorations {
                     }
                 }
             }
-            match occ.spec.burst.map(|b| b.kind) {
-                None => {}
-                Some(BurstKind::Nova) => {
+            let Some(burst_spec) = occ.spec.burst else {
+                continue;
+            };
+            match burst_spec.kind {
+                BurstKind::Nova => {
                     emit_nova_axis(
                         occ,
                         oi,
@@ -4709,7 +4811,7 @@ impl WordDecorations {
                         &mut active_until,
                     );
                 }
-                Some(BurstKind::SuperNova) => {
+                BurstKind::SuperNova => {
                     emit_super_axis(
                         occ,
                         oi,
@@ -4727,11 +4829,11 @@ impl WordDecorations {
                         &mut nuke_pending,
                     );
                 }
-                Some(BurstKind::Glow) => {
+                BurstKind::Glow => {
                     if occ.inert || cfg.reduced_motion {
                         continue;
                     }
-                    if ep.is_some_and(|e| !e.burst_roll) {
+                    if matches!(ep, Some(e) if !e.burst_roll) {
                         continue;
                     }
                     let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
@@ -4739,9 +4841,11 @@ impl WordDecorations {
                         const INV_GLOW_BURST_MS: f32 = 1.0 / GLOW_BURST_MS as f32;
                         let until = occ.appeared + Duration::from_millis(GLOW_BURST_MS);
                         arm_until(&mut active_until, until);
-                        let e = (core::f32::consts::PI * (t as f32 * INV_GLOW_BURST_MS))
-                            .sin()
-                            .max(0.0);
+                        let e = crate::supernova::sin_cos_f32(
+                            core::f32::consts::PI * (t as f32 * INV_GLOW_BURST_MS),
+                        )
+                        .0
+                        .max(0.0);
                         let mid = occ.start_col + (occ.end_col - occ.start_col) / 2;
                         let d = WordDecoration {
                             row: occ.row,
@@ -4757,13 +4861,13 @@ impl WordDecorations {
                         out.push(d);
                     }
                 }
-                Some(BurstKind::Sparkle | BurstKind::Starburst) => {
+                BurstKind::Sparkle | BurstKind::Starburst => {
                     // v3 §1.1: born-done / born-settled sparkles are inert —
                     // the burst played (or resize-settled); zero decos.
                     if occ.inert {
                         continue;
                     }
-                    if ep.is_some_and(|e| !e.burst_roll) {
+                    if matches!(ep, Some(e) if !e.burst_roll) {
                         continue;
                     }
                     let elapsed = now.saturating_duration_since(occ.appeared);
@@ -4809,7 +4913,11 @@ impl WordDecorations {
                     } else {
                         let t = elapsed.as_millis() as u64;
                         let f = if cfg.reduced_motion {
-                            (!ep.is_some_and(|e| e.burst_done)).then_some(1.0f32)
+                            if matches!(ep, Some(e) if e.burst_done) {
+                                None
+                            } else {
+                                Some(1.0f32)
+                            }
                         } else if t < cfg.anim_ms + RESIDUAL_FADE_MS {
                             const INV_RESIDUAL_FADE_MS: f32 = 1.0 / RESIDUAL_FADE_MS as f32;
                             let until = occ.appeared
@@ -4930,10 +5038,11 @@ impl WordDecorations {
             let Some(g) = occ.spec.graphic else {
                 continue;
             };
-            let live = self.persist.get(&occ.ident).is_some_and(|e| {
-                e.shown_as == Some(KittyShownAs::Cat) && !e.peek_done && !e.inert()
-            });
-            if live {
+            if let Some(e) = self.persist.get(&occ.ident)
+                && e.shown_as == Some(KittyShownAs::Cat)
+                && !e.peek_done
+                && !e.inert()
+            {
                 if g.collection == Collection::Animals {
                     animal_slots += 1;
                 } else {
@@ -5132,9 +5241,11 @@ impl WordDecorations {
             if reservation.pane != scope {
                 return true;
             }
-            persist.get(&reservation.owner).is_some_and(|episode| {
-                !episode.nova_done && episode.nova_start == Some(reservation.start)
-            })
+            matches!(
+                persist.get(&reservation.owner),
+                Some(episode)
+                    if !episode.nova_done && episode.nova_start == Some(reservation.start)
+            )
         });
         debug_assert!(
             self.ignitions.iter().filter(|r| r.pane == scope).count() <= MAX_IGNITION_RESERVATIONS
@@ -5157,7 +5268,7 @@ impl WordDecorations {
         }
         let mut until: Option<Instant> = None;
         let mut busy = false;
-        if self.burst_hint.is_some_and(|h| now < h) {
+        if matches!(self.burst_hint, Some(h) if now < h) {
             for ep in self.persist.values() {
                 let Some(end) = burst_mutex_end(ep) else {
                     continue;
@@ -5166,9 +5277,9 @@ impl WordDecorations {
                     continue;
                 }
                 busy = true;
-                until = Some(until.map_or(end, |u: Instant| u.max(end)));
+                arm_until(&mut until, end);
                 if matches!(ep.burst_kind, Some(BurstKind::SuperNova)) {
-                    self.super_until = Some(self.super_until.map_or(end, |u: Instant| u.max(end)));
+                    arm_until(&mut self.super_until, end);
                 }
             }
         } else {
@@ -5176,7 +5287,7 @@ impl WordDecorations {
                 !self
                     .persist
                     .values()
-                    .any(|ep| burst_mutex_end(ep).is_some_and(|end| now < end)),
+                    .any(|ep| matches!(burst_mutex_end(ep), Some(end) if now < end)),
                 "a live burst window outlived the burst-mutex hint"
             );
         }
@@ -5185,12 +5296,16 @@ impl WordDecorations {
                 p.burst_summary() == (p.burst_end_max, p.super_end_max),
                 "a parked shard's burst-mutex summary drifted from its episode map"
             );
-            if let Some(e) = p.burst_end_max.filter(|e| now < *e) {
+            if let Some(e) = p.burst_end_max
+                && now < e
+            {
                 busy = true;
-                until = Some(until.map_or(e, |u: Instant| u.max(e)));
+                arm_until(&mut until, e);
             }
-            if let Some(e) = p.super_end_max.filter(|e| now < *e) {
-                self.super_until = Some(self.super_until.map_or(e, |u: Instant| u.max(e)));
+            if let Some(e) = p.super_end_max
+                && now < e
+            {
+                arm_until(&mut self.super_until, e);
             }
         }
         if !has_super {
@@ -5201,7 +5316,7 @@ impl WordDecorations {
         let grid_h = i32::from(geom.rows) * ch;
         let r_max = supernova::r_max_for(ch, grid_h);
         for (i, occ) in self.occ.iter().enumerate() {
-            if occ.spec.burst.map(|b| b.kind) != Some(BurstKind::SuperNova) {
+            if !matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::SuperNova) {
                 continue;
             }
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
@@ -5215,7 +5330,7 @@ impl WordDecorations {
                 // Deferred while selected (§3.2 safety) or while another
                 // supernova holds the mutex (MAX_ACTIVE_SUPERNOVAE = 1).
                 if busy
-                    || sel.is_some_and(|sv| sv.span_selected(occ.row, occ.start_col, occ.end_col))
+                    || matches!(sel, Some(sv) if sv.span_selected(occ.row, occ.start_col, occ.end_col))
                 {
                     continue;
                 }
@@ -5242,8 +5357,8 @@ impl WordDecorations {
             }
             busy = true;
             let end = start + win;
-            until = Some(until.map_or(end, |u: Instant| u.max(end)));
-            self.super_until = Some(self.super_until.map_or(end, |u: Instant| u.max(end)));
+            arm_until(&mut until, end);
+            arm_until(&mut self.super_until, end);
             if now < start {
                 continue;
             }
@@ -5272,7 +5387,7 @@ impl WordDecorations {
         if cfg.reduced_motion || !has_nova {
             return None;
         }
-        let super_busy = self.super_until.is_some_and(|t| now < t);
+        let super_busy = matches!(self.super_until, Some(t) if now < t);
         let super_wake = self.super_until.map(|su| su + Duration::from_millis(1));
         let mut until: Option<Instant> = None;
         let scope = self.scan_scope();
@@ -5280,7 +5395,7 @@ impl WordDecorations {
         for (i, occ) in self.occ.iter().enumerate() {
             // v3 §6 dispatch: the classic nova is the `BurstKind::Nova` arm
             // (profanity `style = "nova"` and custom specs alike).
-            if occ.spec.burst.map(|b| b.kind) != Some(BurstKind::Nova) {
+            if !matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::Nova) {
                 continue;
             }
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
@@ -5297,12 +5412,13 @@ impl WordDecorations {
                 if !ep.burst_roll {
                     continue;
                 }
-                if sel.is_some_and(|sv| sv.span_selected(occ.row, occ.start_col, occ.end_col)) {
+                if matches!(sel, Some(sv) if sv.span_selected(occ.row, occ.start_col, occ.end_col))
+                {
                     continue;
                 }
                 if super_busy {
                     if let Some(wake) = super_wake {
-                        until = Some(until.map_or(wake, |u: Instant| u.max(wake)));
+                        arm_until(&mut until, wake);
                     }
                     continue;
                 }
@@ -5327,7 +5443,8 @@ impl WordDecorations {
                 ep.nova_done = true;
                 continue;
             }
-            until = Some(until.map_or(start + d, |u: Instant| u.max(start + d)));
+            let end = start + d;
+            arm_until(&mut until, end);
             if now < start {
                 continue;
             }
@@ -5368,11 +5485,19 @@ impl WordDecorations {
     /// Whether any occurrence is still inside its animation window (profanity sparkle, a live ink sweep, or a granted, possibly queued, nova window).
     #[must_use]
     pub fn is_active(&self, now: Instant) -> bool {
-        self.active_until.is_some_and(|d| now < d)
-            || self
-                .parked
-                .values()
-                .any(|p| p.active_until.is_some_and(|d| now < d))
+        if let Some(d) = self.active_until
+            && now < d
+        {
+            return true;
+        }
+        for p in self.parked.values() {
+            if let Some(d) = p.active_until
+                && now < d
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -5415,7 +5540,7 @@ fn grant_burst(
     };
     ep.nova_start = Some(start);
     if let Some(end) = burst_mutex_end(ep) {
-        *burst_hint = Some(burst_hint.map_or(end, |h: Instant| h.max(end)));
+        arm_until(burst_hint, end);
     }
     ep.burst_started = true;
     ep.burst_done = true;
@@ -5459,8 +5584,14 @@ fn grant_ignition(
     // Memory bound, per scope (each pane or declared session holds its own
     // episodes). The safety bound is the rolling-window count below, over
     // every scope.
-    if igns.iter().filter(|r| r.pane == pane).count() >= MAX_IGNITION_RESERVATIONS {
-        return None;
+    let mut pane_count = 0usize;
+    for r in igns.iter() {
+        if r.pane == pane {
+            pane_count += 1;
+            if pane_count >= MAX_IGNITION_RESERVATIONS {
+                return None;
+            }
+        }
     }
     let overlap_dist2 = overlap_dist * overlap_dist;
     let check_overlap = overlap_dist > 0.0;
@@ -5480,7 +5611,10 @@ fn grant_ignition(
                 overlap = true;
             }
             let free = t + IGNITION_WINDOW;
-            next_free = Some(next_free.map_or(free, |f: Instant| f.min(free)));
+            next_free = Some(match next_free {
+                Some(f) => f.min(free),
+                None => free,
+            });
         }
         let cap = if overlap { 1 } else { 2 };
         if count < cap {
@@ -5515,7 +5649,14 @@ fn emit_nova_axis(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) {
-    if let Some(nv) = novas.iter().find(|n| usize::from(n.idx) == oi).copied() {
+    let mut found_nv = None;
+    for n in novas {
+        if usize::from(n.idx) == oi {
+            found_nv = Some(*n);
+            break;
+        }
+    }
+    if let Some(nv) = found_nv {
         let t = now.saturating_duration_since(nv.start).as_millis() as u64;
         let until = nv.start + Duration::from_millis(u64::from(nv.feats.duration_ms));
         arm_until(active_until, until);
@@ -5552,30 +5693,45 @@ fn emit_nova_axis(
             *fp = fold_deco(*fp, d);
         }
     } else {
-        let done = ep.is_none_or(|e| e.nova_done);
+        let done = match ep {
+            Some(e) => e.nova_done,
+            None => true,
+        };
         let fade = if cfg.reduced_motion && !occ.inert {
-            let rolled_off = ep.is_some_and(|e| !e.burst_roll);
-            let spent = ep.is_some_and(|e| {
-                e.nova_done
-                    && e.nova_start.is_some_and(|s| {
-                        now >= s + Duration::from_millis(
-                            u64::from(nova_duration_ms(occ.genome.gkey)) + RESIDUAL_FADE_MS,
-                        )
-                    })
-            });
-            (!rolled_off && !spent).then_some(1.0f32)
+            let rolled_off = matches!(ep, Some(e) if !e.burst_roll);
+            let spent = if let Some(e) = ep
+                && e.nova_done
+                && let Some(s) = e.nova_start
+            {
+                now >= s + Duration::from_millis(
+                    u64::from(nova_duration_ms(occ.genome.gkey)) + RESIDUAL_FADE_MS,
+                )
+            } else {
+                false
+            };
+            if !rolled_off && !spent {
+                Some(1.0f32)
+            } else {
+                None
+            }
         } else if done && !occ.inert {
-            ep.and_then(|e| e.nova_start).and_then(|s| {
+            if let Some(e) = ep
+                && let Some(s) = e.nova_start
+            {
                 let end = s + Duration::from_millis(u64::from(nova_duration_ms(occ.genome.gkey)));
                 let t = now.saturating_duration_since(end).as_millis() as u64;
-                (t < RESIDUAL_FADE_MS).then(|| {
+                if t < RESIDUAL_FADE_MS {
                     const INV_RESIDUAL_FADE_MS: f32 = 1.0 / RESIDUAL_FADE_MS as f32;
                     let f = 1.0 - t as f32 * INV_RESIDUAL_FADE_MS;
                     let until = end + Duration::from_millis(RESIDUAL_FADE_MS);
                     arm_until(active_until, until);
-                    f
-                })
-            })
+                    Some(f)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -5625,9 +5781,19 @@ fn emit_super_axis(
     if occ.inert {
         return;
     }
-    if let Some(sv) = supers.iter().find(|s| usize::from(s.idx) == oi).copied() {
+    let mut found_sv = None;
+    for s in supers {
+        if usize::from(s.idx) == oi {
+            found_sv = Some(*s);
+            break;
+        }
+    }
+    if let Some(sv) = found_sv {
         let t = now.saturating_duration_since(sv.start).as_millis() as u64;
-        let tier = ep.map_or(supernova::SuperTier::Nova, |e| e.burst_tier);
+        let tier = match ep {
+            Some(e) => e.burst_tier,
+            None => supernova::SuperTier::Nova,
+        };
         let until = sv.start + Duration::from_millis(supernova::total_ms(tier));
         arm_until(active_until, until);
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
@@ -5862,7 +6028,7 @@ fn ink_fx(
         }
         break;
     }
-    if occ.spec.burst.map(|b| b.kind) == Some(BurstKind::Nova) {
+    if matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::Nova) {
         let magic = if cfg.profanity_magic {
             nova_magic(occ.genome.magic)
         } else {
@@ -5871,12 +6037,16 @@ fn ink_fx(
         let (core, fringe) = nova::palette(nova_palette(occ.genome.gkey));
         let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, occ.genome.gkey);
         let pair = (hue_nudge(core, n0), hue_nudge(fringe, n1));
-        let done = ep.is_none_or(|e| e.nova_done);
+        let done = match ep {
+            Some(e) => e.nova_done,
+            None => true,
+        };
         if cfg.reduced_motion || done {
             fx.pair = Some(nova::ember_pair(pair, magic));
         } else {
             fx.pair = Some(pair);
-            if let Some(start) = ep.and_then(|e| e.nova_start)
+            if let Some(e) = ep
+                && let Some(start) = e.nova_start
                 && now >= start
             {
                 let t = now.saturating_duration_since(start).as_millis() as u64;
@@ -5894,14 +6064,15 @@ fn ink_fx(
         }
         let nv = &novas[usize::from(ni)];
         let t = now.saturating_duration_since(nv.start).as_millis() as u64;
-        let dist = (span_dist2(occ, nv.center_px, geom) as f32).sqrt();
+        let dist = crate::color_math::sqrt_f32(span_dist2(occ, nv.center_px, geom) as f32);
         let sing = nv.magic == Some(NovaMagic::Singularity);
         if let Some(cross) = nova::crossing_ms(dist, nv.r_max, sing)
             && let Some(env) = nova::pulse_env(t, cross)
         {
-            let base = fx
-                .pair
-                .or_else(|| nudged_ink_pair(occ.class, occ.genome.gkey));
+            let base = match fx.pair {
+                Some(p) => Some(p),
+                None => nudged_ink_pair(occ.class, occ.genome.gkey),
+            };
             if let Some((c0, c1)) = base {
                 let (_, fringe) = nova::palette(nv.feats.palette);
                 let amp = nova::PULSE_AMP * env;
@@ -6161,7 +6332,14 @@ const fn trick_flash_paintable(cfg: &DecoConfig) -> bool {
 
 #[inline]
 fn arm_until(active_until: &mut Option<Instant>, until: Instant) {
-    *active_until = Some(active_until.map_or(until, |d| d.max(until)));
+    match active_until {
+        Some(d) => {
+            if until > *d {
+                *d = until;
+            }
+        }
+        None => *active_until = Some(until),
+    }
 }
 
 #[inline]
@@ -6307,7 +6485,10 @@ fn emit_cat(
     } else {
         None
     };
-    let variant = special.unwrap_or_else(|| cat_variant_v4(occ.genome.gkey));
+    let variant = match special {
+        Some(v) => v,
+        None => cat_variant_v4(occ.genome.gkey),
+    };
     let accessory = if special.is_none() && cfg.feline_magic {
         accessory_variant_v4(occ.genome.magic)
     } else {
@@ -6414,10 +6595,13 @@ fn emit_animal(
         false,
         |ctx| {
             let host = key.host_id();
-            ctx.animal_baker
-                .tile(&key)
-                .and_then(|rgba| ctx.baker.host_tile(host, key.w, key.h, rgba))
-                .or_else(|| ctx.baker.host_peek(host))
+            match ctx.animal_baker.tile(&key) {
+                Some(rgba) => match ctx.baker.host_tile(host, key.w, key.h, rgba) {
+                    Some(t) => Some(t),
+                    None => ctx.baker.host_peek(host),
+                },
+                None => ctx.baker.host_peek(host),
+            }
         },
         free,
         fp,
@@ -6451,7 +6635,10 @@ fn emit_peek<'a>(
     let ps = peek.start?;
     let ch = i32::from(geom.cell_h);
     let rest = i32::from(cat_rest_reveal(g.hart));
-    let dwell_range = occ.spec.graphic.map_or((2200, 3598), |g| g.dwell_ms);
+    let dwell_range = match occ.spec.graphic {
+        Some(g) => g.dwell_ms,
+        None => (2200, 3598),
+    };
     let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, magical, dwell_range);
     let antic = anticipation_ms(occ.genome.gkey);
     let total = CAT_RISE_MS + dwell + antic + CAT_DESCEND_MS;
@@ -6516,7 +6703,7 @@ fn emit_peek<'a>(
     let in_bounce = kitten && !cfg.reduced_motion && in_dwell && td < CAT_BOUNCE_MS;
     let bounce = if in_bounce {
         let q = td as f32 * INV_CAT_BOUNCE_MS;
-        (2.0 * (std::f32::consts::PI * q).sin()).round() as i32
+        (2.0 * crate::supernova::sin_cos_f32(std::f32::consts::PI * q).0).round() as i32
     } else {
         0
     };
@@ -6900,22 +7087,22 @@ fn emit_rainbow_ink(
     let drift = u64::from(drift_ms.max(1));
     let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
     let animating = !occ.inert && !cfg.reduced_motion && t < drift;
-    let phase = if animating {
-        360.0 * (t as f32 / drift as f32)
-    } else {
-        0.0
-    };
-    let hue_at = |u: f32| hsv2rgb(base_hue + u * span_used + phase, sat, val);
+    let start_hue = base_hue
+        + if animating {
+            360.0 * (t as f32 / drift as f32)
+        } else {
+            0.0
+        };
+    let h0 = hsv2rgb(start_hue, sat, val);
     let (guard_hues, guard_len) = if span_used == 0.0 {
-        let h0 = hue_at(0.0);
         ([h0; 4], 1)
     } else {
         (
             [
-                hue_at(0.0),
-                hue_at(1.0 / 3.0),
-                hue_at(2.0 / 3.0),
-                hue_at(1.0),
+                h0,
+                hsv2rgb(start_hue + (1.0 / 3.0) * span_used, sat, val),
+                hsv2rgb(start_hue + (2.0 / 3.0) * span_used, sat, val),
+                hsv2rgb(start_hue + span_used, sat, val),
             ],
             4,
         )
@@ -6952,7 +7139,7 @@ fn emit_rainbow_ink(
             } else if i + 1 == cols_len {
                 guard_hues[3]
             } else {
-                hue_at(i as f32 * inv_denom)
+                hsv2rgb(start_hue + (i as f32 * inv_denom) * span_used, sat, val)
             };
             mix_rgb(rgb3_to_u32(fg_rgb), target, strength)
         } else {
@@ -7004,7 +7191,9 @@ fn emit_rainbow_sparkles(
     }
     const INV_RAINBOW_SPARKLE_MS: f32 = 1.0 / RAINBOW_SPARKLE_MS as f32;
     let p = t as f32 * INV_RAINBOW_SPARKLE_MS;
-    let envelope = (core::f32::consts::PI * p).sin().max(0.0);
+    let envelope = crate::supernova::sin_cos_f32(core::f32::consts::PI * p)
+        .0
+        .max(0.0);
     let width = occ.end_col.saturating_sub(occ.start_col).max(1);
     let base_hue = rainbow_base_hue(occ.genome.gkey);
     let lift = ((i32::from(geom.cell_h).max(8) / 3).min(127)) as i8;
@@ -7018,7 +7207,7 @@ fn emit_rainbow_sparkles(
     for i in 0..count {
         let u = i as f32 * inv_denom;
         let phase = p_tau + i as f32 * 2.094 + seed_phase;
-        let (sin_p, cos_p) = phase.sin_cos();
+        let (sin_p, cos_p) = crate::supernova::sin_cos_f32(phase);
         let shimmer = 0.62 + 0.38 * sin_p.abs();
         let d = WordDecoration {
             row: occ.row,

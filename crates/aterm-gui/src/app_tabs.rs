@@ -397,6 +397,7 @@ impl App {
             .and_then(|session| session.handoff_local_id);
         let dropped = self.pool.detach(session);
         if dropped {
+            self.retire_developer_tools_install(session);
             if let Some(local_id) = handed {
                 self.note_handed_shell_lost(local_id);
             }
@@ -542,7 +543,7 @@ impl App {
         self.closed_view_record_for(window, tab.id, tab.focus)
     }
 
-    fn closed_view_record_for(
+    pub(crate) fn closed_view_record_for(
         &self,
         window: WindowId,
         tab_id: crate::tab_model::TabId,
@@ -583,7 +584,7 @@ impl App {
         })
     }
 
-    fn retain_closed_view(&mut self, record: crate::closed_recovery::ClosedView) {
+    pub(crate) fn retain_closed_view(&mut self, record: crate::closed_recovery::ClosedView) {
         let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
         self.closed_recovery.views.push(record, now_ms);
     }
@@ -858,6 +859,55 @@ impl App {
             return false;
         };
         self.open_system_state_tab_in_window(wid)
+    }
+
+    /// The System State tab for a review that must not take the person's tab (design §6): one
+    /// that is open stays where it is, and one opened now goes behind the tab the frontmost
+    /// window shows, or the first window's when none is in front. Whether a System State tab is
+    /// open.
+    pub(crate) fn open_system_state_tab_quietly(&mut self) -> bool {
+        if self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+            .is_some_and(|instance| {
+                self.view_store.iter().any(|(_, view)| {
+                    matches!(view, crate::tab_model::View::Native(native) if native.instance == instance)
+                })
+            })
+        {
+            return true;
+        }
+        let Some(wid) = self
+            .frontmost_window
+            .filter(|wid| self.windows.contains_key(wid))
+            .or_else(|| self.windows.keys().next().copied())
+        else {
+            return false;
+        };
+        let previous = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.tab_set.active_id());
+        if self.stage_system_state_tab(wid).is_err() {
+            return false;
+        }
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        if let Some(previous) = previous {
+            window.tab_set.switch_to(previous);
+        }
+        window.last_present = None;
+        self.resync_active_or_window(wid);
+        self.sync_active_session();
+        if let Some(window) = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.os_window.as_ref())
+        {
+            window.request_redraw();
+        }
+        true
     }
 
     /// aterm ▸ System State… and its palette row (`MenuAction::SystemState`).
@@ -4103,6 +4153,21 @@ impl App {
             .and_then(|state| state.tab_set.active())
             .is_some_and(|tab| tab.root.len() > 1 && !is_terminal_tab(tab, &self.view_store));
         if mixed_split {
+            // A mixed tab's terminal leaf hangs up its job like any pane's, so it asks first.
+            let busy = self
+                .view_store
+                .get(stable_view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                .is_some_and(|session| self.pane_close_hangs_up_a_job(session));
+            let replay = crate::close_confirm::CloseReplay::Pane {
+                wid: window,
+                tab: stable_tab,
+                view: stable_view,
+            };
+            if !self.view_close_allowed(window, busy, replay) {
+                return None;
+            }
             let _ = self.close_focused_mixed_leaf(window);
             return None;
         }
@@ -4843,7 +4908,8 @@ impl App {
             ended.ctx.fabric.close();
         }
         self.note_shell_exit_for_ledger(session);
-        if self.keep_shell_failed_at_start(session) {
+        if self.finish_developer_tools_install(session) || self.keep_shell_failed_at_start(session)
+        {
             self.settle_log_close(session);
             return Vec::new();
         }
@@ -4974,21 +5040,26 @@ impl App {
         true
     }
 
-    /// A click in window `wid`'s tab strip at column `col`.
-    pub(crate) fn handle_tab_strip_click(&mut self, wid: WindowId, col: u16) {
+    /// A click in window `wid`'s tab strip at column `col`, pressed at `at`.
+    pub(crate) fn handle_tab_strip_click(
+        &mut self,
+        wid: WindowId,
+        col: u16,
+        at: std::time::Instant,
+    ) {
         let Some(segs) = self.windows.get(&wid).map(|ws| ws.tab_segments.clone()) else {
             return;
         };
         let Some(hit) = tab_bar::hit_test(&segs, col) else {
-            let now = std::time::Instant::now();
             let band_repeat = self.windows.get(&wid).is_some_and(|ws| {
-                ws.strip_band_press
-                    .is_some_and(|at| now.duration_since(at).as_millis() <= crate::multi_click_ms())
+                ws.strip_band_press.is_some_and(|last| {
+                    at.saturating_duration_since(last).as_millis() <= crate::multi_click_ms()
+                })
             });
             self.clear_strip_press(wid);
             self.settle_rename_edit(wid);
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.strip_band_press = (!band_repeat).then_some(now);
+                ws.strip_band_press = (!band_repeat).then_some(at);
             }
             #[cfg(windows)]
             if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -5022,12 +5093,12 @@ impl App {
                     .get(&wid)
                     .and_then(|ws| ws.tab_set.tabs().get(i))
                     .map(|tab| tab.id);
-                let now = std::time::Instant::now();
                 let repeat = tab.is_some_and(|tab| {
                     self.windows.get(&wid).is_some_and(|ws| {
-                        ws.strip_press.is_some_and(|(at, was)| {
+                        ws.strip_press.is_some_and(|(last, was)| {
                             was == tab
-                                && now.duration_since(at).as_millis() <= crate::multi_click_ms()
+                                && at.saturating_duration_since(last).as_millis()
+                                    <= crate::multi_click_ms()
                         })
                     })
                 });
@@ -5036,7 +5107,7 @@ impl App {
                     .map(|edit| edit.tab)
                     .is_some_and(|edited| Some(edited) == tab);
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.strip_press = tab.map(|tab| (now, tab));
+                    ws.strip_press = tab.map(|tab| (at, tab));
                     ws.strip_band_press = None;
                     ws.strip_drag = match (repeat || editing_this, tab) {
                         (false, Some(tab)) => Some(crate::app_mouse::StripDrag {
@@ -5395,12 +5466,18 @@ impl App {
             session_store::ExitReason::UiClose,
             session_store::ExitActor::Human,
         );
-        let Some((tab_id, is_native, terminal_index, canonical_count)) =
+        let Some((tab_id, is_native, has_terminal, terminal_index, canonical_count)) =
             self.windows.get(&wid).and_then(|ws| {
                 let tab = ws.tab_set.tab_at(i)?;
                 Some((
                     tab.id,
                     !is_terminal_tab(tab, &self.view_store),
+                    tab.root.leaves().into_iter().any(|view| {
+                        matches!(
+                            self.view_store.get(view),
+                            Some(crate::tab_model::View::Terminal(_))
+                        )
+                    }),
                     terminal_projection_index(&ws.tab_set, &self.view_store, tab.id),
                     ws.tab_set.len(),
                 ))
@@ -5420,6 +5497,21 @@ impl App {
             return false;
         }
         if is_native {
+            // A mixed tab's terminal leaves hang up their jobs as a terminal tab's do, so it
+            // asks as one does.
+            if has_terminal {
+                let exits_window = canonical_count == 1;
+                if !self.window_exit_close_allowed(wid, exits_window) {
+                    return false;
+                }
+                if !exits_window {
+                    let busy = self.tab_close_hangs_up_a_job(wid, i);
+                    let replay = crate::close_confirm::CloseReplay::Tab { wid, tab: tab_id };
+                    if !self.view_close_allowed(wid, busy, replay) {
+                        return false;
+                    }
+                }
+            }
             let mut front = None;
             if let Some(ws) = self.windows.get_mut(&wid) {
                 front = ws.tab_set.active_id().filter(|front| *front != tab_id);
@@ -6011,8 +6103,8 @@ mod system_state_runtime_tests {
             assert!(receive.try_recv().is_err());
             assert_review(&mut app, first_window);
             assert!(app.structural_invariants_ok());
-            // Closing never cancels setup (design §3.5): the offer is let go
-            // either way, and setup resumes at the next launch.
+            // Closing never cancels setup (design §3.3): the review is closed
+            // for this launch either way, and the next launch offers it again.
             if window_close {
                 assert!(
                     app.prepare_window_native_shutdown(first_window, CloseScope::Window)
@@ -6024,7 +6116,7 @@ mod system_state_runtime_tests {
             }
             assert_eq!(
                 receive.try_recv().unwrap().decision,
-                WorkstationSetupDecision::Unavailable
+                WorkstationSetupDecision::Closed
             );
             assert!(!request.pending());
             assert!(app.native_runtime.app(instance).is_none());
@@ -8464,6 +8556,40 @@ mod rename_strip_click_tests {
         seg.start_col + 1
     }
 
+    /// A double click's interval, whose last instant still continues a run of presses.
+    fn interval() -> Duration {
+        Duration::from_millis(
+            u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
+        )
+    }
+
+    /// Where a test's stated presses start: a minute ago, far enough from the clock that a press or
+    /// a stamp that read the clock instead of its stated time lands on the wrong side of a double
+    /// click's interval.
+    fn a_minute_ago() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("a minute of uptime")
+    }
+
+    /// A pointer click on strip column `col` whose button went down and up at `when`.
+    fn click_strip(app: &mut App, wid: WindowId, col: u16, when: Instant) {
+        use aterm_window::event::{ElementState, MouseButton};
+        let (cw, ch) = app.win_cell_size(wid);
+        let (ox, oy) = app.frame_origin(wid);
+        let x = ox as f64 + (app.win_pad(wid) + usize::from(col) * cw + cw / 2) as f64;
+        let y = oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + ch / 2) as f64;
+        assert_eq!(
+            app.strip_col_at(wid, x, y),
+            Some(col),
+            "the pixel is on column {col}"
+        );
+        app.on_cursor_moved(wid, x, y);
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_mouse_input_at(wid, state, MouseButton::Left, when);
+        }
+    }
+
     use crate::session_pin_for_test as pin;
 
     #[test]
@@ -8491,7 +8617,7 @@ mod rename_strip_click_tests {
             Some(tab_bar::TabHit::Select(0))
         );
 
-        app.handle_tab_strip_click(wid, marks);
+        app.handle_tab_strip_click(wid, marks, Instant::now());
         assert!(app.windows[&wid].tab_menu.is_none(), "no menu");
         assert_eq!(
             app.windows[&wid].tab_set.active_index(),
@@ -8501,35 +8627,63 @@ mod rename_strip_click_tests {
         assert_eq!(app.rename_edit_session(wid), None);
     }
 
+    /// Each press states when it happened, so how long the tab switch between two presses
+    /// takes never moves the second across a double click's interval.
     #[test]
     fn a_second_click_on_the_same_chip_opens_the_inline_editor() {
         let (mut app, wid) = app_with_two_tabs();
         let col = chip_col(&app, wid, 0);
+        let first = a_minute_ago();
 
-        app.handle_tab_strip_click(wid, col);
+        app.handle_tab_strip_click(wid, col, first);
         assert_eq!(app.windows[&wid].tabs.active, 0, "the first click switches");
         assert_eq!(app.rename_edit_session(wid), None, "and only switches");
 
-        app.handle_tab_strip_click(wid, col);
+        app.handle_tab_strip_click(wid, col, first + interval());
         assert_eq!(
             app.rename_edit_session(wid),
             Some(0),
-            "the second click on the SAME chip edits its focused session"
+            "the second click on the SAME chip, at the interval's last instant, edits its \
+             focused session"
         );
 
         let (mut app, wid) = app_with_two_tabs();
-        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
-        app.handle_tab_strip_click(wid, chip_col(&app, wid, 1));
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0), first);
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 1), first + interval());
         assert_eq!(app.rename_edit_session(wid), None, "two chips, two clicks");
         assert_eq!(app.windows[&wid].tabs.active, 1);
 
         let (mut app, wid) = app_with_two_tabs();
-        app.handle_tab_strip_click(wid, col);
-        let stale = Instant::now() - Duration::from_millis(crate::multi_click_ms() as u64 + 50);
-        let tab = app.windows[&wid].tab_set.tabs()[0].id;
-        app.windows.get_mut(&wid).unwrap().strip_press = Some((stale, tab));
-        app.handle_tab_strip_click(wid, col);
-        assert_eq!(app.rename_edit_session(wid), None, "a stale press");
+        app.handle_tab_strip_click(wid, col, first);
+        app.handle_tab_strip_click(wid, col, first + interval() + Duration::from_millis(1));
+        assert_eq!(
+            app.rename_edit_session(wid),
+            None,
+            "a press a millisecond after the interval"
+        );
+
+        for settings in [false, true] {
+            for (second, edits) in [
+                (first + interval(), Some(0)),
+                (first + interval() + Duration::from_millis(1), None),
+            ] {
+                let (mut app, wid) = app_with_two_tabs();
+                if settings {
+                    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+                    app.splice_tab_strip(wid);
+                }
+                let col = chip_col(&app, wid, 0);
+                click_strip(&mut app, wid, col, first);
+                click_strip(&mut app, wid, col, second);
+                assert_eq!(
+                    app.rename_edit_session(wid),
+                    edits,
+                    "the pointer's second press on the chip, {:?} after the first (the first \
+                     from a Settings page in front: {settings})",
+                    second - first
+                );
+            }
+        }
     }
 
     #[test]
@@ -8539,11 +8693,11 @@ mod rename_strip_click_tests {
         assert!(app.begin_session_rename(wid, tab0));
         app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("kept".into()));
 
-        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0), Instant::now());
         assert_eq!(app.rename_edit_session(wid), Some(0), "still editing");
         assert_eq!(pin(&app, 0), None, "nothing committed yet");
 
-        app.handle_tab_strip_click(wid, chip_col(&app, wid, 1));
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 1), Instant::now());
         assert_eq!(app.rename_edit_session(wid), None, "the editor closed");
         assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
         assert_eq!(app.windows[&wid].tabs.active, 1, "and the tab switched");
@@ -8562,7 +8716,7 @@ mod rename_strip_click_tests {
         assert!(app.begin_session_rename(wid, tab0));
         app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("kept".into()));
 
-        app.handle_tab_strip_click(wid, plus);
+        app.handle_tab_strip_click(wid, plus, Instant::now());
         assert_eq!(app.rename_edit_session(wid), None);
         assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
         assert!(app.windows[&wid].strip_press.is_none(), "streak broken");
@@ -8588,7 +8742,7 @@ mod rename_strip_click_tests {
         );
 
         for press in 0..2 {
-            app.handle_tab_strip_click(wid, label);
+            app.handle_tab_strip_click(wid, label, Instant::now());
             let ws = &app.windows[&wid];
             assert!(
                 ws.strip_band_press.is_none(),
@@ -8616,37 +8770,41 @@ mod rename_strip_click_tests {
         crate::tray_raster::clear_ui_fonts_for_test();
     }
 
+    /// Each press states when it happened, so how long the work between presses takes never
+    /// moves one across a double click's interval.
     #[test]
     fn bare_band_presses_keep_their_own_double_click_streak() {
         let (mut app, wid) = app_with_two_tabs();
         let band = 999u16;
         assert!(tab_bar::hit_test(&app.windows[&wid].tab_segments, band).is_none());
+        let first = a_minute_ago();
 
-        app.handle_tab_strip_click(wid, band);
+        app.handle_tab_strip_click(wid, band, first);
         assert!(
             app.windows[&wid].strip_band_press.is_some(),
             "the first band press arms"
         );
-        app.handle_tab_strip_click(wid, band);
+        app.handle_tab_strip_click(wid, band, first + interval());
         assert!(
             app.windows[&wid].strip_band_press.is_none(),
-            "the repeat is consumed — a third press is a fresh gesture"
+            "the repeat, at the interval's last instant, is consumed — a third press is a fresh \
+             gesture"
         );
 
-        app.handle_tab_strip_click(wid, band);
+        app.handle_tab_strip_click(wid, band, first + interval() * 2);
         assert!(app.windows[&wid].strip_band_press.is_some());
-        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0), first + interval() * 2);
         assert!(
             app.windows[&wid].strip_band_press.is_none(),
             "a chip press disarms the band streak"
         );
 
-        app.windows.get_mut(&wid).unwrap().strip_band_press =
-            Some(Instant::now() - Duration::from_millis(crate::multi_click_ms() as u64 + 50));
-        app.handle_tab_strip_click(wid, band);
+        app.handle_tab_strip_click(wid, band, first + interval() * 3);
+        assert!(app.windows[&wid].strip_band_press.is_some());
+        app.handle_tab_strip_click(wid, band, first + interval() * 4 + Duration::from_millis(1));
         assert!(
             app.windows[&wid].strip_band_press.is_some(),
-            "a stale press re-arms instead of consuming"
+            "a press a millisecond after the interval re-arms instead of consuming"
         );
     }
 
@@ -8732,7 +8890,11 @@ mod status_glance_tests {
         let report_kind = |state: Option<W>, kind: Option<K>| {
             reports.set(reports.get() + 1);
             ctx.timeline.lock().unwrap().note_program_state(
-                state.map(|state| ProgramState { state, kind }),
+                state.map(|state| ProgramState {
+                    state,
+                    kind,
+                    app: aterm_core::terminal::program_state::ProgramApp::Codex,
+                }),
                 reports.get(),
             );
         };
@@ -8752,6 +8914,7 @@ mod status_glance_tests {
                         pid: 4242,
                         start: "Mon Oct 20 16:37:58 2026".to_string(),
                     }),
+                    scoped: None,
                 });
         };
         let proven = |held: bool| claim(held.then_some(true));
@@ -10529,6 +10692,62 @@ mod exit_attribution_tests {
         assert!(app.pool.get(session).is_none() && !app.session_registered(session));
         assert!(!app.windows[&wid].pending_close);
         assert!(app.structural_invariants_ok());
+    }
+
+    /// A mixed tab's busy terminal leaf (beside a native leaf, as a restore's recovery placeholder
+    /// leaves it) is not closed unasked: neither its pane close (Cmd-W on the leaf) nor the tab's
+    /// close from the strip hangs up the job past the close policy, as a terminal tab's are not.
+    #[test]
+    fn a_busy_terminal_leaf_in_a_mixed_tab_is_not_closed_unasked() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let leaves = |app: &App| {
+            app.windows[&wid]
+                .tab_set
+                .active()
+                .map_or(0, |tab| tab.root.len())
+        };
+        assert_eq!(leaves(&app), 2, "PRECONDITION: a mixed tab");
+        assert!(
+            app.windows[&wid].tab_set.len() > 1,
+            "PRECONDITION: closing the mixed tab leaves the window open"
+        );
+        start_in_shell_job(&app, session);
+        assert!(
+            app.pane_close_hangs_up_a_job(session),
+            "PRECONDITION: closing the leaf hangs up a job (views={:?}, busy={})",
+            app.pool.views(session),
+            app.session_foreground_busy(session)
+        );
+
+        assert!(app.close_active_tab().is_none());
+        assert!(
+            app.pool.get(session).is_some(),
+            "the busy leaf's pane close is refused"
+        );
+        assert_eq!(leaves(&app), 2, "and the leaf stays");
+
+        let index = app.windows[&wid]
+            .tab_set
+            .active_index()
+            .expect("the mixed tab is active");
+        assert!(!app.close_tab_at(wid, index));
+        assert!(
+            app.pool.get(session).is_some(),
+            "the mixed tab's close is refused while its terminal is busy"
+        );
+
+        app.close_confirm = CloseConfirm::Programmatic;
+        assert!(app.close_active_tab().is_none());
+        assert!(
+            !app.pool.get(session).is_some(),
+            "control: an instructed close hangs it up"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

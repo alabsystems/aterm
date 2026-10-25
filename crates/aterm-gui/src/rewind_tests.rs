@@ -1258,10 +1258,38 @@ fn a_drag_over_the_past_screen_selects_and_copies_its_text() {
 /// Review fix #6 (R0b): Select All then Copy select and copy the past screen while it is shown.
 #[test]
 fn select_all_then_copy_takes_the_past_screen_not_the_live_one() {
+    let copy_readiness = |app: &App| {
+        app.publish_menu_live();
+        let palette = app.palette_snapshot(WID);
+        [
+            crate::menu::menu_live().has_selection,
+            app.palette_live().has_selection,
+            palette
+                .rows()
+                .iter()
+                .find(|row| row.action == crate::menu::MenuAction::Copy)
+                .expect("Copy command")
+                .enabled,
+        ]
+    };
+    let terminal_state = |term: &aterm_core::terminal::Terminal| {
+        (
+            crate::control::screen_text(term),
+            term.content_seq(),
+            term.grid().display_offset(),
+            term.selection_to_string(),
+        )
+    };
     let mut app = scripted_app();
     start_recording(&app);
     let past = slice(&app, b"\x1b[2J\x1b[Hthe past screen");
     let _ = slice(&app, b"\x1b[2J\x1b[Hthe live screen now");
+    let live = app.pool.get(0).expect("session 0").live_term().clone();
+    let live_unselected = terminal_state(&term_lock(&live));
+    assert!(
+        !term_lock(&live).text_selection().has_selection(),
+        "negative control: the live screen has no selection"
+    );
     app.rewind_open(0, Target::At(past), None).expect("open");
     app.select_all_in(WID);
     let copied = app.window_selection_text(WID).expect("a selection");
@@ -1269,12 +1297,50 @@ fn select_all_then_copy_takes_the_past_screen_not_the_live_one() {
         copied.contains("the past screen") && !copied.contains("live"),
         "{copied:?}"
     );
+    let shown = view(&app).shown.clone().expect("shown past screen");
+    let past_selected = terminal_state(&term_lock(&shown));
+    let selected_past_ready = copy_readiness(&app);
+    assert_eq!(terminal_state(&term_lock(&shown)), past_selected);
+    assert_eq!(terminal_state(&term_lock(&live)), live_unselected);
+    assert_eq!(
+        app.window_selection_text(WID).as_deref(),
+        Some(copied.as_str())
+    );
+
     assert!(app.rewind_close(0));
     app.select_all_in(WID);
     let copied = app.window_selection_text(WID).expect("a selection");
     assert!(
         copied.contains("the live screen now"),
         "negative control: live, it copies the live screen: {copied:?}"
+    );
+    let live_selected = terminal_state(&term_lock(&live));
+    let selected_live_ready = copy_readiness(&app);
+    assert!(term_lock(&live).text_selection().has_selection());
+
+    app.rewind_open(0, Target::At(past), None).expect("reopen");
+    let shown = view(&app).shown.clone().expect("reopened past screen");
+    assert!(
+        !term_lock(&shown).text_selection().has_selection(),
+        "the reopened past screen has no selection"
+    );
+    assert_eq!(app.window_selection_text(WID), None);
+    let past_unselected = terminal_state(&term_lock(&shown));
+    let unselected_past_ready = copy_readiness(&app);
+    assert_eq!(terminal_state(&term_lock(&shown)), past_unselected);
+    assert_eq!(terminal_state(&term_lock(&live)), live_selected);
+    assert_eq!(app.window_selection_text(WID), None);
+    assert!(app.rewind_close(0));
+    assert_eq!(terminal_state(&term_lock(&live)), live_selected);
+
+    assert_eq!(
+        [
+            selected_past_ready,
+            selected_live_ready,
+            unselected_past_ready
+        ],
+        [[true; 3], [true; 3], [false; 3]],
+        "native menu, palette predicate and Copy row follow the shown selection"
     );
 }
 

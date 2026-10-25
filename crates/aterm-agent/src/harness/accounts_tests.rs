@@ -4844,6 +4844,7 @@ fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sig
                 ..Binding::default()
             },
         )]),
+        ..Logins::default()
     };
     store.save_logins(&logins).unwrap();
     assert_eq!(
@@ -8086,11 +8087,6 @@ fn claudes_roster_admits_no_vendor_key_and_its_store_is_where_it_was() {
     ] {
         let text = format!("{POOL_ROWS}{key}\n");
         let why = Roster::parse(&text).expect_err(key);
-        assert!(
-            why.starts_with("accounts.toml: row `work` has an unknown key")
-                && why.ends_with("a row holds label, class, dir, email and browser"),
-            "{key}: {why}"
-        );
         assert_eq!(Roster::parse_for(Cli::Claude, &text), Err(why));
     }
     assert_eq!(

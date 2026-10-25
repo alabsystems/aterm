@@ -8,9 +8,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::LAB;
+use crate::agy_proof::{egress_verdict, refusals_verdict, talked};
 use crate::codex_proof::{Tally, Verdict};
 use crate::door::Door;
-use crate::gemini_proof::{egress_verdict, refusals_verdict, talked};
 use crate::lab::UpOpts;
 use crate::muse::Launch;
 use crate::procs::JailOut;

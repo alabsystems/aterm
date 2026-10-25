@@ -1315,6 +1315,7 @@ fn the_doors_tell_is_taped() {
         at_ms: since + 1_800_000,
         reading: OccupancyReading::default(),
         ready_idle: None,
+        wake: None,
     };
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
     let host = TapedHost::new(
@@ -1410,6 +1411,7 @@ fn booked_wakes() -> WakesSeen {
                 kinds: vec![AtomKind::File],
                 need: None,
                 need_slots: false,
+                need_met: true,
                 await_only: false,
             },
             WakeSeen {
@@ -1422,6 +1424,7 @@ fn booked_wakes() -> WakesSeen {
                 kinds: vec![AtomKind::Match, AtomKind::Sys, AtomKind::In],
                 need: Some("sys slots>=1 for=1200000ms".to_string()),
                 need_slots: true,
+                need_met: true,
                 await_only: false,
             },
         ],
@@ -1571,6 +1574,13 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
         Some(need),
         "a need reads back in its canonical spelling"
     );
+    // A book a build before any loop read one taped carries no `need_met`: a need reads unmet
+    // there, and a wake with none met. CONTROL: the field as taped reads back.
+    assert!(booked.contains("\"need_met\":true"), "{booked}");
+    let older = booked.replace("\"need_met\":true,", "");
+    let back = WakesSeen::take(older.as_bytes(), origin).expect("an older book reads");
+    assert!(back.wakes[0].need_met, "no need: met");
+    assert!(!back.wakes[1].need_met, "a need no build judged: unmet");
     // CONTROL: words it knows are read.
     assert!(WakeClaim::take(b"\"refused:carry-owed\"", origin).is_ok());
     assert!(NoteOutcome::take(b"\"no-task\"", origin).is_ok());

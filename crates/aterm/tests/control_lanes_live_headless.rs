@@ -101,6 +101,9 @@ fn world(tag: &str) -> World {
     could_not_run("no scratch base with a socket path short enough for sun_path")
 }
 
+/// Boot an instance whose descriptor limit stays at `soft_limit`: its hard limit is pinned there too,
+/// because a cold launch raises its soft limit to `min(4096, hard)` for the tabs it opens, and these
+/// tests stand at the cap a process held at `soft_limit` has (launchd's 256 is the tightest).
 fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
     let (_, hard) = descriptor_limits();
     if hard < soft_limit {
@@ -122,7 +125,7 @@ fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
         .stderr(log.1);
     let limit = libc::rlimit {
         rlim_cur: soft_limit,
-        rlim_max: hard,
+        rlim_max: soft_limit,
     };
     // SAFETY: the hook runs in the forked child before `exec`; it only calls `setrlimit`
     // (async-signal-safe, no allocation) on a value copied in, and `last_os_error` reads errno

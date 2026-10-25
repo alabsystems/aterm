@@ -105,7 +105,7 @@ impl SplitMix {
 
     /// The next 64-bit draw.
     #[inline]
-    pub fn next_u64(&mut self) -> u64 {
+    pub const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -115,7 +115,7 @@ impl SplitMix {
 
     /// A draw in `0..n` (the draw mod `n`); 0 when `n` is 0.
     #[inline]
-    pub fn below(&mut self, n: u64) -> u64 {
+    pub const fn below(&mut self, n: u64) -> u64 {
         match n {
             0 => 0,
             n => self.next_u64() % n,
@@ -124,19 +124,21 @@ impl SplitMix {
 
     /// An element of `xs` drawn by [`Self::below`] of its length; `None` when it is empty.
     #[inline]
-    pub fn pick<T: Copy>(&mut self, xs: &[T]) -> Option<T> {
-        let n = u64::try_from(xs.len()).unwrap_or(u64::MAX);
-        let i = usize::try_from(self.below(n)).ok()?;
-        xs.get(i).copied()
+    pub const fn pick<T: Copy>(&mut self, xs: &[T]) -> Option<T> {
+        if xs.is_empty() {
+            return None;
+        }
+        let i = self.below(xs.len() as u64) as usize;
+        Some(xs[i])
     }
 }
 
 /// An element of a non-empty table.
 #[inline]
-fn pick<T: Copy, const N: usize>(r: &mut SplitMix, xs: &[T; N]) -> T {
+const fn pick<T: Copy, const N: usize>(r: &mut SplitMix, xs: &[T; N]) -> T {
     const { assert!(N > 0) };
-    let i = usize::try_from(r.below(u64::try_from(N).unwrap_or(1))).unwrap_or(0);
-    xs[i.min(N - 1)]
+    let i = r.below(N as u64) as usize;
+    xs[if i < N { i } else { N - 1 }]
 }
 
 /// What a generated scenario exercises beyond typing and cooling.
@@ -207,7 +209,7 @@ struct Look {
 }
 
 impl Look {
-    fn at(&self, row: u16, col: u16) -> Presentation {
+    const fn at(&self, row: u16, col: u16) -> Presentation {
         let cfg = MomentumGlowConfig {
             enabled: true,
             intensity: self.intensity,
@@ -219,7 +221,7 @@ impl Look {
             theme_fg: if self.dark { 0x00C8_C8D2 } else { 0x0024_292F },
             theme_bg: if self.dark { 0x0010_1016 } else { 0x00FF_FFFF },
             block: self.block,
-            glyph_span: Some((0, i32::from(col))),
+            glyph_span: Some((0, col as i32)),
         };
         Presentation::of(Some((row, col)), &s0_geom(), &cfg)
     }
@@ -466,7 +468,9 @@ pub fn corpus_digest(golden: &Digest, parts: &[Vec<u8>]) -> Digest {
     let mut all: Vec<&[u8]> = Vec::with_capacity(parts.len() + 2);
     all.push(&version);
     all.push(&golden.0);
-    all.extend(parts.iter().map(Vec::as_slice));
+    for part in parts {
+        all.push(part.as_slice());
+    }
     Digest::of(CORPUS_DOMAIN, &all)
 }
 
@@ -515,13 +519,13 @@ impl Corpus {
     }
 
     fn parts_of(items: &[Item]) -> Vec<Vec<u8>> {
-        items
-            .iter()
-            .filter_map(|i| {
-                i.scenario()
-                    .map(|s| item_part(i.kind, i.split, &s.encode()))
-            })
-            .collect()
+        let mut out = Vec::with_capacity(items.len());
+        for i in items {
+            if let Some(s) = i.scenario() {
+                out.push(item_part(i.kind, i.split, &s.encode()));
+            }
+        }
+        out
     }
 
     /// The lane items' digest parts, in corpus order.

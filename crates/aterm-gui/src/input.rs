@@ -607,11 +607,15 @@ pub(crate) enum EgressMode {
 fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8], accepted: &mut Accepted) -> Delivery {
     debug_assert!(!bytes.is_empty());
     let (delivery, order, direct, refused) = match mode {
-        EgressMode::Interactive => delivered_receipt(
-            sink.write_frame_interactive_with_receipt(bytes),
-            bytes.len(),
-        ),
+        EgressMode::Interactive => {
+            crate::echo_rtt::note_write_start();
+            delivered_receipt(
+                sink.write_frame_interactive_with_receipt(bytes),
+                bytes.len(),
+            )
+        }
         EgressMode::Backpressured => {
+            crate::echo_rtt::note_write_start();
             delivered_receipt(sink.write_frame_with_receipt(bytes), bytes.len())
         }
         EgressMode::Encode => {
@@ -633,6 +637,7 @@ fn emit_metered(
     accepted: &mut Accepted,
     meter: &BulkMeter,
 ) -> Delivery {
+    crate::echo_rtt::note_write_start();
     let (delivery, order, direct, _) = delivered_receipt(
         sink.write_frame_metered_with_receipt(bytes, meter),
         bytes.len(),

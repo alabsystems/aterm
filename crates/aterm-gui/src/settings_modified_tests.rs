@@ -2087,7 +2087,7 @@ fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
         "Other… opens a field"
     );
     assert_eq!(
-        lab.state().font_text_entry.as_deref(),
+        lab.state().text_entry.as_deref(),
         Some(prefs::EDIT_FONT_FAMILY)
     );
     let submitted = lab
@@ -2114,7 +2114,7 @@ fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
         "{:?}",
         lab.state().feedback
     );
-    assert_eq!(lab.state().font_text_entry, None, "the list button is back");
+    assert_eq!(lab.state().text_entry, None, "the list button is back");
     assert_eq!(lab.state().editing_field, None);
 
     assert!(

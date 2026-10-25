@@ -2628,6 +2628,16 @@ impl App {
         let Some((instance, view)) = self.active_native_view(wid) else {
             return Ok(false);
         };
+        self.reconcile_editor_viewport(wid, instance, view)
+    }
+
+    /// Reconcile one editor leaf without moving the window's keyboard focus.
+    fn reconcile_editor_viewport(
+        &mut self,
+        wid: WindowId,
+        instance: crate::native_app::AppInstanceId,
+        view: crate::tab_model::ViewId,
+    ) -> Result<bool, String> {
         if !self
             .native_runtime
             .app(instance)
@@ -2665,10 +2675,34 @@ impl App {
             (Some(crate::native_app::NativeApp::Editor(editor)), _) => editor.toolbar(),
             _ => crate::native_ui::EditorToolbar::default(),
         };
-        let visible_lines = crate::native_ui::editor_visible_line_capacity_with_palette(
-            self.native_ui_viewport(wid)?,
+        let viewport = self.native_ui_viewport_for(wid, view)?;
+        // The rows under the footer the next frame paints: its status wraps in this editor.
+        let editor_rect = crate::native_ui::editor_text_viewport_rect_with_palette(
+            viewport,
             palette_candidates,
             toolbar,
+        );
+        let footer_rows = match (
+            self.native_runtime.app(instance),
+            self.native_runtime.view_state(view),
+        ) {
+            (
+                Some(crate::native_app::NativeApp::Editor(editor)),
+                Some(crate::native_app::AppViewState::Editor(state)),
+            ) => {
+                let document = self
+                    .native_runtime
+                    .document_id(instance)
+                    .and_then(|document| self.document_store.snapshot(document));
+                editor.footer_rows_in(state, document.as_ref(), editor_rect)
+            }
+            _ => 1,
+        };
+        let visible_lines = crate::native_ui::editor_visible_line_capacity_with_palette(
+            viewport,
+            palette_candidates,
+            toolbar,
+            footer_rows,
         );
         if matches!(
             self.native_runtime.view_state(view),
@@ -2697,6 +2731,44 @@ impl App {
         wid: WindowId,
         event: AppEvent,
     ) -> Result<EventResult, String> {
+        let (instance, view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "active tab is not a native app".to_string())?;
+        self.dispatch_native_target_event(wid, instance, view, event)
+    }
+
+    /// Scroll a visible native leaf without changing which leaf owns the keyboard.
+    pub(crate) fn scroll_native_view(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        lines: i32,
+        key: Option<crate::native_ui::UiKey>,
+    ) -> Result<EventResult, String> {
+        if !self
+            .active_visible_leaf_plan(wid)
+            .is_some_and(|plan| plan.leaf(view).is_some())
+        {
+            return Err("native scroll target is no longer visible".to_string());
+        }
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
+        else {
+            return Err("scroll target is not a native app".to_string());
+        };
+        let event = match key {
+            Some(key) => AppEvent::ScrollAt { lines, key },
+            None => AppEvent::ScrollLines(lines),
+        };
+        self.dispatch_native_target_event(wid, native.instance, view, event)
+    }
+
+    fn dispatch_native_target_event(
+        &mut self,
+        wid: WindowId,
+        instance: crate::native_app::AppInstanceId,
+        view: crate::tab_model::ViewId,
+        event: AppEvent,
+    ) -> Result<EventResult, String> {
         // A scroll the person asked for (a wheel, a page key) moves the page
         // under a still pointer while they watch it: what the pointer rests on
         // afterwards is theirs to press (`app_mouse::NativePointerRest`).
@@ -2707,9 +2779,6 @@ impl App {
         {
             ws.native_rest = None;
         }
-        let (instance, view) = self
-            .active_native_view(wid)
-            .ok_or_else(|| "active tab is not a native app".to_string())?;
         let kind = self
             .native_runtime
             .app(instance)
@@ -2722,10 +2791,12 @@ impl App {
                 | AppEvent::ScrollLines(_)
                 | AppEvent::ScrollPage(_)
                 | AppEvent::ScrollAt { .. } => true,
+                #[cfg(any(a11y_tree, test))]
+                AppEvent::RevealControl(_) => true,
                 _ => false,
             }
         {
-            self.interact_system_state(wid);
+            self.interact_system_state_view(wid, view);
         }
         let event = match event {
             AppEvent::ScrollAt { lines, .. } if kind != crate::native_app::AppKind::Settings => {
@@ -2736,7 +2807,7 @@ impl App {
         if kind == crate::native_app::AppKind::Editor
             && !matches!(event, AppEvent::EditorViewportChanged { .. })
         {
-            let _ = self.reconcile_active_editor_viewport(wid)?;
+            let _ = self.reconcile_editor_viewport(wid, instance, view)?;
         }
         if matches!(
             kind,
@@ -2752,7 +2823,7 @@ impl App {
         let event = if kind == crate::native_app::AppKind::Markdown {
             match event {
                 AppEvent::ScrollLines(lines) => {
-                    let viewport = self.native_ui_viewport(wid)?;
+                    let viewport = self.native_ui_viewport_for(wid, view)?;
                     AppEvent::MarkdownScroll {
                         lines,
                         viewport_width: viewport.width,
@@ -2764,7 +2835,7 @@ impl App {
                     viewport_width: _,
                     viewport_height: _,
                 } => {
-                    let viewport = self.native_ui_viewport(wid)?;
+                    let viewport = self.native_ui_viewport_for(wid, view)?;
                     AppEvent::MarkdownPage {
                         direction,
                         viewport_width: viewport.width,
@@ -2932,6 +3003,51 @@ impl App {
             return Err("native app target is stale or no longer active".to_string());
         }
         self.dispatch_native_event(wid, event)
+    }
+
+    /// Activate the exact live control, keeping viewport focus out of document commands.
+    pub(crate) fn dispatch_native_control_action(
+        &mut self,
+        wid: WindowId,
+        expected_view: crate::tab_model::ViewId,
+        key: crate::native_ui::UiKey,
+        invocation: crate::native_app::ActionInvocation,
+        focus_visible: bool,
+    ) -> Result<EventResult, String> {
+        let (_, active_view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "active tab is not a native app".to_string())?;
+        if active_view != expected_view {
+            return Err("native app target is stale or no longer active".to_string());
+        }
+        let focus_viewport = {
+            let compiled = self.current_native_ui(wid)?;
+            let node = compiled
+                .semantic(&key)
+                .ok_or_else(|| "unknown or stale UI key".to_string())?;
+            if node.action.as_ref() != Some(&invocation.id) {
+                return Err("UI key/action pair does not match the live semantic tree".to_string());
+            }
+            if node.state.is_some_and(|state| !state.enabled) {
+                return Err("semantic action is disabled".to_string());
+            }
+            if node.role == crate::native_ui::SemanticRole::TextViewport {
+                if !compiled.focus_order.contains(&key) {
+                    return Err("text viewport is not focusable".to_string());
+                }
+                if invocation.value.is_some() {
+                    return Err("viewport focus does not accept a value".to_string());
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if focus_viewport {
+            self.focus_native_control(wid, expected_view, key, focus_visible)
+        } else {
+            self.dispatch_native_view_event(wid, expected_view, AppEvent::Action(invocation))
+        }
     }
 
     fn note_native_handled_dispatch(&mut self, wid: WindowId) {
@@ -3271,7 +3387,7 @@ impl App {
             )
         {
             if let Some(target) = target {
-                let _ = self.focus_native_control(wid, target);
+                let _ = self.focus_native_control(wid, active_view, target, true);
             }
             return true;
         }
@@ -3575,14 +3691,20 @@ impl App {
         self.current_native_ui(wid).ok()?.segment_step(&focus, step)
     }
 
-    fn focus_native_control(
+    /// Focus one control only while its original view remains active.
+    pub(crate) fn focus_native_control(
         &mut self,
         wid: WindowId,
+        expected_view: crate::tab_model::ViewId,
         key: crate::native_ui::UiKey,
-    ) -> Result<(), String> {
+        focus_visible: bool,
+    ) -> Result<EventResult, String> {
         let (instance, view) = self
             .active_native_view(wid)
             .ok_or_else(|| "active tab is not a native app".to_string())?;
+        if view != expected_view {
+            return Err("native app target is stale or no longer active".to_string());
+        }
         self.invalidate_native_view_cache(wid, view, DamageRegion::All);
         let outcome = self
             .native_runtime
@@ -3592,10 +3714,10 @@ impl App {
             self.execute_native_effect(wid, instance, view, effect)?;
         }
         if let Some(state) = self.native_runtime.view_state_mut(view) {
-            state.common_mut().focus_visible = true;
+            state.common_mut().focus_visible = focus_visible;
         }
         self.request_redraw_all_windows();
-        Ok(())
+        Ok(outcome.result)
     }
 
     fn move_native_focus(&mut self, wid: WindowId, backwards: bool) -> Result<(), String> {
@@ -3768,26 +3890,35 @@ impl App {
             return Ok(false);
         };
         drop(compiled);
-        self.dispatch_native_event(
+        self.dispatch_native_control_action(
             wid,
-            AppEvent::Action(crate::native_app::ActionInvocation {
+            view,
+            key,
+            crate::native_app::ActionInvocation {
                 id: action,
                 value: None,
-            }),
+            },
+            true,
         )?;
         Ok(true)
     }
 
     fn activate_native_default(&mut self, wid: WindowId) -> Result<bool, String> {
-        let Some((_, action)) = self.current_native_ui(wid)?.default_action.clone() else {
+        let (_, view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "active tab is not a native app".to_string())?;
+        let Some((key, action)) = self.current_native_ui(wid)?.default_action.clone() else {
             return Ok(false);
         };
-        self.dispatch_native_event(
+        self.dispatch_native_control_action(
             wid,
-            AppEvent::Action(crate::native_app::ActionInvocation {
+            view,
+            key,
+            crate::native_app::ActionInvocation {
                 id: action,
                 value: None,
-            }),
+            },
+            true,
         )?;
         Ok(true)
     }

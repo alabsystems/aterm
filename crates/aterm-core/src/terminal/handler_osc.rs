@@ -67,7 +67,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// OSC 7501 (`state=<word>:app=codex[:kind=<k>]`, `state=clear`) ([`super::program_state`]).
+    /// OSC 7501 (`state=<word>:app=<codex|grok-build>[:kind=<k>]`, `state=clear`), the root record
+    /// only ([`super::program_state`]).
     #[inline]
     fn handle_osc_7501(&mut self, params: &[&[u8]]) {
         let [_, body] = params else {

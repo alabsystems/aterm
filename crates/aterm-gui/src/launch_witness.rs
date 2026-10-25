@@ -424,7 +424,7 @@ mod tests {
     }
 
     /// THE LAUNCH'S INSTANT is every mark's, whatever its word: a command no
-    /// rule covers (`sh run-gemini.sh`, a controller's line) is started at
+    /// rule covers (`sh run-agy.sh`, a controller's line) is started at
     /// the wall clock its hold read, with the person count loaded there; a
     /// newer command's start replaces both.
     #[test]
@@ -433,11 +433,11 @@ mod tests {
         let term = Mutex::new(t);
         let (person, w) = (HumanInputStamp::default(), LaunchWitness::default());
         assert_eq!(w.started(), None, "no mark yet");
-        hold(&term, b"sh run-gemini.sh", &person, &w);
+        hold(&term, b"sh run-agy.sh", &person, &w);
         assert_eq!(w.started(), None, "no command start");
         typed_and_entered(&person, "x");
         let before = now_unix_ms();
-        hold(&term, &preexec("sh run-gemini.sh", &hex), &person, &w);
+        hold(&term, &preexec("sh run-agy.sh", &hex), &person, &w);
         let after = now_unix_ms();
         let started = w.started().expect("a start");
         assert_eq!(started.seq, 2, "the count its hold loaded");
@@ -456,7 +456,7 @@ mod tests {
             &person,
             &w,
         );
-        hold(&term, &preexec("gemini", &hex), &person, &w);
+        hold(&term, &preexec("agy", &hex), &person, &w);
         let next = w.started().expect("the next start");
         assert_eq!(next.seq, 3);
         assert!(next.at_ms >= started.at_ms);
@@ -464,7 +464,7 @@ mod tests {
         let w = LaunchWitness::default();
         hold(
             &term,
-            b"\x1b]133;A\x07$ \x1b]133;B\x07gemini\r\n\x1b]633;E;gemini\x07\x1b]133;C\x07",
+            b"\x1b]133;A\x07$ \x1b]133;B\x07agy\r\n\x1b]633;E;agy\x07\x1b]133;C\x07",
             &person,
             &w,
         );

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the wall modes past W2 (`--mode wall-shift` through `wall-bucket`).
+//! Tests for the wall modes past W2 (`--mode wall-redraw` through `wall-relaunch`).
 
 use super::*;
 
@@ -9,16 +9,6 @@ const MUSE_LIMITED: &str = "EVENT limited seq=2 message=◆ Usage limit reached 
 
 fn wall_at(reset: i64) -> Option<(i64, i64)> {
     Some((T0 + 6_000, (T0 + reset) / 1000))
-}
-
-fn approved(t: i64) -> Row {
-    row(
-        t,
-        "limit-retry@v1",
-        "approved",
-        "Keep trying (reset 5:06 AM)",
-        "",
-    )
 }
 
 fn stub_read() -> Option<StubSeen> {
@@ -37,16 +27,6 @@ fn window_read() -> Option<StubSeen> {
     })
 }
 
-fn retry_wait(t: i64, seq: u32, until: i64) -> (i64, String) {
-    j(
-        t,
-        &format!(
-            "WAITING seq={seq} until={} rule=limit-retry@v1 Gemini CLI's usage limit resets at 5:06 AM: Keep trying is pressed past it",
-            stamp(until)
-        ),
-    )
-}
-
 #[test]
 fn the_wall_is_raised_again_at_its_reset_as_each_chain_shifts() {
     let reset = 1_300;
@@ -55,23 +35,13 @@ fn the_wall_is_raised_again_at_its_reset_as_each_chain_shifts() {
         ..Cover::default()
     };
     let due = reset * 1000 - WALL_LIFT_EARLY_MS;
-    assert_eq!(wall_move(Chain::ShiftWall, &c, due - 1), WallMove::Hold);
-    let step = SHIFT_STEP_MS / 1000;
-    assert_eq!(
-        wall_move(Chain::ShiftWall, &c, due),
-        WallMove::Shift(reset + step)
-    );
+    assert_eq!(wall_move(Chain::RedrawWall, &c, due - 1), WallMove::Hold);
+    let step = REDRAW_AHEAD_MS / 1000;
     assert_eq!(
         wall_move(Chain::RedrawWall, &c, due),
-        WallMove::Shift(reset + REDRAW_AHEAD_MS / 1000)
+        WallMove::Shift(reset + step)
     );
-    for chain in [
-        Chain::Wall,
-        Chain::WallHid,
-        Chain::WallDay,
-        Chain::WallClimb,
-        Chain::UnreadWall,
-    ] {
+    for chain in [Chain::Wall, Chain::WallHid, Chain::UnreadWall] {
         assert_eq!(wall_move(chain, &c, due), WallMove::Lift, "{chain:?}");
     }
     assert_eq!(
@@ -80,29 +50,25 @@ fn the_wall_is_raised_again_at_its_reset_as_each_chain_shifts() {
     );
     c.shifted.push((due, reset + step));
     assert_eq!(
-        wall_move(Chain::ShiftWall, &c, due + 10_000),
+        wall_move(Chain::RedrawWall, &c, due + 10_000),
         WallMove::Hold
     );
     let due2 = (reset + step) * 1000 - WALL_LIFT_EARLY_MS;
-    assert_eq!(
-        wall_move(Chain::ShiftWall, &c, due2),
-        WallMove::Shift(reset + 2 * step)
-    );
     assert_eq!(wall_move(Chain::RedrawWall, &c, due2), WallMove::Lift);
-    c.shifted.push((due2, reset + 2 * step));
-    let due3 = (reset + 2 * step) * 1000 - WALL_LIFT_EARLY_MS;
-    assert_eq!(wall_move(Chain::ShiftWall, &c, due3), WallMove::Lift);
-    c.lifted_ms = Some(due3);
-    assert_eq!(wall_move(Chain::ShiftWall, &c, due3 + 1), WallMove::Hold);
+    c.lifted_ms = Some(due2);
+    assert_eq!(wall_move(Chain::RedrawWall, &c, due2 + 1), WallMove::Hold);
     assert_eq!(
-        wall_move(Chain::ShiftWall, &Cover::default(), due),
+        wall_move(Chain::RedrawWall, &Cover::default(), due),
         WallMove::Hold
     );
-    assert_eq!(SHIFT_STEP_MS % 60_000, 0);
     assert_eq!(REDRAW_AHEAD_MS % 60_000, 0);
     assert_eq!(
-        [Chain::ShiftWall, Chain::RedrawWall, Chain::Wall].map(Chain::shifts),
-        [SHIFT_TIMES, 1, 0]
+        [Chain::RedrawWall, Chain::Wall, Chain::SwitchWall].map(Chain::shifts),
+        [1, 0, 0]
+    );
+    assert_eq!(
+        [Chain::RedrawWall, Chain::Wall].map(Chain::shift_step_ms),
+        [REDRAW_AHEAD_MS, 0]
     );
 }
 
@@ -110,17 +76,12 @@ fn the_wall_is_raised_again_at_its_reset_as_each_chain_shifts() {
 fn a_requests_reset_is_the_wall_standing_when_it_was_answered() {
     let mut c = Cover {
         wall: Some((T0, 1_300)),
-        shifted: vec![(T0 + 297_000, 1_600), (T0 + 597_000, 1_900)],
-        lifted_ms: Some(T0 + 897_000),
+        shifted: vec![(T0 + 297_000, 1_600)],
+        lifted_ms: Some(T0 + 597_000),
         ..Cover::default()
     };
-    assert_eq!(c.reset_at(T0 - 1), None);
-    assert_eq!(c.reset_at(T0 + 100_000), Some(1_300));
-    assert_eq!(c.reset_at(T0 + 297_000), Some(1_600));
-    assert_eq!(c.reset_at(T0 + 600_000), Some(1_900));
-    assert_eq!(c.reset_at(T0 + 897_000), None);
-    assert_eq!(c.reset_now(), Some(1_900));
-    assert_eq!(wall_window_end(Chain::ShiftWall, &c), Some(1_900_000));
+    assert_eq!(c.reset_now(), Some(1_600));
+    assert_eq!(Cover::default().reset_now(), None);
     assert_eq!(wall_window_end(Chain::RedrawWall, &c), Some(1_300_000));
     assert_eq!(wall_window_end(Chain::Wall, &c), Some(1_300_000));
     assert_eq!(wall_window_end(Chain::SwitchWall, &c), None);
@@ -145,13 +106,12 @@ fn the_switch_starts_another_agent_once_the_first_has_left_its_tab() {
     }
     assert_eq!(
         Harness::ALL.map(switch_to),
-        [Harness::Muse, Harness::Muse, Harness::Muse, Harness::Claude]
+        [Harness::Muse, Harness::Muse, Harness::Claude]
     );
     assert_eq!(
         Harness::ALL.map(exit_of),
         [
             Exit::CancelThenCtrlCTwice(CLAUDE_CANCEL),
-            Exit::OptionThenCommand(GEMINI_HIDE_OPTION, "/quit"),
             Exit::Command("/quit"),
             Exit::CtrlCTwice
         ]
@@ -224,12 +184,6 @@ fn the_unread_conversation_is_read_again_after_the_told() {
 fn the_walls_past_w2_each_run_their_own_chain_where_they_reach() {
     let modes = [
         (
-            "wall-shift",
-            Mode::WallShift,
-            Chain::ShiftWall,
-            Scenario::W3,
-        ),
-        (
             "wall-redraw",
             Mode::WallRedraw,
             Chain::RedrawWall,
@@ -257,7 +211,7 @@ fn the_walls_past_w2_each_run_their_own_chain_where_they_reach() {
         assert!(c.walled() && c.lands() && !c.managed() && c.autopilot() == "land");
         assert!(Chain::every().contains(&c));
         assert!(c.limit_ms() > c.wall_ahead_ms());
-        let a = parse_args(&v(&["--harness", "gemini", "--mode", w]))
+        let a = parse_args(&v(&["--harness", "agy", "--mode", w]))
             .unwrap()
             .unwrap();
         assert_eq!(a.mode, m);
@@ -268,12 +222,11 @@ fn the_walls_past_w2_each_run_their_own_chain_where_they_reach() {
         assert!(!sc.what().is_empty());
     }
     let reach = |m: Mode| Harness::ALL.map(|h| wall_out_of_reach(h, m).is_none());
-    assert_eq!(reach(Mode::WallShift), [false, true, false, false]);
-    assert_eq!(reach(Mode::WallRedraw), [true, true, true, true]);
-    assert_eq!(reach(Mode::WallSwitch), [true, true, true, true]);
-    assert_eq!(reach(Mode::WallUnread), [true, false, false, false]);
+    assert_eq!(reach(Mode::WallRedraw), [true, true, true]);
+    assert_eq!(reach(Mode::WallSwitch), [true, true, true]);
+    assert_eq!(reach(Mode::WallUnread), [true, false, false]);
     assert_eq!(
-        Chain::of_mode_on(Mode::WallShift, Harness::Muse),
+        Chain::of_mode_on(Mode::WallUnread, Harness::Muse),
         Vec::<Chain>::new()
     );
     assert_eq!(
@@ -282,162 +235,19 @@ fn the_walls_past_w2_each_run_their_own_chain_where_they_reach() {
     );
     assert_eq!(
         Harness::ALL.map(|h| Chain::RedrawWall.hides_on(h)),
-        [true, true, false, false]
+        [true, false, false]
     );
     assert!(Harness::ALL.iter().all(|&h| Chain::UnreadWall.hides_on(h)
         && Chain::WallHid.hides_on(h)
-        && !Chain::ShiftWall.hides_on(h)
         && !Chain::SwitchWall.hides_on(h)
         && !Chain::Wall.hides_on(h)));
     assert_eq!(
-        [Scenario::W3, Scenario::W4, Scenario::W5, Scenario::W6].map(Scenario::id),
-        ["W3", "W4", "W5", "W6"]
+        [Scenario::W4, Scenario::W5, Scenario::W6].map(Scenario::id),
+        ["W4", "W5", "W6"]
     );
     assert_eq!(
         unread_told_words(),
         aterm_agent::supervise::policy::exception::Exception::unread_limit().why
-    );
-}
-
-fn gemini_shifted() -> Seen {
-    Seen {
-        journal: vec![
-            j(5_000, "EVENT idle seq=1 Implemented the parser"),
-            j(
-                5_100,
-                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
-            ),
-            j(
-                125_000,
-                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
-            ),
-            j(
-                140_000,
-                "EVENT prompt seq=2 kind=usage-limit classify=- command=-",
-            ),
-            retry_wait(140_200, 2, 419_000),
-            j(420_000, "APPROVED seq=2 Keep trying (reset 5:06 AM)"),
-            j(
-                422_500,
-                "EVENT prompt seq=3 kind=usage-limit classify=- command=-",
-            ),
-            retry_wait(423_000, 3, 719_000),
-            j(720_000, "APPROVED seq=3 Keep trying (reset 5:11 AM)"),
-            j(
-                722_500,
-                "EVENT prompt seq=4 kind=usage-limit classify=- command=-",
-            ),
-            retry_wait(723_000, 4, 1_019_000),
-            j(1_020_000, "APPROVED seq=4 Keep trying (reset 5:16 AM)"),
-            j(1_024_000, "EVENT idle seq=5 Nothing left: the parser"),
-            j(1_024_000, "DONE seq=5 rule=land@v1 x"),
-        ],
-        ledger: vec![
-            point(5_000, 1),
-            typed(125_000, "land@v1", LAND),
-            point(140_000, 2),
-            approved(420_000),
-            approved(720_000),
-            approved(1_020_000),
-            point(1_024_000, 3),
-            task_done(1_024_000),
-        ],
-        status: vec![
-            status(1_000, "open", "land"),
-            status(1_025_000, "landed", "land"),
-        ],
-        meta: vec![no_meta(1_000)],
-        task: vec![j(1_000, "OK task -")],
-        end_ms: T0 + 1_024_000 + 545_000,
-        stub: stub_read(),
-        cover: Cover {
-            wall: wall_at(300_000),
-            shifted: vec![
-                (T0 + 297_000, (T0 + 600_000) / 1000),
-                (T0 + 597_000, (T0 + 900_000) / 1000),
-            ],
-            lifted_ms: Some(T0 + 897_000),
-            window_stub: window_read(),
-            ..Cover::default()
-        },
-        ..Seen::default()
-    }
-}
-
-#[test]
-fn g3s_climb_across_a_changed_reset_waits_each_new_reset_out() {
-    let w3 = |s: &Seen| one(Chain::ShiftWall, s, "gemini", Scenario::W3);
-    let (w, why) = w3(&gemini_shifted());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains("try 1 at +420.0 s (120.0 s past the reset +300.0 s) met the wall again, its dialog's new reset +600.0 s waited on from +423.0 s")
-            && why.contains("try 2 at +720.0 s (120.0 s past the reset +600.0 s) met the wall again")
-            && why.contains("try 3 at +1020.0 s (120.0 s past the reset +900.0 s) got through")
-            && why.contains("DONE at +1024.0 s"),
-        "{why}"
-    );
-    let fail = |s: &Seen, needle: &str| {
-        let (w, why) = w3(s);
-        assert_eq!(w, "FAIL", "{needle}: {why}");
-        assert!(why.contains(needle), "{needle}: {why}");
-    };
-    let mut s = gemini_shifted();
-    s.ledger[4].ts = T0 + 590_000;
-    fail(&s, "PRESSED BEFORE THE RESET: try 2 at +590.0 s");
-    let mut s = gemini_shifted();
-    s.journal.retain(|(t, _)| *t != T0 + 423_000);
-    fail(
-        &s,
-        "try 1 at +420.0 s met the wall again (its new reset +600.0 s), but no wait on that reset",
-    );
-    let mut s = gemini_shifted();
-    for (t, l) in &mut s.journal {
-        if *t == T0 + 423_000 {
-            *l = retry_wait(423_000, 3, 419_000).1;
-        }
-    }
-    fail(
-        &s,
-        "try 1 at +420.0 s met the wall again (its new reset +600.0 s), but no wait on that reset",
-    );
-    let mut s = gemini_shifted();
-    s.journal.insert(
-        8,
-        j(
-            700_000,
-            "CONTINUED seq=3 rule=usage-resume@v1 [aterm harness] Still landing:",
-        ),
-    );
-    fail(&s, "TYPED into the dialog: usage-resume@v1 at +700.0 s");
-    let mut s = gemini_shifted();
-    s.ledger[5].ts = T0 + 1_400_000;
-    fail(&s, "PERSISTENCE LOST: try 3 at +1400.0 s");
-    let mut s = gemini_shifted();
-    s.ledger.truncate(5);
-    s.journal.truncate(11);
-    s.end_ms = T0 + 1_400_000;
-    fail(&s, "PERSISTENCE LOST: no try got through by +1400.0 s");
-    let mut s = gemini_shifted();
-    s.ledger.insert(6, approved(1_022_000));
-    fail(
-        &s,
-        "a press at +1022.0 s after the try that got through at +1020.0 s",
-    );
-    let mut s = gemini_shifted();
-    s.ledger
-        .insert(3, row(140_100, "-", "escalated", "Keep trying", "x"));
-    fail(&s, "ESCALATED the wall to a person at +140.1 s");
-    let mut s = gemini_shifted();
-    s.cover.shifted.truncate(1);
-    s.cover.lifted_ms = Some(T0 + 597_000);
-    s.ledger.remove(5);
-    s.journal
-        .retain(|(t, _)| *t < T0 + 722_000 || *t >= T0 + 1_024_000);
-    let (w, why) = w3(&s);
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(
-        why.contains("only 1 of 2 tries met the wall again"),
-        "{why}"
     );
 }
 
@@ -696,8 +506,8 @@ fn the_redraw_after_a_typed_resume_is_waited_on_the_loops_floor() {
         "{why}"
     );
     let mut s = agy_redrawn();
-    s.journal.remove(6);
-    s.ledger[3] = approved(553_800);
+    s.journal[6].1 = "CONTINUED seq=2 rule=land@v1 [aterm harness] Autopilot is Land:".into();
+    s.ledger[3] = typed(553_800, "land@v1", LAND);
     let (w, why) = w4(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(
@@ -1036,7 +846,6 @@ fn claude_held_unread() -> Seen {
                 seq: Some(30),
                 commands: 12,
                 command: CLAUDE_HIDE_COMMAND,
-                stopped: false,
                 words: &CLAUDE_WALL_WORDS,
             }),
             unread: Some(Unread {
@@ -1145,12 +954,6 @@ fn a_limit_held_unread_an_hour_past_its_reset_is_told_and_still_held() {
 fn the_walls_of_x1_and_x2_each_run_their_own_chain_where_they_reach() {
     let modes = [
         (
-            "wall-day-stop",
-            Mode::WallDayStop,
-            Chain::DayStopWall,
-            Scenario::W7,
-        ),
-        (
             "wall-cruise",
             Mode::WallCruise,
             Chain::CruiseWall,
@@ -1161,12 +964,6 @@ fn the_walls_of_x1_and_x2_each_run_their_own_chain_where_they_reach() {
             Mode::WallRelaunch,
             Chain::RelaunchWall,
             Scenario::W9,
-        ),
-        (
-            "wall-bucket",
-            Mode::WallBucket,
-            Chain::BucketWall,
-            Scenario::W10,
         ),
     ];
     let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -1179,7 +976,7 @@ fn the_walls_of_x1_and_x2_each_run_their_own_chain_where_they_reach() {
         assert!(c.walled() && !c.managed(), "{c:?}");
         assert!(Chain::every().contains(&c));
         assert!(c.limit_ms() > c.wall_ahead_ms());
-        let a = parse_args(&v(&["--harness", "gemini", "--mode", w]))
+        let a = parse_args(&v(&["--harness", "agy", "--mode", w]))
             .unwrap()
             .unwrap();
         assert_eq!(a.mode, m);
@@ -1200,35 +997,22 @@ fn the_walls_of_x1_and_x2_each_run_their_own_chain_where_they_reach() {
         }
     }
     let reach = |m: Mode| Harness::ALL.map(|h| wall_out_of_reach(h, m).is_none());
-    assert_eq!(reach(Mode::WallDayStop), [false, true, false, false]);
-    assert_eq!(reach(Mode::WallCruise), [true, true, true, true]);
-    assert_eq!(reach(Mode::WallRelaunch), [false, true, true, true]);
-    assert_eq!(reach(Mode::WallBucket), [false, true, false, false]);
+    assert_eq!(reach(Mode::WallCruise), [true, true, true]);
+    assert_eq!(reach(Mode::WallRelaunch), [false, true, true]);
     assert_eq!(
         Chain::of_mode_on(Mode::WallRelaunch, Harness::Claude),
         Vec::<Chain>::new()
     );
     assert_eq!(
-        Chain::of_mode_on(Mode::WallBucket, Harness::Gemini),
-        [Chain::BucketWall]
+        Chain::of_mode_on(Mode::WallRelaunch, Harness::Agy),
+        [Chain::RelaunchWall]
     );
-    assert!(Harness::ALL.iter().all(|&h| Chain::DayStopWall.hides_on(h)
-        && !Chain::CruiseWall.hides_on(h)
-        && !Chain::RelaunchWall.hides_on(h)
-        && !Chain::BucketWall.hides_on(h)));
-    assert_eq!(
-        Chain::DayStopWall.wall_claim_on(Harness::Gemini),
-        WALL_CLAIM
+    assert!(
+        Harness::ALL
+            .iter()
+            .all(|&h| !Chain::CruiseWall.hides_on(h) && !Chain::RelaunchWall.hides_on(h))
     );
-    assert_eq!(
-        Chain::BucketWall.wall_claim_on(Harness::Gemini),
-        crate::stub::gemini::BUCKET_CLAIM
-    );
-    assert_eq!(Chain::DayStopWall.wall_ahead_ms(), WALL_DAY_AHEAD_MS);
-    assert_eq!(
-        [Scenario::W7, Scenario::W8, Scenario::W9, Scenario::W10].map(Scenario::id),
-        ["W7", "W8", "W9", "W10"]
-    );
+    assert_eq!([Scenario::W8, Scenario::W9].map(Scenario::id), ["W8", "W9"]);
     let mut c = Cover {
         wall: Some((T0, 1_600)),
         ..Cover::default()
@@ -1243,181 +1027,6 @@ fn the_walls_of_x1_and_x2_each_run_their_own_chain_where_they_reach() {
     assert_eq!(
         wall_move(Chain::RelaunchWall, &c, 1_600_000 - WALL_LIFT_EARLY_MS),
         WallMove::Lift
-    );
-}
-
-const NO_RESET_BADGE: &str = "Gemini CLI's usage limit names no reset: Keep trying is tried on a \
-     back-off ladder; /stats model says which limit";
-
-const LADDER_WAIT: &str = "Gemini CLI's usage limit names no reset: Keep trying is pressed on the \
-     back-off ladder";
-
-fn gemini_day_stopped() -> Seen {
-    let due = 140_000 + 1_800_000;
-    Seen {
-        journal: vec![
-            j(5_000, "EVENT idle seq=1 Implemented the parser"),
-            j(
-                5_100,
-                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
-            ),
-            j(
-                125_000,
-                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
-            ),
-            j(
-                140_000,
-                &format!(
-                    "WAITING seq=2 until={} rule=limit-retry@v1 {LADDER_WAIT}",
-                    stamp(due)
-                ),
-            ),
-            j(140_100, "ESCALATED seq=2 attention=OK"),
-            j(
-                140_100,
-                "EVENT prompt seq=2 kind=usage-limit classify=- command=-",
-            ),
-            j(
-                168_400,
-                "EVENT limited seq=30 message=[API Error: An unknown error occurred.] reset=-",
-            ),
-            j(
-                168_500,
-                &format!(
-                    "WAITING seq=30 until={} usage-session resets",
-                    stamp(due + 60_000)
-                ),
-            ),
-            j(
-                due + 70_000,
-                "CONTINUED seq=30 rule=usage-resume@v1 [aterm harness] Still landing:",
-            ),
-            j(due + 74_000, "CLEARED seq=31 box attention=OK"),
-            j(due + 75_000, "EVENT idle seq=31 Nothing left: the parser"),
-            j(due + 75_000, "DONE seq=31 rule=land@v1 x"),
-        ],
-        ledger: vec![
-            point(5_000, 1),
-            typed(125_000, "land@v1", LAND),
-            point(140_000, 2),
-            row(
-                140_100,
-                "-",
-                "escalated",
-                "Keep trying (no reset named)",
-                NO_RESET_BADGE,
-            ),
-            row(
-                140_200,
-                "limit-retry@v1",
-                "waiting",
-                "Keep trying (no reset named)",
-                &format!("until …: {LADDER_WAIT}"),
-            ),
-            point(168_400, 2),
-            typed(due + 70_000, "usage-resume@v1", LAND_NUDGE),
-            point(due + 75_000, 3),
-            task_done(due + 75_000),
-        ],
-        status: vec![
-            status(1_000, "open", "land"),
-            status_of(141_000, "open", "ask", "land", "aterm-harness@1"),
-            status(due + 76_000, "landed", "land"),
-        ],
-        status_reads: vec![T0 + 600_000, T0 + 1_200_000, T0 + 1_900_000],
-        meta: vec![no_meta(1_000)],
-        task: vec![j(1_000, "OK task -")],
-        end_ms: T0 + due + 75_000 + 545_000,
-        stub: stub_read(),
-        cover: Cover {
-            wall: wall_at(1_500_000),
-            lifted_ms: Some(T0 + 1_497_000),
-            window_stub: window_read(),
-            hidden: Some(Hidden {
-                first_ms: T0 + 160_000,
-                enter_ms: T0 + 160_000,
-                seen_ms: T0 + 163_000,
-                seq: Some(30),
-                commands: 1,
-                command: GEMINI_HIDE_OPTION,
-                stopped: true,
-                words: &GEMINI_WALL_WORDS,
-            }),
-            ..Cover::default()
-        },
-        ..Seen::default()
-    }
-}
-
-#[test]
-fn the_per_day_dialog_answered_stop_is_kept_trying_while_needs_you_stands() {
-    let w7 = |s: &Seen| one(Chain::DayStopWall, s, "gemini", Scenario::W7);
-    let (w, why) = w7(&gemini_day_stopped());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains(
-            "kept trying: usage-resume@v1 at +2010.0 s (70.0 s after the ladder's first due)"
-        ) && why.contains("needs=ask at 3 status read(s) from the Stop to it")
-            && why.contains("NEEDS YOU down at +2014.0 s"),
-        "{why}"
-    );
-    let fail = |s: &Seen, needle: &str| {
-        let (w, why) = w7(s);
-        assert_eq!(w, "FAIL", "{needle}: {why}");
-        assert!(why.contains(needle), "{needle}: {why}");
-    };
-    let due = 140_000 + 1_800_000;
-    let mut s = gemini_day_stopped();
-    s.journal.truncate(8);
-    s.ledger.truncate(6);
-    s.ledger.push(row(
-        168_450,
-        "-",
-        "escalated",
-        "",
-        "api-error not retried (Gemini CLI retries what time answers; after its usage limit's Stop, see /stats model): [API Error: An unknown error occurred.]",
-    ));
-    s.status.truncate(2);
-    fail(&s, "ESCALATED");
-    let mut s = gemini_day_stopped();
-    s.journal[8].0 = T0 + due - 100_000;
-    s.ledger[6].ts = T0 + due - 100_000;
-    fail(&s, "RESUMED BEFORE ITS RUNG: usage-resume@v1 at +1840.0 s");
-    let mut s = gemini_day_stopped();
-    s.journal[8].1 = "CONTINUED seq=30 rule=land@v1 [aterm harness] Autopilot is Land:".into();
-    s.ledger[6] = typed(due + 70_000, "land@v1", LAND);
-    let (w, why) = w7(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("the first act after the Stop was land@v1"),
-        "{why}"
-    );
-    let mut s = gemini_day_stopped();
-    s.journal
-        .insert(8, j(600_000, "CLEARED seq=30 box attention=OK"));
-    fail(&s, "NEEDS YOU came down at +600.0 s while the limit stood");
-    let mut s = gemini_day_stopped();
-    s.status.insert(2, status(900_000, "open", "land"));
-    fail(&s, "NEEDS YOU not standing at the status read at +900.0 s");
-    let mut s = gemini_day_stopped();
-    s.journal.remove(9);
-    s.status[2] = status_of(due + 76_000, "landed", "ask", "land", "aterm-harness@1");
-    fail(&s, "NEEDS YOU STOOD after the resume that got through");
-    let mut s = gemini_day_stopped();
-    let h = s.cover.hidden.as_mut().expect("hidden");
-    h.stopped = false;
-    h.command = HIDE_COMMAND;
-    s.journal[6].1 = "EVENT idle seq=30 -".into();
-    let (w, why) = w7(&s);
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(why.contains("not the dialog's Stop"), "{why}");
-    let mut s = gemini_day_stopped();
-    s.status_reads.clear();
-    let (w, why) = w7(&s);
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(
-        why.contains("no status read between the Stop and the resume"),
-        "{why}"
     );
 }
 
@@ -1766,124 +1375,6 @@ fn an_agent_launched_again_under_its_wall_waits_it_out() {
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(
         why.contains("never read the wall before the reset"),
-        "{why}"
-    );
-}
-
-fn gemini_bucket() -> Seen {
-    let waits = "Gemini CLI's usage limit resets at 5:06 AM: Stop is pressed and the turn resumed \
-         past it";
-    Seen {
-        journal: vec![
-            j(5_000, "EVENT idle seq=1 Implemented the parser"),
-            j(
-                5_100,
-                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
-            ),
-            j(
-                125_000,
-                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
-            ),
-            j(
-                140_000,
-                "EVENT prompt seq=2 kind=usage-limit classify=- command=-",
-            ),
-            j(
-                140_100,
-                &format!(
-                    "WAITING seq=2 until={} rule=limit-retry@v1 {waits}",
-                    stamp(360_000)
-                ),
-            ),
-            j(361_000, "APPROVED seq=2 Stop (reset 5:06 AM)"),
-            j(
-                362_000,
-                "EVENT limited seq=3 message=[API Error: An unknown error occurred.] reset=-",
-            ),
-            j(
-                363_000,
-                "CONTINUED seq=3 rule=usage-resume@v1 [aterm harness] Still landing:",
-            ),
-            j(367_000, "EVENT idle seq=4 Nothing left: the parser"),
-            j(367_000, "DONE seq=4 rule=land@v1 x"),
-        ],
-        ledger: vec![
-            point(5_000, 1),
-            typed(125_000, "land@v1", LAND),
-            point(140_000, 2),
-            row(
-                140_100,
-                "limit-retry@v1",
-                "waiting",
-                "Stop (reset 5:06 AM)",
-                &format!("until …: {waits}"),
-            ),
-            row(
-                361_000,
-                "limit-stop@v1",
-                "approved",
-                "Stop (reset 5:06 AM)",
-                "",
-            ),
-            point(362_000, 2),
-            typed(363_000, "usage-resume@v1", LAND_NUDGE),
-            point(367_000, 3),
-            task_done(367_000),
-        ],
-        status: vec![
-            status(1_000, "open", "land"),
-            status(368_000, "landed", "land"),
-        ],
-        meta: vec![no_meta(1_000)],
-        task: vec![j(1_000, "OK task -")],
-        end_ms: T0 + 367_000 + 545_000,
-        stub: stub_read(),
-        cover: Cover {
-            wall: wall_at(300_000),
-            lifted_ms: Some(T0 + 297_000),
-            window_stub: window_read(),
-            ..Cover::default()
-        },
-        ..Seen::default()
-    }
-}
-
-#[test]
-fn the_per_model_buckets_dialog_gets_its_stop_never_its_switch() {
-    let w10 = |s: &Seen| one(Chain::BucketWall, s, "gemini", Scenario::W10);
-    let (w, why) = w10(&gemini_bucket());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains("the bucket's Stop at +361.0 s, usage-resume@v1 at +363.0 s")
-            && why.contains("never the switch"),
-        "{why}"
-    );
-    let fail = |s: &Seen, needle: &str| {
-        let (w, why) = w10(s);
-        assert_eq!(w, "FAIL", "{needle}: {why}");
-        assert!(why.contains(needle), "{needle}: {why}");
-    };
-    let mut s = gemini_bucket();
-    s.ledger[4].command = "Switch to gemini-2.5-flash".into();
-    fail(&s, "SWITCHED the model at +361.0 s");
-    let mut s = gemini_bucket();
-    s.ledger[4].ts = T0 + 340_000;
-    fail(&s, "STOPPED BEFORE ITS DUE");
-    let mut s = gemini_bucket();
-    s.ledger[4].ts = T0 + 200_000;
-    fail(&s, "TYPED into the wall");
-    let mut s = gemini_bucket();
-    s.journal[7].0 = T0 + 350_000;
-    s.ledger[6].ts = T0 + 350_000;
-    fail(&s, "NO RESUME typed after the Stop");
-    let mut s = gemini_bucket();
-    s.ledger[4] = approved(361_000);
-    s.journal.remove(7);
-    s.ledger.remove(6);
-    let (w, why) = w10(&s);
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(
-        why.contains("the dialog drawn was not the bucket's"),
         "{why}"
     );
 }

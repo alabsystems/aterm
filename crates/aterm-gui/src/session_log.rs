@@ -1455,8 +1455,7 @@ impl SessionLog {
             | aterm_phase::Program::Grok
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
-            | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini => true,
+            | aterm_phase::Program::Muse => true,
             aterm_phase::Program::Generic => false,
         });
         if self.agent.is_none()

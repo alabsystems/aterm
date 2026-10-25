@@ -1150,7 +1150,7 @@ const HOUR_MS: i64 = 60 * MIN_MS;
 fn said(
     mode: Occupancy,
     since: Option<i64>,
-    verdicts: [SaidVerdict; RuleId::COUNT],
+    verdicts: [SaidVerdict; 2],
     guard: Option<Guard>,
 ) -> OccupancySaid {
     OccupancySaid {
@@ -1181,10 +1181,11 @@ fn said(
         at_ms: NOW,
         reading: OccupancyReading::default(),
         ready_idle: None,
+        wake: None,
     }
 }
 
-const QUIET: [SaidVerdict; RuleId::COUNT] = [SaidVerdict::Quiet, SaidVerdict::Quiet];
+const QUIET: [SaidVerdict; 2] = [SaidVerdict::Quiet, SaidVerdict::Quiet];
 
 /// Thirty-one looks a minute apart from [`NOW`], one slot of three free and holders in tab 7
 /// (session `a`'s) and tab 9 (session `b`'s), the machine with room: what each look's row says.
@@ -1200,7 +1201,7 @@ fn thirty_minutes(j: &mut Judged, sessions: &[(u64, String)]) -> Vec<RingRow> {
                 Some(vec![7, 9]),
             );
             step(j, &snap, t, sessions);
-            j.look_row(sessions, t)
+            j.look_row(sessions, &[], t)
         })
         .collect()
 }
@@ -1267,10 +1268,32 @@ fn a_told_hold_past_two_hours_is_ready_while_a_slot_stands_free() {
         t,
         &sessions,
     );
-    let row = j.look_row(&sessions, t);
+    let row = j.look_row(&sessions, &[], t);
     assert!(!ready(&row, "a"));
     assert_eq!(j.ready_now(), 0);
     assert_eq!(j.idle_ready_min(t), looks, "no minute added");
+}
+
+/// A session a met wake names (a ready wake whose need holds) reads ready in the look's row
+/// though no hold of its does, and its slot-minute counts idle-ready (the plan's F14). CONTROLS:
+/// a session no met wake names is not ready, nor is the same one at the next look once none does.
+#[test]
+fn a_met_wake_reads_its_session_ready_in_the_ring() {
+    let sessions = [(7, "a".to_string()), (9, "b".to_string())];
+    let ready = |row: &RingRow, sid: &str| row.session(sid).is_some_and(|s| s.ready);
+    let mut j = Judged::default();
+    let snap = |t| at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), Some(vec![9]));
+    step(&mut j, &snap(NOW), NOW, &sessions);
+    let row = j.look_row(&sessions, &["a".to_string()], NOW);
+    assert!(ready(&row, "a"));
+    assert!(!ready(&row, "b"), "CONTROL: no wake of b's is met");
+    assert_eq!((j.ready_now(), row.idle_ready()), (1, 1));
+    let t = NOW + MIN_MS;
+    step(&mut j, &snap(t), t, &sessions);
+    let row = j.look_row(&sessions, &[], t);
+    assert!(!ready(&row, "a"), "CONTROL: no wake of a's met now");
+    assert_eq!(j.ready_now(), 0);
+    assert_eq!(j.idle_ready_min(t), 1, "the one look it read ready");
 }
 
 /// The rows a predecessor's ring left are taken once, the newest day of them.
@@ -1505,14 +1528,17 @@ fn a_poke_between_ticks_takes_no_row() {
         let t = NOW + m * MIN_MS;
         let snap = at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), Some(vec![7]));
         step(&mut j, &snap, t, &sessions);
-        assert!(j.looked(&sessions, t, Look::Tick).is_some(), "a tick's row");
+        assert!(
+            j.looked(&sessions, &[], t, Look::Tick).is_some(),
+            "a tick's row"
+        );
         ticks += 1;
         for poke in 1..=3 {
             let t = t + poke * 10_000;
             let snap = at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), Some(vec![7]));
             step(&mut j, &snap, t, &sessions);
             assert!(
-                j.looked(&sessions, t, Look::Poke).is_none(),
+                j.looked(&sessions, &[], t, Look::Poke).is_none(),
                 "a poke's none"
             );
         }

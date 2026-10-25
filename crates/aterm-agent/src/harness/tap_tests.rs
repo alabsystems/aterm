@@ -1000,7 +1000,7 @@ fn each_guard_alone_refuses_the_tap() {
         if c[at].0 == "user" {
             assert_eq!(
                 gate(&all_clear(&argv, &c)),
-                settings_value_chained(Path::new(EXE), Some("x")),
+                settings_value_carrying(Path::new(EXE), true),
                 "the owner's own statusLine in the user's settings.json is carried (R-12)"
             );
         } else {
@@ -1019,21 +1019,17 @@ fn each_guard_alone_refuses_the_tap() {
 /// (2026-10-24, Claude Code 2.1.310): another app's statusLine hook, a plain command line, beside
 /// hooks and an `env` block. The command is that file's, with its home replaced.
 #[cfg(unix)]
-const OWNER_SETTINGS_2_1_310: &str = r#"{
-  "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"},
-  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/bin/sh /Users//example/.orca/agent-hooks/claude-hook.sh"}]}]},
-  "statusLine": {"type": "command", "command": "if [ -f '/Users//example/.orca/agent-hooks/claude-statusline.sh' ] && [ -r '/Users//example/.orca/agent-hooks/claude-statusline.sh' ] && [ -x '/Users//example/.orca/agent-hooks/claude-statusline.sh' ]; then /bin/sh '/Users//example/.orca/agent-hooks/claude-statusline.sh'; else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi"},
-  "theme": "dark"
-}"#;
+const OWNER_SETTINGS_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-user-settings.json");
 
 /// THE OWNER'S OWN STATUSLINE IS CARRIED, NOT A REFUSAL (owner ruling R-12, 2026-10-24: "THE
 /// HARNESS MUST DO THIS STOP ASKING THE USER"). On the measured machine every Claude Code footer
 /// read `weekly ? · /usage` because the person's `~/.claude/settings.json` held another app's
 /// statusLine, and the gate refused the tap over any statusLine, so no line carried it and no
-/// figure was ever read. The gate now carries that command (`--then <hex>`), the value is still
-/// exactly ours for every reader (`is_ours`, `carried_by`, the relaunch's shedding), and every
-/// statusLine it cannot carry faithfully still refuses: one in another document, two documents
-/// that set one, another shape, an over-long command.
+/// figure was ever read. The gate now carries that command (`--carry`, which names no command:
+/// the tap reads it when it runs), the value is still exactly ours for every reader (`is_ours`,
+/// `carried_by`, the relaunch's shedding), and every statusLine it cannot carry faithfully still
+/// refuses: one in another document, two documents that set one, another shape, an over-long
+/// command.
 #[cfg(unix)]
 #[test]
 fn the_owners_own_statusline_is_carried_and_every_other_still_refuses() {
@@ -1054,15 +1050,23 @@ fn the_owners_own_statusline_is_carried_and_every_other_still_refuses() {
     let value = gate(&all_clear(&argv, &measured)).expect("the measured machine gets the tap");
     assert_eq!(
         value,
-        settings_value_chained(Path::new(EXE), Some(&owner)).expect("a carried value")
+        settings_value_carrying(Path::new(EXE), true).expect("a carried value")
     );
-    assert!(value.contains(" harness tap --then "), "{value}");
+    assert!(
+        value.ends_with(r#" harness tap --carry","refreshInterval":10}}"#),
+        "{value}"
+    );
     assert!(
         !value.contains("orca"),
-        "the owner's command rides hex-encoded, inert to a shell: {value}"
+        "the line names no command of the owner's: the tap reads it when it runs: {value}"
+    );
+    assert_eq!(
+        owner_command(OWNER_SETTINGS_2_1_310).as_deref(),
+        Some(owner.as_str()),
+        "the command the tap runs is the one the gate judged"
     );
     assert!(is_ours(&value));
-    assert_eq!(chained_of(&value), Some(Some(owner.clone())));
+    assert_eq!(carrying_of(&value), Some(true));
     let carried: Vec<String> = argv
         .iter()
         .cloned()
@@ -1124,45 +1128,100 @@ fn the_owners_own_statusline_is_carried_and_every_other_still_refuses() {
                 "{}"
             )
         )),
-        settings_value_chained(Path::new(EXE), Some("echo mine")),
+        settings_value_carrying(Path::new(EXE), true),
         "a padding beside the command is the owner's presentation, carried by Claude Code's merge"
     );
 }
 
-/// THE CARRIED VALUE IS EXACT: every near miss of a chained value (another flag, uppercase or odd
-/// hex, a NUL, a key more) is not ours, so the relaunch never sheds or keeps a value aterm did
-/// not write.
+/// THE CARRIED VALUE IS EXACT AND SHORT: it names no command, so its length is the plain tap's
+/// and [`CARRY_FLAG`]'s, whatever the owner's command (the measured one is 333 bytes, which the
+/// hex-encoded value of 864de5a37b put on every relaunch line, past a Darwin tty's line cap);
+/// every near miss is not ours, so the relaunch never sheds or keeps a value aterm did not write;
+/// and the legacy `--then <hex>` value is still ours, so a relaunch sheds it.
 #[cfg(unix)]
 #[test]
 fn the_carried_value_is_exact_and_only_it_is_ours() {
-    let value = settings_value_chained(Path::new(EXE), Some("echo mine")).expect("a value");
+    let value = settings_value_carrying(Path::new(EXE), true).expect("a value");
     assert_eq!(
         value,
-        r#"{"statusLine":{"type":"command","command":"/Applications/aterm.app/Contents/MacOS/aterm harness tap --then 6563686f206d696e65","refreshInterval":10}}"#
+        r#"{"statusLine":{"type":"command","command":"/Applications/aterm.app/Contents/MacOS/aterm harness tap --carry","refreshInterval":10}}"#
     );
-    assert_eq!(
-        text_of_hex("6563686f206d696e65").as_deref(),
-        Some("echo mine")
-    );
+    let plain = settings_value(Path::new(EXE)).expect("a value");
+    assert_eq!(value.len(), plain.len() + 1 + CARRY_FLAG.len());
+    assert_eq!(carrying_of(&plain), Some(false));
+    assert_eq!(carrying_of(&value), Some(true));
     let other = |from: &str, to: &str| value.replacen(from, to, 1);
     for near in [
-        other(" --then ", " --than "),
-        other("6563686f206d696e65", "6563686F206D696E65"),
-        other("6563686f206d696e65", "6563686f206d696e6"),
-        other("6563686f206d696e65", "6563686f00206d696e65"),
-        other("6563686f206d696e65", ""),
+        other(" --carry", " --cary"),
+        other(" --carry", " --carry 6563686f"),
+        other(" --carry", " --carry "),
+        other(" --carry", "  --carry"),
         other(
             r#""refreshInterval":10"#,
             r#""refreshInterval":10,"padding":1"#,
         ),
-        other(" harness tap --then", " harness tap x --then"),
+        other(" harness tap --carry", " harness tap x --carry"),
+        other("/Applications/aterm.app", "aterm.app"),
     ] {
         assert!(!is_ours(&near), "{near}");
     }
-    assert_eq!(settings_value_chained(Path::new(EXE), Some("")), None);
+    let legacy = |hex: &str| other(" --carry", &format!(" --then {hex}"));
     assert_eq!(
-        settings_value_chained(Path::new(EXE), Some("a\u{0}b")),
-        None
+        carrying_of(&legacy("6563686f206d696e65")),
+        Some(true),
+        "864de5a37b's value for `echo mine` is still ours, so a relaunch sheds it"
+    );
+    for near in [
+        legacy("6563686F206D696E65"),
+        legacy("6563686f206d696e6"),
+        legacy("6563686f00206d696e65"),
+        legacy(""),
+        legacy("zz"),
+        legacy(&"78".repeat(CHAIN_MAX + 1)),
+    ] {
+        assert!(!is_ours(&near), "{near}");
+    }
+}
+
+/// THE CARRYING TAP RUNS THE COMMAND THE USER'S `settings.json` NAMES WHEN IT RUNS: the measured
+/// 2.1.310 document's command; nothing (and the tap prints its own row) where that document now
+/// sets no statusLine, another shape, an over-long command, or turns hooks off; and the file is
+/// read under the user's home, never through a symlink.
+#[cfg(unix)]
+#[test]
+fn the_carrying_tap_reads_the_owners_command_when_it_runs() {
+    let owner = netwatch::settings_of(OWNER_SETTINGS_2_1_310)
+        .and_then(|read| read.status_command)
+        .expect("the measured statusLine");
+    assert_eq!(owner_command(OWNER_SETTINGS_2_1_310), Some(owner.clone()));
+    let long = format!(
+        r#"{{"statusLine":{{"type":"command","command":"{}"}}}}"#,
+        "x".repeat(CHAIN_MAX + 1)
+    );
+    for none in [
+        "{}",
+        r#"{"theme":"dark"}"#,
+        r#"{"statusLine":{"type":"command","command":"echo mine","refreshInterval":5}}"#,
+        r#"{"statusLine":{"type":"text","command":"echo mine"}}"#,
+        r#"{"statusLine":{"type":"command","command":"echo mine"},"disableAllHooks":true}"#,
+        "{not json",
+        long.as_str(),
+    ] {
+        assert_eq!(owner_command(none), None, "{none}");
+    }
+    let home = scratch("owner-home");
+    assert_eq!(read_owner_command(home.path()), None, "no settings.json");
+    let dir = home.path().join(".claude");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("settings.json"), OWNER_SETTINGS_2_1_310).expect("write");
+    assert_eq!(read_owner_command(home.path()), Some(owner));
+    let elsewhere = home.path().join("elsewhere.json");
+    std::fs::rename(dir.join("settings.json"), &elsewhere).expect("move");
+    std::os::unix::fs::symlink(&elsewhere, dir.join("settings.json")).expect("link");
+    assert_eq!(
+        read_owner_command(home.path()),
+        None,
+        "a settings.json that is a symlink is not read"
     );
 }
 
@@ -1467,20 +1526,30 @@ const PAYLOAD_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-statusli
 /// THE CARRYING TAP WRITES THE READING AND HANDS ON THE PAYLOAD BYTE FOR BYTE (R-12): on Claude
 /// Code 2.1.310's payload it records the week the footer reads (12.3% used, its reset) as the
 /// plain tap does, prints nothing of its own, and returns exactly what Claude Code wrote for the
-/// owner's command; a payload over the cap hands on nothing.
+/// owner's command; where the owner's file names no command now, or the payload is over the cap,
+/// it prints the plain tap's row instead, so a run never shows less than the plain tap.
 #[test]
 fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
     let dir = scratch("chain");
     let now = 1_792_867_260;
-    let handed = run_chained(
+    let mut out = Vec::new();
+    let carried = run_carrying(
         &mut PAYLOAD_2_1_310.as_bytes(),
         false,
         &vars(),
         Some(dir.path()),
         now,
-    )
-    .expect("a payload to hand on");
-    assert_eq!(handed, PAYLOAD_2_1_310.as_bytes());
+        || Some("echo mine".to_string()),
+        &mut out,
+    );
+    assert_eq!(
+        carried,
+        Carried::Owner {
+            command: "echo mine".to_string(),
+            payload: PAYLOAD_2_1_310.as_bytes().to_vec(),
+        }
+    );
+    assert!(out.is_empty(), "the owner's command prints the row");
     let (reading, _) = Reading::read(dir.path(), SID, 68537, now - 1).expect("the reading");
     assert_eq!(
         reading.seven_day,
@@ -1493,10 +1562,40 @@ fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
     assert_eq!(reading.five_hour.map(|w| w.x10()), Some(375));
     assert_eq!(reading.version.as_deref(), Some("2.1.310"));
     assert_eq!(reading.api_ms, 412_000);
+    let mut out = Vec::new();
+    let own = run_carrying(
+        &mut PAYLOAD_2_1_310.as_bytes(),
+        false,
+        &vars(),
+        Some(dir.path()),
+        now,
+        || None,
+        &mut out,
+    );
+    assert_eq!(own, Carried::Own);
+    assert_eq!(String::from_utf8_lossy(&out), "5h 38% \u{b7} 7d 12%\n");
     let over = vec![b' '; STDIN_MAX + 1];
+    let mut out = Vec::new();
+    let asked = std::cell::Cell::new(false);
     assert_eq!(
-        run_chained(&mut &over[..], false, &vars(), Some(dir.path()), now),
-        None
+        run_carrying(
+            &mut &over[..],
+            false,
+            &vars(),
+            Some(dir.path()),
+            now,
+            || {
+                asked.set(true);
+                Some("echo mine".to_string())
+            },
+            &mut out,
+        ),
+        Carried::Own
+    );
+    assert_eq!(String::from_utf8_lossy(&out), format!("{NO_FIGURES}\n"));
+    assert!(
+        !asked.get(),
+        "the owner's file is not read for a payload the tap cannot hand on"
     );
 }
 
@@ -1544,5 +1643,222 @@ fn the_owners_command_reads_the_payload_and_keeps_its_row_and_status() {
         leftovers(),
         Vec::<String>::new(),
         "the payload's file is unlinked"
+    );
+}
+
+/// THE LAUNCH GATE ([`launch_value`], what `aterm harness tap --launch` prints for the managed
+/// twin's block): an interactive Claude Code started in an aterm tab, on the machine's own stored
+/// login under the account's own `HOME`, gets [`gate`]'s value from its start, the owner's own
+/// statusLine carried; EACH GUARD ALONE turns it into none — the switch off, no tab or one not
+/// spelled as aterm's, `--no-harness`, a `HOME` of its own (or none, or a relative one), a line
+/// already carrying the tap, a subcommand word where the prompt would be, a line [`gate`]
+/// refuses (its own `--settings`), a credential variable, a login or a Claude home of its own,
+/// and a settings chain [`gate`] refuses.
+#[cfg(unix)]
+#[test]
+fn the_launch_gate_taps_a_plain_launch_in_a_tab_and_each_guard_alone_refuses() {
+    let armed = Armed {
+        exe: Path::new(EXE).to_path_buf(),
+        lone_login: None,
+        listed: Vec::new(),
+    };
+    let words = |w: &[&str]| -> Vec<String> { w.iter().map(|s| (*s).to_string()).collect() };
+    let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+        p.iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    };
+    let env = pairs(&[("HOME", "/Users//example"), ("TERM_PROGRAM", "aterm")]);
+    let argv = words(&["claude", "--model", "opus"]);
+    let quiet: Vec<(String, Source)> = vec![
+        ("managed".to_string(), Source::Missing),
+        ("user".to_string(), Source::Text("{}".to_string())),
+    ];
+    fn facts<'a>(
+        armed: &'a Armed,
+        env: &'a [(String, String)],
+        settings: &'a [(String, Source)],
+        argv: &'a [String],
+    ) -> LaunchFacts<'a> {
+        let home = Path::new("/Users//example");
+        LaunchFacts {
+            armed: Some(armed),
+            sid: Some(SID),
+            no_harness: false,
+            env,
+            home: Some(home),
+            account_home: Some(home),
+            argv,
+            settings,
+            user_settings: Some("user"),
+            profile_store: false,
+        }
+    }
+    let facts = |argv| facts(&armed, &env, &quiet, argv);
+    let want = settings_value(Path::new(EXE));
+    assert!(want.is_some());
+    assert_eq!(launch_value(&facts(&argv)), want);
+    for typed in [
+        &["claude"][..],
+        &["claude", "fix the failing test"][..],
+        &["claude", "--resume", "1b0c9a64-5bd3-4d8e-9a3c-0e1f2a3b4c5d"][..],
+        &["claude", "-c"][..],
+        &[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--model",
+            "opus",
+        ][..],
+        &["claude", "Hello"][..],
+    ] {
+        let typed_argv = words(typed);
+        assert_eq!(
+            launch_value(&LaunchFacts {
+                argv: &typed_argv,
+                ..facts(&argv)
+            }),
+            want,
+            "{typed:?}"
+        );
+    }
+    let owner = vec![
+        ("managed".to_string(), Source::Missing),
+        (
+            "user".to_string(),
+            Source::Text(OWNER_SETTINGS_2_1_310.to_string()),
+        ),
+    ];
+    let carried = launch_value(&LaunchFacts {
+        settings: &owner,
+        ..facts(&argv)
+    })
+    .expect("the owner's own statusLine is carried at launch too");
+    assert_eq!(carrying_of(&carried), Some(true));
+    assert_eq!(Some(carried), settings_value_carrying(Path::new(EXE), true));
+    let refused = |f: LaunchFacts<'_>, why: &str| assert_eq!(launch_value(&f), None, "{why}");
+    refused(
+        LaunchFacts {
+            armed: None,
+            ..facts(&argv)
+        },
+        "the switch off",
+    );
+    refused(
+        LaunchFacts {
+            sid: None,
+            ..facts(&argv)
+        },
+        "no tab",
+    );
+    for sid in ["", "s-", "60776b6e", "s-xyz", "s-../x"] {
+        refused(
+            LaunchFacts {
+                sid: Some(sid),
+                ..facts(&argv)
+            },
+            &format!("tab {sid:?}"),
+        );
+    }
+    refused(
+        LaunchFacts {
+            no_harness: true,
+            ..facts(&argv)
+        },
+        "--no-harness",
+    );
+    refused(
+        LaunchFacts {
+            home: Some(Path::new("/Users//example/sandbox")),
+            ..facts(&argv)
+        },
+        "a HOME of its own",
+    );
+    refused(
+        LaunchFacts {
+            home: None,
+            ..facts(&argv)
+        },
+        "no HOME",
+    );
+    refused(
+        LaunchFacts {
+            home: Some(Path::new("example")),
+            account_home: Some(Path::new("example")),
+            ..facts(&argv)
+        },
+        "a relative HOME",
+    );
+    refused(
+        LaunchFacts {
+            account_home: None,
+            ..facts(&argv)
+        },
+        "the account's home unread",
+    );
+    let tapped: Vec<String> = argv
+        .iter()
+        .cloned()
+        .chain(["--settings".to_string(), want.clone().unwrap()])
+        .collect();
+    refused(facts(&tapped), "already carrying the tap");
+    for typed in [
+        &["claude", "mcp", "list"][..],
+        &["claude", "doctor"][..],
+        &["claude", "update"][..],
+        &["claude", "setup-token"][..],
+        &["claude", "--model", "opus", "plugin"][..],
+        &["claude", "hello"][..],
+        &["claude", "--settings", "/Users//example/team.json"][..],
+        &["claude", "--bare"][..],
+        &["claude", "--no-such-flag"][..],
+    ] {
+        let typed_argv = words(typed);
+        refused(
+            LaunchFacts {
+                argv: &typed_argv,
+                ..facts(&argv)
+            },
+            &format!("{typed:?}"),
+        );
+    }
+    for (key, value) in [
+        ("ANTHROPIC_API_KEY", "k"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "t"),
+        ("CLAUDE_CONFIG_DIR", "/Users//example/.claude-b"),
+        (
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "/Users//example/.claude-logins/b",
+        ),
+    ] {
+        let env = pairs(&[("HOME", "/Users//example"), (key, value)]);
+        refused(
+            LaunchFacts {
+                env: &env,
+                ..facts(&argv)
+            },
+            key,
+        );
+    }
+    let statusline = vec![
+        ("managed".to_string(), Source::Missing),
+        ("user".to_string(), Source::Text("{}".to_string())),
+        (
+            "project".to_string(),
+            Source::Text(r#"{"statusLine":{"type":"command","command":"x"}}"#.to_string()),
+        ),
+    ];
+    refused(
+        LaunchFacts {
+            settings: &statusline,
+            ..facts(&argv)
+        },
+        "a project's statusLine",
+    );
+    refused(
+        LaunchFacts {
+            profile_store: true,
+            ..facts(&argv)
+        },
+        "a profile store config",
     );
 }

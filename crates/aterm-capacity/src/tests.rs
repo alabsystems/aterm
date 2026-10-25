@@ -250,6 +250,80 @@ fn a_dead_holder_releases_its_claim_on_the_next_poll() {
     );
 }
 
+/// Set, the waiting stand-in's ledger is under this directory.
+#[cfg(unix)]
+const WAITER: &str = "ATERM_CAPACITY_TEST_WAITER";
+#[cfg(unix)]
+const WAITER_TEST: &str = "tests::standin_waits_for_room";
+
+/// Run by [`a_waiter_marks_its_wait_for_a_ceiling_until_admitted`] in a process of its own, its
+/// [`aterm_toolchain::waits::VAR`] set: waits for a 20 GiB claim in the ledger under the
+/// directory [`WAITER`] names, then exits once admitted.
+#[cfg(unix)]
+#[test]
+fn standin_waits_for_room() {
+    let Some(dir) = std::env::var_os(WAITER).map(PathBuf::from) else {
+        return;
+    };
+    let pace = Pace {
+        poll: Duration::from_millis(10),
+        line_every: Duration::from_secs(60),
+    };
+    let claim = admit_with(
+        &Ledger::at(dir.join("ledger")),
+        &mac48(),
+        Need::new("B").mem_gib(20),
+        Admit::Wait,
+        pace,
+        &mut |_| {},
+    )
+    .expect("the stand-in's claim");
+    drop(claim);
+}
+
+/// A waiter in a tree whose ceiling names a marks' directory marks its wait there, saying what
+/// it is short of and who holds it, and its mark goes once it is admitted: a ceiling reads that
+/// it waits, not works. Negative control: before A lets go, the mark is there.
+#[cfg(unix)]
+#[test]
+fn a_waiter_marks_its_wait_for_a_ceiling_until_admitted() {
+    let s = scratch("marks");
+    let m = mac48();
+    let marks = s.dir.path().join("waits");
+    std::fs::create_dir(&marks).expect("the marks' dir");
+    let a = admitted(enter(&s, &m, Need::new("A").mem_gib(30)), &m);
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", WAITER_TEST, "--test-threads=1", "--nocapture"])
+        .env(WAITER, s.dir.path())
+        .env(aterm_toolchain::waits::VAR, &marks)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the waiting stand-in");
+    let mark = until_within(MUST_HAPPEN, "the stand-in to mark its wait", || {
+        aterm_toolchain::waits::waiting(&marks)
+            .pop()
+            .filter(|w| w.text.contains("short"))
+    });
+    assert_eq!(mark.pid, child.id());
+    names(
+        &mark.text,
+        &[
+            "capacity: B waits",
+            "memory short by 10 GiB",
+            &format!("pid {} holds 30 GiB", std::process::id()),
+        ],
+    );
+    drop(a);
+    let status = child.wait().expect("the stand-in's end");
+    assert!(status.success(), "the stand-in was admitted: {status}");
+    assert!(
+        aterm_toolchain::waits::waiting(&marks).is_empty(),
+        "the mark outlived the wait"
+    );
+}
+
 /// A stream of 1 GiB claims does not overtake a 20 GiB claim waiting for memory (10 GiB is
 /// free, but all of it is the waiter's), and each is admitted once B is. Then, with B waiting
 /// for a quiet machine instead, the stream backfills: each 1 GiB claim that fits beside B's
@@ -1112,7 +1186,10 @@ fn a_stopped_wait_leaves_the_queue_naming_what_it_was_short_of() {
         .recv_timeout(MUST_HAPPEN)
         .expect("the stopped wait ends")
     {
-        Err(Error::Stopped(Some(short))) => {
+        Err(Error::Stopped {
+            signal: None,
+            short: Some(short),
+        }) => {
             names(&short.to_string(), &["short by 10 GiB", "\"A\""]);
         }
         other => panic!("expected a stopped wait, got {other:?}"),
@@ -1440,7 +1517,12 @@ fn a_disk_need_is_relieved_before_it_waits() {
         asked: usize,
     }
     impl crate::Relief for Freeing<'_> {
-        fn relieve(&mut self, short: &crate::Shortfall, say: &mut dyn FnMut(&str)) {
+        fn relieve(
+            &mut self,
+            short: &crate::Shortfall,
+            say: &mut dyn FnMut(&str),
+            _stopped: &dyn Fn() -> bool,
+        ) {
             assert!(matches!(short.shorts[..], [Short::Disk { .. }]), "{short}");
             self.asked += 1;
             self.machine.set({
@@ -1450,7 +1532,11 @@ fn a_disk_need_is_relieved_before_it_waits() {
             });
             say("reclaimed");
         }
-        fn holders(&mut self, _short: &crate::Shortfall) -> Option<String> {
+        fn holders(
+            &mut self,
+            _short: &crate::Shortfall,
+            _stopped: &dyn Fn() -> bool,
+        ) -> Option<String> {
             Some("largest: /vol/big 9 GiB".to_owned())
         }
     }

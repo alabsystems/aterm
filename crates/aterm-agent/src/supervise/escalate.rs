@@ -61,7 +61,6 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
         | aterm_phase::Program::Kimi
         | aterm_phase::Program::Agy
         | aterm_phase::Program::Muse
-        | aterm_phase::Program::Gemini
         | aterm_phase::Program::Generic => {
             return kind_and_subject_read(reader, point);
         }
@@ -1065,10 +1064,10 @@ mod tests {
     fn the_needs_entry_keeps_its_frame_for_a_long_need_in_any_script() {
         for letter in ["\u{915}", "\u{e01}", "\u{9a8}", "\u{25b8}"] {
             let needs = vec![letter.repeat(80), "sign 0.48.0".to_string()];
-            let t = needs_attention_text("Gemini CLI", &needs);
+            let t = needs_attention_text("Muse Code", &needs);
             assert!(t.len() <= ATTENTION_BYTES, "{letter}: {}", t.len());
             assert!(
-                t.starts_with(&format!("Gemini CLI needs you: {letter}"))
+                t.starts_with(&format!("Muse Code needs you: {letter}"))
                     && t.ends_with("\u{2026} (+1 more) \u{2014} carrying on"),
                 "{letter}: {t}"
             );

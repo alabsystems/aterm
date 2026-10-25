@@ -2,11 +2,13 @@
 # Copyright 2026 Andrew Yates
 #
 # THE TOOLCHAIN, ONE SOURCE: where the pinned Trust toolchain is, where rustup is,
-# where plain targo puts its build intermediates, when a checkout is gone, and the
-# lease a run holds on the toolchain it resolved. Std only, so the check runner
-# (aterm-verify), the libc oracle's gate and the package manager (atpkg, which
-# re-exports every module under its old path) depend on it instead of compiling a
-# file of another crate by `#[path]`.
+# where plain targo puts its build intermediates, when a checkout is gone, the
+# lease a run holds on the toolchain it resolved, and the named lock and the
+# interrupt every wait for a lock or for capacity ends on. Std only but for
+# aterm-libc's signal declarations, so the check runner (aterm-verify), the libc
+# oracle's gate and the package manager (atpkg, which re-exports every module
+# under its old path) depend on it instead of compiling a file of another crate
+# by `#[path]`.
 
 [package]
 name = "aterm-toolchain"
@@ -26,10 +28,20 @@ description = "The pinned Trust toolchain's discovery, rustup's home and binary,
 [target.'cfg(windows)'.dependencies]
 aterm-sysprobe = { workspace = true }
 
+# A wait's interrupt (`interrupt::Watch`) sets the process's own SIGINT, SIGTERM and
+# SIGHUP handling aside and puts it back exactly: `sigaction`, `sigemptyset`, `kill`
+# and `getpid` from aterm-libc (package `libc`), first-party generated declarations
+# with no dependencies, which aterm-uds already links into every tool here.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # The lease tests' scratch prefixes, and their one-minute hang detector.
 aterm-spec = { workspace = true }
 aterm-tempfile = { workspace = true }
+# The interrupt and named-lock tests start their waiting stand-ins through
+# `spawnfd::command`. Workspace crate; no cycle (it does not depend on this one).
+aterm-uds = { workspace = true }
 
 [lints]
 workspace = true

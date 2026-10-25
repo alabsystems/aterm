@@ -174,15 +174,16 @@ impl CursorComet {
         }
         self.blaze = e;
 
-        let dt = self
-            .last
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            .min(0.25);
+        let dt = match self.last {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32().min(0.25),
+            None => 0.0,
+        };
         self.last = Some(now);
         self.shimmer = (self.shimmer + dt * (SHIMMER_IDLE + SHIMMER_ACTIVE * e)).fract();
         let phase = self.shimmer * std::f32::consts::TAU;
-        let breathe = 0.5 + 0.35 * phase.sin() + 0.15 * (phase * 2.3 + 0.9).sin();
+        let breathe = 0.5
+            + 0.35 * crate::supernova::sin_cos_f32(phase).0
+            + 0.15 * crate::supernova::sin_cos_f32(phase * 2.3 + 0.9).0;
 
         let styled = if cfg.dark_theme {
             ice_ramp(cfg.color, 0.34 + 0.40 * e + 0.05 * (breathe - 0.5))
@@ -317,7 +318,8 @@ impl CursorComet {
 
         let dimmed = lerp_rgb(cfg.color, 0x0000_0000, 0.50);
         let whitened = lerp_rgb(cfg.color, ICE_WHITE, 0.55);
-        let discs = COMA_DISCS.map(|(rx, cov_x, t0, dt)| {
+        let mut discs = [(0.0f32, 0.0f32, 0.0f32, 0u32); 4];
+        for (slot, &(rx, cov_x, t0, dt)) in discs.iter_mut().zip(&COMA_DISCS) {
             let ramp = ice_ramp_with(cfg.color, dimmed, whitened, t0 + dt * e);
             let color = if rx >= 1.0 {
                 lerp_rgb(cfg.accent, ramp, 0.45)
@@ -325,12 +327,13 @@ impl CursorComet {
                 ramp
             };
             let r = radius * rx;
-            (r, r * r, (cov_core * cov_x).min(COV_CAP), color)
-        });
+            *slot = (r, r * r, (cov_core * cov_x).min(COV_CAP), color);
+        }
         let slab = ((ch * 0.125) as i32).max(2);
         let wob_freq = 0.55 / ch.max(1.0) * 10.0;
         let wob_phase = phase * 1.3;
-        let wobble = |ym: f32| 1.0 + 0.05 * (ym * wob_freq + wob_phase).sin();
+        let wobble =
+            |ym: f32| 1.0 + 0.05 * crate::supernova::sin_cos_f32(ym * wob_freq + wob_phase).0;
 
         let (cxi, cyi) = (cx as i32, cy as i32);
         for &(r, r2, cov, color) in &discs {
@@ -350,7 +353,8 @@ impl CursorComet {
                 let (y0, y1) = (cy_dy.max(cell_y0), (cy_dy + h).min(cell_y1));
                 if y1 > y0 {
                     let ym = dy as f32 + h as f32 * 0.5;
-                    let hw = ((r2 - ym * ym).max(0.0).sqrt() * wobble(ym)) as i32;
+                    let hw =
+                        (crate::color_math::sqrt_f32((r2 - ym * ym).max(0.0)) * wobble(ym)) as i32;
                     let (x0, x1) = ((cxi - hw).max(cell_x0), (cxi + hw).min(cell_x1));
                     if hw >= 1 && x1 > x0 {
                         push_rect(out, geom, x0, y0, x1 - x0, y1 - y0, premul);
@@ -378,8 +382,10 @@ impl CursorComet {
                     continue;
                 }
                 let inv_sum = 1.0 / sum;
-                let avg = |k: usize| ((acc[k] * inv_sum).round() as u32).min(255);
-                ring_premul[i] = premul_rgb((avg(0) << 16) | (avg(1) << 8) | avg(2), cov);
+                let r_avg = ((acc[0] * inv_sum).round() as u32).min(255);
+                let g_avg = ((acc[1] * inv_sum).round() as u32).min(255);
+                let b_avg = ((acc[2] * inv_sum).round() as u32).min(255);
+                ring_premul[i] = premul_rgb((r_avg << 16) | (g_avg << 8) | b_avg, cov);
             }
             let top = (cy - outer).floor() as i32;
             let bot = (cy + outer).ceil() as i32;
@@ -414,15 +420,19 @@ impl CursorComet {
         let two_arm_plus_1 = 2 * arm + 1;
         let cov_base = cov_core * (0.35 + 0.65 * e);
         let phase2 = phase * 2.0;
-        let (sin_p, cos_p) = (phase * 0.55).sin_cos();
+        let (sin_p, cos_p) = crate::supernova::sin_cos_f32(phase * 0.55);
         let glint_dirs: [(f32, f32); GLINTS as usize] = [
             (sin_p, cos_p),
             (cos_p, -sin_p),
             (-sin_p, -cos_p),
             (-cos_p, sin_p),
         ];
-        for (tw_off, (sin_a, cos_a)) in GLINT_TW_PHASES.into_iter().zip(glint_dirs) {
-            let tw = 0.5 + 0.5 * (phase2 + tw_off).sin();
+        let mut gi = 0;
+        while gi < GLINTS as usize {
+            let tw_off = GLINT_TW_PHASES[gi];
+            let (sin_a, cos_a) = glint_dirs[gi];
+            gi += 1;
+            let tw = 0.5 + 0.5 * crate::supernova::sin_cos_f32(phase2 + tw_off).0;
             if tw < 0.55 {
                 continue;
             }
@@ -466,31 +476,31 @@ fn ring_row(
         return;
     }
     let wob = wobble(ym);
-    let hw0 = d2_0.sqrt() * wob;
+    let hw0 = crate::color_math::sqrt_f32(d2_0) * wob;
     if hw0 < 1.0 {
         return;
     }
     let mut hw = [hw0, 0.0, 0.0, 0.0];
     let d2_1 = discs[1].1 - ym2;
     if d2_1 > 0.0 {
-        hw[1] = d2_1.sqrt() * wob;
+        hw[1] = crate::color_math::sqrt_f32(d2_1) * wob;
         let d2_2 = discs[2].1 - ym2;
         if d2_2 > 0.0 {
-            hw[2] = d2_2.sqrt() * wob;
+            hw[2] = crate::color_math::sqrt_f32(d2_2) * wob;
             let d2_3 = discs[3].1 - ym2;
             if d2_3 > 0.0 {
-                hw[3] = d2_3.sqrt() * wob;
+                hw[3] = crate::color_math::sqrt_f32(d2_3) * wob;
             }
         }
     }
     let cx_round = cx.round() as i32;
-    let x_edges = hw.map(|w| {
-        if w == 0.0 {
-            (cx_round, cx_round)
-        } else {
-            ((cx - w).round() as i32, (cx + w).round() as i32)
+    let mut x_edges = [(cx_round, cx_round); 4];
+    for i in 0..4 {
+        let w = hw[i];
+        if w != 0.0 {
+            x_edges[i] = ((cx - w).round() as i32, (cx + w).round() as i32);
         }
-    });
+    }
     for i in 0..discs.len() {
         let premul = ring_premul[i];
         if hw[i] < 1.0 || premul == 0 {

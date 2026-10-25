@@ -3,6 +3,12 @@
 // Author: Andrew Yates
 
 //! OSC 7501 program lifecycle state reports ([`ProgramStateReport::turns`]).
+//!
+//! The program status protocol's wire grammar is `OSC 7501 ; key=value(:key=value)* ST`: `state`
+//! required, `app` the program, `kind` on a `blocked` report, `id` naming a child record (absent:
+//! the root record), base64 `title` and `msg`, and `progress`. This reader takes the root record
+//! of the two programs it knows by their `app` ([`ProgramApp`]) and leaves every child record
+//! alone: a subagent's report, or the `clear` of one, says nothing of the session.
 
 /// The state word of an OSC 7501 report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -80,6 +86,38 @@ impl ProgramBlockedKind {
     }
 }
 
+/// The program an OSC 7501 report names in its `app`, of the ones this reader takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProgramApp {
+    /// Codex (`app=codex`): the vendor build and codex-alab.
+    Codex,
+    /// xAI's Grok Build (`app=grok-build`), read out of its 1.0.70 binary: its root report
+    /// (`state=<word>[:kind=permission]:app=grok-build[:title=<base64>]`), its child records'
+    /// (`:id=<id>`), and `state=clear` at exit.
+    GrokBuild,
+}
+
+impl ProgramApp {
+    /// Its wire word: `codex`, `grok-build`.
+    #[must_use]
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::GrokBuild => "grok-build",
+        }
+    }
+
+    #[inline]
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "codex" => Self::Codex,
+            "grok-build" => Self::GrokBuild,
+            _ => return None,
+        })
+    }
+}
+
 /// One accepted OSC 7501 report (not a `clear`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProgramState {
@@ -87,6 +125,8 @@ pub struct ProgramState {
     pub state: ProgramStateWord,
     /// What a `blocked` report is blocked on, when it said; `None` on every other state.
     pub kind: Option<ProgramBlockedKind>,
+    /// The program the report names.
+    pub app: ProgramApp,
 }
 
 impl ProgramState {
@@ -149,16 +189,17 @@ impl ProgramStateReport {
     }
 
     /// The report standing now as the OSC 7501 body that says it
-    /// (`state=<word>:app=codex[:kind=<kind>]`), which a checkpoint carries ([`Self::restore`]);
+    /// (`state=<word>:app=<app>[:kind=<kind>]`), which a checkpoint carries ([`Self::restore`]);
     /// `None` while none stands.
     pub(super) fn carried(&self) -> Option<String> {
         self.state.map(|state| match state.kind {
             Some(kind) => format!(
-                "state={}:app=codex:kind={}",
+                "state={}:app={}:kind={}",
                 state.state.as_str(),
+                state.app.as_str(),
                 kind.as_str()
             ),
-            None => format!("state={}:app=codex", state.state.as_str()),
+            None => format!("state={}:app={}", state.state.as_str(), state.app.as_str()),
         })
     }
 
@@ -203,8 +244,11 @@ const fn begins_a_turn(last: Option<ProgramStateWord>, next: ProgramStateWord) -
     matches!(next, W::Working | W::Blocked) && !matches!(last, Some(W::Working | W::Blocked))
 }
 
-/// The longest OSC 7501 body this reader looks at; anything longer is not a report.
-const MAX_BODY_BYTES: usize = 128;
+/// The longest OSC 7501 body this reader looks at; anything longer is not a report. The
+/// protocol caps a `title` at 256 base64 bytes, a `msg` at 2,732 and an `id` at 128, so its
+/// longest report, every key at its cap, is about 3,200 bytes: a Grok Build report carries its
+/// `title`, which a 128-byte cap would have dropped whole.
+const MAX_BODY_BYTES: usize = 4096;
 
 /// One OSC 7501 body this reader takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,34 +259,37 @@ enum Body {
     Report(ProgramState),
 }
 
-/// What one OSC 7501 body says ([`Body::Clear`], [`Body::Report`]).
+/// What one OSC 7501 body says ([`Body::Clear`], [`Body::Report`]): only the root record's, so a
+/// body naming an `id` (a child record's report, or its `clear`) is none.
 fn parse(body: &str) -> Option<Body> {
     if body.len() > MAX_BODY_BYTES {
         return None;
     }
-    let (mut state, mut app, mut kind) = (None, None, None);
+    let (mut state, mut app, mut kind, mut id) = (None, None, None, None);
     for item in body.split(':') {
         let (key, value) = item.split_once('=')?;
         match key {
             "state" if state.is_none() => state = Some(value),
             "app" if app.is_none() => app = Some(value),
             "kind" if kind.is_none() => kind = Some(value),
-            "state" | "app" | "kind" => return None,
+            "id" if id.is_none() => id = Some(value),
+            "state" | "app" | "kind" | "id" => return None,
             _ => {}
         }
+    }
+    if id.is_some() {
+        return None;
     }
     if state? == "clear" {
         return Some(Body::Clear);
     }
-    if app != Some("codex") {
-        return None;
-    }
+    let app = ProgramApp::parse(app?)?;
     let state = ProgramStateWord::parse(state?)?;
     let kind = match (state, kind) {
         (ProgramStateWord::Blocked, Some(k)) => Some(ProgramBlockedKind::parse(k)?),
         (_, _) => None,
     };
-    Some(Body::Report(ProgramState { state, kind }))
+    Some(Body::Report(ProgramState { state, kind, app }))
 }
 
 #[cfg(test)]
@@ -250,7 +297,11 @@ mod tests {
     use super::*;
 
     fn state(s: ProgramStateWord, k: Option<ProgramBlockedKind>) -> Option<Body> {
-        Some(Body::Report(ProgramState { state: s, kind: k }))
+        Some(Body::Report(ProgramState {
+            state: s,
+            kind: k,
+            app: ProgramApp::Codex,
+        }))
     }
 
     #[test]
@@ -285,6 +336,7 @@ mod tests {
             "state=sleeping:app=codex",
             "state=idle",
             "state=idle:app=claude",
+            "state=working:app=grok",
             "state=idle:app=codex:state=working",
             "state=blocked:app=codex:kind=coffee",
             "app=codex",
@@ -497,11 +549,13 @@ mod tests {
         let blocked = ProgramState {
             state: ProgramStateWord::Blocked,
             kind: Some(ProgramBlockedKind::Permission),
+            app: ProgramApp::Codex,
         };
         assert_eq!(blocked.wire(), "blocked:permission");
         let idle = ProgramState {
             state: ProgramStateWord::Idle,
             kind: None,
+            app: ProgramApp::GrokBuild,
         };
         assert_eq!(idle.wire(), "idle");
     }
@@ -532,7 +586,8 @@ mod tests {
                 seen(&mut term, bytes),
                 Some(ProgramState {
                     state: want,
-                    kind: None
+                    kind: None,
+                    app: ProgramApp::Codex,
                 })
             );
         }
@@ -558,7 +613,11 @@ mod tests {
         for (bytes, want, kind) in alab {
             assert_eq!(
                 seen(&mut term, bytes),
-                Some(ProgramState { state: want, kind })
+                Some(ProgramState {
+                    state: want,
+                    kind,
+                    app: ProgramApp::Codex,
+                })
             );
         }
         let before = term.program_state().seq;
@@ -577,5 +636,139 @@ mod tests {
         seen(&mut term, b"\x1b]7501;state=working:app=codex\x1b\\");
         assert_eq!(seen(&mut term, b"\x1bc"), None);
         assert_eq!(term.program_state().seq, before + 3);
+    }
+
+    /// The bytes Grok Build 1.0.70 writes, through the real parser. Its binary holds the pieces
+    /// of one report, `ESC ] 7501;state=` `:kind=permission` `:app=grok-build` `:title=`, its
+    /// state words `working`, `blocked` and `error`, a child record's clear
+    /// (`state=clear:id=`) and, at exit, `state=clear`; its question and sign-in waits name no
+    /// kind (it holds no other). Its title is base64, with or without padding.
+    #[test]
+    fn the_root_record_grok_build_writes_is_read_through_the_parser() {
+        use crate::terminal::Terminal;
+        use ProgramStateWord::*;
+        let grok = |state, kind| {
+            Some(ProgramState {
+                state,
+                kind,
+                app: ProgramApp::GrokBuild,
+            })
+        };
+        let mut term = Terminal::new(24, 80);
+        let rows: [(&[u8], Option<ProgramState>); 6] = [
+            (
+                b"\x1b]7501;state=working:app=grok-build:title=Rml4IHRoZSBwYXJzZXI\x1b\\",
+                grok(Working, None),
+            ),
+            (
+                b"\x1b]7501;state=blocked:kind=permission:app=grok-build:title=Rml4IHRoZSBwYXJzZXI=\x1b\\",
+                grok(Blocked, Some(ProgramBlockedKind::Permission)),
+            ),
+            (
+                b"\x1b]7501;state=blocked:app=grok-build:title=Rml4IHRoZSBwYXJzZXI\x1b\\",
+                grok(Blocked, None),
+            ),
+            (
+                b"\x1b]7501;state=done:app=grok-build:title=Rml4IHRoZSBwYXJzZXI\x07",
+                grok(Done, None),
+            ),
+            (
+                b"\x1b]7501;state=error:app=grok-build\x1b\\",
+                grok(Error, None),
+            ),
+            (b"\x1b]7501;state=clear\x1b\\", None),
+        ];
+        for (bytes, want) in rows {
+            term.process(bytes);
+            assert_eq!(
+                term.program_state().state,
+                want,
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        assert_eq!(term.program_state().turns, 1, "one turn, working to done");
+    }
+
+    /// A CHILD RECORD SAYS NOTHING OF THE SESSION: Grok Build gives each running subagent its own
+    /// record (`id=<subagent>`), says it done when it finishes, and clears it with
+    /// `state=clear:id=<subagent>`, all while the session's own turn runs. None of those is
+    /// taken: the root `working` stands, its sequence does not move, and no turn ends or begins.
+    /// NEGATIVE CONTROL: the same reports with no `id` are taken.
+    #[test]
+    fn a_child_records_report_and_clear_leave_the_root_record_standing() {
+        use crate::terminal::Terminal;
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]7501;state=working:app=grok-build\x1b\\");
+        let root = term.program_state();
+        for child in [
+            &b"\x1b]7501;state=working:app=grok-build:id=sub_1:title=cmVhZA\x1b\\"[..],
+            b"\x1b]7501;state=blocked:kind=permission:app=grok-build:id=sub_1\x1b\\",
+            b"\x1b]7501;state=done:app=grok-build:id=sub_1\x1b\\",
+            b"\x1b]7501;state=clear:id=sub_1\x1b\\",
+            b"\x1b]7501;state=clear:id=s/sub_2\x1b\\",
+        ] {
+            term.process(child);
+            assert_eq!(
+                term.program_state(),
+                root,
+                "{}",
+                String::from_utf8_lossy(child)
+            );
+        }
+        term.process(b"\x1b]7501;state=done:app=grok-build\x1b\\");
+        assert_eq!(
+            term.program_state().state.map(|s| s.state),
+            Some(ProgramStateWord::Done),
+            "the root's own report is taken"
+        );
+        term.process(b"\x1b]7501;state=clear\x1b\\");
+        assert_eq!(term.program_state().state, None, "the root's own clear is");
+    }
+
+    /// A CHECKPOINT CARRIES THE REPORT'S OWN PROGRAM: Grok Build's standing report is carried as
+    /// `app=grok-build` and restored as the same report, a re-send of it keeping where it began.
+    /// NEGATIVE CONTROL: codex's carries `app=codex`.
+    #[test]
+    fn a_carried_grok_build_report_restores_as_grok_builds() {
+        let mut live = ProgramStateReport::default();
+        assert!(live.accept("state=blocked:kind=permission:app=grok-build:title=cGFyc2Vy"));
+        let body = live.carried();
+        assert_eq!(
+            body.as_deref(),
+            Some("state=blocked:app=grok-build:kind=permission")
+        );
+        let mut restored = ProgramStateReport::default();
+        restored.restore(body.as_deref(), Some(live.began));
+        assert_eq!(restored.state, live.state);
+        assert!(restored.accept("state=blocked:kind=permission:app=grok-build"));
+        assert_eq!((restored.began, restored.turns), (1, 0), "the same box");
+        let mut codex = ProgramStateReport::default();
+        assert!(codex.accept("state=working:app=codex"));
+        assert_eq!(codex.carried().as_deref(), Some("state=working:app=codex"));
+    }
+
+    /// A report as long as the protocol allows is a report: Grok Build's carries its title, up
+    /// to 256 base64 bytes, beside a `msg` of up to 2,732. One byte past the cap is none.
+    #[test]
+    fn a_report_with_a_title_and_message_at_the_protocols_caps_is_taken() {
+        let title = "A".repeat(256);
+        let msg = "B".repeat(2732);
+        let body = format!(
+            "state=blocked:kind=permission:app=grok-build:progress=40:title={title}:msg={msg}"
+        );
+        assert_eq!(
+            parse(&body),
+            Some(Body::Report(ProgramState {
+                state: ProgramStateWord::Blocked,
+                kind: Some(ProgramBlockedKind::Permission),
+                app: ProgramApp::GrokBuild,
+            }))
+        );
+        let pad = MAX_BODY_BYTES - "state=done:app=grok-build:msg=".len();
+        let edge = format!("state=done:app=grok-build:msg={}", "C".repeat(pad));
+        assert_eq!(edge.len(), MAX_BODY_BYTES);
+        assert!(parse(&edge).is_some(), "at the cap");
+        assert_eq!(parse(&format!("{edge}C")), None, "past it");
     }
 }

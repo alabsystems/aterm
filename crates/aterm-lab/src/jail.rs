@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sandbox profile: ONE profile (`runs/<tag>/jail.sb`) for everything a lab starts — the stub, the instance, its shells, the real Claude Code, Codex, Gemini CLI, agy or Muse Code, and what the lab starts in the jail outside that tree (`codex-run`, the agents' `--version`, the selftests' controls) — so every child inherits it.
+//! The sandbox profile: ONE profile (`runs/<tag>/jail.sb`) for everything a lab starts — the stub, the instance, its shells, the real Claude Code, Codex, agy or Muse Code, and what the lab starts in the jail outside that tree (`codex-run`, the agents' `--version`, the selftests' controls) — so every child inherits it.
 
 use std::path::Path;
 
@@ -25,8 +25,6 @@ pub struct Spec {
     pub claude: String,
     /// The Codex under test, when one is managed here (empty: none).
     pub codex: String,
-    /// The Gemini CLI under test (empty: none).
-    pub gemini: String,
     /// The Antigravity CLI (`agy`) under test (empty: none).
     pub agy: String,
     /// The Muse Code (`muse`) under test (empty: none).
@@ -76,7 +74,6 @@ impl Spec {
             run: run.into(),
             claude: claude.into(),
             codex: codex.into(),
-            gemini: String::new(),
             agy: String::new(),
             muse: String::new(),
             sockdir: sockdir.into(),
@@ -208,7 +205,7 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         }
         homes.push(&spec.caller_home);
     }
-    let (gemini, agy) = (&spec.gemini, &spec.agy);
+    let agy = &spec.agy;
     let muse = &spec.muse;
     let tg_written = spec.repo_target.clone();
     let tg = physical(Path::new(&tg_written))
@@ -236,7 +233,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         &sockdir,
         cc,
         codex,
-        gemini,
         agy,
         muse,
         &st,
@@ -299,13 +295,7 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         })
         .collect();
     let mut store: Vec<String> = Vec::new();
-    for agent in [
-        claude.as_str(),
-        codex.as_str(),
-        gemini.as_str(),
-        agy.as_str(),
-        muse.as_str(),
-    ] {
+    for agent in [claude.as_str(), codex.as_str(), agy.as_str(), muse.as_str()] {
         let Some(h) = homes
             .iter()
             .filter(|h| Path::new(agent).starts_with(h))
@@ -495,7 +485,6 @@ mod tests {
             run: d.run.clone(),
             claude: claude.into(),
             codex: codex.into(),
-            gemini: String::new(),
             agy: String::new(),
             muse: String::new(),
             sockdir: d.sock.clone(),
@@ -622,15 +611,10 @@ mod tests {
         ));
         let mut s = spec(&d, "/x", "", "/Users//o");
         s.agy = format!("{st}/agy/1000001000004000000/bin/agy");
-        s.gemini = "/opt/homebrew/Cellar/gemini-cli/0.46.0/libexec/bin/gemini".into();
         let p = render(&s).unwrap();
         assert!(p.contains(&format!(
             "(allow file-read* (subpath \"{st}/agy/1000001000004000000\"))"
         )));
-        assert!(
-            !p.contains("Cellar"),
-            "Gemini CLI outside the store needs no rule"
-        );
         s.agy = format!("{st}/agy/1/bin/a\"y");
         assert!(render(&s).is_err(), "a path the profile cannot quote");
         let mut s = spec(&d, "/x", "", "/Users//o");

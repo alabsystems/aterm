@@ -243,6 +243,34 @@ impl<'a> AlabVersion<'a> {
     }
 }
 
+/// THE CLIENT VERSION of an ALab package whose own version is `version` (`codex-package.json`'s,
+/// [`package_version`]) and whose [`ALAB_BUILD_JSON`] records `client` as its `client_version`
+/// (`None` when it records none). It is the one of the package's versions that upstream's code
+/// writes as every rollout's `session_meta` `cli_version`, so the only one a rollout, or a build
+/// measured from rollouts, is compared with.
+///
+/// From codex-alab's own line on (codex-alab `alab/README.md`, Decision 8) `alab/package.sh`
+/// records two versions that name the same `<count>` and commit: the package's own, codex-alab's
+/// line (`0.1.0-dev.<count>+codex.<A.B.C>.g<sha9>`), and the client version, upstream's numbering
+/// in the plain dev form (`0.165.0-dev.<count>+g<sha9>`). A package from before that line records
+/// no client version and has one version, which is also its client version.
+///
+/// `None`, so nothing compares it, for an own version that is no [`AlabVersion`]; a client
+/// version that is no [`AlabVersion`], names an upstream baseline (only codex-alab's own version
+/// carries one), or names another `<count>` or commit than the own version; and a compound own
+/// version with no client version (`alab/package.sh` writes none such: a compound version is
+/// codex-alab's own line, never what the rollouts name).
+#[must_use]
+pub fn client_version<'a>(version: &'a str, client: Option<&'a str>) -> Option<&'a str> {
+    let own = AlabVersion::parse(version)?;
+    let Some(client) = client else {
+        return own.baseline.is_none().then_some(version);
+    };
+    let theirs = AlabVersion::parse(client)?;
+    (theirs.baseline.is_none() && theirs.dev == own.dev && theirs.sha9 == own.sha9)
+        .then_some(client)
+}
+
 /// Whether the executable `exe` runs ALab bytes.
 #[must_use]
 pub fn exe_is_alab(exe: &Path) -> bool {

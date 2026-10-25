@@ -266,10 +266,7 @@ fn look_at(
 const fn reads_transcript(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 

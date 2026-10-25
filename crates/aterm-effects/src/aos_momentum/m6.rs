@@ -259,11 +259,18 @@ impl State {
         d.finish().map_err(length)?;
         let t = i64::try_from(s.t).map_err(|_| StateRefusal::Bounds)?;
         let sum = t.saturating_mul(t.saturating_add(1)) / 2;
-        if s.t > MAX_STEPS
-            || s.w.iter().any(|&w| i64::from(w).abs() > t)
-            || s.acc.iter().any(|&a| a.saturating_abs() > sum)
-        {
+        if s.t > MAX_STEPS {
             return Err(StateRefusal::Bounds);
+        }
+        for &w in &s.w {
+            if i64::from(w).abs() > t {
+                return Err(StateRefusal::Bounds);
+            }
+        }
+        for &a in &s.acc {
+            if a.saturating_abs() > sum {
+                return Err(StateRefusal::Bounds);
+            }
         }
         Ok(s)
     }
@@ -271,16 +278,20 @@ impl State {
     /// `plan`'s score, `Σ_{f ∈ φ(plan)} (t·B[f] + acc[f])`. The bounds the trainer and
     /// [`Self::decode`] keep put it below `2⁵⁰` in magnitude.
     #[must_use]
-    pub fn score(&self, plan: &SchedulePlan) -> i64 {
-        let t = i64::try_from(self.t).unwrap_or(i64::MAX);
-        features(plan)
-            .iter()
-            .map(|&f| t * i64::from(BASE[f]) + self.acc[f])
-            .sum()
+    pub const fn score(&self, plan: &SchedulePlan) -> i64 {
+        let t = if self.t > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            self.t as i64
+        };
+        let fs = features(plan);
+        (t * (BASE[fs[0]] as i64) + self.acc[fs[0]])
+            + (t * (BASE[fs[1]] as i64) + self.acc[fs[1]])
+            + (t * (BASE[fs[2]] as i64) + self.acc[fs[2]])
     }
 
-    fn w_sum(&self, fs: &[usize; 3]) -> i64 {
-        fs.iter().map(|&f| i64::from(self.w[f])).sum()
+    const fn w_sum(&self, fs: &[usize; 3]) -> i64 {
+        (self.w[fs[0]] as i64) + (self.w[fs[1]] as i64) + (self.w[fs[2]] as i64)
     }
 }
 
@@ -312,12 +323,16 @@ impl Ranker<'_> {
     /// key collision, which no pinned pool has) the plan's bytes.
     #[must_use]
     pub fn order(&self, pool: &PoolId, plans: &[SchedulePlan]) -> Vec<SchedulePlan> {
-        let mut keyed: Vec<_> = plans
-            .iter()
-            .map(|p| ((self.first(pool, p), tie_key(pool, p), p.encode()), *p))
-            .collect();
+        let mut keyed = Vec::with_capacity(plans.len());
+        for p in plans {
+            keyed.push(((self.first(pool, p), tie_key(pool, p), p.encode()), *p));
+        }
         keyed.sort_unstable_by_key(|k| k.0);
-        keyed.into_iter().map(|(_, p)| p).collect()
+        let mut out = Vec::with_capacity(keyed.len());
+        for (_, p) in keyed {
+            out.push(p);
+        }
+        out
     }
 
     /// The first [`JUDGED`] plans of its order of `plans`.
@@ -336,7 +351,7 @@ impl Ranker<'_> {
 
 /// A label's place in the label order: admitted before refused, admitted plans by training
 /// `(ΣT, ΣZ)` ascending, refused plans tied.
-fn label_order(label: &TrainLabel) -> (u8, u64, u64) {
+const fn label_order(label: &TrainLabel) -> (u8, u64, u64) {
     match label.totals() {
         Some(t) => (0, t.ticks, t.wasted),
         None => (1, 0, 0),
@@ -352,10 +367,18 @@ fn label_order(label: &TrainLabel) -> (u8, u64, u64) {
 pub fn train(parent: &State, data: &[&TrainLabel]) -> Result<State, LearnRefusal> {
     let mut s = parent.clone();
     let mut rng = SplitMix::new(s.rng);
-    let feats: Vec<[usize; 3]> = data.iter().map(|l| features(&l.plan())).collect();
-    let orders: Vec<(u8, u64, u64)> = data.iter().map(|l| label_order(l)).collect();
+    let mut feats = Vec::with_capacity(data.len());
+    let mut orders = Vec::with_capacity(data.len());
+    for l in data {
+        feats.push(features(&l.plan()));
+        orders.push(label_order(l));
+    }
+    let mut perm = Vec::with_capacity(data.len());
     for _ in 0..EPOCHS {
-        let mut perm: Vec<usize> = (0..data.len()).collect();
+        perm.clear();
+        for i in 0..data.len() {
+            perm.push(i);
+        }
         for i in (1..perm.len()).rev() {
             let j = usize::try_from(rng.below(i as u64 + 1)).unwrap_or(0);
             perm.swap(i, j);
@@ -395,19 +418,32 @@ pub fn train(parent: &State, data: &[&TrainLabel]) -> Result<State, LearnRefusal
 }
 
 /// `C(n, k)`, exactly.
-fn choose(n: u32, k: u32) -> u128 {
-    let k = k.min(n - k.min(n));
-    (0..k).fold(1_u128, |c, i| c * u128::from(n - i) / u128::from(i + 1))
+const fn choose(n: u32, k: u32) -> u128 {
+    let min_k = if k < n { k } else { n };
+    let rem = n - min_k;
+    let k = if k < rem { k } else { rem };
+    let mut c = 1_u128;
+    let mut i = 0;
+    while i < k {
+        c = c * ((n - i) as u128) / ((i + 1) as u128);
+        i += 1;
+    }
+    c
 }
 
 /// The one-sided sign test at level `1 / level` (design §13.4): `n ≥ 1` and
 /// `level · Σ_{k=w}^{n} C(n, k) ≤ 2ⁿ`, exactly in `u128`, for `n` up to [`POOLS`].
 #[must_use]
-pub fn sign_test(level: u128, wins: u32, n: u32) -> bool {
+pub const fn sign_test(level: u128, wins: u32, n: u32) -> bool {
     if n == 0 || wins > n || n as usize > POOLS {
         return false;
     }
-    let tail: u128 = (wins..=n).map(|k| choose(n, k)).sum();
+    let mut tail = 0_u128;
+    let mut k = wins;
+    while k <= n {
+        tail += choose(n, k);
+        k += 1;
+    }
     level * tail <= 1_u128 << n
 }
 
@@ -446,7 +482,7 @@ impl Comparison {
     /// untied pools, and summed gains not lower in both `ΣT` and `ΣZ`.
     /// # Errors
     /// [`ModelRefusal::NoUntied`], [`ModelRefusal::Losses`] or [`ModelRefusal::Gain`].
-    pub fn beats(&self, level: u128) -> Result<(), ModelRefusal> {
+    pub const fn beats(&self, level: u128) -> Result<(), ModelRefusal> {
         let n = self.wins + self.losses;
         if n == 0 {
             Err(ModelRefusal::NoUntied)
@@ -462,14 +498,14 @@ impl Comparison {
     /// A look's verdict: [`Self::beats`] at [`LOOK_LEVEL`].
     /// # Errors
     /// As [`Self::beats`].
-    pub fn admits(&self) -> Result<(), ModelRefusal> {
+    pub const fn admits(&self) -> Result<(), ModelRefusal> {
         self.beats(LOOK_LEVEL)
     }
 
     /// A report criterion's verdict: [`Self::beats`] at [`REPORT_LEVEL`].
     /// # Errors
     /// As [`Self::beats`].
-    pub fn shows(&self) -> Result<(), ModelRefusal> {
+    pub const fn shows(&self) -> Result<(), ModelRefusal> {
         self.beats(REPORT_LEVEL)
     }
 }
@@ -575,7 +611,11 @@ impl Manifest {
     /// Its plan count.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.blocks.iter().map(|(_, plans)| plans.len()).sum()
+        let mut total = 0usize;
+        for (_, plans) in &self.blocks {
+            total += plans.len();
+        }
+        total
     }
 
     /// The plans dropped as duplicates.
@@ -588,16 +628,29 @@ impl Manifest {
     /// The digest of its candidate ids, in manifest order.
     #[must_use]
     pub fn ids_digest(&self) -> Digest {
-        let ids: Vec<Digest> = self.plans().map(SchedulePlan::digest).collect();
-        let parts: Vec<&[u8]> = ids.iter().map(|d| d.0.as_slice()).collect();
+        let n = self.count();
+        let mut ids = Vec::with_capacity(n);
+        for (_, plans) in &self.blocks {
+            for p in plans {
+                ids.push(p.digest());
+            }
+        }
+        let mut parts = Vec::with_capacity(ids.len());
+        for d in &ids {
+            parts.push(d.0.as_slice());
+        }
         Digest::of(IDS_DOMAIN, &parts)
     }
 
     /// This manifest with `source`'s `plans` appended, each plan whose id it holds dropped.
     fn with(mut self, source: Source, plans: &[SchedulePlan]) -> Manifest {
-        let seen: BTreeSet<[u8; 12]> = self.plans().map(SchedulePlan::encode).collect();
-        let mut kept = Vec::new();
-        let mut taken = seen;
+        let mut taken = BTreeSet::new();
+        for (_, block_plans) in &self.blocks {
+            for p in block_plans {
+                taken.insert(p.encode());
+            }
+        }
+        let mut kept = Vec::with_capacity(plans.len());
         for plan in plans {
             if taken.insert(plan.encode()) {
                 kept.push(*plan);
@@ -705,8 +758,12 @@ impl Manifest {
 }
 
 /// `n` as a `u32`, saturating (every count here is far below).
-fn len32(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
+const fn len32(n: usize) -> u32 {
+    if n > u32::MAX as usize {
+        u32::MAX
+    } else {
+        n as u32
+    }
 }
 
 /// One label's digest: its candidate id, then its training totals or its first failing law.
@@ -732,7 +789,10 @@ pub fn label_digest(label: &TrainLabel) -> Digest {
 /// The label digest of labels whose digests are `each`, in manifest order.
 #[must_use]
 pub fn labels_digest(each: &[Digest]) -> Digest {
-    let parts: Vec<&[u8]> = each.iter().map(|d| d.0.as_slice()).collect();
+    let mut parts = Vec::with_capacity(each.len());
+    for d in each {
+        parts.push(d.0.as_slice());
+    }
     Digest::of(LABELS_DOMAIN, &parts)
 }
 
@@ -863,8 +923,11 @@ impl Sets {
 
     /// Whether it draws v1's sets in full.
     #[must_use]
-    pub fn full(&self) -> bool {
-        self.scale == Scale::FULL
+    pub const fn full(&self) -> bool {
+        self.scale.train_plans == Scale::FULL.train_plans
+            && self.scale.pools == Scale::FULL.pools
+            && self.scale.plans == Scale::FULL.plans
+            && self.scale.grid == Scale::FULL.grid
     }
 
     /// `set`'s pools, in pool order.
@@ -892,11 +955,17 @@ impl Sets {
     /// [`GRID_V1`]'s plans, in order.
     #[must_use]
     pub fn grid(&self) -> Vec<SchedulePlan> {
-        GRID_V1
-            .iter()
-            .filter_map(|&(split, wake)| SchedulePlan::new(split, wake).ok())
-            .take(self.scale.grid)
-            .collect()
+        let cap = self.scale.grid.min(GRID_V1.len());
+        let mut out = Vec::with_capacity(cap);
+        for &(split, wake) in &GRID_V1 {
+            if out.len() >= self.scale.grid {
+                break;
+            }
+            if let Ok(p) = SchedulePlan::new(split, wake) {
+                out.push(p);
+            }
+        }
+        out
     }
 }
 
@@ -934,7 +1003,12 @@ impl<'e> Labeller<'e> {
 
 /// The plans as bytes.
 fn bytes_of<'p>(plans: impl IntoIterator<Item = &'p SchedulePlan>) -> Vec<[u8; 12]> {
-    plans.into_iter().map(SchedulePlan::encode).collect()
+    let iter = plans.into_iter();
+    let mut out = Vec::with_capacity(iter.size_hint().0);
+    for p in iter {
+        out.push(p.encode());
+    }
+    out
 }
 
 /// Why a version's files are not a version.
@@ -1066,7 +1140,11 @@ impl Version {
     /// The bytes of its labels file: each label's digest, in manifest order.
     #[must_use]
     pub fn labels_bytes(&self) -> Vec<u8> {
-        self.labels.iter().flat_map(|d| d.0).collect()
+        let mut out = Vec::with_capacity(self.labels.len() * 32);
+        for d in &self.labels {
+            out.extend_from_slice(&d.0);
+        }
+        out
     }
 
     /// Its descriptor: exactly the parts its id is the digest of, in order.
@@ -1102,7 +1180,11 @@ impl Version {
         if !rest.is_empty() || chunks.len() != manifest.count() {
             return Err(VersionRefusal::Labels);
         }
-        let labels: Vec<Digest> = chunks.iter().map(|c| Digest(*c)).collect();
+        let mut decoded_labels = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            decoded_labels.push(Digest(*c));
+        }
+        let labels = decoded_labels;
         let mut d = Dec::new(descriptor);
         let wire = VersionRefusal::Descriptor;
         let policy = d.digest("policy").map_err(wire)?;
@@ -1225,7 +1307,12 @@ fn evidence(
         .unwrap_or_default();
     let id = PoolId { set: TRAIN, pool };
     let top = Ranker::Model(&parent.state).top_k(&id, &plans)?;
-    let mut rest: Vec<SchedulePlan> = plans.into_iter().filter(|p| !top.contains(p)).collect();
+    let mut rest = Vec::with_capacity(plans.len());
+    for p in plans {
+        if !top.contains(&p) {
+            rest.push(p);
+        }
+    }
     rest.sort_unstable_by_key(|p| (tie_key(&id, p), p.encode()));
     rest.truncate(EXPLORE);
     let mut out = top.to_vec();
@@ -1293,14 +1380,19 @@ pub fn derive(
     let manifest = data(parent, sets)?;
     label_budget(manifest.count())?;
     let labels = labeller.label(LabelScope::Train, &bytes_of(manifest.plans()))?;
-    let refs: Vec<&TrainLabel> = labels.iter().collect();
+    let mut refs = Vec::with_capacity(labels.len());
+    let mut digests = Vec::with_capacity(labels.len());
+    for l in &labels {
+        refs.push(l);
+        digests.push(label_digest(l));
+    }
     let state = train(&parent.state, &refs)?;
     Ok(Version::of(
         Some(parent.id),
         round,
         state,
         manifest,
-        labels.iter().map(label_digest).collect(),
+        digests,
     ))
 }
 
@@ -1333,23 +1425,31 @@ impl ChainPin {
     /// The pin of `members`, v0..v4.
     #[must_use]
     pub fn of(members: &[Version]) -> Option<ChainPin> {
-        let ids: Vec<Digest> = members.iter().map(Version::id).collect();
-        let labels: Vec<Digest> = members.iter().map(Version::label_digest).collect();
-        Some(ChainPin {
-            ids: ids.try_into().ok()?,
-            labels: labels.try_into().ok()?,
-        })
+        const LEN: usize = 1 + ROUNDS as usize;
+        if members.len() != LEN {
+            return None;
+        }
+        let mut ids = [Digest([0; 32]); LEN];
+        let mut labels = [Digest([0; 32]); LEN];
+        for (i, m) in members.iter().enumerate() {
+            ids[i] = m.id();
+            labels[i] = m.label_digest();
+        }
+        Some(ChainPin { ids, labels })
     }
 
     /// Its digest, which every ledger's `open` line records.
     #[must_use]
     pub fn digest(&self) -> Digest {
-        let parts: Vec<&[u8]> = self
-            .ids
-            .iter()
-            .chain(&self.labels)
-            .map(|d| d.0.as_slice())
-            .collect();
+        const LEN: usize = (1 + ROUNDS as usize) * 2;
+        let mut parts: [&[u8]; LEN] = [&[]; LEN];
+        let n = 1 + ROUNDS as usize;
+        let mut i = 0;
+        while i < n {
+            parts[i] = &self.ids[i].0;
+            parts[n + i] = &self.labels[i].0;
+            i += 1;
+        }
         Digest::of(CHAIN_DOMAIN, &parts)
     }
 }
@@ -1503,12 +1603,23 @@ pub enum VoidCause {
 
 /// The class of a void decided on `cause` after `lines` (design §13.4, rule 6).
 #[must_use]
-pub fn void_class(lines: &[Line], cause: VoidCause) -> VoidClass {
-    let session = &lines[last_open(lines).unwrap_or(0)..];
-    let begun = session.iter().any(|l| matches!(l, Line::LookBegin { .. }));
-    let decided = session
-        .iter()
-        .any(|l| matches!(l, Line::LookVerdict { .. }));
+pub const fn void_class(lines: &[Line], cause: VoidCause) -> VoidClass {
+    let start = match last_open(lines) {
+        Some(at) => at,
+        None => 0,
+    };
+    let session = lines.split_at(start).1;
+    let mut begun = false;
+    let mut decided = false;
+    let mut i = 0;
+    while i < session.len() {
+        match session[i] {
+            Line::LookBegin { .. } => begun = true,
+            Line::LookVerdict { .. } => decided = true,
+            _ => {}
+        }
+        i += 1;
+    }
     match (begun, decided, cause) {
         (false, _, _) => VoidClass::Stopped,
         (true, false, VoidCause::Deadline | VoidCause::ChildFailed) => VoidClass::Opening,
@@ -1577,7 +1688,7 @@ pub enum Line {
 }
 
 impl Line {
-    fn kind(&self) -> u8 {
+    const fn kind(&self) -> u8 {
         match self {
             Line::Open { .. } => 0,
             Line::LookBegin { .. } => 1,
@@ -1900,10 +2011,15 @@ pub fn ledger_head(pair: Pair, raw: &[Vec<u8>]) -> Result<Digest, LedgerRefusal>
 }
 
 /// The last session's `open`: a replaying child's open is part of the session it replays.
-fn last_open(lines: &[Line]) -> Option<usize> {
-    lines
-        .iter()
-        .rposition(|l| matches!(l, Line::Open { replay: false, .. }))
+const fn last_open(lines: &[Line]) -> Option<usize> {
+    let mut i = lines.len();
+    while i > 0 {
+        i -= 1;
+        if matches!(lines[i], Line::Open { replay: false, .. }) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// The candidate and comparator look `look` must name after `bits`, the verdicts of looks
@@ -1915,17 +2031,25 @@ pub fn look_pair(
     ids: &[Digest; 1 + ROUNDS as usize],
 ) -> Option<(Digest, Digest)> {
     let v0 = ids[0];
-    let bit = |n: usize| bits.get(n - 1).copied().unwrap_or(false);
     let mut comparator = v0;
-    for (n, member) in [(1, ids[1]), (3, ids[2]), (4, ids[3])] {
-        if usize::from(look) > n && bit(n) {
+    let pairs = [(1usize, ids[1]), (3usize, ids[2]), (4usize, ids[3])];
+    let mut i = 0;
+    while i < pairs.len() {
+        let (n, member) = pairs[i];
+        let bit_n = if n - 1 < bits.len() {
+            bits[n - 1]
+        } else {
+            false
+        };
+        if (look as usize) > n && bit_n {
             comparator = member;
         }
+        i += 1;
     }
     match look {
         1 => Some((ids[1], v0)),
         2 => Some((control_id(), v0)),
-        3..=5 => Some((ids[usize::from(look) - 1], comparator)),
+        3..=5 => Some((ids[(look as usize) - 1], comparator)),
         _ => None,
     }
 }
@@ -1939,16 +2063,32 @@ pub fn next_line(
     line: &Line,
     ids: &[Digest; 1 + ROUNDS as usize],
 ) -> Result<(), LedgerRefusal> {
-    let ended = lines.iter().any(|l| {
-        matches!(
-            l,
+    let mut ended = false;
+    let mut begun = 0usize;
+    let mut decided = 0usize;
+    let mut report_begun = false;
+    let mut report_done = false;
+    let mut retired = false;
+    let mut replaying = false;
+    for l in lines {
+        match l {
             Line::Record
-                | Line::Void {
-                    class: VoidClass::Opening | VoidClass::Closing,
-                    ..
-                }
-        )
-    });
+            | Line::Void {
+                class: VoidClass::Opening | VoidClass::Closing,
+                ..
+            } => ended = true,
+            Line::LookBegin { .. } => begun += 1,
+            Line::LookVerdict { .. } => decided += 1,
+            Line::ReportBegin { .. } => report_begun = true,
+            Line::ReportDone { .. } => report_done = true,
+            Line::Retire => retired = true,
+            Line::Open { replay: true, .. } => replaying = true,
+            _ => {}
+        }
+    }
+    if ended {
+        return Err(LedgerRefusal::OutOfOrder);
+    }
     let last = lines.last();
     let stopped = matches!(
         last,
@@ -1959,22 +2099,17 @@ pub fn next_line(
     );
     let open = last_open(lines).filter(|_| !stopped);
     let session = open.map_or(&[][..], |at| &lines[at..]);
-    let count = |want: fn(&Line) -> bool| lines.iter().filter(|l| want(l)).count();
-    let begun = count(|l| matches!(l, Line::LookBegin { .. }));
-    let decided = count(|l| matches!(l, Line::LookVerdict { .. }));
-    let report_begun = count(|l| matches!(l, Line::ReportBegin { .. })) > 0;
-    let report_done = count(|l| matches!(l, Line::ReportDone { .. })) > 0;
-    let retired = count(|l| matches!(l, Line::Retire)) > 0;
-    let replaying = count(|l| matches!(l, Line::Open { replay: true, .. })) > 0;
     let replayed = |look: u8| {
-        session
-            .iter()
-            .skip_while(|l| !matches!(l, Line::ReportDone { .. }))
-            .any(|l| *l == Line::Replay { look })
+        let mut after_report = false;
+        for l in session {
+            if matches!(l, Line::ReportDone { .. }) {
+                after_report = true;
+            } else if after_report && *l == (Line::Replay { look }) {
+                return true;
+            }
+        }
+        false
     };
-    if ended {
-        return Err(LedgerRefusal::OutOfOrder);
-    }
     let ok = |cond: bool| {
         if cond {
             Ok(())
@@ -1988,12 +2123,18 @@ pub fn next_line(
             replay: true,
             store,
             ..
-        } => ok(open.is_some()
-            && retired
-            && !replaying
-            && !lines
-                .iter()
-                .any(|l| matches!(l, Line::Open { store: s, .. } if s == store))),
+        } => {
+            let mut seen_store = false;
+            for l in lines {
+                if let Line::Open { store: s, .. } = l
+                    && s == store
+                {
+                    seen_store = true;
+                    break;
+                }
+            }
+            ok(open.is_some() && retired && !replaying && !seen_store)
+        }
         Line::LookBegin {
             look,
             candidate,
@@ -2006,13 +2147,12 @@ pub fn next_line(
             if begun >= usize::from(LOOKS) {
                 return Err(LedgerRefusal::HeldOutSpent);
             }
-            let bits: Vec<bool> = lines
-                .iter()
-                .filter_map(|l| match l {
-                    Line::LookVerdict { bit } => Some(*bit),
-                    _ => None,
-                })
-                .collect();
+            let mut bits = Vec::with_capacity(decided);
+            for l in lines {
+                if let Line::LookVerdict { bit } = l {
+                    bits.push(*bit);
+                }
+            }
             ok(usize::from(*look) == begun + 1
                 && look_pair(*look, &bits, ids) == Some((*candidate, *comparator)))
         }
@@ -2029,7 +2169,16 @@ pub fn next_line(
             && (!retired || replaying)
             && *look >= 1
             && usize::from(*look) <= decided),
-        Line::Retire => ok(open.is_some() && report_done && !retired && (1..=LOOKS).all(replayed)),
+        Line::Retire => {
+            let mut all_replayed = true;
+            for look in 1..=LOOKS {
+                if !replayed(look) {
+                    all_replayed = false;
+                    break;
+                }
+            }
+            ok(open.is_some() && report_done && !retired && all_replayed)
+        }
         Line::Void { cause, class } => ok(open.is_some() && void_class(session, *cause) == *class),
         Line::Record => ok(open.is_some() && retired && replaying),
     }
@@ -2041,51 +2190,65 @@ pub fn next_line(
 /// [`LedgerRefusal::NoRehearsal`], [`LedgerRefusal::VersionClosed`] or
 /// [`LedgerRefusal::PairOrder`].
 pub fn cross_pair(target: u32, pairs: &[(Pair, Vec<Line>)]) -> Result<(), LedgerRefusal> {
-    let lines_of = |pair: Pair| pairs.iter().find(|(p, _)| *p == pair).map(|(_, l)| l);
-    let rehearsed = pairs.iter().any(|(p, lines)| {
-        matches!(p, Pair::Practice(_)) && lines.iter().any(|l| matches!(l, Line::ReportDone { .. }))
-    });
+    let lines_of = |pair: Pair| {
+        for (p, l) in pairs {
+            if *p == pair {
+                return Some(l);
+            }
+        }
+        None
+    };
+    let mut rehearsed = false;
+    let mut closed = false;
+    let mut later = false;
+    for (p, lines) in pairs {
+        match p {
+            Pair::Practice(_) => {
+                for l in lines {
+                    if matches!(l, Line::ReportDone { .. }) {
+                        rehearsed = true;
+                        break;
+                    }
+                }
+            }
+            Pair::Real(i) => {
+                if *i > target && !lines.is_empty() {
+                    later = true;
+                }
+                for l in lines {
+                    if matches!(
+                        l,
+                        Line::Record
+                            | Line::Void {
+                                class: VoidClass::Closing,
+                                ..
+                            }
+                    ) {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if !rehearsed {
         return Err(LedgerRefusal::NoRehearsal);
     }
-    let closed = pairs.iter().any(|(p, lines)| {
-        matches!(p, Pair::Real(_))
-            && lines.iter().any(|l| {
-                matches!(
-                    l,
-                    Line::Record
-                        | Line::Void {
-                            class: VoidClass::Closing,
-                            ..
-                        }
-                )
-            })
-    });
     if closed {
         return Err(LedgerRefusal::VersionClosed);
     }
-    if !(1..=3).contains(&target) {
-        return Err(LedgerRefusal::PairOrder);
-    }
-    let later = pairs
-        .iter()
-        .any(|(p, lines)| matches!(p, Pair::Real(i) if *i > target) && !lines.is_empty());
-    if later {
+    if !(1..=3).contains(&target) || later {
         return Err(LedgerRefusal::PairOrder);
     }
     if lines_of(Pair::Real(target)).is_none_or(Vec::is_empty) {
         for i in 1..target {
-            let opened = lines_of(Pair::Real(i))
-                .and_then(|l| l.last())
-                .is_some_and(|l| {
-                    matches!(
-                        l,
-                        Line::Void {
-                            class: VoidClass::Opening,
-                            ..
-                        }
-                    )
-                });
+            let opened = matches!(
+                lines_of(Pair::Real(i)).and_then(|l| l.last()),
+                Some(Line::Void {
+                    class: VoidClass::Opening,
+                    ..
+                })
+            );
             if !opened {
                 return Err(LedgerRefusal::PairOrder);
             }
@@ -2167,10 +2330,12 @@ fn ranker_of<'c>(id: &Digest, chain: &'c [Version]) -> Option<Ranker<'c>> {
     if *id == control_id() {
         return Some(Ranker::Control);
     }
-    chain
-        .iter()
-        .find(|v| v.id == *id)
-        .map(|v| Ranker::Model(&v.state))
+    for v in chain {
+        if v.id == *id {
+            return Some(Ranker::Model(&v.state));
+        }
+    }
+    None
 }
 
 /// Each pool's top [`JUDGED`] under `x` and under `a`.
@@ -2465,13 +2630,13 @@ impl<L: DurableLog> Ledger<L> {
     /// The bits of its looks, in order.
     #[must_use]
     pub fn bits(&self) -> Vec<bool> {
-        self.lines
-            .iter()
-            .filter_map(|l| match l {
-                Line::LookVerdict { bit } => Some(*bit),
-                _ => None,
-            })
-            .collect()
+        let mut out = Vec::new();
+        for l in &self.lines {
+            if let Line::LookVerdict { bit } = l {
+                out.push(*bit);
+            }
+        }
+        out
     }
 
     /// Refuses a mint or an admission on the runner's ledger, or on a real pair's without the
@@ -2554,15 +2719,21 @@ impl<L: DurableLog> Ledger<L> {
         let (Some(rx), Some(ra)) = (ranker_of(x, chain), ranker_of(a, chain)) else {
             return Err(LedgerRefusal::NotTheChain);
         };
-        let mut tops = Vec::new();
+        let raw_pools = sets.pools(set)?;
+        let mut tops = Vec::with_capacity(raw_pools.len());
         let mut list = BTreeSet::new();
-        for (p, plans) in sets.pools(set)?.iter().enumerate() {
+        for (p, plans) in raw_pools.iter().enumerate() {
             let pool = PoolId {
                 set,
                 pool: len32(p),
             };
             let (tx, ta) = (rx.top_k(&pool, plans)?, ra.top_k(&pool, plans)?);
-            list.extend(tx.iter().chain(&ta).map(SchedulePlan::encode));
+            for plan in &tx {
+                list.insert(plan.encode());
+            }
+            for plan in &ta {
+                list.insert(plan.encode());
+            }
             tops.push((pool, tx, ta));
         }
         Ok((tops, list.into_iter().collect()))
@@ -2649,26 +2820,22 @@ impl<L: DurableLog> Ledger<L> {
             &self.pin.ids,
         )?;
         let set = self.pair.report();
-        let pools: Vec<(PoolId, Vec<SchedulePlan>)> = sets
-            .pools(set)?
-            .into_iter()
-            .enumerate()
-            .map(|(p, plans)| {
-                (
-                    PoolId {
-                        set,
-                        pool: len32(p),
-                    },
-                    plans,
-                )
-            })
-            .collect();
-        let list: Vec<[u8; 12]> = pools
-            .iter()
-            .flat_map(|(_, plans)| plans.iter().map(SchedulePlan::encode))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let raw_pools = sets.pools(set)?;
+        let mut pools = Vec::with_capacity(raw_pools.len());
+        let mut list_set = BTreeSet::new();
+        for (p, plans) in raw_pools.into_iter().enumerate() {
+            for plan in &plans {
+                list_set.insert(plan.encode());
+            }
+            pools.push((
+                PoolId {
+                    set,
+                    pool: len32(p),
+                },
+                plans,
+            ));
+        }
+        let list: Vec<[u8; 12]> = list_set.into_iter().collect();
         self.can_mint(list.len(), READ_LIST_CAP)?;
         self.append(Line::ReportBegin {
             list: list_digest(&list),
@@ -2702,20 +2869,20 @@ impl<L: DurableLog> Ledger<L> {
     ) -> Result<Replayed, LedgerRefusal> {
         self.chain_is_ours(chain)?;
         next_line(&self.lines, &Line::Replay { look }, &self.pin.ids)?;
-        let begins: Vec<(Digest, Digest, Digest)> = self
-            .lines
-            .iter()
-            .filter_map(|l| match l {
+        let mut begins = Vec::new();
+        let mut decided = 0usize;
+        for l in &self.lines {
+            match l {
                 Line::LookBegin {
                     candidate,
                     comparator,
                     list,
                     ..
-                } => Some((*candidate, *comparator, *list)),
-                _ => None,
-            })
-            .collect();
-        let decided = self.bits().len();
+                } => begins.push((*candidate, *comparator, *list)),
+                Line::LookVerdict { .. } => decided += 1,
+                _ => {}
+            }
+        }
         let (Some(&(candidate, comparator, digest)), true) = (
             begins.get(usize::from(look).wrapping_sub(1)),
             (1..=decided).contains(&usize::from(look)),
@@ -2763,14 +2930,30 @@ impl<L: DurableLog> Ledger<L> {
         self.minting()?;
         let ReplayFigures { figures } = replay;
         let named = figures.named;
-        let at = usize::from(named.look).checked_sub(1);
-        let begun = at.and_then(|at| {
-            self.lines
-                .iter()
-                .filter(|l| matches!(l, Line::LookBegin { .. }))
-                .nth(at)
-        });
-        let recorded = at.and_then(|at| self.bits().get(at).copied());
+        let Some(at) = usize::from(named.look).checked_sub(1) else {
+            return Err(LedgerRefusal::OutOfOrder);
+        };
+        let mut begin_idx = 0usize;
+        let mut verdict_idx = 0usize;
+        let mut begun = None;
+        let mut recorded = None;
+        for l in &self.lines {
+            match l {
+                Line::LookBegin { .. } => {
+                    if begin_idx == at {
+                        begun = Some(l);
+                    }
+                    begin_idx += 1;
+                }
+                Line::LookVerdict { bit } => {
+                    if verdict_idx == at {
+                        recorded = Some(*bit);
+                    }
+                    verdict_idx += 1;
+                }
+                _ => {}
+            }
+        }
         let (true, true, Some(recorded)) = (
             named.pair == self.pair && begun == Some(&named.begin()),
             self.lines.last() == Some(&Line::Replay { look: named.look }),
@@ -2830,10 +3013,10 @@ fn pick<'l>(
     by_id: &BTreeMap<Digest, &'l TrainLabel>,
     top: &[SchedulePlan; JUDGED],
 ) -> Option<[&'l TrainLabel; JUDGED]> {
-    let picked: Vec<&TrainLabel> = top
-        .iter()
-        .filter_map(|p| by_id.get(&p.digest()).copied())
-        .collect();
+    let mut picked = Vec::with_capacity(JUDGED);
+    for p in top {
+        picked.push(*by_id.get(&p.digest())?);
+    }
     picked.try_into().ok()
 }
 
@@ -2864,15 +3047,23 @@ fn fold_tops(
     tops: &Tops,
     labels: &[TrainLabel],
 ) -> Result<LookFigures, LedgerRefusal> {
-    let by_id: BTreeMap<Digest, &TrainLabel> = labels.iter().map(|l| (l.id(), l)).collect();
+    let mut by_id = BTreeMap::new();
+    for l in labels {
+        by_id.insert(l.id(), l);
+    }
     let mut pools = Vec::with_capacity(tops.len());
+    let mut xs = Vec::with_capacity(tops.len());
+    let mut as_ = Vec::with_capacity(tops.len());
     for (_, tx, ta) in tops {
         let (Some(lx), Some(la)) = (pick(&by_id, tx), pick(&by_id, ta)) else {
             return Err(LedgerRefusal::Unlabelled);
         };
-        pools.push((labeller.ev.pool_outcome(lx), labeller.ev.pool_outcome(la)));
+        let ox = labeller.ev.pool_outcome(lx);
+        let oa = labeller.ev.pool_outcome(la);
+        xs.push(ox);
+        as_.push(oa);
+        pools.push((ox, oa));
     }
-    let (xs, as_): (Vec<PoolOutcome>, Vec<PoolOutcome>) = pools.iter().copied().unzip();
     let comparison = Comparison::of(&xs, &as_);
     let verdict = comparison.admits();
     #[cfg(test)]
@@ -2973,10 +3164,12 @@ impl Report {
     /// The arm's outcomes, pool by pool.
     #[must_use]
     pub fn arm(&self, arm: Arm) -> &[PoolOutcome] {
-        self.arms
-            .iter()
-            .find(|(a, _)| *a == arm)
-            .map_or(&[][..], |(_, o)| o)
+        for (a, o) in &self.arms {
+            if *a == arm {
+                return o;
+            }
+        }
+        &[]
     }
 
     /// Mf against `against`, by the admission rule's test at [`REPORT_LEVEL`].
@@ -3036,14 +3229,20 @@ impl Report {
 }
 
 /// The count of selections and the summed gains of `pools`.
-fn sums(pools: &[PoolOutcome]) -> (usize, u64, u64) {
-    pools.iter().fold((0, 0, 0), |(n, t, z), o| {
-        (
-            n + usize::from(o.class() == 0),
-            t + o.gain().0,
-            z + o.gain().1,
-        )
-    })
+const fn sums(pools: &[PoolOutcome]) -> (usize, u64, u64) {
+    let (mut n, mut t, mut z) = (0usize, 0u64, 0u64);
+    let mut i = 0;
+    while i < pools.len() {
+        let o = pools[i];
+        if o.class() == 0 {
+            n += 1;
+        }
+        let g = o.gain();
+        t += g.0;
+        z += g.1;
+        i += 1;
+    }
+    (n, t, z)
 }
 
 /// Runs the report's one read: labels every plan of the report set once, then folds every arm in
@@ -3062,12 +3261,18 @@ pub fn run_report(
     let labels = labeller
         .label(LabelScope::Report(token), &list)
         .map_err(|e| LedgerRefusal::Learn(LearnRefusal::Label(e)))?;
-    let by_id: BTreeMap<Digest, &TrainLabel> = labels.iter().map(|l| (l.id(), l)).collect();
-    let (Some(v0), Some(v1), Some(mf)) = (
-        chain.first(),
-        chain.get(1),
-        chain.iter().find(|v| v.id == *active),
-    ) else {
+    let mut by_id = BTreeMap::new();
+    for l in &labels {
+        by_id.insert(l.id(), l);
+    }
+    let mut mf_opt = None;
+    for v in chain {
+        if v.id == *active {
+            mf_opt = Some(v);
+            break;
+        }
+    }
+    let (Some(v0), Some(v1), Some(mf)) = (chain.first(), chain.get(1), mf_opt) else {
         return Err(LedgerRefusal::NotTheChain);
     };
     let ranked = [
@@ -3078,28 +3283,36 @@ pub fn run_report(
         (Arm::Mf, Ranker::Model(&mf.state)),
         (Arm::Ctl, Ranker::Control),
     ];
-    let missing = || LedgerRefusal::Unlabelled;
-    let mut arms: Vec<(Arm, Vec<PoolOutcome>)> = ranked
-        .iter()
-        .map(|&(a, _)| (a, Vec::new()))
-        .chain([(Arm::O, Vec::new())])
-        .collect();
+    let mut arms: Vec<(Arm, Vec<PoolOutcome>)> = Vec::with_capacity(ranked.len() + 1);
+    for &(a, _) in &ranked {
+        arms.push((a, Vec::with_capacity(pools.len())));
+    }
+    arms.push((Arm::O, Vec::with_capacity(pools.len())));
     #[cfg(test)]
-    let mut folded: Vec<(Arm, Vec<[Digest; JUDGED]>)> =
-        ranked.iter().map(|&(a, _)| (a, Vec::new())).collect();
+    let mut folded: Vec<(Arm, Vec<[Digest; JUDGED]>)> = {
+        let mut f = Vec::with_capacity(ranked.len());
+        for &(a, _) in &ranked {
+            f.push((a, Vec::with_capacity(pools.len())));
+        }
+        f
+    };
+    let mut all = Vec::new();
     for (pool, plans) in &pools {
         for (i, (_, ranker)) in ranked.iter().enumerate() {
             let top = ranker.top_k(pool, plans)?;
-            let picked = pick(&by_id, &top).ok_or_else(missing)?;
+            let picked = pick(&by_id, &top).ok_or(LedgerRefusal::Unlabelled)?;
             #[cfg(test)]
             folded[i].1.push(picked.map(TrainLabel::id));
             arms[i].1.push(labeller.ev.pool_outcome(picked));
         }
-        let all = plans
-            .iter()
-            .map(|p| by_id.get(&p.digest()).copied())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(missing)?;
+        all.clear();
+        all.reserve(plans.len());
+        for p in plans {
+            let Some(&lbl) = by_id.get(&p.digest()) else {
+                return Err(LedgerRefusal::Unlabelled);
+            };
+            all.push(lbl);
+        }
         arms[ranked.len()].1.push(labeller.ev.oracle_outcome(&all));
     }
     Ok(Report {
@@ -3680,25 +3893,26 @@ impl<S: DurableStore> Store<S> {
             v.manifest.encode(),
             v.labels_bytes(),
         ];
-        let bytes: usize = parts.iter().map(Vec::len).sum();
+        let bytes = parts[0].len() + parts[1].len() + parts[2].len() + parts[3].len();
         if bytes as u64 > MAX_VERSION_BYTES {
             return Err(StoreRefusal::Budget {
                 what: "a version directory",
             });
         }
-        let files: Vec<(&str, &[u8])> = VERSION_FILES
-            .iter()
-            .zip(&parts)
-            .map(|(name, bytes)| (*name, bytes.as_slice()))
-            .collect();
+        let files: [(&str, &[u8]); 4] = [
+            (VERSION_FILES[0], &parts[0]),
+            (VERSION_FILES[1], &parts[1]),
+            (VERSION_FILES[2], &parts[2]),
+            (VERSION_FILES[3], &parts[3]),
+        ];
         let dir = version_dir(&v.id);
         self.io.create_dir(Step::VersionFiles, &dir, &files)?;
         self.versions.insert(v.id, v.clone());
-        Ok(VERSION_FILES
-            .iter()
-            .zip(&parts)
-            .map(|(name, bytes)| (format!("{dir}/{name}"), bytes.len()))
-            .collect())
+        let mut written = Vec::with_capacity(4);
+        for (name, bytes) in files {
+            written.push((format!("{dir}/{name}"), bytes.len()));
+        }
+        Ok(written)
     }
 
     /// Appends a revision, then moves the pointer to it: two writes, between which a load
@@ -3795,12 +4009,10 @@ impl<S: DurableStore> Store<S> {
         if pair != self.pair {
             return Err(StoreRefusal::ForeignPair);
         }
-        if self
-            .revisions
-            .iter()
-            .any(|r| r.reason == Reason::Admit && r.look == Some(look))
-        {
-            return Err(StoreRefusal::Republished { look });
+        for r in &self.revisions {
+            if r.reason == Reason::Admit && r.look == Some(look) {
+                return Err(StoreRefusal::Republished { look });
+            }
         }
         if self.pointer.active != comparator {
             return Err(StoreRefusal::NotComparator);
@@ -3845,10 +4057,13 @@ impl<S: DurableStore> Store<S> {
         if reread.id != to || reread != *kept {
             return Err(StoreRefusal::StoreCorrupt { file: dir });
         }
-        let admitted = self
-            .revisions
-            .iter()
-            .any(|r| r.reason == Reason::Admit && r.active == to);
+        let mut admitted = false;
+        for r in &self.revisions {
+            if r.reason == Reason::Admit && r.active == to {
+                admitted = true;
+                break;
+            }
+        }
         if to != Version::base().id && !admitted {
             return Err(StoreRefusal::NotAdmitted);
         }
@@ -3962,9 +4177,11 @@ impl GridRecord {
     pub fn of(labels: &[TrainLabel]) -> GridRecord {
         let mut refused: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut best: Option<(u64, u64, [u8; 12])> = None;
+        let mut admitted = 0usize;
         for l in labels {
             match (l.totals(), l.law()) {
                 (Some(t), _) => {
+                    admitted += 1;
                     let key = (t.ticks, t.wasted, l.plan().encode());
                     if best.is_none_or(|k| key < k) {
                         best = Some(key);
@@ -3975,17 +4192,14 @@ impl GridRecord {
         }
         GridRecord {
             judged: labels.len(),
-            admitted: labels.iter().filter(|l| l.totals().is_some()).count(),
+            admitted,
             refused: refused.into_iter().collect(),
             best: best.map(|(t, z, bytes)| {
-                (
-                    bytes.iter().fold(String::new(), |mut s, b| {
-                        let _ = write!(s, "{b:02x}");
-                        s
-                    }),
-                    t,
-                    z,
-                )
+                let mut s = String::with_capacity(24);
+                for b in bytes {
+                    let _ = write!(s, "{b:02x}");
+                }
+                (s, t, z)
             }),
         }
     }
@@ -4154,10 +4368,13 @@ fn roll<S: DurableStore>(
 ) -> Result<Option<u8>, SessionRefusal> {
     let retrain = |store: &mut Store<S>, moves: &mut Vec<(&'static str, Moved)>, round: u8| {
         let (v, moved) = store.train(env.sets, &env.labeller, ledger)?;
-        let wrote_version = moved
-            .written
-            .iter()
-            .any(|(n, _)| n.starts_with("versions/"));
+        let mut wrote_version = false;
+        for (n, _) in &moved.written {
+            if n.starts_with("versions/") {
+                wrote_version = true;
+                break;
+            }
+        }
         moves.push(("retrain", moved));
         if Some(&v) != chain.get(usize::from(round)) || wrote_version {
             return Err(SessionRefusal::Rollback { round });
@@ -4167,17 +4384,20 @@ fn roll<S: DurableStore>(
     moves.push(("rollback", store.rollback(chain[0].id, ledger)?));
     retrain(store, moves, 1)?;
     retrain(store, moves, 2)?;
-    let admitted: Vec<Digest> = store
-        .revisions()
-        .iter()
-        .filter(|r| r.reason == Reason::Admit)
-        .map(|r| r.active)
-        .collect();
-    let r2 = chain[1..=3]
-        .iter()
-        .rev()
-        .find(|v| admitted.contains(&v.id))
-        .map(|v| v.round);
+    let mut r2 = None;
+    for v in chain[1..=3].iter().rev() {
+        let mut was_admitted = false;
+        for r in store.revisions() {
+            if r.reason == Reason::Admit && r.active == v.id {
+                was_admitted = true;
+                break;
+            }
+        }
+        if was_admitted {
+            r2 = Some(v.round);
+            break;
+        }
+    }
     if let Some(round) = r2 {
         moves.push((
             "rollback",

@@ -33,49 +33,68 @@ pub(super) enum SpawnCall {
 impl CursorGlow {
     /// Expire the seam's holds at the tick, before this tick's move.
     pub(super) fn expire_seam_holds(&mut self, now: Instant) {
-        if self
-            .held_park
-            .is_some_and(|p| !p.fresh(now) || (p.cross_row && self.typed_credits_within(now) == 0))
+        if let Some(p) = self.held_park
+            && (!p.fresh(now) || (p.cross_row && self.typed_credits_within(now) == 0))
         {
             self.flush_held_park();
         }
         if let Some(orphans) = self.insert.retire_orphans(now) {
-            self.insert.orphan_exact = orphans
-                .site
-                .zip(self.type_press_ring.exact_run_between(
+            self.insert.orphan_exact = if let (Some((row, col, print_seq)), Some((presses, len))) = (
+                orphans.site,
+                self.type_press_ring.exact_run_between(
                     now,
                     orphans.dispatched_at,
                     orphans.delivered_at,
-                ))
-                .and_then(|((row, col, print_seq), (presses, len))| {
-                    let mut keys = [None; ORPHAN_EXACT_KEYS_MAX];
-                    for (i, press) in presses.into_iter().take(len).enumerate() {
-                        let (pressed_at, glyph) = press?;
-                        let key_col = col.checked_add(u16::try_from(i).ok()?)?;
-                        key_col.checked_add(1)?;
-                        keys[i] = Some(OrphanExactKey {
-                            pressed_at,
-                            row,
-                            col: key_col,
-                            glyph,
-                            print_seq,
-                        });
+                ),
+            ) {
+                let mut keys = [None; ORPHAN_EXACT_KEYS_MAX];
+                let mut ok = true;
+                let mut i = 0;
+                while i < len {
+                    let Some((pressed_at, glyph)) = presses[i] else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(key_col) = col.checked_add(i as u16) else {
+                        ok = false;
+                        break;
+                    };
+                    if key_col.checked_add(1).is_none() {
+                        ok = false;
+                        break;
                     }
+                    keys[i] = Some(OrphanExactKey {
+                        pressed_at,
+                        row,
+                        col: key_col,
+                        glyph,
+                        print_seq,
+                    });
+                    i += 1;
+                }
+                if ok {
                     Some(OrphanExactRun {
                         keys,
                         next: 0,
                         len,
                         insert_col: col,
                     })
-                });
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             self.type_press_ring.retire_through(orphans.delivered_at);
         }
-        if self.insert.orphan_exact.is_some_and(|run| {
-            run.current().is_none_or(|key| {
-                now.saturating_duration_since(key.pressed_at) > IN_FLIGHT_PATIENCE_DUR
-            })
-        }) {
-            self.insert.orphan_exact = None;
+        if let Some(run) = self.insert.orphan_exact {
+            let expired = match run.current() {
+                Some(key) => now.saturating_duration_since(key.pressed_at) > IN_FLIGHT_PATIENCE_DUR,
+                None => true,
+            };
+            if expired {
+                self.insert.orphan_exact = None;
+            }
         }
     }
 
@@ -108,7 +127,8 @@ impl CursorGlow {
             return Some((cr, cc));
         }
         let ((r, c), seen) = self.last_visible?;
-        if let Some(run) = cur.and_then(|to| self.exact_repaint_run((r, c), to, now, cfg)) {
+        let to = cur?;
+        if let Some(run) = self.exact_repaint_run((r, c), to, now, cfg) {
             if run.origin_row != r {
                 let lift = self.exact_hand_prefix((r, c), run.origin_row, now)?;
                 self.v2.lift_hand(lift);
@@ -116,24 +136,29 @@ impl CursorGlow {
             }
             return Some((run.origin_row, c));
         }
+        let (cr, cc) = to;
         let fresh = now.saturating_duration_since(seen).as_millis() as u64
             <= crate::cursor_trail::HIDE_BRIDGE_MS;
         let typed_fresh = self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR);
-        let nav_bridge = hint_fresh_dur(self.nav_hint, now, NAV_HINT_FRESH_DUR)
-            && self
-                .nav_hint
-                .is_some_and(|key| crate::cursor_trail::nav_bridge_admits(key, seen, now));
+        let nav_bridge = match self.nav_hint {
+            Some(key) => {
+                now.saturating_duration_since(key) <= NAV_HINT_FRESH_DUR
+                    && crate::cursor_trail::nav_bridge_admits(key, seen, now)
+            }
+            None => false,
+        };
         let reach =
             crate::cursor_trail::hide_bridge_reach(typed_fresh, nav_bridge, self.pane_columns);
-        let plausible = cur.is_some_and(|to| reach.admits((r, c), to));
-        let in_flight_echo = cur.is_some_and(|(cr, cc)| {
-            self.judging_on_rows(r, cr, |glow| {
-                glow.unpaid_typed_echo(r, c, cr, cc, now, cfg, geom)
-            })
+        let plausible = reach.admits((r, c), to);
+        let in_flight_echo = self.judging_on_rows(r, cr, |glow| {
+            glow.unpaid_typed_echo(r, c, cr, cc, now, cfg, geom)
         });
-        let insert_echo =
-            cur.is_some_and(|(cr, cc)| self.visible_insert_echo(r, c, cr, cc, now, cfg).is_some());
-        (((fresh || nav_bridge) && plausible) || in_flight_echo || insert_echo).then_some((r, c))
+        let insert_echo = self.visible_insert_echo(r, c, cr, cc, now, cfg).is_some();
+        if ((fresh || nav_bridge) && plausible) || in_flight_echo || insert_echo {
+            Some((r, c))
+        } else {
+            None
+        }
     }
 
     /// Judge the observed caret against its source.
@@ -147,9 +172,10 @@ impl CursorGlow {
     ) {
         let declined_hidden_relocation = spawn_from.is_none()
             && self.last.is_none()
-            && cur
-                .zip(self.last_visible.map(|(cell, _)| cell))
-                .is_some_and(|(current, previous)| current != previous);
+            && matches!(
+                (cur, self.last_visible),
+                (Some(current), Some((previous, _))) if current != previous
+            );
         let completed_hidden_reappearance =
             self.last.is_none() && cur.is_some() && self.last_visible.is_some();
         let unseeded_visible = self.last.is_none() && self.last_visible.is_none() && cur.is_some();
@@ -166,22 +192,40 @@ impl CursorGlow {
             };
             self.coalesced_prefix_echo((pr, pc), (cr, cc), now, cfg, geom);
             let exact_orphans = self.orphan_exact_echo((pr, pc), (cr, cc), now, cfg);
-            let orphans = self.insert.orphan_exact.take().and_then(|mut run| {
-                if exact_orphans == 0 {
-                    return None;
+            let orphans = match self.insert.orphan_exact.take() {
+                Some(mut run) if exact_orphans > 0 => {
+                    let mut claimed = [None; ORPHAN_EXACT_KEYS_MAX];
+                    let mut ok = true;
+                    let mut i = 0;
+                    while i < exact_orphans {
+                        let Some(Some(key)) = run.keys.get(run.next + i).copied() else {
+                            ok = false;
+                            break;
+                        };
+                        claimed[i] = Some(key);
+                        i += 1;
+                    }
+                    if ok {
+                        run.next += exact_orphans;
+                        if run.next < run.len {
+                            if let Some((_, _, print_seq)) = self.print_anchor
+                                && let Some(next_key) = run.keys[run.next].as_mut()
+                            {
+                                next_key.print_seq = print_seq;
+                                self.insert.orphan_exact = Some(run);
+                                Some(claimed)
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(claimed)
+                        }
+                    } else {
+                        None
+                    }
                 }
-                let mut claimed = [None; ORPHAN_EXACT_KEYS_MAX];
-                for (i, slot) in claimed.iter_mut().take(exact_orphans).enumerate() {
-                    *slot = Some(run.keys.get(run.next + i).copied().flatten()?);
-                }
-                run.next += exact_orphans;
-                if run.next < run.len {
-                    let print_seq = self.print_anchor?.2;
-                    run.keys[run.next].as_mut()?.print_seq = print_seq;
-                    self.insert.orphan_exact = Some(run);
-                }
-                Some(claimed)
-            });
+                _ => None,
+            };
             if let Some(claimed) = orphans {
                 for key in claimed.into_iter().flatten() {
                     self.type_press_ring
@@ -258,19 +302,22 @@ impl CursorGlow {
             || width > run.len.saturating_sub(run.next)
             || (width > 1 && self.ctx_alt && !self.blink_fresh(now))
             || !self.type_press_ring.is_empty()
-            || !self
-                .insert
-                .span
-                .is_some_and(|span| span.row == key.row && span.col1 == run.insert_col)
-            || !self
-                .row_prev_meta
-                .is_some_and(|m| m.row == key.row && m.caret == key.col && m.at < now)
-            || !self
-                .row_cur_meta
-                .is_some_and(|m| m.row == key.row && m.caret == to.1 && m.at == now)
-            || !self
-                .print_anchor
-                .is_some_and(|(_, _, seq)| seq > key.print_seq && seq != self.print_anchor_seen)
+            || !matches!(
+                self.insert.span,
+                Some(span) if span.row == key.row && span.col1 == run.insert_col
+            )
+            || !matches!(
+                self.row_prev_meta,
+                Some(m) if m.row == key.row && m.caret == key.col && m.at < now
+            )
+            || !matches!(
+                self.row_cur_meta,
+                Some(m) if m.row == key.row && m.caret == to.1 && m.at == now
+            )
+            || !matches!(
+                self.print_anchor,
+                Some((_, _, seq)) if seq > key.print_seq && seq != self.print_anchor_seen
+            )
         {
             return 0;
         }
@@ -292,9 +339,7 @@ impl CursorGlow {
             if next.row != key.row
                 || next.col != col
                 || matches!(next.glyph, ' ' | '\0')
-                || self
-                    .print_anchor
-                    .is_none_or(|(_, _, seq)| seq <= next.print_seq)
+                || !matches!(self.print_anchor, Some((_, _, seq)) if seq > next.print_seq)
                 || self.row_prev.get(usize::from(col)).copied().unwrap_or(' ') != ' '
                 || self.row_cur.get(usize::from(col)).copied().unwrap_or(' ') != next.glyph
             {
@@ -333,7 +378,7 @@ impl CursorGlow {
     /// Recall a typed lay the caret rests on or left of, keylessly, after a print ended off its row.
     pub(super) fn recall_torn_lay(&mut self, lay: TornLay, (row, col): (u16, u16), now: Instant) {
         if !lay.printed_off_row
-            || lay.hand_before.is_some_and(|hand| hand.row == lay.row)
+            || matches!(lay.hand_before, Some(hand) if hand.row == lay.row)
             || row != lay.row
             || col >= lay.col1
         {
@@ -490,9 +535,7 @@ impl CursorGlow {
             return None;
         }
         if let Some(glyph) = self.print_anchor_glyph
-            && self
-                .print_anchor
-                .is_some_and(|(r, c, _)| r == row && c == end)
+            && matches!(self.print_anchor, Some((r, c, _)) if r == row && c == end)
         {
             return Some(glyph);
         }
@@ -525,7 +568,7 @@ impl CursorGlow {
         to: u16,
         judge: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let admit = from == to && self.hand_row.is_some_and(|hand| hand.row == to);
+        let admit = from == to && matches!(self.hand_row, Some(hand) if hand.row == to);
         let prior = std::mem::replace(&mut self.type_press_ring.admit_held, admit);
         let verdict = judge(self);
         self.type_press_ring.admit_held = prior;
@@ -549,13 +592,20 @@ impl CursorGlow {
             || hint_fresh(self.reflow_hint, now, Self::REFLOW_HINT_FRESH)
             || hint_fresh_dur(self.user_gesture_hint, now, USER_GESTURE_HINT_FRESH_DUR)
             || self.insert.fresh(now).is_some()
-            || self.last_erase.is_some_and(|erase| erase.owed_at(now))
+            || match &self.last_erase {
+                Some(erase) => erase.owed_at(now),
+                None => false,
+            }
         {
             return None;
         }
-        self.row_inserted_run(from, to, now)
-            .or_else(|| self.split_inserted_run(from, to, now))
-            .or_else(|| self.rewrapped_typed_run(from, to, now))
+        if let Some(run) = self.row_inserted_run(from, to, now) {
+            Some(run)
+        } else if let Some(run) = self.split_inserted_run(from, to, now) {
+            Some(run)
+        } else {
+            self.rewrapped_typed_run(from, to, now)
+        }
     }
 
     fn row_inserted_run(
@@ -572,24 +622,31 @@ impl CursorGlow {
             || shown.row != pr
             || shown.caret != pc
             || shown.at >= now
-            || self.hand_row.is_none_or(|hand| hand.row != pr)
+            || !matches!(self.hand_row, Some(hand) if hand.row == pr)
             || current.row != cr
             || current.caret != cc
             || current.at != now
-            || self
-                .print_anchor
-                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+            || !matches!(self.print_anchor, Some((_, _, seq)) if seq != self.print_anchor_seen)
         {
             return None;
         }
-        let pane_col0 = self.pane_columns.map_or(0, |(col0, _)| col0);
-        if pc <= pane_col0
-            || !(pane_col0..pc).all(|col| {
-                rk::witness::unit_at(&self.row_shown, col)
-                    == rk::witness::unit_at(&self.row_cur, col)
-            })
-            || !self.insert_tail_preserved(pc, cc)
-        {
+        let pane_col0 = match self.pane_columns {
+            Some((col0, _)) => col0,
+            None => 0,
+        };
+        if pc <= pane_col0 {
+            return None;
+        }
+        let mut col = pane_col0;
+        while col < pc {
+            if rk::witness::unit_at(&self.row_shown, col)
+                != rk::witness::unit_at(&self.row_cur, col)
+            {
+                return None;
+            }
+            col += 1;
+        }
+        if !self.insert_tail_preserved(pc, cc) {
             return None;
         }
         let cells = usize::from(cc - pc);
@@ -620,43 +677,51 @@ impl CursorGlow {
         let Some(tail) = self
             .row_shown
             .get(usize::from(old_col)..self.ink_end_in_pane(&self.row_shown))
-            .filter(|tail| tail.len() >= 2)
         else {
             return false;
         };
-        let end = usize::from(new_col).checked_add(tail.len());
-        if end.and_then(|end| self.row_cur.get(usize::from(new_col)..end)) == Some(tail) {
+        if tail.len() < 2 {
+            return false;
+        }
+        if let Some(end) = usize::from(new_col).checked_add(tail.len())
+            && self.row_cur.get(usize::from(new_col)..end) == Some(tail)
+        {
             return true;
         }
-        if !self
-            .row_cur_meta
-            .is_some_and(|m| m.below == NbrProbe::Probed)
-        {
+        if !matches!(self.row_cur_meta, Some(m) if m.below == NbrProbe::Probed) {
             return false;
         }
         let Some(first) = self
             .row_cur
             .get(usize::from(new_col)..self.ink_end_in_pane(&self.row_cur))
-            .filter(|first| !first.is_empty() && first.len() < tail.len())
         else {
             return false;
         };
-        if !tail.starts_with(first) {
+        if first.is_empty() || first.len() >= tail.len() || !tail.starts_with(first) {
             return false;
         }
-        let pane_col0 = self.pane_columns.map_or(0, |(col0, _)| col0);
+        let pane_col0 = match self.pane_columns {
+            Some((col0, _)) => col0,
+            None => 0,
+        };
         let end = self.ink_end_in_pane(&self.row_below_cur);
-        let Some(start) = (usize::from(pane_col0)..end)
-            .find(|&col| !matches!(self.row_below_cur[col], ' ' | '\0'))
-        else {
+        let mut start = None;
+        let mut col = usize::from(pane_col0);
+        while col < end {
+            if !matches!(self.row_below_cur[col], ' ' | '\0') {
+                start = Some(col);
+                break;
+            }
+            col += 1;
+        }
+        let Some(start) = start else {
             return false;
         };
         for dropped in [false, true] {
             let split = first.len() + usize::from(dropped);
             if (!dropped || tail.get(first.len()) == Some(&' '))
-                && tail.get(split..).is_some_and(|rest| {
-                    self.row_below_cur.get(start..start + rest.len()) == Some(rest)
-                })
+                && let Some(rest) = tail.get(split..)
+                && self.row_below_cur.get(start..start + rest.len()) == Some(rest)
             {
                 return true;
             }
@@ -682,20 +747,36 @@ impl CursorGlow {
                 return None;
             };
         let width = self.v2.ribbon().typed_suffix_len((row, col), now);
-        let lo = col.checked_sub(width).filter(|_| width > 0)?;
-        if !(lo..col).any(|c| {
-            rk::witness::unit_at(&self.row_shown, c) != rk::witness::unit_at(old_current, c)
-        }) {
+        if width == 0 {
+            return None;
+        }
+        let lo = col.checked_sub(width)?;
+        let mut changed = false;
+        let mut c = lo;
+        while c < col {
+            if rk::witness::unit_at(&self.row_shown, c) != rk::witness::unit_at(old_current, c) {
+                changed = true;
+                break;
+            }
+            c += 1;
+        }
+        if !changed {
             return None;
         }
         let hi = col.checked_sub(1)?;
-        let last = self
-            .v2
-            .ribbon()
-            .cells()
-            .iter()
-            .filter(|c| c.row == row && c.col == hi && c.typing && !c.leaving())
-            .max_by_key(|c| c.born)?;
+        let mut last: Option<&rk::ribbon::Cell> = None;
+        for cell in self.v2.ribbon().cells() {
+            if cell.row == row && cell.col == hi && cell.typing && !cell.leaving() {
+                let replace = match last {
+                    Some(prev) => cell.born >= prev.born,
+                    None => true,
+                };
+                if replace {
+                    last = Some(cell);
+                }
+            }
+        }
+        let last = last?;
         Some(rk::witness::FollowRun {
             row,
             cohort: last.cohort,
@@ -713,37 +794,42 @@ impl CursorGlow {
     ) -> Option<ExactTypedRun> {
         let source_row = cr.checked_sub(1)?;
         let (old_row, previous) = if self.last.is_some() {
-            (
-                &self.row_prev,
-                self.row_prev_meta
-                    .filter(|probe| probe.row == pr && probe.caret == pc)?,
-            )
+            let probe = self.row_prev_meta?;
+            if probe.row != pr || probe.caret != pc {
+                return None;
+            }
+            (&self.row_prev, probe)
         } else {
             (&self.row_shown, self.row_shown_meta?)
         };
         let current = self.row_cur_meta?;
         if previous.caret != pc
-            || ![previous.row, source_row].contains(&pr)
-            || ![source_row, cr].contains(&previous.row)
-            || self.hand_row.is_none_or(|hand| hand.row != previous.row)
+            || !(pr == previous.row || pr == source_row)
+            || !(previous.row == source_row || previous.row == cr)
+            || !matches!(self.hand_row, Some(hand) if hand.row == previous.row)
             || previous.at >= now
             || current.row != cr
             || current.caret != cc
             || current.at != now
             || current.above != NbrProbe::Probed
-            || self
-                .print_anchor
-                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+            || !matches!(self.print_anchor, Some((_, _, seq)) if seq != self.print_anchor_seen)
         {
             return None;
         }
-        let pane_col0 = self.pane_columns.map_or(0, |(col0, _)| col0);
-        if pc <= pane_col0
-            || !(pane_col0..pc).all(|col| {
-                rk::witness::unit_at(old_row, col) == rk::witness::unit_at(&self.row_above_cur, col)
-            })
-        {
+        let pane_col0 = match self.pane_columns {
+            Some((col0, _)) => col0,
+            None => 0,
+        };
+        if pc <= pane_col0 {
             return None;
+        }
+        let mut col = pane_col0;
+        while col < pc {
+            if rk::witness::unit_at(old_row, col) != rk::witness::unit_at(&self.row_above_cur, col)
+            {
+                return None;
+            }
+            col += 1;
         }
         let old_end = self.ink_end_in_pane(old_row);
         let old_tail = old_row.get(usize::from(pc)..old_end)?;
@@ -755,8 +841,16 @@ impl CursorGlow {
         {
             return None;
         }
-        let landing_start = (pane_col0..cc)
-            .find(|&col| !matches!(rk::witness::unit_at(&self.row_cur, col).ch, ' ' | '\0'))?;
+        let mut landing_start = None;
+        let mut col = pane_col0;
+        while col < cc {
+            if !matches!(rk::witness::unit_at(&self.row_cur, col).ch, ' ' | '\0') {
+                landing_start = Some(col);
+                break;
+            }
+            col += 1;
+        }
+        let landing_start = landing_start?;
         let source_end = u16::try_from(self.ink_end_in_pane(&self.row_above_cur)).ok()?;
         let source_len = usize::from(source_end.checked_sub(pc)?);
         let landing_len = usize::from(cc - landing_start);
@@ -806,7 +900,10 @@ impl CursorGlow {
     /// The glyph at `(row, end - 1)` in this frame's row probe (the caret's row, [`Self::observe_row`], or a flanking row, [`Self::observe_neighbor_rows`]).
     pub(super) fn probe_glyph_before(&self, row: u16, end: u16, now: Instant) -> Option<char> {
         let col = end.checked_sub(1)?;
-        let meta = self.row_cur_meta.filter(|m| m.at == now)?;
+        let meta = self.row_cur_meta?;
+        if meta.at != now {
+            return None;
+        }
         let cols = if row == meta.row {
             &self.row_cur
         } else if row.checked_add(1) == Some(meta.row) && meta.above == NbrProbe::Probed {
@@ -829,17 +926,11 @@ impl CursorGlow {
         same_caret: bool,
     ) -> Option<usize> {
         if col == 0
-            || self
-                .print_anchor
-                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+            || !matches!(self.print_anchor, Some((_, _, seq)) if seq != self.print_anchor_seen)
             || (!same_caret && !self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR))
             || self.typed_credits_within(now) == 0
-            || !self
-                .row_prev_meta
-                .is_some_and(|p| p.row == row && p.caret == col)
-            || !self
-                .row_cur_meta
-                .is_some_and(|p| p.row == row && p.caret == observed_caret)
+            || !matches!(self.row_prev_meta, Some(p) if p.row == row && p.caret == col)
+            || !matches!(self.row_cur_meta, Some(p) if p.row == row && p.caret == observed_caret)
         {
             return None;
         }
@@ -860,14 +951,17 @@ impl CursorGlow {
             let (slot, expected) = self
                 .type_press_ring
                 .oldest_fresh_glyph(now, TYPE_HINT_FRESH_DUR)?;
-            (new == expected).then_some(slot)?
+            if new != expected {
+                return None;
+            }
+            slot
         };
-        self.v2
-            .ribbon()
-            .cells()
-            .iter()
-            .any(|c| c.row == row && c.col == col - 1 && c.typing && !c.leaving())
-            .then_some(slot)
+        for c in self.v2.ribbon().cells() {
+            if c.row == row && c.col == col - 1 && c.typing && !c.leaving() {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     /// A Backspace whose retreat is still owed and the keys typed since it, rendered as one repaint.
@@ -877,27 +971,34 @@ impl CursorGlow {
         (cr, cc): (u16, u16),
         now: Instant,
     ) -> Option<(u16, usize)> {
-        let erase = self.last_erase.filter(|erase| erase.owed_at(now))?;
-        if cr != pr {
+        let erase = self.last_erase?;
+        if !erase.owed_at(now) || cr != pr {
             return None;
         }
         let keys = i32::from(erase.owed) + i32::from(cc) - i32::from(pc);
-        let keys = usize::try_from(keys)
-            .ok()
-            .filter(|keys| (1..=EXACT_COALESCED_PREFIX_MAX).contains(keys))?;
+        let keys = usize::try_from(keys).ok()?;
+        if !(1..=EXACT_COALESCED_PREFIX_MAX).contains(&keys) {
+            return None;
+        }
         let mid = cc.checked_sub(keys as u16)?;
-        let source = |m: &RowProbe| m.row == pr && m.caret == pc && m.at < now;
-        let (prev, _) = match self
-            .row_shown_meta
-            .filter(|m| self.last.is_none() && source(m))
+        let prev = if self.last.is_none()
+            && let Some(m) = self.row_shown_meta
+            && m.row == pr
+            && m.caret == pc
+            && m.at < now
         {
-            Some(meta) => (&self.row_shown, meta),
-            None => (&self.row_prev, self.row_prev_meta.filter(source)?),
+            &self.row_shown
+        } else {
+            let m = self.row_prev_meta?;
+            if m.row != pr || m.caret != pc || m.at >= now {
+                return None;
+            }
+            &self.row_prev
         };
-        if !self
-            .row_cur_meta
-            .is_some_and(|m| m.row == pr && m.caret == cc && m.at == now)
-        {
+        if !matches!(
+            self.row_cur_meta,
+            Some(m) if m.row == pr && m.caret == cc && m.at == now
+        ) {
             return None;
         }
         let mut glyphs = [' '; EXACT_COALESCED_PREFIX_MAX];
@@ -954,7 +1055,10 @@ impl CursorGlow {
         if !matches!(cfg.style, GlowStyle::RainbowKitty) {
             return None;
         }
-        let erase = self.last_erase.filter(|erase| erase.owed_at(now))?;
+        let erase = self.last_erase?;
+        if !erase.owed_at(now) {
+            return None;
+        }
         if cr != pr || cc == pc {
             return Some(EraseHop::Past);
         }
@@ -972,13 +1076,18 @@ impl CursorGlow {
         }
         let late = hop - before;
         let retired = erase.retired();
-        let spelled = late <= retired.len()
-            && self
-                .row_cur_meta
-                .is_some_and(|m| m.row == pr && m.at == now)
-            && retired[..late].iter().enumerate().all(|(i, &glyph)| {
-                self.row_cur.get(usize::from(cc) - late + i).copied() == Some(glyph)
-            });
+        let mut spelled = late <= retired.len()
+            && matches!(self.row_cur_meta, Some(m) if m.row == pr && m.at == now);
+        if spelled {
+            let mut i = 0;
+            while i < late {
+                if self.row_cur.get(usize::from(cc) - late + i).copied() != Some(retired[i]) {
+                    spelled = false;
+                    break;
+                }
+                i += 1;
+            }
+        }
         Some(if spelled {
             EraseHop::Late(late as u16)
         } else {
@@ -1004,10 +1113,10 @@ impl CursorGlow {
         {
             return;
         }
-        let Some(slot) = self
-            .exact_pending_prefix_slot(pr, pc, cc, now, false)
-            .or_else(|| self.exact_coalesced_prefix_slot(pr, pc, cc, now))
-        else {
+        let Some(slot) = (match self.exact_pending_prefix_slot(pr, pc, cc, now, false) {
+            Some(slot) => Some(slot),
+            None => self.exact_coalesced_prefix_slot(pr, pc, cc, now),
+        }) else {
             return;
         };
         self.admit_exact_prefix(pr, pc, slot, now, cfg, geom);
@@ -1022,25 +1131,23 @@ impl CursorGlow {
         now: Instant,
     ) -> Option<usize> {
         let width = target.checked_sub(col)?.checked_add(1)?;
+        let prev_meta = self.row_prev_meta?;
         if col == 0
             || !(2..=EXACT_COALESCED_PREFIX_MAX).contains(&usize::from(width))
+            || !matches!(self.print_anchor, Some((_, _, seq)) if seq != self.print_anchor_seen)
+            || !matches!(
+                self.row_cur_meta,
+                Some(m) if m.row == row && m.caret == target && m.at == now
+            )
+            || prev_meta.row != row
+            || prev_meta.caret != col
+            || prev_meta.at > now
             || self
-                .print_anchor
-                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
-            || !self
-                .row_cur_meta
-                .is_some_and(|m| m.row == row && m.caret == target && m.at == now)
-            || !self.row_prev_meta.is_some_and(|m| {
-                m.row == row
-                    && m.caret == col
-                    && m.at <= now
-                    && self
-                        .row_prev
-                        .get(usize::from(col - 1))
-                        .copied()
-                        .unwrap_or(' ')
-                        == ' '
-            })
+                .row_prev
+                .get(usize::from(col - 1))
+                .copied()
+                .unwrap_or(' ')
+                != ' '
         {
             return None;
         }
@@ -1052,11 +1159,8 @@ impl CursorGlow {
         if matches!(glyphs[0], ' ' | '\0') {
             return None;
         }
-        self.type_press_ring.exact_unpaid_run(
-            now,
-            self.row_prev_meta?.at,
-            &glyphs[..usize::from(width)],
-        )
+        self.type_press_ring
+            .exact_unpaid_run(now, prev_meta.at, &glyphs[..usize::from(width)])
     }
 
     /// A rewrap carried the hand's old word left on its row or down one row and printed queued keys after it.
@@ -1068,10 +1172,20 @@ impl CursorGlow {
     ) -> Option<ExactTypedRun> {
         let same_row = pr == cr && cc < pc;
         let down_one = pr.checked_add(1) == Some(cr);
-        let source = |probe: &RowProbe| probe.row == pr && probe.caret == pc && probe.at < now;
-        let (old_row, previous) = match self.row_prev_meta.filter(source) {
-            Some(previous) => (&self.row_prev, previous),
-            None => (&self.row_shown, self.row_shown_meta.filter(source)?),
+        let (old_row, previous) = if let Some(prev) = self.row_prev_meta
+            && prev.row == pr
+            && prev.caret == pc
+            && prev.at < now
+        {
+            (&self.row_prev, prev)
+        } else if let Some(shown) = self.row_shown_meta
+            && shown.row == pr
+            && shown.caret == pc
+            && shown.at < now
+        {
+            (&self.row_shown, shown)
+        } else {
+            return None;
         };
         let current = self.row_cur_meta?;
         if !(same_row || down_one)
@@ -1079,10 +1193,8 @@ impl CursorGlow {
             || current.caret != cc
             || current.at != now
             || (down_one && current.above != NbrProbe::Probed)
-            || self.hand_row.is_none_or(|hand| hand.row != pr)
-            || self
-                .print_anchor
-                .is_none_or(|(_, _, seq)| seq == self.print_anchor_seen)
+            || !matches!(self.hand_row, Some(hand) if hand.row == pr)
+            || !matches!(self.print_anchor, Some((_, _, seq)) if seq != self.print_anchor_seen)
         {
             return None;
         }
@@ -1097,24 +1209,44 @@ impl CursorGlow {
         } else {
             &self.row_above_cur
         };
-        if width == 0
-            || !self.v2.ribbon().cells().iter().any(|cell| {
-                cell.row == pr && cell.col == source_end && cell.typing && !cell.leaving()
-            })
-            || (source_start..pc).any(|col| {
-                source_now
-                    .get(usize::from(col))
-                    .is_some_and(|&glyph| glyph != ' ')
-            })
-        {
+        if width == 0 {
             return None;
         }
-        let pane_start = self.pane_columns.map_or(0, |(start, _)| start);
-        let start = (pane_start..cc).find(|&col| {
-            self.row_cur
-                .get(usize::from(col))
-                .is_some_and(|&glyph| !matches!(glyph, ' ' | '\0'))
-        })?;
+        let mut has_end = false;
+        for cell in self.v2.ribbon().cells() {
+            if cell.row == pr && cell.col == source_end && cell.typing && !cell.leaving() {
+                has_end = true;
+                break;
+            }
+        }
+        if !has_end {
+            return None;
+        }
+        let mut col = source_start;
+        while col < pc {
+            if let Some(&glyph) = source_now.get(usize::from(col))
+                && glyph != ' '
+            {
+                return None;
+            }
+            col += 1;
+        }
+        let pane_start = match self.pane_columns {
+            Some((start, _)) => start,
+            None => 0,
+        };
+        let mut start = None;
+        let mut col = pane_start;
+        while col < cc {
+            if let Some(&glyph) = self.row_cur.get(usize::from(col))
+                && !matches!(glyph, ' ' | '\0')
+            {
+                start = Some(col);
+                break;
+            }
+            col += 1;
+        }
+        let start = start?;
         let landing_start = start.checked_add(width)?;
         let cells = usize::from(cc.checked_sub(landing_start)?);
         if !(1..=EXACT_COALESCED_PREFIX_MAX).contains(&cells)
@@ -1159,8 +1291,8 @@ impl CursorGlow {
         geom: Geom,
     ) -> bool {
         let Some((row, col)) = cur else { return false };
-        let reappeared =
-            self.last.is_none() && self.last_visible.is_some_and(|(cell, _)| cur == Some(cell));
+        let reappeared = self.last.is_none()
+            && matches!(self.last_visible, Some((cell, _)) if cur == Some(cell));
         if !matches!(cfg.style, GlowStyle::RainbowKitty)
             || cursor_move_observed
             || (self.last != cur && !reappeared)
@@ -1208,10 +1340,7 @@ impl CursorGlow {
 
     /// A licensed first-cell admission can take `classify_move`'s re-anchor branch and skip `hand_v2_typed_sweep`.
     pub(super) fn remember_exact_first_cell(&mut self, row: u16, col: u16, now: Instant) {
-        if !self
-            .row_cur_meta
-            .is_some_and(|m| m.row == row && m.at == now)
-        {
+        if !matches!(self.row_cur_meta, Some(m) if m.row == row && m.at == now) {
             return;
         }
         let glyph = self.row_cur.get(usize::from(col)).copied().unwrap_or(' ');
@@ -1233,9 +1362,7 @@ impl CursorGlow {
     pub(super) fn remember_fold_landing(&mut self, row: u16, col0: u16, col1: u16, now: Instant) {
         if col0 >= col1
             || usize::from(col1 - col0) > RECENT_TYPED_RUN_CAP
-            || !self
-                .row_cur_meta
-                .is_some_and(|m| m.row == row && m.at == now)
+            || !matches!(self.row_cur_meta, Some(m) if m.row == row && m.at == now)
         {
             return;
         }
@@ -1290,7 +1417,7 @@ impl CursorGlow {
             && let Some((row, _)) = cur
             && row == caret.row
             && row != ar
-            && self.hand_row.is_none_or(|hand| hand.row != row)
+            && !matches!(self.hand_row, Some(hand) if hand.row == row)
         {
             caret.parked = true;
         }
@@ -1303,36 +1430,44 @@ impl CursorGlow {
             None => (None, None, false),
         };
         let was_tainted = tainted;
-        let established_echo_row = self.last_anchor_sweep.is_some_and(|(row, _)| row == ar);
+        let established_echo_row = matches!(self.last_anchor_sweep, Some((row, _)) if row == ar);
         let pane_col1 = {
             let (col0, cols) = self.pane_span(geom);
             col0.saturating_add(cols)
         };
-        let wrap_parked = cur.is_some_and(|(r, c)| {
-            r == ar
+        let wrap_parked = matches!(
+            cur,
+            Some((r, c)) if r == ar
                 && usize::from(c).saturating_add(1) == usize::from(ac)
                 && usize::from(ac) == pane_col1
-        });
-        let licensed_this_tick = self
-            .last_licensed_row
-            .is_some_and(|(row, at)| row == ar && at == now);
+        );
+        let licensed_this_tick =
+            matches!(self.last_licensed_row, Some((row, at)) if row == ar && at == now);
         let in_flight = (established_echo_row || wrap_parked)
-            && prev.is_some_and(|pc| {
-                ac > pc
-                    && self.judging_on_rows(ar, ar, |glow| {
-                        glow.unpaid_typed_echo(ar, pc, ar, ac, now, cfg, geom)
-                    })
-            });
-        let younger_than_stamp =
-            |at: Instant| now.saturating_duration_since(at) <= TYPE_HINT_FRESH_DUR;
-        let insert_admits = prev.and_then(|pc| {
-            let ins = self.insert_echo(ar, pc, ar, ac, now, cfg)?;
-            let spoken = self
-                .last_anchor_sweep
-                .is_some_and(|(row, at)| row != ar && younger_than_stamp(at));
-            (!spoken && Self::insert_row_identity(ar, usize::from(ac - pc), ins)).then_some(ins)
-        });
-        if prev.is_some_and(|pc| ac > pc)
+            && match prev {
+                Some(pc) if ac > pc => self.judging_on_rows(ar, ar, |glow| {
+                    glow.unpaid_typed_echo(ar, pc, ar, ac, now, cfg, geom)
+                }),
+                _ => false,
+            };
+        let insert_admits = if let Some(pc) = prev
+            && let Some(ins) = self.insert_echo(ar, pc, ar, ac, now, cfg)
+        {
+            let spoken = match self.last_anchor_sweep {
+                Some((row, at)) => {
+                    row != ar && now.saturating_duration_since(at) <= TYPE_HINT_FRESH_DUR
+                }
+                None => false,
+            };
+            if !spoken && Self::insert_row_identity(ar, usize::from(ac - pc), ins) {
+                Some(ins)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if matches!(prev, Some(pc) if ac > pc)
             && !self.move_licensed(now)
             && !established_echo_row
             && !licensed_this_tick
@@ -1354,7 +1489,7 @@ impl CursorGlow {
             return;
         }
         let hidden = cur.is_none();
-        let parked = cur.is_some_and(|(r, _)| r != ar);
+        let parked = matches!(cur, Some((r, _)) if r != ar);
         if !(hidden || parked || wrap_parked) {
             return;
         }
@@ -1397,12 +1532,17 @@ impl CursorGlow {
             }
             return;
         }
-        let spoken_for = self
-            .last_anchor_sweep
-            .is_some_and(|(row, at)| row != ar && younger_than_stamp(at))
-            || self
-                .last_licensed_row
-                .is_some_and(|(row, at)| row != ar && younger_than_stamp(at));
+        let spoken_for = match self.last_anchor_sweep {
+            Some((row, at)) => {
+                row != ar && now.saturating_duration_since(at) <= TYPE_HINT_FRESH_DUR
+            }
+            None => false,
+        } || match self.last_licensed_row {
+            Some((row, at)) => {
+                row != ar && now.saturating_duration_since(at) <= TYPE_HINT_FRESH_DUR
+            }
+            None => false,
+        };
         if tainted || spoken_for {
             // Logged when contested (a typed stamp fresh, the in-flight batch, or an insert-width advance); a lone spinner tick is refused silently so it cannot push the drop's verdict out of the ring.
             if typed_fresh || in_flight || insert_admits.is_some() {
@@ -1414,10 +1554,10 @@ impl CursorGlow {
             return;
         }
         if parked && !self.caret_hidden && insert_admits.is_none() {
-            let foreign = self
-                .glyph_before(ar, ac, now)
-                .and_then(|printed| self.type_press_ring.foreign_to_live(now, printed))
-                == Some(true);
+            let foreign = match self.glyph_before(ar, ac, now) {
+                Some(printed) => self.type_press_ring.foreign_to_live(now, printed) == Some(true),
+                None => false,
+            };
             let hand_at_caret = self.hand_types_at_the_caret(cur);
             if foreign || hand_at_caret {
                 self.log_decline(now, (ar, pc), (ar, ac), Self::DECLINE_PROGRAM_ROW);
@@ -1788,12 +1928,11 @@ impl CursorGlow {
             return false;
         };
         if Some(next_row) != row.checked_add(1)
-            || !self
-                .row_prev_meta
-                .is_some_and(|p| p.row == row && p.caret == col)
-            || !self
-                .row_cur_meta
-                .is_some_and(|m| m.row == next_row && m.caret == next_col)
+            || !matches!(self.row_prev_meta, Some(p) if p.row == row && p.caret == col)
+            || !matches!(
+                self.row_cur_meta,
+                Some(m) if m.row == next_row && m.caret == next_col
+            )
         {
             return false;
         }
@@ -1804,10 +1943,16 @@ impl CursorGlow {
         if glyph.is_blank() {
             return false;
         }
-        let Some(sample) = self.witness_rows[..self.witness_rows_n]
-            .iter()
-            .find(|s| s.row == row)
-        else {
+        let mut sample = None;
+        let mut wi = 0;
+        while wi < self.witness_rows_n {
+            if self.witness_rows[wi].row == row {
+                sample = Some(&self.witness_rows[wi]);
+                break;
+            }
+            wi += 1;
+        }
+        let Some(sample) = sample else {
             return false;
         };
         let old_end = u16::try_from(self.ink_end_in_pane(&self.row_prev)).unwrap_or(u16::MAX);
@@ -1815,15 +1960,22 @@ impl CursorGlow {
             return false;
         };
         let dest_start = usize::from(next_col);
-        let moved_tail = dest_start
-            .checked_add(old_tail.len())
-            .and_then(|end| self.row_cur.get(dest_start..end));
-        old_tail.len() >= 2
-            && moved_tail == Some(old_tail)
-            && (col..old_end).all(|c| rk::witness::unit_at(&sample.cols, c).is_blank())
-            && self
-                .type_press_ring
-                .fresh_glyph(now, IN_FLIGHT_PATIENCE_DUR, glyph.ch)
+        let moved_tail = match dest_start.checked_add(old_tail.len()) {
+            Some(end) => self.row_cur.get(dest_start..end),
+            None => None,
+        };
+        if old_tail.len() < 2 || moved_tail != Some(old_tail) {
+            return false;
+        }
+        let mut c = col;
+        while c < old_end {
+            if !rk::witness::unit_at(&sample.cols, c).is_blank() {
+                return false;
+            }
+            c += 1;
+        }
+        self.type_press_ring
+            .fresh_glyph(now, IN_FLIGHT_PATIENCE_DUR, glyph.ch)
     }
 
     /// One past the last glyph of a sampled row inside the focused pane (the whole row when no pane is set).
@@ -1866,7 +2018,8 @@ impl CursorGlow {
             rk::Licence::Typed
         } else {
             if let Some(at) = gesture_taken
-                && self.insert.armed.is_some_and(|i| i.at == at)
+                && let Some(armed) = self.insert.armed
+                && armed.at == at
             {
                 self.insert.clear();
             }
@@ -1907,41 +2060,64 @@ impl CursorGlow {
         born: Instant,
         now: Instant,
     ) {
-        let sample = self
-            .row_cur_meta
-            .is_some_and(|m| m.row == row && m.at == now)
-            && col0 < col1;
+        let sample =
+            matches!(self.row_cur_meta, Some(m) if m.row == row && m.at == now) && col0 < col1;
         if !sample {
             self.recent_typed_run = None;
             self.v2.on_event(rk::Event::Sweep { row, col0, col1 }, born);
             return;
         }
         let old = self.recent_typed_run.as_ref();
-        let joined = old.is_some_and(|run| {
-            run.row == row
+        let joined = if let Some(run) = old {
+            if run.row == row
                 && run.end() == col0
                 && usize::from(run.len) + usize::from(col1 - col0) <= RECENT_TYPED_RUN_CAP
                 && now.saturating_duration_since(run.at) <= rk::ribbon::CHAIN_GAP_MAX_DUR
-                && (run.col0..col0).all(|col| {
-                    self.row_cur.get(usize::from(col)).copied().unwrap_or(' ')
-                        == run.glyphs[usize::from(col - run.col0)]
-                })
-        });
+            {
+                let mut ok = true;
+                let mut col = run.col0;
+                while col < col0 {
+                    if self.row_cur.get(usize::from(col)).copied().unwrap_or(' ')
+                        != run.glyphs[usize::from(col - run.col0)]
+                    {
+                        ok = false;
+                        break;
+                    }
+                    col += 1;
+                }
+                ok
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let mut origin = None;
         if joined && let Some(run) = old {
             let (standing, first) = self.typed_run_standing(row, run.col0, col0, now);
-            origin = first.map(|(_, o)| o).or(run.origin);
+            origin = match first {
+                Some((_, o)) => Some(o),
+                None => run.origin,
+            };
             let standing = &standing[..usize::from(run.len)];
-            let missing = standing.contains(&false)
-                && standing.iter().enumerate().any(|(index, &stands)| {
-                    !stands
+            let mut missing = false;
+            if standing.contains(&false) {
+                let mut index = 0;
+                while index < standing.len() {
+                    if !standing[index]
                         && !self.v2.returning_partial_cell(
                             row,
                             run.col0.saturating_add(index as u16),
                             &self.row_cur,
                             now,
                         )
-                });
+                    {
+                        missing = true;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
             if missing {
                 self.v2.on_event(
                     rk::Event::Sweep {
@@ -1997,7 +2173,10 @@ impl CursorGlow {
         let mut standing = [false; RECENT_TYPED_RUN_CAP];
         let mut first: Option<(u16, rk::ribbon::RunOrigin)> = None;
         let cohorts = ribbon.cohorts();
-        let first_cohort = cohorts.first().map_or(0, |coh| coh.id);
+        let first_cohort = match cohorts.first() {
+            Some(coh) => coh.id,
+            None => 0,
+        };
         let mut cached_coh: Option<(u32, Option<(&rk::ribbon::Cohort, bool)>)> = None;
         for cell in ribbon.cells() {
             if cell.row != row
@@ -2011,13 +2190,15 @@ impl CursorGlow {
                 Some((id, entry)) if id == cell.cohort => entry,
                 _ => {
                     let id_offset = cell.cohort.wrapping_sub(first_cohort);
-                    let entry = cohorts
+                    let entry = match cohorts
                         .binary_search_by_key(&id_offset, |coh| coh.id.wrapping_sub(first_cohort))
-                        .ok()
-                        .map(|idx| {
+                    {
+                        Ok(idx) => {
                             let coh = &cohorts[idx];
-                            (coh, coh.leaving_at(now))
-                        });
+                            Some((coh, coh.leaving_at(now)))
+                        }
+                        Err(_) => None,
+                    };
                     cached_coh = Some((cell.cohort, entry));
                     entry
                 }
@@ -2033,7 +2214,11 @@ impl CursorGlow {
                 && let Some(slot) = standing.get_mut(usize::from(cell.col - col0))
             {
                 *slot = true;
-                if first.is_none_or(|(c, _)| cell.col < c) {
+                let replace = match first {
+                    Some((c, _)) => cell.col < c,
+                    None => true,
+                };
+                if replace {
                     first = Some((cell.col, rk::ribbon::RunOrigin::of(coh)));
                 }
             }
@@ -2165,9 +2350,10 @@ impl CursorGlow {
                 && mv.typed_hinted
                 && cr == pr
                 && pc.checked_add(1) == Some(cc)
-                && let Some(at_probe) = self.row_cur_meta.filter(|m| m.row == cr).map(|m| m.at)
+                && let Some(m) = self.row_cur_meta
+                && m.row == cr
             {
-                self.remember_exact_first_cell(cr, cc - 1, at_probe);
+                self.remember_exact_first_cell(cr, cc - 1, m.at);
             }
         }
         if mv.typing && mv.shape_wrap && mv.fold_laid > 0 && !soft_wrap_paid {
@@ -2298,9 +2484,14 @@ impl CursorGlow {
         let insert = match lane {
             SpawnLane::Visible => self.visible_insert_echo(pr, pc, cr, cc, now, cfg),
             SpawnLane::Anchored { insert_ok } => {
-                self.insert_echo(pr, pc, cr, cc, now, cfg).filter(|ins| {
-                    insert_ok && !self.fresher_class_owns_hop(usize::from(cc - pc), *ins, now)
-                })
+                if insert_ok
+                    && let Some(ins) = self.insert_echo(pr, pc, cr, cc, now, cfg)
+                    && !self.fresher_class_owns_hop(usize::from(cc - pc), ins, now)
+                {
+                    Some(ins)
+                } else {
+                    None
+                }
             }
         };
         if let Some(ins) = insert {
@@ -2311,9 +2502,11 @@ impl CursorGlow {
             self.retract_insert(cr, cc, cells, now);
             return true;
         }
-        let exact_run = (call == SpawnCall::Live && lane == SpawnLane::Visible)
-            .then(|| self.exact_repaint_run((pr, pc), (cr, cc), now, cfg))
-            .flatten();
+        let exact_run = if call == SpawnCall::Live && lane == SpawnLane::Visible {
+            self.exact_repaint_run((pr, pc), (cr, cc), now, cfg)
+        } else {
+            None
+        };
         let park = exact_run.is_none()
             && call == SpawnCall::Live
             && lane == SpawnLane::Visible
@@ -2358,10 +2551,11 @@ impl CursorGlow {
         let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, lane, call, exact_run);
         let parked_redisplay = self.v2.engaged()
             && lane == SpawnLane::Visible
-            && self
-                .unowned_caret
-                .is_some_and(|caret| caret.parked && caret.row == cr)
-            && self.hand_row.is_none_or(|hand| hand.row != cr)
+            && matches!(
+                self.unowned_caret,
+                Some(caret) if caret.parked && caret.row == cr
+            )
+            && !matches!(self.hand_row, Some(hand) if hand.row == cr)
             && exact_run.is_none()
             && (mv.typed_hinted || mv.in_flight_licence);
         if mv.landing_foreign || parked_redisplay {
@@ -2468,9 +2662,11 @@ impl CursorGlow {
             && matches!(cfg.style, GlowStyle::Phaser | GlowStyle::Beam)
             && gap <= Self::PHASER_CHAIN_GAP_MAX
         {
-            for s in self.sparks.iter_mut().filter(|s| s.typing) {
-                let age = now.saturating_duration_since(s.born).as_secs_f32();
-                s.life = s.life.min(age + spark_life);
+            for s in &mut self.sparks {
+                if s.typing {
+                    let age = now.saturating_duration_since(s.born).as_secs_f32();
+                    s.life = s.life.min(age + spark_life);
+                }
             }
         }
         let fire_meteor =
@@ -2575,9 +2771,10 @@ impl CursorGlow {
         const PHASER_CHAIN_GAP_MAX_DUR: Duration = Duration::from_nanos(
             (CursorGlow::PHASER_CHAIN_GAP_MAX as f64 * 1_000_000_000.0).round() as u64,
         );
-        let wrap_echo_rhythm = self
-            .last_type
-            .is_some_and(|t| now.saturating_duration_since(t) <= PHASER_CHAIN_GAP_MAX_DUR);
+        let wrap_echo_rhythm = match self.last_type {
+            Some(t) => now.saturating_duration_since(t) <= PHASER_CHAIN_GAP_MAX_DUR,
+            None => false,
+        };
         let (pane_col0, pane_cols) = self.pane_span(geom);
         let fresh_stamp = self.type_hint.peek_fresh(now, TYPE_HINT_FRESH_DUR);
         let mut typed_at = fresh_stamp;
@@ -2590,9 +2787,11 @@ impl CursorGlow {
             in_flight_licence = typed_at.is_some();
         }
         let tight_fold = self.fold_shape(pr, pc, cr, cc, geom);
-        let coalesced_fold = self
-            .coalesced_fold_shape(pr, pc, cr, cc, now, geom)
-            .filter(|_| wrap_echo_rhythm || in_flight_licence);
+        let coalesced_fold = if wrap_echo_rhythm || in_flight_licence {
+            self.coalesced_fold_shape(pr, pc, cr, cc, now, geom)
+        } else {
+            None
+        };
         let shape_wrap = tight_fold.is_some() || coalesced_fold.is_some();
         let fold_cells = tight_fold.or(coalesced_fold);
         let typed_pair = typed_at.is_some();
@@ -2636,9 +2835,12 @@ impl CursorGlow {
             && dc_abs as usize <= Self::RAINBOW_TYPED_SWEEP_MAX;
         let typed_over_cap = typed_fwd && dc_abs as usize > Self::RAINBOW_TYPED_SWEEP_MAX;
         let older_batch = rainbow_coalesce
-            && fresh_stamp.is_some_and(|stamp| {
-                self.type_press_ring.cells_where(now, |t| t < stamp) >= dc_abs as usize
-            });
+            && match fresh_stamp {
+                Some(stamp) => {
+                    self.type_press_ring.cells_where(now, |t| t < stamp) >= dc_abs as usize
+                }
+                None => false,
+            };
         let typed_at = if older_batch {
             self.type_press_ring.oldest_unpaid(now).or(typed_at)
         } else {
@@ -2668,22 +2870,33 @@ impl CursorGlow {
             (None, None) => Some((cr, cc)),
         };
         let witness = match call {
-            SpawnCall::Live => {
-                laid_cell_end.and_then(|(row, end)| self.probe_glyph_before(row, end, now))
+            SpawnCall::Live => match laid_cell_end {
+                Some((row, end)) => self.probe_glyph_before(row, end, now),
+                None => None,
+            },
+            SpawnCall::FlushedPark { landing_cell, .. } => {
+                if laid_cell_end == Some((cr, cc))
+                    && let Some(g) = landing_cell
+                    && g != ' '
+                    && g != '\0'
+                {
+                    Some(g)
+                } else {
+                    None
+                }
             }
-            SpawnCall::FlushedPark { landing_cell, .. } => laid_cell_end
-                .filter(|&cell| cell == (cr, cc))
-                .and(landing_cell)
-                .filter(|&g| g != ' ' && g != '\0'),
         };
         let landing_foreign = re_anchor_landing
             && lane == SpawnLane::Visible
-            && witness.is_some_and(|g| self.type_press_ring.foreign_to_live(now, g) == Some(true));
+            && match witness {
+                Some(g) => self.type_press_ring.foreign_to_live(now, g) == Some(true),
+                None => false,
+            };
         let re_anchor_lays_landing = re_anchor_landing && !landing_foreign;
         if landing_foreign {
             self.forget_typed_credits(now);
         }
-        let soft_wrap = soft_wrap.filter(|_| !landing_foreign);
+        let soft_wrap = if landing_foreign { None } else { soft_wrap };
         let mut fold_laid = 0;
         if let Some(run) = exact_typed_run {
             self.type_press_ring.retire_before_slot(run.slot);

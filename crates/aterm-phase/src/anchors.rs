@@ -1433,124 +1433,6 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     ),
 ];
 
-/// Every string aterm guards on in Gemini CLI's screen.
-pub const GEMINI_ANCHORS: &[Anchor] = &[
-    lit("gemini.banner", "Gemini CLI", "0.46.0"),
-    lit("gemini.status.shortcuts", "? for shortcuts", "0.46.0"),
-    lit("gemini.status.cancel", "(esc to cancel, ", "0.46.0"),
-    lit(
-        "gemini.status.details",
-        "press tab twice for more",
-        "0.46.0",
-    ),
-    lit("gemini.mode.yolo", "YOLO", "0.46.0"),
-    lit("gemini.mode.auto_edit", "auto edit", "0.46.0"),
-    lit("gemini.mode.plan", "plan", "0.46.0"),
-    lit(
-        "gemini.composer.placeholder",
-        "Type your message or @path/to/file",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.footer.workspace",
-        "workspace (/directory)",
-        "0.46.0",
-    ),
-    lit("gemini.footer.model", "/model", "0.46.0"),
-    lit("gemini.banner.auth", "Authenticated with ", "0.46.0"),
-    lit("gemini.banner.google", "Signed in with Google", "0.46.0"),
-    lit("gemini.banner.auth.tail", " /auth", "0.46.0"),
-    lit("gemini.turn.cancelled", "Request cancelled.", "0.46.0"),
-    lit("gemini.error.api", "[API Error:", "0.46.0"),
-    lit(
-        "gemini.error.unknown",
-        "An unknown error occurred.",
-        "0.46.0",
-    ),
-    lit("gemini.error.failed", "This request failed", "0.46.0"),
-    lit("gemini.box.exec.ask", "Allow execution of", "0.46.0"),
-    lit("gemini.box.redirection", "Redirection detected.", "0.46.0"),
-    lit("gemini.box.change.ask", "Apply this change?", "0.46.0"),
-    lit("gemini.box.writing", "Writing to ", "0.46.0"),
-    lit("gemini.box.once", "Allow once", "0.46.0"),
-    lit("gemini.box.session", "Allow for this session", "0.46.0"),
-    lit("gemini.box.session.tail", "for this session", "0.46.0"),
-    lit("gemini.box.action", "Action Required", "0.46.0"),
-    lit("gemini.box.proceed", "Do you want to proceed?", "0.46.0"),
-    lit("gemini.box.expansion.head", "To run", "0.46.0"),
-    lit(
-        "gemini.box.expansion.ask",
-        ", allow access to the following?",
-        "0.46.0",
-    ),
-    lit("gemini.box.saved", "all future sessions", "0.46.0"),
-    lit("gemini.box.editor", "Modify with external editor", "0.46.0"),
-    lit("gemini.box.deny", "No, suggest changes (esc)", "0.46.0"),
-    lit("gemini.question.title", "Answer Questions", "0.46.0"),
-    lit("gemini.question.custom", "Enter a custom value", "0.46.0"),
-    hint("gemini.question.keys", "Enter to select", "0.46.0"),
-    lit("gemini.question.review", "Review your answers:", "0.46.0"),
-    hint("gemini.question.submit", "Enter to submit", "0.46.0"),
-    lit("gemini.usage.title", "Usage limit reached for", "0.46.0"),
-    lit("gemini.usage.retry", "Keep trying", "0.46.0"),
-    composed("gemini.usage.switch", "Switch to ", "0.46.0"),
-    lit(
-        "gemini.usage.upgrade",
-        "Upgrade for higher limits",
-        "0.46.0",
-    ),
-    lit("gemini.usage.resets", "Access resets at ", "0.46.0"),
-    composed("gemini.queued", "Queued (press ↑ to edit):", "0.46.0"),
-    lit(
-        "gemini.fallback.no_access",
-        "It seems like you don't have access to ",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.fallback.not_found",
-        "was not found or is invalid.",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.fallback.demand",
-        "We are currently experiencing high demand.",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.notice.still_trusted",
-        "Note: This folder is still trusted because",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.notice.untrusted",
-        "This folder is untrusted, project settings, hooks, MCPs, and GEMINI.md files will not be applied for this folder.",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.notice.agents_skipped",
-        "Skipping project agents due to untrusted folder.",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.trust.title",
-        "Do you trust the files in this folder?",
-        "0.46.0",
-    ),
-    lit("gemini.trust.folder", "Trust folder (", "0.46.0"),
-    lit("gemini.trust.parent", "Trust parent folder (", "0.46.0"),
-    lit("gemini.trust.no", "Don't trust", "0.46.0"),
-    lit(
-        "gemini.exit.farewell",
-        "Agent powering down. Goodbye!",
-        "0.46.0",
-    ),
-    lit(
-        "gemini.exit.resume",
-        "To resume this session: gemini --resume",
-        "0.46.0",
-    ),
-];
-
 /// Every string aterm guards on in Grok Build's screen ([`crate::grok`]): the sign-in screen as
 /// 1.0.70 drew it, the limit and login texts as 1.0.67's and 1.0.70's binaries carry them, and
 /// the team's API rate limit, the `API error (status ` its sampler's limit texts sit after, the
@@ -1868,7 +1750,6 @@ pub fn anchor(id: &str) -> &'static str {
         .iter()
         .chain(AGY_ANCHORS)
         .chain(MUSE_ANCHORS)
-        .chain(GEMINI_ANCHORS)
         .chain(GROK_ANCHORS)
         .chain(KIMI_ANCHORS)
         .chain(TRANSCRIPT_KEYS)
@@ -1926,13 +1807,6 @@ pub const fn anchor_text(id: &str) -> &'static str {
     while i < MUSE_ANCHORS.len() {
         if same(MUSE_ANCHORS[i].id, id) {
             return MUSE_ANCHORS[i].text;
-        }
-        i += 1;
-    }
-    let mut i = 0;
-    while i < GEMINI_ANCHORS.len() {
-        if same(GEMINI_ANCHORS[i].id, id) {
-            return GEMINI_ANCHORS[i].text;
         }
         i += 1;
     }
@@ -2099,7 +1973,6 @@ mod tests {
             .iter()
             .chain(AGY_ANCHORS)
             .chain(MUSE_ANCHORS)
-            .chain(GEMINI_ANCHORS)
             .chain(GROK_ANCHORS)
             .chain(KIMI_ANCHORS)
             .chain(TRANSCRIPT_KEYS)
@@ -2477,37 +2350,5 @@ mod tests {
     #[should_panic(expected = "a slot touches an identifier's char")]
     fn a_word_glued_before_a_slot_is_refused() {
         holds(b"let sa=1", &format!("let s{JS_NAME}=1"));
-    }
-
-    /// The bundle finder on a stand-in package: the version its
-    /// `package.json` names and every `.js` file of the script's directory,
-    /// found through a link.
-    #[cfg(unix)]
-    #[test]
-    fn the_gemini_canary_reads_the_bundle_its_script_resolves_into() {
-        let root = aterm_tempfile::TempDir::new().expect("a private Gemini bundle");
-        let root = root.path();
-        let bundle = root.join("lib/node_modules/@google/gemini-cli/bundle");
-        std::fs::create_dir_all(&bundle).expect("a bundle directory");
-        std::fs::write(bundle.join("gemini.js"), b"import './chunk-A.js';").expect("a script");
-        std::fs::write(bundle.join("chunk-A.js"), b"Allow once").expect("a chunk");
-        std::fs::write(bundle.join("notes.txt"), b"Keep trying").expect("a file");
-        let package = bundle.parent().expect("the package").join("package.json");
-        std::fs::write(
-            &package,
-            b"{\n  \"name\": \"@google/gemini-cli\",\n  \"version\": \"0.46.0\"\n}",
-        )
-        .expect("a package.json");
-        std::fs::create_dir_all(root.join("bin")).expect("a bin directory");
-        let link = root.join("bin/gemini");
-        std::os::unix::fs::symlink(bundle.join("gemini.js"), &link).expect("a link");
-        let (_, bytes, version) = gemini_bundle(&link).expect("the bundle");
-        assert_eq!(version.as_deref(), Some("0.46.0"));
-        assert!(contains(&bytes, "Allow once") && contains(&bytes, "chunk-A.js"));
-        assert!(!contains(&bytes, "Keep trying"), "only its .js files");
-        std::fs::write(&package, b"{\"name\": \"another-gemini\"}").expect("a package.json");
-        assert!(gemini_bundle(&link).is_none(), "another package");
-        std::fs::remove_file(&package).expect("removed");
-        assert!(gemini_bundle(&link).is_none(), "no package");
     }
 }

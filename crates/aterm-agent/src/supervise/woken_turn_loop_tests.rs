@@ -84,13 +84,20 @@ impl IdleHost for WokeHost {
     }
 }
 
-/// One run: a busy turn, the Mac sleeping as the retry row is first read, the row held until a
-/// key and the screens after it.
+/// One run: a busy turn, the Mac sleeping as the retry row is first read (or as it is read a
+/// second time), the row held until a key and the screens after it.
 #[derive(Clone)]
 struct Case {
     retry: Vec<String>,
+    /// A busy read showed the retry row before the Mac slept: the sleep comes at a later read.
+    seen_before_the_sleep: bool,
+    /// What the first reads after the wake show before the retry row stands again.
+    after_the_wake: Vec<Vec<String>>,
     /// The retry row stands until a key: a press takes it away.
     held: bool,
+    /// The server's replies to the first keys, in order (`OK skipped …`); the row then stands
+    /// until one more key past them.
+    replies: Vec<&'static str>,
     after: Vec<Vec<String>>,
     /// The first screen after the key stands until the loop types a turn.
     after_turn: bool,
@@ -110,7 +117,10 @@ impl Case {
     fn on(retry: Vec<String>) -> Self {
         Self {
             retry,
+            seen_before_the_sleep: false,
+            after_the_wake: Vec::new(),
             held: true,
+            replies: Vec::new(),
             after: vec![busy_screen(), ended(STOP)],
             after_turn: false,
             slept_s: SLEPT_S,
@@ -154,16 +164,33 @@ impl Woke {
 fn woken_run(tag: &str, case: Case) -> Woke {
     let (dir, path) = journal_file(&format!("te-woken-{tag}"));
     let mut screens = vec![busy_screen(), case.retry.clone()];
+    if case.seen_before_the_sleep {
+        // Busy reads of the row before the sleep (a read can serve a screen the busy branch never
+        // sees, so more than one).
+        screens.extend([case.retry.clone(), case.retry.clone()]);
+    }
+    let mut slept_at = screens.len() - 1;
+    if !case.after_the_wake.is_empty() {
+        slept_at += 1;
+        screens.extend(case.after_the_wake.iter().cloned());
+        screens.push(case.retry.clone());
+    }
+    let at = screens.len() - 1;
     screens.extend(case.after.iter().cloned());
     let mut m = Mock::new(screens);
-    if case.held {
-        m.key_releases = Some(1);
+    if !case.replies.is_empty() {
+        m.key_gates.push((at, case.replies.len()));
+        for reply in &case.replies {
+            m.key_replies.push_back(ok(reply));
+        }
+    } else if case.held {
+        m.key_releases = Some(at);
     }
     if case.after_turn {
-        m.turn_releases = Some(2);
+        m.turn_releases = Some(at + 1);
     }
     if case.slept_s > 0 {
-        m.sleeps_at.insert(1, case.slept_s);
+        m.sleeps_at.insert(slept_at, case.slept_s);
     }
     m.human_seq = case.human_seq;
     m.cell_attrs = case.cell_attrs;
@@ -443,28 +470,228 @@ fn the_vendors_own_waits_and_a_short_countdown_are_pressed_nothing() {
     assert_eq!(w.escs.len(), 1, "the control, 5 s: {:#?}", w.lines);
 }
 
+/// Claude Code 2.1.310's no-response retry row: the failed try's window, then the retry's.
+const NO_RESPONSE: &str = "✻ No response from the API after 3m · retrying once, waiting up to 10m";
+
+/// Claude Code 2.1.310's screens as the lab measured them (2026-10-24), each with a message
+/// queued behind the retry row.
+fn measured_2_1_310(text: &str) -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(text)
+}
+
+/// A no-response row names the failed try's window, never when the retry in flight went out:
+/// the one that stood at the last busy read before the Mac slept crossed the sleep, and is cut
+/// once the API is measured up since the wake for the margin. Measured: the row with the hint
+/// the vendor wraps under it.
 #[test]
-fn a_try_that_went_out_after_the_api_came_up_is_not_cut_short() {
-    let old = queued_with(
-        "✻ No response from the API after 1m 5s · retrying, waiting up to 3m · attempt 2/10",
-    );
-    assert_eq!(worker_phase(&old), Phase::Busy, "PRECONDITION");
-    let w = woken_run("no-response-old", Case::on(old));
+fn a_no_response_try_that_crossed_the_sleep_is_cut_once_the_api_is_up() {
+    use aterm_phase::prompt::fixtures::API_NO_RESPONSE_QUEUED_2_1_310;
+    let rows = measured_2_1_310(API_NO_RESPONSE_QUEUED_2_1_310);
+    assert_eq!(worker_phase(&rows), Phase::Busy, "PRECONDITION");
+    let row = aterm_phase::api_retry_row(&rows).expect("PRECONDITION: the retry row");
     assert_eq!(
-        w.escs.len(),
-        1,
-        "65 s waited, sent before the API came up: {:#?}",
-        w.lines
+        (row.cause, row.failed_wait_s),
+        (aterm_phase::RetryCause::NoResponse, Some(13)),
+        "PRECONDITION"
     );
-    let young = queued_with(
-        "✻ No response from the API after 8s · retrying, waiting up to 3m · attempt 2/10",
-    );
-    let w = woken_run("no-response-young", Case::on(young));
     assert!(
-        w.escs.is_empty(),
-        "8 s waited, sent since the API came up: {:#?}",
+        rows[row.row + 1].contains("A proxy or gateway that buffers"),
+        "PRECONDITION: the vendor's hint under the row"
+    );
+    let matcher = aterm_observe::row_matcher(&row.guard).expect("the server compiles the guard");
+    assert!(matcher.matches(&rows[row.row]), "the guard holds its row");
+    assert!(
+        matcher.matches(&rows[row.row].replacen('✻', "✢", 1)),
+        "whatever the spinner shows"
+    );
+    for later in [
+        "✻ No response from the API after 13s · retrying, waiting up to 10m · attempt 2/3",
+        "✻ No response from the API after 10m · retrying once, waiting up to 10m",
+    ] {
+        assert!(!matcher.matches(later), "never a later try's row: {later}");
+    }
+    let w = woken_run(
+        "no-response-crossed",
+        Case {
+            seen_before_the_sleep: true,
+            ..Case::on(rows)
+        },
+    );
+    assert_eq!(
+        w.escs.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+        [format!("key if-human=0 if={} esc", row.guard)],
+        "{:#?}",
         w.lines
     );
+    let since = w.host.since().expect("the host was asked after the wake");
+    assert!(
+        w.escs[0].1.saturating_duration_since(since) >= WOKEN_MARGIN,
+        "no Esc inside the margin"
+    );
+    assert_eq!(w.unstuck().len(), 1, "{:#?}", w.lines);
+    assert!(
+        w.unstuck()[0].contains("crossed the sleep"),
+        "{:#?}",
+        w.unstuck()
+    );
+    // The row gone from a read after the wake, then drawn the same again: a later try's.
+    for (tag, between) in [
+        ("streaming", busy_screen()),
+        (
+            "counting-down",
+            queued_with(
+                "✻ Stream watchdog detected system suspend; aborting to retry on a fresh \
+                 connection · Retrying in 2s · attempt 1/10",
+            ),
+        ),
+    ] {
+        let w = woken_run(
+            &format!("no-response-crossed-then-{tag}"),
+            Case {
+                seen_before_the_sleep: true,
+                after_the_wake: vec![between.clone(), between],
+                ..Case::on(queued_with(NO_RESPONSE))
+            },
+        );
+        assert!(
+            w.escs.is_empty(),
+            "{tag}: the row drawn again after the wake is no try that crossed the sleep: {:#?}",
+            w.lines
+        );
+    }
+}
+
+/// The retry a no-response row names, first read since the wake, may be one sent once the
+/// network came back and waiting on a gateway that buffers its stream, which the vendor's longer
+/// wait is for: it is left to the vendor, past the failed try's whole window with the API up,
+/// and with the API down no note promises it an Esc, while the same row read before the sleep is
+/// cut.
+#[test]
+fn a_no_response_retry_first_read_since_the_wake_is_left_to_the_vendors_wait() {
+    let down = |tag: &str, seen_before_the_sleep: bool| {
+        let w = woken_run(
+            tag,
+            Case {
+                net: Net::Down,
+                seen_before_the_sleep,
+                ..Case::on(queued_with(NO_RESPONSE))
+            },
+        );
+        (w.escs.len(), w.waiting().len(), w.lines)
+    };
+    let (escs, waiting, lines) = down("no-response-crossed-down", true);
+    assert_eq!(
+        (escs, waiting),
+        (0, 1),
+        "the control, the API down: one note: {lines:#?}"
+    );
+    let (escs, waiting, lines) = down("no-response-since-the-wake-down", false);
+    assert_eq!(
+        (escs, waiting),
+        (0, 0),
+        "a row first read since the wake is promised nothing: {lines:#?}"
+    );
+    for window in ["10s", "30s", "3m"] {
+        let row =
+            format!("✻ No response from the API after {window} · retrying once, waiting up to 10m");
+        let w = woken_run(
+            &format!("no-response-since-the-wake-{window}"),
+            Case {
+                max_s: 240,
+                ..Case::on(queued_with(&row))
+            },
+        );
+        assert!(
+            w.escs.is_empty(),
+            "{window}: the API up for four minutes: {:#?}",
+            w.lines
+        );
+        let control = woken_run(
+            &format!("no-response-crossed-{window}"),
+            Case {
+                seen_before_the_sleep: true,
+                max_s: 240,
+                ..Case::on(queued_with(&row))
+            },
+        );
+        assert_eq!(
+            control.escs.len(),
+            1,
+            "{window}: the control, the same try across the sleep: {:#?}",
+            control.lines
+        );
+        let since = control
+            .host
+            .since()
+            .expect("the control asked after the wake");
+        assert!(
+            control.escs[0].1.saturating_duration_since(since) >= WOKEN_MARGIN,
+            "{window}: the control waited out the margin"
+        );
+    }
+}
+
+/// Claude Code 2.1.310's network retry rows as the lab measured them, each with a message
+/// queued: every lead class is pressed once the API is up since the wake.
+#[test]
+fn claude_code_2_1_310s_measured_network_retry_rows_are_pressed() {
+    use aterm_phase::prompt::fixtures::{
+        API_DROPPED_QUEUED_2_1_310, API_ROUTE_QUEUED_2_1_310, API_STALLED_QUEUED_2_1_310,
+        API_UNREACHABLE_QUEUED_2_1_310,
+    };
+    for (tag, text) in [
+        ("unreachable", API_UNREACHABLE_QUEUED_2_1_310),
+        ("dropped", API_DROPPED_QUEUED_2_1_310),
+        ("route", API_ROUTE_QUEUED_2_1_310),
+        ("stalled", API_STALLED_QUEUED_2_1_310),
+    ] {
+        let rows = measured_2_1_310(text);
+        let row = aterm_phase::api_retry_row(&rows).expect("PRECONDITION: the retry row");
+        let matcher = aterm_observe::row_matcher(&row.guard).expect("the guard compiles");
+        assert!(
+            matcher.matches(&rows[row.row]),
+            "{tag}: the guard holds its row"
+        );
+        let w = woken_run(&format!("measured-{tag}"), Case::on(rows));
+        assert_eq!(
+            w.escs.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+            [format!("key if-human=0 if={} esc", row.guard)],
+            "{tag}: {:#?}",
+            w.lines
+        );
+        assert_eq!(w.unstuck().len(), 1, "{tag}: {:#?}", w.lines);
+    }
+}
+
+/// Only a press the server took spends the wake's one Esc: a skipped one (the row moved under
+/// the guard) or a yielded one (a person's key since the read) is pressed again at a later read.
+#[test]
+fn a_skipped_or_yielded_press_leaves_the_wakes_esc_for_a_later_read() {
+    let control = woken_run("taken", Case::on(queued()));
+    assert_eq!(
+        (control.escs.len(), control.unstuck().len()),
+        (1, 1),
+        "the control, taken at once: {:#?}",
+        control.lines
+    );
+    for (tag, reply) in [
+        ("skipped", "OK skipped seq=7\n"),
+        ("yielded", "OK skipped reason=person seq=7\n"),
+    ] {
+        let w = woken_run(
+            tag,
+            Case {
+                replies: vec![reply],
+                ..Case::on(queued())
+            },
+        );
+        assert_eq!(
+            (w.escs.len(), w.unstuck().len()),
+            (2, 1),
+            "{tag}: the next read presses again, and only the taken press is said: {:#?}",
+            w.lines
+        );
+    }
 }
 
 #[test]
@@ -594,7 +821,7 @@ fn only_claude_codes_retry_row_is_pressed() {
         clock.skip(WOKEN_MARGIN);
         s.unstick_woken_turn(&screen, reader, &opts, &mut heard)
             .expect("the read past the margin");
-        let pressed = s.woken.is_some_and(|w| w.pressed());
+        let pressed = s.woken.as_ref().is_some_and(|w| w.pressed());
         let stands = s.turn_end.woken_esc_stands();
         drop(s);
         (m.presses().len(), pressed, stands, heard.said)
@@ -611,7 +838,6 @@ fn only_claude_codes_retry_row_is_pressed() {
         Program::Kimi,
         Program::Agy,
         Program::Muse,
-        Program::Gemini,
         Program::Generic,
     ] {
         let (presses, pressed, stands, said) = press(program.reader());

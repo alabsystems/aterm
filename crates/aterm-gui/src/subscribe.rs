@@ -954,6 +954,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             let t = crate::term_lock(&watch.term);
             if !watch.closing && crate::frame_unfinished_now(&t) {
                 watch.pace.frame = t.frame_hang_deadline();
+                watch.pace.content.settle(false);
                 break 'content;
             }
             watch.pace.frame = None;
@@ -1031,6 +1032,10 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             out.push_str(&frame_cursor(sid, seq, cr, cc, cv, cs));
             watch.last_cursor = cur;
         }
+        watch
+            .pace
+            .content
+            .settle(!out.is_empty() || cells_payload.is_some());
         let segs = match cells_payload {
             Some(frame) => Vec::from(frame_cells(sid, seq, frame, &mut out)),
             None if out.is_empty() => Vec::new(),
@@ -1320,7 +1325,7 @@ pub(crate) fn await_roster_written(store: &Store, seq: u64, within: Duration) ->
 
 const LIVENESS: Duration = Duration::from_millis(250);
 
-/// The least time between two content reads (`screen`, `cursor`, `cells`) that wakes drive on one watch.
+/// The least time after a content read (`screen`, `cursor`, `cells`) that pushed something before the next one a wake drives on the same watch; a read that pushed nothing opens no window ([`ReadPace::settle`]).
 pub(crate) const CONTENT_PACE: Duration = Duration::from_millis(16);
 
 /// The least time between two `events` reads that the PTY reader's wakes drive on one watch.
@@ -1348,6 +1353,8 @@ impl Paces {
 pub(crate) struct ReadPace {
     read_at: Option<Instant>,
     owed: bool,
+    /// The window the read [`Self::visit`] just made replaced, until [`Self::settle`] says whether that read found anything.
+    replaced: Option<Option<Instant>>,
 }
 
 impl ReadPace {
@@ -1361,13 +1368,23 @@ impl ReadPace {
             return None;
         }
         self.owed = false;
-        self.read_at = Some(now);
+        self.replaced = Some(self.read_at.replace(now));
         Some(true)
+    }
+
+    /// Settles the read [`Self::visit`] just made: one that pushed something keeps the window it opened; one that pushed nothing hands it back, so a change a moment after an empty read (a keystroke's echo after a ring that moved nothing) is read at its own ring instead of at the end of a window nothing was pushed in. A read with nothing to settle is left as it is.
+    pub(crate) fn settle(&mut self, pushed: bool) {
+        if let Some(replaced) = self.replaced.take()
+            && !pushed
+        {
+            self.read_at = replaced;
+        }
     }
 
     /// The read at `now` that a record drove ([`EVENTS_PACE`]): made whatever the window, and covering any read owed, since it reads the latest state.
     pub(crate) const fn read_now(&mut self, now: Instant) {
         self.owed = false;
+        self.replaced = None;
         self.read_at = Some(now);
     }
 
@@ -4671,6 +4688,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_read_that_pushes_nothing_opens_no_window() {
+        let term = Arc::new(Mutex::new(Terminal::new(2, 16)));
+        crate::term_lock(&term).process(b"$ ");
+        let streams = TargetStreams {
+            screen: true,
+            cursor: true,
+            ..Default::default()
+        };
+        let mut w = watch_on(1, &term);
+        let pass = |w: &mut Watch, at: Instant| {
+            pass_streams(streams, &mut w.pace, true, false, at)
+                .map(|visit| wake_text(w, visit, true))
+        };
+        let t0 = Instant::now();
+        assert!(
+            pass(&mut w, t0).is_some_and(|f| f.contains(" screen ")),
+            "the catch-up"
+        );
+        let quiet = t0 + CONTENT_PACE;
+        assert_eq!(
+            pass(&mut w, quiet).as_deref(),
+            Some(""),
+            "a ring that moved nothing reads and pushes nothing"
+        );
+        crate::term_lock(&term).process(b"x");
+        let echo = quiet + Duration::from_millis(1);
+        let got = pass(&mut w, echo);
+        assert!(
+            got.as_deref().is_some_and(|f| f.contains("$ x")),
+            "the echo a millisecond after the empty read is read at its own ring: {got:?}"
+        );
+        crate::term_lock(&term).process(b"y");
+        assert_eq!(
+            pass(&mut w, echo + Duration::from_millis(1)),
+            None,
+            "a read that pushed still opens the window"
+        );
+        assert!(
+            pass(&mut w, echo + CONTENT_PACE).is_some_and(|f| f.contains("$ xy")),
+            "and the read it owes lands at the window's end"
+        );
+    }
+
+    #[test]
+    fn a_frame_finished_after_a_put_off_read_is_read_at_its_ring() {
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        crate::term_lock(&term).process(b"\x1b[?2026h\x1b[H\x1b[2Jhalf");
+        let screen = TargetStreams {
+            screen: true,
+            ..Default::default()
+        };
+        let mut w = watch_on(1, &term);
+        let t0 = Instant::now();
+        assert_eq!(
+            pass_streams(screen, &mut w.pace, true, false, t0),
+            Some(screen)
+        );
+        assert!(
+            frames_for_watch(&mut w, screen, true).is_empty(),
+            "half a frame is not pushed"
+        );
+        crate::term_lock(&term).process(b" full\x1b[?2026l");
+        let end = t0 + Duration::from_millis(1);
+        assert_eq!(
+            pass_streams(screen, &mut w.pace, true, false, end),
+            Some(screen),
+            "the frame's end is read at its ring, not at the end of a window the put-off read opened"
+        );
+        assert!(wake_text(&mut w, screen, true).contains("half full"));
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct EventsReads {
         at_once: u32,
@@ -6907,6 +6996,7 @@ mod log_stream_tests {
             Some(ProgramState {
                 state: ProgramStateWord::Working,
                 kind: None,
+                app: aterm_core::terminal::program_state::ProgramApp::Codex,
             }),
             1,
         );

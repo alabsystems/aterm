@@ -671,20 +671,6 @@ fn an_agys_limit_under_a_host_is_the_hostless_lanes() {
     }
 }
 
-#[test]
-fn a_gemini_clis_limit_under_a_host_is_the_hostless_lanes() {
-    use aterm_phase::prompt::fixtures::screen;
-    a_limit_is_the_hostless_lanes(
-        "gemini",
-        &Limited {
-            program: None,
-            wall: None,
-            after: screen(aterm_phase::gemini::fixtures::END_OF_TURN),
-            seed: Some(muse_limit()),
-        },
-    );
-}
-
 fn a_build() -> Vec<String> {
     rows(&["$ make", "cc -c parser.c", "cc -c lexer.c"])
 }
@@ -989,26 +975,6 @@ fn agent_limits() -> Vec<AgentLimit> {
     use aterm_phase::agy::fixtures::lab as a;
     use aterm_phase::muse::fixtures as u;
     use aterm_phase::prompt::fixtures::screen;
-    let limit = muse_limit();
-    let reason = approvals::wall_wait_reason(
-        Some(TEST_NOW + LIMITED_RESET_IN),
-        limit.reset.as_deref(),
-        limit.kind,
-        &limit.message,
-    );
-    let gemini_row = Row {
-        rule_id: RULE_WALL_WAIT,
-        outcome: Outcome::Waiting,
-        command: "",
-        reason: &reason,
-        box_seq: 100,
-    }
-    .to_json_wall_wait_by(
-        (TEST_NOW - 60) * 1000,
-        Some("@s-1"),
-        &Conversation::Hostless,
-        Some(Program::Gemini),
-    );
     vec![
         AgentLimit {
             name: "muse",
@@ -1021,12 +987,6 @@ fn agent_limits() -> Vec<AgentLimit> {
             wall: Some(screen(a::ERROR_429_LONG)),
             seed: None,
             own: screen(a::BG_TASK),
-        },
-        AgentLimit {
-            name: "gemini",
-            wall: None,
-            seed: Some(gemini_row),
-            own: screen(aterm_phase::gemini::fixtures::END_OF_TURN),
         },
     ]
 }
@@ -1177,7 +1137,6 @@ fn a_screen_alone_agents_limit_is_no_limit_of_another_screen_alone_agent_after_i
     let idle = [
         ("muse", screen(aterm_phase::muse::fixtures::END_OF_TURN)),
         ("agy", screen(aterm_phase::agy::fixtures::lab::END_OF_TURN)),
-        ("gemini", screen(aterm_phase::gemini::fixtures::END_OF_TURN)),
     ];
     let mut pairs = 0;
     for l in &agent_limits() {
@@ -1204,7 +1163,7 @@ fn a_screen_alone_agents_limit_is_no_limit_of_another_screen_alone_agent_after_i
             }
         }
     }
-    assert_eq!(pairs, 12, "every ordered pair, hosted and hostless");
+    assert_eq!(pairs, 4, "every ordered pair, hosted and hostless");
 }
 
 fn held_points<'a>(
@@ -1261,7 +1220,6 @@ fn claude_codes_unread_limit_holds_no_screen_alone_agent_in_its_tab() {
     for (name, agent) in [
         ("muse", screen(aterm_phase::muse::fixtures::END_OF_TURN)),
         ("agy", screen(aterm_phase::agy::fixtures::lab::END_OF_TURN)),
-        ("gemini", screen(aterm_phase::gemini::fixtures::END_OF_TURN)),
     ] {
         for host in [true, false] {
             let (dir, ledger) = ledger_at(&format!("claude-then-{name}-{host}"));
@@ -1672,12 +1630,6 @@ fn a_hosts_loop_takes_up_a_screen_alone_agents_wall_with_no_churn() {
             Program::Agy,
             agy_limit,
             screen(aterm_phase::agy::fixtures::lab::BG_TASK),
-        ),
-        (
-            "gemini",
-            Program::Gemini,
-            muse_limit(),
-            screen(aterm_phase::gemini::fixtures::END_OF_TURN),
         ),
     ] {
         let named = row(&wall, Some(program));

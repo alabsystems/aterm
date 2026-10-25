@@ -80,16 +80,24 @@ impl DogCameo {
         if DOG_HEADS.is_empty() {
             return;
         }
-        let resident = self.active(now).then_some(self.look).flatten();
+        let resident = if self.active(now) { self.look } else { None };
         let breed = match resident {
             Some(prev) if DOG_HEADS.len() > 1 => {
-                let prev_ix = DOG_HEADS.iter().position(|&b| b == prev.breed).unwrap_or(0);
+                let mut prev_ix = 0;
+                let mut i = 0;
+                while i < DOG_HEADS.len() {
+                    if DOG_HEADS[i] as u8 == prev.breed as u8 {
+                        prev_ix = i;
+                        break;
+                    }
+                    i += 1;
+                }
                 let draw = scale(mix(seed ^ BREED_SALT), DOG_HEADS.len() - 1);
                 DOG_HEADS[if draw >= prev_ix { draw + 1 } else { draw }]
             }
             _ => DOG_HEADS[scale(mix(seed ^ BREED_SALT), DOG_HEADS.len())],
         };
-        let coat = (mix(seed ^ COAT_SALT) % 16) as u8;
+        let coat = (mix(seed ^ COAT_SALT) & 15) as u8;
         self.look = Some(DogLook { breed, coat });
         self.since = Some(now);
     }
@@ -98,8 +106,10 @@ impl DogCameo {
     #[inline]
     #[must_use]
     pub fn active(&self, now: Instant) -> bool {
-        self.since
-            .is_some_and(|at| now.saturating_duration_since(at) < VISIT_LIFE)
+        match self.since {
+            Some(at) => now.saturating_duration_since(at) < VISIT_LIFE,
+            None => false,
+        }
     }
 
     /// The visit's presence envelope (`0..=255`) at `now`.
@@ -130,13 +140,18 @@ impl DogCameo {
         let Some(at) = self.since else {
             return 0.0;
         };
-        let ms = now.saturating_duration_since(at).as_millis() as u64;
+        Self::bob_ms(now.saturating_duration_since(at).as_millis() as u64)
+    }
+
+    #[inline]
+    const fn bob_ms(ms: u64) -> f32 {
         if ms >= HOP_MS * HOPS {
             return 0.0;
         }
         let hop = (ms / HOP_MS) as usize;
         let rem_ms = (ms % HOP_MS) as f32;
-        -HOP_LIFTS[hop] * (rem_ms * HOP_PHASE_RAD_PER_MS).sin()
+        let (sin_p, _) = crate::supernova::sin_cos_f32(rem_ms * HOP_PHASE_RAD_PER_MS);
+        -HOP_LIFTS[hop] * sin_p
     }
 
     /// The current visit's rolled identity (`None` before the first summon).

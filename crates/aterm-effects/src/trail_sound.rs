@@ -432,7 +432,7 @@ const fn pow2i(oct: i32) -> f32 {
 #[inline]
 const fn penta(base: f32, degree: i32) -> f32 {
     let oct = degree.div_euclid(5);
-    let step = degree.rem_euclid(5) as usize;
+    let step = (degree - oct * 5) as usize;
     base * PENTA[step] * pow2i(oct)
 }
 
@@ -1311,10 +1311,11 @@ const PAN_LAW_SCALE: f32 = 0.35;
 const PAN_LAW_CLAMP: f32 = 0.6;
 
 #[inline]
-fn pan_gains(gain: f32, pan: f32) -> (f32, f32) {
+const fn pan_gains(gain: f32, pan: f32) -> (f32, f32) {
     let p = (pan * PAN_LAW_SCALE).clamp(-PAN_LAW_CLAMP, PAN_LAW_CLAMP);
     let a = (p + 1.0) * core::f32::consts::FRAC_PI_4;
-    (gain * a.cos(), gain * core::hint::black_box(a).sin())
+    let (s, c) = crate::supernova::sin_cos_f32(a);
+    (gain * c, gain * s)
 }
 
 const LIMIT_THRESHOLD: f32 = 0.2;
@@ -1580,7 +1581,7 @@ impl TrailSynth {
         let pause = self.since_event;
         const INV_RATE_TAU: f32 = -1.0 / 0.6;
         self.rate = if self.rate > 0.0 && self.since_event > 0.0 {
-            self.rate * (self.since_event * INV_RATE_TAU).exp() + 1.0
+            self.rate * crate::color_math::exp_f32(self.since_event * INV_RATE_TAU) + 1.0
         } else {
             self.rate + 1.0
         };
@@ -1610,7 +1611,7 @@ impl TrailSynth {
             }
         }
 
-        let duck = 1.0 / (1.0 + 0.55 * self.rate).sqrt();
+        let duck = 1.0 / crate::color_math::sqrt_f32(1.0 + 0.55 * self.rate);
         let bypass = matches!(
             ev.kind,
             SoundGesture::Trail(SoundKind::Jump)
@@ -1765,38 +1766,52 @@ impl TrailSynth {
     const fn melody_hz(&self, base: f32, degree: i32) -> f32 {
         let (table, transpose) = tone_tables(self.tone);
         let oct = degree.div_euclid(5);
-        let step = degree.rem_euclid(5) as usize;
+        let step = (degree - oct * 5) as usize;
         base * transpose * table[step] * pow2i(oct)
     }
 
     #[inline]
-    fn claim_lane(&mut self, lane: u8, deferred: bool) -> Option<usize> {
+    const fn all_voices_on(&self) -> bool {
+        let mut i = 0;
+        while i < self.voices.len() {
+            if !self.voices[i].on {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    #[inline]
+    const fn claim_lane(&mut self, lane: u8, deferred: bool) -> Option<usize> {
         if lane == LANE_NONE {
             return Some(self.claim());
         }
         if !deferred && !self.lane_make_room(lane, MAX_VOICES) {
             return None;
         }
-        if lane_drops_the_newcomer(lane) && self.voices.iter().all(|v| v.on) {
+        if lane_drops_the_newcomer(lane) && self.all_voices_on() {
             return None;
         }
         Some(self.claim())
     }
 
-    fn lane_make_room(&mut self, lane: u8, skip: usize) -> bool {
+    const fn lane_make_room(&mut self, lane: u8, skip: usize) -> bool {
         let cap = lane_cap(lane);
         let mut live = 0usize;
         let mut oldest = None;
         let mut oldest_born = u32::MAX;
-        for (i, v) in self.voices.iter().enumerate() {
-            if i == skip || !v.on || v.lane != lane || v.damp > 0.0 || v.t < 0.0 {
-                continue;
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &self.voices[i];
+            if i != skip && v.on && v.lane == lane && v.damp <= 0.0 && v.t >= 0.0 {
+                live += 1;
+                if v.born < oldest_born {
+                    oldest_born = v.born;
+                    oldest = Some(i);
+                }
             }
-            live += 1;
-            if v.born < oldest_born {
-                oldest_born = v.born;
-                oldest = Some(i);
-            }
+            i += 1;
         }
         if live < cap {
             return true;
@@ -1813,16 +1828,18 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn lane_onset_steal(&mut self, vi: usize) -> bool {
+    const fn lane_onset_steal(&mut self, vi: usize) -> bool {
         let lane = self.voices[vi].lane;
         !self.lane_make_room(lane, vi)
     }
 
     #[inline]
-    fn claim(&mut self) -> usize {
+    const fn claim(&mut self) -> usize {
         let mut best = 0;
         let mut best_w = f32::MAX;
-        for (i, v) in self.voices.iter().enumerate() {
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &self.voices[i];
             if !v.on {
                 return i;
             }
@@ -1831,19 +1848,20 @@ impl TrailSynth {
                 best_w = w;
                 best = i;
             }
+            i += 1;
         }
         self.steals = self.steals.saturating_add(1);
         best
     }
 
     #[inline]
-    fn spawn(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<usize> {
+    const fn spawn(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<usize> {
         let tw_ph = self.rnd();
         let ph = [self.rnd(), self.rnd(), self.rnd()];
         self.spawn_seeded(proto, gain, pan, tw_ph, ph)
     }
 
-    fn spawn_seeded(
+    const fn spawn_seeded(
         &mut self,
         proto: Voice,
         gain: f32,
@@ -1851,10 +1869,16 @@ impl TrailSynth {
         tw_ph: f32,
         ph: [f32; 3],
     ) -> Option<usize> {
-        let idx = self.claim_lane(proto.lane, proto.delay > 0.0)?;
+        let Some(idx) = self.claim_lane(proto.lane, proto.delay > 0.0) else {
+            return None;
+        };
         #[cfg(test)]
         {
-            let l = usize::from(proto.lane).min(15);
+            let l = if proto.lane < 15 {
+                proto.lane as usize
+            } else {
+                15
+            };
             self.lane_births[l] = self.lane_births[l].saturating_add(1);
         }
         let mut v = proto;
@@ -1866,26 +1890,29 @@ impl TrailSynth {
                 v.delay *= feel;
             }
         }
-        if self.shift_octave != 1.0 && v.p.iter().any(|p| p.lvl > 0.0) {
+        if self.shift_octave != 1.0 && (v.p[0].lvl > 0.0 || v.p[1].lvl > 0.0 || v.p[2].lvl > 0.0) {
             v.lp_cut *= self.shift_octave;
-            for i in 0..v.p.len() {
-                if v.p[i].lvl <= 0.0 {
-                    continue;
+            let inv_shift_octave = 1.0 / self.shift_octave;
+            let mut i = 0;
+            while i < v.p.len() {
+                if v.p[i].lvl > 0.0 {
+                    let (fi0, fi1) = (v.p[i].f0, v.p[i].f1);
+                    let mut j = 0;
+                    while j < v.p.len() {
+                        if i != j && v.p[j].lvl > 0.0 {
+                            let r0 = v.p[j].f0 / fi0;
+                            if r0 > 1.0 && r0 < DETUNE_MAX_RATIO {
+                                v.p[j].f0 = fi0 * (1.0 + (r0 - 1.0) * inv_shift_octave);
+                            }
+                            let r1 = if fi1 > 0.0 { v.p[j].f1 / fi1 } else { 0.0 };
+                            if r1 > 1.0 && r1 < DETUNE_MAX_RATIO {
+                                v.p[j].f1 = fi1 * (1.0 + (r1 - 1.0) * inv_shift_octave);
+                            }
+                        }
+                        j += 1;
+                    }
                 }
-                let (fi0, fi1) = (v.p[i].f0, v.p[i].f1);
-                for j in 0..v.p.len() {
-                    if i == j || v.p[j].lvl <= 0.0 {
-                        continue;
-                    }
-                    let r0 = v.p[j].f0 / fi0;
-                    if r0 > 1.0 && r0 < DETUNE_MAX_RATIO {
-                        v.p[j].f0 = fi0 * (1.0 + (r0 - 1.0) / self.shift_octave);
-                    }
-                    let r1 = if fi1 > 0.0 { v.p[j].f1 / fi1 } else { 0.0 };
-                    if r1 > 1.0 && r1 < DETUNE_MAX_RATIO {
-                        v.p[j].f1 = fi1 * (1.0 + (r1 - 1.0) / self.shift_octave);
-                    }
-                }
+                i += 1;
             }
         }
         v.on = true;
@@ -1904,37 +1931,40 @@ impl TrailSynth {
         }
         v.tw_ph = tw_ph;
         let dt = self.inv_sr;
-        v.k_a = (-dt / v.attack.max(2e-4)).exp();
-        v.k_d = (-dt / v.decay.max(1e-3)).exp();
+        v.k_a = crate::color_math::exp_f32(-dt / v.attack.max(2e-4));
+        v.k_d = crate::color_math::exp_f32(-dt / v.decay.max(1e-3));
         v.k_n = if v.n_glide > 0.0 {
-            (-dt / v.n_glide).exp()
+            crate::color_math::exp_f32(-dt / v.n_glide)
         } else {
             1.0
         };
         v.env_run = false;
         v.env_n = 0;
         v.k_nd = if v.n_decay > 0.0 {
-            (-dt / v.n_decay).exp()
+            crate::color_math::exp_f32(-dt / v.n_decay)
         } else {
             1.0
         };
-        for (part, ph) in v.p.iter_mut().zip(ph) {
-            part.ph = ph;
+        let mut p_idx = 0;
+        while p_idx < 3 {
+            let part = &mut v.p[p_idx];
+            part.ph = ph[p_idx];
             part.k_g = if part.glide > 0.0 {
-                (-dt / part.glide).exp()
+                crate::color_math::exp_f32(-dt / part.glide)
             } else {
                 1.0
             };
             part.k_f = if part.fm_ratio > 0.0 {
-                (-dt / part.fm_tau.max(1e-3)).exp()
+                crate::color_math::exp_f32(-dt / part.fm_tau.max(1e-3))
             } else {
                 1.0
             };
             part.k_p = if part.decay > 0.0 {
-                (-dt / part.decay).exp()
+                crate::color_math::exp_f32(-dt / part.decay)
             } else {
                 1.0
             };
+            p_idx += 1;
         }
         v.lp = 0.0;
         v.n_lp = 0.0;
@@ -1943,7 +1973,9 @@ impl TrailSynth {
         if v.n_lvl > 0.0 {
             v.n_damp = 1.0 / v.n_q.max(0.3);
             if v.n_glide <= 0.0 {
-                v.svf_g = (core::f32::consts::PI * (v.n_f0 * dt).min(0.45)).tan();
+                let (s, c) =
+                    crate::supernova::sin_cos_f32(core::f32::consts::PI * (v.n_f0 * dt).min(0.45));
+                v.svf_g = s / c;
                 v.svf_den = 1.0 + v.svf_g * (v.svf_g + v.n_damp);
             }
         }
@@ -2622,7 +2654,8 @@ impl TrailSynth {
         let sustain_limit = if turnaround { 6 } else { phrase.len() };
         let lp_cut = 2800.0 + 1400.0 * build;
         let shimmer = 0.10 + 0.12 * build;
-        for (i, &deg) in phrase.iter().enumerate() {
+        for i in 0..phrase.len() {
+            let deg = phrase[i];
             // Distinct branch.
             if deg == REST {
                 continue;
@@ -2668,7 +2701,9 @@ impl TrailSynth {
             );
         }
         if turnaround {
-            for (k, &deg) in CELEBRATION_FILL.iter().enumerate() {
+            let mut k = 0;
+            while k < CELEBRATION_FILL.len() {
+                let deg = CELEBRATION_FILL[k];
                 let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + shift);
                 let v = Voice {
                     delay: (6.0 + 0.5 * k as f32) * CELEBRATION_EIGHTH,
@@ -2686,6 +2721,7 @@ impl TrailSynth {
                     g * (0.34 + 0.06 * k as f32) * lift,
                     celebration_sway(ev.pan, deg),
                 );
+                k += 1;
             }
         }
         self.sing = 1.0;
@@ -2739,7 +2775,7 @@ impl TrailSynth {
         self.since_shift += dt_block;
         if self.rate > 0.0 {
             const INV_RATE_TAU: f32 = -1.0 / 0.6;
-            self.rate *= (dt_block * INV_RATE_TAU).exp();
+            self.rate *= crate::color_math::exp_f32(dt_block * INV_RATE_TAU);
             if self.rate < 1e-7 {
                 self.rate = 0.0;
             }
@@ -2765,7 +2801,7 @@ impl TrailSynth {
         let dt = self.inv_sr;
         let duck_step = if self.duck > 0.0 {
             const INV_BONK_DUCK_TAU: f32 = -1.0 / BONK_DUCK_TAU;
-            (dt * INV_BONK_DUCK_TAU).exp()
+            crate::color_math::exp_f32(dt * INV_BONK_DUCK_TAU)
         } else {
             0.0
         };
@@ -2782,16 +2818,16 @@ impl TrailSynth {
             const INV_LIMIT_ATTACK_S: f32 = -1.0 / LIMIT_ATTACK_S;
             const INV_LIMIT_RELEASE_S: f32 = -1.0 / LIMIT_RELEASE_S;
             (
-                1.0 - (dt * INV_LIMIT_ATTACK_S).exp(),
-                (dt * INV_LIMIT_RELEASE_S).exp(),
+                1.0 - crate::color_math::exp_f32(dt * INV_LIMIT_ATTACK_S),
+                crate::color_math::exp_f32(dt * INV_LIMIT_RELEASE_S),
             )
         } else {
             (0.0, 0.0)
         };
         let mut active_voices = [0u8; MAX_VOICES];
         let mut active_len = 0usize;
-        for (i, v) in self.voices.iter().enumerate() {
-            if v.on {
+        for i in 0..self.voices.len() {
+            if self.voices[i].on {
                 active_voices[active_len] = i as u8;
                 active_len += 1;
             }
@@ -2856,7 +2892,7 @@ impl TrailSynth {
                     }
                     let freq = if p.glide > 0.0 {
                         p.g_e = if seed {
-                            (-v.t / p.glide).exp()
+                            crate::color_math::exp_f32(-v.t / p.glide)
                         } else {
                             p.g_e * p.k_g
                         };
@@ -2871,7 +2907,7 @@ impl TrailSynth {
                             if p.fm_ratio > 0.0 {
                                 p.fm_ph = (p.fm_ph + freq * p.fm_ratio * dt).fract();
                                 p.fm_e = if seed {
-                                    (-v.t / p.fm_tau.max(1e-3)).exp()
+                                    crate::color_math::exp_f32(-v.t / p.fm_tau.max(1e-3))
                                 } else {
                                     p.fm_e * p.k_f
                                 };
@@ -2891,7 +2927,7 @@ impl TrailSynth {
                     };
                     if p.decay > 0.0 {
                         p.p_e = if seed {
-                            (-v.t / p.decay).exp()
+                            crate::color_math::exp_f32(-v.t / p.decay)
                         } else {
                             p.p_e * p.k_p
                         };
@@ -2905,12 +2941,15 @@ impl TrailSynth {
                     let damp = v.n_damp;
                     let (g_svf, den) = if v.n_glide > 0.0 {
                         v.n_e = if seed {
-                            (-v.t / v.n_glide).exp()
+                            crate::color_math::exp_f32(-v.t / v.n_glide)
                         } else {
                             v.n_e * v.k_n
                         };
                         let fc = v.n_f1 + (v.n_f0 - v.n_f1) * v.n_e;
-                        let g = (core::f32::consts::PI * (fc * dt).min(0.45)).tan();
+                        let (sn, cs) = crate::supernova::sin_cos_f32(
+                            core::f32::consts::PI * (fc * dt).min(0.45),
+                        );
+                        let g = sn / cs;
                         (g, 1.0 + g * (g + damp))
                     } else {
                         (v.svf_g, v.svf_den)
@@ -2920,7 +2959,7 @@ impl TrailSynth {
                     v.n_lp += g_svf * v.n_bp;
                     if v.n_decay > 0.0 {
                         v.nd_e = if seed {
-                            (-v.t / v.n_decay).exp()
+                            crate::color_math::exp_f32(-v.t / v.n_decay)
                         } else {
                             v.nd_e * v.k_nd
                         };
@@ -2930,8 +2969,8 @@ impl TrailSynth {
                     }
                 }
                 if seed {
-                    v.env_a = (-v.t / v.attack.max(2e-4)).exp();
-                    v.env_d = (-v.t / v.decay.max(1e-3)).exp();
+                    v.env_a = crate::color_math::exp_f32(-v.t / v.attack.max(2e-4));
+                    v.env_d = crate::color_math::exp_f32(-v.t / v.decay.max(1e-3));
                     v.env_run = true;
                 } else {
                     v.env_a *= v.k_a;
@@ -3011,7 +3050,7 @@ impl TrailSynth {
                 self.sing_hold -= dt_block;
             } else {
                 const INV_SING_DUCK_TAU: f32 = -1.0 / SING_DUCK_TAU;
-                self.sing *= (dt_block * INV_SING_DUCK_TAU).exp();
+                self.sing *= crate::color_math::exp_f32(dt_block * INV_SING_DUCK_TAU);
             }
             if self.sing < 1e-4 {
                 self.sing = 0.0;
@@ -3031,7 +3070,7 @@ impl TrailSynth {
         let b = &mut self.bed;
         if b.energy > 0.0 {
             let inv_tau_e = if b.energy < 0.02 { -5.0 } else { -1.0 / 0.7 };
-            b.energy *= (dt * inv_tau_e).exp();
+            b.energy *= crate::color_math::exp_f32(dt * inv_tau_e);
         }
         let target = b.energy.min(1.0);
         if b.level != target {
@@ -3042,7 +3081,7 @@ impl TrailSynth {
             } else {
                 -1.0 / 0.7
             };
-            b.level += (target - b.level) * (1.0 - (dt * inv_tau).exp());
+            b.level += (target - b.level) * (1.0 - crate::color_math::exp_f32(dt * inv_tau));
         }
         if b.energy < 3e-3 && b.level < 3e-3 {
             b.energy = 0.0;
@@ -3052,7 +3091,7 @@ impl TrailSynth {
         let dying = (0.35 - b.level).max(0.0) * INV_035;
         if b.droop != dying {
             const INV_DROOP_TAU: f32 = -1.0 / 0.4;
-            b.droop += (dying - b.droop) * (1.0 - (dt * INV_DROOP_TAU).exp());
+            b.droop += (dying - b.droop) * (1.0 - crate::color_math::exp_f32(dt * INV_DROOP_TAU));
             if b.level == 0.0 && (dying - b.droop).abs() < 1e-6 {
                 b.droop = dying;
             }

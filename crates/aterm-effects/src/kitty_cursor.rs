@@ -614,24 +614,33 @@ impl CursorCat {
     #[inline]
     pub fn placement_frame(&self, now: Instant) -> CursorCatPlacementFrame {
         let fold_now = self.collection_sample_time(now);
-        let fold = self.fold.and_then(|fold| {
-            const INV_CURSOR_FOLD_SECS: f32 = 1.0 / CURSOR_FOLD_DURATION.as_secs_f32();
-            let progress = fold_now
-                .saturating_duration_since(fold.started)
-                .as_secs_f32()
-                * INV_CURSOR_FOLD_SECS;
-            (progress < 1.0).then_some(CatFoldFrame {
-                started: fold.started,
-                direction: fold.direction,
-                progress: progress.clamp(0.0, 1.0),
-            })
-        });
+        let fold = match self.fold {
+            Some(fold) => {
+                const INV_CURSOR_FOLD_SECS: f32 = 1.0 / CURSOR_FOLD_DURATION.as_secs_f32();
+                let progress = fold_now
+                    .saturating_duration_since(fold.started)
+                    .as_secs_f32()
+                    * INV_CURSOR_FOLD_SECS;
+                if progress < 1.0 {
+                    Some(CatFoldFrame {
+                        started: fold.started,
+                        direction: fold.direction,
+                        progress: progress.clamp(0.0, 1.0),
+                    })
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let facing_left = match fold {
+            Some(active) => matches!(active.direction, CatFoldDirection::Reverse),
+            None => self.facing_left,
+        };
         CursorCatPlacementFrame {
             sampled_at: now,
             fold,
-            facing_left: fold.map_or(self.facing_left, |active| {
-                matches!(active.direction, CatFoldDirection::Reverse)
-            }),
+            facing_left,
         }
     }
 
@@ -651,11 +660,10 @@ impl CursorCat {
 
     #[inline]
     fn on_key_with_owner(&mut self, now: Instant, forward: bool, ordinary_flight_owned: bool) {
-        let dt = self
-            .last
-            .map(|l| now.saturating_duration_since(l).as_secs_f32())
-            .unwrap_or(0.0)
-            .min(0.5);
+        let dt = match self.last {
+            Some(l) => now.saturating_duration_since(l).as_secs_f32().min(0.5),
+            None => 0.0,
+        };
         if forward {
             let held = self.momentum.value(now);
             if held >= CAT_BAND {
@@ -673,7 +681,7 @@ impl CursorCat {
             self.stride = if next_stride < 1024.0 {
                 next_stride
             } else {
-                next_stride.rem_euclid(1024.0)
+                next_stride - (next_stride * (1.0 / 1024.0)).floor() * 1024.0
             };
             self.momentum.advance(now);
             if let State::FadeOut(t0) = self.state
@@ -732,10 +740,13 @@ impl CursorCat {
         if !self.is_active() {
             return;
         }
-        let same_burst = self.reaction == CatReaction::Startled
-            && self
-                .oops_last
-                .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() < OOPS_REARM);
+        let same_burst = if self.reaction == CatReaction::Startled
+            && let Some(t) = self.oops_last
+        {
+            now.saturating_duration_since(t).as_secs_f32() < OOPS_REARM
+        } else {
+            false
+        };
         self.reaction = CatReaction::Startled;
         self.reaction_until = Some(now + OOPS_HOLD_DUR);
         self.oops_last = Some(now);
@@ -751,9 +762,10 @@ impl CursorCat {
         if hits == 0 || !self.is_active() {
             return false;
         }
-        let chained = self.wince_last.is_some_and(|last| {
-            now.saturating_duration_since(last).as_secs_f32() < WINCE_CHAIN_WINDOW
-        });
+        let chained = match self.wince_last {
+            Some(last) => now.saturating_duration_since(last).as_secs_f32() < WINCE_CHAIN_WINDOW,
+            None => false,
+        };
         self.wince_chain = if chained {
             self.wince_chain.saturating_add(hits).min(MAX_WINCE_CHAIN)
         } else {
@@ -813,9 +825,10 @@ impl CursorCat {
         if hits == 0 || !self.is_active() {
             return false;
         }
-        let chained = self.delight_last.is_some_and(|last| {
-            now.saturating_duration_since(last).as_secs_f32() < DELIGHT_CHAIN_WINDOW
-        });
+        let chained = match self.delight_last {
+            Some(last) => now.saturating_duration_since(last).as_secs_f32() < DELIGHT_CHAIN_WINDOW,
+            None => false,
+        };
         self.delight_chain = if chained {
             self.delight_chain
                 .saturating_add(hits)
@@ -930,32 +943,53 @@ impl CursorCat {
             return;
         };
         let hidden = now.saturating_duration_since(paused_at);
-        self.discovery_until = self.discovery_until.map(|at| at + hidden);
-        self.reaction_until = self.reaction_until.map(|at| at + hidden);
-        self.wince_at = self.wince_at.map(|at| at + hidden);
-        self.wince_last = self.wince_last.map(|at| at + hidden);
-        self.delight_at = self.delight_at.map(|at| at + hidden);
-        self.delight_last = self.delight_last.map(|at| at + hidden);
-        self.oops_at = self.oops_at.map(|at| at + hidden);
-        self.oops_last = self.oops_last.map(|at| at + hidden);
-        self.land_at = self.land_at.map(|at| at + hidden);
-        self.meteor = self.meteor.map(|m| Flight {
-            t0: m.t0 + hidden,
-            land_at: m.land_at + hidden,
-            ..m
-        });
-        self.fold = self.fold.map(|f| CatFold {
-            started: f.started + hidden,
-            ..f
-        });
-        self.disp_at = self.disp_at.map(|at| at + hidden);
-        self.stride_at = self.stride_at.map(|at| at + hidden);
-        self.flight = self.flight.map(|at| at + hidden);
-        self.state = match self.state {
-            State::FadeIn(at) => State::FadeIn(at + hidden),
-            State::FadeOut(at) => State::FadeOut(at + hidden),
-            state => state,
-        };
+        if let Some(at) = &mut self.discovery_until {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.reaction_until {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.wince_at {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.wince_last {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.delight_at {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.delight_last {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.oops_at {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.oops_last {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.land_at {
+            *at += hidden;
+        }
+        if let Some(m) = &mut self.meteor {
+            m.t0 += hidden;
+            m.land_at += hidden;
+        }
+        if let Some(f) = &mut self.fold {
+            f.started += hidden;
+        }
+        if let Some(at) = &mut self.disp_at {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.stride_at {
+            *at += hidden;
+        }
+        if let Some(at) = &mut self.flight {
+            *at += hidden;
+        }
+        match &mut self.state {
+            State::FadeIn(at) | State::FadeOut(at) => *at += hidden,
+            State::Hidden | State::Shown => {}
+        }
     }
 
     #[inline]
@@ -972,12 +1006,17 @@ impl CursorCat {
 
     #[inline]
     fn discovery_active(&self, now: Instant) -> bool {
-        self.discovery_until.is_some_and(|until| now < until)
+        match self.discovery_until {
+            Some(until) => now < until,
+            None => false,
+        }
     }
 
     #[inline]
     fn reaction_at(&mut self, now: Instant) -> CatReaction {
-        if self.reaction_until.is_some_and(|until| now >= until) {
+        if let Some(until) = self.reaction_until
+            && now >= until
+        {
             self.reaction = CatReaction::Cruise;
             self.reaction_until = None;
             self.oops_at = None;
@@ -995,20 +1034,20 @@ impl CursorCat {
         if self.stride_at == Some(now) {
             return;
         }
-        let dt = self
-            .stride_at
-            .map(|l| now.saturating_duration_since(l).as_secs_f32())
-            .unwrap_or(0.0)
-            .min(0.10);
+        let dt = match self.stride_at {
+            Some(l) => now.saturating_duration_since(l).as_secs_f32().min(0.10),
+            None => 0.0,
+        };
         self.stride_at = Some(now);
         if dt > 0.0 {
-            let wrap = |x: f32| {
-                if (0.0..1024.0).contains(&x) {
+            #[inline]
+            const fn wrap(x: f32) -> f32 {
+                if x >= 0.0 && x < 1024.0 {
                     x
                 } else {
-                    x.rem_euclid(1024.0)
+                    x - (x * (1.0 / 1024.0)).floor() * 1024.0
                 }
-            };
+            }
             self.stride = wrap(self.stride + dt * STRIDE_IDLE_HZ);
             let mut gap = wrap(self.stride - self.stride_shown + 512.0) - 512.0;
             if gap >= 1.0 {
@@ -1017,7 +1056,7 @@ impl CursorCat {
             }
             if gap != 0.0 {
                 const INV_STRIDE_TAU: f32 = 1.0 / STRIDE_TAU;
-                let k = 1.0 - (-dt * INV_STRIDE_TAU).exp();
+                let k = 1.0 - crate::color_math::exp_f32(-dt * INV_STRIDE_TAU);
                 let step = (gap * k).clamp(-STRIDE_RATE_MAX * dt, STRIDE_RATE_MAX * dt);
                 self.stride_shown = wrap(self.stride_shown + step);
             }
@@ -1059,7 +1098,7 @@ impl CursorCat {
                 let dt = now.saturating_duration_since(prev).as_secs_f32().min(0.1);
                 if dt > 0.0 && self.disp != target {
                     const INV_DISP_TAU: f32 = 1.0 / DISP_TAU;
-                    let alpha = 1.0 - (-dt * INV_DISP_TAU).exp();
+                    let alpha = 1.0 - crate::color_math::exp_f32(-dt * INV_DISP_TAU);
                     self.disp += (target - self.disp) * alpha;
                 }
             }
@@ -1105,19 +1144,24 @@ impl CursorCat {
         }
         self.stride_advance(now);
         if self.flight.is_some() && bank > 0.0 {
-            let foot = (std::f32::consts::TAU * self.stride_shown).cos().max(0.0) * bank;
+            let foot = crate::supernova::sin_cos_f32(std::f32::consts::TAU * self.stride_shown)
+                .1
+                .max(0.0)
+                * bank;
             scale_y *= 1.0 - STRIDE_SQUASH * foot;
             scale_x *= 1.0 + STRIDE_SQUASH * 0.7 * foot;
         }
-        if let Some(t0) = self.land_at.filter(|&t0| now >= t0) {
+        if let Some(t0) = self.land_at
+            && now >= t0
+        {
             const INV_LAND_DUR: f32 = 1.0 / LAND_DUR;
             let u = now.saturating_duration_since(t0).as_secs_f32() * INV_LAND_DUR;
             if u >= 1.0 {
                 self.land_at = None;
             } else {
                 let q = LAND_AMP
-                    * (-LAND_DECAY * u).exp()
-                    * (std::f32::consts::TAU * LAND_FREQ * u).cos();
+                    * crate::color_math::exp_f32(-LAND_DECAY * u)
+                    * crate::supernova::sin_cos_f32(std::f32::consts::TAU * LAND_FREQ * u).1;
                 scale_y *= 1.0 - q;
                 scale_x *= 1.0 + q * 0.6;
             }
@@ -1126,18 +1170,20 @@ impl CursorCat {
             CatReaction::Startled => {
                 const INV_OOPS_ATTACK: f32 = 1.0 / OOPS_ATTACK;
                 const INV_OOPS_SETTLE: f32 = 1.0 / OOPS_SETTLE;
-                let attack = self.oops_at.map_or(1.0, |t0| {
-                    smoothstep_0(
+                let attack = match self.oops_at {
+                    Some(t0) => smoothstep_0(
                         INV_OOPS_ATTACK,
                         now.saturating_duration_since(t0).as_secs_f32(),
-                    )
-                });
-                let settle = self.reaction_until.map_or(1.0, |until| {
-                    smoothstep_0(
+                    ),
+                    None => 1.0,
+                };
+                let settle = match self.reaction_until {
+                    Some(until) => smoothstep_0(
                         INV_OOPS_SETTLE,
                         until.saturating_duration_since(now).as_secs_f32(),
-                    )
-                });
+                    ),
+                    None => 1.0,
+                };
                 let env = attack * settle;
                 lead = lead * (1.0 - env) - OOPS_RECOIL * env;
                 scale_y *= 1.0 - OOPS_SQUASH * env;
@@ -1147,19 +1193,25 @@ impl CursorCat {
                 const INV_WINCE_HOLD: f32 = 1.0 / WINCE_HOLD;
                 const INV_WINCE_ATTACK: f32 = 1.0 / WINCE_ATTACK;
                 const INV_WINCE_SETTLE: f32 = 1.0 / WINCE_SETTLE;
-                let elapsed = self
-                    .wince_at
-                    .map_or(0.0, |t0| now.saturating_duration_since(t0).as_secs_f32());
+                let elapsed = match self.wince_at {
+                    Some(t0) => now.saturating_duration_since(t0).as_secs_f32(),
+                    None => 0.0,
+                };
                 let attack = smoothstep_0(INV_WINCE_ATTACK, elapsed);
-                let settle = self.reaction_until.map_or(1.0, |until| {
-                    smoothstep_0(
+                let settle = match self.reaction_until {
+                    Some(until) => smoothstep_0(
                         INV_WINCE_SETTLE,
                         until.saturating_duration_since(now).as_secs_f32(),
-                    )
-                });
+                    ),
+                    None => 1.0,
+                };
                 let chain = self.wince_chain.max(1);
                 let phase = elapsed * INV_WINCE_HOLD * f32::from(chain);
-                let pulse = 0.78 + 0.22 * (std::f32::consts::TAU * phase).cos().abs();
+                let pulse = 0.78
+                    + 0.22
+                        * crate::supernova::sin_cos_f32(std::f32::consts::TAU * phase)
+                            .1
+                            .abs();
                 let strength = 1.0 + 0.18 * f32::from(chain.saturating_sub(1));
                 let env = attack * settle * pulse * strength;
                 lead = lead * (1.0 - env.min(1.0)) - WINCE_RECOIL * env;
@@ -1167,7 +1219,8 @@ impl CursorCat {
                 scale_x *= 1.0 + WINCE_SQUASH * 0.7 * env;
                 let omega =
                     WINCE_TUMBLE_OMEGA[(chain as usize - 1).min(MAX_WINCE_CHAIN as usize - 1)];
-                let swing = (-WINCE_TUMBLE_DECAY * elapsed).exp() * (omega * elapsed).sin();
+                let swing = crate::color_math::exp_f32(-WINCE_TUMBLE_DECAY * elapsed)
+                    * crate::supernova::sin_cos_f32(omega * elapsed).0;
                 let swing_env = swing * attack * settle;
                 lead += WINCE_TUMBLE * swing_env;
                 let wobble = 0.05 * swing_env;
@@ -1178,21 +1231,26 @@ impl CursorCat {
                 const INV_DELIGHT_HOLD: f32 = 1.0 / DELIGHT_HOLD;
                 const INV_DELIGHT_ATTACK: f32 = 1.0 / DELIGHT_ATTACK;
                 const INV_DELIGHT_SETTLE: f32 = 1.0 / DELIGHT_SETTLE;
-                let elapsed = self
-                    .delight_at
-                    .map_or(0.0, |t0| now.saturating_duration_since(t0).as_secs_f32());
+                let elapsed = match self.delight_at {
+                    Some(t0) => now.saturating_duration_since(t0).as_secs_f32(),
+                    None => 0.0,
+                };
                 let attack = smoothstep_0(INV_DELIGHT_ATTACK, elapsed);
-                let settle = self.reaction_until.map_or(1.0, |until| {
-                    smoothstep_0(
+                let settle = match self.reaction_until {
+                    Some(until) => smoothstep_0(
                         INV_DELIGHT_SETTLE,
                         until.saturating_duration_since(now).as_secs_f32(),
-                    )
-                });
+                    ),
+                    None => 1.0,
+                };
                 let arc = (elapsed * INV_DELIGHT_HOLD).clamp(0.0, 1.0);
                 let env = attack * settle;
                 let chain = self.delight_chain.max(1);
                 let strength = 1.0 + 0.16 * f32::from(chain.saturating_sub(1));
-                let pulse = (std::f32::consts::PI * arc * f32::from(chain)).sin().abs();
+                let pulse =
+                    crate::supernova::sin_cos_f32(std::f32::consts::PI * arc * f32::from(chain))
+                        .0
+                        .abs();
                 let stretch = pulse * env * strength;
                 scale_y *= 1.0 + DELIGHT_STRETCH * 0.33 * stretch;
                 scale_x *= 1.0 - DELIGHT_STRETCH * 0.18 * stretch;
@@ -1204,7 +1262,9 @@ impl CursorCat {
             let pulse = (1.0 - u) * (1.0 - u);
             scale_y *= 1.0 - SING_SQUASH * pulse * self.sing;
             scale_x *= 1.0 + SING_SQUASH * 0.7 * pulse * self.sing;
-            lead += SING_SWAY * (std::f32::consts::PI * self.sing_beat).sin() * self.sing;
+            lead += SING_SWAY
+                * crate::supernova::sin_cos_f32(std::f32::consts::PI * self.sing_beat).0
+                * self.sing;
         }
         let eyes = match reaction {
             CatReaction::Wince => EyesFrame::Blink,
@@ -1214,7 +1274,7 @@ impl CursorCat {
                 EyesFrame::Open
             }
             CatReaction::Cruise | CatReaction::Discovery => {
-                if self.meteor.is_some_and(|m| now < m.squint_until()) {
+                if matches!(self.meteor, Some(m) if now < m.squint_until()) {
                     // The flight's squint: through the flight and a beat past the
                     // landing, outranking the idle blink.
                     EyesFrame::Happy
@@ -1374,11 +1434,18 @@ impl CursorCat {
         if !self.collection_hello || self.collection_paused_at.is_some() {
             return None;
         }
-        let d0 = self.discovery_until.filter(|d| *d > now);
-        let d1 = if matches!(self.reaction, CatReaction::Startled | CatReaction::Wince) {
-            self.reaction_until.filter(|d| *d > now)
-        } else {
-            None
+        let d0 = match self.discovery_until {
+            Some(d) if d > now => Some(d),
+            _ => None,
+        };
+        let d1 = match self.reaction_until {
+            Some(d)
+                if matches!(self.reaction, CatReaction::Startled | CatReaction::Wince)
+                    && d > now =>
+            {
+                Some(d)
+            }
+            _ => None,
         };
         match (d0, d1) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1617,7 +1684,9 @@ pub fn emit_exit_fx(
         return;
     }
     let ch = geom.ch as i32;
-    let pop = (fade_out * std::f32::consts::PI).sin().clamp(0.0, 1.0);
+    let pop = crate::supernova::sin_cos_f32(fade_out * std::f32::consts::PI)
+        .0
+        .clamp(0.0, 1.0);
     match exit {
         CatExit::Plain => {}
         CatExit::HeartMeow => {
@@ -1631,7 +1700,6 @@ pub fn emit_exit_fx(
                     return;
                 }
                 const ROWS: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
-                const BUMPS: [(i32, i32); 1] = [(4, 5)];
                 let pink = premul_rgb(EXIT_HEART_PINK, cov);
                 for (ry, &(x0, x1)) in ROWS.iter().enumerate() {
                     push_fx_rect(
@@ -1644,9 +1712,7 @@ pub fn emit_exit_fx(
                         pink,
                     );
                 }
-                for &(x0, x1) in &BUMPS {
-                    push_fx_rect(out, geom, hx + x0 * u, hy, (x1 - x0 + 1) * u, u, pink);
-                }
+                push_fx_rect(out, geom, hx + 4 * u, hy, 2 * u, u, pink);
             } else {
                 let alpha = (210.0 * pop).min(InkRole::OverText.alpha_cap()) as u8;
                 if alpha >= 24 {
@@ -1666,7 +1732,7 @@ pub fn emit_exit_fx(
             }
         }
         CatExit::StarWink => {
-            let twinkle = 0.6 + 0.4 * (fade_out * EXIT_STAR_SCINT).sin();
+            let twinkle = 0.6 + 0.4 * crate::supernova::sin_cos_f32(fade_out * EXIT_STAR_SCINT).0;
             let sx = ax + geom.cw as i32;
             let sy = ay - ch / 3;
             let a = (ch / 5).max(2);

@@ -115,15 +115,36 @@ fn editor(
 
 fn screen(app: &App) -> usize {
     let wid = WindowId(0);
-    let (instance, _) = app.active_native_view(wid).expect("the editor tab");
+    let (instance, view) = app.active_native_view(wid).expect("the editor tab");
     let Some(crate::native_app::NativeApp::Editor(editor)) = app.native_runtime.app(instance)
     else {
         panic!("the active tab is not an editor");
     };
+    let viewport = app.native_ui_viewport(wid).expect("the editor's viewport");
+    let palette = crate::native_ui::EditorPalette::None;
+    let footer_rows = match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::Editor(state)) => {
+            let document = app
+                .native_runtime
+                .document_id(instance)
+                .and_then(|document| app.document_store.snapshot(document));
+            editor.footer_rows_in(
+                state,
+                document.as_ref(),
+                crate::native_ui::editor_text_viewport_rect_with_palette(
+                    viewport,
+                    palette,
+                    editor.toolbar(),
+                ),
+            )
+        }
+        _ => 1,
+    };
     crate::native_ui::editor_visible_line_capacity_with_palette(
-        app.native_ui_viewport(wid).expect("the editor's viewport"),
-        crate::native_ui::EditorPalette::None,
+        viewport,
+        palette,
         editor.toolbar(),
+        footer_rows,
     )
 }
 
@@ -840,7 +861,7 @@ fn rows(screen: usize) -> Vec<Row> {
             "isearch Shift+Tab",
             vec![isearch()],
             press(Key::Named(N::Tab), shift),
-            r#"sel=6 mb=isearch:"" focus=editor/commands-button"#,
+            r#"sel=6 mb=isearch:"" focus=editor/find-button"#,
         ),
         row(
             "isearch C-f",

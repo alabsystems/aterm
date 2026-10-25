@@ -708,10 +708,12 @@ fn a_painted_buffer_not_presented_is_not_on_the_window() {
 /// The rows a window gains after a whole present are drawn by the next
 /// present, however small its damage: Windows holds them in the window's
 /// update region, and a present copies that region from the buffer before it
-/// validates the client area. The window smoke's launch at 150 % kept such
-/// rows white (docs/measured/windows-lw3-2026-10-21.md). NEGATIVE CONTROL:
-/// with the update rectangle left out of the copy (softbuffer's protocol)
-/// the gained rows are not the frame's.
+/// validates the client area. The window smoke's launch at 150 % (`lab
+/// windows window --cpu`) holds the same for rows that come back on the
+/// screen; the white band it once read was rows past the screen's edge,
+/// which Windows never draws (docs/measured/windows-lw3-2026-10-21.md).
+/// NEGATIVE CONTROL: with the update rectangle left out of the copy
+/// (softbuffer's protocol) the gained rows are not the frame's.
 #[test]
 fn rows_the_window_gains_after_a_present_are_drawn_by_the_next() {
     let window = TestWindow::new(W0 as i32, H0 as i32);

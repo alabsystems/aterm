@@ -3,8 +3,9 @@
 
 //! The steps of `OccupancyDoor` (`aterm_models_harness::occupancy_door_model`) that no function
 //! here performs. The loop's own bind where the real code runs: `Intend` and `Lapse` on
-//! [`super::decide`], `IdleRead` and `HoldCloses` on [`super::HoldClock::step`], `Crash` on
-//! [`crate::supervise::facts::FactsState::seed`], `Type` on the loop's fenced write
+//! [`super::decide`], `OpenWake` on the book's head a break would tell
+//! ([`super::rules::wake_opens`]), `IdleRead` and `HoldCloses` on [`super::HoldClock::step`],
+//! `Crash` on [`crate::supervise::facts::FactsState::seed`], `Type` on the loop's fenced write
 //! (`Session::type_fact`), `Skip` on its skipped outcome (`Session::door_skipped`), and `Sample`
 //! and `SampleLast` on the K clock's look ([`super::due::DueClock::sample`]), each projected by
 //! the Tier-1 bind (`tests/conformance_occupancy.rs`). Proof and test builds only.
@@ -146,14 +147,6 @@
         machine = "OccupancyDoor",
         action = "OpenNudge",
         reason = "A rule's condition met in an episode not yet told: what decide reads from the hold and the books in the same call that makes Intend's verdict; the Tier-1 bind opens it at that read."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "OccupancyDoor",
-        action = "OpenWake",
-        reason = "A declared wake met (§4.1), not implemented yet. The Tier-1 bind walks the built-in rules only; a wake is Tier-0 only."
     )
 )]
 #[cfg_attr(

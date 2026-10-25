@@ -99,10 +99,13 @@ impl CursorGlow {
         if self.sound_cues.len() >= Self::MAX_SOUND_CUES {
             return false;
         }
-        let col = self
-            .last
-            .or_else(|| self.last_visible.map(|(c, _)| c))
-            .map_or(0, |(_, c)| c);
+        let col = match self.last {
+            Some((_, c)) => c,
+            None => match self.last_visible {
+                Some(((_, c), _)) => c,
+                None => 0,
+            },
+        };
         let heat = self.keyed_blaze(now);
         self.cue_sound_shifted(kind, col, heat, shifted);
         self.key_cue_at = Some(now);
@@ -122,10 +125,13 @@ impl CursorGlow {
         if self.sound_cues.len() >= Self::MAX_SOUND_CUES {
             return false;
         }
-        let col = self
-            .last
-            .or_else(|| self.last_visible.map(|(c, _)| c))
-            .map_or(0, |(_, c)| c);
+        let col = match self.last {
+            Some((_, c)) => c,
+            None => match self.last_visible {
+                Some(((_, c), _)) => c,
+                None => 0,
+            },
+        };
         let (heat, flare) = self.cooled_blaze(now);
         self.cue_sound_at(
             crate::trail_sound::SoundKind::Shift,
@@ -148,9 +154,10 @@ impl CursorGlow {
     #[inline]
     pub(super) fn keyed_blaze(&self, now: Instant) -> f32 {
         let (heat, flare) = self.cooled_blaze(now);
-        let gap = self
-            .key_cue_at
-            .map_or(f32::MAX, |t| now.saturating_duration_since(t).as_secs_f32());
+        let gap = match self.key_cue_at {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32(),
+            None => f32::MAX,
+        };
         let charged = (heat + Self::heat_cadence(gap) * self.heat_gain_live).min(1.0);
         charged.max(flare).clamp(0.0, 1.0)
     }
@@ -158,17 +165,18 @@ impl CursorGlow {
     /// The standing heat/flare cooled to `now` as the next tick will cool them: [`Self::keyed_blaze`] without the cadence charge, for a cue whose press earns no echo (the Shift lift).
     #[inline]
     pub(super) fn cooled_blaze(&self, now: Instant) -> (f32, f32) {
-        let dt = self
-            .heat_at
-            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32());
+        let dt = match self.heat_at {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32(),
+            None => 0.0,
+        };
         if dt > 0.0 && self.heat_tau_live > 0.0 {
             let heat = if self.heat != 0.0 {
-                self.heat * (-dt / self.heat_tau_live).exp()
+                self.heat * crate::color_math::exp_f32(-dt / self.heat_tau_live)
             } else {
                 0.0
             };
             let flare = if self.flare != 0.0 {
-                self.flare * (-dt * (1.0 / Self::FLARE_DECAY_TAU)).exp()
+                self.flare * crate::color_math::exp_f32(-dt * (1.0 / Self::FLARE_DECAY_TAU))
             } else {
                 0.0
             };
@@ -187,9 +195,10 @@ impl CursorGlow {
         const KEYED_CLICK_FRESH_DUR: Duration = Duration::from_nanos(
             (CursorGlow::KEYED_CLICK_FRESH as f64 * 1_000_000_000.0).round() as u64,
         );
-        let fresh = self
-            .keyed_click_at
-            .is_some_and(|t| now.saturating_duration_since(t) <= KEYED_CLICK_FRESH_DUR);
+        let fresh = match self.keyed_click_at {
+            Some(t) => now.saturating_duration_since(t) <= KEYED_CLICK_FRESH_DUR,
+            None => false,
+        };
         if !fresh {
             self.keyed_clicks = 0;
             self.keyed_click_at = None;

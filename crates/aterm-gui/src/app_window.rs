@@ -3796,6 +3796,29 @@ mod tests {
     }
 
     #[test]
+    fn a_mixed_tab_s_untitled_terminal_titles_the_window_by_its_cwd() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        crate::term_lock(&app.pool.get(session).expect("the split's shell").term)
+            .process(b"\x1b]7;file://localhost/aterm-proof/mixed-title\x07");
+        let title = app
+            .prepare_heterogeneous_input_scratch(wid)
+            .expect("a mixed frame");
+        let mut slot = String::new();
+        assert_eq!(
+            app.window_title_identity(wid, &title, &mut slot),
+            Some(session)
+        );
+        assert_eq!(
+            slot, "/aterm-proof/mixed-title",
+            "an untitled terminal leaf titles the window by its cwd, as a terminal tab does"
+        );
+    }
+
+    #[test]
     fn window_title_cwd_fallback_never_waits_for_the_terminal_parser() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);

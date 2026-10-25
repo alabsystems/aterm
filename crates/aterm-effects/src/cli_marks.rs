@@ -43,8 +43,6 @@ pub enum CliMark {
     Agy,
     /// Meta Muse Code.
     Muse,
-    /// Google Gemini CLI.
-    Gemini,
     /// xAI Grok.
     Grok,
     /// Moonshot Kimi Code.
@@ -53,12 +51,11 @@ pub enum CliMark {
 
 impl CliMark {
     /// All marks in declaration order.
-    pub const ALL: [CliMark; 7] = [
+    pub const ALL: [CliMark; 6] = [
         CliMark::Claude,
         CliMark::Codex,
         CliMark::Agy,
         CliMark::Muse,
-        CliMark::Gemini,
         CliMark::Grok,
         CliMark::Kimi,
     ];
@@ -71,7 +68,6 @@ impl CliMark {
             b"codex" => Some(Self::Codex),
             b"agy" => Some(Self::Agy),
             b"muse" => Some(Self::Muse),
-            b"gemini" => Some(Self::Gemini),
             b"grok" => Some(Self::Grok),
             b"kimi" => Some(Self::Kimi),
             _ => None,
@@ -211,7 +207,6 @@ pub const fn brand(mark: CliMark) -> &'static Brand {
         CliMark::Codex => &CODEX,
         CliMark::Agy => &AGY,
         CliMark::Muse => &MUSE,
-        CliMark::Gemini => &GEMINI,
         CliMark::Grok => &GROK,
         CliMark::Kimi => &KIMI,
     }
@@ -285,39 +280,6 @@ const MUSE: Brand = Brand {
     texels: &[Texel::Ink(0), Texel::Ink(1), Texel::Half(0)],
     sd: MUSE_SD,
     hd: Some(MUSE_HD),
-};
-
-/// Gemini CLI brand specification (six-stop name gradient and eight-stop icon gradient).
-const GEMINI: Brand = Brand {
-    word: "gemini",
-    alab_word: None,
-    name: Inks::both(&[
-        0x47_96E4, 0x5F_8BDB, 0x78_80D2, 0x91_76BE, 0xAA_6F9F, 0xC3_677F,
-    ]),
-    icon: Inks::both(&[
-        0x47_96E4, 0x58_8EDE, 0x6A_86D7, 0x7B_7ED1, 0x8D_77C3, 0x9F_72AC, 0xB1_6C96, 0xC3_677F,
-    ]),
-    chars: b"12345678abcdefgh",
-    texels: &[
-        Texel::Ink(0),
-        Texel::Ink(1),
-        Texel::Ink(2),
-        Texel::Ink(3),
-        Texel::Ink(4),
-        Texel::Ink(5),
-        Texel::Ink(6),
-        Texel::Ink(7),
-        Texel::Half(0),
-        Texel::Half(1),
-        Texel::Half(2),
-        Texel::Half(3),
-        Texel::Half(4),
-        Texel::Half(5),
-        Texel::Half(6),
-        Texel::Half(7),
-    ],
-    sd: GEMINI_SD,
-    hd: Some(GEMINI_HD),
 };
 
 /// Grok brand specification (monochrome, flipped with ground polarity).
@@ -509,19 +471,20 @@ pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
     let inks = b.icon.on(dark_ground(ground));
     let mut floored = [0u32; MAX_ICON_INKS];
-    for (slot, &ink) in floored.iter_mut().zip(inks) {
+    for (slot, &ink) in floored[..inks.len()].iter_mut().zip(inks) {
         *slot = floor_contrast_keeping_hue(ink, ground, ICON_CONTRAST);
     }
-    b.texels
-        .iter()
-        .map(|&t| match t {
+    let mut out = Vec::with_capacity(b.texels.len());
+    for &t in b.texels {
+        out.push(match t {
             Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
             Texel::Half(i) => {
                 FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA)
             }
             Texel::Hole(rgb) => FxInk::over(rgb, 255),
-        })
-        .collect()
+        });
+    }
+    out
 }
 
 /// Build the [`FxContent`] sprite payload for `mark` at `fit` on `ground`.
@@ -694,52 +657,6 @@ const MUSE_HD: &[&str] = &[
     ".........nMMMMn.........",
     "..........nMMn..........",
     "...........nn...........",
-];
-
-/// Gemini CLI's four-point sparkle, SD 12×12: two-pixel arms tapering to
-/// half-tone tips, column `k` in gradient stop `1 + round(k·7/11)`.
-const GEMINI_SD: &[&str] = &[
-    ".....de.....",
-    ".....45.....",
-    ".....45.....",
-    "....4455....",
-    "...344556...",
-    "a2234455677h",
-    "a2234455677h",
-    "...344556...",
-    "....4455....",
-    ".....45.....",
-    ".....45.....",
-    ".....de.....",
-];
-
-/// Gemini CLI's four-point sparkle, HD 24×24: an astroid (pinch 0.70),
-/// column `k` in gradient stop `1 + round(k·7/23)`.
-const GEMINI_HD: &[&str] = &[
-    "........................",
-    "...........de...........",
-    "...........45...........",
-    "..........d45e..........",
-    "..........4455..........",
-    ".........444555.........",
-    "........c444555f........",
-    ".......c34445556f.......",
-    "......c3344455566f......",
-    ".....33334445556666.....",
-    "...b2333344455566667g...",
-    ".a22233334445556666777h.",
-    ".a22233334445556666777h.",
-    "...b2333344455566667g...",
-    ".....33334445556666.....",
-    "......c3344455566f......",
-    ".......c34445556f.......",
-    "........c444555f........",
-    ".........444555.........",
-    "..........4455..........",
-    "..........d45e..........",
-    "...........45...........",
-    "...........de...........",
-    "........................",
 ];
 
 /// Grok's slashed ring, SD 12×12.
@@ -1077,7 +994,7 @@ mod tests {
     /// Every master is rectangular, holds only its declared chars, preserves its symmetry, and fits centred at integer scale.
     #[test]
     fn every_mark_is_crisp_and_centred() {
-        use CliMark::{Agy, Claude, Codex, Gemini, Grok, Kimi, Muse};
+        use CliMark::{Agy, Claude, Codex, Grok, Kimi, Muse};
         use Master::{Hd, Sd};
         for mark in CliMark::ALL {
             let b = brand(mark);
@@ -1098,10 +1015,10 @@ mod tests {
                     (rows[0].len(), rows.len()),
                     "{mark:?} {master:?}"
                 );
-                if matches!(mark, Claude | Agy | Muse | Gemini) {
+                if matches!(mark, Claude | Agy | Muse) {
                     assert!(mirrored(rows), "{mark:?} {master:?} mirrors");
                 }
-                if matches!(mark, Codex | Muse | Gemini) {
+                if matches!(mark, Codex | Muse) {
                     assert!(turned(rows), "{mark:?} {master:?} turns half round");
                 }
             }
@@ -1111,42 +1028,36 @@ mod tests {
             ((7, 14), Codex, Sd, 1, (1, 1)),
             ((7, 14), Agy, Sd, 1, (1, 2)),
             ((7, 14), Muse, Sd, 1, (1, 1)),
-            ((7, 14), Gemini, Sd, 1, (1, 1)),
             ((7, 14), Grok, Sd, 1, (1, 1)),
             ((7, 14), Kimi, Sd, 1, (1, 1)),
             ((9, 23), Claude, Sd, 1, (2, 6)),
             ((9, 23), Codex, Sd, 1, (3, 5)),
             ((9, 23), Agy, Sd, 1, (3, 6)),
             ((9, 23), Muse, Sd, 1, (3, 5)),
-            ((9, 23), Gemini, Sd, 1, (3, 5)),
             ((9, 23), Grok, Sd, 1, (3, 5)),
             ((9, 23), Kimi, Sd, 1, (3, 5)),
             ((11, 21), Claude, Sd, 1, (4, 5)),
             ((11, 21), Codex, Sd, 1, (5, 4)),
             ((11, 21), Agy, Sd, 1, (5, 5)),
             ((11, 21), Muse, Sd, 1, (5, 4)),
-            ((11, 21), Gemini, Sd, 1, (5, 4)),
             ((11, 21), Grok, Sd, 1, (5, 4)),
             ((11, 21), Kimi, Sd, 1, (5, 4)),
             ((15, 28), Claude, Hd, 1, (1, 6)),
             ((15, 28), Codex, Hd, 1, (3, 2)),
             ((15, 28), Agy, Sd, 2, (3, 4)),
             ((15, 28), Muse, Hd, 1, (3, 2)),
-            ((15, 28), Gemini, Hd, 1, (3, 2)),
             ((15, 28), Grok, Hd, 1, (3, 2)),
             ((15, 28), Kimi, Hd, 1, (3, 2)),
             ((22, 42), Claude, Sd, 3, (1, 6)),
             ((22, 42), Codex, Sd, 3, (4, 3)),
             ((22, 42), Agy, Sd, 3, (4, 6)),
             ((22, 42), Muse, Sd, 3, (4, 3)),
-            ((22, 42), Gemini, Sd, 3, (4, 3)),
             ((22, 42), Grok, Sd, 3, (4, 3)),
             ((22, 42), Kimi, Sd, 3, (4, 3)),
             ((30, 56), Claude, Hd, 2, (2, 12)),
             ((30, 56), Codex, Hd, 2, (6, 4)),
             ((30, 56), Agy, Sd, 5, (0, 3)),
             ((30, 56), Muse, Hd, 2, (6, 4)),
-            ((30, 56), Gemini, Hd, 2, (6, 4)),
             ((30, 56), Grok, Hd, 2, (6, 4)),
             ((30, 56), Kimi, Hd, 2, (6, 4)),
         ];

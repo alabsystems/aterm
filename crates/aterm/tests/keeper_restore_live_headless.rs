@@ -20,6 +20,9 @@ use crate::{child_output, headless_boot, launch_isolation};
 
 /// A wait for something that must happen is a hang detector (AGENTS.md).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// How long macOS may hold the first exec of a new program: the bound on the keeper showing
+/// it runs from its fresh copy of its code ([`keeper_ran`]).
+const FIRST_EXEC_HANG: Duration = aterm_uds::deadline::FIRST_EXEC_HANG;
 /// How often a wait on a status line asks again.
 const GAP: Duration = Duration::from_millis(50);
 
@@ -37,14 +40,49 @@ const LEDGER_SEAM: &str = "ATERM_DEBUG_RECOVERY_LEDGER";
 
 /// One scratch world the keeper and both instances share: one `$HOME`, one config with
 /// the keeper on, one `$XDG_RUNTIME_DIR` (where the keeper's socket lives, `/tmp` being no
-/// private `$TMPDIR`); removed on drop, after the keeper and every instance (declared
-/// after it, so dropped first), past the hung-up shell's last history write.
+/// private `$TMPDIR`), in a directory made for it ([`world`]); removed on drop, after the
+/// keeper and every instance (declared after it, so dropped first), past the hung-up shell's
+/// last history write, unless it holds a copy of the keeper's code that never showed it ran
+/// ([`unrun_copies`]).
 struct World(PathBuf);
 
 impl Drop for World {
     fn drop(&mut self) {
-        headless_boot::remove_world(&self.0);
+        let unrun = unrun_copies(&self.0);
+        if unrun.is_empty() {
+            headless_boot::remove_world(&self.0);
+        } else {
+            eprintln!(
+                "KEPT {}: the keeper's copy {unrun:?} never showed it ran, so macOS may still be \
+                 assessing its first exec; remove it once no process runs from it",
+                self.0.display()
+            );
+        }
     }
+}
+
+/// Where the world's keepers keep the copies of their code they run from.
+fn keeper_code(root: &Path) -> PathBuf {
+    aterm_keeper::code::code_dir_in(&root.join("home"))
+}
+
+/// The copies of the keeper's code in the world that never showed they ran (no
+/// [`aterm_keeper::code::RAN`] mark): macOS may still be assessing the first exec of one, and
+/// a file unlinked mid-assessment can strand every exec waiting on macOS's program check, so
+/// it stays until a child showed it ran from it (AGENTS.md), however old its exec stamp is.
+/// A half-made `.partial` copy was never run, and an entry no keeper named is no copy.
+fn unrun_copies(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(keeper_code(root))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            !name.ends_with(".partial") && aterm_keeper::code::owner_of(&name).is_some()
+        })
+        .map(|entry| entry.path())
+        .filter(|copy| !copy.join(aterm_keeper::code::RAN).exists())
+        .collect()
 }
 
 /// One child process, SIGKILLed and reaped on drop.
@@ -60,11 +98,19 @@ impl Drop for Proc {
     }
 }
 
+/// A new world in a directory made for it (`/tmp/atkr-<tag>-…`), never one an earlier run
+/// kept ([`World`]) and never removed to make room.
 fn world(tag: &str) -> World {
-    let root = PathBuf::from(format!("/tmp/atkr-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let made = aterm_tempfile::Builder::new()
+        .prefix(&format!("atkr-{tag}-"))
+        .tempdir_in("/tmp");
+    let world = match made {
+        Ok(dir) => World(dir.keep()),
+        Err(e) => aterm_spec::host::could_not_run(format!("no scratch world in /tmp ({e})")),
+    };
+    let root = &world.0;
     if !launch_isolation::sock_fits(&root.join("run/aterm/keeper-dev-00000000.sock"))
-        || launch_isolation::prepare(&root).is_err()
+        || launch_isolation::prepare(root).is_err()
     {
         aterm_spec::host::could_not_run("no scratch world with a socket path short enough");
     }
@@ -72,7 +118,7 @@ fn world(tag: &str) -> World {
     let mut text = std::fs::read_to_string(&config).expect("the scratch config");
     text.push_str("[keeper]\nenabled = true\n");
     std::fs::write(&config, text).expect("turn the keeper on");
-    World(root)
+    world
 }
 
 /// `aterm keeper <args…>` in the world's environment, read to its end.
@@ -110,23 +156,57 @@ fn await_keeper(root: &Path, word: &str) {
 }
 
 /// This build's keeper, in the foreground (`serve --no-relaunch`: no window is brought
-/// back, the next launch recovers).
+/// back, the next launch recovers). It runs again from a fresh copy of its code
+/// (`aterm_keeper::code`), a new program whose first exec macOS holds for as long as its
+/// queue of new programs makes it (over a minute behind a build's), so the one-minute wait for
+/// its answer starts once it showed it runs ([`await_start`]).
 fn keeper(root: &Path) -> Proc {
-    let log = std::fs::File::create(root.join("keeper.log")).expect("the keeper's log");
+    let log = root.join("keeper.log");
+    let file = std::fs::File::create(&log).expect("the keeper's log");
     let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
     cmd.args(["keeper", "serve", "--no-relaunch"])
         .stdin(Stdio::null())
-        .stdout(log.try_clone().expect("log"))
-        .stderr(log);
+        .stdout(file.try_clone().expect("log"))
+        .stderr(file);
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => aterm_spec::host::could_not_run(format!("cannot launch the keeper ({e})")),
     };
-    let keeper = Proc {
+    let mut keeper = Proc {
         child,
         _lifeline: None,
     };
+    let pid = keeper.child.id();
+    let started = await_start(root, pid, HANG, FIRST_EXEC_HANG, &mut || {
+        !matches!(keeper.child.try_wait(), Ok(None))
+    });
+    match started {
+        Start::Ran | Start::Ended => {}
+        Start::NoCopy => {
+            aterm_uds::deadline::require_trust_service();
+            panic!(
+                "the keeper (pid {pid}) made no copy of its code to run from in {HANG:?}: no \
+                 exec stamp in one, nothing in its log"
+            );
+        }
+        Start::NotRun => {
+            let held = aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0));
+            if let Some(words) = aterm_uds::deadline::held_words(pid, FIRST_EXEC_HANG, held) {
+                aterm_spec::host::could_not_run(words);
+            }
+            panic!(
+                "the keeper (pid {pid}) never showed it runs: no mark in its copy of its code, \
+                 nothing in its log"
+            );
+        }
+    }
+    if let Ok(Some(status)) = keeper.child.try_wait() {
+        panic!(
+            "the keeper exited ({status}) before it answered; its log:\n{}",
+            headless_boot::log_tail(&log)
+        );
+    }
     let mut last = String::new();
     let answered = aterm_spec::wait::within(HANG, GAP, || {
         last = keeper_status(root);
@@ -137,9 +217,70 @@ fn keeper(root: &Path) -> Proc {
     assert!(
         answered.is_some(),
         "the keeper never answered; its status:\n{last}\nits log:\n{}",
-        headless_boot::log_tail(&root.join("keeper.log"))
+        headless_boot::log_tail(&log)
     );
     keeper
+}
+
+/// How far a keeper's start got ([`await_start`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Start {
+    /// It showed it runs.
+    Ran,
+    /// It exited.
+    Ended,
+    /// No copy of its code was stamped for its exec, nor did it write a line.
+    NoCopy,
+    /// Its copy was stamped for its exec and never showed it runs.
+    NotRun,
+}
+
+/// Wait for keeper `pid` to show it runs, `ended` saying whether it exited, in two waits. First
+/// up to `copy_hang` for its copy's exec stamp ([`aterm_uds::deadline::EXEC_STAMP`], written
+/// just before it runs again from the copy): the work before is its own, its first exec (this
+/// build's) warmed by [`launch_isolation::apply`]. Then up to `run_hang` for the copy's mark
+/// ([`aterm_keeper::code::RAN`]): that wait is macOS's first-exec check of the copy. A line
+/// in its log answers either wait ([`keeper_reached`]).
+fn await_start(
+    root: &Path,
+    pid: u32,
+    copy_hang: Duration,
+    run_hang: Duration,
+    ended: &mut dyn FnMut() -> bool,
+) -> Start {
+    let mut wait = |hang, mark| {
+        aterm_spec::wait::within(hang, GAP, || {
+            if ended() {
+                Some(Start::Ended)
+            } else {
+                keeper_reached(root, pid, mark).then_some(Start::Ran)
+            }
+        })
+    };
+    match wait(copy_hang, aterm_uds::deadline::EXEC_STAMP) {
+        None => Start::NoCopy,
+        Some(Start::Ran) => wait(run_hang, aterm_keeper::code::RAN).unwrap_or(Start::NotRun),
+        Some(other) => other,
+    }
+}
+
+/// Whether keeper `pid`'s copy of its code in the world ([`keeper_code`], `<pid>-<start>`,
+/// never a half-made `.partial` one) holds the file `mark`, or the keeper wrote to its log,
+/// which before it runs from its copy it does only where its start went another way: it
+/// exits, serves from this build, or could not stamp its copy (a world made for it holds no
+/// earlier keeper's copy for its sweep to speak of).
+fn keeper_reached(root: &Path, pid: u32, mark: &str) -> bool {
+    let said = std::fs::metadata(root.join("keeper.log")).is_ok_and(|meta| meta.len() > 0);
+    said || std::fs::read_dir(keeper_code(root))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            !name.ends_with(".partial")
+                && aterm_keeper::code::owner_of(&name).is_some_and(|(owner, _)| owner == pid)
+                && entry.path().join(mark).exists()
+        })
 }
 
 /// One headless instance on its own socket in the world, hearing no system's memory pressure
@@ -750,4 +891,140 @@ fn an_instance_hearing_a_system_at_critical_sheds_its_ring() {
         "the stand-in system never reached the instance: {last}"
     );
     await_status(&mut ctl, "journal_ring", "shed");
+}
+
+/// A keeper has run once its copy of its code holds the mark it writes as it starts from it,
+/// or once it wrote to its log, never merely once it was spawned: the first exec of its copy is
+/// macOS's to finish. Negative controls: a half-made copy's mark, another keeper's (pids 42
+/// and 424 beside 4242) and an empty log are no proof.
+#[test]
+fn a_keeper_has_run_once_its_copy_says_so_or_it_wrote_a_line() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("akran-")
+        .tempdir()
+        .expect("a scratch world");
+    let root = scratch.path();
+    let copy = |name: &str, ran: bool| {
+        let dir = keeper_code(root).join(name);
+        std::fs::create_dir_all(&dir).expect("a copy");
+        if ran {
+            aterm_keeper::code::mark_ran(&dir);
+        }
+    };
+    let keeper_ran = |pid| keeper_reached(root, pid, aterm_keeper::code::RAN);
+    std::fs::write(root.join("keeper.log"), "").expect("the log");
+    copy("4242-1792000000-7", false);
+    copy("4242-1792000000-8.partial", true);
+    copy("42-1792000000-7", true);
+    assert!(!keeper_ran(4242), "spawned, its copy unmarked");
+    assert!(keeper_ran(42), "pid 42's marked copy");
+    copy("4242-1792000000-7", true);
+    assert!(keeper_ran(4242), "its copy marked");
+    assert!(
+        !keeper_ran(424),
+        "pid 4242's mark is not pid 424's, and its log is empty"
+    );
+    std::fs::write(root.join("keeper.log"), "aterm keeper serve: not a copy\n").expect("a line");
+    assert!(keeper_ran(424), "its line");
+}
+
+/// A keeper's start is judged in two waits ([`await_start`]): its own work up to its copy's
+/// exec stamp, then macOS's first-exec check of the copy up to the copy's mark. Each bound is
+/// zero here, so each wait looks once. Negative controls: no copy, or a copy not yet stamped,
+/// is [`Start::NoCopy`] (the first wait's, never the second's), a stamped copy unmarked is
+/// [`Start::NotRun`], and an exit or a line in its log ends either wait.
+#[test]
+fn a_keeper_s_start_waits_for_its_copy_s_stamp_then_its_mark() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("akstart-")
+        .tempdir()
+        .expect("a scratch world");
+    let root = scratch.path();
+    let now = |ended: bool| await_start(root, 4242, Duration::ZERO, Duration::ZERO, &mut || ended);
+    std::fs::write(root.join("keeper.log"), "").expect("the log");
+    assert_eq!(now(false), Start::NoCopy, "spawned, no copy");
+    assert_eq!(now(true), Start::Ended, "exited before it made one");
+    let copy = keeper_code(root).join("4242-1792000000-7");
+    std::fs::create_dir_all(&copy).expect("a copy");
+    assert_eq!(now(false), Start::NoCopy, "copied, not stamped");
+    aterm_uds::deadline::stamp_exec(&copy);
+    assert_eq!(now(false), Start::NotRun, "stamped, unmarked");
+    aterm_keeper::code::mark_ran(&copy);
+    assert_eq!(now(false), Start::Ran, "its copy marked");
+    std::fs::remove_dir_all(&copy).expect("its copy goes");
+    std::fs::write(root.join("keeper.log"), "aterm keeper serve: not a copy\n").expect("a line");
+    assert_eq!(now(false), Start::Ran, "its line, no copy");
+}
+
+/// A world whose keeper's copy never showed it ran is kept when dropped, the copy left to
+/// macOS's assessment of its first exec, however long ago it was stamped (the product's sweep
+/// would take a copy that old, [`aterm_uds::deadline::copy_may_go`]). Negative controls: once
+/// the copy holds its mark the world goes, beside an entry no keeper named and a half-made
+/// `.partial` copy, neither of which ran. (The copy's keeper is gone: this process's pid at
+/// another start.)
+#[test]
+fn a_world_holding_a_keeper_copy_that_never_ran_is_kept() {
+    let made = |ran: bool| {
+        let root = aterm_tempfile::Builder::new()
+            .prefix("akkept-")
+            .tempdir()
+            .expect("a scratch world")
+            .keep();
+        let copy = keeper_code(&root).join(format!("{}-1-2", std::process::id()));
+        std::fs::create_dir_all(&copy).expect("a copy");
+        aterm_uds::deadline::stamp_exec(&copy);
+        if ran {
+            aterm_keeper::code::mark_ran(&copy);
+        }
+        (root, copy)
+    };
+    let kept_when_dropped = |root: PathBuf| {
+        drop(World(root.clone()));
+        let kept = root.exists();
+        // The stand-in copy holds no program, so nothing assesses it: it may go now.
+        let _ = std::fs::remove_dir_all(&root);
+        kept
+    };
+    let (unrun, _) = made(false);
+    assert!(
+        kept_when_dropped(unrun),
+        "the world of a copy that never ran is kept"
+    );
+    let (aged, copy) = made(false);
+    std::fs::write(copy.join(aterm_uds::deadline::EXEC_STAMP), "").expect("a blank stamp");
+    std::fs::File::open(&copy)
+        .and_then(|dir| dir.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)))
+        .expect("the copy made long ago");
+    assert!(
+        aterm_uds::deadline::copy_may_go(&copy, std::time::SystemTime::now()),
+        "premise: by the product's rule the copy may go"
+    );
+    assert!(
+        kept_when_dropped(aged),
+        "the world of a copy that never ran is kept, however old the copy"
+    );
+    let (ran, copy) = made(true);
+    let code = copy.parent().expect("the copies' folder");
+    std::fs::write(code.join(".DS_Store"), "").expect("an entry no keeper named");
+    std::fs::create_dir_all(code.join(format!("{}-1-3.partial", std::process::id())))
+        .expect("a half-made copy");
+    drop(World(ran.clone()));
+    assert!(!ran.exists(), "the world of a copy that ran goes");
+}
+
+/// A world is made new each time ([`world`]): never at a path an earlier one holds, which a
+/// test before it with this pid and tag may have kept, and never by removing one. Negative
+/// control: each world goes when dropped.
+#[test]
+fn a_world_is_made_new_never_over_an_earlier_one() {
+    let first = world("u");
+    let marker = first.0.join("home").join("earlier");
+    std::fs::write(&marker, "").expect("a file in the earlier world");
+    let second = world("u");
+    assert_ne!(first.0, second.0, "two worlds of one tag in one process");
+    assert!(marker.exists(), "making a world removed an earlier one");
+    let (a, b) = (first.0.clone(), second.0.clone());
+    drop(second);
+    drop(first);
+    assert!(!a.exists() && !b.exists(), "each world goes when dropped");
 }

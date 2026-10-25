@@ -46,6 +46,9 @@ struct At<'a> {
     supervised: Vec<String>,
     barred: Vec<String>,
     live: Vec<String>,
+    held: Vec<String>,
+    /// What holds [`Self::held`]: a usage-limit wall unless a test says otherwise.
+    hold: HeldBy,
     dead: Vec<u32>,
 }
 
@@ -63,8 +66,15 @@ impl<'a> At<'a> {
             supervised: live.clone(),
             barred: Vec::new(),
             live,
+            held: Vec::new(),
+            hold: HeldBy::Limit,
             dead: Vec::new(),
         }
+    }
+
+    /// [`Self::held`], each with [`Self::hold`]: the look's [`Look::held`].
+    fn held_by(&self) -> Vec<(String, HeldBy)> {
+        self.held.iter().map(|s| (s.clone(), self.hold)).collect()
     }
 
     /// A look at `free` bytes free, its level judged against its own floor as a host's is.
@@ -81,6 +91,7 @@ impl<'a> At<'a> {
     fn step(&self, lease: &mut Lease, now_ms: i64) -> Said {
         let dead = self.dead.clone();
         let alive = move |h: &HostId| !dead.contains(&h.pid);
+        let held = self.held_by();
         step(
             lease,
             &Look {
@@ -97,6 +108,28 @@ impl<'a> At<'a> {
                 supervised: &self.supervised,
                 barred: &self.barred,
                 live: &self.live,
+                held: &held,
+                alive: &alive,
+            },
+        )
+    }
+}
+
+impl At<'_> {
+    /// This host's take-over before its look's pass ([`take_over`]), over the same roster.
+    fn take_over(&self, lease: &mut Lease) -> Vec<String> {
+        let dead = self.dead.clone();
+        let alive = move |h: &HostId| !dead.contains(&h.pid);
+        let held = self.held_by();
+        take_over(
+            lease,
+            &Roster {
+                host: self.host,
+                key: KEY,
+                supervised: &self.supervised,
+                barred: &self.barred,
+                live: &self.live,
+                held: &held,
                 alive: &alive,
             },
         )
@@ -207,17 +240,380 @@ fn one_session_machine_wide_is_elected_from_every_hosts_nominee() {
     );
 }
 
+/// A nominee whose host a look reads ended stands [`ADOPT_MS`] from that first read: a seamless
+/// update's successor, which runs the session under a new host, looks within it and nominates
+/// the session again, and the round elects it there; with no successor, the next best is elected
+/// once that time is over. A look that dropped the ended host's nominee at once
+/// (`Fault::DropEndedNominee`) elected a weaker seat, or ran out with nobody, before the
+/// successor's first look.
 #[test]
-fn a_dead_hosts_nominee_is_not_elected() {
-    let (h1, h2) = (host(1), host(2));
+fn an_ended_hosts_nominee_stands_for_its_successor_then_gives_way() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
     let mut lease = Lease::default();
     let mut one = At::short(&h1, vec![seat("s-a", 2, true)]);
     let two = At::short(&h2, vec![seat("s-c", 30, false)]);
     one.dead = vec![2];
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        two.step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    let round = lease.clone();
+    let at = T0 + NOMINATE_MS;
+    let waits = Said::Nominating {
+        until_ms: at + ADOPT_MS,
+        seat: Some("s-a".to_owned()),
+    };
+    assert_eq!(
+        one.step(&mut lease, at),
+        waits,
+        "s-c outranks s-a, and its host's successor may yet nominate it"
+    );
+    assert_eq!(
+        one.step(&mut lease, at + ADOPT_MS - 1),
+        waits,
+        "the wait runs from the look that first read its host ended"
+    );
+    let said = one.step(&mut lease.clone(), at + ADOPT_MS);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"),
+        "no successor looked: the next best: {said:?}"
+    );
+    // A successor runs s-c now, and its first look nominates it again: elected there.
+    let mut three = At::short(&h3, vec![seat("s-c", 30, false)]);
+    three.dead = vec![2];
+    assert_eq!(
+        three.step(&mut lease, at + ADOPT_MS - 1),
+        Said::Elected {
+            pick: Pick {
+                host: h3.clone(),
+                sid: "s-c".to_owned()
+            },
+            held: 30 * GIB
+        }
+    );
+    let dropped = fault::with(fault::Fault::DropEndedNominee, || {
+        one.step(&mut round.clone(), at)
+    });
+    assert!(
+        matches!(&dropped, Said::Elected { pick, .. } if pick.sid == "s-a"),
+        "the defect: the weaker seat, before the successor looked: {dropped:?}"
+    );
+    // A look of a host with no seat of its own waits too, where it ran out with nobody.
+    let mut lease = Lease::default();
+    let mut none = At::short(&h1, Vec::new());
+    none.dead = vec![2];
+    assert!(matches!(none.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        two.step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    assert_eq!(
+        none.step(&mut lease, at),
+        Said::Nominating {
+            until_ms: at + ADOPT_MS,
+            seat: None
+        }
+    );
+}
+
+/// A session held where it cannot take a line now (`Look::held`: an unspent usage-limit wall, a
+/// box only its owner can answer) is not among its host's seats, so it is never nominated, however
+/// much its checkout holds; and an elected one that comes to such a wall before its turn break
+/// goes back to the episode at its host's next look, at no election's cost. Kept owed
+/// (`Fault::KeepHeld`), it waited out its delivery window and was handed off as undelivered,
+/// spending an election with no line typed.
+#[test]
+fn a_pick_its_host_holds_at_a_wall_goes_back_to_the_episode_at_no_elections_cost() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-b", 9, true)]);
+    one.held = vec!["s-a".to_owned()];
+    one.live = vec!["s-a".to_owned(), "s-b".to_owned()];
+    one.supervised = one.live.clone();
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    let said = elected(&mut lease, &one, &two);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-b"),
+        "{said:?}"
+    );
+    one.seats.clear();
+    one.held = vec!["s-a".to_owned(), "s-b".to_owned()];
+    let t = T0 + NOMINATE_MS + 60_000;
+    let kept = fault::with(fault::Fault::KeepHeld, || one.step(&mut lease.clone(), t));
+    assert!(
+        matches!(&kept, Said::Owed { pick, .. } if pick.sid == "s-b"),
+        "the defect: owed on: {kept:?}"
+    );
+    let back = one.step(&mut lease, t);
+    assert_eq!(
+        back,
+        Said::Returned {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-b".to_owned()
+            },
+            why: HeldBy::Limit
+        }
+    );
+    assert!(back.moves(), "the host that moved it journals it");
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.released, e.asks, e.returned.as_slice()),
+        (0, 0, 0, ["s-b".to_owned()].as_slice()),
+        "out of the picks, so it costs no election"
+    );
+    assert!(matches!(
+        two.step(&mut lease, t + 60_000),
+        Said::Nominating { .. }
+    ));
+    let said = one.step(&mut lease, t + NOMINATE_MS);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-c"),
+        "{said:?}"
+    );
+}
+
+/// A session alone on the machine is elected mid-turn and comes to a usage-limit wall before its
+/// turn break: its host's next look sends it back to the episode, and the round, with nobody
+/// else to elect, waits for it (`said: waiting`) and elects it again at the first look after it
+/// is past, so its line goes once it rests. A session goes back once an episode: held again
+/// after that second election, it is released and stays a pick, so the next round, with nobody
+/// left, runs out. A release that kept it a pick at its first wall (`Fault::HoldKeepsPick`, the
+/// release before held picks went back) ran the round out there with no line typed, and the
+/// episode parked for its cooldown though the session was past twenty minutes later.
+#[test]
+fn a_pick_held_after_its_election_is_waited_for_and_elected_again_once_past() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 30, false)]);
+    let two = At::short(&h2, Vec::new());
     let said = elected(&mut lease, &one, &two);
     assert!(
         matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"),
         "{said:?}"
+    );
+    one.seats.clear();
+    one.held = vec!["s-a".to_owned()];
+    let t = T0 + NOMINATE_MS + 60_000;
+    let walled = lease.clone();
+    assert!(matches!(one.step(&mut lease, t), Said::Returned { .. }));
+    let round = t + NOMINATE_MS;
+    let mut kept = walled.clone();
+    let out = fault::with(fault::Fault::HoldKeepsPick, || {
+        let released = one.step(&mut kept, t);
+        assert!(
+            matches!(
+                released,
+                Said::Handoff {
+                    why: Miss::Released,
+                    ..
+                }
+            ),
+            "{released:?}"
+        );
+        one.step(&mut kept, round)
+    });
+    assert_eq!(
+        out,
+        Said::Out {
+            last: Some(Miss::Released),
+            asked: false
+        },
+        "the defect: out at its first wall"
+    );
+    let waiting = Said::Waiting {
+        held: vec!["s-a".to_owned()],
+        why: vec![HeldBy::Limit],
+    };
+    assert_eq!(two.step(&mut lease, round), waiting);
+    assert_eq!(one.step(&mut lease, round + 20 * 60_000), waiting);
+    let e = lease.entry(KEY).expect("entry").clone();
+    assert!(
+        owner_line(&e, round + 20 * 60_000).is_some_and(|l| l.contains("usage limit")),
+        "{:?}",
+        owner_line(&e, round + 20 * 60_000)
+    );
+    assert!(
+        why_lines(&lease, &[], round)
+            .iter()
+            .any(|l| l.contains("back in the episode") && l.contains("@s-a")),
+        "{:#?}",
+        why_lines(&lease, &[], round)
+    );
+    one.held.clear();
+    one.seats = vec![seat("s-a", 30, false)];
+    let past = round + 21 * 60_000;
+    let said = one.step(&mut lease, past);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"),
+        "past its wall, elected again: {said:?}"
+    );
+    let mut typed = lease.clone();
+    assert_eq!(
+        at_break(&mut typed, KEY, &h1, "s-a", past + 60_000, false),
+        Break::Yours,
+        "its line goes at its turn break"
+    );
+    // Held again after that second election: released, and it stays a pick.
+    one.seats.clear();
+    one.held = vec!["s-a".to_owned()];
+    assert_eq!(
+        one.step(&mut lease, past + 60_000),
+        Said::Handoff {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned()
+            },
+            why: Miss::Released
+        }
+    );
+    let e = lease.entry(KEY).expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.released, e.returned.len()),
+        (1, 1, 1),
+        "released at no election's cost, and back no more"
+    );
+    assert_eq!(
+        two.step(&mut lease, past + 60_000 + NOMINATE_MS),
+        Said::Out {
+            last: Some(Miss::Released),
+            asked: false
+        },
+        "nobody left to elect or wait for"
+    );
+}
+
+/// The lease's record of every host's held sessions is kept only while an episode is open: it
+/// goes with the episode, and the next one starts from the opening look's own. A record kept past
+/// its episode was never replaced while the volume read clear (no look steps it then), so
+/// `harness disk why` said, days on, that a session long past its wall was at it, and the next
+/// episode's first owner line said every session was at a usage limit before the host whose
+/// record it was looked again.
+#[test]
+fn the_record_of_held_sessions_goes_with_its_episode() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 3, true)]);
+    let mut two = At::short(&h2, Vec::new());
+    two.held = vec!["s-c".to_owned()];
+    two.live = two.held.clone();
+    two.supervised = two.held.clone();
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        two.step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    assert_eq!(lease.entry(KEY).map(|e| e.held.len()), Some(1));
+    let mut clear = At::short(&h1, Vec::new());
+    clear.reads(FLOOR + END_MARGIN);
+    assert!(matches!(
+        clear.step(&mut lease, T0 + 120_000),
+        Said::Ended { .. }
+    ));
+    let e = lease.entry(KEY).expect("entry").clone();
+    assert!(e.held.is_empty(), "{:?}", e.held);
+    assert!(
+        !why_lines(&lease, &[], T0 + 3_600_000)
+            .iter()
+            .any(|l| l.contains("usage limit")),
+        "{:#?}",
+        why_lines(&lease, &[], T0 + 3_600_000)
+    );
+    // A day on the volume falls short again; host 1 opens with no seat of its own, before host 2
+    // (whose session is long past its wall) looks.
+    let none = At::short(&h1, Vec::new());
+    let later = T0 + 86_400_000;
+    assert!(matches!(none.step(&mut lease, later), Said::Opened { .. }));
+    let e = lease.entry(KEY).expect("entry").clone();
+    assert!(e.held.is_empty(), "{:?}", e.held);
+    assert_eq!(
+        owner_line(&e, later + NOMINATE_MS),
+        None,
+        "no stale wall told to the owner"
+    );
+    // A look of a host whose own session is held at the opening records it.
+    let mut lease = Lease::default();
+    let mut walled = At::short(&h1, Vec::new());
+    walled.held = vec!["s-a".to_owned()];
+    walled.live = walled.held.clone();
+    walled.supervised = walled.held.clone();
+    assert!(matches!(walled.step(&mut lease, T0), Said::Opened { .. }));
+    assert_eq!(
+        lease.entry(KEY).map(|e| e.held.clone()),
+        Some(vec![Held {
+            host: h1.clone(),
+            sid: "s-a".to_owned(),
+            why: Some(HeldBy::Limit),
+            orphan_ms: None
+        }])
+    );
+}
+
+/// When the round's time is over and every session not yet elected is held at a wall or a box,
+/// the round waits for one to be past, and the owner's line says so; the first look after one is
+/// past elects it. A round that ran out on them (`Fault::OutWhileHeld`) parked the episode for
+/// its cooldown while a session that could free space was a reset away.
+#[test]
+fn a_round_whose_sessions_are_all_held_waits_and_elects_the_first_past() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, Vec::new());
+    one.held = vec!["s-a".to_owned()];
+    one.live = one.held.clone();
+    one.supervised = one.held.clone();
+    let mut two = At::short(&h2, Vec::new());
+    two.held = vec!["s-c".to_owned()];
+    two.live = two.held.clone();
+    two.supervised = two.held.clone();
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        two.step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    let at = T0 + NOMINATE_MS;
+    let out = fault::with(fault::Fault::OutWhileHeld, || {
+        one.step(&mut lease.clone(), at)
+    });
+    assert!(matches!(out, Said::Out { .. }), "the defect: {out:?}");
+    let waiting = Said::Waiting {
+        held: vec!["s-a".to_owned(), "s-c".to_owned()],
+        why: vec![HeldBy::Limit],
+    };
+    assert_eq!(one.step(&mut lease, at), waiting);
+    assert!(!waiting.moves(), "a standing word");
+    assert_eq!(two.step(&mut lease, at + 3_600_000), waiting);
+    let e = lease.entry(KEY).expect("entry").clone();
+    assert!(
+        owner_line(&e, at + 3_600_000).is_some_and(|l| l.contains("usage limit")),
+        "{:?}",
+        owner_line(&e, at + 3_600_000)
+    );
+    assert!(
+        why_lines(&lease, &[], at).iter().any(|l| l
+            .contains("@s-a (host pid 1) at a usage limit, @s-c (host pid 2) at a usage limit")),
+        "{:#?}",
+        why_lines(&lease, &[], at)
+    );
+    assert_eq!(
+        Lease::decode(&lease.encode()),
+        Lease {
+            schema: 1,
+            ..lease.clone()
+        },
+        "the held sessions round-trip the lease file"
+    );
+    two.held.clear();
+    two.seats = vec![seat("s-c", 4, true)];
+    let said = two.step(&mut lease, at + 3_660_000);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-c"),
+        "past its wall, elected: {said:?}"
+    );
+    assert_eq!(
+        lease.entry(KEY).map(|e| e.held.len()),
+        Some(1),
+        "s-a is held still"
     );
 }
 
@@ -477,7 +873,10 @@ fn an_episode_parked_out_or_settled_gives_way_to_a_new_one_after_the_cooldown() 
     ));
     assert_eq!(
         one.step(&mut lease, T0 + NOMINATE_MS),
-        Said::Out { last: None }
+        Said::Out {
+            last: None,
+            asked: false
+        }
     );
     // Free space then sits within the margin above the floor for days: ordinary churn.
     let mut now = T0 + NOMINATE_MS;
@@ -547,7 +946,10 @@ fn an_episode_parked_out_or_settled_gives_way_to_a_new_one_after_the_cooldown() 
     assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
     assert_eq!(
         one.step(&mut lease, T0 + NOMINATE_MS),
-        Said::Out { last: None }
+        Said::Out {
+            last: None,
+            asked: false
+        }
     );
     one.done = None;
     assert_eq!(
@@ -853,7 +1255,8 @@ fn a_session_that_frees_nothing_hands_off_to_one_other_then_the_episode_is_out()
     assert_eq!(
         one.step(&mut lease, t3),
         Said::Out {
-            last: Some(Miss::NothingFreed)
+            last: Some(Miss::NothingFreed),
+            asked: true
         },
         "two lines this episode: no third session is asked"
     );
@@ -884,12 +1287,63 @@ fn a_pick_that_never_takes_its_line_costs_an_election_and_the_elections_are_boun
             } => now += NOMINATE_MS,
             Said::Out {
                 last: Some(Miss::Undelivered),
+                asked: false,
             } => break,
             other => panic!("unexpected {other:?}"),
         }
     }
     assert_eq!(elected_sids, ["s-0", "s-1", "s-2", "s-3"]);
     assert_eq!(lease.entry(KEY).expect("entry").asks, 0);
+}
+
+/// An episode that runs out with no line typed says that no session took its line, as the
+/// owner's line does, not that the agents asked did not free it: the ledger row and `harness
+/// disk why` read this sentence. Only an episode whose lines went says the agents asked did not
+/// free it.
+#[test]
+fn an_episode_out_with_no_line_typed_says_no_session_took_its_line() {
+    let h1 = host(1);
+    let seats: Vec<Seat> = (0..6)
+        .map(|i| seat(&format!("s-{i}"), 10 - i, false))
+        .collect();
+    let one = At::short(&h1, seats);
+    let run_out = |type_lines: bool| {
+        let mut lease = Lease::default();
+        assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+        let mut now = T0 + NOMINATE_MS;
+        loop {
+            match one.step(&mut lease, now) {
+                Said::Elected { pick, .. } if type_lines => {
+                    assert!(typed(&mut lease, KEY, &h1, &pick.sid, now, 20 * GIB));
+                    now += ANSWER_MS;
+                }
+                Said::Elected { .. } => now += DELIVER_MS,
+                Said::Handoff { .. } => now += NOMINATE_MS,
+                said @ Said::Out { .. } => return (said, lease),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    };
+    let (out, lease) = run_out(false);
+    let text = out.describe();
+    assert!(
+        text.starts_with("no session took its line (last: undelivered)"),
+        "{text}"
+    );
+    let row = row(T0 / 1000, KEY, &out, Level::Short, 0, &h1);
+    assert!(row.contains("no session took its line"), "{row}");
+    assert!(
+        owner_line(lease.entry(KEY).expect("entry"), T0 + COOLDOWN_MS)
+            .is_some_and(|l| l.contains("none took its line")),
+        "the owner's line says the same"
+    );
+    let (out, _) = run_out(true);
+    assert!(
+        out.describe()
+            .starts_with("the agents asked did not free it (last: nothing-freed)"),
+        "{}",
+        out.describe()
+    );
 }
 
 #[test]
@@ -1036,7 +1490,8 @@ fn a_host_that_finds_its_pick_may_not_be_asked_releases_it_and_a_host_with_no_se
     assert_eq!(
         one.step(&mut lease, T0 + 2 * NOMINATE_MS + 1),
         Said::Out {
-            last: Some(Miss::Released)
+            last: Some(Miss::Released),
+            asked: false
         },
         "its one session was picked already: nobody is left to ask"
     );
@@ -1045,7 +1500,10 @@ fn a_host_that_finds_its_pick_may_not_be_asked_releases_it_and_a_host_with_no_se
     assert!(matches!(none.step(&mut lease, T0), Said::Opened { .. }));
     assert_eq!(
         none.step(&mut lease, T0 + NOMINATE_MS),
-        Said::Out { last: None }
+        Said::Out {
+            last: None,
+            asked: false
+        }
     );
 }
 
@@ -1381,6 +1839,298 @@ fn another_hosts_look_leaves_an_ended_hosts_pick_owed_until_its_successor_adopts
     );
 }
 
+/// A seamless update's successor takes its session's owed pick over as its first look begins,
+/// before that look's pass, so another host's look while the pass runs, past `ADOPT_MS` from
+/// the look that first read the ended host, reads the pick's host running and keeps it owed; the
+/// successor's step after its pass keeps it and its line goes there. With the take-over at the
+/// step after the pass alone (`Fault::NoTakeOver`), a first look's pass longer than about a
+/// minute (discovery, profile walks) let that other look hand the pick off as undelivered,
+/// spending an election on the session the successor runs.
+#[test]
+fn a_successor_takes_its_sessions_pick_over_before_its_pass_so_no_other_look_hands_it_off() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
+    let mut lease = Lease::default();
+    let one = At::short(&h1, vec![seat("s-a", 12, true)]);
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    elected(&mut lease, &one, &two);
+    let mut other = At::short(&h2, vec![seat("s-c", 3, true)]);
+    other.dead = vec![1];
+    let ended = T0 + NOMINATE_MS + 30_000;
+    assert!(matches!(other.step(&mut lease, ended), Said::Owed { .. }));
+    let mut successor = At::short(&h3, vec![seat("s-a", 12, true)]);
+    successor.dead = vec![1];
+    let begins = ended + 60_000;
+    let before = lease.clone();
+    assert_eq!(
+        other.take_over(&mut lease),
+        Vec::<String>::new(),
+        "not its session"
+    );
+    assert_eq!(lease, before, "another host takes nothing over");
+    let skipped = fault::with(fault::Fault::NoTakeOver, || {
+        let mut l = lease.clone();
+        assert!(successor.take_over(&mut l).is_empty());
+        other.step(&mut l, ended + ADOPT_MS)
+    });
+    assert_eq!(
+        skipped,
+        Said::Handoff {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned()
+            },
+            why: Miss::Undelivered
+        },
+        "the defect the conformance control arms: handed off while the successor's pass ran"
+    );
+    assert_eq!(successor.take_over(&mut lease), vec!["s-a".to_owned()]);
+    let adopted = Pick {
+        host: h3.clone(),
+        sid: "s-a".to_owned(),
+    };
+    assert!(
+        matches!(phase(&lease), Phase::Owed { pick, orphan_ms: None, .. } if *pick == adopted),
+        "{:?}",
+        phase(&lease)
+    );
+    assert_eq!(
+        lease
+            .entry(KEY)
+            .map(|e| (e.picks.clone(), e.released, e.asks)),
+        Some((vec![adopted.clone()], 0, 0)),
+        "moved, nothing else"
+    );
+    assert_eq!(
+        successor.take_over(&mut lease),
+        Vec::<String>::new(),
+        "nothing left to take"
+    );
+    // The successor's pass runs on; the other host's looks keep the pick owed.
+    for at in [ended + ADOPT_MS, ended + 2 * ADOPT_MS] {
+        assert!(
+            matches!(other.step(&mut lease, at), Said::Owed { pick, .. } if pick == adopted),
+            "{at}"
+        );
+    }
+    assert!(matches!(
+        successor.step(&mut lease, begins + 3 * ADOPT_MS),
+        Said::Owed { pick, .. } if pick == adopted
+    ));
+    assert_eq!(
+        at_break(
+            &mut lease,
+            KEY,
+            &h3,
+            "s-a",
+            begins + 3 * ADOPT_MS + 1,
+            false
+        ),
+        Break::Yours
+    );
+    // No episode open: nothing to take.
+    let mut idle = Lease::default();
+    assert!(successor.take_over(&mut idle).is_empty());
+    assert_eq!(idle, Lease::default());
+}
+
+/// A successor's take-over before its pass moves the ended host's nominee of a session it may
+/// nominate to itself, figures kept, so the other host's look past the round's time elects it
+/// there instead of waiting for, or dropping, the ended host's; it drops the nominee of a session
+/// its seat rule bars, and records one it holds as held. It moves the ended host's record of
+/// every held session it runs, whether or not its seat rule reads that session held before its
+/// pass (D), as that reading can lack what holds it: the step after the pass replaces the records
+/// with its own reading, under one lock.
+#[test]
+fn a_successor_takes_over_its_sessions_nominee_and_held_record_before_its_pass() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 30, true)]);
+    one.held = vec!["s-b".to_owned(), "s-d".to_owned()];
+    one.live.extend(one.held.clone());
+    one.supervised = one.live.clone();
+    let two = At::short(&h2, vec![seat("s-c", 3, true)]);
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    assert!(matches!(
+        two.step(&mut lease, T0 + 60_000),
+        Said::Nominating { .. }
+    ));
+    let mut successor = At::short(&h3, Vec::new());
+    successor.live = ["s-a", "s-b", "s-d"].map(str::to_owned).to_vec();
+    successor.supervised = successor.live.clone();
+    successor.held = vec!["s-b".to_owned()];
+    successor.dead = vec![1];
+    let round = lease.clone();
+    assert_eq!(
+        successor.take_over(&mut lease),
+        ["s-a", "s-b", "s-d"].map(str::to_owned).to_vec()
+    );
+    let e = lease.entry(KEY).expect("entry").clone();
+    let Phase::Nominating { nominees, .. } = &e.phase else {
+        panic!("{:?}", e.phase);
+    };
+    assert_eq!(
+        nominees
+            .iter()
+            .map(|n| (n.host.pid, n.sid.as_str(), n.held, n.orphan_ms))
+            .collect::<Vec<_>>(),
+        [(3, "s-a", 30 * GIB, None), (2, "s-c", 3 * GIB, None)],
+        "A's nominee moved with its figures"
+    );
+    let records = |e: &Entry| {
+        e.held
+            .iter()
+            .map(|h| (h.host.pid, h.sid.clone(), h.why))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        records(&e),
+        [
+            (3, "s-b".to_owned(), Some(HeldBy::Limit)),
+            (3, "s-d".to_owned(), Some(HeldBy::Limit))
+        ],
+        "B's and D's records moved, D's though the successor's rule does not read it held yet"
+    );
+    let mut other = At::short(&h2, vec![seat("s-c", 3, true)]);
+    other.dead = vec![1];
+    assert_eq!(
+        other.step(&mut lease, T0 + NOMINATE_MS),
+        Said::Elected {
+            pick: Pick {
+                host: h3.clone(),
+                sid: "s-a".to_owned()
+            },
+            held: 30 * GIB
+        },
+        "elected on the successor at the round's time"
+    );
+    // A successor whose seat rule bars A drops its nominee.
+    let mut barring = round.clone();
+    successor.barred = vec!["s-a".to_owned()];
+    assert_eq!(
+        successor.take_over(&mut barring),
+        ["s-b", "s-d"].map(str::to_owned).to_vec()
+    );
+    assert!(
+        matches!(
+            phase(&barring),
+            Phase::Nominating { nominees, .. } if nominees.iter().all(|n| n.sid != "s-a")
+        ),
+        "{:?}",
+        phase(&barring)
+    );
+    // A successor whose seat rule holds A, and B, at a draft left in its prompt: A's nominee
+    // becomes a record of A held there, and B's record says the draft.
+    let mut holding = round;
+    successor.barred.clear();
+    successor.held = vec!["s-a".to_owned(), "s-b".to_owned()];
+    successor.hold = HeldBy::Draft;
+    assert_eq!(
+        successor.take_over(&mut holding),
+        ["s-a", "s-b", "s-d"].map(str::to_owned).to_vec()
+    );
+    let e = holding.entry(KEY).expect("entry").clone();
+    assert!(
+        matches!(
+            &e.phase,
+            Phase::Nominating { nominees, .. } if nominees.iter().all(|n| n.sid != "s-a")
+        ),
+        "{:?}",
+        e.phase
+    );
+    assert_eq!(
+        records(&e),
+        [
+            (3, "s-b".to_owned(), Some(HeldBy::Draft)),
+            (3, "s-d".to_owned(), Some(HeldBy::Limit)),
+            (3, "s-a".to_owned(), Some(HeldBy::Draft))
+        ]
+    );
+    let mut other = At::short(&h2, vec![seat("s-c", 3, true)]);
+    other.dead = vec![1];
+    assert_eq!(
+        other.step(&mut holding, T0 + NOMINATE_MS),
+        Said::Elected {
+            pick: Pick {
+                host: h2.clone(),
+                sid: "s-c".to_owned()
+            },
+            held: 3 * GIB
+        },
+        "C, as A's successor holds A"
+    );
+}
+
+/// A round waits past its time on an ended host's record of a held session alone when that
+/// host's successor begins a look whose seat rule, before its pass, does not read the session
+/// held (before its first pass a process places no session on the volume, and reads no draft as
+/// standing): its take-over moves the record to itself, so another host's look while the pass
+/// runs, past `ADOPT_MS` too, still waits, and the successor's step after its pass, reading the
+/// session fit, replaces the record and elects it. A take-over that dropped the record by that
+/// reading (`Fault::TakeOverByRule`, the first take-over) left the round with nobody to elect or
+/// wait for, and the other host's look ran the episode out, parking it for its cooldown.
+#[test]
+fn a_successor_keeps_a_held_record_it_takes_over_whatever_its_rule_reads_before_its_pass() {
+    let (h1, h2, h3) = (host(1), host(2), host(3));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, Vec::new());
+    one.held = vec!["s-a".to_owned()];
+    one.hold = HeldBy::Draft;
+    one.live = one.held.clone();
+    one.supervised = one.held.clone();
+    let two = At::short(&h2, Vec::new());
+    assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+    let round = T0 + NOMINATE_MS;
+    let waiting = Said::Waiting {
+        held: vec!["s-a".to_owned()],
+        why: vec![HeldBy::Draft],
+    };
+    assert_eq!(two.step(&mut lease, round), waiting);
+    let mut successor = At::short(&h3, Vec::new());
+    successor.live = vec!["s-a".to_owned()];
+    successor.supervised = successor.live.clone();
+    successor.dead = vec![1];
+    let mut other = At::short(&h2, Vec::new());
+    other.dead = vec![1];
+    let begins = round + 120_000;
+    let dropped = fault::with(fault::Fault::TakeOverByRule, || {
+        let mut l = lease.clone();
+        assert!(successor.take_over(&mut l).is_empty());
+        other.step(&mut l, begins + 60_000)
+    });
+    assert_eq!(
+        dropped,
+        Said::Out {
+            last: None,
+            asked: false
+        },
+        "the defect: run out while the successor's pass ran"
+    );
+    assert_eq!(successor.take_over(&mut lease), vec!["s-a".to_owned()]);
+    assert_eq!(
+        lease.entry(KEY).map(|e| e.held.clone()),
+        Some(vec![Held {
+            host: h3.clone(),
+            sid: "s-a".to_owned(),
+            why: Some(HeldBy::Draft),
+            orphan_ms: None
+        }]),
+        "moved, its hold kept"
+    );
+    for at in [begins + 60_000, begins + ADOPT_MS + 60_000] {
+        assert_eq!(other.step(&mut lease, at), waiting, "{at}");
+    }
+    successor.seats = vec![seat("s-a", 9, true)];
+    let said = successor.step(&mut lease, begins + ADOPT_MS + 90_000);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.host == h3 && pick.sid == "s-a"),
+        "the step after the pass reads A fit: {said:?}"
+    );
+    assert!(
+        lease.entry(KEY).is_some_and(|e| e.held.is_empty()),
+        "{lease:?}"
+    );
+}
+
 #[test]
 fn a_late_record_that_spends_the_episodes_lines_withdraws_a_pick_elected_since() {
     let (h1, h2) = (host(1), host(2));
@@ -1449,7 +2199,8 @@ fn a_late_record_that_spends_the_episodes_lines_withdraws_a_pick_elected_since()
     assert_eq!(
         one.step(&mut lease, at + ANSWER_MS),
         Said::Out {
-            last: Some(Miss::NothingFreed)
+            last: Some(Miss::NothingFreed),
+            asked: true
         }
     );
     // The planted defect the conformance control arms: C stays owed, and takes a third line.
@@ -1560,7 +2311,8 @@ fn a_lost_record_is_counted_after_its_pick_was_handed_off_and_waits_on_its_answe
     assert_eq!(
         two.step(&mut lease, t + ANSWER_MS),
         Said::Out {
-            last: Some(Miss::NothingFreed)
+            last: Some(Miss::NothingFreed),
+            asked: true
         },
         "two lines went: nobody else is asked"
     );
@@ -1999,13 +2751,17 @@ fn the_owners_line_says_who_was_asked_and_what_came_of_it() {
     let two = At::short(&h2, vec![seat("s-c", 3, true)]);
     elected(&mut lease, &one, &two);
     let entry = |l: &Lease| l.entry(KEY).cloned().expect("entry");
-    assert_eq!(owner_line(&entry(&lease)), None, "no line typed yet");
+    assert_eq!(
+        owner_line(&entry(&lease), T0 + NOMINATE_MS),
+        None,
+        "no line typed yet"
+    );
     let t = T0 + NOMINATE_MS + 1;
     assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
-    let said = owner_line(&entry(&lease)).expect("asked");
+    let said = owner_line(&entry(&lease), t).expect("asked");
     assert!(said.starts_with("aterm asked @s-a at 2026-"), "{said}");
     two.step(&mut lease, t + ANSWER_MS);
-    let said = owner_line(&entry(&lease)).expect("handing off");
+    let said = owner_line(&entry(&lease), t + ANSWER_MS).expect("handing off");
     assert!(said.contains("one other session is asked"), "{said}");
     one.step(&mut lease, t + ANSWER_MS + 1);
     two.step(&mut lease, t + ANSWER_MS + 2);
@@ -2019,14 +2775,210 @@ fn the_owners_line_says_who_was_asked_and_what_came_of_it() {
         20 * GIB
     ));
     one.step(&mut lease, t + 2 * ANSWER_MS + NOMINATE_MS);
-    let said = owner_line(&entry(&lease)).expect("out");
+    let said = owner_line(&entry(&lease), t + 2 * ANSWER_MS + NOMINATE_MS).expect("out");
     assert!(said.contains("asked @s-a and @s-c"), "{said}");
     assert!(said.contains("no more agents are asked"), "{said}");
     let mut lease = Lease::default();
     let none = At::short(&h1, Vec::new());
     none.step(&mut lease, T0);
     none.step(&mut lease, T0 + NOMINATE_MS);
-    assert!(owner_line(&entry(&lease)).is_some_and(|s| s.contains("only you can free it")));
+    assert!(
+        owner_line(&entry(&lease), T0 + NOMINATE_MS)
+            .is_some_and(|s| s.contains("only you can free it"))
+    );
+}
+
+/// After a line went and freed nothing, a round whose sessions are all held at a wall or a box
+/// waits (`said: waiting`), for days at a weekly limit: the owner's line says so, and who was
+/// asked. It said one other session was being asked, while nobody was, as it read the hand-off
+/// before the wait. Before the round's time is over, other hosts may yet nominate, so it says the
+/// hand-off.
+#[test]
+fn the_owners_line_says_a_round_after_a_line_waits_on_held_sessions() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut one = At::short(&h1, vec![seat("s-a", 12, true), seat("s-b", 3, true)]);
+    let mut two = At::short(&h2, vec![seat("s-c", 5, true)]);
+    let said = elected(&mut lease, &one, &two);
+    assert!(
+        matches!(&said, Said::Elected { pick, .. } if pick.sid == "s-a"),
+        "{said:?}"
+    );
+    let t = T0 + NOMINATE_MS + 1;
+    assert!(typed(&mut lease, KEY, &h1, "s-a", t, 20 * GIB));
+    // B and C come to walls before A's answer is due.
+    one.seats = vec![seat("s-a", 12, true)];
+    one.held = vec!["s-b".to_owned()];
+    two.seats.clear();
+    two.held = vec!["s-c".to_owned()];
+    let missed = t + ANSWER_MS;
+    assert!(matches!(
+        one.step(&mut lease, missed),
+        Said::Handoff {
+            why: Miss::NothingFreed,
+            ..
+        }
+    ));
+    assert!(matches!(
+        two.step(&mut lease, missed + 60_000),
+        Said::Nominating { .. }
+    ));
+    let said = owner_line(lease.entry(KEY).expect("entry"), missed + 60_000).expect("handing off");
+    assert!(
+        said.contains("so one other session is asked"),
+        "within the round's time: {said}"
+    );
+    let over = missed + NOMINATE_MS;
+    let waiting = Said::Waiting {
+        held: vec!["s-b".to_owned(), "s-c".to_owned()],
+        why: vec![HeldBy::Limit],
+    };
+    assert_eq!(one.step(&mut lease, over), waiting);
+    let days = over + 3 * 86_400_000;
+    assert_eq!(two.step(&mut lease, days), waiting);
+    let said = owner_line(lease.entry(KEY).expect("entry"), days).expect("waiting");
+    assert!(
+        said.starts_with("aterm asked @s-a; it freed under 1"),
+        "{said}"
+    );
+    assert!(said.contains("usage limit"), "{said}");
+    assert!(
+        !said.contains("one other session is asked"),
+        "nobody is asked: {said}"
+    );
+}
+
+/// A round that waits on a session held by the owner's hold (or a person's take-over) or by a
+/// draft left in its prompt says what holds it and what ends the wait, on the owner's line, in
+/// `harness disk why`, in the journal's sentence and in its row: it is no usage limit and no
+/// box, and the owner, told to look for one, was never told that lifting the hold, or sending or
+/// clearing the draft, lets the ask go on. A session given back for either says so too. A
+/// record an older build wrote names no hold, and is said as the two that build knew, as is a
+/// hold word this build does not know.
+#[test]
+fn a_round_that_waits_on_a_hold_or_a_draft_says_what_holds_it_and_what_ends_the_wait() {
+    let (h1, h2) = (host(1), host(2));
+    for (hold, at, past) in [
+        (
+            HeldBy::Hold,
+            "on hold (yours, or a person's take-over)",
+            "its hold is lifted",
+        ),
+        (
+            HeldBy::Draft,
+            "with a draft left in its prompt",
+            "its draft is sent or cleared",
+        ),
+    ] {
+        let mut lease = Lease::default();
+        let mut one = At::short(&h1, Vec::new());
+        one.held = vec!["s-a".to_owned()];
+        one.hold = hold;
+        one.live = one.held.clone();
+        one.supervised = one.held.clone();
+        let two = At::short(&h2, Vec::new());
+        assert!(matches!(one.step(&mut lease, T0), Said::Opened { .. }));
+        let round = T0 + NOMINATE_MS;
+        let said = two.step(&mut lease, round);
+        assert_eq!(
+            said,
+            Said::Waiting {
+                held: vec!["s-a".to_owned()],
+                why: vec![hold]
+            }
+        );
+        let e = lease.entry(KEY).cloned().expect("entry");
+        let line = owner_line(&e, round).expect("waiting");
+        assert_eq!(
+            line,
+            format!(
+                "Every agent session that could free space is {at}: aterm asks one once {past} \
+                 (`aterm harness disk why`)"
+            )
+        );
+        let text = said.describe();
+        let why = why_lines(&lease, &[], round).join("\n");
+        assert!(text.contains(hold.at(false)), "{text}");
+        assert!(
+            why.contains(&format!("@s-a (host pid 1) {}", hold.at(false))),
+            "{why}"
+        );
+        for said in [&line, &text, &why] {
+            for not in ["usage limit", "box"] {
+                assert!(!said.contains(not), "{hold:?}: {said}");
+            }
+        }
+        let r = row(round / 1000, KEY, &said, Level::Short, 20 * GIB, &h2);
+        let v: Value = aterm_json::from_str(&r).expect("json");
+        assert_eq!(v.get("why").and_then(Value::as_str), Some(hold.word()));
+        assert_eq!(
+            Lease::decode(&lease.encode()),
+            Lease {
+                schema: 1,
+                ..lease.clone()
+            },
+            "the hold round-trips the lease file"
+        );
+        let back = Said::Returned {
+            from: Pick {
+                host: h1.clone(),
+                sid: "s-a".to_owned(),
+            },
+            why: hold,
+        }
+        .describe();
+        assert!(
+            back.contains(hold.at(false)) && back.contains(past),
+            "{back}"
+        );
+    }
+    // An older build's record names no hold; another session waits on a draft.
+    let mut e = Entry {
+        key: KEY.to_owned(),
+        episode_ms: Some(T0),
+        phase: Phase::Nominating {
+            until_ms: T0,
+            nominees: Vec::new(),
+            after: None,
+        },
+        held: vec![
+            Held {
+                host: h1.clone(),
+                sid: "s-a".to_owned(),
+                why: None,
+                orphan_ms: None,
+            },
+            Held {
+                host: h2.clone(),
+                sid: "s-c".to_owned(),
+                why: Some(HeldBy::Draft),
+                orphan_ms: None,
+            },
+        ],
+        ..Entry::default()
+    };
+    assert_eq!(
+        owner_line(&e, T0).as_deref(),
+        Some(
+            "Every agent session that could free space is at a usage limit, at a box only you can \
+             answer or with a draft left in its prompt: aterm asks one once it is past or its \
+             draft is sent or cleared (`aterm harness disk why`)"
+        )
+    );
+    e.held.truncate(1);
+    let lease = Lease {
+        schema: 1,
+        volumes: vec![e],
+    };
+    let unknown = lease
+        .encode()
+        .replace("\"sid\":\"s-a\"", "\"sid\":\"s-a\",\"why\":\"telepathy\"");
+    assert!(unknown.contains("telepathy"), "{unknown}");
+    assert_eq!(
+        Lease::decode(&unknown),
+        lease,
+        "a hold this build does not know reads as none, not as an empty lease"
+    );
 }
 
 #[test]

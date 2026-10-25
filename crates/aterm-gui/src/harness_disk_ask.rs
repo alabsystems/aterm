@@ -59,6 +59,71 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// As a look begins, before its pass: take over what a host that ended left in the home volume's
+/// open episode of this process's sessions `sids` (the supervised ones, Autopilot not Off), a
+/// seamless update's predecessor's pick, nominee and held records among them
+/// ([`ask::take_over`]). It reads only what the pass does not change: the volume's key, the lease
+/// and this process's seat rule. A look's pass can run a minute or more (discovery, profile
+/// walks), and the step after it ([`after_look`]) was the first a successor adopted at, so
+/// another host's look while its first pass ran, [`ask::ADOPT_MS`] after it first read the
+/// predecessor ended, handed the pick off as undelivered, or dropped its nominee. The lease is
+/// read first without its lock, and its lock taken only when there is something to take over; a
+/// contended lock leaves it to the step after the pass, which adopts as well.
+pub(super) fn before_pass(sids: &[String], store: &Store) {
+    let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
+        return;
+    };
+    if super::disk_private(&home).is_some() {
+        return;
+    }
+    let Ok(reading) = disk::volume_of(&home, &aterm_sysprobe::volumes::table()) else {
+        return;
+    };
+    let key = reading.key.spelled();
+    let host = ask::HostId::this();
+    let lease = ask::read(&state);
+    let open = lease.entry(&key).is_some_and(|e| e.episode_ms.is_some());
+    if !open {
+        return;
+    }
+    let Rule {
+        barred, live, held, ..
+    } = rule(store, sids, &key, &[], false);
+    let alive = |h: &ask::HostId| h.alive();
+    let roster = ask::Roster {
+        host: &host,
+        key: &key,
+        supervised: sids,
+        barred: &barred,
+        live: &live,
+        held: &held,
+        alive: &alive,
+    };
+    if ask::take_over(&mut lease.clone(), &roster).is_empty() {
+        return;
+    }
+    match ask::transact(&state, &ask::LOCK_LADDER, |l| ask::take_over(l, &roster)) {
+        Ok(Some(took)) if !took.is_empty() => aterm_log::info!(
+            "harness disk watch: {} took over {} from a host that ended, before this look's pass",
+            ask::RULE_DISK_FREE,
+            took.iter()
+                .map(|s| format!("@{s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ok(Some(_)) => {}
+        Ok(None) => aterm_log::debug!(
+            "harness disk watch: {} is held; the ask's take-over waits for the step after the pass",
+            state.join(ask::LOCK_FILE).display()
+        ),
+        Err(e) => aterm_log::warn!(
+            "harness disk watch: the ask's lease in {} could not take over before the pass ({e}); \
+             the step after the pass adopts",
+            state.display()
+        ),
+    }
+}
+
 /// After a look: step the home volume's lease with this process's sessions `sids` (the
 /// supervised ones, Autopilot not Off), as [`Looked`] says the look went. The look judges the
 /// volume short against this process's own floor ([`disk::Thresholds::short_below`]); the lease
@@ -94,6 +159,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         crate::disk_board::publish(|b| {
             b.asks.retain(|_, o| o.key != key);
             b.unfit.retain(|sid, _| sids.contains(sid));
+            b.walls.retain(|sid, _| sids.contains(sid));
         });
         *OWNER.lock().unwrap_or_else(PoisonError::into_inner) = None;
         journal(
@@ -124,7 +190,8 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         seated,
         barred,
         live,
-    } = rule(store, sids, &key, &holders);
+        held,
+    } = rule(store, sids, &key, &holders, true);
     let seats: Vec<ask::Seat> = seated.iter().map(|s| s.seat.clone()).collect();
     let alive = |h: &ask::HostId| h.alive();
     let look = ask::Look {
@@ -141,6 +208,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         supervised: sids,
         barred: &barred,
         live: &live,
+        held: &held,
         alive: &alive,
     };
     let unrecorded = typed_last(&key);
@@ -204,6 +272,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
     });
     crate::disk_board::publish(|b| {
         b.unfit.retain(|sid, _| sids.contains(sid));
+        b.walls.retain(|sid, _| sids.contains(sid));
         b.asks
             .retain(|sid, o| o.key != key || owed.as_ref().is_some_and(|(s, _)| s == sid));
         if let Some((sid, text)) = &owed {
@@ -216,15 +285,14 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             );
         }
     });
-    let owner = entry.as_ref().and_then(ask::owner_line);
+    let owner = entry.as_ref().and_then(|e| ask::owner_line(e, now));
     *OWNER.lock().unwrap_or_else(PoisonError::into_inner) = owner.clone();
-    // The pass's own line is `disk.low`; out of inodes or with removal off, the owner's line is
-    // the one the look raises itself (`disk.full`, `disk.low-cleanup-off`), which says
-    // [`owner_said`] at each look.
-    if matches!(said, ask::Said::Out { .. })
-        && thresholds.floor > 0
-        && entry.as_ref().and_then(|e| e.done) == Some(ask::Done::Spent)
-    {
+    if out_raises_low(
+        &said,
+        level,
+        thresholds.floor,
+        entry.as_ref().and_then(|e| e.done),
+    ) {
         let glass: Vec<String> = holders
             .iter()
             .map(|h| h.line_within(Some(&home), crate::message_reporters::DISK_LOW_HOG_CHARS))
@@ -242,6 +310,23 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             asked: owner,
         });
     }
+}
+
+/// Whether a look whose step said `said`, reading the volume at `level` against this process's
+/// floor `floor` (`[disk] auto_free_gib`, in bytes), raises the owner's `disk.low` line itself
+/// with the ask's out sentence: the episode ran out at this look after a spent pass, and this look
+/// reads the volume short. The pass's own line is `disk.low`; out of inodes or with removal off,
+/// the owner's line is the one the look raises itself (`disk.full`, `disk.low-cleanup-off`), which
+/// says [`owner_said`] at each look. A look that reads the volume at or above its own floor (an
+/// episode another host's floor holds open, within [`ask::END_MARGIN`]) raises nothing: its
+/// `disk.low` said the home volume was still short, the next look found it plenty and cleared it,
+/// and the owner kept a false alert's record. The out sentence then goes with the next short
+/// look's line ([`owner_said`]).
+fn out_raises_low(said: &ask::Said, level: Level, floor: u64, done: Option<ask::Done>) -> bool {
+    matches!(said, ask::Said::Out { .. })
+        && level >= Level::Short
+        && floor > 0
+        && done == Some(ask::Done::Spent)
 }
 
 /// Whether a look that reads volume `key` at `level` leaves the lease in `state` as it is, its lock
@@ -301,6 +386,10 @@ struct Facts {
     /// Why its worker found it unfit at its last turn break (`Board::unfit`), as that finding
     /// holds now ([`crate::disk_board::Unfit::bars`]).
     unfit: Option<&'static str>,
+    /// What holds it where it cannot take a line now and passes ([`held_of`]): `limited`, an
+    /// unspent usage-limit wall; `box`, a box its loop escalated to its owner; `hold`, the owner's
+    /// hold or a person's take-over; `draft`, a draft standing in its composer at a rest.
+    held: Option<ask::HeldBy>,
     /// Whether the board places its directory on the volume asked about; `None`: its directory,
     /// or the volume it is on, was not read.
     on_volume: Option<bool>,
@@ -318,6 +407,11 @@ enum Judged {
     /// publication names no agent, or its directory or its volume was not read. A line owed it
     /// stays owed while it is supervised, and is handed on once it is not.
     Unseated,
+    /// It would be seated but for what holds it now and passes ([`Facts::held`]): it is not
+    /// nominated, a line owed it goes back to the episode at this look, once an episode, and is
+    /// released the next time ([`ask::Look::held`]), as it could not take it, and a round with
+    /// nobody else to elect waits for it to be past.
+    Held(ask::HeldBy),
 }
 
 /// The seat rule: a supervised Claude Code (the line is written for its composer) working on the
@@ -342,7 +436,6 @@ fn judge(f: &Facts) -> Judged {
             Program::Codex
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Grok
             | Program::Kimi
             | Program::Generic,
@@ -350,11 +443,136 @@ fn judge(f: &Facts) -> Judged {
         None => return Judged::Unseated,
     }
     match f.on_volume {
-        Some(true) => Judged::Seat,
+        Some(true) => f.held.map_or(Judged::Seat, Judged::Held),
         Some(false) => Judged::Barred("off-volume"),
         None => Judged::Unseated,
     }
 }
+
+/// What holds a session where it cannot take a line now, as a look reads it ([`Facts::held`], each
+/// [`ask::HeldBy`] here by its word):
+/// - `hold` while the owner's hold or a person's take-over stands on it (`halted`: the fabric's
+///   hold, `status hold=1`), whatever its agent reads;
+/// - `limited` while its agent reads `limited` at a wall its loop has open and has not yet taken
+///   as spent (`wall`, [`crate::disk_board::Wall::holds`] at `now_s`: before its reset and the
+///   loop's grace, when the loop rests there and its line could go);
+/// - `box` while its agent reads a box (`prompt`, `question`) its loop escalated to its owner
+///   (`escalated`: the supervisor's own attention stands on it, not a limit's);
+/// - `draft` while its agent reads `idle` with a draft standing in its composer (`drafted`: the
+///   same typed text this process's last look read there, [`Draft::stands`]).
+///
+/// A box no rule answers waits on a person, and a wall on its reset: neither turn ends, so a line
+/// owed would wait out its delivery window. A hold and a draft keep the session at a turn break,
+/// but the fenced write refuses every try there (`wait:held`, `wait:draft`) while they last, so a
+/// line owed would wait it out as well, its claim stretching it to the delivery window and a
+/// grace. All of them pass, so the session is held, not barred.
+fn held_of(
+    word: &str,
+    escalated: bool,
+    wall: Option<&crate::disk_board::Wall>,
+    halted: bool,
+    drafted: bool,
+    now_s: i64,
+) -> Option<ask::HeldBy> {
+    if halted {
+        return Some(ask::HeldBy::Hold);
+    }
+    match word {
+        "limited" if wall.is_some_and(|w| w.holds(now_s)) => Some(ask::HeldBy::Limit),
+        "prompt" | "question" if escalated => Some(ask::HeldBy::Box),
+        "idle" if drafted => Some(ask::HeldBy::Draft),
+        _ => None,
+    }
+}
+
+/// What a session's composer held as a look read it ([`draft_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Draft {
+    /// Its screen was not read: its terminal was busy, scrolled back or mid-frame, or the session
+    /// is not supervised.
+    Unread,
+    /// No typed text: an empty composer, its placeholder, or none drawn.
+    Clear,
+    /// Typed text stands there.
+    Text(String),
+}
+
+impl Draft {
+    /// Whether this reading is a draft standing since `last`, what this process's last look read
+    /// of the composer ([`DRAFTS`]): the same typed text, a look (a minute) apart, as the loop's
+    /// own guard reads a draft that stands. A draft a person is still typing reads as no draft
+    /// that stands.
+    fn stands(&self, last: Option<&str>) -> bool {
+        matches!(self, Draft::Text(t) if last == Some(t.as_str()))
+    }
+}
+
+/// What the composer drawn in `rows` holds, the caret at `cursor` and `dim` saying whether a
+/// row's first composer glyph is dim (Claude Code's placeholder, [`glyph_dim`]): read as the
+/// fenced write reads it ([`aterm_agent::harness::upgrade::composer_is_empty`]), so a draft the
+/// look reads is one the write would refuse.
+fn draft_in(rows: &[String], cursor: (usize, usize), dim: impl Fn(usize) -> bool) -> Draft {
+    let Some((caret, lines)) = aterm_phase::phase::composer_draft(rows) else {
+        return Draft::Clear;
+    };
+    if aterm_agent::harness::upgrade::composer_is_empty(rows, Some(cursor), dim(caret)) {
+        Draft::Clear
+    } else {
+        Draft::Text(lines.join("\n"))
+    }
+}
+
+/// What `t`'s live screen shows in its composer ([`draft_in`]); [`Draft::Unread`] while it is
+/// scrolled back or mid-frame.
+fn draft_on(t: &aterm_core::terminal::Terminal) -> Draft {
+    if t.grid().display_offset() > 0 || crate::frame_unfinished_now(t) {
+        return Draft::Unread;
+    }
+    let rows: Vec<String> = (0..usize::from(t.rows()))
+        .map(|r| crate::claude_lights::row_text(t, r))
+        .collect();
+    let cursor = t.cursor();
+    draft_in(
+        &rows,
+        (usize::from(cursor.row), usize::from(cursor.col)),
+        |row| {
+            let cells = u16::try_from(row)
+                .ok()
+                .and_then(|row| t.grid().row_at_screen(row));
+            glyph_dim(|col| {
+                let col = u16::try_from(col).ok()?;
+                cells.and_then(|cells| cells.get(col)).map(|c| c.flags())
+            })
+        },
+    )
+}
+
+/// Whether the composer's first glyph is dim, `flags(col)` the composer row's cell flags at
+/// `col`: the glyph at [`aterm_agent::supervise::screen::COMPOSER_COL`], or, where the program
+/// draws its own caret over it (`inverse`, as Claude Code draws its suggestion's first glyph), the
+/// glyph after it, as the fenced write reads the same cells
+/// ([`aterm_agent::supervise::screen::composer_glyph_cell`]). Read at the caret alone, a
+/// suggestion's inverse first glyph reads plain, and the suggestion as a draft.
+fn glyph_dim(flags: impl Fn(usize) -> Option<aterm_core::grid::CellFlags>) -> bool {
+    use aterm_agent::supervise::screen::COMPOSER_COL;
+    use aterm_core::grid::CellFlags;
+    let glyph = match flags(COMPOSER_COL) {
+        Some(first) if first.contains(CellFlags::INVERSE) => flags(
+            COMPOSER_COL
+                + if first.contains(CellFlags::WIDE) {
+                    2
+                } else {
+                    1
+                },
+        ),
+        first => first,
+    };
+    glyph.is_some_and(|f| f.contains(CellFlags::DIM))
+}
+
+/// The typed text each session's composer held at this process's last look ([`after_look`]), so
+/// the next look knows a draft that stands ([`Draft::stands`]).
+static DRAFTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 /// Why the seat rule bars a session by its task record: its task is done (it landed) or
 /// exited, or it goes on, so the session is a manager's worker (`managed`, as its loop's guard
@@ -383,6 +601,15 @@ struct Read {
     at_break: bool,
     /// Its agent reads busy: it works.
     working: bool,
+    /// Its agent's word ([`held_of`]).
+    word: &'static str,
+    /// The supervisor's own attention stands on it, and is no usage limit's: its loop escalated a
+    /// box to its owner ([`held_of`]).
+    escalated: bool,
+    /// The owner's hold or a person's take-over stands on it ([`held_of`]).
+    halted: bool,
+    /// What its composer holds, read only for a supervised session ([`Draft`]).
+    draft: Draft,
 }
 
 /// This process's live sessions (`only`: that one alone), each as [`Read`] says; `sids` are the
@@ -412,21 +639,37 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
                 let p = t.agent();
                 (agent_of(p), p.word, t.task().map(|r| r.state))
             };
+            let escalated = h
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .attention_owners
+                .get(aterm_agent::supervise::ATTENTION_OWNER)
+                .is_some_and(|t| !t.starts_with(aterm_agent::supervise::ATTENTION_PREFIX));
+            let halted = h.ctx.fabric.hold().is_some();
             let sid = h.sid.as_str().to_owned();
             let supervised = sids.contains(&sid);
-            let cwd = supervised
-                .then(|| match h.term.try_lock() {
-                    Ok(t) => t
-                        .native_working_directory()
-                        .filter(|c| !c.is_empty())
-                        .map(|c| PathBuf::from(c.into_owned())),
-                    Err(_) => known
-                        .iter()
-                        .find(|(id, _)| *id == h.local_id)
-                        .map(|(_, cwd)| cwd.clone()),
-                })
-                .flatten()
-                .filter(|cwd| cwd.is_absolute());
+            let (cwd, draft) = if supervised {
+                match h.term.try_lock() {
+                    Ok(t) => (
+                        t.native_working_directory()
+                            .filter(|c| !c.is_empty())
+                            .map(|c| PathBuf::from(c.into_owned())),
+                        draft_on(&t),
+                    ),
+                    Err(_) => (
+                        known
+                            .iter()
+                            .find(|(id, _)| *id == h.local_id)
+                            .map(|(_, cwd)| cwd.clone()),
+                        Draft::Unread,
+                    ),
+                }
+            } else {
+                (None, Draft::Unread)
+            };
+            let cwd = cwd.filter(|cwd| cwd.is_absolute());
             Read {
                 sid,
                 local: h.local_id,
@@ -436,6 +679,10 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
                 cwd,
                 at_break: word == "idle",
                 working: word == "busy",
+                word,
+                escalated,
+                halted,
+                draft,
             }
         })
         .collect()
@@ -447,14 +694,30 @@ fn read_sessions(store: &Store, sids: &[String], only: Option<&str>) -> Vec<Read
 /// wait) while its agent reads busy ([`crate::disk_board::Unfit::bars`]), so a session given
 /// something to do since is seated again.
 fn judged(read: Vec<Read>, key: &str) -> Vec<(Read, Judged)> {
+    let now_s = aterm_time::unix_secs()
+        .and_then(|s| i64::try_from(s).ok())
+        .unwrap_or(0);
+    let drafts = DRAFTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     let b = crate::disk_board::SHELF.board_lock();
     read.into_iter()
         .map(|r| {
+            let drafted = r.draft.stands(drafts.get(&r.sid).map(String::as_str));
             let facts = Facts {
                 supervised: r.supervised,
                 program: r.program,
                 task: r.task,
                 unfit: b.unfit.get(&r.sid).and_then(|u| u.bars(r.working)),
+                held: held_of(
+                    r.word,
+                    r.escalated,
+                    b.walls.get(&r.sid),
+                    r.halted,
+                    drafted,
+                    now_s,
+                ),
                 on_volume: r
                     .cwd
                     .as_ref()
@@ -476,20 +739,43 @@ struct Rule {
     barred: Vec<String>,
     /// Every live session.
     live: Vec<String>,
+    /// Those it would seat but for what holds them now and passes, each with what holds it
+    /// ([`ask::Look::held`]).
+    held: Vec<(String, ask::HeldBy)>,
 }
 
 /// The seat rule over this process's live sessions on volume `key` (its spelling), `sids` the
-/// supervised ones and `holders` what the pass left.
-fn rule(store: &Store, sids: &[String], key: &str, holders: &[Hog]) -> Rule {
+/// supervised ones and `holders` what the pass left. A look's own rule (`remember`, after its
+/// pass) keeps what each composer held for the next look ([`DRAFTS`]); the take-over before the
+/// pass reads it alone.
+fn rule(store: &Store, sids: &[String], key: &str, holders: &[Hog], remember: bool) -> Rule {
     let mut out = Rule {
         seated: Vec::new(),
         barred: Vec::new(),
         live: Vec::new(),
+        held: Vec::new(),
     };
-    for (r, judged) in judged(read_sessions(store, sids, None), key) {
+    let judged = judged(read_sessions(store, sids, None), key);
+    if remember {
+        let mut drafts = DRAFTS.lock().unwrap_or_else(PoisonError::into_inner);
+        for (r, _) in &judged {
+            match &r.draft {
+                Draft::Text(t) => {
+                    drafts.insert(r.sid.clone(), t.clone());
+                }
+                Draft::Clear => {
+                    drafts.remove(&r.sid);
+                }
+                Draft::Unread => {}
+            }
+        }
+        drafts.retain(|sid, _| judged.iter().any(|(r, _)| r.sid == *sid));
+    }
+    for (r, judged) in judged {
         out.live.push(r.sid.clone());
         match (judged, r.cwd) {
             (Judged::Barred(_), _) => out.barred.push(r.sid),
+            (Judged::Held(why), _) => out.held.push((r.sid, why)),
             (Judged::Seat, Some(cwd)) => out.seated.push(Seated {
                 seat: ask::Seat {
                     held: held_under(holders, &cwd),
@@ -504,16 +790,16 @@ fn rule(store: &Store, sids: &[String], key: &str, holders: &[Hog]) -> Rule {
     out
 }
 
-/// Why the seat rule bars this process's session `sid` on volume `key` (its spelling) now, read
-/// as the look reads it ([`judge`]), so a session the look would not seat by a lasting fact is
-/// never typed its line. `None`: it may be asked, or it is not this process's.
-fn bar_at(store: &Store, sid: &str, key: &str) -> Option<&'static str> {
+/// What the seat rule says of this process's session `sid` on volume `key` (its spelling) now,
+/// read as the look reads it ([`judge`]), so a session the look would not seat by a lasting fact
+/// is never typed its line, and one it holds is neither claimed nor typed it.
+/// [`Judged::Unseated`]: it is not this process's.
+fn judge_at(store: &Store, sid: &str, key: &str) -> Judged {
     judged(read_sessions(store, &[sid.to_owned()], Some(sid)), key)
         .into_iter()
-        .find_map(|(_, judged)| match judged {
-            Judged::Barred(why) => Some(why),
-            Judged::Seat | Judged::Unseated => None,
-        })
+        .map(|(_, judged)| judged)
+        .next()
+        .unwrap_or(Judged::Unseated)
 }
 
 /// The checkout `cwd` works in, of those `holders` serve: the deepest one it sits under, so a
@@ -578,13 +864,15 @@ enum Stepped {
 
 /// The live act ([`super::Acts::disk_free`]): at session `sid`'s turn break, type `owed`'s line
 /// when the lease still names it, or release it when the session may not be asked (`unfit`, the
-/// worker's finding, or what else the seat rule bars it by, [`bar_at`], so a session the look
+/// worker's finding, or what else the seat rule bars it by, [`judge_at`], so a session the look
 /// would not seat by a lasting fact is never typed its line, nor is one the loop holds for
 /// someone else for good: its `exchange` or `managed`, which the worker hands in as `unfit`). A
 /// line `held` at this turn break for a while (the loop's word, `person`: a person's grace or
-/// another driver's hand, the occupancy door's guard) is not typed and stays owed,
-/// `wait:<held>`. The claim, the typing and its record hold the lease's
-/// lock as one step ([`ask::at_break`]), so no other host hands the line on while it is typed.
+/// another driver's hand, the occupancy door's guard; or what the seat rule holds it by,
+/// [`held_of`]: the owner's hold, a draft standing in its composer) is not claimed or typed and
+/// stays owed, `wait:<held>`, until the look gives it back to the episode. The claim, the typing
+/// and its record hold the lease's lock as one step ([`ask::at_break`]), so no other host hands
+/// the line on while it is typed.
 /// The step: `typed`, `wait:<why>` (tried again at its next turn break), `released:<why>`, or
 /// `gone` (the lease names it no more).
 pub(super) fn act(
@@ -601,7 +889,7 @@ pub(super) fn act(
     let host = ask::HostId::this();
     let now = now_ms();
     let (free, level) = volume_on(&owed.key);
-    let unfit = unfit.or_else(|| bar_at(store, sid, &owed.key));
+    let (unfit, held) = guards(judge_at(store, sid, &owed.key), unfit, held);
     let token = super::harness_drive_token();
     let at = AtBreak {
         state: &state,
@@ -626,6 +914,22 @@ pub(super) fn act(
         &[ask::step_row(now / 1000, sid, &owed.key, &step, &host)],
     );
     step
+}
+
+/// What bars and what holds session `sid`'s line at its turn break ([`act`]): the worker's
+/// `unfit` and `held`, joined with the seat rule's reading of the session now (`judged`,
+/// [`judge_at`]): one it bars is released, and one it holds (a wall, a box, the owner's hold, a
+/// draft that stood a look) waits, `wait:<why>`, unclaimed, so its claim does not stretch its time.
+fn guards(
+    judged: Judged,
+    unfit: Option<&'static str>,
+    held: Option<&'static str>,
+) -> (Option<&'static str>, Option<&'static str>) {
+    match judged {
+        Judged::Barred(why) => (unfit.or(Some(why)), held),
+        Judged::Held(why) => (unfit, held.or(Some(why.word()))),
+        Judged::Seat | Judged::Unseated => (unfit, held),
+    }
 }
 
 /// One turn break's step for the line [`Self::owed`] holds for session [`Self::sid`]
@@ -735,6 +1039,15 @@ fn volume_on(key: &str) -> (u64, Level) {
 mod tests {
     use super::*;
 
+    /// Why the seat rule bars this process's session `sid` on volume `key` now ([`judge_at`]).
+    /// `None`: it may be asked, or it is not this process's.
+    fn bar_at(store: &Store, sid: &str, key: &str) -> Option<&'static str> {
+        match judge_at(store, sid, key) {
+            Judged::Barred(why) => Some(why),
+            Judged::Seat | Judged::Unseated | Judged::Held(_) => None,
+        }
+    }
+
     fn rows(state: &Path) -> Vec<String> {
         std::fs::read_to_string(state.join(aterm_agent::harness::cli::DISK_LEDGER))
             .unwrap_or_default()
@@ -785,6 +1098,7 @@ mod tests {
             program: Some(Program::Claude),
             task: None,
             unfit: None,
+            held: None,
             on_volume: Some(true),
         };
         assert_eq!(
@@ -846,8 +1160,34 @@ mod tests {
                 },
                 "off-volume",
             ),
+            (
+                Facts {
+                    task: Some(TaskState::Done),
+                    held: Some(ask::HeldBy::Limit),
+                    ..seat
+                },
+                "task-done",
+            ),
+            (
+                Facts {
+                    on_volume: Some(false),
+                    held: Some(ask::HeldBy::Box),
+                    ..seat
+                },
+                "off-volume",
+            ),
         ] {
             assert_eq!(judge(&facts), Judged::Barred(why), "{facts:?}");
+        }
+        for why in [ask::HeldBy::Limit, ask::HeldBy::Box] {
+            assert_eq!(
+                judge(&Facts {
+                    held: Some(why),
+                    ..seat
+                }),
+                Judged::Held(why),
+                "a seat but for what passes: held, not barred"
+            );
         }
         for facts in [
             Facts {
@@ -862,6 +1202,16 @@ mod tests {
                 on_volume: None,
                 ..seat
             },
+            Facts {
+                on_volume: None,
+                held: Some(ask::HeldBy::Limit),
+                ..seat
+            },
+            Facts {
+                supervised: false,
+                held: Some(ask::HeldBy::Box),
+                ..seat
+            },
         ] {
             assert_eq!(
                 judge(&facts),
@@ -869,6 +1219,497 @@ mod tests {
                 "nothing that lasts: an owed line stays owed while supervised: {facts:?}"
             );
         }
+    }
+
+    /// A session at a usage-limit wall its loop has open, before its reset and the loop's grace,
+    /// or at a box its loop escalated to its owner, cannot take a line before its delivery window
+    /// ends: the look holds it out of its seats. A seat rule that seated such a tab elected it,
+    /// often first (its checkout the largest), and the line waited out its window and was handed
+    /// on as undelivered, spending an election with nothing typed.
+    #[test]
+    fn a_session_at_an_unspent_wall_or_an_escalated_box_is_held() {
+        use crate::disk_board::Wall;
+        let wall = |until_s| Wall { until_s };
+        let now = 1_000_000;
+        let held = |word, escalated, wall: Option<&Wall>| {
+            held_of(word, escalated, wall, false, false, now)
+        };
+        assert_eq!(
+            held("limited", false, Some(&wall(Some(now + 1)))),
+            Some(ask::HeldBy::Limit)
+        );
+        assert_eq!(
+            held("limited", false, Some(&wall(None))),
+            Some(ask::HeldBy::Limit),
+            "no reset known: held until the loop closes the wall"
+        );
+        assert_eq!(
+            held("limited", false, Some(&wall(Some(now)))),
+            None,
+            "spent: the loop rests there, and the line can go"
+        );
+        assert_eq!(
+            held("limited", false, None),
+            None,
+            "no wall the loop has open"
+        );
+        assert_eq!(
+            held("idle", false, Some(&wall(None))),
+            None,
+            "past the wall: its agent no longer reads limited"
+        );
+        for word in ["prompt", "question"] {
+            assert_eq!(held(word, true, None), Some(ask::HeldBy::Box), "{word}");
+            assert_eq!(
+                held(word, false, None),
+                None,
+                "{word}: a box a rule answers is no person's to wait on"
+            );
+        }
+        assert_eq!(held("busy", true, None), None);
+    }
+
+    /// A session the owner holds (or a person took over: `status hold=1`), or whose composer
+    /// holds a draft that stands at a rest, keeps to a turn break, and the fenced write refuses
+    /// every try there (`wait:held`, `wait:draft`): the look holds it, as a wall or a box. Read as
+    /// fit, it was nominated before a working session in the same GiB (it rests at a turn break),
+    /// elected, refused at every step of the wait for the delivery window and a grace, and handed
+    /// on as undelivered, spending an election with no line typed.
+    #[test]
+    fn a_held_session_or_one_whose_draft_stands_at_a_rest_is_held() {
+        let now = 1_000_000;
+        for word in ["idle", "busy", "prompt", "limited"] {
+            assert_eq!(
+                held_of(word, false, None, true, false, now),
+                Some(ask::HeldBy::Hold),
+                "{word}: the hold refuses any typed line"
+            );
+        }
+        assert_eq!(
+            held_of("idle", false, None, false, true, now),
+            Some(ask::HeldBy::Draft)
+        );
+        assert_eq!(
+            held_of("busy", false, None, false, true, now),
+            None,
+            "a draft queued while it works goes with its turn"
+        );
+        assert_eq!(held_of("idle", false, None, false, false, now), None);
+        let seat = Facts {
+            supervised: true,
+            program: Some(Program::Claude),
+            task: None,
+            unfit: None,
+            held: None,
+            on_volume: Some(true),
+        };
+        for why in [ask::HeldBy::Hold, ask::HeldBy::Draft] {
+            assert_eq!(
+                judge(&Facts {
+                    held: Some(why),
+                    ..seat
+                }),
+                Judged::Held(why),
+                "neither seated nor barred"
+            );
+        }
+        // A draft stands when the look before read the same typed text there.
+        let text = Draft::Text("fix the flaky test".to_owned());
+        assert!(text.stands(Some("fix the flaky test")));
+        assert!(!text.stands(None), "first read: it may be a person typing");
+        assert!(!text.stands(Some("fix the")), "still being typed");
+        assert!(!Draft::Clear.stands(Some("fix the flaky test")));
+        assert!(!Draft::Unread.stands(Some("fix the flaky test")));
+    }
+
+    /// The composer as the fenced write reads it: typed text is a draft; an empty composer, or
+    /// Claude Code's dim placeholder with the caret at its start, is none.
+    #[test]
+    fn a_draft_is_read_off_the_composer_as_the_fenced_write_reads_it() {
+        let rule = "\u{2500}".repeat(60);
+        let screen = |line: &str| vec![rule.clone(), format!("\u{276f} {line}"), rule.clone()];
+        assert_eq!(
+            draft_in(&screen("fix the flaky test"), (1, 20), |_| false),
+            Draft::Text("fix the flaky test".to_owned())
+        );
+        assert_eq!(draft_in(&screen(""), (1, 2), |_| false), Draft::Clear);
+        assert_eq!(
+            draft_in(&screen("Try \"refactor this\""), (1, 2), |row| row == 1),
+            Draft::Clear,
+            "the dim placeholder"
+        );
+        assert_eq!(
+            draft_in(&screen("Try \"refactor this\""), (1, 2), |_| false),
+            Draft::Text("Try \"refactor this\"".to_owned()),
+            "the same words typed"
+        );
+        assert_eq!(
+            draft_in(&["$ ls".to_owned()], (0, 4), |_| false),
+            Draft::Clear,
+            "no composer drawn"
+        );
+    }
+
+    /// Through the look: the owner's hold reads on the session at once, and its composer off its
+    /// own screen, a look's own rule keeping what it held for the next look ([`DRAFTS`]), so the
+    /// second look to read the same typed text reads it standing; the take-over's rule before the
+    /// pass keeps nothing, and a cleared composer is forgotten.
+    #[test]
+    fn a_look_reads_the_owners_hold_and_a_draft_that_stands_since_its_last_look() {
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_300);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let sids = [sid.clone()];
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        let key = "fsid:9300";
+        let draw = |line: &str| {
+            let rule = "\u{2500}".repeat(60);
+            let col = line.chars().count() + 3;
+            h.term
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .process(
+                    format!("\x1b[2J\x1b[H{rule}\r\n\u{276f} {line}\r\n{rule}\x1b[2;{col}H")
+                        .as_bytes(),
+                );
+        };
+        let read = || {
+            let r = read_sessions(&store, &sids, Some(&sid))
+                .pop()
+                .expect("the session");
+            let last = DRAFTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&sid)
+                .cloned();
+            let stands = r.draft.stands(last.as_deref());
+            (r.halted, r.draft, stands)
+        };
+        draw("");
+        let clear = read();
+        assert!(crate::fabric::apply_hold_for_test(
+            &*h.ctx,
+            Some(crate::fabric::Hold {
+                reason: "-".into(),
+                origin: "local".into(),
+            })
+        ));
+        let halted = read().0;
+        assert!(crate::fabric::apply_hold_for_test(&*h.ctx, None));
+        draw("fix the flaky test");
+        let first = read();
+        let _ = rule(&store, &sids, key, &[], false);
+        let before_pass = read();
+        let _ = rule(&store, &sids, key, &[], true);
+        let second = read();
+        draw("");
+        let _ = rule(&store, &sids, key, &[], true);
+        let forgotten = DRAFTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&sid)
+            .is_none();
+        assert_eq!(
+            clear,
+            (false, Draft::Clear, false),
+            "CONTROL: nothing holds it"
+        );
+        assert!(halted, "the owner's hold: status hold=1");
+        let text = Draft::Text("fix the flaky test".to_owned());
+        assert_eq!(
+            first,
+            (false, text.clone(), false),
+            "first read: maybe a person typing"
+        );
+        assert_eq!(
+            before_pass,
+            (false, text.clone(), false),
+            "the take-over keeps nothing"
+        );
+        assert_eq!(second, (false, text, true), "it stood since the last look");
+        assert!(forgotten, "cleared: forgotten");
+    }
+
+    /// Through the seat rule itself ([`rule`], [`judge_at`]) and the turn break ([`guards`],
+    /// [`AtBreak`]): a fit Claude Code tab resting at a turn break on the volume is seated; under
+    /// the owner's hold (`status hold=1`) it is held (`hold`), not seated, and a line owed it waits
+    /// there (`wait:hold`), unclaimed; lifted, it is seated again. With a draft typed in its prompt
+    /// it is seated at the look that first reads the draft (a person may be typing), held
+    /// (`draft`) from the next look that reads the same text, its owed line waiting the same way,
+    /// and seated again once the prompt is cleared. A seat rule that left the hold or the draft out
+    /// seated such a tab, which, at rest, outranked a working one in the same GiB, was elected, and
+    /// was refused at every turn break until the delivery window handed it on as undelivered.
+    #[cfg(unix)]
+    #[test]
+    fn the_seat_rule_holds_a_tab_on_hold_or_with_a_standing_draft_and_its_line_waits_unclaimed() {
+        use aterm_sysprobe::volumes::{Reading, VolumeKey};
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_400);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let sids = [sid.clone()];
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publish_agent(
+                "idle",
+                None,
+                None,
+                Some(Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        let draw = |line: &str| {
+            let rule = "\u{2500}".repeat(60);
+            let col = line.chars().count() + 3;
+            h.term
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .process(
+                    format!(
+                        "\x1b]7;file://localhost/u/held-tab\x07\x1b[2J\x1b[H{rule}\r\n\u{276f} \
+                         {line}\r\n{rule}\x1b[2;{col}H"
+                    )
+                    .as_bytes(),
+                );
+        };
+        // The board places the tab on the volume asked about, as a pass does.
+        let volume = VolumeKey::Fsid(9_400);
+        let key = volume.spelled();
+        {
+            let mut b = crate::disk_board::SHELF.board_lock();
+            b.volumes.push(crate::disk_board::VolumeRow {
+                reading: Reading {
+                    mount: PathBuf::from("/u"),
+                    key: volume.clone(),
+                    total: 2000 * GIB,
+                    free: 10 * GIB,
+                    files_free: Some(1 << 30),
+                    dev: 9_400,
+                    read_only: false,
+                },
+                thresholds: disk::Config::default().thresholds(Some(2000 * GIB)),
+                level: Level::Short,
+                room: None,
+                as_of: std::time::Instant::now(),
+                as_of_unix: 0,
+                reclaimed_here: true,
+            });
+            let at = b.volumes.len() - 1;
+            b.sessions.insert(h.local_id, at);
+        }
+        let read = || {
+            let r = rule(&store, &sids, &key, &[], true);
+            (
+                r.seated
+                    .iter()
+                    .map(|s| s.seat.sid.clone())
+                    .collect::<Vec<_>>(),
+                r.held,
+            )
+        };
+        let hold = |on: bool| {
+            assert!(crate::fabric::apply_hold_for_test(
+                &*h.ctx,
+                on.then(|| crate::fabric::Hold {
+                    reason: "-".into(),
+                    origin: "local".into(),
+                })
+            ));
+        };
+        draw("");
+        let clear = read();
+        hold(true);
+        let on_hold = read();
+        let judged_hold = judge_at(&store, &sid, &key);
+        hold(false);
+        let lifted = read();
+        draw("refactor the parser");
+        let first = read();
+        let second = read();
+        let judged_draft = judge_at(&store, &sid, &key);
+        draw("");
+        let cleared = read();
+        {
+            let mut b = crate::disk_board::SHELF.board_lock();
+            b.sessions.remove(&h.local_id);
+            b.volumes.retain(|r| r.reading.key != volume);
+        }
+        DRAFTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&sid);
+        let seated = (vec![sid.clone()], Vec::new());
+        let held = |why| (Vec::new(), vec![(sid.clone(), why)]);
+        assert_eq!(clear, seated, "CONTROL: a fit tab at rest is seated");
+        assert_eq!(on_hold, held(ask::HeldBy::Hold), "the owner's hold");
+        assert_eq!(lifted, seated, "the hold lifted");
+        assert_eq!(first, seated, "a draft read once: a person may be typing");
+        assert_eq!(second, held(ask::HeldBy::Draft), "the same draft a look on");
+        assert_eq!(cleared, seated, "the prompt cleared");
+        assert_eq!(judged_hold, Judged::Held(ask::HeldBy::Hold));
+        assert_eq!(judged_draft, Judged::Held(ask::HeldBy::Draft));
+        // A line owed it waits at its turn break, unclaimed, so its time is not stretched.
+        let state = aterm_tempfile::TempDir::new().expect("owned lease dir");
+        let host = ask::HostId {
+            pid: 9,
+            start: "start-9".to_owned(),
+        };
+        let now = now_ms();
+        owed_at(state.path(), &key, &host, &sid, now);
+        let before = ask::read(state.path());
+        let owed = crate::disk_board::AskOwed {
+            key: key.clone(),
+            text: "the line".to_owned(),
+        };
+        for (judged, why) in [(judged_hold, "hold"), (judged_draft, "draft")] {
+            let (unfit, held) = guards(judged, None, None);
+            let at = AtBreak {
+                state: state.path(),
+                host: &host,
+                sid: &sid,
+                owed: &owed,
+                now,
+                unfit,
+                held,
+                free: 10 * GIB,
+                level: Level::Short,
+            };
+            assert_eq!(
+                at.step(
+                    || panic!("typed a tab {why} holds"),
+                    || panic!("measured at a tab {why} holds")
+                ),
+                format!("wait:{why}")
+            );
+        }
+        assert_eq!(
+            ask::read(state.path()),
+            before,
+            "unclaimed, and owed until the look gives it back to the episode"
+        );
+        assert_eq!(
+            guards(Judged::Seat, None, None),
+            (None, None),
+            "CONTROL: a seat is typed"
+        );
+    }
+
+    /// The composer's first glyph is read past a caret the program draws over it, as the fenced
+    /// write reads it: Claude Code draws its suggestion's first glyph inverse and the rest dim, and
+    /// a typed draft's first glyph inverse and the rest plain.
+    #[test]
+    fn the_composers_first_glyph_is_read_past_a_drawn_caret() {
+        use aterm_core::grid::CellFlags;
+        let at = |cells: Vec<(usize, CellFlags)>| {
+            move |col: usize| cells.iter().find(|(c, _)| *c == col).map(|(_, f)| *f)
+        };
+        let (dim, plain, inverse) = (CellFlags::DIM, CellFlags::empty(), CellFlags::INVERSE);
+        assert!(glyph_dim(at(vec![(2, dim)])), "dim at the caret");
+        assert!(
+            glyph_dim(at(vec![(2, inverse), (3, dim)])),
+            "a suggestion under a drawn caret"
+        );
+        assert!(
+            !glyph_dim(at(vec![(2, inverse), (3, plain)])),
+            "a typed draft under a drawn caret"
+        );
+        assert!(
+            glyph_dim(at(vec![
+                (2, inverse.union(CellFlags::WIDE)),
+                (3, plain),
+                (4, dim),
+            ])),
+            "past a wide glyph"
+        );
+        assert!(!glyph_dim(at(vec![(2, plain)])));
+        assert!(!glyph_dim(at(Vec::new())), "no cell");
+    }
+
+    /// A look that runs the episode out raises the owner's `disk.low` itself only when it reads
+    /// the volume short against its own floor. A look that read it at or above its floor (an
+    /// episode another host's higher floor held open) raised "the home volume is still short",
+    /// and the next look, finding it plenty, cleared it: a false alert kept as a message record.
+    #[test]
+    fn a_look_that_runs_the_episode_out_raises_disk_low_only_reading_the_volume_short() {
+        let out = ask::Said::Out {
+            last: Some(ask::Miss::NothingFreed),
+            asked: true,
+        };
+        let spent = Some(ask::Done::Spent);
+        let floor = 32 << 30;
+        assert!(out_raises_low(&out, Level::Short, floor, spent));
+        assert!(out_raises_low(&out, Level::Emergency, floor, spent));
+        for level in [Level::Low, Level::Ok, Level::Unknown] {
+            assert!(
+                !out_raises_low(&out, level, floor, spent),
+                "{level:?}: not read short against this host's floor"
+            );
+        }
+        assert!(
+            !out_raises_low(&out, Level::Short, 0, spent),
+            "the floor at 0"
+        );
+        assert!(
+            !out_raises_low(&out, Level::Short, floor, Some(ask::Done::CleanupOff)),
+            "removal off: its own line"
+        );
+        assert!(!out_raises_low(
+            &ask::Said::Spent,
+            Level::Short,
+            floor,
+            spent
+        ));
+    }
+
+    /// The look reads a box as escalated by the supervisor's own attention entry on the session,
+    /// which its loop writes as it asks the owner, and not by the badge of a usage limit it
+    /// raised, which a wall the board holds says instead.
+    #[test]
+    fn a_look_reads_a_box_its_loop_escalated_and_not_a_limits_badge() {
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_200);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publish_agent(
+                "prompt",
+                None,
+                None,
+                Some(Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        let read = |badge: Option<&str>| {
+            h.ctx
+                .meta
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_attention_owned(
+                    aterm_agent::supervise::ATTENTION_OWNER,
+                    badge.map(str::to_owned),
+                )
+                .expect("a slot");
+            let r = read_sessions(&store, std::slice::from_ref(&sid), Some(&sid))
+                .pop()
+                .expect("the session");
+            (r.word, r.escalated)
+        };
+        assert_eq!(read(None), ("prompt", false), "CONTROL: nobody asked");
+        assert_eq!(read(Some("approve: rm -rf target")), ("prompt", true));
+        let limit = format!("{} resets 3pm", aterm_agent::supervise::ATTENTION_PREFIX);
+        assert_eq!(read(Some(&limit)), ("prompt", false), "a limit's badge");
     }
 
     #[test]
@@ -908,7 +1749,7 @@ mod tests {
             },
         );
         let key = "fsid:9000";
-        let found = rule(&store, &sids, key, &[]);
+        let found = rule(&store, &sids, key, &[], false);
         let bars: Vec<Option<&'static str>> =
             (0..5).map(|i| bar_at(&store, &sid(i), key)).collect();
         crate::disk_board::SHELF.board_lock().unfit.remove(&sid(2));

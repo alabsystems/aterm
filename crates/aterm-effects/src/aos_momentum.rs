@@ -211,11 +211,10 @@ impl MomentumState {
     }
 
     fn last_time(&self, epoch: Instant) -> Option<i128> {
-        let seen = self
-            .glow
-            .snapshot(epoch)
-            .map_or([None, None], |s| [s.rate_at, s.stamp]);
-        [self.clock, seen[0], seen[1]].into_iter().flatten().max()
+        match self.glow.snapshot(epoch) {
+            Ok(s) => self.clock.max(s.rate_at).max(s.stamp),
+            Err(_) => self.clock,
+        }
     }
 }
 
@@ -915,11 +914,16 @@ impl MomentumCode {
 
     /// The implementation a short or artifact name names.
     #[must_use]
-    pub fn from_name(name: &str) -> Option<MomentumCode> {
-        MomentumCode::ALL
-            .iter()
-            .copied()
-            .find(|c| c.name() == name || c.artifact_name() == name)
+    pub const fn from_name(name: &str) -> Option<MomentumCode> {
+        match name.as_bytes() {
+            b"shipped" | b"momentum-glow.shipped" => Some(MomentumCode::Shipped),
+            b"safe" | b"momentum-glow.safe" => Some(MomentumCode::Safe),
+            #[cfg(any(test, debug_assertions))]
+            b"demo-stranded-settle" | b"momentum-glow.demo-stranded-settle" => {
+                Some(MomentumCode::DemoStrandedSettle)
+            }
+            _ => None,
+        }
     }
 
     /// What the artifact declares about itself.
@@ -1363,7 +1367,7 @@ impl Contract<MomentumSchema> for NoStrandedLight {
                             );
                         }
                     }
-                    if forecast.is_some_and(|(_, latched)| latched != *cfg) {
+                    if matches!(forecast, Some((_, latched)) if latched != *cfg) {
                         forecast = None;
                     }
                     last_tick = Some(*cfg);

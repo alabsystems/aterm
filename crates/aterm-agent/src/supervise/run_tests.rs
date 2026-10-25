@@ -3427,10 +3427,10 @@ fn a_busy_row_the_guard_could_not_read_is_still_up() {
 #[test]
 fn each_agents_busy_guard_is_up_on_its_busy_row_alone() {
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{agy::fixtures as a, gemini::fixtures as g, muse::fixtures as u};
+    use aterm_phase::{agy::fixtures as a, muse::fixtures as u};
     let mut m = Mock::new(Vec::new());
     let mut s = session(&mut m, None);
-    let cases: [(Program, &[&str], &[&str]); 3] = [
+    let cases: [(Program, &[&str], &[&str]); 2] = [
         (
             Program::Agy,
             &[a::BUSY, a::BUSY_TIP],
@@ -3463,28 +3463,6 @@ fn each_agents_busy_guard_is_up_on_its_busy_row_alone() {
                 u::KEY_REJECTED,
                 u::USAGE_WALL,
                 u::QUESTION,
-            ],
-        ),
-        (
-            Program::Gemini,
-            &[
-                g::BUSY_THINKING,
-                g::BUSY_STREAMING,
-                g::RETRY_503,
-                g::RETRY_500,
-            ],
-            &[
-                g::IDLE,
-                g::DRAFT,
-                g::END_OF_TURN,
-                g::INTERRUPTED,
-                g::SLASH_MENU,
-                g::BOX_SHELL,
-                g::BOX_WRITE,
-                g::QUESTION,
-                g::LIMIT_DIALOG,
-                g::TRUST,
-                g::ERROR_401,
             ],
         ),
     ];
@@ -4735,11 +4713,10 @@ fn esc_line_of(rows: Vec<String>, program: &'static str) -> Option<String> {
 #[test]
 fn drive_phase_says_esc_quits_the_program_on_a_trust_dialog() {
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{agy, gemini, muse, prompt};
+    use aterm_phase::{agy, muse, prompt};
     for (name, rows, program) in [
         ("claude", screen(prompt::fixtures::TRUST), "claude"),
         ("muse", screen(muse::fixtures::TRUST_1_4_10), "muse"),
-        ("gemini", screen(gemini::fixtures::TRUST), "node"),
         ("agy", screen(agy::fixtures::BOX_TRUST), "agy"),
         (
             "agy lab",
@@ -4755,7 +4732,6 @@ fn drive_phase_says_esc_quits_the_program_on_a_trust_dialog() {
     }
     for (name, rows, program) in [
         ("claude", screen(prompt::fixtures::BOX_BASH_TOUCH), "claude"),
-        ("gemini", screen(gemini::fixtures::BOX_SHELL), "node"),
         (
             "agy terms",
             screen(agy::fixtures::lab::FIRST_RUN_TERMS),
@@ -4768,20 +4744,11 @@ fn drive_phase_says_esc_quits_the_program_on_a_trust_dialog() {
             "the control: {name}"
         );
     }
-    for (name, rows, program) in [
-        (
-            "gemini quota",
-            screen(gemini::fixtures::LIMIT_DIALOG),
-            "node",
-        ),
-        (
-            "agy colour scheme",
-            screen(agy::fixtures::lab::FIRST_RUN_SCHEME),
-            "agy",
-        ),
-    ] {
-        assert_eq!(esc_line_of(rows, program), None, "the control: {name}");
-    }
+    assert_eq!(
+        esc_line_of(screen(agy::fixtures::lab::FIRST_RUN_SCHEME), "agy"),
+        None,
+        "the control: agy colour scheme"
+    );
 }
 
 #[test]
@@ -5054,7 +5021,7 @@ fn an_event_summary_is_what_the_worker_said_not_the_survey() {
 #[test]
 fn the_event_summary_joins_the_replys_wrapped_rows() {
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{agy, gemini, muse, prompt};
+    use aterm_phase::{agy, muse, prompt};
     let tail = "every caller now. Which do you prefer (1 or 2)?";
     let ask = format!("Two ways on from here: keep the old API, or move {tail}");
     let claude_line = format!("Two ways on from here: keep the old API, or move {tail}");
@@ -5063,12 +5030,6 @@ fn the_event_summary_joins_the_replys_wrapped_rows() {
             "claude",
             prompt::fixtures::REPLY_WRAPPED_50_2_1_302,
             claude_line.as_str(),
-            tail,
-        ),
-        (
-            "gemini",
-            gemini::fixtures::REPLY_WRAPPED_50,
-            ask.as_str(),
             tail,
         ),
         (
@@ -6319,66 +6280,6 @@ fn every_word_in_a_composer_with_no_placeholder_is_typed() {
     assert!(!typed_draft(agy, &at_home(&ended)));
     let composer = agy.composer(&drafted);
     assert!(!typed_draft_in(composer.as_ref(), true, &at_home(&drafted)));
-}
-
-#[test]
-fn gemini_clis_placeholder_is_no_draft_and_its_draft_is() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let gemini = &aterm_phase::GeminiReader;
-    let at = |rows: &[String], col: usize| Screen {
-        rows: rows.to_vec(),
-        cursor_row: gemini.composer(rows).expect("the composer").0,
-        cursor_col: col,
-        ..Screen::default()
-    };
-    let idle = screen(g::IDLE);
-    let draft = screen(g::DRAFT);
-    let mut m = Mock::new(Vec::new());
-    let mut s = session(&mut m, None);
-    for col in [2, 3] {
-        assert!(!typed_draft(gemini, &at(&idle, col)), "column {col}");
-        let c = gemini.composer(&idle);
-        assert_eq!(
-            s.composer_draft(
-                c.as_ref(),
-                gemini.placeholder(),
-                gemini.placeholder_fg(),
-                &at(&idle, col)
-            ),
-            Some(false),
-            "column {col}"
-        );
-    }
-    for col in [3, 3 + "a draft the lab never sends".len()] {
-        assert!(typed_draft(gemini, &at(&draft, col)), "column {col}");
-        let c = gemini.composer(&draft);
-        assert_eq!(
-            s.composer_draft(
-                c.as_ref(),
-                gemini.placeholder(),
-                gemini.placeholder_fg(),
-                &at(&draft, col)
-            ),
-            Some(true),
-            "column {col}"
-        );
-    }
-    drop(s);
-    assert!(
-        !m.requests.iter().any(|r| r.starts_with("cell ")),
-        "{:#?}",
-        m.requests
-    );
-    let caret = gemini.composer(&idle).expect("the composer").0;
-    let words = (
-        caret,
-        vec!["Type your message or @path/to/file".to_string()],
-    );
-    assert!(
-        typed_draft_in(Some(&words), gemini.placeholder(), &at(&idle, 3)),
-        "the control"
-    );
 }
 
 fn with_context(mut r: Vec<String>, left: u8) -> Vec<String> {
@@ -9533,7 +9434,6 @@ fn the_agent_a_spawn_started_is_read_off_meta() {
     };
     for program in [
         aterm_phase::Program::Claude,
-        aterm_phase::Program::Gemini,
         aterm_phase::Program::Agy,
         aterm_phase::Program::Muse,
     ] {
@@ -9544,9 +9444,16 @@ fn the_agent_a_spawn_started_is_read_off_meta() {
         meta("-"),
         meta("generic"),
         meta("vim"),
+        meta("gemini"),
+        meta("gemini-cli"),
         "OK title=- cwd=/w agent_cwd=/w state=alive trusted_cwd=/w\n".to_string(),
     ] {
-        s.note_cwd(&meta("gemini"));
+        s.note_cwd(&meta("agy"));
+        assert_eq!(
+            s.worker_agent,
+            Some(aterm_phase::Program::Agy),
+            "the control"
+        );
         s.note_cwd(&none);
         assert_eq!(s.worker_agent, None, "{none}");
     }

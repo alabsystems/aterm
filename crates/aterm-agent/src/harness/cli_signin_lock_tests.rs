@@ -133,8 +133,12 @@ impl AccountsHost for LockHost {
     fn now(&self) -> i64 {
         self.now
     }
-    fn login(&self, _: Option<&str>) -> Result<i32, String> {
-        self.login_result()
+    fn login(&self, dir: Option<&str>) -> Result<i32, String> {
+        let result = self.login_result();
+        if result == Ok(0) {
+            std::fs::write(Path::new(dir.unwrap()).join(".claude.json"), b"{}").unwrap();
+        }
+        result
     }
     fn auth_status(&self, _: &str) -> Result<Captured, String> {
         self.held();

@@ -1756,3 +1756,234 @@ fn overscroll_bounce_springs_and_self_disarms() {
     );
     assert_eq!(ws.scroll_frac_px, 0, "Reduced motion rests whole-row");
 }
+
+/// A mixed tab's frame draws its terminal leaf's whole rows, not a glide's or bounce's sub-row
+/// band or the scroll pill: its scroll motion asks for a frame only when a row moves, where a
+/// single terminal pane's asks on every tick.
+#[test]
+fn a_mixed_tab_s_scroll_motion_asks_for_frames_only_when_a_row_moves() {
+    use std::time::Instant;
+
+    struct Run {
+        requests: u32,
+        moves: u32,
+        ticks: u32,
+    }
+    let mixed_tab = |route: Option<crate::VisibleContentRoute>| {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let mixed = app
+            .active_visible_content_route(wid)
+            .expect("a visible route");
+        assert_eq!(
+            mixed,
+            crate::VisibleContentRoute::Heterogeneous,
+            "PRECONDITION: a mixed tab"
+        );
+        let _ = app.prepare_layout_coordinate_space(wid, mixed);
+        let ws = app.windows.get_mut(&wid).expect("the window");
+        if let Some(route) = route {
+            ws.last_layout_coordinate_space
+                .as_mut()
+                .expect("PRECONDITION: the frame's coordinate space")
+                .route = route;
+        }
+        ws.focused = true;
+        ws.frame_interval = Some(Duration::from_micros(8_333));
+        assert!(
+            ws.front_terminal().is_some(),
+            "PRECONDITION: the terminal leaf has focus"
+        );
+        let term = seed_history(&app, wid);
+        (app, wid, term)
+    };
+    let requests = |app: &App, wid: WindowId| app.windows[&wid].redraw_requests_for_test.get();
+
+    let glide = |route| {
+        let (mut app, wid, term) = mixed_tab(route);
+        let mut row = term_lock(&term).grid().display_offset();
+        app.scroll_wheel_animated_at(wid, &term, 3, None, None, Instant::now());
+        let (mut moves, mut ticks) = (0, 0);
+        for _ in 0..500 {
+            let Some(at) = app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .map(|st| st.wake_deadline())
+            else {
+                break;
+            };
+            app.service_due_scroll_motion(at);
+            ticks += 1;
+            let landed = term_lock(&term).grid().display_offset();
+            if landed != row {
+                moves += 1;
+                row = landed;
+            }
+        }
+        assert_eq!(row, 3, "the notch scrolls its three rows on every route");
+        Run {
+            requests: requests(&app, wid),
+            moves,
+            ticks,
+        }
+    };
+    let bounce = |route| {
+        let (mut app, wid, term) = mixed_tab(route);
+        term_lock(&term).scroll_display(i32::MAX);
+        app.scroll_wheel_animated_at(wid, &term, 3, None, None, Instant::now());
+        let mut ticks = 0;
+        for _ in 0..500 {
+            let Some(at) = app.windows[&wid]
+                .overscroll
+                .as_ref()
+                .map(|sp| sp.wake_deadline())
+            else {
+                break;
+            };
+            app.service_due_scroll_motion(at);
+            ticks += 1;
+        }
+        Run {
+            requests: requests(&app, wid),
+            moves: 0,
+            ticks,
+        }
+    };
+    let track = |route| {
+        let (mut app, wid, term) = mixed_tab(route);
+        let cell_h = app.win_cell_size(wid).1 as f64;
+        app.scroll_wheel_animated_at(wid, &term, 0, None, Some(2.5 * cell_h), Instant::now());
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            3,
+            "a push of two and a half rows lands on the third, its band half a row back"
+        );
+        Run {
+            requests: requests(&app, wid),
+            moves: 1,
+            ticks: 0,
+        }
+    };
+
+    let mixed = track(None);
+    assert_eq!(
+        mixed.requests, mixed.moves,
+        "a mixed frame is asked for the rows a trackpad push moves, not its band"
+    );
+    let single = track(Some(crate::VisibleContentRoute::Terminal {
+        composed: false,
+    }));
+    assert_eq!(
+        single.requests,
+        single.moves + 1,
+        "control: a single pane also draws the push's sub-row band"
+    );
+
+    let mixed = glide(None);
+    assert!(
+        mixed.ticks > mixed.moves,
+        "PRECONDITION: some glide ticks move the band within a row ({} ticks, {} moves)",
+        mixed.ticks,
+        mixed.moves
+    );
+    assert_eq!(
+        mixed.requests, mixed.moves,
+        "a mixed frame is asked for once per row the glide moves"
+    );
+    let single = glide(Some(crate::VisibleContentRoute::Terminal {
+        composed: false,
+    }));
+    assert_eq!(
+        single.requests,
+        single.ticks + 1,
+        "control: a single pane draws every tick's band and the wheel's pill"
+    );
+
+    let mixed = bounce(None);
+    assert!(
+        mixed.ticks > 0,
+        "PRECONDITION: the push past the top bounces"
+    );
+    assert_eq!(mixed.requests, 0, "a mixed frame draws no bounce");
+    let single = bounce(Some(crate::VisibleContentRoute::Terminal {
+        composed: false,
+    }));
+    assert_eq!(
+        single.requests,
+        single.ticks + 1,
+        "control: a single pane draws every bounce tick"
+    );
+}
+
+/// A glide row step that lands back on the glide's recorded row after output repinned the
+/// viewport still moves what a mixed tab shows, so it asks for its frame: every tick that changes
+/// the engine's offset asks for one, and no other tick does.
+#[test]
+fn a_mixed_tab_s_glide_step_that_cancels_an_output_repin_asks_for_its_frame() {
+    use std::time::Instant;
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    let route = app
+        .active_visible_content_route(wid)
+        .expect("a visible route");
+    assert_eq!(
+        route,
+        crate::VisibleContentRoute::Heterogeneous,
+        "PRECONDITION: a mixed tab"
+    );
+    let _ = app.prepare_layout_coordinate_space(wid, route);
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.focused = true;
+    ws.frame_interval = Some(Duration::from_micros(8_333));
+    let term = seed_history(&app, wid);
+    term_lock(&term).scroll_display(20);
+    app.scroll_wheel_animated_at(wid, &term, -3, None, None, Instant::now());
+    let requests = |app: &App| app.windows[&wid].redraw_requests_for_test.get();
+    let mut repinned = false;
+    let mut cancelled = false;
+    for _ in 0..500 {
+        let Some(at) = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .map(|st| st.wake_deadline())
+        else {
+            break;
+        };
+        let engine_row = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .map(|st| st.engine_row);
+        let before = (term_lock(&term).grid().display_offset(), requests(&app));
+        app.service_due_scroll_motion(at);
+        let after = (term_lock(&term).grid().display_offset(), requests(&app));
+        assert_eq!(
+            after.1 - before.1,
+            u32::from(after.0 != before.0),
+            "a tick asks for a frame exactly when it moves the engine's offset ({} -> {})",
+            before.0,
+            after.0
+        );
+        if repinned && after.0 != before.0 && engine_row == Some(after.0 as i64) {
+            cancelled = true;
+        }
+        if !repinned && after.0 != before.0 && app.windows[&wid].scroll_glide.is_some() {
+            let pinned = term_lock(&term).grid().display_offset();
+            term_lock(&term).process(b"one more line\r\n");
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                pinned + 1,
+                "PRECONDITION: output repins the scrolled-back viewport"
+            );
+            repinned = true;
+        }
+    }
+    assert!(
+        cancelled,
+        "PRECONDITION: a row step landed back on the glide's recorded row"
+    );
+}

@@ -162,15 +162,118 @@ fn row_home(cli: Cli, row: &Row, home: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// A managed pool's policy, bindings and budget state captured under the account writer lock.
+struct PoolSnapshot {
+    roster: Roster,
+    logins: accounts::Logins,
+    state: accounts::State,
+}
+
+/// Fingerprint the endpoint and the managed login generation, not the credentials. Tagged,
+/// length-delimited fields distinguish absent and empty values, even on non-UTF-8 homes.
+/// Serving a turn does not change this key; renewing even in the same directory does.
+fn sample_context(
+    seat: &Seat<'_>,
+    cli: Cli,
+    row: &Row,
+    logins: &accounts::Logins,
+) -> accounts::SampleContext {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-pool-sample-context-v2");
+    let mut field = |value: Option<&[u8]>| match value {
+        None => hash.update([0]),
+        Some(value) => {
+            hash.update([1]);
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value);
+        }
+    };
+    field(Some(cli.id().as_bytes()));
+    field(Some(seat.home.as_os_str().as_encoded_bytes()));
+    field(Some(row.label.as_bytes()));
+    field(row.dir.as_deref().map(str::as_bytes));
+    field(row.email.as_deref().map(str::as_bytes));
+    field(row.identity_email.as_deref().map(str::as_bytes));
+    field(row.vendor.region.map(|region| region.as_str().as_bytes()));
+    field(row.flow(cli).map(|flow| flow.as_str().as_bytes()));
+    let binding = logins.labels.get(&row.label);
+    field(
+        binding
+            .and_then(|binding| binding.dir.as_deref())
+            .map(str::as_bytes),
+    );
+    field(
+        binding
+            .and_then(|binding| binding.renewed_at)
+            .map(|at| at.to_be_bytes())
+            .as_ref()
+            .map(|bytes| bytes.as_slice()),
+    );
+    field(
+        binding
+            .map(|binding| binding.renewal_generation.to_be_bytes())
+            .as_ref()
+            .map(|bytes| bytes.as_slice()),
+    );
+    field(
+        binding
+            .and_then(|binding| binding.proved_by)
+            .map(|proof| proof.as_str().as_bytes()),
+    );
+    field(
+        binding
+            .and_then(|binding| binding.proved_email.as_deref())
+            .map(str::as_bytes),
+    );
+    field(
+        binding
+            .and_then(|binding| binding.proved_dir.as_deref())
+            .map(str::as_bytes),
+    );
+    accounts::SampleContext(aterm_codec::hex::encode_lower(&hash.finalize()))
+}
+
+fn snapshot_held(seat: &Seat<'_>, cli: Cli, store: &Store) -> Result<PoolSnapshot, String> {
+    let raw = seat.roster(cli)?;
+    let (logins, _) = store.load_logins(seat.now)?;
+    let (state, _) = store.load(seat.now)?;
+    Ok(PoolSnapshot {
+        roster: accounts::bound(&raw, &logins),
+        logins,
+        state,
+    })
+}
+
+fn pool_snapshot(seat: &Seat<'_>, cli: Cli) -> Result<PoolSnapshot, String> {
+    let raw = seat.roster(cli)?;
+    if raw.rows.is_empty() {
+        return Ok(PoolSnapshot {
+            roster: raw,
+            logins: accounts::Logins::default(),
+            state: accounts::State::default(),
+        });
+    }
+    let store = seat.store(cli);
+    let _held = store
+        .acquire_within(&accounts::LOCK_LADDER)
+        .map_err(|why| why.to_string())?
+        .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
+    snapshot_held(seat, cli, &store)
+}
+
 /// Reads the usage of each of `roster`'s rows of `cli` whose login is here (`enrolled`, or the
-/// default row) and whose sample is older than [`USAGE_FRESH_S`], each in its own home and at
+/// default row) and whose sample is older than [`USAGE_FRESH_S`] or lacks the current login
+/// context, each in its own home and at
 /// once, with `read`; records each reading under its row in `cli`'s store (its sample, and the
 /// wall it names) in one transaction. The labels recorded. When an overlay CLI's default row is
 /// due, its default home is read before linking and reading the overlay homes so any shared
 /// suffix file the CLI creates at startup exists there first.
+/// Samples from the future or before the last managed renewal are ignored. A context mismatch
+/// never clears stored usage or limits; only an accepted new sample receives the current tag.
 /// # Errors
-/// Account state could not be read or fresh usage could not be recorded. A caller must
-/// not select from the old state after a failed write.
+/// Account state, bindings or current policy could not be read, the policy changed during
+/// polling, or fresh usage could not be recorded. A caller must not select from the old
+/// state after a failed write.
 pub fn record_usage(
     seat: &Seat<'_>,
     cli: Cli,
@@ -178,24 +281,46 @@ pub fn record_usage(
     enrolled: &std::collections::BTreeSet<String>,
     read: ReadUsage<'_>,
 ) -> Result<Vec<String>, String> {
+    let before = pool_snapshot(seat, cli)?;
+    if before.roster != *roster {
+        return Err("account policy or login changed before usage read".into());
+    }
+    poll_usage(seat, cli, &before, enrolled, read).map(|(_, labels)| labels)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSampleContext",
+        action = "Poll",
+        project = "aterm_agent::harness::accounts_pool::tests::sample_context::context_transition"
+    )
+)]
+fn poll_usage(
+    seat: &Seat<'_>,
+    cli: Cli,
+    before: &PoolSnapshot,
+    enrolled: &std::collections::BTreeSet<String>,
+    read: ReadUsage<'_>,
+) -> Result<(accounts::State, Vec<String>), String> {
     let store = seat.store(cli);
-    let (state, _) = store
-        .load(seat.now)
-        .map_err(|why| format!("{}: {why}", store.state_file().display()))?;
-    let due_rows: Vec<&Row> = roster
+    let due_rows: Vec<&Row> = before
+        .roster
         .rows
         .iter()
         .filter(|row| row.dir.is_none() || enrolled.contains(&row.label))
         .filter(|row| {
-            state
-                .accounts
-                .get(&row.label)
-                .and_then(|a| a.sample.as_ref())
-                .is_none_or(|s| seat.now.saturating_sub(s.at) >= USAGE_FRESH_S)
+            before.state.accounts.get(&row.label).is_none_or(|account| {
+                account.sample_context.as_ref()
+                    != Some(&sample_context(seat, cli, row, &before.logins))
+                    || account.sample.as_ref().is_none_or(|sample| {
+                        sample.at > seat.now || seat.now.saturating_sub(sample.at) >= USAGE_FRESH_S
+                    })
+            })
         })
         .collect();
     if due_rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok((before.state.clone(), Vec::new()));
     }
     let is_overlay = matches!(cli.accounts().seam, Seam::Overlay { .. });
     let mut readings: Vec<(String, Usage)> = Vec::new();
@@ -228,25 +353,45 @@ pub fn record_usage(
                 .collect::<Vec<_>>()
         }));
     }
-    if readings.is_empty() {
-        return Ok(Vec::new());
+    let held = store
+        .acquire_within(&accounts::LOCK_LADDER)
+        .map_err(|why| why.to_string())?
+        .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
+    let current = snapshot_held(seat, cli, &store)?;
+    if current.roster != before.roster || current.logins != before.logins {
+        return Err("account policy or login changed during usage read; nothing recorded".into());
     }
-    let mut note = None;
-    let recorded = store.transact_within(&accounts::LOCK_LADDER, seat.now, &mut note, |state| {
+    readings.retain(|(label, usage)| {
+        usage.sample.at <= seat.now
+            && before
+                .logins
+                .labels
+                .get(label)
+                .and_then(|binding| binding.renewed_at)
+                .is_none_or(|renewed| usage.sample.at >= renewed)
+    });
+    if readings.is_empty() {
+        return Ok((current.state, Vec::new()));
+    }
+    let mut state_after = None;
+    let recorded = store.transact_logins_held(&held, seat.now, &mut None, |state, _| {
         let mut events = Vec::new();
         for (label, usage) in &readings {
-            events.extend(accounts::note_sample(
-                state,
-                label,
-                usage.sample.clone(),
-                seat.now,
-            ));
+            let sample_events = accounts::note_sample(state, label, usage.sample.clone(), seat.now);
+            if !sample_events.is_empty()
+                && let Some(row) = current.roster.row(label)
+                && let Some(account) = state.accounts.get_mut(label)
+            {
+                account.sample_context = Some(sample_context(seat, cli, row, &current.logins));
+            }
+            events.extend(sample_events);
             if let Some((window, until)) = usage.wall {
                 events.extend(accounts::note_wall(
                     state, label, window, until, seat.now, seat.now,
                 ));
             }
         }
+        state_after = Some(state.clone());
         Ok(events)
     });
     recorded.map_err(|why| {
@@ -255,7 +400,10 @@ pub fn record_usage(
             store.state_file().display()
         )
     })?;
-    Ok(readings.into_iter().map(|(label, _)| label).collect())
+    Ok((
+        state_after.ok_or("usage transaction supplied no state")?,
+        readings.into_iter().map(|(label, _)| label).collect(),
+    ))
 }
 
 /// The product's [`ReadUsage`]: Codex's app server started in `home`, asked
@@ -277,8 +425,9 @@ pub fn live_usage(cli: Cli, home: &Path, now: i64) -> Option<Usage> {
 /// keyring ([`Seat::keyring_held`]). Under `[harness] accounts = "off"` only the owner's pin
 /// is honoured.
 /// # Errors
-/// The pool's records cannot be read, no managed row is usable, or the chosen login's
-/// overlay cannot be prepared. A caller must hold the launch on these failures.
+/// The pool's records cannot be read, its effective roster changes during polling, no managed
+/// row is usable, the chosen login's overlay cannot be prepared, or its binding, routing or
+/// selection changes during preparation. A caller must hold the launch on these failures.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -287,61 +436,61 @@ pub fn live_usage(cli: Cli, home: &Path, now: i64) -> Option<Usage> {
         project = "aterm_agent::harness::accounts_pool::tests::launch_admission::launch_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolUsagePolicy",
+        action = "PollAndChoose",
+        project = "aterm_agent::harness::accounts_pool::tests::usage_policy::usage_transition"
+    )
+)]
 pub fn launch_env(
     seat: &Seat<'_>,
     cli: Cli,
     read: ReadUsage<'_>,
 ) -> Result<Option<LoginEnv>, String> {
+    launch_env_using(seat, cli, read, |row| login_env(cli, row, seat.home))
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolLaunchPolicy",
+        action = "Finish",
+        project = "aterm_agent::harness::accounts_pool::tests::launch_policy::launch_transition"
+    )
+)]
+fn launch_env_using(
+    seat: &Seat<'_>,
+    cli: Cli,
+    read: ReadUsage<'_>,
+    mut prepare: impl FnMut(&Row) -> io::Result<LoginEnv>,
+) -> Result<Option<LoginEnv>, String> {
     if !cli.accounts().measured || seat.keyring_held(cli) {
         return Ok(None);
     }
-    let roster = seat.bound_roster(cli)?;
+    let snapshot = pool_snapshot(seat, cli)?;
+    let roster = &snapshot.roster;
     if roster.rows.is_empty() {
         return Ok(None);
     }
-    let enrolled = accounts::enrolled_for(cli, &roster);
-    let store = seat.store(cli);
-    let load = || {
-        store
-            .load(seat.now)
-            .map_err(|why| format!("{}: {why}", store.state_file().display()))
-    };
-    let (initial_state, _) = load()?;
-    let checked_pin = |state: &accounts::State| -> Result<Option<&Row>, String> {
-        if !state.pinned {
-            return Ok(None);
-        }
-        let pinned = state
-            .active
-            .as_deref()
-            .and_then(|label| roster.row(label))
-            .ok_or_else(|| format!("{} account pin names no roster row", cli.id()))?;
-        let cond = accounts::condition(
-            pinned,
-            state,
-            pinned.dir.is_none() || enrolled.contains(&pinned.label),
-            seat.now,
-        );
-        if matches!(
-            cond,
-            accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
-        ) {
-            return Err(format!(
-                "{} account {} is not signed in",
-                cli.id(),
-                pinned.label
-            ));
-        }
-        Ok(Some(pinned))
-    };
-    let pinned = checked_pin(&initial_state)?;
-    if seat.mode() == Mode::Off {
+    let enrolled = accounts::enrolled_for(cli, roster);
+    let configured_mode = seat.mode();
+    let pinned = checked_launch_pin(seat, cli, roster, &snapshot.state, &enrolled)?;
+    if configured_mode == Mode::Off {
         let Some(pinned) = pinned else {
             return Ok(None);
         };
-        return login_env(cli, pinned, seat.home)
-            .map(Some)
-            .map_err(|why| why.to_string());
+        let env = prepare(pinned).map_err(|why| why.to_string())?;
+        finish_launch(
+            seat,
+            cli,
+            &snapshot,
+            pinned,
+            &Default::default(),
+            configured_mode,
+        )?;
+        return Ok(Some(env));
     }
     if let [only] = roster.rows.as_slice()
         && only.dir.is_none()
@@ -349,16 +498,19 @@ pub fn launch_env(
     {
         return Ok(None);
     }
-    record_usage(seat, cli, &roster, &enrolled, read)?;
-    let (state, _) = load()?;
-    checked_pin(&state)?;
-    let mut candidate_enrolled = enrolled;
+    let (state, _) = poll_usage(seat, cli, &snapshot, &enrolled, read)?;
+    checked_launch_pin(seat, cli, roster, &state, &enrolled)?;
+    let mut candidate_enrolled = enrolled.clone();
     let mut last_overlay_error = None;
     loop {
-        let row = accounts::launch_row(&roster, &state, &candidate_enrolled, seat.now)
+        let row = accounts::launch_row(roster, &state, &candidate_enrolled, seat.now)
             .ok_or_else(|| last_overlay_error.take().unwrap_or_else(|| format!("{} account pool has no usable account; inspect `aterm harness accounts --cli {}`", cli.id(), cli.id())))?;
-        let why = match login_env(cli, row, seat.home) {
-            Ok(env) => return Ok(Some(env)),
+        let why = match prepare(row) {
+            Ok(env) => {
+                let excluded = enrolled.difference(&candidate_enrolled).cloned().collect();
+                finish_launch(seat, cli, &snapshot, row, &excluded, configured_mode)?;
+                return Ok(Some(env));
+            }
             Err(why) => why,
         };
         if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
@@ -369,6 +521,114 @@ pub fn launch_env(
         last_overlay_error = Some(why.to_string());
     }
 }
+
+fn checked_launch_pin<'a>(
+    seat: &Seat<'_>,
+    cli: Cli,
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+) -> Result<Option<&'a Row>, String> {
+    if !state.pinned {
+        return Ok(None);
+    }
+    let pinned = state
+        .active
+        .as_deref()
+        .and_then(|label| roster.row(label))
+        .ok_or_else(|| format!("{} account pin names no roster row", cli.id()))?;
+    let cond = accounts::condition(
+        pinned,
+        state,
+        pinned.dir.is_none() || enrolled.contains(&pinned.label),
+        seat.now,
+    );
+    if matches!(
+        cond,
+        accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
+    ) {
+        return Err(format!(
+            "{} account {} is not signed in",
+            cli.id(),
+            pinned.label
+        ));
+    }
+    Ok(Some(pinned))
+}
+
+/// Observe current admission after preparing an environment. This read-only check does not
+/// freeze credential contents, raw roster writers or the caller's later process spawn.
+fn finish_launch(
+    seat: &Seat<'_>,
+    cli: Cli,
+    before: &PoolSnapshot,
+    row: &Row,
+    excluded: &std::collections::BTreeSet<String>,
+    configured_mode: Mode,
+) -> Result<(), String> {
+    let store = seat.store(cli);
+    let _held = store
+        .acquire_within(&accounts::LOCK_LADDER)
+        .map_err(|why| why.to_string())?
+        .ok_or(accounts::LOCK_HELD)?;
+    let current = snapshot_held(seat, cli, &store)?;
+    if current.roster.row(&row.label) != Some(row)
+        || !accounts::RenewalParent::capture(&before.logins, &row.label)
+            .matches(&current.logins, &row.label)
+    {
+        return Err("account policy or login changed while preparing a launch".into());
+    }
+    if seat.keyring_held(cli) || seat.mode() != configured_mode {
+        return Err("account routing changed while preparing a launch".into());
+    }
+    let mut enrolled = accounts::enrolled_for(cli, &current.roster);
+    enrolled.retain(|label| !excluded.contains(label));
+    let pinned = checked_launch_pin(seat, cli, &current.roster, &current.state, &enrolled)?;
+    let selected = if configured_mode == Mode::Off {
+        pinned
+    } else {
+        accounts::launch_row(&current.roster, &current.state, &enrolled, seat.now)
+    };
+    if selected.map(|current| &current.label) != Some(&row.label) {
+        return Err("account selection changed while preparing a launch".into());
+    }
+    Ok(())
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunchPolicy",
+        action = "AnotherProvider",
+        reason = "Model bookkeeping: select the Codex, Grok or Kimi launch fixture"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunchPolicy",
+        action = "OffWithPin",
+        reason = "Model bookkeeping: select automatic admission or off mode with an explicit pin"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunchPolicy",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: select the change injected during environment preparation"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunchPolicy",
+        action = "Prepare",
+        reason = "Model bookkeeping: freeze the native fixture before Finish"
+    )
+)]
+#[doc(hidden)]
+pub fn account_pool_launch_policy_environment() {}
 
 /// A running session of a pooled CLI, as [`session_move`] asks about it.
 #[derive(Debug, Clone)]
@@ -412,76 +672,83 @@ impl Moved {
 /// The advice for session `s` from its own CLI's roster (as `logins.json` binds it) and store
 /// ([`accounts::advise_session`]), and the relaunch line a move writes ([`relaunch::pool_line`]).
 /// The usage sample and a wall the session stands at are recorded in the store under every
-/// mode, `off` included, before the advice is read, and a turn end proves the session's row
-/// where it is the rotation's unproven `active` ([`accounts::prove`]). A move's line is written
-/// before anything is committed ([`StayWhy::NoLine`] where it cannot be); a move that rotates
-/// then commits its rotation ([`accounts::begin_rotation`]), so the breaker counts it in that
+/// mode, `off` included, before the advice is read. A turn end on the row's current login
+/// proves the rotation's unproven `active` ([`accounts::prove`]); a superseded login only
+/// contributes usage evidence. A move's line is written
+/// before anything is committed ([`StayWhy::NoLine`] where it cannot be). After preparing it,
+/// both endpoint rows and login generations are checked and advice is recomputed under the
+/// account lock. A move that rotates then commits its rotation ([`accounts::begin_rotation`]), so the breaker counts it in that
 /// CLI's store alone. A CLI that keeps its login in the OS keyring stays
 /// ([`StayWhy::KeyringStore`]).
 #[must_use]
 pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
+    session_move_using(seat, s, |row| {
+        login_env(s.cli, row, seat.home)
+            .ok()
+            .and_then(|env| relaunch::pool_line(&s.relaunch, s.cli, &env).ok())
+    })
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountPoolMovePolicy",
+        action = "Finish",
+        project = "aterm_agent::harness::accounts_pool::tests::move_policy::move_transition"
+    )
+)]
+fn session_move_using(
+    seat: &Seat<'_>,
+    s: &Session<'_>,
+    mut prepare: impl FnMut(&Row) -> Option<String>,
+) -> Moved {
     if s.supervisor == Supervisor::Own {
         return Moved::stay(StayWhy::OtherSupervisor);
     }
-    let Ok(roster) = seat.bound_roster(s.cli) else {
+    let Ok(mut roster) = seat.bound_roster(s.cli) else {
         return Moved::stay(StayWhy::NoRoster);
     };
-    let store = seat.store(s.cli);
     let who = accounts::ProcessLogin::of_env_for(s.cli, s.env.iter().copied());
     let me = who.me(&roster);
     if let Some(label) = me.label().filter(|_| me.default_home && me.stored_login) {
-        let mut note = None;
-        let recorded =
-            store.transact_within(&accounts::LOCK_LADDER, seat.now, &mut note, |state| {
-                let mut events = Vec::new();
-                if s.point == Point::TurnEnd {
-                    // A served turn on the rotation's new row proves it, as Claude Code's
-                    // host's `account_served` does, so the canary it held does not hold
-                    // the pool's early moves for good.
-                    events.extend(accounts::prove(state, label, seat.now));
-                    events.extend(accounts::note_session(state, s.sid, label, None, seat.now));
-                }
-                if let Some(sample) = s.sample.clone() {
-                    events.extend(accounts::note_sample(state, label, sample, seat.now));
-                }
-                if let Point::Wall { window, at } = &s.point {
-                    events.extend(accounts::note_wall(
-                        state,
-                        label,
-                        window,
-                        None,
-                        at.unwrap_or(seat.now),
-                        seat.now,
-                    ));
-                }
-                Ok(events)
-            });
-        if recorded.is_err() {
-            return Moved::stay(StayWhy::NothingDue);
-        }
+        let recorded = roster
+            .row(label)
+            .ok_or_else(|| "observed row is missing".into())
+            .and_then(|row| record_session(seat, s, &who, row));
+        roster = match recorded {
+            Ok(current) => current,
+            Err(_) => return Moved::stay(StayWhy::NothingDue),
+        };
     }
     if seat.keyring_held(s.cli) {
         return Moved::stay(StayWhy::KeyringStore);
     }
-    let Ok((state, _)) = store.load(seat.now) else {
+    let Ok(snapshot) = pool_snapshot(seat, s.cli) else {
         return Moved::stay(StayWhy::NothingDue);
     };
-    let enrolled = accounts::enrolled_for(s.cli, &roster);
-    let mut candidate_enrolled = enrolled;
+    if snapshot.roster != roster {
+        return Moved::stay(StayWhy::NothingDue);
+    }
+    let roster = &snapshot.roster;
+    let state = &snapshot.state;
+    let me = who.me(roster);
+    let configured_mode = seat.mode();
+    let enrolled = accounts::enrolled_for(s.cli, roster);
+    let mut candidate_enrolled = enrolled.clone();
     let mut saw_line_failure = false;
-    let (advice, to, rotates, line) = loop {
+    let (advice, line) = loop {
         let advice = accounts::advise_session(
             s.cli,
             s.supervisor,
-            &roster,
-            &state,
+            roster,
+            state,
             &candidate_enrolled,
             &me,
             &s.point,
             s.mode,
             seat.now,
         );
-        let Advice::Move { to, rotates, .. } = &advice else {
+        let Advice::Move { to, .. } = &advice else {
             return if saw_line_failure {
                 Moved::stay(StayWhy::NoLine)
             } else {
@@ -495,11 +762,8 @@ pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
                 StayWhy::NoCandidate
             });
         };
-        if let Some(line) = login_env(s.cli, row, seat.home)
-            .ok()
-            .and_then(|env| relaunch::pool_line(&s.relaunch, s.cli, &env).ok())
-        {
-            break (advice.clone(), to.clone(), *rotates, line);
+        if let Some(line) = prepare(row) {
+            break (advice, line);
         }
         saw_line_failure = true;
         if (state.pinned && state.active.as_deref() == Some(to.as_str()))
@@ -508,38 +772,193 @@ pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
             return Moved::stay(StayWhy::NoLine);
         }
     };
-    if rotates {
-        let Some(from) = me.label() else {
-            return Moved::stay(StayWhy::NotListed);
-        };
-        let expect = state.active.clone();
-        let mut note = None;
-        let committed =
-            store.transact_within(&accounts::LOCK_LADDER, seat.now, &mut note, |held| {
-                let mover = accounts::Mover {
-                    sid: s.sid,
-                    account: from,
-                };
-                accounts::begin_rotation(
-                    held,
-                    &roster,
-                    &candidate_enrolled,
-                    expect.as_deref(),
-                    mover,
-                    &to,
-                    seat.now,
-                )
-                .map(|event| vec![event])
-                .map_err(|lost| format!("{lost:?}"))
-            });
-        if committed.is_err() {
-            return Moved::stay(StayWhy::NothingDue);
-        }
+    let excluded = enrolled.difference(&candidate_enrolled).cloned().collect();
+    if finish_move(
+        seat,
+        s,
+        &snapshot,
+        &who,
+        &advice,
+        &excluded,
+        configured_mode,
+    )
+    .is_err()
+    {
+        return Moved::stay(StayWhy::NothingDue);
     }
     Moved {
         advice,
         line: Some(line),
     }
+}
+
+/// Validate a prepared line at one current policy observation before returning it. Roster
+/// writers do not share the lock; this does not freeze their files or a later process spawn.
+fn finish_move(
+    seat: &Seat<'_>,
+    session: &Session<'_>,
+    before: &PoolSnapshot,
+    who: &accounts::ProcessLogin,
+    advice: &Advice,
+    excluded: &std::collections::BTreeSet<String>,
+    configured_mode: Mode,
+) -> Result<(), String> {
+    let Advice::Move { to, rotates, .. } = advice else {
+        return Err("no prepared account move".into());
+    };
+    let from = who
+        .me(&before.roster)
+        .label()
+        .ok_or("source account disappeared")?;
+    let store = seat.store(session.cli);
+    let held = store
+        .acquire_within(&accounts::LOCK_LADDER)
+        .map_err(|why| why.to_string())?
+        .ok_or(accounts::LOCK_HELD)?;
+    let current = snapshot_held(seat, session.cli, &store)?;
+    for label in [from, to.as_str()] {
+        if before.roster.row(label) != current.roster.row(label)
+            || !accounts::RenewalParent::capture(&before.logins, label)
+                .matches(&current.logins, label)
+        {
+            return Err("account policy or login changed while preparing a move".into());
+        }
+    }
+    if seat.keyring_held(session.cli) || seat.mode() != configured_mode {
+        return Err("account routing changed while preparing a move".into());
+    }
+    let mut enrolled = accounts::enrolled_for(session.cli, &current.roster);
+    enrolled.retain(|label| !excluded.contains(label));
+    let me = who.me(&current.roster);
+    let fresh = accounts::advise_session(
+        session.cli,
+        session.supervisor,
+        &current.roster,
+        &current.state,
+        &enrolled,
+        &me,
+        &session.point,
+        session.mode,
+        seat.now,
+    );
+    if fresh != *advice {
+        return Err("account advice changed while preparing a move".into());
+    }
+    if *rotates {
+        store.transact_logins_held(&held, seat.now, &mut None, |state, _| {
+            accounts::begin_rotation(
+                state,
+                &current.roster,
+                &enrolled,
+                current.state.active.as_deref(),
+                accounts::Mover {
+                    sid: session.sid,
+                    account: from,
+                },
+                to,
+                seat.now,
+            )
+            .map(|event| vec![event])
+            .map_err(|lost| format!("{lost:?}"))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolMovePolicy",
+        action = "AnotherProvider",
+        reason = "Model bookkeeping: select the native Codex, Grok or Kimi fixture"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolMovePolicy",
+        action = "FollowActive",
+        reason = "Model bookkeeping: select rotation or following an already active account"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolMovePolicy",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: select the change injected during command preparation"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolMovePolicy",
+        action = "Choose",
+        reason = "Model bookkeeping: freeze the native fixture before Finish"
+    )
+)]
+#[doc(hidden)]
+pub fn account_pool_move_environment() {}
+
+/// Re-resolve attribution inside the recording lock: a concurrent renewal can turn a
+/// current login into a historical one. Keep its usage, but only an unchanged current
+/// login can prove the canary. An unrecognised login supplies neither kind of evidence.
+/// Return the effective roster read under the lock for the following advice step.
+fn record_session(
+    seat: &Seat<'_>,
+    session: &Session<'_>,
+    who: &accounts::ProcessLogin,
+    row: &accounts::Row,
+) -> Result<Roster, String> {
+    let path = seat.config_dir.join(session.cli.accounts().roster_file);
+    let observation = accounts::LoginObservation {
+        roster_path: &path,
+        row,
+        who,
+    };
+    let mut recorded = None;
+    seat.store(session.cli).transact_logins_within(
+        &accounts::LOCK_LADDER,
+        seat.now,
+        &mut None,
+        |state, logins| {
+            let raw = Roster::load_for(session.cli, &path)?;
+            let current = accounts::bound(&raw, logins);
+            let me = who.me(&current);
+            if !me.default_home || !me.stored_login || me.label() != Some(row.label.as_str()) {
+                return Err("session login changed; usage attribution is unknown".into());
+            }
+            let mut events = Vec::new();
+            if session.point == Point::TurnEnd {
+                if observation.matches_current(&current) {
+                    events.extend(accounts::prove(state, &row.label, seat.now));
+                }
+                events.extend(accounts::note_session(
+                    state,
+                    session.sid,
+                    &row.label,
+                    None,
+                    seat.now,
+                ));
+            }
+            if let Some(sample) = session.sample.clone() {
+                events.extend(accounts::note_sample(state, &row.label, sample, seat.now));
+            }
+            if let Point::Wall { window, at } = &session.point {
+                events.extend(accounts::note_wall(
+                    state,
+                    &row.label,
+                    window,
+                    None,
+                    at.unwrap_or(seat.now),
+                    seat.now,
+                ));
+            }
+            recorded = Some(current);
+            Ok(events)
+        },
+    )?;
+    recorded.ok_or_else(|| "session observation was not recorded".into())
 }
 
 #[cfg_attr(
@@ -624,6 +1043,44 @@ pub fn session_move(seat: &Seat<'_>, s: &Session<'_>) -> Moved {
 )]
 #[doc(hidden)]
 pub fn account_pool_launch_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolUsagePolicy",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for PollAndChoose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolUsagePolicy",
+        action = "Choose",
+        reason = "Model bookkeeping: the model fixes the case it checks before the bound PollAndChoose"
+    )
+)]
+#[doc(hidden)]
+pub fn account_pool_usage_policy_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSampleContext",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for the bound Poll"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSampleContext",
+        action = "Choose",
+        reason = "Model bookkeeping: the model fixes the case it checks before the bound Poll"
+    )
+)]
+#[doc(hidden)]
+pub fn account_sample_context_environment() {}
 
 #[cfg(test)]
 #[path = "accounts_pool_tests.rs"]

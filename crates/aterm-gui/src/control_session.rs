@@ -157,7 +157,7 @@ pub(crate) fn sessions_lines(
             user_title,
             word,
             land_at,
-            (claimed_here, proven),
+            (claimed_here, proven, shown_proven),
         ) = {
             let meta = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let opt = |v: Option<&str>| v.map_or_else(|| "-".to_string(), pct_encode);
@@ -174,6 +174,7 @@ pub(crate) fn sessions_lines(
                 (
                     live == Some(crate::autopilot::own_holder()),
                     meta.supervisor_proven(now),
+                    meta.claim_proven(now),
                 ),
             )
         };
@@ -235,7 +236,7 @@ pub(crate) fn sessions_lines(
             h.state.as_str(),
             title,
             nonce = h.nonce.to_hex(),
-            proven = flag(proven),
+            proven = flag(shown_proven),
         );
     }
     out
@@ -2974,7 +2975,6 @@ fn read_as_claude(ctx: &SessionCtx) -> bool {
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic,
         )
         | None => false,
@@ -3427,7 +3427,60 @@ pub(crate) fn cmd_meta_supervisor(
     if holder == "-" || !crate::session_timeline::valid_owner_token(holder) {
         return Some((USAGE.to_string(), false));
     }
-    let ttl_ms = match toks.next() {
+    let words: Vec<&str> = toks.collect();
+    let words = match aterm_agent::harness::contract::read(holder, &words) {
+        aterm_agent::harness::contract::Words::V2(words) => words,
+        aterm_agent::harness::contract::Words::Refused(why) => {
+            return Some((
+                format!(
+                    "ERR usage: meta set supervisor <id>@<pid> contract=3 scope=<word>[,<word>…] \
+                     [version=<MAJOR.MINOR.0>] [vendor=<version>]: {why}\n"
+                ),
+                false,
+            ));
+        }
+        aterm_agent::harness::contract::Words::Foreign => {
+            return Some(claim_reply(
+                ctx,
+                conn,
+                crate::session_timeline::claim_supervisor_as(
+                    ctx, holder, conn, None, None, now, by,
+                ),
+                None,
+            ));
+        }
+        aterm_agent::harness::contract::Words::Scoped(claim) => {
+            let Some(proven) = prove(holder) else {
+                aterm_log::info!(
+                    "harness @{}: {}'s contract 3 claim is unproven (the kernel's peer, the \
+                     foreground group or the image rule); nothing is claimed",
+                    ctx.self_id,
+                    holder
+                );
+                return Some((
+                    "ERR unproven: a contract 3 claim needs its own direct connection, the \
+                     session's foreground group and a build of its program from atpkg\n"
+                        .to_string(),
+                    false,
+                ));
+            };
+            let versions = claim.versions();
+            let scope = claim.scopes.words();
+            let scoped = crate::harness_claim::Scoped { proven, claim };
+            let claimed = crate::session_timeline::claim_supervisor_scoped(
+                ctx, holder, conn, scoped, now, by,
+            );
+            if claimed.as_ref().is_ok_and(|c| c.changed) {
+                aterm_log::info!(
+                    "harness @{}: {versions} holds the session under contract 3, scope={scope}; \
+                     aterm's built-in engine stands down from exactly that",
+                    ctx.self_id
+                );
+            }
+            return Some(claim_reply(ctx, conn, claimed, None));
+        }
+    };
+    let ttl_ms = match words.first() {
         None => None,
         Some(tok) => match tok.strip_prefix("ttl=").map(str::parse::<u64>) {
             Some(Ok(ms)) if (1..=crate::session_timeline::SUPERVISOR_TTL_MAX_MS).contains(&ms) => {
@@ -3436,7 +3489,7 @@ pub(crate) fn cmd_meta_supervisor(
             _ => return Some((USAGE.to_string(), false)),
         },
     };
-    if toks.next().is_some() {
+    if words.len() > 1 {
         return Some((USAGE.to_string(), false));
     }
     let (bound, expires_us) = match ttl_ms {
@@ -3449,9 +3502,21 @@ pub(crate) fn cmd_meta_supervisor(
         prove(holder)
     };
     let proof = proven.clone();
-    match crate::session_timeline::claim_supervisor_as(
+    let claimed = crate::session_timeline::claim_supervisor_as(
         ctx, holder, bound, expires_us, proven, now, by,
-    ) {
+    );
+    Some(claim_reply(ctx, bound, claimed, proof))
+}
+
+/// A claim's reply: `OK` (noting a connection-bound claim, and a proven self-claim's record
+/// copy), or `ERR busy supervisor=<holder>`.
+fn claim_reply(
+    ctx: &SessionCtx,
+    bound: Option<u64>,
+    claimed: Result<crate::session_timeline::Claimed, String>,
+    proof: Option<crate::self_claim::Proven>,
+) -> (String, bool) {
+    match claimed {
         Ok(claimed) => {
             if bound.is_some() {
                 super::note_connection_claim();
@@ -3465,12 +3530,12 @@ pub(crate) fn cmd_meta_supervisor(
                     claimed.replaced.as_deref(),
                 );
             }
-            Some(("OK\n".to_string(), claimed.changed))
+            ("OK\n".to_string(), claimed.changed)
         }
-        Err(other) => Some((
+        Err(other) => (
             format!("ERR busy supervisor={}\n", pct_encode(&other)),
             false,
-        )),
+        ),
     }
 }
 
@@ -3742,7 +3807,7 @@ fn meta_status(
         attention_owners(&meta),
         attention_kinds(&meta),
         opt(meta.live_supervisor(crate::metrics::now_us())),
-        u8::from(meta.supervisor_proven(crate::metrics::now_us())),
+        u8::from(meta.claim_proven(crate::metrics::now_us())),
         opt(meta.questions.as_deref()),
         opt(agent_cwd.as_deref()),
         opt(trusted_cwd.as_deref()),
@@ -5557,11 +5622,14 @@ mod tests {
             )
         };
         let report = |state, kind| {
-            w.ctx
-                .timeline
-                .lock()
-                .unwrap()
-                .note_program_state(Some(ProgramState { state, kind }), 1);
+            w.ctx.timeline.lock().unwrap().note_program_state(
+                Some(ProgramState {
+                    state,
+                    kind,
+                    app: aterm_core::terminal::program_state::ProgramApp::Codex,
+                }),
+                1,
+            );
         };
         let sid = w.sid.as_str();
         let parked = std::thread::scope(|s| {
@@ -5621,6 +5689,7 @@ mod tests {
                         pid: 4242,
                         start: "Mon Oct 20 16:37:58 2026".to_string(),
                     }),
+                    scoped: None,
                 });
         }
         let out = sessions_lines(

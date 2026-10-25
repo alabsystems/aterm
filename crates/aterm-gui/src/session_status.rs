@@ -2043,7 +2043,6 @@ impl StatusObserver {
                     | aterm_phase::Program::Kimi
                     | aterm_phase::Program::Agy
                     | aterm_phase::Program::Muse
-                    | aterm_phase::Program::Gemini
                     | aterm_phase::Program::Generic,
                 )
                 | None => None,
@@ -2452,9 +2451,12 @@ impl crate::App {
                 timeline.slog_mut().program_tick(at);
                 timeline.slog_mut().shown_tick(at);
                 // The claim is judged by the program in front once this sweep's foreground move
-                // is noted (unnamed right after one), never by the name read before it.
-                let honoured =
-                    crate::program_state::honoured_for(timeline.agent().program.as_deref());
+                // is noted (unnamed right after one), never by the name read before it, and only
+                // where the report names that program.
+                let honoured = crate::program_state::honoured_for(
+                    timeline.agent().program.as_deref(),
+                    program_report.state.map(|s| s.app),
+                );
                 (previous, timeline.slog_wake(), honoured)
             };
             self.session_status.slog_wakes.note(id, wake);
@@ -2507,7 +2509,7 @@ impl crate::App {
                 }
                 crate::harness_host::note_codex_report(
                     session.ctx.self_id.as_str(),
-                    shown.is_some(),
+                    shown.map(|state| state.app),
                 );
             }
             if let Some(previous) = previous_group {
@@ -3109,7 +3111,7 @@ impl crate::App {
                 format!(
                     "{} supervisor_proven={}",
                     live.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode),
-                    u8::from(proven),
+                    u8::from(meta.claim_proven(now)),
                 ),
                 meta.autopilot_word(),
                 meta.land_at,

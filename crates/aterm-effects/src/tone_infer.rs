@@ -99,9 +99,10 @@ impl ToneTracker {
             return;
         }
         let due = self.keys_since_infer >= INFER_KEYS
-            || self
-                .last_infer
-                .is_none_or(|at| now.saturating_duration_since(at) >= INFER_INTERVAL);
+            || !matches!(
+                self.last_infer,
+                Some(at) if now.saturating_duration_since(at) < INFER_INTERVAL
+            );
         if due {
             self.infer_pending = true;
         }

@@ -17,10 +17,25 @@ pub enum WorkstationSetupDecision {
     /// Begin with this complete reviewed plan, after explicit Apply or thirty
     /// seconds active and visible without interaction.
     Begin(Plan),
-    /// The person ended this launch's review without changing setup records.
+    /// The person pressed Cancel: the worker records it for good (design §3.3).
     Cancelled,
-    /// This process has no live, focused window, or its window closed before a decision.
+    /// The person closed the review that was shown, unanswered: not this launch. Nothing is
+    /// recorded and nothing offers it again in this launch; the next launch offers it once more.
+    Closed,
+    /// No window could show the review (none, or none focused), or the setup it reviews ended
+    /// meanwhile: the worker offers it again once one can.
     Unavailable,
+}
+
+/// Which review an offer is (design §3.3, §3.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfferKind {
+    /// The launch's review of the plan to set up.
+    Launch,
+    /// The review of the groups this Mac's ALab signal adds to `in_force`, the provisional plan
+    /// a review admitted before: it holds none of aterm's own permissions (they are in
+    /// `in_force` and run), and it never takes the person's tab.
+    Widen { in_force: Plan },
 }
 
 /// The page's decision and the optional, ephemeral vault password.
@@ -41,6 +56,10 @@ pub struct SetupAnswer {
     /// Empty: the plan in force as it stands (Set up now). `None`: the plan as sent (the
     /// first-run offer's answer).
     pub changed: Option<Selection>,
+    /// The review answered showed the widened plan the worker sent while it was up
+    /// ([`await_initial_setup_answer_while`]'s `look`), in place of the plan first offered:
+    /// what an untouched Apply admits, and what a Cancel names as the plan the review showed.
+    pub widened: bool,
 }
 
 impl From<WorkstationSetupDecision> for SetupAnswer {
@@ -52,6 +71,7 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
             chosen: false,
             vault_typed: false,
             changed: None,
+            widened: false,
         }
     }
 }
@@ -69,9 +89,40 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
 /// Wait on a worker thread for System State's answer to the offer of `initial`.
 /// A delivered Begin calls `on_begin` before the window can handle another input,
 /// so a Stop and quit know its admission is under way even before this wait returns.
+/// `look` is asked each second while the review is up: the first plan it names widens the
+/// review's draft in place, unless the person edited it (design §3.5).
 pub fn await_initial_setup_answer_while(
     initial: Plan,
     finished: impl FnMut() -> bool,
+    look: impl FnMut() -> Option<Plan>,
+    on_begin: impl FnOnce() + Send + 'static,
+) -> SetupAnswer {
+    await_answer(OfferKind::Launch, initial, finished, look, on_begin)
+}
+
+/// Wait on a worker thread for System State's answer to the review of `widened`, the plan this
+/// Mac's ALab signal widens `in_force` to (design §3.5): offered in the System State tab without
+/// taking the person's tab, and holding none of aterm's own permissions.
+pub fn await_widen_answer_while(
+    widened: Plan,
+    in_force: Plan,
+    finished: impl FnMut() -> bool,
+    on_begin: impl FnOnce() + Send + 'static,
+) -> SetupAnswer {
+    await_answer(
+        OfferKind::Widen { in_force },
+        widened,
+        finished,
+        || None,
+        on_begin,
+    )
+}
+
+fn await_answer(
+    kind: OfferKind,
+    initial: Plan,
+    finished: impl FnMut() -> bool,
+    look: impl FnMut() -> Option<Plan>,
     on_begin: impl FnOnce() + Send + 'static,
 ) -> SetupAnswer {
     let proxy = PROXY.lock().ok().and_then(|proxy| proxy.clone());
@@ -79,12 +130,37 @@ pub fn await_initial_setup_answer_while(
         return WorkstationSetupDecision::Unavailable.into();
     };
     let (send, receive) = mpsc::channel();
-    let request = Request::with_handoff(initial, send, on_begin);
+    let mut request = Request::with_handoff(initial, send, on_begin);
+    request.kind = kind;
     let pending = Arc::downgrade(&request.reply);
+    let widened = Arc::clone(&request.widened);
     if proxy.send_event(Wake::WorkstationSetup(request)).is_err() {
         return WorkstationSetupDecision::Unavailable.into();
     }
-    wait_for_decision(pending, receive, finished, Duration::from_secs(1))
+    wait_for_decision(
+        pending,
+        receive,
+        finished,
+        widen_once(widened, look),
+        Duration::from_secs(1),
+    )
+}
+
+/// `look`, asked until it names a plan, which is left in `slot` for the review to take.
+fn widen_once(
+    slot: Arc<Mutex<Option<Plan>>>,
+    mut look: impl FnMut() -> Option<Plan>,
+) -> impl FnMut() {
+    let mut done = false;
+    move || {
+        if done {
+            return;
+        }
+        if let Some(plan) = look() {
+            done = true;
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(plan);
+        }
+    }
 }
 
 /// Focus gains of this process's windows ([`window_focus_gains`]).
@@ -151,7 +227,7 @@ pub fn drive_initial_setup_answer_for_test(
     let request = Request::with_handoff(initial, send, on_begin);
     let pending = Arc::downgrade(&request.reply);
     drive(Box::new(move |answer| request.finish_answer(answer)));
-    wait_for_decision(pending, receive, || false, Duration::from_secs(60))
+    wait_for_decision(pending, receive, || false, || {}, Duration::from_secs(60))
 }
 
 type Reply = Mutex<Option<mpsc::Sender<SetupAnswer>>>;
@@ -161,6 +237,7 @@ fn wait_for_decision(
     pending: Weak<Reply>,
     receive: mpsc::Receiver<SetupAnswer>,
     mut finished: impl FnMut() -> bool,
+    mut look: impl FnMut(),
     poll: Duration,
 ) -> SetupAnswer {
     loop {
@@ -174,6 +251,8 @@ fn wait_for_decision(
                     && let Some(reply) = pending.upgrade()
                 {
                     finish_reply(&reply, WorkstationSetupDecision::Unavailable.into());
+                } else if pending.upgrade().is_some() {
+                    look();
                 }
             }
         }
@@ -192,8 +271,11 @@ fn finish_reply(reply: &Reply, answer: SetupAnswer) -> bool {
 #[derive(Clone)]
 pub(crate) struct Request {
     initial: Plan,
+    kind: OfferKind,
     reply: Arc<Reply>,
     on_begin: Arc<Mutex<Option<BeginHandoff>>>,
+    /// A widened plan the worker sent while the review is up, not yet taken by the page.
+    widened: Arc<Mutex<Option<Plan>>>,
 }
 
 impl std::fmt::Debug for Request {
@@ -210,6 +292,14 @@ impl Request {
         Self::with_handoff(initial.into(), reply, || {})
     }
 
+    /// An offer whose answer nobody awaits: a dev scenario's review
+    /// (`crate::system_state::fixture_review`), whose actions are inert.
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    pub(crate) fn unanswered(initial: Plan) -> Self {
+        let (reply, _answer) = mpsc::channel();
+        Self::with_handoff(initial, reply, || {})
+    }
+
     fn with_handoff(
         initial: Plan,
         reply: mpsc::Sender<SetupAnswer>,
@@ -217,9 +307,43 @@ impl Request {
     ) -> Self {
         Self {
             initial,
+            kind: OfferKind::Launch,
             reply: Arc::new(Mutex::new(Some(reply))),
             on_begin: Arc::new(Mutex::new(Some(Box::new(on_begin)))),
+            widened: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// A test's review of the groups the ALab signal adds to `in_force` ([`OfferKind::Widen`]).
+    #[cfg(test)]
+    pub(crate) fn widen(
+        widened: impl Into<Plan>,
+        in_force: impl Into<Plan>,
+        reply: mpsc::Sender<SetupAnswer>,
+    ) -> Self {
+        let mut request = Self::new(widened, reply);
+        request.kind = OfferKind::Widen {
+            in_force: in_force.into(),
+        };
+        request
+    }
+
+    /// Leave `plan` for the review as the worker's look does ([`widen_once`]).
+    #[cfg(test)]
+    pub(crate) fn send_widened(&self, plan: Plan) {
+        *self.widened.lock().unwrap_or_else(PoisonError::into_inner) = Some(plan);
+    }
+
+    pub(crate) const fn kind(&self) -> &OfferKind {
+        &self.kind
+    }
+
+    /// The widened plan the worker sent, once.
+    pub(crate) fn take_widened(&self) -> Option<Plan> {
+        self.widened
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
     /// The page's answer, a closing window and a withdrawn offer compete for this single decision.
     pub(crate) fn finish(&self, decision: WorkstationSetupDecision) {
@@ -320,6 +444,10 @@ pub(crate) struct Host {
     unified: bool,
     permissions: PermissionGate,
     proxy_registered: bool,
+    /// The Command Line Tools install a setup run asked for this launch.
+    pub(crate) developer_tools: crate::clt_install::Install,
+    /// Its dedicated terminal's child owns the prompt slot until exit or final detachment.
+    pub(crate) developer_tools_session: Option<crate::clt_install::Terminal>,
 }
 
 impl Host {
@@ -345,6 +473,8 @@ impl Host {
             request: None,
             permissions: PermissionGate::default(),
             proxy_registered: false,
+            developer_tools: crate::clt_install::Install::default(),
+            developer_tools_session: None,
         }
     }
 
@@ -383,6 +513,11 @@ impl Host {
     /// allows Permissions, else none.
     pub(crate) fn access_revision(&self) -> Option<u64> {
         self.permissions.access_revision()
+    }
+
+    /// No local decision or Stop holds deferred work for the current setup run.
+    pub(crate) fn setup_unheld(&self) -> bool {
+        self.permissions.setup_unheld()
     }
 
     fn start(&mut self, now: Instant) {
@@ -440,7 +575,8 @@ fn start_preview() -> bool {
             } else {
                 Selection::all()
             };
-            let mut answer = await_initial_setup_answer_while(initial.into(), || false, || {});
+            let mut answer =
+                await_initial_setup_answer_while(initial.into(), || false, || None, || {});
             if matches!(answer.decision, WorkstationSetupDecision::Begin(_))
                 && let Some(receipt) = answer.receipt.take()
             {
@@ -452,6 +588,7 @@ fn start_preview() -> bool {
                         format!("begin\nselection_bits={}\n", plan.selection.bits())
                     }
                     WorkstationSetupDecision::Unavailable => "unavailable\n".to_owned(),
+                    WorkstationSetupDecision::Closed => "closed\n".to_owned(),
                     WorkstationSetupDecision::Cancelled => "cancelled\n".to_owned(),
                 };
                 let result = format!("{word}elapsed_ms={}\n", started.elapsed().as_millis());
@@ -489,12 +626,14 @@ pub(crate) const fn eligible_launch_command(
 
 impl App {
     pub(crate) fn offer_workstation_setup(&mut self, request: Request) {
+        // A review of the groups the ALab signal adds waits in its tab, focused or not.
+        let widen = matches!(request.kind(), OfferKind::Widen { .. });
         if self.headless
             || self
                 .windows
                 .values()
                 .all(|window| window.os_window.is_none())
-            || !self.any_os_window_focused()
+            || (!widen && !self.any_os_window_focused())
         {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
@@ -516,6 +655,8 @@ impl App {
     pub(crate) fn stop_initial_setup_permissions(&mut self) {
         self.workstation_setup.unified = true;
         self.workstation_setup.permissions.stop();
+        // A Command Line Tools install the stopped run asked for opens no tab.
+        self.workstation_setup.developer_tools = self.workstation_setup.developer_tools.withdrawn();
         self.retire_launch_warmup();
     }
 
@@ -1112,6 +1253,7 @@ mod tests {
                 Arc::downgrade(&request.reply),
                 receive,
                 || true,
+                || {},
                 Duration::ZERO
             )
             .decision,
@@ -1128,7 +1270,7 @@ mod tests {
         let pending = Arc::downgrade(&request.reply);
         drop(request); // the queued Wake was discarded when the event loop closed
         assert_eq!(
-            wait_for_decision(pending, receive, || false, Duration::from_secs(60)).decision,
+            wait_for_decision(pending, receive, || false, || {}, Duration::from_secs(60)).decision,
             WorkstationSetupDecision::Unavailable
         );
     }

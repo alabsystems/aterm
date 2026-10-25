@@ -71,88 +71,142 @@ fn command_spelling(exe: &Path) -> Option<String> {
 /// The `--settings` value for `exe`.
 #[must_use]
 pub fn settings_value(exe: &Path) -> Option<String> {
-    settings_value_chained(exe, None)
+    settings_value_carrying(exe, false)
 }
 
-/// The flag that names the owner's own statusLine command the tap runs after its write
-/// ([`settings_value_chained`]), hex-encoded so the command line stays inert to a shell.
-pub const CHAIN_FLAG: &str = "--then";
+/// The flag of the tap that carries the owner's own statusLine ([`settings_value_carrying`]):
+/// the tap writes its reading, then runs the command the user's own `settings.json` names
+/// ([`owner_command`]), read when it runs, so the line names no command and is as short as the
+/// plain tap's.
+pub const CARRY_FLAG: &str = "--carry";
 
-/// The longest owner's statusLine command the tap carries, in bytes ([`settings_line`]).
+/// The flag of the carrying tap as main's builds from 864de5a37b spelled it, followed by the
+/// lowercase hex of the owner's command: still exactly ours ([`carrying_of`]), so a relaunch
+/// sheds it, and still served by the verb, which runs the command the user's `settings.json`
+/// names now. Never written: that value put the whole command on the typed line, which a
+/// Darwin tty's line cap then refused, so every relaunch fell back to no tap at all.
+pub const LEGACY_CHAIN_FLAG: &str = "--then";
+
+/// The longest owner's statusLine command the tap carries, in bytes ([`settings_line`],
+/// [`owner_command`]).
 pub const CHAIN_MAX: usize = 4096;
 
-/// THE `--settings` VALUE FOR `exe` THAT CARRIES THE OWNER'S OWN STATUSLINE `chain`
-/// (owner ruling R-12): `<exe> harness tap --then <hex of chain>`, so the tap writes its
-/// reading and then runs the owner's command on the same payload, whose row is the one shown;
-/// [`settings_value`]'s with no chain. `None` where `exe` cannot be named, or `chain` is empty,
-/// longer than [`CHAIN_MAX`] or holds a NUL.
+/// The environment variable the carrying tap sets on the owner's command ([`chain_command`]): a
+/// carrying tap that finds it set runs no owner's command again (one whose own command is the
+/// carrying tap would otherwise exec itself without end), and prints its own row.
+pub const CARRIED_ENV: &str = "ATERM_TAP_CARRIED";
+
+/// THE `--settings` VALUE FOR `exe`, carrying the owner's own statusLine where `carry` (owner
+/// ruling R-12): `<exe> harness tap --carry`, so the tap writes its reading and then runs the
+/// owner's command ([`owner_command`]) on the same payload, whose row is the one shown;
+/// `<exe> harness tap` where not. Its length does not depend on the owner's command: a relaunch
+/// line with room for the plain tap has room for this one but [`CARRY_FLAG`]'s eight bytes.
+/// `None` where `exe` cannot be named.
 #[must_use]
-pub fn settings_value_chained(exe: &Path, chain: Option<&str>) -> Option<String> {
+pub fn settings_value_carrying(exe: &Path, carry: bool) -> Option<String> {
     let exe = command_spelling(exe)?;
-    let tail = match chain {
-        None => String::new(),
-        Some(cmd) if cmd.is_empty() || cmd.len() > CHAIN_MAX || cmd.contains('\0') => {
-            return None;
-        }
-        Some(cmd) => format!(" {CHAIN_FLAG} {}", hex_of(cmd.as_bytes())),
+    let tail = if carry {
+        format!(" {CARRY_FLAG}")
+    } else {
+        String::new()
     };
     Some(format!("{VALUE_HEAD}{exe}{COMMAND_TAIL}{tail}{VALUE_TAIL}"))
 }
 
-/// Lowercase hex of `bytes`.
-fn hex_of(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from(DIGITS[usize::from(b >> 4)]));
-        out.push(char::from(DIGITS[usize::from(b & 0xf)]));
-    }
-    out
-}
-
-/// The UTF-8 text lowercase hex `hex` spells; `None` for anything else (odd length, another
-/// digit, an uppercase one, bytes that are not UTF-8).
-#[must_use]
-pub fn text_of_hex(hex: &str) -> Option<String> {
+/// Whether `hex` is lowercase hex of a non-empty command no longer than [`CHAIN_MAX`] that holds
+/// no NUL, as [`LEGACY_CHAIN_FLAG`]'s operand was written.
+fn legacy_operand(hex: &str) -> bool {
     let digit = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
         _ => None,
     };
     let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
-    if !rest.is_empty() {
-        return None;
-    }
-    let decoded = pairs
-        .iter()
-        .map(|&[hi, lo]| Some((digit(hi)? << 4) | digit(lo)?))
-        .collect::<Option<Vec<u8>>>()?;
-    String::from_utf8(decoded).ok()
+    !pairs.is_empty()
+        && rest.is_empty()
+        && pairs.len() <= CHAIN_MAX
+        && pairs
+            .iter()
+            .map(|&[hi, lo]| Some((digit(hi)? << 4) | digit(lo)?))
+            .collect::<Option<Vec<u8>>>()
+            .is_some_and(|bytes| !bytes.contains(&0) && std::str::from_utf8(&bytes).is_ok())
 }
 
-/// The owner's statusLine command an exact tap value carries (`Some(None)`: the plain tap), or
-/// `None` where `value` is not exactly aterm's tap ([`is_ours`]).
+/// Whether an exact tap value carries the owner's own statusLine (`Some(false)`: the plain tap),
+/// or `None` where `value` is not exactly aterm's tap ([`is_ours`]): [`settings_value_carrying`]'s,
+/// or [`LEGACY_CHAIN_FLAG`]'s.
 #[must_use]
-pub fn chained_of(value: &str) -> Option<Option<String>> {
+pub fn carrying_of(value: &str) -> Option<bool> {
     let command = value
         .strip_prefix(VALUE_HEAD)
         .and_then(|rest| rest.strip_suffix(VALUE_TAIL))?;
-    let (exe, chain) = match command.strip_suffix(COMMAND_TAIL) {
-        Some(exe) => (exe, None),
-        None => {
-            let (head, hex) = command.rsplit_once(&format!(" {CHAIN_FLAG} "))?;
-            (head.strip_suffix(COMMAND_TAIL)?, Some(text_of_hex(hex)?))
-        }
+    let (exe, carry) = match command.strip_suffix(COMMAND_TAIL) {
+        Some(exe) => (exe, false),
+        None => match command.strip_suffix(&format!("{COMMAND_TAIL} {CARRY_FLAG}")) {
+            Some(exe) => (exe, true),
+            None => {
+                let (head, hex) = command.rsplit_once(&format!(" {LEGACY_CHAIN_FLAG} "))?;
+                let exe = head.strip_suffix(COMMAND_TAIL)?;
+                let spelled = command_spelling(Path::new(exe))?;
+                return (spelled == exe && legacy_operand(hex)).then_some(true);
+            }
+        },
     };
-    (settings_value_chained(Path::new(exe), chain.as_deref()).as_deref() == Some(value))
-        .then_some(chain)
+    (settings_value_carrying(Path::new(exe), carry).as_deref() == Some(value)).then_some(carry)
 }
 
 /// Whether a `--settings` value is exactly aterm's tap, plain or carrying the owner's own
-/// statusLine ([`settings_value_chained`]).
+/// statusLine ([`carrying_of`]).
 #[must_use]
 pub fn is_ours(value: &str) -> bool {
-    chained_of(value).is_some()
+    carrying_of(value).is_some()
+}
+
+/// THE OWNER'S OWN STATUSLINE COMMAND the carrying tap runs, from the text of the user's own
+/// `settings.json` as it reads when the tap runs: the plain command line
+/// ([`netwatch::Settings::status_command`]), at most [`CHAIN_MAX`] bytes with no NUL, where the
+/// document sets no `disableAllHooks`; `None` for anything else (no statusLine, another shape, an
+/// unparsed document), and the tap then prints its own row, as the plain tap does. Read at run
+/// time, not when the line was typed, so the line names no command, and a statusLine the owner
+/// edits shows from the next run, as Claude Code's own reload of the file would show it.
+#[must_use]
+pub fn owner_command(user_settings: &str) -> Option<String> {
+    let read = netwatch::settings_of(user_settings)?;
+    if read.hooks_off {
+        return None;
+    }
+    read.status_command
+        .filter(|cmd| cmd.len() <= CHAIN_MAX && !cmd.contains('\0'))
+}
+
+/// The most of the user's `settings.json` the carrying tap reads ([`read_owner_command`]).
+const OWNER_SETTINGS_MAX: u64 = 1024 * 1024;
+
+/// [`owner_command`] of the user's own `settings.json` under the user home `home`
+/// (`<home>/.claude/settings.json`), opened without following a symlink at its last component
+/// and read to at most a mebibyte; `None` where it cannot be.
+#[must_use]
+pub fn read_owner_command(home: &Path) -> Option<String> {
+    let path = home.join(".claude").join("settings.json");
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = open.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(OWNER_SETTINGS_MAX + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > OWNER_SETTINGS_MAX {
+        return None;
+    }
+    owner_command(&text)
 }
 
 /// Whether `argv` (`argv[0]` first) carries aterm's tap.
@@ -677,35 +731,64 @@ pub fn run(
     std::process::ExitCode::SUCCESS
 }
 
-/// `aterm harness tap --then <hex>`, the tap that carries the owner's own statusLine
-/// ([`settings_value_chained`]): it writes the reading as [`run`] does and prints nothing, and
-/// returns the payload, byte for byte, for the owner's command ([`chain_command`]), whose row is
-/// the one Claude Code shows. `None` where there is nothing to hand on (a payload over
-/// [`STDIN_MAX`], or one that could not be read): that run shows no row, as a command that
-/// printed nothing.
-pub fn run_chained(
+/// What one run of the carrying tap leaves to do ([`run_carrying`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Carried {
+    /// Become the owner's command `command` with the payload `payload` on its stdin
+    /// ([`chain_command`]): its row and exit status are the ones Claude Code shows.
+    Owner {
+        /// The owner's statusLine command ([`owner_command`]).
+        command: String,
+        /// The payload Claude Code wrote, byte for byte.
+        payload: Vec<u8>,
+    },
+    /// The tap printed its own row ([`run`]'s): the user's `settings.json` names no command it
+    /// carries now, the run is itself one an owner's command started ([`CARRIED_ENV`]), or the
+    /// payload could not be handed on (over [`STDIN_MAX`], or unread).
+    Own,
+}
+
+/// `aterm harness tap --carry`, the tap that carries the owner's own statusLine
+/// ([`settings_value_carrying`]): it writes the reading as [`run`] does, then, where `owner`
+/// names the owner's command now ([`read_owner_command`]), prints nothing and hands the payload
+/// on, byte for byte ([`Carried::Owner`]); else it prints its own row as [`run`] does
+/// ([`Carried::Own`]), so a run never shows less than the plain tap.
+pub fn run_carrying(
     stdin: &mut dyn Read,
     stdin_is_tty: bool,
     vars: &TapVars,
     dir: Option<&Path>,
     now: i64,
-) -> Option<Vec<u8>> {
+    owner: impl FnOnce() -> Option<String>,
+    out: &mut dyn Write,
+) -> Carried {
     let started = std::time::Instant::now();
     let bytes = if stdin_is_tty {
-        Vec::new()
+        Some(Vec::new())
     } else {
-        read_bytes(stdin)?
+        read_bytes(stdin)
     };
-    let _ = record(std::str::from_utf8(&bytes).ok(), vars, dir, now, started);
-    Some(bytes)
+    let payload = bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok());
+    let reading = record(payload, vars, dir, now, started);
+    if let Some(payload) = bytes
+        && let Some(command) = owner()
+    {
+        return Carried::Owner { command, payload };
+    }
+    let line = reading
+        .as_ref()
+        .map_or_else(|| NO_FIGURES.to_owned(), Reading::line);
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+    Carried::Own
 }
 
 /// THE OWNER'S OWN STATUSLINE COMMAND `cmd`, as Claude Code runs one (`/bin/sh -c`, in this
-/// process's working directory and environment, which are the ones Claude Code gave the tap),
-/// with `payload` on its stdin: an unlinked 0600 file in the temporary directory, so a payload
-/// of any size is there before the command starts. Its stdout and stderr are this process's, so
-/// an exec of it ([`aterm_uds::spawnfd::Command::exec`]) leaves Claude Code its row and its exit
-/// status, as if aterm were not there.
+/// process's working directory and environment, which are the ones Claude Code gave the tap,
+/// with [`CARRIED_ENV`] set), with `payload` on its stdin: an unlinked 0600 file in the temporary
+/// directory, so a payload of any size is there before the command starts. Its stdout and stderr
+/// are this process's, so an exec of it ([`aterm_uds::spawnfd::Command::exec`]) leaves Claude
+/// Code its row and its exit status, as if aterm were not there.
 #[cfg(unix)]
 pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd::Command> {
     use std::io::{Seek as _, SeekFrom};
@@ -726,7 +809,7 @@ pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd
     file.write_all(payload)?;
     file.seek(SeekFrom::Start(0))?;
     let mut command = aterm_uds::spawnfd::command("/bin/sh");
-    command.arg("-c").arg(cmd).stdin(file);
+    command.arg("-c").arg(cmd).env(CARRIED_ENV, "1").stdin(file);
     Ok(command)
 }
 
@@ -853,7 +936,7 @@ pub struct GateFacts<'a> {
 }
 
 /// The `--settings` value a relaunch line carries, or `None`: the plain tap, or the tap that
-/// carries the owner's own statusLine ([`settings_line`], [`settings_value_chained`]).
+/// carries the owner's own statusLine ([`settings_line`], [`settings_value_carrying`]).
 #[must_use]
 pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     let exe = f.exe?;
@@ -865,7 +948,84 @@ pub fn gate(f: &GateFacts<'_>) -> Option<String> {
         return None;
     }
     let chain = settings_line(f.settings, f.user_settings)?;
-    settings_value_chained(exe, chain.as_deref())
+    settings_value_carrying(exe, chain.is_some())
+}
+
+/// What a Claude Code launch's own environment gives the tap at launch ([`launch_value`]):
+/// `aterm harness tap --launch`, which atpkg's managed twin asks inside an aterm tab, and a
+/// worker's line (`spawn agent=claude`).
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchFacts<'a> {
+    /// `[harness] usage_tap` armed for this launch ([`Armed::arm`]).
+    pub armed: Option<&'a Armed>,
+    /// The tab it runs in (`ATERM_PARENT_SESSION_ID`), which keys the reading ([`Reading::sid`]).
+    pub sid: Option<&'a str>,
+    /// `ATERM_NO_HARNESS` is set (`claude --no-harness`): the harness keeps off this one.
+    pub no_harness: bool,
+    /// Every pair of the environment the launch runs with.
+    pub env: &'a [(String, String)],
+    /// Its `HOME`.
+    pub home: Option<&'a Path>,
+    /// The account's own home (`getpwuid_r`): a launch under another `HOME` keeps its records
+    /// where no footer reads them, and is not tapped.
+    pub account_home: Option<&'a Path>,
+    /// Its argv, `argv[0]` first.
+    pub argv: &'a [String],
+    /// Every document of the settings chain Claude Code reads for it, in its directory.
+    pub settings: &'a [(String, Source)],
+    /// Which of [`Self::settings`] is the user's own `settings.json`.
+    pub user_settings: Option<&'a str>,
+    /// The vendor's profile store holds a config ([`accounts::profile_configured`]).
+    pub profile_store: bool,
+}
+
+/// THE `--settings` VALUE A CLAUDE CODE LAUNCH CARRIES FROM ITS START (owner ruling R-12: the
+/// harness reads the week itself, so a session needs no relaunch for its figures): [`gate`]'s,
+/// judged on the launch's own environment ([`LaunchFacts`]), for an interactive launch only
+/// ([`launch_admits`]), in an aterm tab, with the harness on for it, under the account's own
+/// `HOME`, and not carrying the tap already; `None` (the launch runs as typed) anywhere else.
+#[must_use]
+pub fn launch_value(f: &LaunchFacts<'_>) -> Option<String> {
+    let armed = f.armed?;
+    if f.no_harness || !f.sid.is_some_and(is_tab_id) || carried_by(f.argv) {
+        return None;
+    }
+    if f.home.is_none_or(|home| !home.is_absolute()) || f.home != f.account_home {
+        return None;
+    }
+    if !launch_admits(f.argv) {
+        return None;
+    }
+    let pairs = || f.env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let var = |name: &str| pairs().find(|(k, _)| *k == name).map(|(_, v)| v);
+    let login = var(accounts::LOGIN_ENV);
+    gate(&GateFacts {
+        exe: Some(&armed.exe),
+        stored_login: accounts::ProcessLogin::of_env(pairs()).stored_login,
+        login,
+        lone_login: armed.lone_for(login),
+        home: var(accounts::HOME_ENV).filter(|home| !home.is_empty()),
+        argv: f.argv,
+        settings: f.settings,
+        user_settings: f.user_settings,
+        profile_store: f.profile_store,
+    })
+}
+
+/// Whether a launch's argv (`argv[0]` first) is an interactive Claude Code the tap rides on from
+/// its start: [`line_admits`] it, and its first operand, where it has one, is no word a
+/// subcommand's name could be (`mcp`, `doctor`, `plugin`, `setup-token`, …: a lowercase word of
+/// letters, digits and hyphens), so the flag is never put ahead of a subcommand. A prompt of one
+/// such word (`claude hello`) is not tapped at launch; one of more words is.
+#[must_use]
+pub fn launch_admits(argv: &[String]) -> bool {
+    let subcommand_like = |word: &str| {
+        !word.is_empty()
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    line_admits(argv) && super::upgrade::first_operand(argv).is_none_or(|w| !subcommand_like(w))
 }
 
 /// [`gate`]'s argv half: the line (`argv[0]` first) parses, and carries no `--settings` or
@@ -904,7 +1064,8 @@ pub fn settings_admit(settings: &[(String, Source)], user: Option<&str>) -> bool
 /// document was read and none sets a statusLine (the plain tap), `Some(Some(cmd))` where the
 /// one statusLine the chain sets is the owner's own in the user's `settings.json` (`user`), a
 /// plain command line ([`netwatch::Settings::status_command`]), so the tap carries it
-/// ([`settings_value_chained`]) and the owner's row still shows; `None` (no tap) where a
+/// ([`settings_value_carrying`], which reads it again when it runs: [`owner_command`]) and the
+/// owner's row still shows; `None` (no tap) where a
 /// document cannot be read or parsed, one turns hooks off, a statusLine is set anywhere else (a
 /// project's or a local one, a managed one, a `--settings` value's, `cowork_settings.json`'s:
 /// carrying those would mean re-deciding Claude Code's merge and trust), two documents set one,
@@ -979,6 +1140,9 @@ pub enum Refusal {
     /// A statusLine of its own, hooks turned off, a settings document unread, or an
     /// `apiKeyHelper` or credential in one ([`settings_admit`]).
     Settings,
+    /// The relaunch line aterm would type for it has no room for the tap on the tty's line
+    /// (`relaunch::tap_room`): the line would fall back to no tap rather than to no relaunch.
+    Room,
 }
 
 /// The freshness rule, per tab.

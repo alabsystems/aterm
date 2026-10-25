@@ -154,11 +154,7 @@ impl stable::Rustup for Provisioned {
         let host = "aarch64-apple-darwin";
         Ok(match (a.as_slice(), toolchain) {
             (["toolchain", "list"], _) => format!("stable-{host}\n{}-{host}\n", self.pin),
-            (["target", "list", "--installed"], Some("stable")) => {
-                let mut t: Vec<&str> = FOREIGN_CELL_TARGETS.to_vec();
-                t.push("x86_64-apple-darwin");
-                t.join("\n")
-            }
+            (["target", "list", "--installed"], Some("stable")) => CELL_TARGETS.join("\n"),
             (["target", "list", "--installed"], _) => "wasm32-unknown-unknown\n".into(),
             (["component", "list", "--installed"], _) => format!("clippy-{host}\n"),
             (other, _) => return Err(format!("this rustup changes nothing: {other:?}")),

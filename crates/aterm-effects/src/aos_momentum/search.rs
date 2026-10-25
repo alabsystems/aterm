@@ -232,11 +232,13 @@ impl GridProposer {
     /// Encoded plan bytes in [`GRID_V1`] order (54 plans).
     #[must_use]
     pub fn plans() -> Vec<Vec<u8>> {
-        GRID_V1
-            .iter()
-            .filter_map(|&(split, wake)| SchedulePlan::new(split, wake).ok())
-            .map(|p| p.encode().to_vec())
-            .collect()
+        let mut out = Vec::with_capacity(GRID_V1.len());
+        for &(split, wake) in &GRID_V1 {
+            if let Ok(p) = SchedulePlan::new(split, wake) {
+                out.push(p.encode().to_vec());
+            }
+        }
+        out
     }
 }
 
@@ -278,24 +280,27 @@ fn hex_bytes(s: &str) -> Option<Vec<u8>> {
     if !rest.is_empty() {
         return None;
     }
-    pairs
-        .iter()
-        .map(|&[hi, lo]| Some((hex_value(hi)? << 4) | hex_value(lo)?))
-        .collect()
+    let mut out = Vec::with_capacity(pairs.len());
+    for &[hi, lo] in pairs {
+        out.push((hex_value(hi)? << 4) | hex_value(lo)?);
+    }
+    Some(out)
 }
 
 impl FileProposer {
     /// The candidates `text` holds (the type's docs).
     #[must_use]
     pub fn from_text(text: &str) -> FileProposer {
-        let candidates = text
-            .lines()
-            .filter_map(|line| {
-                let line = line.split('#').next().unwrap_or("").trim();
-                (!line.is_empty())
-                    .then(|| hex_bytes(line).unwrap_or_else(|| line.as_bytes().to_vec()))
-            })
-            .collect();
+        let mut candidates = Vec::new();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if !line.is_empty() {
+                candidates.push(match hex_bytes(line) {
+                    Some(bytes) => bytes,
+                    None => line.as_bytes().to_vec(),
+                });
+            }
+        }
         FileProposer {
             candidates,
             text: Digest::of(PROPOSER_DOMAIN, &[text.as_bytes()]),

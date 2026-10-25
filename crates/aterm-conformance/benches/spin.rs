@@ -16,12 +16,24 @@ mod measuring {
     use std::time::Duration;
 
     use aterm_conformance::measure::Rig;
+    use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::spin::{SpinRow, SpinScene, measure};
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
     const MAX_ARMS: u64 = 100;
 
+    // `max_wakes` bounds every loop wake in the window (`event_wakes`), not only its timers: a loop
+    // that wakes itself as it parks takes wait-cancelled wakes and turns, which neither
+    // `past_deadline_arms` nor `timer_wakes` sees. Each row's comment gives what debug builds of
+    // 71b865e7c4 measured in three takes or more (the rig takes any aterm executable), and its
+    // bound's headroom over that. Proven red
+    // 2026-10-25 on the headless rows by a debug build of 71b865e7c4 whose display-free loop
+    // signalled its own wake source as it parked (a mutant, reverted): the three rows measured
+    // 682,944, 507,404 and 833,204 wakes with at most 1 arm and 2 timer wakes, which the arm and
+    // timer bounds alone passed.
     const ROWS: &[(&str, SpinRow)] = &[
+        // The repainter writes every 166.7 ms, about 66 output wakes in the window: 75 and 76
+        // wakes measured, bounded at twice that.
         (
             "an_idle_claude_shaped_client_banks_no_past_deadline_arms",
             SpinRow {
@@ -29,8 +41,10 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: Some(12),
+                max_wakes: 150,
             },
         ),
+        // No timer fired and no event came: 0 wakes measured in each take, bounded at one a second.
         (
             "a_bare_idle_instance_banks_no_past_deadline_arms",
             SpinRow {
@@ -38,12 +52,14 @@ mod measuring {
                 window: Duration::from_secs(6),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: None,
+                max_wakes: 6,
             },
         ),
         // A recording prompt frozen in an open Rewind view (design §14.5 R0 item 7). Proven red
         // 2026-10-24: a release build of c4d3f61702 measured timer_wakes=0 frames=0 over 10 s, and the
         // same build with a 100 ms refresh deadline armed while any view is open measured
-        // timer_wakes=99 and failed this row.
+        // timer_wakes=99 and failed this row. 1 wake measured (the view's own Rewind wake), bounded
+        // as its timers are.
         (
             "an_idle_open_rewind_view_arms_no_timer",
             SpinRow {
@@ -51,6 +67,26 @@ mod measuring {
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
                 max_timer_wakes: Some(12),
+                max_wakes: 12,
+            },
+        ),
+        // A bare prompt in a window: AppKit's loop, which no headless row runs. Under
+        // `motion = "reduced"`, so neither a focused window's Deck live edge (about 16 frames a
+        // second) nor its pet lane (290 timer wakes for 31 frames in 10 s at the shipped motion)
+        // makes the bound hang on a focus the rig does not decide: the cursor blink (19 timer
+        // wakes), the vitals (10 timer, 10 event) and each frame's surface-ready wake, 72 and 73
+        // wakes measured, bounded at 200. Proven red 2026-10-25: a debug build of 71b865e7c4 with 5db5aa8c37^'s
+        // event_loop.rs, whose proxy clone (taken by `aos_watch` in every `about_to_wait`) made a
+        // run loop source and woke the loop, measured 456,021 wakes (455,992 wait-cancelled) with
+        // 25 past-deadline arms and 29 timer wakes, and the three headless rows passed on it.
+        (
+            "an_idle_window_parks_until_its_next_deadline",
+            SpinRow {
+                scene: SpinScene::Windowed,
+                window: Duration::from_secs(10),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: None,
+                max_wakes: 200,
             },
         ),
     ];
@@ -58,6 +94,7 @@ mod measuring {
     fn take(rig: &Rig, row: &SpinRow) -> Outcome {
         let report = match measure(rig, row) {
             Ok(report) => report,
+            Err(CouldNotRun::Unanswered(why)) => return Outcome::Unanswered(why),
             Err(why) => {
                 return Outcome::CouldNotRun(format!(
                     "SPIN COULD NOT RUN [{:?}]: the probe decided nothing: {why}",
@@ -70,18 +107,35 @@ mod measuring {
         } else {
             Outcome::Fail(format!(
                 "SPIN CONFORMANCE FAILED [{:?}]: an idle instance armed wakes past its own \
-                 observation gate, or woke for timers far past its quiet rate.\n  {report}",
+                 observation gate, or woke for timers or at all far past its quiet rate.\n  \
+                 {report}",
                 row.scene
             ))
         }
     }
+
+    /// Set by `verify --no-windows`: the rows that open a window are left out (verify names
+    /// their skip).
+    const NO_WINDOWS: &str = "ATERM_MEASURE_NO_WINDOWS";
 
     pub fn run() -> std::process::ExitCode {
         let rig = Rig::release(
             &["ATERM_SPIN_BIN", "ATERM_PAINT_BIN"],
             env!("CARGO_BIN_EXE_fake-tui"),
         );
-        support::run("spin", ROWS, |row| take(&rig, row))
+        let windows = std::env::var_os(NO_WINDOWS).is_none();
+        let rows: Vec<(&str, SpinRow)> = ROWS
+            .iter()
+            .copied()
+            .filter(|(name, row)| {
+                let kept = windows || row.scene != SpinScene::Windowed;
+                if !kept {
+                    eprintln!("measure spin: {name} left out ({NO_WINDOWS}: it opens a window)");
+                }
+                kept
+            })
+            .collect();
+        support::run("spin", &rows, |row| take(&rig, row))
     }
 }
 

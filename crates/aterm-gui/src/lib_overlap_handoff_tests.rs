@@ -1402,10 +1402,12 @@ fn an_observed_dialog_banner_names_the_asking_tab() {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .user_title = Some("build agent".to_string());
+    let prompt_owner = std::sync::Arc::new(());
     let prompt = |session| super::consent_observer::ObservedPrompt {
         session,
         blocked_on: String::new(),
         service: "kTCCServiceSystemPolicyDocumentsFolder".to_string(),
+        validity: crate::notify::NoticeValidity::new(&prompt_owner),
     };
     let bare = prompt(0).notice().body;
     assert_eq!(

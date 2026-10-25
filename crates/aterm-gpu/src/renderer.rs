@@ -7418,21 +7418,20 @@ impl GpuRenderer {
         self.cpu.set_knock_out(on);
     }
 
-    /// Swap in an already-built CPU face and theme in place.
+    /// Swap in an already-built CPU face and theme in place. The face keeps its own
+    /// variation requests (`font_weight`, `font_variation`): a prepared face was built
+    /// with the config it installs, and a rebuild carries the live ones
+    /// ([`Renderer::rebuild_from_admitted`]).
     pub fn set_face(&mut self, cpu: Renderer, theme: Theme) {
         let prior_shaping = self.cpu.text_shaping().clone();
         let prior_blending = self.cpu.text_blending();
         let prior_thicken = self.cpu.font_thicken();
         let prior_stem_gamma = self.cpu.stem_gamma();
-        let prior_variations = self.cpu.font_variation_requests().to_vec();
-        let prior_dark_nudge = self.cpu.font_weight_dark_nudge();
         self.cpu = cpu;
         self.cpu.set_text_shaping(prior_shaping);
         self.cpu.set_text_blending(prior_blending);
         self.cpu.set_font_thicken(prior_thicken);
         self.cpu.set_stem_gamma(prior_stem_gamma);
-        self.cpu
-            .set_font_variations(&prior_variations, prior_dark_nudge);
         self.theme = theme;
         self.resident_keys.clear();
         self.mono_res = None;
@@ -20512,6 +20511,25 @@ mod tests {
             aterm_types::text_shaping::LigatureMode::Disabled,
             "shaping must survive the face rebuild, not reset to Enabled"
         );
+    }
+
+    /// A prepared face draws the weight it was prepared at: a config reload of
+    /// `font_weight`, and the headless build's deferred GPU, install a face that already
+    /// carries the config's variation requests. Before, installing it put back the
+    /// requests of the face it replaced, so a weight changed in Settings (or a headless
+    /// instance's configured weight) never reached the GPU's glyphs.
+    #[test]
+    fn a_prepared_face_keeps_the_weight_it_was_prepared_at() {
+        let theme = Theme::default();
+        let mut gpu = crate::renderer::gpu_renderer_for_test(Some("Menlo"), 16.0, theme);
+        assert!(gpu.cpu.font_variation_requests().is_empty());
+        let Some(mut prepared) = Renderer::from_system(16.0, theme) else {
+            aterm_spec::host::could_not_run("no system monospace font");
+        };
+        let weight = [(aterm_render::variation::WGHT_TAG, 600.0)];
+        let _ = prepared.set_font_variations(&weight, 0.0);
+        gpu.install_prepared_font(None, prepared, theme);
+        assert_eq!(gpu.cpu.font_variation_requests(), weight);
     }
 
     #[test]

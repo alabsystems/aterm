@@ -30,8 +30,6 @@ pub struct BoxFacts {
     pub bypass: bool,
     /// Whether a limit reset was passed over at this dialog's mount.
     pub limit_reset_passed: bool,
-    /// Whether Gemini CLI's usage-limit dialog is due its `Keep trying` retry.
-    pub limit_retry: bool,
     /// Worker environment where read, or why it could not be read.
     pub worker: Option<Result<WorkerEnv, String>>,
     /// Additional directories where the worker's Bash tool may stand.
@@ -50,9 +48,14 @@ pub struct BoxFacts {
     pub box_call: Option<String>,
     /// Whether the `/login` picker is behind the loop's own `/login`.
     pub login_carry: bool,
-    /// Whether the login came back in another tab while `/login` was carried.
+    /// Whether the login came back in another tab while `/login` was carried, so the loop backs
+    /// out of its picker.
     pub login_back: bool,
-    /// Whether a followed renewal replaced the login while `/login` was carried.
+    /// Whether the loop's own `/login` stands over a roster row's login, which aterm's sign-in
+    /// ladder signs in, so the loop backs out of its picker.
+    pub login_roster: bool,
+    /// Whether a followed renewal replaced the login while `/login` was carried, so the loop
+    /// backs out of its picker.
     pub login_renewed: bool,
     /// Existing login method read by the host for the loop's own `/login` picker.
     pub login_method: Option<aterm_phase::LoginMethod>,
@@ -79,7 +82,6 @@ pub const FIELDS: &[&str] = &[
     "worker_agent",
     "bypass",
     "limit_reset_passed",
-    "limit_retry",
     "worker",
     "shell_cwds",
     "shell",
@@ -90,6 +92,7 @@ pub const FIELDS: &[&str] = &[
     "box_call",
     "login_carry",
     "login_back",
+    "login_roster",
     "login_renewed",
     "login_method",
 ];
@@ -130,7 +133,6 @@ impl ApprovalCtx {
         ctx.autocompact_offer = config.autocompact_offer;
         ctx.limit_reset = config.limit_reset && !facts.limit_reset_passed;
         ctx.reset_kinds.clone_from(&config.limit_reset_kinds);
-        ctx.limit_retry = facts.limit_retry;
         ctx.usage_credits = config.usage_credits;
         ctx.python_allow = allow.to_vec();
         if let Some(worker) = &facts.worker {
@@ -156,6 +158,7 @@ impl ApprovalCtx {
         ctx.box_call = facts.box_call.clone();
         ctx.login_carry = facts.login_carry;
         ctx.login_back = facts.login_back;
+        ctx.login_roster = facts.login_roster;
         ctx.login_renewed = facts.login_renewed;
         ctx.login_method = facts.login_method;
         ctx
@@ -172,7 +175,6 @@ struct Wire {
     worker_agent: Option<String>,
     bypass: bool,
     limit_reset_passed: bool,
-    limit_retry: bool,
     worker: Option<Answer<WorkerWire>>,
     shell_cwds: Vec<String>,
     shell: Option<Answer<ShellWire>>,
@@ -183,6 +185,7 @@ struct Wire {
     box_call: Option<String>,
     login_carry: bool,
     login_back: bool,
+    login_roster: bool,
     login_renewed: bool,
     login_method: Option<String>,
 }
@@ -214,7 +217,6 @@ impl BoxFacts {
             worker_agent: self.worker_agent.map(|a| a.name().to_string()),
             bypass: self.bypass,
             limit_reset_passed: self.limit_reset_passed,
-            limit_retry: self.limit_retry,
             worker: self.worker.as_ref().map(|w| match w {
                 Ok(w) => Answer::Ok(WorkerWire {
                     digest: format!("{:016x}", w.digest(seed)),
@@ -242,6 +244,7 @@ impl BoxFacts {
             box_call: self.box_call.clone(),
             login_carry: self.login_carry,
             login_back: self.login_back,
+            login_roster: self.login_roster,
             login_renewed: self.login_renewed,
             login_method: self.login_method.map(|m| m.word().to_string()),
         };
@@ -289,7 +292,6 @@ impl BoxFacts {
                 .transpose()?,
             bypass: wire.bypass,
             limit_reset_passed: wire.limit_reset_passed,
-            limit_retry: wire.limit_retry,
             worker: wire
                 .worker
                 .map(|w| match w {
@@ -336,6 +338,7 @@ impl BoxFacts {
             box_call: wire.box_call,
             login_carry: wire.login_carry,
             login_back: wire.login_back,
+            login_roster: wire.login_roster,
             login_renewed: wire.login_renewed,
             login_method: wire
                 .login_method

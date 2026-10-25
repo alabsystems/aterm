@@ -129,11 +129,15 @@ impl RainBaker {
     /// `glyph`'s baked tile (`glyph` taken modulo the 64 glyphs), `None` until baked.
     #[must_use]
     #[inline]
-    pub fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
+    pub const fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
         const _: () = assert!(ROM_GLYPHS.is_power_of_two());
-        self.tiles
-            .get(usize::from(glyph) & (ROM_GLYPHS - 1))
-            .and_then(Option::as_ref)
+        let tiles = self.tiles.as_slice();
+        let idx = (glyph as usize) & (ROM_GLYPHS - 1);
+        if idx < tiles.len() {
+            tiles[idx].as_ref()
+        } else {
+            None
+        }
     }
 
     /// Box-filter `tile`'s 24×48 master into a `(cell_w, cell_h)` art with integer area weighting.

@@ -129,10 +129,17 @@ impl RainLayers {
             }
             self.by_row[r].push(*c);
         }
-        let at = layers
-            .iter()
-            .position(|l| l.blend == FxBlend::Linear && l.slot == FxSlot::Under)
-            .unwrap_or(layers.len());
+        let mut at = layers.len();
+        let mut li = 0;
+        while li < layers.len() {
+            if matches!(layers[li].blend, FxBlend::Linear)
+                && matches!(layers[li].slot, FxSlot::Under)
+            {
+                at = li;
+                break;
+            }
+            li += 1;
+        }
         let version = tiles.version();
         let mut held = std::mem::take(&mut self.held);
         for (r, row_cells) in self.by_row.iter().enumerate() {
@@ -140,7 +147,16 @@ impl RainLayers {
                 continue;
             }
             let row = r as u16;
-            let entry = match held.iter().position(|h| h.row == row) {
+            let mut found = None;
+            let mut hi = 0;
+            while hi < held.len() {
+                if held[hi].row == row {
+                    found = Some(hi);
+                    break;
+                }
+                hi += 1;
+            }
+            let entry = match found {
                 Some(i) => {
                     let mut prev = held.swap_remove(i);
                     if prev.version != version || prev.cells != *row_cells {
@@ -217,10 +233,18 @@ fn row_content(cells: &[RainCell], tiles: &RainBaker) -> FxContent {
             continue;
         };
         let ink = FxInk::over(c.tint & 0x00FF_FFFF, c.alpha);
-        let k = palette.iter().position(|&p| p == ink).unwrap_or_else(|| {
+        let mut k = palette.len();
+        let mut pi = 0;
+        while pi < palette.len() {
+            if palette[pi] == ink {
+                k = pi;
+                break;
+            }
+            pi += 1;
+        }
+        if k == palette.len() {
             palette.push(ink);
-            palette.len() - 1
-        });
+        }
         items.push(FxItem::Sprite(FxSprite {
             x: i32::from(c.x),
             y: i32::from(c.y),

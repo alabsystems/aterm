@@ -47,19 +47,21 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
     let budget = Budget::from_now(BUDGET_SECS);
     let mut sampler = Sampler::start(SAMPLER_TICK);
     let mut scratch = Scratch::new("atpaint")
-        .map_err(|e| CouldNotRun(format!("cannot make a scratch world: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
     if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
         scratch.keep();
     }
     let take = run_take(rig, row, scratch.path(), &sampler, budget);
     let sched = sampler.finish();
-    let take = take.map_err(|CouldNotRun(why)| {
-        CouldNotRun(format!(
-            "{why} [sched_ticks={} sched_late_max_us={} wall_ms={}]",
-            sched.ticks,
-            sched.late_max_us,
-            started.elapsed().as_millis()
-        ))
+    let take = take.map_err(|e| {
+        e.map(|why| {
+            format!(
+                "{why} [sched_ticks={} sched_late_max_us={} wall_ms={}]",
+                sched.ticks,
+                sched.late_max_us,
+                started.elapsed().as_millis()
+            )
+        })
     })?;
     let wall_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let (ticks, late_max_us) = sched.deciding();
@@ -124,7 +126,7 @@ fn run_take(
     budget: Budget,
 ) -> Result<Take, CouldNotRun> {
     let world = World::prepare(root, &config_head(row))
-        .map_err(|e| CouldNotRun(format!("cannot lay out the scratch world: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;
     if let Some(split) = row.split {
@@ -147,10 +149,12 @@ fn run_take(
     };
     let metrics = ctl.ok(&["metrics"])?;
     let backend = field(&metrics, "backend")
-        .ok_or_else(|| CouldNotRun(format!("ctl metrics reported no backend ({metrics})")))?
+        .ok_or_else(|| {
+            CouldNotRun::Unanswered(format!("ctl metrics reported no backend ({metrics})"))
+        })?
         .to_string();
     let fx_under_frames = uint_field(&metrics, "fx_under_frames")
-        .ok_or_else(|| CouldNotRun("ctl metrics reported no fx_under_frames".into()))?;
+        .ok_or_else(|| CouldNotRun::Unanswered("ctl metrics reported no fx_under_frames".into()))?;
     if backend != "gpu" {
         return could_not_run(format!(
             "these frames were drawn by the {backend} renderer, not the GPU the shipped artifact \
@@ -165,7 +169,7 @@ fn run_take(
         driven_ms: capture.driven_ms,
     };
     let scan = scan_dir(&capture.frames_dir, &ctx)
-        .map_err(|e| CouldNotRun(format!("the take could not be scanned: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("the take could not be scanned: {e}")))?;
     let ledger = Ledger {
         rows: capture.rows,
         final_row: capture.final_row,
@@ -199,16 +203,18 @@ fn stage_split(ctl: &Ctl, split: Split) -> Result<(), CouldNotRun> {
     Ok(())
 }
 
-fn scene_missed(inst: &Instance, CouldNotRun(why): CouldNotRun) -> CouldNotRun {
+fn scene_missed(inst: &Instance, why: CouldNotRun) -> CouldNotRun {
     let screen = match inst.ctl.call(&["text", SCREEN_TAIL_ROWS]) {
         reply if reply.ok() => reply.stdout,
         reply => format!("(unreadable: {})", reply.stderr.trim()),
     };
-    CouldNotRun(format!(
-        "{why}\n--- the screen's last rows ---\n{}\n--- the instance log's tail ---\n{}",
-        screen.trim_end(),
-        inst.log_tail()
-    ))
+    why.map(|why| {
+        format!(
+            "{why}\n--- the screen's last rows ---\n{}\n--- the instance log's tail ---\n{}",
+            screen.trim_end(),
+            inst.log_tail()
+        )
+    })
 }
 
 fn stage_scene(rig: &Rig, inst: &Instance, scene: Scene) -> Result<u64, CouldNotRun> {
@@ -273,7 +279,7 @@ fn cell_of(ctl: &Ctl) -> Result<Cell, CouldNotRun> {
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(0);
     Cell::new(w, h)
-        .ok_or_else(|| CouldNotRun(format!("ctl dims reported no positive cell ({dims})")))
+        .ok_or_else(|| CouldNotRun::Refused(format!("ctl dims reported no positive cell ({dims})")))
 }
 
 fn caret(ctl: &Ctl) -> Result<(String, String, String), CouldNotRun> {
@@ -365,7 +371,7 @@ fn capture_video(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
     }
     let reply = recorder
         .join()
-        .map_err(|_| CouldNotRun("the recording thread panicked".into()))?;
+        .map_err(|_| CouldNotRun::Refused("the recording thread panicked".into()))?;
     sampler.close_window();
     if opened?.is_none() && !row.keys.is_empty() {
         return could_not_run(format!(
@@ -380,16 +386,16 @@ fn capture_video(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
         .filter(|_| line.starts_with("OK frames="))
         .map(|(_, rest)| PathBuf::from(format!("/{rest}")))
         .ok_or_else(|| {
-            CouldNotRun(format!(
+            CouldNotRun::Refused(format!(
                 "ctl video reported no take ({line} {})",
                 reply.stderr.trim()
             ))
         })?;
-    let index = RecordingIndex::load(&index_path).map_err(CouldNotRun)?;
+    let index = RecordingIndex::load(&index_path).map_err(CouldNotRun::Refused)?;
     let frames_dir = index_path
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| CouldNotRun("the recording index has no directory".into()))?;
+        .ok_or_else(|| CouldNotRun::Refused("the recording index has no directory".into()))?;
     let final_row = Some(ctl.call(&["trail", "status"]).line().to_string())
         .filter(|l| l.starts_with("trail "))
         .map(StatusRow::new);
@@ -495,7 +501,7 @@ fn capture_burst(ctl: &Ctl, row: &PaintRow, sampler: &Sampler) -> Result<Capture
     sampler.close_window();
     let frames_dir = burst
         .dir
-        .ok_or_else(|| CouldNotRun("the image burst produced no frames".into()))?;
+        .ok_or_else(|| CouldNotRun::Refused("the image burst produced no frames".into()))?;
     Ok(Captured {
         frames_dir,
         rows: Some(burst.rows),

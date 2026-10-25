@@ -1311,60 +1311,6 @@ fn a_gemini_wall_is_googles_error_body() {
 }
 
 #[test]
-fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
-    let reset = 1_792_584_000;
-    let e = gemini::exhausted_error("gemini-3.5-flash", 3725, reset);
-    let err = e.get("error").unwrap();
-    assert_eq!(
-        (err.get("code"), err.get("status").and_then(J::as_str)),
-        (Some(&J::Int(429)), Some("RESOURCE_EXHAUSTED"))
-    );
-    assert_eq!(
-        err.get("message").and_then(J::as_str),
-        Some("You have exhausted your capacity on this model. Your quota will reset after 1h2m5s.")
-    );
-    let details = err.get("details").and_then(J::as_arr).unwrap();
-    let info = details
-        .iter()
-        .find(|d| {
-            d.get("@type").and_then(J::as_str) == Some("type.googleapis.com/google.rpc.ErrorInfo")
-        })
-        .unwrap();
-    assert_eq!(
-        info.get("reason").and_then(J::as_str),
-        Some("QUOTA_EXHAUSTED")
-    );
-    assert_eq!(
-        info.get("domain").and_then(J::as_str),
-        Some("cloudcode-pa.googleapis.com")
-    );
-    let meta = info.get("metadata").unwrap();
-    assert_eq!(
-        meta.get("quotaResetTimeStamp").and_then(J::as_str),
-        Some(format!("{}Z", crate::util::utc_civil(reset)).as_str())
-    );
-    assert_eq!(
-        meta.get("model").and_then(J::as_str),
-        Some("gemini-3.5-flash")
-    );
-    let retry = details
-        .iter()
-        .find(|d| {
-            d.get("@type").and_then(J::as_str) == Some("type.googleapis.com/google.rpc.RetryInfo")
-        })
-        .unwrap();
-    assert_eq!(retry.get("retryDelay").and_then(J::as_str), Some("3725s"));
-    let short = gemini::exhausted_error("m", 240, reset).py();
-    assert!(short.contains("reset after 4m0s."), "{short}");
-    let day = gemini::quota_error("gemini-3.5-flash", 3725).py();
-    assert!(
-        day.contains("PerDay") && !day.contains("QUOTA_EXHAUSTED"),
-        "{day}"
-    );
-    assert_eq!(gemini::ACCOUNT_CLAIM, "code_assist");
-}
-
-#[test]
 fn the_measured_refusals_are_custom_modes_in_googles_shape() {
     let refusals = gemini::measured_refusals();
     assert_eq!(refusals.len(), 8);
@@ -1488,13 +1434,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     assert_eq!(walled.status(), 429);
     assert!(String::from_utf8_lossy(walled.body()).contains("PerDay"));
     let future = crate::util::now_secs() + 600;
-    control(&port, &format!("/__mode?m=limit:code_assist:{future}")).unwrap();
-    let account = post(stream, turn);
-    assert_eq!(account.status(), 429);
-    let body = String::from_utf8_lossy(account.body()).into_owned();
-    assert!(body.contains("\"QUOTA_EXHAUSTED\""), "{body}");
-    assert!(body.contains("cloudcode-pa.googleapis.com"), "{body}");
-    assert!(!body.contains("PerDay"), "{body}");
     control(&port, &format!("/__mode?m=limit:five_hour:{future}")).unwrap();
     let key = String::from_utf8_lossy(post(stream, turn).body()).into_owned();
     assert!(
@@ -1512,17 +1451,21 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
             .to_string()
     };
     let classifier = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"responseJsonSchema":{"type":"object","properties":{"reasoning":{"type":"string"},"model_choice":{"type":"string","enum":["flash","pro"]}},"required":["reasoning","model_choice"]}}}"#;
-    control(&port, &format!("/__mode?m=limit:code_assist_pro:{future}")).unwrap();
-    assert_eq!(side_answer(router), r#"{"complexity_score":100}"#);
-    assert!(side_answer(classifier).contains(r#""model_choice":"pro""#));
-    let bucket = String::from_utf8_lossy(post(stream, turn).body()).into_owned();
-    assert!(bucket.contains("\"QUOTA_EXHAUSTED\""), "{bucket}");
-    control(&port, &format!("/__mode?m=limit:code_assist:{future}")).unwrap();
-    assert_eq!(side_answer(router), r#"{"complexity_score":10}"#);
-    assert!(side_answer(classifier).contains(r#""model_choice":"flash""#));
-    let past = crate::util::now_secs() - 1;
-    control(&port, &format!("/__mode?m=limit:code_assist_pro:{past}")).unwrap();
-    assert_eq!(side_answer(router), r#"{"complexity_score":10}"#);
+    // The retired Gemini CLI's Google-account claims are no wall of their own:
+    // each is an API key's spent per-day quota, and no side answer is routed.
+    for claim in ["code_assist", "code_assist_pro"] {
+        control(&port, &format!("/__mode?m=limit:{claim}:{future}")).unwrap();
+        let wall = String::from_utf8_lossy(post(stream, turn).body()).into_owned();
+        assert!(
+            wall.contains("PerDay") && !wall.contains("QUOTA_EXHAUSTED"),
+            "{claim}: {wall}"
+        );
+        assert_eq!(side_answer(router), r#"{"complexity_score":10}"#, "{claim}");
+        assert!(
+            side_answer(classifier).contains(r#""model_choice":"flash""#),
+            "{claim}"
+        );
+    }
 
     std::fs::write(
         &tool_file,

@@ -2,11 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! Replay of occupancy rules over recorded session ring and hold rows. The nudge's wait is
-//! this process's ([`rules::wait_nudge_after_ms`]).
+//! this process's ([`rules::wait_nudge_after_ms`]). The ring holds no wakes, so `wake@v1` is
+//! not replayed, and the replay picks as slice 1 did ([`WakeSight::slice1`]).
 
 use super::hold::RowSaid;
 use super::ring::RingRow;
-use super::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict};
+use super::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict, WakeSight};
 use super::said::{SaidVerdict, clock_words};
 use crate::supervise::Guard;
 use crate::supervise::config::Autopilot;
@@ -129,6 +130,7 @@ pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> 
             &guards,
             rules::wait_nudge_after_ms(),
             at,
+            &WakeSight::slice1(),
         );
         for (rule, verdict) in verdicts {
             let now = match verdict {
@@ -136,6 +138,7 @@ pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> 
                 Verdict::Spent => Some(SaidVerdict::Spent),
                 Verdict::Held(guard) => Some(SaidVerdict::Held(guard)),
                 Verdict::Paced { .. } => Some(SaidVerdict::Paced),
+                Verdict::Outranked => Some(SaidVerdict::Outranked),
                 Verdict::Due(_) => Some(SaidVerdict::Would),
             };
             if now == Some(SaidVerdict::Would) {
@@ -182,6 +185,13 @@ pub fn replay_lines(
         ));
     }
     for rule in RuleId::ALL {
+        if rule == RuleId::Wake {
+            lines.push(format!(
+                "{} not replayed (the ring holds no wakes)",
+                rule.name()
+            ));
+            continue;
+        }
         let first = replayed
             .iter()
             .find(|r| r.rule == rule && r.verdict == SaidVerdict::Would)

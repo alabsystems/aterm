@@ -950,6 +950,10 @@ struct WakeWire {
     kinds: Vec<String>,
     need: Option<String>,
     need_slots: bool,
+    /// Written by every build that reads the book; a tape without it never had a loop read one,
+    /// and reads a need as met only where the wake has none.
+    #[serde(default)]
+    need_met: Option<bool>,
     await_only: bool,
 }
 
@@ -982,6 +986,7 @@ fn wake_wire(w: &WakeSeen) -> WakeWire {
         kinds: w.kinds.iter().map(|k| k.word().to_string()).collect(),
         need: w.need.clone(),
         need_slots: w.need_slots,
+        need_met: Some(w.need_met),
         await_only: w.await_only,
     }
 }
@@ -1018,6 +1023,7 @@ fn wake_of(w: WakeWire) -> Result<WakeSeen, CodecError> {
         .iter()
         .map(|k| AtomKind::of_word(k).ok_or(UNKNOWN))
         .collect::<Result<Vec<_>, _>>()?;
+    let need_met = w.need_met.unwrap_or(w.need.is_none());
     Ok(WakeSeen {
         ord: w.ord,
         class: Declarer::of_word(&w.class).ok_or(UNKNOWN)?,
@@ -1035,6 +1041,7 @@ fn wake_of(w: WakeWire) -> Result<WakeSeen, CodecError> {
             })
             .transpose()?,
         need_slots: w.need_slots,
+        need_met,
         await_only: w.await_only,
     })
 }

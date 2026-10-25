@@ -902,11 +902,15 @@ fn captured_daemon(
         .then_some(DaemonProcess { pid, birth })
 }
 
-fn absent(pid: i32) -> bool {
-    crate::sys::signal_probe(pid, 0).is_err_and(|e| e.raw_os_error() == Some(libc::ESRCH))
-}
-
+/// The daemon `pid` runs, read as this layout's ([`captured_daemon`]). `None` where no process
+/// holds `pid`, or one that has exited and is not yet reaped: a daemon's parent is launchd,
+/// which reaps it when it can, and until then signal zero still finds it while its start and
+/// words no longer read. It runs nothing again, so a stop that waits on it is over.
+/// # Errors
+/// A live `pid` that does not read as this VM's daemon, or one whose presence cannot be read:
+/// either is preserved.
 fn observe_daemon(l: &Layout, kind: Daemon, pid: i32) -> Result<Option<DaemonProcess>, String> {
+    use aterm_uds::process::ProcessPresence;
     let before = aterm_uds::process::read_process_birth(pid);
     let argv = aterm_uds::process::read_process_argv(pid);
     let after = aterm_uds::process::read_process_birth(pid);
@@ -916,12 +920,12 @@ fn observe_daemon(l: &Layout, kind: Daemon, pid: i32) -> Result<Option<DaemonPro
     {
         return Ok(Some(found));
     }
-    if absent(pid) {
-        return Ok(None);
+    match aterm_uds::process::process_presence(pid) {
+        ProcessPresence::Absent | ProcessPresence::Exited => Ok(None),
+        ProcessPresence::Present | ProcessPresence::Unknown => Err(format!(
+            "{kind:?} pid {pid} has no stable identity and arguments for this VM; preserved"
+        )),
     }
-    Err(format!(
-        "{kind:?} pid {pid} has no stable identity and arguments for this VM; preserved"
-    ))
 }
 
 fn daemon(l: &Layout, kind: Daemon) -> Result<Option<DaemonProcess>, String> {
@@ -2905,6 +2909,8 @@ mod tests {
     const BOOTER_STAND_IN: &str = "windows::tests::a_booter_stand_in";
     /// The stand-in booter's layout home, verb and whether it records its boot, tabs between.
     const BOOTER_ENV: &str = "ATERM_LAB_TEST_WINDOWS_BOOTER";
+    /// What the stand-in booter says once its boot is recorded, for its QEMU to start.
+    const BOOTING: &str = "the stand-in starts QEMU";
     /// What the stand-in booter says, with its QEMU's pid, once the VM is up.
     const BOOTED: &str = "the stand-in booted QEMU pid";
 
@@ -2967,11 +2973,12 @@ mod tests {
 
     /// Not a test alone: run as [`BOOTER_STAND_IN`], it boots the VM of the layout under
     /// [`BOOTER_ENV`]'s home as a lane run of its verb does: the boot recorded beside the VM
-    /// ([`crate::vm_admit::Booter`]), then [`a_qemu_stand_in`] started with the lane's own QEMU
-    /// words, left to run on its own, and once it is up its pid recorded as the boot's VM
-    /// process ([`crate::vm_admit::record_vm`]). Told not to record, it boots as a lab that
-    /// keeps no records does. It says [`BOOTED`] with QEMU's pid; then a one-shot run dies by its
-    /// own `SIGKILL`, and `up` ends as `up` ends ([`Up::keep`]: the VM kept).
+    /// ([`crate::vm_admit::Booter`]), then the VM's QEMU started, and once it is up its pid
+    /// recorded as the boot's VM process ([`crate::vm_admit::record_vm`]). The QEMU is
+    /// [`boot_by`]'s, started when this booter says [`BOOTING`]: `-daemonize` leaves the real one
+    /// to launchd, never to the run. Told not to record, it boots as a lab that keeps no records
+    /// does. It says [`BOOTED`] with QEMU's pid; then a one-shot run dies by its own `SIGKILL`,
+    /// and `up` ends as `up` ends ([`Up::keep`]: the VM kept).
     #[test]
     fn a_booter_stand_in() {
         let Ok(spec) = std::env::var(BOOTER_ENV) else {
@@ -2987,38 +2994,19 @@ mod tests {
                 .expect("the boot recorded");
         }
         std::fs::create_dir_all(l.run()).expect("the run directory");
-        let words = qemu_args(
-            &l,
-            &tools(),
-            &Boot {
-                install: None,
-                port: 1,
-                vnc: None,
-            },
-        );
-        let _qemu = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test"))
-            .arg0(&tools().qemu)
-            .args([
-                "--exact",
-                QEMU_STAND_IN,
-                "--nocapture",
-                "--test-threads=1",
-                "--",
-            ])
-            .args(&words)
-            .env(QEMU_ENV, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the stand-in QEMU starts");
-        let pid = i32::try_from(_qemu.id()).expect("a pid");
+        println!("{BOOTING}");
+        let _ = std::io::stdout().flush();
         // The one-minute hang detector: the stand-in writes its pid file and opens QMP at once.
         let end = Instant::now() + Duration::from_secs(60);
-        while !(running(&l) == Ok(Some(pid)) && l.qmp().exists()) {
+        let pid = loop {
+            if let Ok(Some(pid)) = running(&l)
+                && l.qmp().exists()
+            {
+                break pid;
+            }
             assert!(Instant::now() < end, "the stand-in QEMU did not come up");
             std::thread::sleep(Duration::from_millis(20));
-        }
+        };
         if records {
             crate::vm_admit::record_vm(Some(&l.booter()), qemu(&l));
         }
@@ -3033,9 +3021,64 @@ mod tests {
         aterm_uds::process::kill_self_now()
     }
 
+    /// [`a_qemu_stand_in`] as the QEMU of the VM in `l`, with the lane's own QEMU words: this
+    /// test's child, which nothing but this test reaps.
+    fn qemu_stand_in(l: &Layout) -> aterm_uds::spawnfd::Child {
+        let words = qemu_args(
+            l,
+            &tools(),
+            &Boot {
+                install: None,
+                port: 1,
+                vnc: None,
+            },
+        );
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("this test"))
+            .arg0(&tools().qemu)
+            .args([
+                "--exact",
+                QEMU_STAND_IN,
+                "--nocapture",
+                "--test-threads=1",
+                "--",
+            ])
+            .args(&words)
+            .env(QEMU_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the stand-in QEMU starts")
+    }
+
+    /// A stopped QEMU of [`boot_by`]'s: held where a stop raced launchd's reap on a loaded Mac,
+    /// exited and not yet reaped, until this reaps it.
+    fn reaped(vm: &mut aterm_uds::spawnfd::Child) {
+        use aterm_uds::process::{ProcessPresence, process_presence};
+        let pid = i32::try_from(vm.id()).expect("a pid");
+        assert_eq!(
+            process_presence(pid),
+            ProcessPresence::Exited,
+            "QEMU pid {pid} has exited and is held unreaped"
+        );
+        let status = vm.wait().expect("QEMU is reaped");
+        assert!(status.success(), "QEMU pid {pid}: {status}");
+    }
+
     /// Boot the VM of the layout under `home` by [`a_booter_stand_in`] running `verb`, recording
-    /// the boot when `records`: its pid, how it ended, and its QEMU's pid.
-    fn boot_by(home: &Path, verb: &str, records: bool) -> (u32, std::process::ExitStatus, i32) {
+    /// the boot when `records`, its QEMU [`qemu_stand_in`] started once it says [`BOOTING`]: the
+    /// booter's pid, how it ended, its QEMU and that QEMU's pid. Nothing reaps the QEMU until the
+    /// test does ([`reaped`]), so a stop's wait for it always meets it exited and not yet reaped.
+    fn boot_by(
+        home: &Path,
+        verb: &str,
+        records: bool,
+    ) -> (
+        u32,
+        std::process::ExitStatus,
+        aterm_uds::spawnfd::Child,
+        i32,
+    ) {
         let mut booter = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test"))
             .args([
                 "--exact",
@@ -3057,29 +3100,39 @@ mod tests {
             .spawn()
             .expect("the stand-in booter starts");
         let pid = booter.id();
+        let mut vm = None;
+        let mut said = Vec::new();
         // Read to its end, so the booter never writes into a closed pipe.
-        let said: Vec<String> = BufReader::new(booter.stdout.take().expect("its stdout"))
+        for line in BufReader::new(booter.stdout.take().expect("its stdout"))
             .lines()
             .map_while(Result::ok)
-            .collect();
+        {
+            if line.contains(BOOTING) && vm.is_none() {
+                vm = Some(qemu_stand_in(&Layout::under(home)));
+            }
+            said.push(line);
+        }
         let status = booter.wait().expect("the booter is reaped");
-        let qemu = said
-            .iter()
-            .find_map(|l| {
-                l.split_once(BOOTED)
-                    .and_then(|(_, p)| p.split_whitespace().next()?.parse().ok())
-            })
-            .unwrap_or_else(|| panic!("the booter's QEMU ({status}): {said:?}"));
-        (pid, status, qemu)
+        let vm = vm.unwrap_or_else(|| panic!("the booter started no QEMU ({status}): {said:?}"));
+        let qemu = i32::try_from(vm.id()).expect("a pid");
+        let booted = said.iter().find_map(|l| {
+            l.split_once(BOOTED)
+                .and_then(|(_, p)| p.split_whitespace().next()?.parse().ok())
+        });
+        assert_eq!(booted, Some(qemu), "the booter's QEMU ({status}): {said:?}");
+        (pid, status, vm, qemu)
     }
 
     /// A VM a one-shot run booted and left as it died (killed by its own `SIGKILL` after the
     /// boot, QEMU still running) is stopped by the next run's bring-up through `down`'s own path
     /// (QMP's power button here: no SSH port was recorded), which names the dead run; when it
-    /// ends, that QEMU is gone, and so is its record. Negative controls: once such a VM was
-    /// stopped as a lab that keeps no records stops it (its record left behind) and booted
-    /// again by one, the record describes a boot that is over, and the VM is adopted; and a VM
-    /// `up` left is adopted with its QEMU running, until `down` stops it.
+    /// ends, that QEMU is gone, and so is its record. Every stop here meets its QEMU exited and
+    /// not yet reaped ([`boot_by`] holds it there), as a loaded Mac once let one meet a QEMU
+    /// launchd had yet to reap and refuse it as foreign: such a QEMU is gone, and so is one a
+    /// pid file still names, as a QEMU ended by a signal leaves it. Negative controls: once such
+    /// a VM was stopped as a lab that keeps no records stops it (its record left behind) and
+    /// booted again by one, the record describes a boot that is over, and the VM is adopted;
+    /// and a VM `up` left is adopted with its QEMU running, until `down` stops it.
     #[test]
     fn a_vm_a_dead_one_shot_run_left_is_stopped_and_one_up_left_is_adopted() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -3090,9 +3143,8 @@ mod tests {
             .expect("a scratch home");
         let l = Layout::under(home.path());
         assert!(lossy(&l.qmp()).len() < 104, "{}", l.qmp().display());
-        let gone = |pid: i32| aterm_uds::process::read_process_birth(pid).is_none();
 
-        let (booter, status, qemu) = boot_by(home.path(), "lab windows smoke", true);
+        let (booter, status, mut vm, qemu) = boot_by(home.path(), "lab windows smoke", true);
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
         assert_eq!(running(&l), Ok(Some(qemu)), "the dead run's QEMU runs on");
         let mut said = Vec::new();
@@ -3106,16 +3158,23 @@ mod tests {
             )) && line.ends_with(&format!("(QEMU pid {qemu})"))),
             "{said:?}"
         );
-        assert!(gone(qemu), "QEMU pid {qemu} is gone when the stop ends");
         assert_eq!(running(&l), Ok(None));
+        reaped(&mut vm);
         assert!(!l.booter().exists(), "the stopped VM's record went with it");
 
-        let (_, status, qemu) = boot_by(home.path(), "lab windows smoke", true);
+        let (_, status, mut vm, qemu) = boot_by(home.path(), "lab windows smoke", true);
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
         stop(&l, None).expect("stopped as a lab that keeps no records stops it");
-        assert!(gone(qemu), "QEMU pid {qemu} stopped");
+        std::fs::write(l.qemu_pid(), format!("{qemu}\n")).expect("the pid file");
+        assert_eq!(
+            running(&l),
+            Ok(None),
+            "a pid file names QEMU pid {qemu}, which has exited"
+        );
+        std::fs::remove_file(l.qemu_pid()).expect("the pid file goes");
+        reaped(&mut vm);
         assert!(l.booter().exists(), "the dead run's record is left behind");
-        let (_, status, qemu) = boot_by(home.path(), "lab windows up", false);
+        let (_, status, mut vm, qemu) = boot_by(home.path(), "lab windows up", false);
         assert!(status.success(), "{status}");
         let mut said = Vec::new();
         let adopted_pid =
@@ -3127,18 +3186,18 @@ mod tests {
         );
         assert!(said.is_empty(), "{said:?}");
         down(&l, &tools()).expect("down stops it");
-        assert!(gone(qemu), "down stopped QEMU pid {qemu}");
+        reaped(&mut vm);
 
-        let (_, status, qemu) = boot_by(home.path(), "lab windows up", true);
+        let (_, status, mut vm, qemu) = boot_by(home.path(), "lab windows up", true);
         assert!(status.success(), "{status}");
         let mut said = Vec::new();
         let adopted_pid =
             adopted(&l, &tools(), &mut |line| said.push(line.to_owned())).map_err(|f| f.msg);
         assert_eq!(adopted_pid, Ok(Some(qemu)), "{said:?}");
         assert!(said.is_empty(), "{said:?}");
-        assert!(!gone(qemu), "the VM up left runs on");
+        assert_eq!(vm.exited().ok(), Some(false), "the VM up left runs on");
         down(&l, &tools()).expect("down stops it");
-        assert!(gone(qemu), "down stopped QEMU pid {qemu}");
+        reaped(&mut vm);
     }
 
     #[test]

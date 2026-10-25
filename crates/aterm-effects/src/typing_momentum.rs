@@ -67,7 +67,7 @@ impl TypingMomentum {
         let v = if dt == 0.0 {
             self.value
         } else {
-            self.value * (-dt * (1.0 / TYPING_MOMENTUM_TAU)).exp()
+            self.value * crate::color_math::exp_f32(-dt * (1.0 / TYPING_MOMENTUM_TAU))
         };
         if v < SNAP_ZERO { 0.0 } else { v }
     }
@@ -75,9 +75,10 @@ impl TypingMomentum {
     /// Record one printable advance at `now`, crediting `RATE * min(gap, CREDIT_CAP_S)`.
     #[inline]
     pub fn advance(&mut self, now: Instant) {
-        let gap = self.at.map_or(TYPING_MOMENTUM_CREDIT_CAP_S, |at| {
-            now.saturating_duration_since(at).as_secs_f32()
-        });
+        let gap = match self.at {
+            Some(at) => now.saturating_duration_since(at).as_secs_f32(),
+            None => TYPING_MOMENTUM_CREDIT_CAP_S,
+        };
         let credit = TYPING_MOMENTUM_RATE * gap.min(TYPING_MOMENTUM_CREDIT_CAP_S);
         self.value = (self.value(now) + credit).min(1.0);
         self.at = Some(now);
@@ -119,7 +120,7 @@ impl TypingMomentum {
         if self.value <= threshold {
             return Some(at);
         }
-        let elapsed = TYPING_MOMENTUM_TAU * (self.value / threshold).ln();
+        let elapsed = TYPING_MOMENTUM_TAU * crate::color_math::ln_pos_f32(self.value / threshold);
         Some(at + std::time::Duration::from_secs_f32(elapsed.max(0.0)))
     }
 

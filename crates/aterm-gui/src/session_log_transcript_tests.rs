@@ -701,6 +701,7 @@ fn set_rollout_claim(ctx: &crate::SessionCtx, target: &crate::self_claim::Rollou
             pid: target.pid,
             start: target.start.clone(),
         }),
+        scoped: None,
     });
     crate::self_claim::set_copy_for_test(
         ctx.self_id.as_str(),

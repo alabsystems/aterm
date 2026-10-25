@@ -203,11 +203,22 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
 
 impl CommandLineTools {
     fn install(sys: &dyn System) -> Result<(), String> {
+        // A closed tab (SIGHUP), a Ctrl-C or a Ctrl-\ reaches this run, never `softwareupdate`
+        // (its own process group): caught, it lets the running step finish and the placeholder
+        // guard remove the placeholder, which would otherwise refuse every later install.
+        let _stops = sys.catch_stops();
         sys.create_new(Path::new(PLACEHOLDER), b"", 0o644)
             .map_err(|e| format!("{PLACEHOLDER}: {e}"))?;
         let _placeholder = Placeholder { sys };
+        say("reading Apple's software catalog (minutes on a slow network)");
         let list = Cmd::new(SOFTWAREUPDATE).arg("-l").budget(LIST_BUDGET);
         let listed = run_ok(sys, &list)?;
+        if let Some(signal) = sys.stopped() {
+            return Err(format!(
+                "stopped by signal {signal} once {} had read Apple's catalog; nothing was installed",
+                list.display()
+            ));
+        }
         let labels = parse_labels(&listed);
         let Some(label) = pick(&labels) else {
             return Err(format!(
@@ -218,6 +229,11 @@ impl CommandLineTools {
         let install = Cmd::new(SOFTWAREUPDATE)
             .args(["-i", label.label.as_str()])
             .budget(INSTALL_BUDGET);
+        say(&format!(
+            "installing {}: about half a gigabyte to download, then the install (often ten \
+             minutes or more)",
+            label.label
+        ));
         let ran = sys
             .run(&install)
             .map_err(|e| format!("{}: {e}", install.display()))?;
@@ -240,6 +256,13 @@ impl CommandLineTools {
         }
         Ok(())
     }
+}
+
+/// One progress line on this run's terminal, so a minutes-long download does not look hung. A
+/// terminal gone with its tab is no error: the install goes on.
+fn say(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "Command Line Tools: {line}\u{2026}");
 }
 
 const SOFTWAREUPDATE_BOILERPLATE: [&str; 2] =
@@ -555,6 +578,49 @@ Software Update found the following new or updated software:\n\
             Some(
                 "/bin/rm -rf /Library/Developer/CommandLineTools; /usr/sbin/pkgutil --forget=com.apple.pkg.CLTools_Executables"
             )
+        );
+    }
+
+    /// A closed tab or a Ctrl-C while `softwareupdate -l` reads the catalog installs nothing and
+    /// leaves no placeholder to refuse the next install: the stops are caught before the
+    /// placeholder exists.
+    #[test]
+    fn a_stop_while_the_catalog_is_read_installs_nothing_and_removes_the_placeholder() {
+        let mut sys = Fake::root();
+        sys.stop_after = Some(0);
+        sys.on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST));
+        let why = CommandLineTools::install(&sys).unwrap_err();
+        assert!(why.starts_with("stopped by signal"), "{why}");
+        let calls = sys.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
+        let caught = at("catch stops").expect("stops caught");
+        let created = at("create /tmp/.com.apple.dt.CommandLineTools").expect("placeholder");
+        assert!(
+            caught < created,
+            "caught before the placeholder exists: {calls:?}"
+        );
+        assert!(at("/usr/sbin/softwareupdate -i").is_none(), "{calls:?}");
+        assert!(
+            at("remove /tmp/.com.apple.dt.CommandLineTools").is_some(),
+            "{calls:?}"
+        );
+        assert!(sys.written(PLACEHOLDER).is_none());
+
+        let unstopped = Fake::root();
+        unstopped
+            .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+            .on(
+                "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+                installed_quietly(),
+            )
+            .on(PKGUTIL, Ran::ok(RECEIPT));
+        CommandLineTools::install(&unstopped).unwrap();
+        assert!(
+            unstopped
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")),
+            "the negative control installs"
         );
     }
 

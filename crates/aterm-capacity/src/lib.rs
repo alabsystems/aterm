@@ -40,7 +40,7 @@ pub use admit::{
     CREDIT_MAX, Claim, Error, Holder, Pace, Polled, Relief, Short, Shortfall, Waiter, admit,
     admit_relieved, admit_until, admit_with, gib, never, span,
 };
-pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, size};
+pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
 pub use ledger::{Held, Ledger, Record};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
@@ -220,3 +220,6 @@ impl Admit {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod interrupt_tests;

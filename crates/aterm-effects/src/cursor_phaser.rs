@@ -180,10 +180,10 @@ impl CursorPhaser {
 
         let active = e > SETTLED_ENERGY;
         let dt = if was_active && active {
-            self.last
-                .map(|t| now.saturating_duration_since(t).as_secs_f32())
-                .unwrap_or(0.0)
-                .min(0.25)
+            match self.last {
+                Some(t) => now.saturating_duration_since(t).as_secs_f32().min(0.25),
+                None => 0.0,
+            }
         } else {
             0.0
         };
@@ -194,7 +194,7 @@ impl CursorPhaser {
         let breath = if self.pulse == 0.0 {
             0.5
         } else {
-            0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin()
+            0.5 + 0.5 * crate::supernova::sin_cos_f32(self.pulse * std::f32::consts::TAU).0
         };
 
         let fill = match cfg.base {
@@ -298,7 +298,7 @@ impl CursorPhaser {
             while dy < half_h_i32 {
                 let h = slab.min(half_h_i32 - dy).max(1);
                 let ym = (dy as f32 + h as f32 * 0.5) * inv_half_h;
-                let hw = (r * (1.0 - ym * ym).max(0.0).sqrt()) as i32;
+                let hw = (r * crate::color_math::sqrt_f32((1.0 - ym * ym).max(0.0))) as i32;
                 if hw >= 1 {
                     let y = cy_i32 + dy;
                     push_rect(out, geom, cell_l - hw, y, hw, h, left_premul);

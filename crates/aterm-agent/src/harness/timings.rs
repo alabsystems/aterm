@@ -52,14 +52,6 @@ pub struct Timings {
     pub agy_lock: Duration,
     /// The agy lane: an adopted TUI seen in its tab.
     pub agy_adopt: Duration,
-    /// The Gemini CLI lane: the relaunched parent found as the shell's child.
-    pub gemini_found: Duration,
-    /// The Gemini CLI lane: the relaunched TUI's composer drawn.
-    pub gemini_up: Duration,
-    /// The Gemini CLI lane: the start-time rule naming the relaunched process's session.
-    pub gemini_witness: Duration,
-    /// The Gemini CLI lane: an adopted TUI seen in its tab.
-    pub gemini_adopt: Duration,
     /// The supervisor loop: delay before re-deciding a point whose fenced write was skipped.
     pub redecide_after_skip: Duration,
     /// The supervisor loop: the lease TTL its claim on a session asks for.
@@ -88,10 +80,6 @@ impl Timings {
         agy_up: Duration::from_secs(60),
         agy_lock: Duration::from_secs(30),
         agy_adopt: Duration::from_secs(30),
-        gemini_found: Duration::from_secs(90),
-        gemini_up: Duration::from_secs(60),
-        gemini_witness: Duration::from_secs(30),
-        gemini_adopt: Duration::from_secs(30),
         redecide_after_skip: Duration::from_secs(2),
         claim_ttl: Duration::from_secs(90),
     };
@@ -117,10 +105,6 @@ impl Timings {
         agy_up: Duration::from_secs(2),
         agy_lock: Duration::from_millis(1_000),
         agy_adopt: Duration::from_secs(2),
-        gemini_found: Duration::from_secs(3),
-        gemini_up: Duration::from_secs(2),
-        gemini_witness: Duration::from_millis(1_000),
-        gemini_adopt: Duration::from_secs(2),
         redecide_after_skip: Duration::from_millis(100),
         claim_ttl: Duration::from_secs(600),
     };
@@ -183,10 +167,6 @@ mod tests {
             (p.agy_up, f.agy_up),
             (p.agy_lock, f.agy_lock),
             (p.agy_adopt, f.agy_adopt),
-            (p.gemini_found, f.gemini_found),
-            (p.gemini_up, f.gemini_up),
-            (p.gemini_witness, f.gemini_witness),
-            (p.gemini_adopt, f.gemini_adopt),
             (p.redecide_after_skip, f.redecide_after_skip),
         ] {
             assert!(fast <= prod, "{fast:?} > {prod:?}");

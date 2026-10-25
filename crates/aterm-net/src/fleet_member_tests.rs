@@ -1202,6 +1202,11 @@ fn a_drive_grant_holds_the_key_it_was_made_for() {
         approved.driver(Some(&proof(a.node(), a.key())), &[]),
         Err(Undriven::Unlisted(a.node().to_owned()))
     );
+    assert_eq!(
+        Keyring::default().driver(Some(&proof(a.node(), a.key())), &[]),
+        Err(Undriven::Unlisted(a.node().to_owned())),
+        "a node no grant names is refused as that, bound or not"
+    );
     let rebound = Keyring::of(&[keyed(0xa1, m.key(), [10, 0, 0, 9], 7100)]);
     assert_eq!(
         rebound.proven(Some(&proof(m.node(), m.key()))),
@@ -1220,6 +1225,11 @@ fn a_drive_grant_holds_the_key_it_was_made_for() {
         rebound.driver(Some(&proof(a.node(), a.key())), &grants),
         Err(Undriven::Unproven(Unproven::OtherKey(a.node().to_owned()))),
         "and the Mac the grant was made for is held to the book too"
+    );
+    assert_eq!(
+        Keyring::default().driver(Some(&proof(m.node(), m.key())), &grants),
+        Err(Undriven::Rekeyed(a.node().to_owned())),
+        "a key its grant does not hold is refused as that, bound or not"
     );
     assert_eq!(
         approved.driver(None, &grants),
@@ -1310,19 +1320,66 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
             old(),
             fetched
         ),
-        Err(Undriven::Unproven(Unproven::Unbound(n.node().to_owned()))),
+        Err(Undriven::Unjoined(n.node().to_owned())),
         "taken out on the issuer: refused"
     );
     assert!(copied().is_empty(), "the copy follows the issuer's book");
+    let said = Undriven::Unjoined(n.node().to_owned()).to_string();
+    assert!(
+        said.contains("nor by its issuer's book read just now") && !said.contains("again"),
+        "{said}"
+    );
+    let stranger = identity(&node_of(0xe5), 5);
+    assert_eq!(
+        driver_as_of(
+            as_of(&stranger).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            young(),
+            unread
+        ),
+        Err(Undriven::Unlisted(stranger.node().to_owned())),
+        "a node no grant names reads no book"
+    );
+    let claimant = identity(n.node(), 6);
+    assert_eq!(
+        driver_as_of(
+            as_of(&claimant).as_ref(),
+            (member.dir(), &grants, &secret(5)),
+            young(),
+            unread
+        ),
+        Err(Undriven::Rekeyed(n.node().to_owned())),
+        "nor does a granted node, the copy binding it no more, proving another key than its grant"
+    );
+    write_book(issuer_state.dir(), std::slice::from_ref(&entry));
     assert_eq!(
         driver_as_of(
             as_of(&n).as_ref(),
             (member.dir(), &grants, &secret(5)),
             young(),
-            unread
+            fetched
         ),
-        Err(Undriven::Unproven(Unproven::Unbound(n.node().to_owned()))),
-        "and refuses by itself from then"
+        Ok(n.node().to_owned()),
+        "joined again: a granted node a young copy does not bind is read afresh"
+    );
+    assert_eq!(copied(), vec![copy(entry.clone())]);
+
+    keep_copy(member.dir(), i.node(), &[]).unwrap();
+    write_book(member.dir(), &[issuer_at(closed_port(), Some(i.key()))]);
+    let unread_now = driver_as_of(
+        as_of(&n).as_ref(),
+        (member.dir(), &grants, &secret(5)),
+        young(),
+        fetched,
+    );
+    assert!(
+        matches!(&unread_now, Err(Undriven::Unread { node, .. }) if node == n.node()),
+        "{unread_now:?}"
+    );
+    let said = unread_now.unwrap_err().to_string();
+    assert!(
+        said.contains("whether it joined since") && said.contains("reaches its issuer"),
+        "{said}"
     );
 
     keep_copy(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
@@ -1356,6 +1413,7 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     );
 
     // A leave while the issuer's book is read: nothing of the fleet is written back.
+    write_book(issuer_state.dir(), &[]);
     write_book(member.dir(), &[issuer_at(issuing.port, Some(i.key()))]);
     remove_private(member.dir(), KEY_FILE).unwrap();
     let left = driver_as_of(
@@ -1364,10 +1422,7 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         old(),
         fetched,
     );
-    assert_eq!(
-        left,
-        Err(Undriven::Unproven(Unproven::Unbound(n.node().to_owned())))
-    );
+    assert_eq!(left, Err(Undriven::Unjoined(n.node().to_owned())));
     assert_eq!(copied(), vec![copy(entry.clone())], "the copy as it was");
 }
 
@@ -4881,15 +4936,25 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     let bound = Keyring::of(&[keyed(0xd7, host.key(), [127, 0, 0, 1], 7100)]);
 
     let (port, running, serving) = listen(host.clone(), &[FleetOp::Survey, FleetOp::Drive]);
-    let mut driven =
-        drive(&target(port), &bound, (&secret(6), &me), HANG).expect("the bound node is driven");
+    let mut driven = drive(
+        &target(port),
+        &bound,
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+    )
+    .expect("the bound node is driven");
     assert_eq!(driven.node, host.node());
     driven.write_all(b"s-1 status\n").unwrap();
     let mut answer = String::new();
     io::BufRead::read_line(&mut io::BufReader::new(&mut driven), &mut answer).unwrap();
     assert_eq!(answer, "OK drive s-1 status\n", "the line after the proof");
     drop(driven);
-    match drive(&target(port), &Keyring::default(), (&secret(6), &me), HANG) {
+    match drive(
+        &target(port),
+        &Keyring::default(),
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+    ) {
         Err(Unreached::Unbound { node, .. }) => {
             assert_eq!(
                 node.as_deref(),
@@ -4907,7 +4972,12 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
 
     let (port, running, serving) =
         listen(identity(host.node(), 5), &[FleetOp::Survey, FleetOp::Drive]);
-    match drive(&target(port), &bound, (&secret(6), &me), HANG) {
+    match drive(
+        &target(port),
+        &bound,
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+    ) {
         Err(Unreached::Impostor { node, .. }) => assert_eq!(node, host.node()),
         other => panic!(
             "another key was driven: {:?}",
@@ -4918,7 +4988,12 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     serving.join().unwrap();
 
     let (port, running, serving) = listen(host.clone(), &[FleetOp::Survey]);
-    match drive(&target(port), &bound, (&secret(6), &me), HANG) {
+    match drive(
+        &target(port),
+        &bound,
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+    ) {
         Err(why @ Unreached::Handshake(_, FleetError::UnknownOp(_))) => {
             assert!(
                 why.to_string().contains("aterm fleet allow drive"),

@@ -3953,82 +3953,20 @@ fn a_long_texts_guard_never_matches_a_shells_row() {
 }
 
 #[test]
-fn gemini_clis_guard_is_anchored_one_column_in() {
+fn a_composer_guard_escapes_its_caret_and_holds_its_column() {
     use crate::supervise::run::turn_end_loop::{composer_guard, composer_guard_at};
-    let reader = &aterm_phase::GeminiReader;
-    let (caret, column) = (
-        aterm_phase::ScreenReader::caret(reader).expect("a caret"),
-        aterm_phase::ScreenReader::caret_column(reader),
-    );
-    assert_eq!((caret, column), ('>', 1));
-    let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::DRAFT);
-    let measured = rows
-        .iter()
-        .find(|r| r.starts_with(" > "))
-        .expect("the caret row");
-    let text = "a draft the lab never sends";
-    let g = aterm_observe::row_matcher(&composer_guard_at(caret, column, text)).expect("compiles");
-    assert!(g.matches(measured), "{measured}");
-    assert!(g.matches(&format!(" > {text} {:60}", "")));
-    for other in [
-        format!("> {text}"),
-        format!("  > {text}"),
-        " >   Type your message or @path/to/file".to_string(),
-        format!("$ {text}"),
-    ] {
-        assert!(!g.matches(&other), "{other}");
-    }
-    let old = aterm_observe::row_matcher(&composer_guard(caret, text)).expect("compiles");
-    assert!(!old.matches(measured), "the control");
-
-    let long = owners_policy().answer_text;
-    let g = aterm_observe::row_matcher(&composer_guard_at(caret, column, &long)).expect("compiles");
-    let old = aterm_observe::row_matcher(&composer_guard(caret, &long)).expect("compiles");
-    let mut old_missed = 0;
-    for width in 30..=160 {
-        let last = gemini_wrapped_last_row(&long, width);
-        assert!(g.matches(&last), "width {width}: {last:?}");
-        old_missed += usize::from(!old.matches(&last));
-    }
-    assert!(old_missed > 0, "the column-0 guard misses some width");
-    for shell in [
-        format!("user@host ~ % {long}"),
-        "ould recommend, prefer reversible steps, and keep going.".to_string(),
-        "> keep going.".to_string(),
-        "$ keep going.".to_string(),
-    ] {
-        assert!(!g.matches(&shell), "{shell}");
-    }
-}
-
-#[test]
-fn a_yolo_caret_is_escaped_in_its_guard() {
-    use crate::supervise::run::turn_end_loop::{composer_guard, composer_guard_at};
-    let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::YOLO_DRAFT);
-    let caret = aterm_phase::ScreenReader::caret_on(&aterm_phase::GeminiReader, &rows)
-        .expect("the composer's caret");
-    assert_eq!(caret, '*');
-    let measured = rows
-        .iter()
-        .find(|r| r.starts_with(" * "))
-        .expect("the caret row");
     let text = "hello in yolo";
-    let guard = composer_guard_at(caret, 1, text);
+    let guard = composer_guard_at('*', 1, text);
     assert!(guard.starts_with("^\\s\\*\\s"), "{guard}");
     let g = aterm_observe::row_matcher(&guard).expect("compiles");
-    assert!(g.matches(measured), "{measured}");
+    assert!(g.matches(&format!(" * {text}")));
+    assert!(g.matches(&format!(" * {text} {:60}", "")));
     for other in [
         format!(" > {text}"),
         format!("* {text}"),
         format!("  * {text}"),
     ] {
         assert!(!g.matches(&other), "{other}");
-    }
-    let long = owners_policy().answer_text;
-    let g = aterm_observe::row_matcher(&composer_guard_at(caret, 1, &long)).expect("compiles");
-    for width in 30..=160 {
-        let last = gemini_wrapped_last_row(&long, width).replacen(" > ", " * ", 1);
-        assert!(g.matches(&last), "width {width}: {last:?}");
     }
     assert_eq!(
         composer_guard('❯', "keep going"),
@@ -4072,31 +4010,6 @@ fn muse_codes_measured_drafts_take_the_composer_guard() {
     for row in &wrapped[caret..caret + 2] {
         assert!(!guard.matches(row), "the control: {row}");
     }
-}
-
-fn gemini_wrapped_last_row(text: &str, width: usize) -> String {
-    let room = width - 4;
-    let chars: Vec<char> = text.chars().collect();
-    let (mut at, mut rows) = (0, Vec::new());
-    while at < chars.len() {
-        let end = (at + room).min(chars.len());
-        let cut = if end == chars.len() {
-            end
-        } else {
-            (at + 1..=end)
-                .rev()
-                .find(|&i| chars[i] == ' ')
-                .unwrap_or(end)
-        };
-        rows.push(chars[at..cut].iter().collect::<String>());
-        at = if cut < chars.len() && chars[cut] == ' ' {
-            cut + 1
-        } else {
-            cut
-        };
-    }
-    let last = rows.len() - 1;
-    format!("{}{}", if last == 0 { " > " } else { "   " }, rows[last])
 }
 
 fn word_wrapped_last_row(text: &str, width: usize) -> String {
@@ -5114,19 +5027,14 @@ fn a_muse_code_question_is_answered_by_the_cursor_and_enter() {
 
 #[test]
 fn a_question_read_by_its_roles_is_told_once_as_the_policys_choice() {
+    use aterm_phase::agy::fixtures::lab as a;
     use aterm_phase::muse::fixtures as u;
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{agy::fixtures::lab as a, gemini::fixtures as g};
     type Case = (&'static str, fn() -> Mock, &'static str);
-    let cases: [Case; 3] = [
+    let cases: [Case; 2] = [
         (
             "agy",
             || agy_mock(vec![screen(a::QUESTION), screen(a::QUESTION_ANSWERED)]),
-            "Which colour should the lab probe use? → Red",
-        ),
-        (
-            "gemini",
-            || gemini_mock(vec![screen(g::QUESTION), screen(g::QUESTION_ANSWERED)]),
             "Which colour should the lab probe use? → Red",
         ),
         (
@@ -5215,1565 +5123,6 @@ fn a_muse_code_report_ending_with_the_token_gets_the_done_check() {
         );
         assert!(done.is_empty(), "{tag}: {done:#?}");
     }
-}
-
-fn gemini_mock(screens: Vec<Vec<String>>) -> Mock {
-    let carets: Vec<Option<usize>> = screens
-        .iter()
-        .map(|s| aterm_phase::gemini::composer_draft(s).map(|(caret, _)| caret))
-        .collect();
-    let mut m = fenced(screens);
-    m.program = "node";
-    for (i, caret) in carets.into_iter().enumerate() {
-        if let Some(row) = caret {
-            m.screen_cursors.insert(i, row);
-        }
-    }
-    m
-}
-
-fn gemini_ended(words: &str) -> Vec<String> {
-    let mut rows =
-        aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::END_OF_TURN);
-    let at = rows
-        .iter()
-        .rposition(|r| r.starts_with("✦ "))
-        .expect("the reply");
-    rows[at] = format!("✦ {words}");
-    rows
-}
-
-#[test]
-fn a_gemini_session_is_supervised_end_to_end() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let screens = || {
-        vec![
-            screen(g::BUSY_THINKING),
-            screen(g::BOX_SHELL),
-            screen(g::BUSY_THINKING),
-            screen(g::END_OF_TURN),
-        ]
-    };
-    let mut m = gemini_mock(screens());
-    m.gen_fence = true;
-    m.sends_gen = true;
-    m.turn_releases = Some(3);
-    m.vanish_after = Some(2);
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(30)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-    });
-    let command_row = screen(g::BOX_SHELL)
-        .into_iter()
-        .find(|r| r.starts_with("│ │ touch lab-probe.txt"))
-        .expect("the command row");
-    let press = m
-        .presses()
-        .into_iter()
-        .find(|r| r.ends_with(" 1"))
-        .cloned()
-        .unwrap_or_else(|| panic!("the box answered: {lines:#?} {:#?}", m.requests));
-    assert!(
-        press.contains(&crate::supervise::policy::row_guard(&command_row)),
-        "guarded on the command's row: {press}"
-    );
-    let turn = m
-        .requests
-        .iter()
-        .find(|r| r.starts_with("turn "))
-        .unwrap_or_else(|| panic!("the continuation: {lines:#?} {:#?}", m.requests));
-    assert!(
-        turn.starts_with("turn submit=guarded:^\\s>\\skeep\\x20going\\s*$ "),
-        "{turn}"
-    );
-    assert!(
-        lines.iter().any(|l| l.starts_with("CONTINUED ")),
-        "{lines:#?}"
-    );
-    assert_eq!(count(&m, "meta set attention"), 0, "nothing handed over");
-
-    let mut m = gemini_mock(screens());
-    m.program = "zsh";
-    m.gen_fence = true;
-    m.sends_gen = true;
-    m.vanish_after = Some(2);
-    let _ = watch_lines(&mut m, &opts);
-    assert!(m.presses().is_empty(), "{:#?}", m.requests);
-    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
-}
-
-#[test]
-fn a_gemini_continuation_past_the_paste_fold_is_guarded_on_its_chip() {
-    use crate::supervise::run::turn_end_loop::composer_guard_at;
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let long = format!(
-        "keep going on the owner's terms: {}finish it.",
-        "verify each step, commit it and push it, then read what came back. ".repeat(8)
-    );
-    assert!(long.len() > aterm_phase::gemini::PASTE_FOLD_UNITS);
-    let mut m = gemini_mock(vec![screen(g::BUSY_THINKING), screen(g::END_OF_TURN)]);
-    m.turn_releases = Some(1);
-    m.vanish_after = Some(2);
-    let opts = SuperviseOpts {
-        policy: SupervisorConfig {
-            continue_text: long.clone(),
-            ..owners_policy()
-        },
-        ..auto(30)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-    });
-    let turn = m
-        .requests
-        .iter()
-        .find(|r| r.starts_with("turn "))
-        .unwrap_or_else(|| panic!("the continuation: {lines:#?} {:#?}", m.requests));
-    assert!(
-        turn.ends_with(&long),
-        "the owner's words typed whole: {turn}"
-    );
-    let chip = aterm_phase::gemini::folded_paste(&long).expect("past the fold");
-    let guard = composer_guard_at('>', 1, &chip);
-    assert!(
-        turn.starts_with(&format!("turn submit=guarded:{guard} ")),
-        "the chip's guard: {turn}"
-    );
-
-    let rows = screen(g::FOLDED_PASTE);
-    let measured = aterm_phase::gemini::folded_paste(&"x".repeat(538)).expect("folds");
-    let at_chip =
-        aterm_observe::row_matcher(&composer_guard_at('>', 1, &measured)).expect("compiles");
-    assert!(
-        rows.iter().any(|r| at_chip.matches(r)),
-        "the measured chip row"
-    );
-    let words = aterm_observe::row_matcher(&composer_guard_at('>', 1, &long)).expect("compiles");
-    assert!(
-        !rows.iter().any(|r| words.matches(r)),
-        "the control: the words' guard matches no row of the folded screen"
-    );
-    for reader in [
-        &aterm_phase::ClaudeReader as &dyn aterm_phase::ScreenReader,
-        &aterm_phase::CodexReader,
-        &aterm_phase::AgyReader,
-        &aterm_phase::MuseReader,
-        &aterm_phase::GenericReader,
-    ] {
-        assert_eq!(reader.folded_paste(&long), None, "{:?}", reader.program());
-    }
-}
-
-#[test]
-fn a_gemini_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let mut m = gemini_mock(vec![
-        screen(g::BUSY_THINKING),
-        gemini_ended("Fixed the parser; all done."),
-        screen(g::BUSY_THINKING),
-        gemini_ended("DONE"),
-    ]);
-    m.turn_releases = Some(1);
-    m.vanish_after = Some(4);
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(30)
-    };
-    let quick = |s: &mut Watched<'_, '_>| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, quick);
-    assert!(
-        lines.iter().any(|l| l.starts_with("CONTINUED ")
-            && l.contains(&format!("rule={RULE_DONE_CHECK} "))),
-        "{lines:#?}"
-    );
-    let turns: Vec<&String> = m
-        .requests
-        .iter()
-        .filter(|r| r.starts_with("turn "))
-        .collect();
-    assert_eq!(turns.len(), 1, "the check alone: {:#?}", m.requests);
-    assert!(
-        turns[0].starts_with("turn submit=guarded:^\\s[>\\s]\\s.*"),
-        "its long form, one column in: {}",
-        turns[0]
-    );
-    assert!(turns[0].ends_with(DONE_CHECK), "{}", turns[0]);
-
-    let mut m = gemini_mock(vec![
-        screen(g::BUSY_THINKING),
-        gemini_ended("Fixed the parser; the suite is green."),
-    ]);
-    m.turn_releases = Some(1);
-    m.vanish_after = Some(2);
-    let _ = watch_lines_with(&mut m, &opts, quick);
-    assert!(
-        m.requests
-            .iter()
-            .any(|r| r.starts_with("turn ") && r.ends_with(" keep going")),
-        "the control: {:#?}",
-        m.requests
-    );
-}
-
-#[test]
-fn a_gemini_draft_is_never_typed_over_and_its_placeholder_is_continued() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let ended = screen(g::END_OF_TURN);
-    let drafted = {
-        let held = screen(g::DRAFT);
-        let caret = aterm_phase::gemini::composer_draft(&held)
-            .expect("the composer")
-            .0;
-        let at = aterm_phase::gemini::composer_draft(&ended)
-            .expect("the composer")
-            .0;
-        let mut rows = ended.clone();
-        rows[at] = held[caret].clone();
-        let status = rows
-            .iter()
-            .position(|r| r.trim() == "? for shortcuts")
-            .expect("the status row");
-        rows[status] = String::new();
-        rows
-    };
-    assert_eq!(
-        aterm_phase::gemini::composer_draft(&drafted).map(|(_, l)| l),
-        Some(vec!["a draft the lab never sends".to_string()]),
-        "the draft is read"
-    );
-    for (end, typed) in [(drafted, false), (ended, true)] {
-        let mut m = gemini_mock(vec![screen(g::BUSY_THINKING), end]);
-        m.cell_unreadable = true;
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(2);
-        let mut opts = hosted(3);
-        opts.policy.human_grace_s = 0;
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_turn_end_timing(TurnEndTiming {
-                min_work: Duration::ZERO,
-                ..TurnEndTiming::default()
-            });
-        });
-        assert!(
-            !m.requests.iter().any(|r| r.starts_with("cell ")),
-            "typed {typed}: {:#?}",
-            m.requests
-        );
-        assert_eq!(
-            m.requests.iter().any(|r| r.starts_with("turn ")),
-            typed,
-            "typed {typed}: {lines:#?}\n{:#?}",
-            m.requests
-        );
-    }
-}
-
-#[test]
-fn gemini_clis_command_menu_is_never_typed_into() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    for (end, typed) in [(g::SLASH_MENU, false), (g::END_OF_TURN, true)] {
-        let mut m = gemini_mock(vec![screen(g::BUSY_THINKING), screen(end)]);
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(2);
-        let (lines, _) = watch_lines_with(&mut m, &hosted(3), |s| {
-            s.set_turn_end_timing(TurnEndTiming {
-                min_work: Duration::ZERO,
-                ..TurnEndTiming::default()
-            });
-        });
-        assert_eq!(
-            m.requests
-                .iter()
-                .any(|r| r.starts_with("turn ") || r.starts_with("send ")),
-            typed,
-            "{}: {lines:#?}\n{:#?}",
-            end.lines().next().unwrap_or_default(),
-            m.requests
-        );
-    }
-}
-
-#[test]
-fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_is_told() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let dialog = screen(g::LIMIT_DIALOG);
-    assert_eq!(
-        aterm_phase::gemini::limit_reset(&dialog),
-        None,
-        "PRECONDITION"
-    );
-    let (dir, journal) = journal_file("te-gemini-day-stopped");
-    let mut m = gemini_mock(vec![
-        screen(g::BUSY_THINKING),
-        dialog.clone(),
-        screen(g::LIMIT_STOPPED),
-        screen(g::BUSY_THINKING),
-        dialog.clone(),
-        screen(g::BUSY_THINKING),
-        gemini_ended("Carried on."),
-    ]);
-    m.attention_gates = vec![(1, 0)];
-    m.turn_gates = vec![2];
-    m.key_gates = vec![(4, 0)];
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(|m| {
-        let unset = m
-            .requests
-            .iter()
-            .rposition(|r| r.starts_with("meta unset attention owner=supervisor"));
-        let key = m.requests.iter().rposition(|r| verb_of(r) == "key");
-        key.is_some() && unset > key
-    });
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        journal: Some(journal.clone()),
-        ..auto(6 * 3600)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock_running();
-    });
-    let (records, _) = journal_records(&journal);
-    let _ = std::fs::remove_dir_all(&dir);
-    let all = || records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>();
-    let at = |needle: &str| -> Vec<usize> {
-        m.requests
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.starts_with(needle))
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let verb_at = |verb: &str| -> Vec<usize> {
-        m.requests
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| verb_of(r) == verb)
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let turns = verb_at("turn");
-    let keys = verb_at("key");
-    let typed: Vec<_> = records
-        .iter()
-        .filter(|r| r.line.starts_with("CONTINUED "))
-        .collect();
-    assert_eq!(turns.len(), typed.len(), "{lines:#?}\n{:#?}", all());
-    assert_eq!(keys.len(), 1, "{:#?}", m.requests);
-    assert!(turns[0] < keys[0], "{:#?}", m.requests);
-    assert!(m.presses()[0].ends_with(" 1"), "{:?}", m.presses());
-    // The resume, then at most the continuation the work it led to earns.
-    assert!(
-        typed[0].line.contains("rule=usage-resume@v1")
-            && typed.len() <= 2
-            && typed[1..]
-                .iter()
-                .all(|r| r.line.contains("rule=continue@v1")),
-        "{:#?}",
-        all()
-    );
-    let raised = at("meta set attention owner=supervisor");
-    let lowered = at("meta unset attention owner=supervisor");
-    assert_eq!(raised.len(), 1, "raised once: {:#?}", m.requests);
-    assert!(
-        m.requests[raised[0]].contains("names no reset"),
-        "{}",
-        m.requests[raised[0]]
-    );
-    assert!(raised[0] < turns[0], "{:#?}", m.requests);
-    assert_eq!(lowered.len(), 1, "taken down once: {:#?}", m.requests);
-    assert!(lowered[0] > keys[0], "{:#?}", m.requests);
-    assert!(
-        !m.requests
-            .iter()
-            .any(|r| r.contains("An unknown error occurred.")),
-        "the error is no person's: {:#?}",
-        m.requests
-    );
-    let until = |l: &str| -> i64 {
-        let stamp = l
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("until="))
-            .expect("an until");
-        aterm_types::rfc3339::parse_utc(stamp).expect("a stamp")
-    };
-    let near = |got: i64, want: i64| (want..want + 30).contains(&got);
-    let error_wait = records
-        .iter()
-        .find(|r| r.line.starts_with("WAITING ") && r.line.contains("usage-session resets"))
-        .unwrap_or_else(|| panic!("the error waited on: {:#?}", all()));
-    assert!(
-        near(until(&error_wait.line), TEST_NOW + 1800),
-        "the first rung: {:#?}",
-        all()
-    );
-    let waited_ms: u64 = m.requests[..turns[0]]
-        .iter()
-        .filter(|r| r.starts_with("await seq "))
-        .filter_map(|r| r.rsplit(' ').next().and_then(|ms| ms.parse::<u64>().ok()))
-        .sum();
-    assert!(
-        waited_ms >= 1_700_000,
-        "typed at the rung, not into the quota: {waited_ms} ms {:#?}",
-        all()
-    );
-    let again = records
-        .iter()
-        .find(|r| {
-            r.line.starts_with("WAITING ")
-                && r.line.contains("rule=limit-retry@v1")
-                && r.line.contains("try 1)")
-        })
-        .unwrap_or_else(|| panic!("the dialog's return waited on: {:#?}", all()));
-    assert!(
-        again
-            .line
-            .contains("(drawn again after its typed resume, try 1)"),
-        "{}",
-        again.line
-    );
-    assert!(
-        near(until(&again.line), until(&error_wait.line) + 2 * 3600),
-        "the second rung, from the resume: {:#?}",
-        all()
-    );
-    assert!(
-        records
-            .iter()
-            .any(|r| r.line.starts_with("CLEARED ") && r.line.contains(" box ")),
-        "{:#?}",
-        all()
-    );
-
-    for (tag, screens, gates) in [
-        (
-            "the error alone",
-            vec![screen(g::BUSY_THINKING), screen(g::LIMIT_STOPPED)],
-            vec![(1, 0)],
-        ),
-        (
-            "after a point that was neither",
-            vec![
-                screen(g::BUSY_THINKING),
-                dialog.clone(),
-                gemini_ended("Answered."),
-                screen(g::LIMIT_STOPPED),
-            ],
-            vec![(1, 0), (3, 1)],
-        ),
-    ] {
-        let mut m = gemini_mock(screens);
-        m.attention_gates = gates;
-        m.vanish_after = Some(6);
-        let opts = SuperviseOpts {
-            policy: owners_policy(),
-            ..auto(30)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_turn_end_timing(TurnEndTiming {
-                min_work: Duration::ZERO,
-                ..TurnEndTiming::default()
-            });
-        });
-        assert!(
-            m.presses().is_empty(),
-            "{tag}: {lines:#?}\n{:#?}",
-            m.requests
-        );
-        assert!(
-            !m.requests
-                .iter()
-                .any(|r| r.starts_with("turn ") && r.contains("usage-resume")),
-            "{tag}: {:#?}",
-            m.requests
-        );
-        assert!(
-            m.requests
-                .iter()
-                .any(|r| r.starts_with("meta set attention owner=supervisor")
-                    && r.contains("An unknown error occurred.")),
-            "{tag}: the error handed over: {lines:#?}\n{:#?}",
-            m.requests
-        );
-    }
-    let mut m = gemini_mock(vec![screen(g::BUSY_THINKING), screen(g::BOX_SHELL)]);
-    m.key_releases = Some(1);
-    m.vanish_after = Some(2);
-    let _ = watch_lines(&mut m, &opts);
-    assert!(
-        m.presses().iter().any(|r| r.ends_with(" 1")),
-        "the control: {:#?}",
-        m.requests
-    );
-}
-
-fn gemini_reset_redrawn(rows: &[String], reset: &str) -> Vec<String> {
-    rows.iter()
-        .map(|r| {
-            if !r.starts_with("│ Access resets at") {
-                return r.clone();
-            }
-            let width = r.chars().count() - 1;
-            let with = r.replacen("5:06 AM", reset, 1);
-            let body = with.trim_end_matches('│').trim_end();
-            format!("{body:<width$}│")
-        })
-        .collect()
-}
-
-#[test]
-fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    for (tag, fixture, digit) in [
-        ("bucket", g::LIMIT_DIALOG_BUCKET, " 2"),
-        (
-            "bucket under the Google login",
-            g::LIMIT_DIALOG_BUCKET_UPGRADE,
-            " 3",
-        ),
-        (
-            "NEGATIVE CONTROL: the account's",
-            g::LIMIT_DIALOG_ACCOUNT,
-            " 1",
-        ),
-    ] {
-        let bucket = digit != " 1";
-        let dialog = gemini_reset_redrawn(&screen(fixture), "9:05 AM");
-        assert_eq!(
-            aterm_phase::gemini::limit_reset(&dialog)
-                .map(|r| r.to_string())
-                .as_deref(),
-            Some("9:05 AM PDT"),
-            "PRECONDITION {tag}"
-        );
-        let (dir, journal) = journal_file("te-gemini-bucket");
-        let after = if bucket {
-            screen(g::LIMIT_STOPPED)
-        } else {
-            screen(g::BUSY_THINKING)
-        };
-        let mut m = gemini_mock(vec![
-            screen(g::BUSY_THINKING),
-            dialog,
-            after,
-            screen(g::BUSY_THINKING),
-            gemini_ended("Carried on."),
-        ]);
-        m.key_gates = vec![(1, 0)];
-        if bucket {
-            m.turn_gates = vec![2];
-        }
-        m.stall_sleep = Some(Duration::from_secs(3600));
-        m.exit_when = Some(|m| m.requests.iter().any(|r| verb_of(r) == "turn"));
-        let opts = SuperviseOpts {
-            policy: owners_policy(),
-            journal: Some(journal.clone()),
-            ..auto(2 * 3600)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_turn_end_timing(TurnEndTiming {
-                min_work: Duration::ZERO,
-                ..TurnEndTiming::default()
-            });
-            s.set_clock_running();
-        });
-        let (records, _) = journal_records(&journal);
-        let _ = std::fs::remove_dir_all(&dir);
-        let all = || records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>();
-        let presses = m.presses();
-        assert_eq!(presses.len(), 1, "{tag}: {lines:#?}\n{:#?}", m.requests);
-        assert!(presses[0].ends_with(digit), "{tag}: {presses:?}");
-        assert!(
-            !m.requests
-                .iter()
-                .any(|r| r.starts_with("meta set attention owner=supervisor")),
-            "{tag}: never handed over: {:#?}",
-            m.requests
-        );
-        let due_s = TEST_NOW + 10 * 60 + 60 + 60;
-        let wait = records
-            .iter()
-            .map(|r| r.line.as_str())
-            .find(|l| l.starts_with("WAITING ") && l.contains("rule=limit-retry@v1"))
-            .unwrap_or_else(|| panic!("{tag}: the dialog waited on: {:#?}", all()));
-        assert!(
-            wait.contains(&format!(
-                "until={}",
-                utc_stamp(u64::try_from(due_s).expect("a time"))
-            )),
-            "{tag}: {wait}"
-        );
-        let said = if bucket {
-            "resets at 9:05 AM PDT: Stop is pressed and the turn resumed past it"
-        } else {
-            "resets at 9:05 AM PDT: Keep trying is pressed past it"
-        };
-        assert!(wait.contains(said), "{tag}: {wait}");
-        let key = m
-            .requests
-            .iter()
-            .position(|r| verb_of(r) == "key")
-            .expect("the press");
-        let waited: u64 = m.requests[..key]
-            .iter()
-            .filter(|r| r.starts_with("await gone ^│") && r.contains("Access"))
-            .filter_map(|r| r.rsplit(' ').next().and_then(|ms| ms.parse::<u64>().ok()))
-            .sum();
-        assert!(waited >= 710_000, "{tag}: the reset waited out: {waited}");
-        let subject = if bucket {
-            "Stop (reset 9:05 AM PDT)"
-        } else {
-            "Keep trying (reset 9:05 AM PDT)"
-        };
-        assert!(
-            records
-                .iter()
-                .any(|r| r.line.starts_with("APPROVED ") && r.line.ends_with(subject)),
-            "{tag}: {:#?}",
-            all()
-        );
-        let typed: Vec<&str> = records
-            .iter()
-            .map(|r| r.line.as_str())
-            .filter(|l| l.starts_with("CONTINUED "))
-            .collect();
-        if bucket {
-            // The resume, then at most the continuation the work it led to earns.
-            assert!(
-                typed[0].contains("rule=usage-resume@v1")
-                    && typed.len() <= 2
-                    && typed[1..].iter().all(|l| l.contains("rule=continue@v1")),
-                "{tag}: {typed:?}"
-            );
-            let turn = m
-                .requests
-                .iter()
-                .position(|r| verb_of(r) == "turn")
-                .expect("the resume");
-            assert!(turn > key, "{tag}: {:#?}", m.requests);
-        } else {
-            assert!(
-                !typed.iter().any(|l| l.contains("rule=usage-resume@v1")),
-                "{tag}: {typed:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(60)
-    };
-    let off = SuperviseOpts {
-        policy: SupervisorConfig {
-            limit_wait: false,
-            ..owners_policy()
-        },
-        ..auto(60)
-    };
-    let stopped = screen(g::LIMIT_STOPPED);
-    let reading = aterm_phase::Program::Gemini.reader().read(&stopped, None);
-    assert!(
-        reading
-            .wall
-            .as_ref()
-            .is_some_and(aterm_phase::gemini::stopped_error),
-        "PRECONDITION: {reading:?}"
-    );
-    let grace = i64::try_from(
-        TurnEndTiming::default()
-            .grace_for(aterm_phase::Program::Gemini)
-            .as_secs(),
-    )
-    .expect("a grace");
-    let gemini = aterm_phase::Program::Gemini;
-    let adopted_as = |reads: &[(Vec<String>, i64)], pressed: bool, opts: &SuperviseOpts| {
-        let mut m = gemini_mock(vec![stopped.clone()]);
-        let mut s = session(&mut m, None);
-        s.program = Some("node".to_owned());
-        let mut last = 0;
-        for (rows, at) in reads {
-            s.set_clock(TEST_NOW + at, PDT);
-            let busy = gemini.reader().phase(rows) == aterm_phase::Phase::Busy;
-            s.note_limit_dialog(gemini, rows, busy);
-            last = *at;
-        }
-        if pressed {
-            s.limit_retry_pressed();
-        }
-        s.set_clock(TEST_NOW + last + 2, PDT);
-        s.limit_stopped_adopt(&reading, opts);
-        s.limit_stopped(&reading, &stopped)
-            .map(|l| (l.wall.kind, l.wall.reset, l.reset_unix))
-    };
-    let adopted = |reads: &[Vec<String>], opts: &SuperviseOpts| {
-        let timed: Vec<(Vec<String>, i64)> = (0..)
-            .zip(reads)
-            .map(|(i, rows)| (rows.clone(), 20 * i))
-            .collect();
-        adopted_as(&timed, false, opts)
-    };
-    let day = screen(g::LIMIT_DIALOG);
-    assert_eq!(
-        adopted(std::slice::from_ref(&day), &opts),
-        Some((
-            aterm_phase::WallKind::UsageSession,
-            None,
-            TEST_NOW + 1800 - grace
-        )),
-        "the per-day dialog: its ladder's first rung from its first read"
-    );
-    assert_eq!(
-        adopted(&[day.clone(), day.clone()], &opts),
-        Some((
-            aterm_phase::WallKind::UsageSession,
-            None,
-            TEST_NOW + 1800 - grace
-        ))
-    );
-    assert_eq!(
-        adopted(&[gemini_reset_dialog("9:05 AM PDT")], &opts),
-        Some((
-            aterm_phase::WallKind::UsageSession,
-            Some("9:05 AM PDT".to_owned()),
-            TEST_NOW + 10 * 60 + 60
-        )),
-        "the account's dialog: its reset placed"
-    );
-    assert!(
-        adopted_as(
-            &[(day.clone(), 0), (screen(g::BUSY_THINKING), 3)],
-            false,
-            &opts
-        )
-        .is_some(),
-        "a frame between"
-    );
-    assert_eq!(adopted(&[], &opts), None, "no dialog read");
-    assert_eq!(
-        adopted_as(
-            &[
-                (day.clone(), 0),
-                (screen(g::BUSY_THINKING), 60),
-                (screen(g::BUSY_THINKING), 3600)
-            ],
-            false,
-            &opts
-        ),
-        None,
-        "the worker working past the dialog"
-    );
-    assert_eq!(
-        adopted_as(&[(day.clone(), 0)], true, &opts),
-        None,
-        "the loop's own press"
-    );
-    assert_eq!(
-        adopted(&[day.clone(), screen(g::BOX_SHELL)], &opts),
-        None,
-        "another box read after it"
-    );
-    assert_eq!(
-        adopted(std::slice::from_ref(&day), &off),
-        None,
-        "limit_wait off"
-    );
-    let head_end = day
-        .iter()
-        .position(|r| r.contains("/model to switch models."))
-        .expect("PRECONDITION: the dialog's head");
-    let headless: Vec<String> = day[head_end + 1..].to_vec();
-    let read = aterm_phase::gemini::prompt(&headless).expect("PRECONDITION: a box read");
-    assert!(read.head_off_screen, "PRECONDITION: {read:?}");
-    assert_ne!(
-        read.kind,
-        aterm_phase::PromptKind::UsageLimit,
-        "PRECONDITION"
-    );
-    assert_eq!(
-        adopted(std::slice::from_ref(&headless), &opts),
-        None,
-        "its head off the rows"
-    );
-    assert_eq!(
-        adopted(&[day.clone(), headless], &opts),
-        None,
-        "its head off the rows after its read"
-    );
-}
-
-#[test]
-fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let at_reset = |reset: &str| -> Vec<String> {
-        screen(g::LIMIT_DIALOG_ACCOUNT)
-            .into_iter()
-            .map(|r| {
-                if !r.starts_with("│ Access resets at") {
-                    return r;
-                }
-                let width = r.chars().count() - 1;
-                let with = r.replacen("5:06 AM", reset, 1);
-                let body = with.trim_end_matches('│').trim_end();
-                format!("{body:<width$}│")
-            })
-            .collect()
-    };
-    let dialog = at_reset("9:05 AM");
-    assert_eq!(
-        aterm_phase::gemini::limit_reset(&dialog)
-            .map(|r| r.to_string())
-            .as_deref(),
-        Some("9:05 AM PDT"),
-        "PRECONDITION"
-    );
-    let (dir, journal) = journal_file("te-gemini-keep-trying");
-    const RETRIES: usize = 7;
-    let mut screens = vec![screen(g::BUSY_THINKING)];
-    for _ in 0..RETRIES {
-        screens.extend([dialog.clone(), screen(g::BUSY_THINKING)]);
-    }
-    let changed = at_reset("10:35 AM");
-    assert_eq!(
-        aterm_phase::gemini::limit_reset(&changed)
-            .map(|r| r.to_string())
-            .as_deref(),
-        Some("10:35 AM PDT")
-    );
-    screens.extend([changed, screen(g::BUSY_THINKING)]);
-    let mut m = gemini_mock(screens);
-    m.key_gates = (0..=RETRIES).map(|i| (2 * i + 1, i)).collect();
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(|m| m.presses().len() > RETRIES);
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        journal: Some(journal.clone()),
-        ..auto(4 * 3600)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock_running();
-    });
-    let presses = m.presses();
-    assert_eq!(presses.len(), RETRIES + 1, "{lines:#?}\n{:#?}", m.requests);
-    assert!(
-        presses.iter().all(|p| p.ends_with(" 1")),
-        "{presses:?}\n{lines:#?}"
-    );
-    assert!(
-        !m.requests
-            .iter()
-            .any(|r| r.starts_with("meta set attention owner=supervisor")),
-        "never handed over: {:#?}",
-        m.requests
-    );
-    let (records, _) = journal_records(&journal);
-    let due_s = TEST_NOW + 10 * 60 + 60 + 60;
-    let waiting: Vec<&String> = records
-        .iter()
-        .map(|r| &r.line)
-        .filter(|l| l.starts_with("WAITING ") && l.contains("rule=limit-retry@v1"))
-        .collect();
-    let until = |s: i64| format!("until={}", utc_stamp(u64::try_from(s).expect("a time")));
-    assert_eq!(
-        waiting.len(),
-        RETRIES + 1,
-        "said once for each due: {waiting:#?}"
-    );
-    assert!(
-        waiting[0].contains(&until(due_s))
-            && waiting[0].contains("resets at 9:05 AM PDT")
-            && !waiting[0].contains("drawn again"),
-        "{waiting:#?}"
-    );
-    let pauses = [120, 240, 480, 960, 1800, 1800, 1800];
-    let mut next_due = due_s;
-    for (n, (wait, pause)) in waiting.iter().skip(1).zip(pauses).enumerate() {
-        next_due += pause;
-        assert!(wait.contains(&until(next_due)), "{waiting:#?}");
-        assert!(
-            wait.contains(&format!(
-                "(drawn again after its Keep trying, try {})",
-                n + 1
-            )),
-            "each return says which try it answered: {waiting:#?}"
-        );
-    }
-    assert!(
-        waiting[RETRIES].contains("resets at 10:35 AM PDT"),
-        "{waiting:#?}"
-    );
-    let mut waited = [0_u64; RETRIES + 1];
-    let mut keys = 0;
-    for r in &m.requests {
-        if verb_of(r) == "key" {
-            keys += 1;
-        } else if keys <= RETRIES && r.starts_with("await gone ^│") && r.contains("Access") {
-            waited[keys] += r
-                .rsplit(' ')
-                .next()
-                .and_then(|ms| ms.parse::<u64>().ok())
-                .expect("a timeout");
-        }
-    }
-    assert!(waited[0] >= 710_000, "the reset waited out: {waited:?}");
-    assert!(
-        (110_000..710_000).contains(&waited[1]),
-        "the back-off, not the reset again: {waited:?}"
-    );
-    assert!(
-        waited[RETRIES] >= 1_700_000,
-        "the changed reset's press waits the climb: {waited:?}"
-    );
-    assert!(
-        records
-            .iter()
-            .filter(|r| r.line.starts_with("APPROVED ") && r.line.contains("Keep trying"))
-            .count()
-            == RETRIES + 1,
-        "{records:#?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    let opts = SuperviseOpts {
-        journal: None,
-        ..opts
-    };
-
-    use super::super::approval_loop::{LIMIT_RETRY_RELOOK_S, RetryDue};
-    let mut m = gemini_mock(vec![dialog.clone()]);
-    let mut s = session(&mut m, None);
-    s.program = Some("node".to_owned());
-    s.set_clock(TEST_NOW, PDT);
-    s.set_mono_standing();
-    assert_eq!(
-        s.limit_retry_due(&dialog, &opts),
-        RetryDue::Hold {
-            until_unix: due_s,
-            reset: Some("9:05 AM PDT".to_owned()),
-        }
-    );
-    let mono = s.fx.mono();
-    s.clock_jump_handle().slept(2 * 3600);
-    assert_eq!(s.fx.mono(), mono, "the sleep does not advance Instant");
-    assert_eq!(s.limit_retry_due(&dialog, &opts), RetryDue::Due);
-    let later = at_reset("11:05 AM");
-    assert_eq!(
-        s.limit_retry_due(&later, &opts),
-        RetryDue::Hold {
-            until_unix: due_s + 2 * 3600,
-            reset: Some("11:05 AM PDT".to_owned()),
-        }
-    );
-    let nine_oh_five = due_s - 2 * 60;
-    let tomorrow = |s: &mut Session<'_, Mock>| {
-        let now = s.now_unix();
-        let held = s.limit_retry_due(&dialog, &opts);
-        held == RetryDue::Hold {
-            until_unix: now + LIMIT_RETRY_RELOOK_S,
-            reset: Some("9:05 AM PDT".to_owned()),
-        } && s.limit_retry.as_ref().and_then(|r| r.placed_unix()) == Some(nine_oh_five + 86_400)
-    };
-    assert!(tomorrow(&mut s), "{:?}", s.limit_retry);
-    drop(s);
-    for program_changed in [true, false] {
-        let mut m = gemini_mock(vec![dialog.clone()]);
-        let mut s = session(&mut m, None);
-        s.program = Some("node".to_owned());
-        s.set_clock(TEST_NOW, PDT);
-        assert!(
-            matches!(s.limit_retry_due(&dialog, &opts), RetryDue::Hold { until_unix, .. } if until_unix == due_s)
-        );
-        if program_changed {
-            s.program = Some("claude".to_owned());
-            assert_eq!(s.limit_retry_due(&dialog, &opts), RetryDue::Not);
-            s.program = Some("node".to_owned());
-        } else {
-            let point = point_at(&s, screen(g::END_OF_TURN), 103);
-            s.turn_end_at_point(&point, None, &opts)
-                .expect("the answered point");
-        }
-        s.clock_jump_handle().slept(2 * 3600);
-        assert!(tomorrow(&mut s), "{:?}", s.limit_retry);
-    }
-}
-
-#[test]
-fn gemini_clis_usage_limit_answered_stop_is_waited_out_and_resumed() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let dialog = gemini_reset_dialog("9:05 AM PDT");
-    assert_eq!(
-        aterm_phase::gemini::limit_reset(&dialog)
-            .map(|r| r.to_string())
-            .as_deref(),
-        Some("9:05 AM PDT"),
-        "PRECONDITION"
-    );
-    let (dir, journal) = journal_file("te-gemini-stopped");
-    let mut m = gemini_mock(vec![
-        screen(g::BUSY_THINKING),
-        dialog.clone(),
-        screen(g::LIMIT_STOPPED),
-        screen(g::BUSY_THINKING),
-        dialog.clone(),
-        screen(g::BUSY_THINKING),
-        gemini_ended("Carried on."),
-    ]);
-    m.turn_gates = vec![2];
-    m.key_gates = vec![(4, 0)];
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(|m| !m.presses().is_empty());
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        journal: Some(journal.clone()),
-        ..auto(2 * 3600)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock_running();
-    });
-    let (records, _) = journal_records(&journal);
-    let _ = std::fs::remove_dir_all(&dir);
-    let all = || records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>();
-    assert!(
-        !m.requests
-            .iter()
-            .any(|r| r.starts_with("meta set attention owner=supervisor")),
-        "never handed over: {:#?}\n{lines:#?}",
-        all()
-    );
-    let typed: Vec<_> = records
-        .iter()
-        .filter(|r| r.line.starts_with("CONTINUED "))
-        .collect();
-    assert_eq!(typed.len(), 1, "{:#?}", all());
-    assert!(
-        typed[0].line.contains("rule=usage-resume@v1"),
-        "{:#?}",
-        all()
-    );
-    let due_s = TEST_NOW + 10 * 60 + 60 + 60;
-    let mut waited = [0_u64; 2];
-    let mut leg = 0;
-    for r in &m.requests {
-        let on_its_screen = match leg {
-            0 => r.starts_with("await seq "),
-            _ => r.starts_with("await gone ^│") && r.contains("Access"),
-        };
-        match verb_of(r) {
-            "turn" => leg = 1,
-            "key" => break,
-            _ if on_its_screen => {
-                waited[leg] += r
-                    .rsplit(' ')
-                    .next()
-                    .and_then(|ms| ms.parse::<u64>().ok())
-                    .expect("a timeout");
-            }
-            _ => {}
-        }
-    }
-    assert!(
-        waited[0] >= 710_000,
-        "typed past the reset, not into the quota: {waited:?}\n{:#?}",
-        all()
-    );
-    let until = |s: i64| format!("until={}", utc_stamp(u64::try_from(s).expect("a time")));
-    assert!(
-        records.iter().any(|r| r.line.starts_with("WAITING ")
-            && r.line.contains(&until(due_s))
-            && r.line.contains("usage-session resets")),
-        "the error waited on to the dialog's reset: {:#?}",
-        all()
-    );
-    let presses = m.presses();
-    assert_eq!(presses.len(), 1, "{presses:?}\n{:#?}", all());
-    assert!(presses[0].ends_with(" 1"), "{presses:?}");
-    assert!(
-        records.iter().any(|r| r.line.starts_with("WAITING ")
-            && r.line.contains("rule=limit-retry@v1")
-            && r.line.contains("try 1)")
-            && r.line.contains(&until(due_s + 120))),
-        "{:#?}",
-        all()
-    );
-    assert!(
-        (110_000..710_000).contains(&waited[1]),
-        "the back-off from the resume: {waited:?}"
-    );
-    let pressed: Vec<_> = records
-        .iter()
-        .filter(|r| r.line.starts_with("APPROVED ") && r.line.contains("Keep trying"))
-        .collect();
-    assert_eq!(pressed.len(), 1, "{:#?}", all());
-
-    let mut m = gemini_mock(vec![screen(g::BUSY_THINKING), screen(g::LIMIT_STOPPED)]);
-    m.attention_gates = vec![(1, 0)];
-    m.vanish_after = Some(3);
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(30)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-    });
-    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
-    assert!(
-        m.requests
-            .iter()
-            .any(|r| r.starts_with("meta set attention owner=supervisor")),
-        "the control: {lines:#?}\n{:#?}",
-        m.requests
-    );
-}
-
-fn gemini_reset_dialog(reset: &str) -> Vec<String> {
-    aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT)
-        .into_iter()
-        .map(|r| {
-            if !r.starts_with("│ Access resets at") {
-                return r;
-            }
-            let width = r.chars().count() - 1;
-            let with = r.replacen("5:06 AM PDT", reset, 1);
-            let body = with.trim_end_matches('│').trim_end();
-            format!("{body:<width$}│")
-        })
-        .collect()
-}
-
-#[test]
-fn gemini_clis_usage_limit_reset_is_placed_in_the_zone_it_names() {
-    use super::super::approval_loop::{LIMIT_RETRY_RELOOK_S, RetryDue};
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(60)
-    };
-    let mut m = gemini_mock(vec![gemini_reset_dialog("9:05 AM PDT")]);
-    let mut s = session(&mut m, None);
-    s.program = Some("node".to_owned());
-    s.set_clock(TEST_NOW, PDT);
-    let due_s = TEST_NOW + 10 * 60 + 60 + 60;
-    for reset in [
-        "9:05 AM PDT",
-        "6:05 PM GMT+2",
-        "12:05 PM EDT",
-        "4:05 PM UTC",
-        "4:05 PM GMT",
-        "6:05 AM HST",
-        "9:35 PM GMT+5:30",
-        "1:35 PM GMT-2:30",
-        "5:50 AM GMT+13:45",
-    ] {
-        let dialog = gemini_reset_dialog(reset);
-        assert_eq!(
-            aterm_phase::gemini::limit_reset(&dialog)
-                .map(|r| r.to_string())
-                .as_deref(),
-            Some(reset),
-            "PRECONDITION"
-        );
-        assert_eq!(
-            s.limit_retry_due(&dialog, &opts),
-            RetryDue::Hold {
-                until_unix: due_s,
-                reset: Some(reset.to_owned()),
-            },
-            "{reset}"
-        );
-    }
-    let bare = gemini_reset_dialog("9:05 AM");
-    assert_eq!(
-        s.limit_retry_due(&bare, &opts),
-        RetryDue::Hold {
-            until_unix: due_s,
-            reset: Some("9:05 AM".to_owned()),
-        }
-    );
-    let foreign = gemini_reset_dialog("11:05 PM CEST");
-    let relook = TEST_NOW + LIMIT_RETRY_RELOOK_S;
-    assert_eq!(
-        s.limit_retry_due(&foreign, &opts),
-        RetryDue::Hold {
-            until_unix: relook,
-            reset: Some("11:05 PM CEST".to_owned()),
-        }
-    );
-    s.set_clock(relook, PDT);
-    assert_eq!(s.limit_retry_due(&foreign, &opts), RetryDue::Due);
-    s.limit_retry_pressed();
-    s.set_clock(relook + 5, PDT);
-    assert_eq!(
-        s.limit_retry_due(&foreign, &opts),
-        RetryDue::Hold {
-            until_unix: relook + LIMIT_RETRY_RELOOK_S,
-            reset: Some("11:05 PM CEST".to_owned()),
-        },
-        "drawn again on that look, it is looked at again a bound on, never the back-off's burst"
-    );
-}
-
-fn presses_till(reset: &str, real: i64) -> Vec<i64> {
-    use super::super::approval_loop::RetryDue;
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(60)
-    };
-    let dialog = gemini_reset_dialog(reset);
-    let mut m = gemini_mock(vec![dialog.clone()]);
-    let mut s = session(&mut m, None);
-    s.program = Some("node".to_owned());
-    s.set_clock(TEST_NOW, PDT);
-    let mut now = TEST_NOW;
-    let mut presses = Vec::new();
-    for _ in 0..400 {
-        match s.limit_retry_due(&dialog, &opts) {
-            RetryDue::Hold { until_unix, .. } => {
-                assert!(until_unix > now, "{reset}: a hold ahead");
-                now = until_unix;
-            }
-            RetryDue::Due => {
-                presses.push(now);
-                if now >= real {
-                    break;
-                }
-                s.limit_retry_pressed();
-                now += 5;
-            }
-            RetryDue::Not => panic!("{reset}: the dialog is the rule's"),
-        }
-        s.set_clock(now, PDT);
-    }
-    presses
-}
-
-#[test]
-fn a_reset_whose_zone_is_unread_is_looked_at_a_bound_apart_and_tried_at_its_reset() {
-    use super::super::approval_loop::LIMIT_RETRY_RELOOK_S;
-    let grace = 60;
-    let right = TEST_NOW + 14 * 3600 + 10 * 60;
-    let presses = presses_till("11:05 PM", right + 60 + grace);
-    let (last, looks) = presses.split_last().expect("presses");
-    assert_eq!(*last, right + 60 + grace, "tried at its reset: {presses:?}");
-    assert!(
-        !looks.is_empty()
-            && looks[0] == TEST_NOW + LIMIT_RETRY_RELOOK_S
-            && looks
-                .windows(2)
-                .all(|w| w[1] - w[0] == LIMIT_RETRY_RELOOK_S)
-            && last - looks[looks.len() - 1] <= LIMIT_RETRY_RELOOK_S,
-        "looked at a bound apart: {presses:?}"
-    );
-    let real = TEST_NOW + 8 * 3600 + 10 * 60 + 60;
-    let presses = presses_till("8:05 PM", real);
-    let first_past = presses
-        .iter()
-        .find(|&&p| p >= real)
-        .expect("a press past the real reset");
-    assert!(
-        first_past - real <= LIMIT_RETRY_RELOOK_S,
-        "tried within a bound of the real reset: {presses:?}"
-    );
-}
-
-#[test]
-fn a_reset_first_read_long_past_is_tried_within_the_bound() {
-    use super::super::approval_loop::{LIMIT_RETRY_RELOOK_S, RetryDue};
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(60)
-    };
-    let dialog = gemini_reset_dialog("1:30 AM PDT");
-    let mut m = gemini_mock(vec![dialog.clone()]);
-    let mut s = session(&mut m, None);
-    s.program = Some("node".to_owned());
-    s.set_clock(TEST_NOW, PDT);
-    let look = TEST_NOW + LIMIT_RETRY_RELOOK_S;
-    assert_eq!(
-        s.limit_retry_due(&dialog, &opts),
-        RetryDue::Hold {
-            until_unix: look,
-            reset: Some("1:30 AM PDT".to_owned()),
-        }
-    );
-    let tomorrows = TEST_NOW - (7 * 3600 + 25 * 60) + 86_400 + 60 + 60;
-    s.set_clock(look, PDT);
-    assert_eq!(s.limit_retry_due(&dialog, &opts), RetryDue::Due);
-    s.limit_retry_pressed();
-    s.set_clock(look + 5, PDT);
-    assert_eq!(
-        s.limit_retry_due(&dialog, &opts),
-        RetryDue::Hold {
-            until_unix: tomorrows,
-            reset: Some("1:30 AM PDT".to_owned()),
-        },
-        "drawn again on the look: its reset waited for"
-    );
-}
-
-#[test]
-fn a_reset_the_loop_cannot_place_is_kept_trying_on_the_ladder() {
-    use super::super::approval_loop::RetryDue;
-    use crate::supervise::policy::approval::{LimitTry, limit_no_reset_reason};
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(60)
-    };
-    let dialog = gemini_reset_dialog("soon");
-    assert_eq!(
-        aterm_phase::gemini::limit_reset(&dialog).map(|r| r.clock),
-        Some("soon".to_owned()),
-        "PRECONDITION: a reset drawn"
-    );
-    let mut m = gemini_mock(vec![dialog.clone()]);
-    let mut s = session(&mut m, None);
-    s.program = Some("node".to_owned());
-    s.set_clock(TEST_NOW, PDT);
-    let rung = TEST_NOW + 1800;
-    assert_eq!(
-        s.limit_retry_due(&dialog, &opts),
-        RetryDue::Hold {
-            until_unix: rung,
-            reset: None,
-        }
-    );
-    s.set_clock(rung, PDT);
-    assert_eq!(s.limit_retry_due(&dialog, &opts), RetryDue::Due);
-    s.limit_retry_pressed();
-    s.set_clock(rung + 5, PDT);
-    assert_eq!(
-        s.limit_retry_due(&dialog, &opts),
-        RetryDue::Hold {
-            until_unix: rung + 2 * 3600,
-            reset: None,
-        },
-        "the ladder's second rung from the press"
-    );
-    let said = limit_no_reset_reason(Some("soon"), LimitTry::KeepTrying);
-    assert!(
-        said.contains("cannot place (soon)") && !said.contains("names no reset"),
-        "{said}"
-    );
-    assert!(said.chars().count() <= 120, "{said}");
-}
-
-#[test]
-fn a_try_that_got_through_ends_the_usage_limit_episode() {
-    use super::super::approval_loop::{LIMIT_RETRY_ANSWER_S, RetryDue};
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        ..auto(60)
-    };
-    let named = gemini_reset_dialog("9:05 AM PDT");
-    let none = screen(g::LIMIT_DIALOG);
-    for (busy_at, in_flight) in [(10, true), (3 * 3600, false)] {
-        assert_eq!(busy_at < LIMIT_RETRY_ANSWER_S, in_flight, "PRECONDITION");
-        let mut m = gemini_mock(vec![named.clone()]);
-        let mut s = session(&mut m, None);
-        s.program = Some("node".to_owned());
-        s.set_clock(TEST_NOW, PDT);
-        assert!(matches!(
-            s.limit_retry_due(&named, &opts),
-            RetryDue::Hold { .. }
-        ));
-        let pressed = TEST_NOW + 12 * 60;
-        s.set_clock(pressed, PDT);
-        assert_eq!(s.limit_retry_due(&named, &opts), RetryDue::Due);
-        s.limit_retry_pressed();
-        s.set_clock(pressed + busy_at, PDT);
-        assert!(!s.limit_retry_busy(), "no badge stands for a named reset");
-        let met = pressed + busy_at + 5;
-        s.set_clock(met, PDT);
-        let want = if in_flight {
-            pressed + 2 * 3600
-        } else {
-            met + 1800
-        };
-        assert_eq!(
-            s.limit_retry_due(&none, &opts),
-            RetryDue::Hold {
-                until_unix: want,
-                reset: None,
-            },
-            "busy {busy_at} s after the press"
-        );
-    }
-}
-
-#[test]
-fn gemini_clis_usage_limit_with_no_reset_is_kept_trying_while_a_person_is_told() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let dialog = screen(g::LIMIT_DIALOG);
-    assert_eq!(
-        aterm_phase::gemini::limit_reset(&dialog),
-        None,
-        "PRECONDITION"
-    );
-    const TRIES: usize = 4;
-    let (dir, journal) = journal_file("te-gemini-no-reset");
-    let (ledger_dir, ledger) = ledger_at("gemini-no-reset");
-    let mut screens = vec![screen(g::BUSY_THINKING)];
-    for _ in 0..TRIES {
-        screens.extend([
-            dialog.clone(),
-            screen(g::BUSY_THINKING),
-            screen(g::BUSY_STREAMING),
-        ]);
-    }
-    screens.push(gemini_ended("Back past the quota."));
-    let mut m = gemini_mock(screens);
-    m.key_gates = (0..TRIES).map(|i| (3 * i + 1, i)).collect();
-    m.stall_sleep = Some(Duration::from_secs(3600));
-    m.exit_when = Some(|m| {
-        let unset = m
-            .requests
-            .iter()
-            .rposition(|r| r.starts_with("meta unset attention owner=supervisor"));
-        let key = m.requests.iter().rposition(|r| verb_of(r) == "key");
-        m.presses().len() >= TRIES && unset > key
-    });
-    let opts = SuperviseOpts {
-        policy: owners_policy(),
-        journal: Some(journal.clone()),
-        ..auto(20 * 3600)
-    };
-    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-        s.set_turn_end_timing(TurnEndTiming {
-            min_work: Duration::ZERO,
-            ..TurnEndTiming::default()
-        });
-        s.set_clock_running();
-        s.set_approval_ledger(Some(ledger.clone()));
-    });
-    let presses = m.presses();
-    assert_eq!(presses.len(), TRIES, "{lines:#?}\n{:#?}", m.requests);
-    assert!(
-        presses.iter().all(|p| p.ends_with(" 1")),
-        "{presses:?}\n{lines:#?}"
-    );
-    let at = |needle: &str| -> Vec<usize> {
-        m.requests
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.starts_with(needle))
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let raised = at("meta set attention owner=supervisor");
-    let lowered = at("meta unset attention owner=supervisor");
-    let keys: Vec<usize> = m
-        .requests
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| verb_of(r) == "key")
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(raised.len(), 1, "raised once: {:#?}", m.requests);
-    assert!(
-        m.requests[raised[0]].contains("names no reset"),
-        "{}",
-        m.requests[raised[0]]
-    );
-    assert_eq!(lowered.len(), 1, "taken down once: {:#?}", m.requests);
-    assert!(raised[0] < keys[0], "{:#?}", m.requests);
-    assert!(lowered[0] > keys[TRIES - 1], "{:#?}", m.requests);
-    let (records, _) = journal_records(&journal);
-    assert!(
-        records
-            .iter()
-            .any(|r| r.line.starts_with("CLEARED ") && r.line.contains(" box ")),
-        "{records:#?}"
-    );
-    let waiting: Vec<&String> = records
-        .iter()
-        .map(|r| &r.line)
-        .filter(|l| l.starts_with("WAITING ") && l.contains("rule=limit-retry@v1"))
-        .collect();
-    assert_eq!(waiting.len(), TRIES, "said once for each due: {waiting:#?}");
-    let untils: Vec<i64> = waiting
-        .iter()
-        .map(|l| {
-            let stamp = l
-                .split_whitespace()
-                .find_map(|w| w.strip_prefix("until="))
-                .expect("an until");
-            aterm_types::rfc3339::parse_utc(stamp).expect("a stamp")
-        })
-        .collect();
-    let rungs = [1800, 2 * 3600, 6 * 3600, 6 * 3600];
-    let near = |got: i64, want: i64| (want..want + 30).contains(&got);
-    assert!(near(untils[0], TEST_NOW + rungs[0]), "{waiting:#?}");
-    for k in 1..TRIES {
-        assert!(
-            near(untils[k] - untils[k - 1], rungs[k]),
-            "rung {k}: {waiting:#?}"
-        );
-        assert!(
-            waiting[k].contains(&format!("(drawn again after its Keep trying, try {k})")),
-            "{waiting:#?}"
-        );
-    }
-    assert!(
-        waiting
-            .iter()
-            .all(|l| l.contains("names no reset") && l.contains("back-off ladder")),
-        "{waiting:#?}"
-    );
-    let ledgered = std::fs::read_to_string(&ledger).unwrap_or_default();
-    let rows = |decision: &str| {
-        ledgered
-            .lines()
-            .filter(|l| {
-                l.contains("\"rule_id\":\"limit-retry@v1\"")
-                    && l.contains(&format!("\"decision\":\"{decision}\""))
-            })
-            .count()
-    };
-    assert_eq!(rows("waiting"), TRIES, "{ledgered}");
-    assert_eq!(rows("approved"), TRIES, "{ledgered}");
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&ledger_dir);
 }
 
 /// A host whose measure of the API's reach is scripted ([`IdleHost::reach`]):
@@ -13013,6 +11362,17 @@ struct AccountHost {
     /// [`IdleHost::login_label`]: the session's renewable login, as a test
     /// sets it.
     login_label: std::sync::Mutex<Option<String>>,
+    /// The row the roster names once the loop types `/login` ([`IdleHost::login_carry`]): a
+    /// login the roster learned while the `/login` aterm typed into it opened.
+    label_at_login: std::sync::Mutex<Option<String>>,
+    /// The row the roster names once the loop tells an exception for now
+    /// ([`IdleHost::exception`]), with the accounts' news: a login the roster learned only after
+    /// its sign-in was told.
+    label_on_ask: std::sync::Mutex<Option<String>>,
+    /// The row the host's discovery names ([`IdleHost::login_discover`]), with the accounts'
+    /// news: a login whose address the upkeep's sync adopts; and how often it was asked.
+    label_on_discover: std::sync::Mutex<Option<String>>,
+    discovered: std::sync::atomic::AtomicUsize,
     /// [`IdleHost::transcript_tail`]: the agent's transcript, as a test sets
     /// it (`None`: none this host can read).
     tail: std::sync::Mutex<Option<String>>,
@@ -13087,6 +11447,19 @@ impl AccountHost {
 }
 
 impl IdleHost for AccountHost {
+    fn login_carry(&self) -> Result<(), String> {
+        if let Some(label) = self.label_at_login.lock().unwrap().take() {
+            *self.login_label.lock().unwrap() = Some(label);
+        }
+        Ok(())
+    }
+    fn login_discover(&self) {
+        self.discovered.fetch_add(1, Ordering::SeqCst);
+        if let Some(label) = self.label_on_discover.lock().unwrap().take() {
+            *self.login_label.lock().unwrap() = Some(label);
+            self.stamp.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     fn wants(&self) -> bool {
         self.carry.load(Ordering::SeqCst)
     }
@@ -13186,6 +11559,12 @@ impl IdleHost for AccountHost {
         );
         let at = self.said.lock().unwrap().len();
         self.told.lock().unwrap().push((word, at));
+        if standing.is_some_and(|e| e.when == crate::supervise::policy::exception::Urgency::Now)
+            && let Some(label) = self.label_on_ask.lock().unwrap().take()
+        {
+            *self.login_label.lock().unwrap() = Some(label);
+            self.stamp.fetch_add(1, Ordering::SeqCst);
+        }
     }
     fn standing_limit(&self) -> Option<crate::harness::upgrade::StandingLimit> {
         self.standing_asks.fetch_add(1, Ordering::SeqCst);
@@ -14069,6 +12448,69 @@ fn the_login_success_gets_one_fenced_enter() {
     }
 }
 
+/// THE TURN END'S ESC OUT OF THE DIALOG OF THE `/login` ATERM TYPED ([`TurnEndAction::Cancel`]):
+/// one key, fenced on the judged read, its person count and the dialog's own `Esc to cancel`
+/// row. CONTROLS: none where the read carries no person count, and none where it draws no dialog
+/// to cancel.
+#[test]
+fn the_dialogs_cancel_is_one_fenced_esc() {
+    let direct = |rows: Vec<String>, counted: bool| {
+        let mut m = fenced(vec![rows]);
+        let mut heard = Heard::default();
+        {
+            let mut s = session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            s.program = Some("claude".to_string());
+            let read = s.screen().expect("the captured screen");
+            let mut point = point_at(&s, read.rows.clone(), read.seq);
+            point.screen = read;
+            if !counted {
+                point.screen.human_seq = None;
+            }
+            s.turn_end_execute(
+                &point,
+                TurnEndAction::Cancel {
+                    rule_id: crate::supervise::policy::login::RULE_LOGIN_BACK_OUT,
+                },
+                &hosted(3),
+                &[],
+                &mut heard,
+            )
+            .expect("the captured action is handled");
+        }
+        let escs: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .cloned()
+            .collect();
+        (escs, heard)
+    };
+    let (pressed, heard) = direct(handoff(), true);
+    assert_eq!(pressed.len(), 1, "{pressed:?}");
+    assert!(
+        pressed[0].contains("if-human=7 ")
+            && pressed[0].contains(" if-gen=")
+            && pressed[0].contains(" if=^\\x20{2}Esc\\x20to\\x20cancel"),
+        "fenced on the read and the dialog's own row: {pressed:?}"
+    );
+    assert_eq!(
+        heard
+            .said
+            .iter()
+            .filter(|l| l.starts_with("TYPED ") && l.contains(" rule=login-back-out@v1 esc at "))
+            .count(),
+        1,
+        "{:?}",
+        heard.said
+    );
+    let (pressed, _) = direct(handoff(), false);
+    assert!(pressed.is_empty(), "no key without its fence: {pressed:?}");
+    let (pressed, _) = direct(login_expired(), true);
+    assert!(pressed.is_empty(), "no dialog to cancel: {pressed:?}");
+}
+
 #[test]
 fn the_picker_of_its_own_login_gets_the_method_the_login_is() {
     let mut login = rows(&[
@@ -14134,6 +12576,417 @@ fn the_picker_of_its_own_login_gets_the_method_the_login_is() {
     assert!(keys(&m).is_empty(), "the owner's pick: {log}");
     let (m, log) = run("te-picker-uncounted", subscription, false);
     assert!(keys(&m).is_empty(), "no key without its fence: {log}");
+}
+
+/// THE PICKER OF THE `/login` ATERM TYPED BEFORE THE ROSTER NAMED THE LOGIN'S ROW: the roster
+/// learns the row as the `/login` goes in, and aterm's sign-in ladder signs that row in by
+/// itself, so the picker gets one fenced Esc (its own `Esc to cancel`) and no method, and the tab
+/// waits on the row's sign-in once the dialog is gone. CONTROLS: the same picker with no row
+/// named gets the method's Enter (no Esc), and with no person count to fence on, no key at all.
+#[test]
+fn the_picker_of_its_own_login_over_a_roster_row_is_backed_out_of() {
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let picker = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER);
+    let left =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED);
+    let run = |tag: &str, label: Option<&str>, counted: bool| {
+        let (dir, path) = journal_file(tag);
+        let mut m = fenced(vec![
+            busy_screen(),
+            login.clone(),
+            login.clone(),
+            login.clone(),
+            picker.clone(),
+            left.clone(),
+        ]);
+        m.vanish_after = Some(3);
+        m.cursor_on_caret = true;
+        m.turn_releases = Some(3);
+        m.key_releases = Some(4);
+        if !counted {
+            m.human_seq = None;
+        }
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        *host.login_method.lock().unwrap() = Some(aterm_phase::LoginMethod::Subscription);
+        *host.label_at_login.lock().unwrap() = label.map(str::to_string);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(3)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let log = format!("{lines:#?}\n{journal:#?}\n{:#?}", m.requests);
+        let ended = host.said("account:login-ended").len();
+        (m, journal, log, ended)
+    };
+    let keys = |m: &Mock| -> Vec<String> {
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .cloned()
+            .collect()
+    };
+    let (m, journal, log, ended) = run("te-picker-roster", Some("m7-a"), true);
+    let pressed = keys(&m);
+    assert_eq!(pressed.len(), 1, "one key: {log}");
+    assert!(
+        pressed[0].starts_with("key if-human=7 ") && pressed[0].ends_with(" esc"),
+        "the picker's own Esc, fenced on the person: {log}"
+    );
+    assert!(
+        !journal
+            .iter()
+            .any(|l| l.starts_with("EXCEPTION ") && l.contains("kind=login when=now")),
+        "no one is asked to sign in: {log}"
+    );
+    assert!(ended >= 1, "the host is told the row's login ended: {log}");
+    let typed = m.requests.iter().filter(|r| r.contains("/login")).count();
+    let (m, _, log, _) = run("te-picker-unrostered", None, true);
+    let pressed = keys(&m);
+    assert_eq!(pressed.len(), 1, "{log}");
+    assert!(pressed[0].ends_with(" enter"), "the method's Enter: {log}");
+    assert_eq!(
+        m.requests.iter().filter(|r| r.contains("/login")).count(),
+        typed,
+        "`/login` typed alike, once: {log}"
+    );
+    let (m, _, log, _) = run("te-picker-roster-uncounted", Some("m7-a"), false);
+    assert!(keys(&m).is_empty(), "no key without its fence: {log}");
+}
+
+/// THE PICKER OF THE `/login` ATERM BACKED OUT OF, STILL DRAWN AFTER ITS ESC (an Esc Claude Code
+/// dropped): the approval loop holds the picker, asking no one, until that Esc's pause is over,
+/// and then presses the picker's own Esc again (the pauses' doubling is the policy's,
+/// `a_dialog_still_drawn_after_aterms_esc_gets_the_esc_again`); never a second Esc inside the
+/// pause, and nobody told to close it or sign in. CONTROL: a picker read gone after its first Esc
+/// gets no second.
+#[test]
+fn a_picker_still_drawn_after_aterms_esc_gets_the_esc_again_after_its_pause() {
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let picker = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER);
+    let left =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED);
+    let run = |tag: &str, drawn: usize| {
+        let (dir, path) = journal_file(tag);
+        let mut screens = vec![busy_screen(), login.clone(), login.clone(), login.clone()];
+        screens.extend(std::iter::repeat_n(picker.clone(), drawn));
+        screens.push(left.clone());
+        let mut m = fenced(screens);
+        m.exit_when = Some(|m: &Mock| m.served >= m.screens.len());
+        m.cursor_on_caret = true;
+        m.turn_releases = Some(3);
+        m.key_gates = (0..drawn).map(|k| (4 + k, k)).collect();
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        *host.login_method.lock().unwrap() = Some(aterm_phase::LoginMethod::Subscription);
+        *host.label_at_login.lock().unwrap() = Some("m7-a".to_string());
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(45)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let log = format!("{lines:#?}\n{journal:#?}\n{:#?}", m.requests);
+        let keys: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .cloned()
+            .collect();
+        let held = journal
+            .iter()
+            .chain(lines.iter())
+            .filter(|l| l.starts_with("WAITING ") && l.contains(" rule=login-back-out@v1 "))
+            .count();
+        (keys, held, journal, log)
+    };
+    let (keys, held, journal, log) = run("te-picker-esc-again", 2);
+    assert_eq!(keys.len(), 2, "one Esc per picker drawn: {log}");
+    assert!(
+        keys.iter()
+            .all(|k| k.starts_with("key if-human=7 ") && k.ends_with(" esc")),
+        "each the picker's own Esc, fenced on the person: {log}"
+    );
+    assert!(
+        held >= 1,
+        "the second Esc waited out the first one's pause: {log}"
+    );
+    assert!(
+        !journal
+            .iter()
+            .any(|l| l.starts_with("EXCEPTION ") && l.contains("kind=login when=now")),
+        "no one is asked to sign in or close the dialog: {log}"
+    );
+    assert!(
+        !journal.iter().any(|l| l.starts_with("ESCALATED ")),
+        "no badge asks anyone: {log}"
+    );
+    let (keys, held, _, log) = run("te-picker-esc-once", 1);
+    assert_eq!(
+        keys.len(),
+        1,
+        "a picker read gone gets no second Esc: {log}"
+    );
+    assert_eq!(held, 0, "no pause waited out: {log}");
+}
+
+/// THE HAND-OFF OF THE `/login` ATERM TYPED, THE ROSTER NAMING THE LOGIN'S ROW ONLY AFTER THAT
+/// HAND-OFF WAS DECIDED: no row was named at the picker (it got the method) or at the hand-off
+/// (its browser sign-in was told), then the accounts' news names the row while the hand-off sits
+/// unchanged on the screen. The news decides the hand-off again: one fenced Esc out of it, the
+/// sign-in withdrawn, and the host told the row's login ended once the dialog is gone. CONTROL:
+/// with no row named, the method's Enter alone, no Esc, and the sign-in told stands.
+#[test]
+fn a_row_named_under_its_own_handoff_backs_out_of_it() {
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let picker = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER);
+    let left =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED);
+    let run = |tag: &str, label: Option<&str>| {
+        let (dir, path) = journal_file(tag);
+        let mut m = fenced(vec![
+            busy_screen(),
+            login.clone(),
+            login.clone(),
+            login.clone(),
+            picker.clone(),
+            handoff(),
+            left.clone(),
+        ]);
+        m.vanish_after = Some(3);
+        m.cursor_on_caret = true;
+        m.turn_releases = Some(3);
+        m.key_gates = vec![(4, 0), (5, 1)];
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        *host.login_method.lock().unwrap() = Some(aterm_phase::LoginMethod::Subscription);
+        *host.label_on_ask.lock().unwrap() = label.map(str::to_string);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(3)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let log = format!(
+            "{lines:#?}\n{journal:#?}\n{:?}\n{:#?}",
+            host.told(),
+            m.requests
+        );
+        let keys: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .cloned()
+            .collect();
+        (keys, host, journal, log)
+    };
+    let cleared = |journal: &[String]| {
+        journal
+            .iter()
+            .position(|l| l.starts_with("CLEARED ") && l.contains(" exception=login "))
+    };
+    let (keys, host, journal, log) = run("te-handoff-named", Some("m7-a"));
+    assert_eq!(keys.len(), 2, "the method's Enter, then one Esc: {log}");
+    assert!(
+        keys[0].ends_with(" enter")
+            && keys[1].starts_with("key if-human=7 ")
+            && keys[1].ends_with(" esc"),
+        "the hand-off's own Esc, fenced on the person: {log}"
+    );
+    assert_eq!(
+        host.told().first().map(String::as_str),
+        Some("exception:login:now"),
+        "the sign-in told while no row was named: {log}"
+    );
+    let esc = journal
+        .iter()
+        .position(|l| l.starts_with("TYPED ") && l.contains(" rule=login-back-out@v1 "));
+    assert!(
+        cleared(&journal).is_some_and(|at| esc.is_some_and(|esc| at < esc)),
+        "the sign-in withdrawn at the news, before the Esc: {log}"
+    );
+    assert!(
+        !host.said("account:login-ended").is_empty(),
+        "the host is told the row's login ended: {log}"
+    );
+    let (keys, host, journal, log) = run("te-handoff-unnamed", None);
+    assert_eq!(keys.len(), 1, "the method's Enter alone: {log}");
+    assert!(keys[0].ends_with(" enter"), "{log}");
+    assert_eq!(
+        host.told().first().map(String::as_str),
+        Some("exception:login:now"),
+        "{log}"
+    );
+    assert!(
+        cleared(&journal).is_none_or(|at| journal[at].starts_with("CLEARED seq=0 ")),
+        "the sign-in told stands while the loop runs: {log}"
+    );
+}
+
+/// THE PICKER OF THE `/login` ATERM TYPED, LEFT TO A PERSON (no method read), THE ROSTER NAMING
+/// THE LOGIN'S ROW ONLY AFTER: the accounts' news decides the picker again, as the box of a
+/// roster row's login, and it gets one fenced Esc, no method; the host is told the row's login
+/// ended once it is gone. CONTROL: with no row named, no key at all.
+#[test]
+fn a_row_named_under_its_own_picker_backs_out_of_it() {
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let picker = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER);
+    let left =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED);
+    let run = |tag: &str, label: Option<&str>| {
+        let (dir, path) = journal_file(tag);
+        let mut m = fenced(vec![
+            busy_screen(),
+            login.clone(),
+            login.clone(),
+            login.clone(),
+            picker.clone(),
+            left.clone(),
+        ]);
+        m.vanish_after = Some(3);
+        m.cursor_on_caret = true;
+        m.turn_releases = Some(3);
+        m.key_releases = Some(4);
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        *host.label_on_ask.lock().unwrap() = label.map(str::to_string);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(3)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let log = format!(
+            "{lines:#?}\n{journal:#?}\n{:?}\n{:#?}",
+            host.told(),
+            m.requests
+        );
+        let keys: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .cloned()
+            .collect();
+        (keys, host, log)
+    };
+    let (keys, host, log) = run("te-picker-named-late", Some("m7-a"));
+    assert_eq!(keys.len(), 1, "one key: {log}");
+    assert!(
+        keys[0].starts_with("key if-human=7 ") && keys[0].ends_with(" esc"),
+        "the picker's own Esc, fenced on the person: {log}"
+    );
+    assert!(
+        !host.said("account:login-ended").is_empty(),
+        "the host is told the row's login ended: {log}"
+    );
+    let (keys, _, log) = run("te-picker-unnamed-late", None);
+    assert!(
+        keys.is_empty(),
+        "no key at a picker left to a person: {log}"
+    );
+}
+
+/// A LOST LOGIN NO ROSTER ROW NAMES YET, BEFORE ANY `/login`: the host's discovery is asked once
+/// ([`IdleHost::login_discover`]). Where it names the login's row (an address the upkeep's sync
+/// adopts), the tab takes the row's wait: no `/login` typed, nobody told, and the host told the
+/// row's login ended. CONTROL: where it names none (an address aterm cannot read), `/login` is
+/// typed once and its sign-in told, the discovery still asked once.
+#[test]
+fn a_lost_login_whose_row_is_discovered_types_no_login() {
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let run = |tag: &str, label: Option<&str>| {
+        let (dir, path) = journal_file(tag);
+        let mut m = fenced(vec![
+            busy_screen(),
+            login.clone(),
+            login.clone(),
+            login.clone(),
+            handoff(),
+        ]);
+        m.vanish_after = Some(3);
+        m.cursor_on_caret = true;
+        m.turn_releases = Some(3);
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        *host.label_on_discover.lock().unwrap() = label.map(str::to_string);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(3)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        let log = format!(
+            "{lines:#?}\n{journal:#?}\n{:?}\n{:#?}",
+            host.told(),
+            m.requests
+        );
+        let typed = m.requests.iter().filter(|r| r.contains("/login")).count();
+        (typed, host, journal, log)
+    };
+    let (typed, host, journal, log) = run("te-discovered", Some("m7-a"));
+    assert_eq!(typed, 0, "no /login over the discovered row: {log}");
+    assert_eq!(
+        host.discovered.load(Ordering::SeqCst),
+        1,
+        "asked once: {log}"
+    );
+    assert!(
+        !journal
+            .iter()
+            .any(|l| l.starts_with("EXCEPTION ") && l.contains("kind=login when=now")),
+        "no one is asked to sign in: {log}"
+    );
+    assert!(
+        !host.said("account:login-ended").is_empty(),
+        "the host is told the row's login ended: {log}"
+    );
+    let (typed, host, _, log) = run("te-undiscovered", None);
+    assert_eq!(typed, 1, "`/login` once where no row is found: {log}");
+    assert_eq!(
+        host.discovered.load(Ordering::SeqCst),
+        1,
+        "asked once: {log}"
+    );
+    assert!(
+        host.told().iter().any(|t| t == "exception:login:now"),
+        "its sign-in told: {log}"
+    );
 }
 
 /// A ROSTER ROW'S LOST LOGIN THAT NOTHING RELAUNCHES THE TAB ONTO (`relaunch` off), renewed or
@@ -22768,18 +21621,30 @@ fn a_landed_workers_task_is_marked_once_with_its_defense() {
     assert!(!untasked.exists(), "nothing written");
 }
 
+/// Muse Code's measured end of a turn with its one reply row saying `words`.
+fn muse_ended(words: &str) -> Vec<String> {
+    let mut rows =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::muse::fixtures::END_OF_TURN_1_4_10);
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("◆ "))
+        .expect("the reply");
+    rows[at] = format!("◆ {words}");
+    rows
+}
+
 #[test]
 fn a_screen_read_workers_landing_is_its_result() {
-    use aterm_phase::gemini::fixtures as g;
+    use aterm_phase::muse::fixtures as u;
     let root = crate::supervise::ScratchDir::new("task", "screen-result");
     let defense = "Nothing left: all of it is merged into the remote main branch.";
-    let busy = aterm_phase::prompt::fixtures::screen(g::BUSY_THINKING);
+    let busy = aterm_phase::prompt::fixtures::screen(u::BUSY_1_4_10);
     let host = TaskHost::reading(&root.join("none.jsonl"), &[]);
-    let mut m = gemini_mock(vec![
+    let mut m = muse_mock(vec![
         busy.clone(),
-        gemini_ended(WORK),
+        muse_ended(WORK),
         busy,
-        gemini_ended(defense),
+        muse_ended(defense),
     ]);
     landing(&mut m);
     m.gen_fence = true;
@@ -22818,7 +21683,7 @@ fn a_screen_read_workers_landing_is_its_result() {
     assert_eq!(
         crate::harness::result::answer(&path, false),
         format!(
-            "OK 3 source=screen program=gemini bytes={}\n{report}\n",
+            "OK 3 source=screen program=muse bytes={}\n{report}\n",
             report.len()
         )
     );
@@ -22980,15 +21845,7 @@ fn tall_landing(
 #[test]
 fn a_tall_land_report_on_every_harness_is_read_whole_before_it_lands() {
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{agy, gemini, muse};
-    let gemini_tall = |need: bool| {
-        let end = screen(gemini::fixtures::END_OF_TURN);
-        let at = end
-            .iter()
-            .rposition(|r| r.starts_with("✦ "))
-            .expect("the reply");
-        tall_on(&end, at, &tall_said(need), "✦ ")
-    };
+    use aterm_phase::{agy, muse};
     let muse_tall = |need: bool| {
         let end = screen(muse::fixtures::END_OF_TURN_1_4_10);
         let at = end
@@ -23034,14 +21891,7 @@ fn a_tall_land_report_on_every_harness_is_read_whole_before_it_lands() {
         &'static str,
         Tall,
     );
-    let harnesses: [Harness; 3] = [
-        (
-            "gemini",
-            gemini_mock,
-            gemini::fixtures::BUSY_THINKING,
-            gemini::fixtures::END_OF_TURN,
-            Box::new(gemini_tall),
-        ),
+    let harnesses: [Harness; 2] = [
         (
             "agy",
             agy_mock,
@@ -23181,7 +22031,7 @@ fn a_need_said_earlier_in_a_turn_above_the_screen_is_read_before_it_lands() {
 #[test]
 fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{agy, gemini, muse};
+    use aterm_phase::{agy, muse};
     let before = |need: bool, head: &str| -> Vec<String> {
         if need {
             vec![
@@ -23201,27 +22051,6 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
         } else {
             (drawn, Vec::new())
         }
-    };
-    let gemini_turn = move |need: bool, tall: bool| {
-        let end = screen(gemini::fixtures::END_OF_TURN);
-        let at = end
-            .iter()
-            .rposition(|r| r.starts_with("✦ "))
-            .expect("the reply");
-        let mut drawn = end[..at].to_vec();
-        drawn.extend(before(need, "✦ "));
-        drawn.push(String::new());
-        drawn.push("╭────────────────────────────────────────────╮".to_string());
-        for call in 0..calls(tall) {
-            drawn.push(format!(
-                "│ ✓  Shell git push origin branch-{call:02}             │"
-            ));
-        }
-        drawn.push("╰────────────────────────────────────────────╯".to_string());
-        drawn.push(String::new());
-        drawn.push(format!("✦ {defense}"));
-        drawn.extend(end[at + 1..].iter().cloned());
-        split(drawn, end.len(), tall)
     };
     let agy_turn = move |need: bool, tall: bool| {
         let end = screen(agy::fixtures::END_OF_TURN);
@@ -23275,14 +22104,7 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
         &'static str,
         Turn,
     );
-    let harnesses: [Harness; 3] = [
-        (
-            "gemini",
-            gemini_mock,
-            gemini::fixtures::BUSY_THINKING,
-            gemini::fixtures::END_OF_TURN,
-            Box::new(gemini_turn),
-        ),
+    let harnesses: [Harness; 2] = [
         (
             "agy",
             agy_mock,
@@ -23352,8 +22174,7 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
 }
 
 fn program_reader(program: &str, rows: &[String]) -> &'static dyn aterm_phase::ScreenReader {
-    let name = if program == "gemini" { "node" } else { program };
-    aterm_phase::identify(Some(name), rows)
+    aterm_phase::identify(Some(program), rows)
 }
 
 #[test]
@@ -26264,6 +25085,8 @@ struct LatchHost {
     /// The login comes back in this tab right after this one takes its
     /// sign-in: the owner signed in elsewhere.
     back_in: Option<&'static str>,
+    /// The method the session's login already is, for its own picker.
+    method: Option<aterm_phase::LoginMethod>,
     said: std::sync::Mutex<Vec<String>>,
 }
 
@@ -26275,6 +25098,7 @@ impl LatchHost {
             peer: None,
             blind: false,
             back_in: None,
+            method: None,
             said: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -26293,6 +25117,9 @@ impl IdleHost for LatchHost {
     }
     fn owns_turn_end(&self) -> bool {
         false
+    }
+    fn login_method(&self) -> Option<aterm_phase::LoginMethod> {
+        self.method
     }
     fn login_shared(&self) -> Option<LoginShared> {
         let shared = (!self.blind)
@@ -26522,6 +25349,12 @@ fn one_sign_in_per_login_however_many_tabs_share_it() {
     }
 }
 
+/// THE TAB THAT CARRIES THE SIGN-IN, ITS LOGIN BACK IN ANOTHER TAB WHILE THE DIALOG OF THE
+/// `/login` IT TYPED STANDS: nobody needs that sign-in, so aterm closes the dialog with its own Esc
+/// (fenced on the person count and the dialog's `Esc to cancel` row), tells no one, and once the
+/// dialog is gone delivers the turn again, once. CONTROLS: with no person count to fence the Esc
+/// on, no key (and still no one told); with the login not back, no Esc, the sign-in told, and
+/// once a person's Esc left the dialog nothing typed into it.
 #[test]
 fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
     let wall_row = |r: &String| r.trim_end() == "❯ /login";
@@ -26534,15 +25367,19 @@ fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
     lost.push(String::new());
     lost.extend(composer("  ? for shortcuts"));
     let left = login_left_from(&dialog);
-    let run = |back_in: Option<&'static str>| {
+    let run = |back_in: Option<&'static str>, counted: bool| {
         let latches = Arc::new(LoginLatches::default());
         let host = Arc::new(LatchHost {
             back_in,
             ..LatchHost::tab(&latches, "@1")
         });
-        let tag = if back_in.is_some() { "back" } else { "none" };
+        let tag = match (back_in.is_some(), counted) {
+            (true, true) => "back",
+            (true, false) => "back-uncounted",
+            (false, _) => "none",
+        };
         let (dir, path) = journal_file(&format!("te-carrier-{tag}"));
-        let mut m = Mock::new(vec![
+        let mut m = fenced(vec![
             busy_screen(),
             lost.clone(),
             dialog.clone(),
@@ -26553,6 +25390,12 @@ fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
         ]);
         m.turn_releases = Some(1);
         m.vanish_after = Some(2);
+        if back_in.is_some() && counted {
+            m.key_releases = Some(3);
+        }
+        if !counted {
+            m.human_seq = None;
+        }
         let mut opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             journal: Some(path.clone()),
@@ -26582,16 +25425,32 @@ fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
                 .count()
         };
         let counts = (typed(RULE_LOGIN), typed(RULE_LOGIN_BACK));
-        let log = format!("{lines:#?}\n{records:#?}\n{:#?}", host.said());
-        (notices, counts, host.said(), latches, log)
+        let keys: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .cloned()
+            .collect();
+        let log = format!(
+            "{lines:#?}\n{records:#?}\n{:#?}\n{:#?}",
+            host.said(),
+            m.requests
+        );
+        (notices, counts, keys, host.said(), latches, log)
     };
-    let (notices, (logins, backs), said, latches, log) = run(Some("@2"));
+    let (notices, (logins, backs), keys, said, latches, log) = run(Some("@2"), true);
     assert_eq!(logins, 1, "`/login` once: {log}");
+    assert_eq!(keys.len(), 1, "one key: {log}");
+    assert!(
+        keys[0].starts_with("key if-human=7 ")
+            && keys[0].contains("Esc\\x20to\\x20cancel")
+            && keys[0].ends_with(" esc"),
+        "the dialog's own Esc, fenced on the person and its cancel row: {log}"
+    );
     assert_eq!(backs, 1, "the turn delivered again, once: {log}");
-    assert_eq!(
-        notices,
-        ["login-back-dialog"],
-        "the dialog to close, no sign-in, none cancelled: {log}"
+    assert!(
+        notices.is_empty(),
+        "no one told to close the dialog or sign in: {log}"
     );
     assert_eq!(said.last().map(String::as_str), Some("back"), "{log}");
     assert_eq!(
@@ -26599,10 +25458,127 @@ fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
         None,
         "its loss over: {log}"
     );
-    let (notices, (logins, backs), _, _, log) = run(None);
+    let (notices, (logins, _), keys, _, _, log) = run(Some("@2"), false);
     assert_eq!(logins, 1, "{log}");
+    assert!(keys.is_empty(), "no key without its fence: {log}");
+    assert!(notices.is_empty(), "no one told to close it: {log}");
+    let (notices, (logins, backs), keys, _, _, log) = run(None, true);
+    assert_eq!(logins, 1, "{log}");
+    assert!(keys.is_empty(), "no Esc where the sign-in is needed: {log}");
     assert_eq!(backs, 0, "nothing typed into the left sign-in: {log}");
     assert_eq!(notices, ["login-sign-in", "login-cancelled"], "{log}");
+}
+
+/// THE PICKER OF A `/login` THE TAB TYPED AFTER ITS TURN WAS DELIVERED AGAIN (the login came back
+/// in another tab, `login-back@v1` typed, the wall met again, so it signs in itself), the host
+/// still reporting the login back elsewhere: the turn end counts that `Back` as the one already
+/// delivered, and so does the approval loop's picker gate, which answers the picker with its
+/// method and presses no Esc. CONTROL: the picker of the tab's first `/login`, its login then
+/// back in another tab, gets the picker's own Esc and the turn delivered again.
+#[test]
+fn a_login_back_already_delivered_is_not_backed_out_of_at_the_picker() {
+    let mut lost = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    lost.extend(composer("  ? for shortcuts"));
+    let picker = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER);
+    let left =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED);
+    let run = |delivered: bool| {
+        let latches = Arc::new(LoginLatches::default());
+        if delivered {
+            assert_eq!(latches.carry(LATCH_KEY, "@1"), Ok(()));
+            latches.back(LATCH_KEY, "@2");
+        }
+        let host = Arc::new(LatchHost {
+            back_in: Some("@2"),
+            method: Some(aterm_phase::LoginMethod::Subscription),
+            ..LatchHost::tab(&latches, "@1")
+        });
+        let tag = if delivered { "delivered" } else { "first" };
+        let (dir, path) = journal_file(&format!("te-back-picker-{tag}"));
+        let screens = if delivered {
+            vec![
+                busy_screen(),
+                lost.clone(),
+                busy_screen(),
+                lost.clone(),
+                picker.clone(),
+                left.clone(),
+            ]
+        } else {
+            vec![
+                busy_screen(),
+                lost.clone(),
+                picker.clone(),
+                left.clone(),
+                busy_screen(),
+                ended("Pushed."),
+            ]
+        };
+        let at_picker = screens
+            .iter()
+            .position(|s| *s == picker)
+            .expect("the picker");
+        let mut m = fenced(screens);
+        m.cursor_on_caret = true;
+        m.vanish_after = Some(3);
+        m.turn_gates = vec![1, 3];
+        m.key_gates = vec![(at_picker, 0)];
+        let mut opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(30)
+        };
+        opts.policy.continue_policy = false;
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let typed = |rule: &str| {
+            lines
+                .iter()
+                .filter(|l| {
+                    (l.starts_with("TYPED ") || l.starts_with("CONTINUED "))
+                        && l.contains(&format!(" rule={rule}"))
+                })
+                .count()
+        };
+        let counts = (typed(RULE_LOGIN), typed(RULE_LOGIN_BACK));
+        let keys: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .cloned()
+            .collect();
+        let log = format!(
+            "{lines:#?}\n{records:#?}\n{:#?}\n{:#?}",
+            host.said(),
+            m.requests
+        );
+        (counts, keys, log)
+    };
+    let ((logins, backs), keys, log) = run(true);
+    assert_eq!(
+        (logins, backs),
+        (1, 1),
+        "delivered once, then its own sign-in: {log}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.ends_with(" esc")),
+        "no Esc at its picker: {log}"
+    );
+    assert_eq!(keys.len(), 1, "one key: {log}");
+    assert!(keys[0].ends_with(" enter"), "the method's Enter: {log}");
+    let ((logins, backs), keys, log) = run(false);
+    assert_eq!(logins, 1, "{log}");
+    assert_eq!(keys.len(), 1, "one key: {log}");
+    assert!(
+        keys[0].starts_with("key if-human=7 ") && keys[0].ends_with(" esc"),
+        "the picker's own Esc, fenced on the person: {log}"
+    );
+    assert_eq!(backs, 1, "the turn delivered again, once: {log}");
 }
 
 fn login_left_from(dialog: &[String]) -> Vec<String> {
@@ -27008,30 +25984,28 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
         drawn.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         fit(drawn, 30)
     };
-    let gemini_turn = |tall: bool| {
-        use aterm_phase::gemini;
+    let muse_turn = |tall: bool| {
+        use aterm_phase::muse;
         use aterm_phase::prompt::fixtures::screen;
-        let end = screen(gemini::fixtures::END_OF_TURN);
+        let end = screen(muse::fixtures::END_OF_TURN_1_4_10);
         let at = end
             .iter()
-            .rposition(|r| r.starts_with("✦ "))
+            .position(|r| r.starts_with("◆ Hi!"))
             .expect("the reply");
         let mut drawn = end[..at].to_vec();
-        drawn.push("✦ NEEDS YOU: the signing credential".to_string());
+        drawn.push("◆ NEEDS YOU: the signing credential".to_string());
         drawn.push("  I will push the branch now.".to_string());
         drawn.push(String::new());
-        drawn.push("╭────────────────────────────────────────────╮".to_string());
         for call in 0..(if tall { 60 } else { 1 }) {
             drawn.push(format!(
-                "│ ✓  Shell git push origin branch-{call:02}             │"
+                "◆ Ran command · Push branch-{call:02} · ✓ · 2.3s · ctrl+o"
             ));
+            drawn.push(String::new());
         }
-        drawn.push("╰────────────────────────────────────────────╯".to_string());
-        drawn.push(String::new());
-        drawn.push("✦ I will push the next branch now.".to_string());
+        drawn.push("◆ I will push the next branch now.".to_string());
         drawn.extend(end[at + 1..].iter().cloned());
         if tall {
-            fit(drawn, end.len())
+            fit(drawn, end.len().max(20))
         } else {
             (drawn, Vec::new())
         }
@@ -27089,19 +26063,19 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
         }
     }
     for tall in [true, false] {
-        use aterm_phase::gemini;
+        use aterm_phase::muse;
         use aterm_phase::prompt::fixtures::screen;
-        let turn = gemini_turn(tall);
+        let turn = muse_turn(tall);
         assert_eq!(!turn.1.is_empty(), tall);
         let (raised, clean_before, lines) = run(
-            gemini_mock,
-            screen(gemini::fixtures::BUSY_THINKING),
-            screen(gemini::fixtures::END_OF_TURN),
+            muse_mock,
+            screen(muse::fixtures::BUSY_1_4_10),
+            screen(muse::fixtures::END_OF_TURN_1_4_10),
             "cruise",
             turn,
         );
-        assert!(raised, "gemini tall={tall}: {lines:#?}");
-        assert!(clean_before, "gemini tall={tall}: {lines:#?}");
+        assert!(raised, "muse tall={tall}: {lines:#?}");
+        assert!(clean_before, "muse tall={tall}: {lines:#?}");
     }
 }
 
@@ -27389,17 +26363,35 @@ const LAB_REPLY: &str = "Implemented the parser module and its unit tests in thi
 
 type LaunchCase = (&'static str, fn() -> Mock, u64, u64);
 
+/// Claude Code's composer drawn on an otherwise blank screen: a launch's
+/// frame before any prompt (idle, no message, no reply).
+fn claude_pre_banner() -> Vec<String> {
+    let mut rows = vec![String::new(); 20];
+    rows.extend(composer("  ? for shortcuts"));
+    rows
+}
+
+/// Claude Code's reply `said` after a turn it says took seconds: a short turn.
+fn ended_quick(said: &str) -> Vec<String> {
+    let mut r = rows(&[
+        &format!("⏺ {said}"),
+        "",
+        "✻ Worked for 6s · done 4:24 PM",
+        "",
+    ]);
+    r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    r
+}
+
 fn launches() -> Vec<LaunchCase> {
-    use aterm_phase::prompt::fixtures::screen;
-    fn gemini() -> Mock {
-        use aterm_phase::gemini::fixtures as g;
-        gemini_mock(vec![
-            screen(g::PRE_BANNER),
-            screen(g::BUSY_THINKING),
-            gemini_ended(LAB_REPLY),
+    fn claude() -> Mock {
+        Mock::new(vec![
+            claude_pre_banner(),
+            busy_screen(),
+            ended_quick(LAB_REPLY),
         ])
     }
-    vec![("gemini", gemini, 101, 103)]
+    vec![("claude", claude, 101, 103)]
 }
 
 #[test]
@@ -27516,18 +26508,12 @@ fn a_program_still_starting_is_no_point() {
 
 #[test]
 fn a_frame_after_a_start_the_loop_saw_is_a_launchs() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
     let mut screens = vec![vec![String::new(); 50]; 4];
-    screens.extend([
-        screen(g::PRE_BANNER),
-        screen(g::BUSY_THINKING),
-        gemini_ended(LAB_REPLY),
-    ]);
+    screens.extend([claude_pre_banner(), busy_screen(), ended_quick(LAB_REPLY)]);
     let host = LaunchHost::saw(None);
     let (lines, rows) = launched_run(
-        "start-gemini-attach",
-        &mut gemini_mock(screens),
+        "start-claude-attach",
+        &mut Mock::new(screens),
         &host,
         Some(""),
     );
@@ -27566,27 +26552,21 @@ fn a_start_that_stands_still_a_minute_is_read_as_it_stands() {
 
 #[test]
 fn a_launch_with_a_task_counts_its_first_reply() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
     for (label, screens, at) in [
         (
             "the frame first",
-            vec![
-                screen(g::PRE_BANNER),
-                screen(g::BUSY_THINKING),
-                gemini_ended(LAB_REPLY),
-            ],
+            vec![claude_pre_banner(), busy_screen(), ended_quick(LAB_REPLY)],
             103,
         ),
         (
             "its turn running first",
-            vec![screen(g::BUSY_THINKING), gemini_ended(LAB_REPLY)],
+            vec![busy_screen(), ended_quick(LAB_REPLY)],
             102,
         ),
-        ("its reply first", vec![gemini_ended(LAB_REPLY)], 101),
+        ("its reply first", vec![ended_quick(LAB_REPLY)], 101),
     ] {
         let host = LaunchHost::saw(Some(LAUNCHED_MS));
-        let mut m = gemini_mock(screens);
+        let mut m = Mock::new(screens);
         let (lines, rows) = launched_run("p3-tasked", &mut m, &host, Some(""));
         assert_eq!(point_rows(&rows), [(at, 1)], "{label}: {rows:#?}");
         assert_eq!(
@@ -27595,10 +26575,10 @@ fn a_launch_with_a_task_counts_its_first_reply() {
             "{label}: {lines:#?}"
         );
     }
-    let mut m = gemini_mock(vec![
-        screen(g::PRE_BANNER),
-        screen(g::BUSY_THINKING),
-        gemini_ended(LAB_REPLY),
+    let mut m = Mock::new(vec![
+        claude_pre_banner(),
+        busy_screen(),
+        ended_quick(LAB_REPLY),
     ]);
     let (_, rows) = launched_run("p3-tasked-attach", &mut m, &LaunchHost::saw(None), Some(""));
     assert_eq!(point_rows(&rows), [(101, 1), (103, 2)], "{rows:#?}");
@@ -27606,25 +26586,17 @@ fn a_launch_with_a_task_counts_its_first_reply() {
 
 #[test]
 fn a_successors_first_point_keeps_its_seeds() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let screens = || {
-        vec![
-            screen(g::PRE_BANNER),
-            screen(g::BUSY_THINKING),
-            gemini_ended(LAB_REPLY),
-        ]
-    };
+    let screens = || vec![claude_pre_banner(), busy_screen(), ended_quick(LAB_REPLY)];
     let host = Arc::new(LaunchHost {
         launch: Some(LAUNCHED_MS),
         lifted: true,
         ..LaunchHost::default()
     });
-    let (_, rows) = launched_run("p3-lifted", &mut gemini_mock(screens()), &host, Some(""));
+    let (_, rows) = launched_run("p3-lifted", &mut Mock::new(screens()), &host, Some(""));
     assert_eq!(point_rows(&rows), [(101, 1), (103, 2)], "{rows:#?}");
     let (_, books) = launched_run(
         "p3-books",
-        &mut gemini_mock(vec![screen(g::PRE_BANNER), screen(g::BUSY_THINKING)]),
+        &mut Mock::new(vec![claude_pre_banner(), busy_screen()]),
         &LaunchHost::saw(None),
         Some(""),
     );
@@ -27638,7 +26610,7 @@ fn a_successors_first_point_keeps_its_seeds() {
     let books = books.join("\n") + "\n";
     let (_, rows) = launched_run(
         "p3-successor",
-        &mut gemini_mock(screens()),
+        &mut Mock::new(screens()),
         &LaunchHost::saw(Some(LAUNCHED_MS)),
         Some(&books),
     );
@@ -27652,7 +26624,7 @@ fn a_successors_first_point_keeps_its_seeds() {
         box_seq: 90,
     }
     .to_json(crate::supervise::journal::unix_ms() - 10_000, None);
-    let mut m = gemini_mock(screens());
+    let mut m = Mock::new(screens());
     m.autopilot = Some("land");
     let (lines, rows) = launched_run(
         "p3-land-act",
@@ -27670,18 +26642,10 @@ fn a_successors_first_point_keeps_its_seeds() {
 
 #[test]
 fn an_agent_started_again_since_its_books_is_a_launchs() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let screens = || {
-        vec![
-            screen(g::PRE_BANNER),
-            screen(g::BUSY_THINKING),
-            gemini_ended(LAB_REPLY),
-        ]
-    };
+    let screens = || vec![claude_pre_banner(), busy_screen(), ended_quick(LAB_REPLY)];
     let (_, books) = launched_run(
         "p3b-books",
-        &mut gemini_mock(vec![screen(g::PRE_BANNER), screen(g::BUSY_THINKING)]),
+        &mut Mock::new(vec![claude_pre_banner(), busy_screen()]),
         &LaunchHost::saw(None),
         Some(""),
     );
@@ -27691,7 +26655,7 @@ fn an_agent_started_again_since_its_books_is_a_launchs() {
     let host = LaunchHost::saw(Some(last + 1_000));
     let (lines, rows) = launched_run(
         "p3b-started-again",
-        &mut gemini_mock(screens()),
+        &mut Mock::new(screens()),
         &host,
         Some(&books),
     );
@@ -27713,7 +26677,7 @@ fn an_agent_started_again_since_its_books_is_a_launchs() {
     ] {
         let (lines, rows) = launched_run(
             tag,
-            &mut gemini_mock(screens()),
+            &mut Mock::new(screens()),
             &LaunchHost::saw(launch),
             Some(&books),
         );
@@ -27729,14 +26693,12 @@ fn an_agent_started_again_since_its_books_is_a_launchs() {
 
 #[test]
 fn a_screen_cleared_after_the_first_point_still_owes_its_act() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
     let host = LaunchHost::saw(Some(LAUNCHED_MS));
-    let mut m = gemini_mock(vec![
-        screen(g::PRE_BANNER),
-        screen(g::BUSY_THINKING),
-        gemini_ended(LAB_REPLY),
-        screen(g::PRE_BANNER),
+    let mut m = Mock::new(vec![
+        claude_pre_banner(),
+        busy_screen(),
+        ended_quick(LAB_REPLY),
+        claude_pre_banner(),
     ]);
     let (lines, rows) = launched_run("p3-cleared", &mut m, &host, Some(""));
     assert!(
@@ -27751,12 +26713,12 @@ fn a_screen_cleared_after_the_first_point_still_owes_its_act() {
     assert_eq!(point_rows(&rows), [(103, 1)], "{rows:#?}");
     assert_eq!(host.asked.load(Ordering::SeqCst), 1, "{lines:#?}");
     let host = LaunchHost::saw(Some(LAUNCHED_MS));
-    let mut m = gemini_mock(vec![
-        screen(g::PRE_BANNER),
-        screen(g::BUSY_THINKING),
-        gemini_ended(LAB_REPLY),
-        screen(g::BUSY_THINKING),
-        screen(g::PRE_BANNER),
+    let mut m = Mock::new(vec![
+        claude_pre_banner(),
+        busy_screen(),
+        ended_quick(LAB_REPLY),
+        busy_screen(),
+        claude_pre_banner(),
     ]);
     let (lines, rows) = launched_run("p3-cleared-ran", &mut m, &host, Some(""));
     assert_eq!(point_rows(&rows), [(103, 1), (105, 2)], "{rows:#?}");
@@ -27765,17 +26727,6 @@ fn a_screen_cleared_after_the_first_point_still_owes_its_act() {
         Some("2 short turn(s) in a row: 4 min back-off"),
         "{lines:#?}"
     );
-}
-
-fn gemini_tool_only_end() -> Vec<String> {
-    let mut rows =
-        aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::YOLO_TOOL_RAN);
-    let at = rows
-        .iter()
-        .rposition(|r| r.starts_with("✦ Tool call done."))
-        .expect("the reply");
-    rows[at] = String::new();
-    rows
 }
 
 fn policy_reading(program: &str, rows: &[String]) -> TurnEndReading {
@@ -27791,58 +26742,6 @@ fn policy_reading(program: &str, rows: &[String]) -> TurnEndReading {
         None,
         None,
     )
-}
-
-#[test]
-fn a_turn_ended_with_no_words_still_holds_a_conversation() {
-    use aterm_phase::prompt::fixtures::screen;
-    let rows = gemini_tool_only_end();
-    assert!(
-        rows.iter().filter(|row| row.starts_with(" > ")).count() >= 2,
-        "two messages on the screen"
-    );
-    let r = policy_reading("gemini", &rows);
-    assert_eq!((r.said_tail.as_deref(), r.opened_by), (None, None));
-    assert!(r.message_drawn, "{r:?}");
-    assert!(!r.holds_no_conversation(), "{r:?}");
-    let measured = policy_reading(
-        "gemini",
-        &screen(aterm_phase::gemini::fixtures::YOLO_TOOL_RAN),
-    );
-    assert!(!measured.holds_no_conversation(), "{measured:?}");
-    let pre = policy_reading("gemini", &screen(aterm_phase::gemini::fixtures::PRE_BANNER));
-    assert!(!pre.message_drawn, "{pre:?}");
-    assert!(pre.holds_no_conversation(), "{pre:?}");
-    let blank = vec![String::new(); 50];
-    let muse = policy_reading("muse", &blank);
-    assert!(!muse.message_drawn, "{muse:?}");
-}
-
-#[test]
-fn a_first_turn_ended_with_no_words_after_a_launch_is_judged() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let screens = || {
-        vec![
-            screen(g::PRE_BANNER),
-            gemini_tool_only_end(),
-            gemini_tool_only_end(),
-            gemini_tool_only_end(),
-        ]
-    };
-    let host = LaunchHost::saw(Some(LAUNCHED_MS));
-    let mut m = gemini_mock(screens());
-    let (lines, rows) = launched_run("rv2-launch", &mut m, &host, Some(""));
-    assert_eq!(point_rows(&rows).len(), 1, "the turn's point: {rows:#?}");
-    assert_eq!(
-        back_offs(&lines),
-        ["1 short turn(s) in a row: 2 min back-off"],
-        "{lines:#?}"
-    );
-    let host = LaunchHost::saw(None);
-    let mut m = gemini_mock(screens());
-    let (_, rows_attach) = launched_run("rv2-attach", &mut m, &host, Some(""));
-    assert_eq!(point_rows(&rows_attach), [(101, 1)], "{rows_attach:#?}");
 }
 
 #[test]
@@ -28040,130 +26939,6 @@ fn a_turn_the_verdict_never_saw_busy_is_rechecked_under_a_short_settle() {
     );
 }
 
-#[test]
-fn gemini_clis_usage_limit_stopped_before_any_point_decided_it_is_read_as_its_limit() {
-    use aterm_phase::gemini::fixtures as g;
-    use aterm_phase::prompt::fixtures::screen;
-    let run = |before: Vec<String>| {
-        let (dir, journal) = journal_file("te-gemini-unsettled-stop");
-        let mut m = gemini_mock(vec![
-            screen(g::BUSY_THINKING),
-            before,
-            screen(g::LIMIT_STOPPED),
-            screen(g::BUSY_THINKING),
-            gemini_ended("Carried on."),
-        ]);
-        m.turn_gates = vec![2];
-        m.attention_gates = vec![(2, 0)];
-        m.stall_sleep = Some(Duration::from_secs(3600));
-        m.vanish_after = Some(8);
-        m.exit_when = Some(|m| {
-            m.requests
-                .iter()
-                .any(|r| r.starts_with("meta unset attention owner=supervisor"))
-        });
-        let opts = SuperviseOpts {
-            policy: owners_policy(),
-            journal: Some(journal.clone()),
-            ..auto(3 * 3600)
-        };
-        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_turn_end_timing(TurnEndTiming {
-                min_work: Duration::ZERO,
-                ..TurnEndTiming::default()
-            });
-            s.set_box_settle(Duration::from_secs(1));
-            s.set_clock_running();
-        });
-        let (records, _) = journal_records(&journal);
-        let _ = std::fs::remove_dir_all(&dir);
-        let lines: Vec<String> = records
-            .iter()
-            .map(|r| r.line.clone())
-            .chain(lines)
-            .collect();
-        (m, lines)
-    };
-    let (m, lines) = run(screen(g::LIMIT_DIALOG));
-    let said = |needle: &str| lines.iter().any(|l| l.contains(needle));
-    assert!(
-        !said("rule=limit-retry@v1"),
-        "PRECONDITION: no point decided the dialog: {lines:#?}"
-    );
-    let raised: Vec<&String> = m
-        .requests
-        .iter()
-        .filter(|r| r.starts_with("meta set attention owner=supervisor"))
-        .collect();
-    assert_eq!(raised.len(), 1, "{lines:#?}\n{:#?}", m.requests);
-    assert!(
-        raised[0].contains(
-            "(Gemini CLI's usage limit names no reset; after Stop, resumed on a back-off ladder"
-        ),
-        "the badge's reason is the limit, not the error: {}",
-        raised[0]
-    );
-    let turns: Vec<usize> = m
-        .requests
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| verb_of(r) == "turn")
-        .map(|(i, _)| i)
-        .collect();
-    assert!(
-        lines
-            .iter()
-            .find(|l| l.starts_with("CONTINUED "))
-            .is_some_and(|l| l.contains("rule=usage-resume@v1")),
-        "the first turn typed is the limit's resume: {lines:#?}"
-    );
-    let wait = lines
-        .iter()
-        .find(|l| l.starts_with("WAITING ") && l.contains("usage-session resets"))
-        .unwrap_or_else(|| panic!("the error waited on: {lines:#?}"));
-    let until = wait
-        .split_whitespace()
-        .find_map(|w| w.strip_prefix("until="))
-        .and_then(aterm_types::rfc3339::parse_utc)
-        .expect("an until");
-    assert!(
-        (TEST_NOW + 1800..TEST_NOW + 1830).contains(&until),
-        "the ladder's first rung from the dialog's read: {wait}"
-    );
-    let unset = m
-        .requests
-        .iter()
-        .position(|r| r.starts_with("meta unset attention owner=supervisor"))
-        .expect("the badge taken down");
-    assert!(
-        unset > turns[0],
-        "after the try got through: {:#?}",
-        m.requests
-    );
-
-    let (m, lines) = run(screen(g::BOX_SHELL));
-    assert!(
-        !m.requests
-            .iter()
-            .any(|r| verb_of(r) == "turn" && r.contains("keep going")),
-        "the control: {lines:#?}\n{:#?}",
-        m.requests
-    );
-    let raised: Vec<&String> = m
-        .requests
-        .iter()
-        .filter(|r| r.starts_with("meta set attention owner=supervisor"))
-        .collect();
-    assert!(
-        raised
-            .iter()
-            .any(|r| r.contains("An unknown error occurred."))
-            && !raised.iter().any(|r| r.contains("after Stop")),
-        "the control: the error handed over as itself: {lines:#?}\n{:#?}",
-        m.requests
-    );
-}
-
 /// A host whose step at an idle point, asked once `wanting`, moved the session where `moved`
 /// (the live upgrade's relaunch under Land: the agent ended and its line typed at the shell, no
 /// carry-on) or moved nothing, typing no turn either way.
@@ -28346,158 +27121,5 @@ fn a_restarts_count_baseline_is_marked_as_a_reading_marks_its_conversation() {
         after.map(|n| n - 1),
         before,
         "a person's prompt answered since the restart is folded as a turn: {a:?}"
-    );
-}
-
-#[test]
-fn a_rewrapped_band_read_as_a_launch_card_keeps_the_points_back_off() {
-    let msg = " > FOREVERLAB-SAME-WORDS. write the parser for this repository under \
-               lab/parser-module-parser-module-parser.rs and land it";
-    let said = "✦ Implemented the parser module and its unit tests in this turn.";
-    let banner = || {
-        [
-            "",
-            " ▝▜▄     Gemini CLI v0.46.0",
-            "   ▝▜▄",
-            "  ▗▟▀    Authenticated with gemini-api-key /auth",
-            " ▝▀",
-            "",
-            "",
-            "Tips for getting started:",
-            "1. Create GEMINI.md files to customize your interactions",
-            "2. /help for more information",
-            "3. Ask coding questions, edit code or run commands",
-            "4. Be specific for the best results",
-        ]
-        .iter()
-        .map(|r| (*r).to_string())
-        .collect::<Vec<_>>()
-    };
-    let footer = |cols: usize, gap: usize, blank: usize| {
-        let mut r = vec![String::new(); blank];
-        r.extend([
-            format!("{}? for shortcuts", " ".repeat(cols - 16)),
-            "─".repeat(cols),
-            " Shift+Tab to accept edits".to_string(),
-            "▄".repeat(cols),
-            " >   Type your message or @path/to/file".to_string(),
-            "▀".repeat(cols),
-            format!(
-                " workspace (/directory){}branch{}sandbox{}/model",
-                " ".repeat(gap),
-                " ".repeat(14),
-                " ".repeat(18)
-            ),
-            format!(
-                " /private/tmp/at.8Vr8/proj/same-words{}main{}no sandbox{}Auto",
-                " ".repeat(gap),
-                " ".repeat(16),
-                " ".repeat(17)
-            ),
-        ]);
-        r
-    };
-    let mut whole = banner();
-    whole.extend([
-        "▄".repeat(144),
-        msg.to_string(),
-        "▀".repeat(144),
-        said.to_string(),
-    ]);
-    whole.extend(footer(144, 42, 2));
-    whole.extend(std::iter::repeat_n(String::new(), 24));
-    let mut rewrapped = banner();
-    rewrapped.extend([
-        "▄".repeat(104),
-        "▄".repeat(40),
-        msg[..104].to_string(),
-        msg[104..].to_string(),
-        "▀".repeat(104),
-        "▀".repeat(40),
-        said.to_string(),
-    ]);
-    rewrapped.extend(footer(104, 29, 5));
-    rewrapped.extend([
-        String::new(),
-        format!("ox{}/model", " ".repeat(31)),
-        format!(
-            " /private/tmp/at.8Vr8/proj/same-words{}main{}no sa",
-            " ".repeat(28),
-            " ".repeat(30)
-        ),
-        format!("ndbox{}Auto", " ".repeat(30)),
-    ]);
-    rewrapped.extend(std::iter::repeat_n(String::new(), 26));
-    assert!(
-        !aterm_phase::gemini::fresh(&whole) && aterm_phase::gemini::fresh(&rewrapped),
-        "the reader takes the re-wrapped frame for a launch card"
-    );
-    type Inputs = (Option<u64>, u64);
-    let read =
-        |rows: &[String], cursor_row: usize, seq: u64, submits: u64, inputs: Inputs| Screen {
-            rows: rows.to_vec(),
-            cursor_row,
-            cursor_col: 3,
-            seq,
-            submits: Some(submits),
-            inputs_before: inputs.0,
-            inputs_after: Some(inputs.1),
-            ..Screen::default()
-        };
-    let run = |cleared: bool, first_inputs: Inputs, again_inputs: Inputs| {
-        let mut m = Mock::new(vec![whole.clone()]);
-        m.program = "gemini";
-        let opts = hosted(30);
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_clock(TEST_NOW, PDT);
-        let first = s.turn_of(read(&whole, 22, 3614, 2, first_inputs));
-        let a = s
-            .turn_end_at_point(&first, Some(Duration::from_secs(6)), &opts)
-            .expect("the first decision");
-        assert!(
-            matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
-            "the first point's back-off: {a:?}"
-        );
-        let again = s.turn_of(read(
-            &rewrapped,
-            28,
-            4306,
-            if cleared { 3 } else { 2 },
-            again_inputs,
-        ));
-        s.turn_end_at_point(&again, None, &opts)
-            .expect("the re-wrapped point's decision")
-    };
-    let settled = (Some(40), 40);
-    let a = run(false, settled, settled);
-    assert!(
-        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
-        "the first point's back-off stands: {a:?}"
-    );
-    let keyed = (Some(43), 43);
-    assert_eq!(
-        run(true, settled, keyed),
-        TurnEndAction::Nothing,
-        "a /clear: no task"
-    );
-    assert_eq!(
-        run(false, settled, keyed),
-        TurnEndAction::Nothing,
-        "keys with nothing submitted: no task"
-    );
-    assert_eq!(
-        run(false, settled, (Some(40), 41)),
-        TurnEndAction::Nothing,
-        "a key that landed while the re-wrapped rows were read: no task"
-    );
-    assert_eq!(
-        run(false, (Some(40), 41), (Some(41), 41)),
-        TurnEndAction::Nothing,
-        "a key that landed while the point's rows were read: no task"
-    );
-    assert_eq!(
-        run(false, (None, 41), (Some(41), 41)),
-        TurnEndAction::Nothing,
-        "a write in flight at the point's read: no task"
     );
 }

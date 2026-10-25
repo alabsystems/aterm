@@ -25,7 +25,9 @@ description = "aterm's host-capacity reader (cores, load, available and physical
 aterm-sysprobe = { workspace = true }
 # `record_lock::RecordLock`: a claim is a flock on a file whose record (pid,
 # start, checkout, what, need) other processes read; the kernel lets the lock
-# go when its holder dies, however it dies. Workspace crate, std only.
+# go when its holder dies, however it dies. `interrupt::Watch`: SIGINT, SIGTERM
+# or SIGHUP ends a wait, as it ends a named lock's. Workspace crate, std only
+# but for aterm-libc's signal declarations.
 aterm-toolchain = { workspace = true }
 # A claim's record is one JSON object a line. First-party; aterm-sysprobe
 # already links it.
@@ -56,6 +58,12 @@ aterm-uds = { workspace = true }
 # `spawnfd::command`; the one-minute hang detector (`aterm_spec::wait`).
 aterm-uds = { workspace = true }
 aterm-spec = { workspace = true }
+
+# The interrupt tests send their waiting stand-ins SIGINT or SIGTERM (`kill`), and
+# a stand-in installs a tool's own handler (`signal`): aterm-libc, first-party,
+# which aterm-toolchain already links.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 [lints]
 workspace = true

@@ -7,7 +7,7 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-description = "The real-Claude lab: the real Claude Code TUI (and Codex, Gemini CLI, agy, Muse Code) in a private, jailed headless aterm against a local stub of the API; and private aterm instances for checking a change (instance, trail-gallery, presence-flap, codex-alab-proof, fleet-sim)"
+description = "The real-Claude lab: the real Claude Code TUI (and Codex, agy, Muse Code) in a private, jailed headless aterm against a local stub of the API; and private aterm instances for checking a change (instance, trail-gallery, presence-flap, codex-alab-proof, fleet-sim)"
 
 # Dev-only: never packed or shipped (the workspace's atpkg expose/bundle lists
 # name `aterm` alone). Run it as `targo --unverified lab <verb>` (the
@@ -129,7 +129,7 @@ aterm-capacity = { workspace = true }
 # scenario is paced for, not a copy of its constants.
 aterm-effects = { workspace = true }
 # The tests' one-minute hang detector and the unclocked first exec of a script
-# a test just wrote (`aterm_spec::wait`): the gemini/agy launch fixture.
+# a test just wrote (`aterm_spec::wait`): the agy launch fixture.
 aterm-spec = { workspace = true }
 
 [lints]

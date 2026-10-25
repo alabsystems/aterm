@@ -1243,118 +1243,127 @@ fn a_leap_bed_is_one_tube_across_a_short_gap() {
     );
 }
 
-#[test]
-fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
+/// The ink a Comet lays under the row after `typed` keys and one completion of `jump` cells at
+/// Trail `length`, on the dark (or light) reference ground: before the completion, and on the
+/// frame after it, one alpha a column.
+fn comet_completion_beds(
+    dark: bool,
+    typed: usize,
+    jump: usize,
+    length: usize,
+) -> (Vec<u8>, Vec<u8>) {
     use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
     let g = tall_geom();
     let line: Vec<char> = LINE.chars().collect();
-    let typed = 10_usize;
-    let jump = 6_usize;
-    let cfg_at = |length: usize| {
-        let glow = resolve_glow_config(
-            GlowKnobs {
-                enabled: true,
-                color: None,
-                accent: None,
-                duration_ms: 260,
-                length,
-                intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Comet), false),
-                radius: 0.6,
-                ring: true,
-            },
-            GlowSpelling {
-                style: Some(GlowStyle::Comet),
-                beam: true,
-                ribbon_tall: true,
-                ribbon_flat: false,
-                classic_mono: false,
-            },
-            CURSOR,
-            true,
-            FG,
-            BG,
-            0.5,
-        );
-        let trail = TrailConfig {
-            enabled: !crate::cursor_fx::comet_tail_is_its_streak(&glow),
-            duration: Duration::from_millis(260),
-            max_len: length,
-            color: glow.color,
-            intensity: 0.0,
-            warmth: 0.0,
-        };
-        (glow, trail)
+    let (fg, bg) = if dark {
+        (FG, BG)
+    } else {
+        (0x001F_2328, 0x00FF_FFFF)
     };
-    let beds = |length: usize| -> (Vec<u8>, Vec<u8>) {
-        let (glow_cfg, trail_cfg) = cfg_at(length);
-        let mut fx = CursorFx::default();
-        let t0 = Instant::now();
-        let input = |now: Instant, col: u16| CursorFxInput {
-            now,
-            cur: Some((ROW, col)),
-            live_viewport: true,
-            cursor_style: CursorStyle::SteadyBlock,
-            blink_phase: true,
-            live_cursor: CURSOR,
-            cursor_color_pinned: false,
-            default_bg: BG,
-            cursor_cell_bg: None,
-            geom: g,
-            focused: true,
-            shed_envelope: 1.0,
-            trail_brightness: 1.0,
-            body_allowed: true,
-            momentum_glow: true,
-            user_tinted: false,
-            accent_pinned: false,
-        };
-        let blank = vec![' '; g.cols];
-        let row_with = |shown: usize| {
-            let mut cols = vec![' '; g.cols];
-            cols[0] = '$';
-            for (i, ch) in line.iter().take(shown).enumerate() {
-                cols[usize::from(START) + i] = *ch;
-            }
-            cols
-        };
-        let bed_row = |fx: &CursorFx| -> Vec<u8> {
-            (0..g.cols as u16)
-                .map(|col| bed_alpha_at(fx.glow.under_quads(), g.cell_center(ROW, col).0 as u16))
-                .collect()
-        };
-        let mut t = t0;
-        for k in 0..=typed {
-            if k > 0 {
-                t += Duration::from_millis(60);
-                fx.glow.note_synthetic_typed(t, 1);
-                fx.cadence.on_keystroke(t);
-                fx.momentum.on_key(t, MOMENTUM_GLOW_TAU_S);
-            }
-            let caret = START + k as u16;
-            fx.begin(true, true);
-            fx.glow.observe_row(ROW, caret, &row_with(k), t);
-            fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
-            fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+    let glow_cfg = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: None,
+            accent: None,
+            duration_ms: 260,
+            length,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(GlowStyle::Comet), false),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(GlowStyle::Comet),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+        },
+        CURSOR,
+        dark,
+        fg,
+        bg,
+        0.5,
+    );
+    let trail_cfg = TrailConfig {
+        enabled: !crate::cursor_fx::comet_tail_is_its_streak(&glow_cfg),
+        duration: Duration::from_millis(260),
+        max_len: length,
+        color: glow_cfg.color,
+        intensity: 0.0,
+        warmth: 0.0,
+    };
+    let mut fx = CursorFx::default();
+    let t0 = Instant::now();
+    let input = |now: Instant, col: u16| CursorFxInput {
+        now,
+        cur: Some((ROW, col)),
+        live_viewport: true,
+        cursor_style: CursorStyle::SteadyBlock,
+        blink_phase: true,
+        live_cursor: CURSOR,
+        cursor_color_pinned: false,
+        default_bg: bg,
+        cursor_cell_bg: None,
+        geom: g,
+        focused: true,
+        shed_envelope: 1.0,
+        trail_brightness: 1.0,
+        body_allowed: true,
+        momentum_glow: true,
+        user_tinted: false,
+        accent_pinned: false,
+    };
+    let blank = vec![' '; g.cols];
+    let row_with = |shown: usize| {
+        let mut cols = vec![' '; g.cols];
+        cols[0] = '$';
+        for (i, ch) in line.iter().take(shown).enumerate() {
+            cols[usize::from(START) + i] = *ch;
         }
-        let before = bed_row(&fx);
-        t += Duration::from_millis(60);
-        fx.cadence.on_keystroke(t);
-        fx.glow.note_user_gesture(t);
-        fx.trail.note_user_gesture(t);
-        let caret = START + (typed + jump) as u16;
-        fx.begin(true, true);
-        fx.glow.observe_row(ROW, caret, &row_with(typed + jump), t);
-        fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
-        fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
-        t += Duration::from_millis(16);
-        fx.begin(true, true);
-        fx.glow.observe_row(ROW, caret, &row_with(typed + jump), t);
-        fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
-        fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
-        (before, bed_row(&fx))
+        cols
     };
-    let (short_before, short_after) = beds(2);
-    let (long_before, long_after) = beds(24);
+    let bed_row = |fx: &CursorFx| -> Vec<u8> {
+        (0..g.cols as u16)
+            .map(|col| bed_alpha_at(fx.glow.under_quads(), g.cell_center(ROW, col).0 as u16))
+            .collect()
+    };
+    let mut t = t0;
+    for k in 0..=typed {
+        if k > 0 {
+            t += Duration::from_millis(60);
+            fx.glow.note_synthetic_typed(t, 1);
+            fx.cadence.on_keystroke(t);
+            fx.momentum.on_key(t, MOMENTUM_GLOW_TAU_S);
+        }
+        let caret = START + k as u16;
+        fx.begin(true, true);
+        fx.glow.observe_row(ROW, caret, &row_with(k), t);
+        fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+        fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+    }
+    let before = bed_row(&fx);
+    t += Duration::from_millis(60);
+    fx.cadence.on_keystroke(t);
+    fx.glow.note_user_gesture(t);
+    fx.trail.note_user_gesture(t);
+    let caret = START + (typed + jump) as u16;
+    fx.begin(true, true);
+    fx.glow.observe_row(ROW, caret, &row_with(typed + jump), t);
+    fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+    fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+    t += Duration::from_millis(16);
+    fx.begin(true, true);
+    fx.glow.observe_row(ROW, caret, &row_with(typed + jump), t);
+    fx.glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+    fx.tick(&input(t, caret), &glow_cfg, trail_cfg);
+    (before, bed_row(&fx))
+}
+
+#[test]
+fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
+    let (typed, jump) = (10_usize, 6_usize);
+    let (short_before, short_after) = comet_completion_beds(true, typed, jump, 2);
+    let (long_before, long_after) = comet_completion_beds(true, typed, jump, 24);
     assert_eq!(
         short_before, long_before,
         "control: typing alone lays one bed at every length"
@@ -1373,6 +1382,34 @@ fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
         "Length cuts the completion's bed: {:?} at 24 against {:?} at 2",
         &long_after[path.clone()],
         &short_after[path]
+    );
+}
+
+/// On a light ground a Comet completion's ink is as long as the path it laid, the path Trail
+/// length cut, as the dark bed's is: before, the light Comet drew every run as the typing
+/// wedge, 3.5 cells behind its head, so a completion looked the same at every length (only its
+/// faint trail cells moved, at most 12 levels apart in the preview).
+#[test]
+fn a_light_comet_completion_lays_the_path_length_cuts() {
+    let (typed, jump) = (10_usize, 8_usize);
+    let (short_before, short_after) = comet_completion_beds(false, typed, jump, 2);
+    let (long_before, long_after) = comet_completion_beds(false, typed, jump, 24);
+    assert_eq!(
+        short_before, long_before,
+        "control: typing alone lays one ink at every length"
+    );
+    // Past the typing wedge's reach behind the head: only a jump's own path inks there.
+    let head = usize::from(START) + typed + jump;
+    let far = head - jump..head - 4;
+    let longer = far
+        .clone()
+        .filter(|&col| long_after[col] > short_after[col] + 8)
+        .count();
+    assert!(
+        longer >= 2,
+        "Length cuts the completion's ink: {:?} at 24 against {:?} at 2",
+        &long_after[far.clone()],
+        &short_after[far]
     );
 }
 

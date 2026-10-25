@@ -155,49 +155,11 @@ fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
     }
 }
 
-/// Escalates the loop's picker with `Esc` once another tab has restored the login.
+/// The gate of the loop's own picker: carried, or backed out of where its sign-in nobody needs
+/// (the login back in another tab, a roster row's, or one a followed renewal replaced); a
+/// person's own picker is theirs whatever else holds.
 #[test]
-fn the_picker_of_a_login_back_elsewhere_is_answered_by_nobody() {
-    let back = LoginShared::Back {
-        by: "@2".to_string(),
-    };
-    let carried = LoginShared::Carried {
-        by: "@2".to_string(),
-    };
-    assert_eq!(picker_gate(true, Some(&back), false), PickerGate::Back);
-    assert_eq!(
-        picker_gate(true, Some(&carried), false),
-        PickerGate::Carried
-    );
-    assert_eq!(picker_gate(true, None, false), PickerGate::Carried);
-    assert_eq!(picker_gate(false, Some(&back), false), PickerGate::Persons);
-    assert_eq!(picker_gate(false, None, false), PickerGate::Persons);
-    let rows = screen(LOGIN_PICKER);
-    let read = aterm_phase::read(Some("claude"), &rows, Some(2));
-    for approve in [Approve::None, Approve::Safe, Approve::All] {
-        let at_back = ApprovalCtx {
-            login_method: Some(LoginMethod::Subscription),
-            login_back: true,
-            ..ctx(approve)
-        };
-        let d = decide(&read, &rows, &at_back);
-        assert!(
-            matches!(&d, Decision::Escalate { reason, .. } if reason.contains("Esc")),
-            "{approve:?}: {d:?}"
-        );
-        let ours = ApprovalCtx {
-            login_carry: true,
-            login_back: false,
-            ..at_back.clone()
-        };
-        let d = decide(&read, &rows, &ours);
-        assert_eq!(focus_steps(&d), Some(0), "{approve:?}: {d:?}");
-    }
-}
-
-/// Escalates the loop's picker with `Esc` once a followed renewal replaces its login.
-#[test]
-fn the_picker_over_a_renewed_login_is_answered_by_nobody() {
+fn the_picker_gate_backs_out_only_of_its_own_login_nobody_needs() {
     let cfg = SupervisorConfig::default();
     assert!(renewal_followed(true, &cfg, true));
     assert!(!renewal_followed(false, &cfg, true), "no renewal");
@@ -211,34 +173,92 @@ fn the_picker_over_a_renewed_login_is_answered_by_nobody() {
         }
         assert!(!renewal_followed(true, &c, true), "{off} off");
     }
-    let back = LoginShared::Back {
-        by: "@2".to_string(),
-    };
-    assert_eq!(picker_gate(true, None, true), PickerGate::Renewed);
-    assert_eq!(picker_gate(true, None, false), PickerGate::Carried);
-    assert_eq!(picker_gate(false, None, true), PickerGate::Persons);
-    assert_eq!(picker_gate(true, Some(&back), true), PickerGate::Back);
-    let rows = screen(LOGIN_PICKER);
+    for (back, roster, renewed, gate) in [
+        (true, false, false, PickerGate::Back),
+        (true, true, true, PickerGate::Back),
+        (false, true, false, PickerGate::Roster),
+        (false, true, true, PickerGate::Roster),
+        (false, false, true, PickerGate::Renewed),
+        (false, false, false, PickerGate::Carried),
+    ] {
+        let got = picker_gate(true, back, roster, renewed);
+        assert_eq!(got, gate, "{back} {roster} {renewed}");
+        assert_eq!(
+            got.backs_out(),
+            gate != PickerGate::Carried,
+            "{back} {roster} {renewed}"
+        );
+        let persons = picker_gate(false, back, roster, renewed);
+        assert_eq!(persons, PickerGate::Persons, "{back} {roster} {renewed}");
+        assert!(!persons.backs_out(), "a person's own picker");
+    }
+}
+
+/// The picker of the `/login` aterm typed whose sign-in nobody needs — the login back in another
+/// tab, a roster row's (which aterm's sign-in ladder signs in), or one a followed renewal replaced
+/// — is backed out of with the picker's own Esc, the focus where it stands, whatever `approve`
+/// says; nobody is asked to close it. Negative controls: the same picker of aterm's own `/login`
+/// otherwise gets the method's Enter, and a person's own picker is nobody's to answer or close.
+#[test]
+fn the_picker_aterm_opened_and_nobody_needs_is_backed_out_of() {
+    let (rows, _, picker) = picker_of(LOGIN_PICKER);
     let read = aterm_phase::read(Some("claude"), &rows, Some(2));
     for approve in [Approve::None, Approve::Safe, Approve::All] {
-        let renewed = ApprovalCtx {
+        let base = ApprovalCtx {
             login_method: Some(LoginMethod::Subscription),
-            login_renewed: true,
             ..ctx(approve)
         };
-        let d = decide(&read, &rows, &renewed);
-        assert!(
-            matches!(&d, Decision::Escalate { reason, .. } if reason.contains("Esc")),
-            "{approve:?}: {d:?}"
-        );
+        for gate in ["back", "roster", "renewed"] {
+            let nobody = ApprovalCtx {
+                login_back: gate == "back",
+                login_roster: gate == "roster",
+                login_renewed: gate == "renewed",
+                ..base.clone()
+            };
+            let d = decide(&read, &rows, &nobody);
+            let Decision::Approve {
+                rule_id,
+                choice: Choice::FocusKey { steps, key, .. },
+                guard,
+                ..
+            } = &d
+            else {
+                panic!("{gate} {approve:?}: {d:?}");
+            };
+            assert_eq!(
+                (*rule_id, *steps, *key),
+                (RULE_LOGIN_BACK_OUT, 0, "esc"),
+                "{gate} {approve:?}"
+            );
+            assert_eq!(guard, &row_guard(&picker.title_row), "{gate} {approve:?}");
+        }
         let ours = ApprovalCtx {
             login_carry: true,
-            login_renewed: false,
-            ..renewed.clone()
+            ..base.clone()
         };
         let d = decide(&read, &rows, &ours);
         assert_eq!(focus_steps(&d), Some(0), "{approve:?}: {d:?}");
+        let d = decide(&read, &rows, &base);
+        assert!(
+            matches!(&d, Decision::Escalate { .. }),
+            "a person's picker: {approve:?}: {d:?}"
+        );
     }
+}
+
+/// The row the dialog's Esc is fenced on: its own `Esc to cancel`, at the picker, the browser
+/// hand-off and the error state; no such row once the dialog has signed in, or with no dialog.
+#[test]
+fn the_dialogs_esc_is_fenced_on_its_cancel_row() {
+    for text in [LOGIN_PICKER, LOGIN_HANDOFF, LOGIN_ERROR, LOGIN_OPENING] {
+        let row = cancel_row(&screen(text)).map(|r| r.trim().to_string());
+        assert_eq!(row.as_deref(), Some("Esc to cancel"), "{text}");
+    }
+    assert_eq!(cancel_row(&screen(LOGIN_SUCCESS)), None);
+    assert_eq!(
+        cancel_row(&screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED)),
+        None
+    );
 }
 
 fn dialog(text: &str) -> LoginScreen {

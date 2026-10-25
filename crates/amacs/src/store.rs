@@ -381,6 +381,19 @@ impl DocumentStore {
         }
     }
 
+    /// Make the document's text `text` at `base`, as one atomic commit of only
+    /// the spans that differ ([`crate::diff::minimal_edits`]): a selection,
+    /// mark or scroll anchor rebased through the deltas stays on its text
+    /// wherever that text is unchanged, where one `0..len` edit would send
+    /// every one of them to the end.
+    pub fn replace_text(&mut self, id: DocumentId, base: Seq, text: &str) -> DocumentTxnOutcome {
+        let edits = match self.documents.get(&id) {
+            Some(document) => crate::diff::minimal_edits(document.projection.as_ref(), text),
+            None => return DocumentTxnOutcome::Rejected(DocumentError::UnknownDocument),
+        };
+        self.transact(id, base, edits)
+    }
+
     /// Prepare removal of `closing`.
     pub fn prepare_close(
         &mut self,
@@ -876,6 +889,51 @@ mod tests {
         store.checkpoint_ack(id, seq).unwrap();
         assert_eq!(store.detach_view_if_ready(id, view), Ok(true));
         assert_eq!(store.detach_view_if_ready(id, view), Ok(false));
+    }
+
+    #[test]
+    fn replacing_the_text_keeps_positions_outside_the_change_on_their_text() {
+        let before = "a = 1\nb = 2\nc = 3\nd = 4\n";
+        let after = "a = 1\nc = 3\nd = 4\n";
+        let caret = before.find("c = 3").unwrap();
+        let later = before.find("d = 4").unwrap() + 2;
+
+        let mut store = DocumentStore::for_test();
+        let id = store.open("mem://config".into(), before.into());
+        let base = store.snapshot(id).unwrap().seq;
+        let DocumentTxnOutcome::Committed { deltas, .. } = store.replace_text(id, base, after)
+        else {
+            panic!("replace_text did not commit");
+        };
+        assert_eq!(store.snapshot(id).unwrap().text.as_ref(), after);
+        assert_eq!(rebase_position(0, &deltas), 0, "before the change");
+        assert_eq!(
+            rebase_position(caret, &deltas),
+            after.find("c = 3").unwrap(),
+            "the line after a deleted one keeps its caret"
+        );
+        assert_eq!(
+            rebase_position(later, &deltas),
+            after.find("d = 4").unwrap() + 2
+        );
+
+        // The control: the whole-text edit this replaces sends every position to the end.
+        let whole = [EditDelta {
+            old: 0..before.len(),
+            inserted_len: after.len(),
+        }];
+        assert_eq!(rebase_position(caret, &whole), after.len());
+    }
+
+    #[test]
+    fn replacing_with_the_same_text_commits_nothing() {
+        let (mut store, id) = open();
+        let base = store.snapshot(id).unwrap().seq;
+        let outcome = store.replace_text(id, base, "hello\nworld");
+        assert!(
+            matches!(&outcome, DocumentTxnOutcome::Committed { seq, deltas, .. } if *seq == base && deltas.is_empty()),
+            "{outcome:?}"
+        );
     }
 
     #[test]

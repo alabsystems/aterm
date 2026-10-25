@@ -448,6 +448,8 @@ mod face_identity_tests;
 #[cfg(test)]
 mod raster_tests;
 #[cfg(test)]
+mod styled_instance_tests;
+#[cfg(test)]
 mod theme_from_scheme_tests {
     use super::Theme;
     use aterm_types::scheme::{self, ColorScheme};
@@ -1036,6 +1038,38 @@ struct ResolvedInstances {
     bold: VarCoords,
 }
 
+/// The instance a styled or injected face of the primary family draws at, resolved
+/// for its role ([`FaceRole`]) by the policy the primary's own instance follows
+/// ([`Renderer::compute_variations_for_face`]), so SF Mono's italic, whose `fvar`
+/// default is Light, draws the weight of the Regular upright beside it. Both `None`
+/// for a static face and where the instance is the face's `fvar` default.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct FaceInstance {
+    /// What the face's glyphs are drawn and shaped at.
+    drawn: VarCoords,
+    /// Its own bold instance, for a bold-italic cell the italic face serves: a real
+    /// weight where synthetic bold would dilate `drawn`.
+    bold: VarCoords,
+}
+
+/// The role a primary-family face plays, which picks its instance
+/// ([`FaceInstance`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaceRole {
+    /// The italic face: the regular weight, as the upright primary draws it.
+    Regular,
+    /// A bold, bold-italic or injected bold face: a bold weight
+    /// ([`variation::bold_role_coords`]).
+    Bold,
+}
+
+impl FaceRole {
+    /// The role of styled slot `slot` (0 bold, 1 italic, 2 bold-italic).
+    const fn of_slot(slot: usize) -> Self {
+        if slot == 1 { Self::Regular } else { Self::Bold }
+    }
+}
+
 #[derive(Clone)]
 enum AdmittedFontBlob {
     Slice(std::sync::Arc<[u8]>),
@@ -1245,6 +1279,9 @@ pub struct Renderer {
     bold_font: Option<crate::font::Font>,
     bold_font_bytes: Option<std::sync::Arc<[u8]>>,
     bold_font_index: u32,
+    /// The instance the injected bold face draws at ([`FaceRole::Bold`];
+    /// [`Self::refresh_family_instances`] keeps it current).
+    bold_font_instance: FaceInstance,
     bold_gid_cache: FxHashMap<char, Option<u16>>,
     bold_yields_private_use: bool,
     bold_lowered_asterisk: Option<bundled::LoweredAsterisk>,
@@ -2449,6 +2486,9 @@ struct StyledFace {
     id: StyledFaceId,
     yields_private_use: bool,
     lowered_asterisk: Option<bundled::LoweredAsterisk>,
+    /// The instance this face draws at for its slot's role
+    /// ([`Renderer::refresh_family_instances`] keeps it current).
+    instance: FaceInstance,
 }
 
 impl StyledFace {
@@ -4070,9 +4110,20 @@ impl CachedGlyph {
     }
 }
 
+/// The knock-out mask's mix ([`Renderer::blit_glyph_ring`]): coverage `t` takes the share of
+/// the pixel cut toward the whole as the old page stamp's [`blend`] took a pixel toward the
+/// page (the shares left uncovered multiply), and every channel keeps that share as a linear
+/// byte, the alpha factor the cut reads ([`fx_raster::cut_sprite_art`]). [`blend`] toward
+/// white kept it sRGB-encoded, which cut a letter's soft rim deeper than the stamp did.
+#[inline]
+fn knock_cover(m: u32, _white: u32, t: u8) -> u32 {
+    let m = m & 0xff;
+    (m + ((255 - m) * u32::from(t) + 127) / 255) * 0x0001_0101
+}
+
 /// The knock-out's ring of a `width × height` mono coverage (`bytes`): its coverage stamped at
-/// each of [`KNOCK_DILATE_OFFSETS`], composed as each stamp's [`blend`] toward white composes
-/// (the shares left uncovered multiply), over a raster [`KNOCK_REACH`] pixels larger on every
+/// each of [`KNOCK_DILATE_OFFSETS`], composed as each stamp's [`knock_cover`] composes (the
+/// shares left uncovered multiply), over a raster [`KNOCK_REACH`] pixels larger on every
 /// side. One blit of it cuts a body as the 21 stamps one after another do, a 21st of the work.
 fn knock_ring(width: usize, height: usize, bytes: &[u8]) -> Box<[u8]> {
     let reach = KNOCK_REACH as usize;
@@ -4094,7 +4145,7 @@ fn knock_ring(width: usize, height: usize, bytes: &[u8]) -> Box<[u8]> {
 
 #[cfg(test)]
 mod knock_ring_tests {
-    use super::{KNOCK_DILATE_OFFSETS, KNOCK_REACH, blend, blit_mono_with, knock_ring};
+    use super::{KNOCK_DILATE_OFFSETS, KNOCK_REACH, blit_mono_with, knock_cover, knock_ring};
 
     /// THE RING CUTS AS ITS STAMPS DO. One blit of a glyph's ring leaves the mask as the 21
     /// stamps of its coverage one after another leave it, to within the rounding of the
@@ -4131,7 +4182,7 @@ mod knock_ring_tests {
                     1,
                     everywhere.0,
                     everywhere.1,
-                    blend,
+                    knock_cover,
                 );
             }
             let ring = knock_ring(w, h, &glyph);
@@ -4150,7 +4201,7 @@ mod knock_ring_tests {
                 1,
                 everywhere.0,
                 everywhere.1,
-                blend,
+                knock_cover,
             );
             let worst = stamped
                 .iter()
@@ -4178,7 +4229,7 @@ mod knock_ring_tests {
                 1,
                 everywhere.0,
                 everywhere.1,
-                blend,
+                knock_cover,
             );
             assert!(
                 stamped
@@ -4186,6 +4237,85 @@ mod knock_ring_tests {
                     .zip(&bare)
                     .any(|(a, b)| ((a & 0xff) as i32 - (b & 0xff) as i32).abs() > 2),
                 "control: the stamps reach past the bare coverage"
+            );
+        }
+    }
+
+    /// THE MASK HOLDS THE SHARE CUT. Under a glyph, each pixel of the knock-out's mask holds
+    /// the share its 21 stamps cut, `1 - Π(1 - coverage)`, as a linear byte: the cut reads it
+    /// as an alpha factor ([`crate::fx_raster::cut_sprite_art`]), so a body cut over the page
+    /// is the old page stamp up to rounding. Mixed with [`super::blend`] toward white, the
+    /// mask held that share sRGB-encoded and a letter's soft rim cut the body by
+    /// `srgb(share)`: a tenth's share cut a third of it. Both paths: the ring blit and a
+    /// doubled line's stamps.
+    #[test]
+    fn the_mask_holds_the_share_cut() {
+        let mut rend =
+            super::Renderer::from_system(18.0, super::Theme::default()).expect(super::NO_FONT);
+        let key = rend.glyph_key('o');
+        let baseline = rend.baseline;
+        let reach = KNOCK_REACH;
+        for xs in [1usize, 2] {
+            let super::GlyphImage::Mono {
+                width: w,
+                height: h,
+                xmin,
+                ymin,
+                ref bytes,
+                ..
+            } = rend.cached_glyph(key).img
+            else {
+                panic!("fixture: 'o' rasterizes as a mono coverage");
+            };
+            let bytes = bytes.clone();
+            let scale = super::Scale {
+                xs,
+                ys: xs,
+                ..super::Scale::NORMAL
+            };
+            let (s, gx0, gy0) = (
+                xs as i32,
+                xmin * xs as i32,
+                xs as i32 * (baseline - h as i32 - ymin),
+            );
+            let area = [
+                gx0 - reach - 1,
+                gy0 - reach - 1,
+                gx0 + w as i32 * s + reach + 1,
+                gy0 + h as i32 * s + reach + 1,
+            ];
+            let stride = (area[2] - area[0]) as usize;
+            let mut mask = vec![0u32; stride * (area[3] - area[1]) as usize];
+            rend.blit_glyph_ring(&mut mask, area, 0, 0, key, scale);
+            let cov = |x: i32, y: i32| {
+                let (i, j) = ((x - gx0).div_euclid(s), (y - gy0).div_euclid(s));
+                if (0..w as i32).contains(&i) && (0..h as i32).contains(&j) {
+                    f64::from(bytes[j as usize * w + i as usize]) / 255.0
+                } else {
+                    0.0
+                }
+            };
+            let (mut worst, mut soft) = ((0.0f64, 0u32, 0.0f64), 0usize);
+            for y in area[1]..area[3] {
+                for x in area[0]..area[2] {
+                    let left: f64 = KNOCK_DILATE_OFFSETS
+                        .iter()
+                        .map(|&(dx, dy)| 1.0 - cov(x - dx, y - dy))
+                        .product();
+                    let share = 255.0 * (1.0 - left);
+                    let m = mask[(y - area[1]) as usize * stride + (x - area[0]) as usize] & 0xff;
+                    soft += usize::from(share > 8.0 && share < 128.0);
+                    if (f64::from(m) - share).abs() > worst.0 {
+                        worst = ((f64::from(m) - share).abs(), m, share);
+                    }
+                }
+            }
+            assert!(soft > 0, "fixture: the ring at scale {xs} has soft pixels");
+            assert!(
+                worst.0 <= 2.5,
+                "scale {xs}: a mask pixel holds {} where its stamps cut {:.1} of 255",
+                worst.1,
+                worst.2
             );
         }
     }
@@ -5745,6 +5875,17 @@ fn face_name_match(face: &aterm_font::Face<'_>, want: &str) -> Option<NameMatch>
             }
         }
     }
+    // A variable styled face also answers to its family and the style it is
+    // drawn in (`SF Mono Italic`), the name a picker lists it by
+    // ([`font_catalog::variable_role_words`]).
+    if let Some(words) = font_catalog::variable_role_words(face) {
+        for id in [SUBFAMILY, TYPOGRAPHIC_SUBFAMILY] {
+            let normalized = normalize_family(words);
+            if !records.contains(&(id, normalized.clone())) {
+                records.push((id, normalized));
+            }
+        }
+    }
     let named = |id: u16| {
         records
             .iter()
@@ -6300,6 +6441,7 @@ impl Renderer {
             bold_font: None,
             bold_font_bytes: None,
             bold_font_index: 0,
+            bold_font_instance: FaceInstance::default(),
             bold_gid_cache: FxHashMap::default(),
             bold_yields_private_use: false,
             bold_lowered_asterisk: None,
@@ -6565,6 +6707,7 @@ impl Renderer {
         self.bold_lowered_asterisk = bundled::lowered_asterisk(&owned);
         self.bold_font_bytes = Some(owned);
         self.bold_font_index = index;
+        self.refresh_family_instances();
         self.refresh_drawn_faces();
         self.bold_gid_cache.clear();
         self.styled_keys.clear();
@@ -6602,8 +6745,10 @@ impl Renderer {
             index,
             gid_cache: FxHashMap::default(),
             id: next_styled_face_id(),
+            instance: FaceInstance::default(),
         });
         self.styled_retire_pending[slot] = None;
+        self.refresh_family_instances();
         self.refresh_drawn_faces();
         self.styled_keys.clear();
         self.clear_glyph_images();
@@ -7312,6 +7457,15 @@ impl Renderer {
             return;
         }
         self.styled_loaded = true;
+        self.discover_styled_faces();
+        // No glyph has drawn from a face that just arrived, so nothing cached
+        // holds its old instance.
+        self.refresh_family_instances();
+    }
+
+    /// [`Self::ensure_styled_faces`]'s discovery: fill each empty styled slot from the
+    /// bundled siblings, the sibling files beside the primary, then its collection.
+    fn discover_styled_faces(&mut self) {
         let Some(primary) = self.primary_path.clone() else {
             // A byte-loaded or embedded primary has no sibling file to derive.
             return;
@@ -7330,6 +7484,7 @@ impl Renderer {
                         id: next_styled_face_id(),
                         yields_private_use: bundled::yields_private_use(bytes),
                         lowered_asterisk: bundled::lowered_asterisk(bytes),
+                        instance: FaceInstance::default(),
                     });
                 }
             }
@@ -7352,6 +7507,7 @@ impl Renderer {
                         id: next_styled_face_id(),
                         yields_private_use: bundled::yields_private_use(&bytes),
                         lowered_asterisk: bundled::lowered_asterisk(&bytes),
+                        instance: FaceInstance::default(),
                     });
                     break;
                 }
@@ -7490,18 +7646,47 @@ impl Renderer {
         .map(|style| {
             let (face, synthetic) =
                 match resolve_styled_face(style, self.bold_font_bytes.is_some(), present) {
+                    // An instanced face is named for what it draws ("SF Mono Italic"): its
+                    // name table names only its `fvar` default.
                     FacePick::InjectedBold { synthetic } => (
-                        self.bold_font_bytes
-                            .as_deref()
-                            .and_then(|bytes| face_display_name(bytes, self.bold_font_index)),
+                        self.bold_font_bytes.as_deref().and_then(|bytes| {
+                            if self.bold_font_instance.drawn.is_some() {
+                                face_family_name(bytes, self.bold_font_index)
+                                    .map(|family| format!("{family} Bold"))
+                            } else {
+                                face_display_name(bytes, self.bold_font_index)
+                            }
+                        }),
                         synthetic,
                     ),
-                    FacePick::Styled { slot, synthetic } => (
-                        self.styled_faces[slot]
-                            .as_ref()
-                            .and_then(|face| face_display_name(&face.bytes, face.index)),
-                        synthetic,
-                    ),
+                    FacePick::Styled { slot, synthetic } => {
+                        let (coords, _, instanced) = self.styled_instance(slot, synthetic);
+                        let face = self.styled_faces[slot].as_ref();
+                        match (face, coords) {
+                            (Some(face), Some(_)) => {
+                                // The style the instance draws: the face's own, and bold
+                                // where its bold instance serves a bold-italic cell.
+                                let drawn = StyleBits(style.0 & !instanced.0);
+                                let words = match (
+                                    drawn.contains(StyleBits::BOLD),
+                                    drawn.contains(StyleBits::ITALIC),
+                                ) {
+                                    (true, true) => "Bold Italic",
+                                    (true, false) => "Bold",
+                                    _ => "Italic",
+                                };
+                                (
+                                    face_family_name(&face.bytes, face.index)
+                                        .map(|family| format!("{family} {words}")),
+                                    instanced,
+                                )
+                            }
+                            (face, _) => (
+                                face.and_then(|face| face_display_name(&face.bytes, face.index)),
+                                synthetic,
+                            ),
+                        }
+                    }
                     FacePick::Primary
                         if style.contains(StyleBits::BOLD) && self.vf_bold_coords.is_some() =>
                     {
@@ -7784,15 +7969,18 @@ impl Renderer {
             let gid = self.primary_unicode_gid(ch)?;
             let bytes = self.shaping_primary_bytes.clone()?;
             let index = self.primary_index;
+            // The portable raster draws the bold instance where CoreText is not the
+            // rasterizer, as it does on the other platforms.
             self.ct_glyph(
                 bytes.as_ptr() as usize,
-                bytes,
+                bytes.clone(),
                 index,
                 gid,
                 self.px,
                 &coords,
                 2,
             )
+            .or_else(|| variation::varied_glyph_raster(&bytes, index, &coords, gid, self.px))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -7892,7 +8080,11 @@ impl Renderer {
                 }
                 let gid = key.ch_or_id as u16;
                 if key.source == FaceId::BoldPrimary {
-                    if key.style.0 != StyleBits::REGULAR.0 {
+                    // Synthesis and an instanced face stay grayscale: this raster draws a
+                    // face as authored.
+                    if key.style.0 != StyleBits::REGULAR.0
+                        || self.bold_font_instance.drawn.is_some()
+                    {
                         return None;
                     }
                     (self.bold_font_bytes.clone()?, self.bold_font_index, gid)
@@ -7907,10 +8099,15 @@ impl Renderer {
                             if synthetic.0 == StyleBits::REGULAR.0 =>
                         {
                             let sf = self.styled_faces[slot].as_ref()?;
+                            // This raster applies no instance coords.
+                            if sf.instance.drawn.is_some() {
+                                return None;
+                            }
                             (sf.bytes.clone(), sf.index, gid)
                         }
                         FacePick::InjectedBold { synthetic }
-                            if synthetic.0 == StyleBits::REGULAR.0 =>
+                            if synthetic.0 == StyleBits::REGULAR.0
+                                && self.bold_font_instance.drawn.is_none() =>
                         {
                             (self.bold_font_bytes.clone()?, 0, gid)
                         }
@@ -7928,7 +8125,11 @@ impl Renderer {
                 if styled {
                     self.ensure_styled_faces();
                     let (slot, remaining) = self.styled_face_slot(ch, key.style)?;
-                    if remaining.0 != StyleBits::REGULAR.0 {
+                    if remaining.0 != StyleBits::REGULAR.0
+                        || self.styled_faces[slot]
+                            .as_ref()
+                            .is_some_and(|sf| sf.instance.drawn.is_some())
+                    {
                         return None;
                     }
                     let gid = self.styled_faces[slot]
@@ -8302,6 +8503,7 @@ impl Renderer {
                     id: next_styled_face_id(),
                     yields_private_use: bundled::yields_private_use(bytes),
                     lowered_asterisk: bundled::lowered_asterisk(bytes),
+                    instance: FaceInstance::default(),
                 });
             }
         }
@@ -8457,7 +8659,6 @@ impl Renderer {
         variation::varied_glyph_raster(bytes, self.primary_index, coords, gid, self.px)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn vf_bold_gid_raster(&self, gid: u16) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
         let coords = self.vf_bold_coords.as_deref()?;
         let bytes = self.shaping_primary_bytes.as_deref()?;
@@ -8544,7 +8745,7 @@ impl Renderer {
         self.install_variations(resolved, geometry)
     }
 
-    /// The last-applied variation requests ([`Self::set_font_variations`]), carried over by the GPU wrapper's rebuild so a zoom/theme rebuild keeps the user's instance.
+    /// The last-applied variation requests ([`Self::set_font_variations`]), which [`Self::rebuild_from_admitted`] carries so a zoom/theme rebuild keeps the user's instance.
     #[inline]
     #[must_use]
     pub fn font_variation_requests(&self) -> &[(u32, f32)] {
@@ -8574,7 +8775,11 @@ impl Renderer {
 
     fn install_variations(&mut self, resolved: ResolvedInstances, geometry: CellGeometry) -> bool {
         let geometry_moved = self.geom_coords.as_deref() != resolved.geometry.as_deref();
+        // A weight change moves every style together, a static primary's variable
+        // italic too.
+        let family_moved = self.refresh_family_instances();
         if !geometry_moved
+            && !family_moved
             && self.var_coords.as_deref() == resolved.drawn.as_deref()
             && self.vf_bold_coords.as_deref() == resolved.bold.as_deref()
         {
@@ -8702,6 +8907,97 @@ impl Renderer {
             drawn: var_coords,
             geometry,
             bold: vf_bold,
+        }
+    }
+
+    /// The instance face `index` of `bytes` draws at in `role`, under the live
+    /// requests and dark-theme nudge: the primary's policy over that face's own `fvar`.
+    fn family_face_instance(&self, bytes: &[u8], index: u32, role: FaceRole) -> FaceInstance {
+        let Some(probe) = variation::probe(bytes, index) else {
+            return FaceInstance::default();
+        };
+        match role {
+            FaceRole::Regular => {
+                let resolved = self.compute_variations_for_face(
+                    Some((bytes, index)),
+                    &self.cfg_font_variations,
+                    self.font_weight_dark_nudge,
+                );
+                FaceInstance {
+                    drawn: resolved.drawn,
+                    bold: resolved.bold,
+                }
+            }
+            FaceRole::Bold => {
+                let axes = &probe.axes;
+                let base = variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
+                let base = variation::apply_requests(axes, base, &self.cfg_font_variations);
+                let bold = variation::bold_role_coords(axes, &base);
+                let all_default = axes
+                    .iter()
+                    .zip(&bold)
+                    .all(|(axis, &value)| (value - axis.def).abs() < 1e-4);
+                FaceInstance {
+                    drawn: (!all_default).then(|| {
+                        axes.iter()
+                            .zip(&bold)
+                            .map(|(axis, &value)| (axis.tag, value))
+                            .collect()
+                    }),
+                    // A bold face serves the bold itself.
+                    bold: None,
+                }
+            }
+        }
+    }
+
+    /// Re-resolve every styled slot's and the injected bold's instance; whether any
+    /// moved (the caller drops the caches that baked the old one).
+    fn refresh_family_instances(&mut self) -> bool {
+        let mut moved = false;
+        for slot in 0..3 {
+            let Some((bytes, index)) = self.styled_faces[slot]
+                .as_ref()
+                .map(|face| (face.bytes.clone(), face.index))
+            else {
+                continue;
+            };
+            let instance = self.family_face_instance(&bytes, index, FaceRole::of_slot(slot));
+            if let Some(face) = self.styled_faces[slot].as_mut()
+                && face.instance != instance
+            {
+                face.instance = instance;
+                moved = true;
+            }
+        }
+        let bold = self
+            .bold_font_bytes
+            .clone()
+            .map(|bytes| self.family_face_instance(&bytes, self.bold_font_index, FaceRole::Bold))
+            .unwrap_or_default();
+        if self.bold_font_instance != bold {
+            self.bold_font_instance = bold;
+            moved = true;
+        }
+        moved
+    }
+
+    /// `(coords, var_slot, residual)` styled slot `slot` draws a cell at that leaves
+    /// `residual` to synthesize: its bold instance where the cell still wants bold
+    /// (BOLD then leaves the residual), else its drawn instance. `var_slot` tells the
+    /// raster caches one face's instances apart (0 as authored, 1 drawn, 2 bold).
+    fn styled_instance(&self, slot: usize, residual: StyleBits) -> (VarCoords, u8, StyleBits) {
+        let Some(face) = self.styled_faces.get(slot).and_then(Option::as_ref) else {
+            return (None, 0, residual);
+        };
+        if residual.contains(StyleBits::BOLD)
+            && let Some(bold) = face.instance.bold.clone()
+        {
+            return (Some(bold), 2, StyleBits(residual.0 & !StyleBits::BOLD.0));
+        }
+        match face.instance.drawn.clone() {
+            Some(drawn) => (Some(drawn), 1, residual),
+            None => (None, 0, residual),
         }
     }
 
@@ -10171,6 +10467,14 @@ impl Renderer {
                 .as_ref()
                 .map(|sf| (sf.bytes.as_ref(), sf.index))
         });
+        // The instance each styled run shapes at, by `styled_row_faces`' slot (3 = the
+        // injected bold).
+        let styled_vars: [Option<&[(u32, f32)]>; 4] = std::array::from_fn(|i| match i {
+            0..=2 => self.styled_faces[i]
+                .as_ref()
+                .and_then(|sf| sf.instance.drawn.as_deref()),
+            _ => self.bold_font_instance.drawn.as_deref(),
+        });
         let primary_vars: &[(aterm_font::Tag, f32)] = &self.shaping_variations;
         let mut row_face: Option<Option<ligature_shaping::RowShaper<'_>>> = None;
         let mut styled_row_faces: [Option<Option<ligature_shaping::RowShaper<'_>>>; 4] =
@@ -10219,6 +10523,8 @@ impl Renderer {
                     face.as_mut()
                         .and_then(|f| f.shape(run, run_chars, admit_collapsed, shaping_buffer))
                 } else {
+                    // Preserve each sibling's collection index, and shape at
+                    // the face's own instance (`styled_vars`).
                     let (slot, source) = match pick {
                         FacePick::Styled { slot, .. } => (slot, styled_bytes[slot]),
                         FacePick::InjectedBold { .. } => (3, injected_bold),
@@ -10226,8 +10532,14 @@ impl Renderer {
                     };
                     let face = styled_row_faces[slot].get_or_insert_with(|| {
                         source.and_then(|(b, idx)| {
-                            aterm_font::shape::ShapeFace::from_slice(b, idx)
-                                .map(|f| ligature_shaping::RowShaper::new(f, features))
+                            let mut f = aterm_font::Face::parse(b, idx).ok()?;
+                            for &(tag, value) in styled_vars[slot].unwrap_or(&[]) {
+                                f.set_variation(aterm_font::Tag(tag), value);
+                            }
+                            Some(ligature_shaping::RowShaper::new(
+                                aterm_font::shape::ShapeFace::new(f),
+                                features,
+                            ))
                         })
                     });
                     face.as_mut()
@@ -10613,33 +10925,67 @@ impl Renderer {
                     Vec<u8>,
                 ) = if let Some((slot, remaining)) = styled_slot {
                     synth_style = remaining;
+                    let (coords, var_slot, instanced_residual) =
+                        self.styled_instance(slot, remaining);
                     let gid = self.styled_faces[slot]
                         .as_mut()
                         .and_then(|sf| sf.unicode_gid(ch));
-                    #[cfg(target_os = "macos")]
-                    let ct = {
-                        let src = match (gid, self.styled_faces[slot].as_ref()) {
-                            (Some(g), Some(sf)) => {
-                                Some((sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index, g))
-                            }
-                            _ => None,
-                        };
-                        src.and_then(|(kp, b, idx, g)| {
-                            self.ct_glyph(kp, b, idx, g, self.px, &[], 0)
-                        })
+                    let src = match (gid, self.styled_faces[slot].as_ref()) {
+                        (Some(g), Some(sf)) => {
+                            Some((sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index, g))
+                        }
+                        _ => None,
                     };
+                    #[cfg(target_os = "macos")]
+                    let ct = src.clone().and_then(|(kp, b, idx, g)| {
+                        let vars = coords.clone();
+                        self.ct_glyph(
+                            kp,
+                            b,
+                            idx,
+                            g,
+                            self.px,
+                            vars.as_deref().unwrap_or(&[]),
+                            var_slot,
+                        )
+                    });
+                    // Linux declines an instanced face as it declines a varied primary.
                     #[cfg(any(all(unix, not(target_os = "macos")), windows))]
                     let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
-                        let src = match (gid, self.styled_faces[slot].as_ref()) {
-                            (Some(g), Some(sf)) => {
-                                Some((sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index, g))
-                            }
-                            _ => None,
-                        };
-                        src.and_then(|(kp, b, idx, g)| self.hinted_glyph(kp, &b, idx, g, &[], 0))
+                        #[cfg(unix)]
+                        let src = src.clone().filter(|_| coords.is_none());
+                        src.clone().and_then(|(kp, b, idx, g)| {
+                            let vars = coords.clone();
+                            self.hinted_glyph(
+                                kp,
+                                &b,
+                                idx,
+                                g,
+                                vars.as_deref().unwrap_or(&[]),
+                                var_slot,
+                            )
+                        })
                     };
                     #[cfg(not(any(unix, windows)))]
-                    let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
+                    let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
+                        let _ = var_slot;
+                        None
+                    };
+                    // Where the native raster declined, the instance's outline, never the
+                    // `fvar` default fontdue would draw.
+                    let ct = ct.or_else(|| {
+                        let (_, bytes, index, gid) = src.as_ref()?;
+                        variation::varied_glyph_raster(
+                            bytes,
+                            *index,
+                            coords.as_deref()?,
+                            *gid,
+                            self.px,
+                        )
+                    });
+                    if ct.is_some() && coords.is_some() {
+                        synth_style = instanced_residual;
+                    }
                     let (gw, gh, gxmin, gymin, gadv, bytes) = if let Some(t) = ct {
                         t
                     } else {
@@ -10792,6 +11138,23 @@ impl Renderer {
                 } else {
                     self.run_face_pick(key.style)
                 };
+                // A styled or injected pick's instance and what it leaves to synthesize; the
+                // primary's are picked in each arm below.
+                let (face_vars, face_var_slot, instanced_synth): (VarCoords, u8, StyleBits) =
+                    match &pick {
+                        FacePick::Styled { slot, synthetic } => {
+                            self.styled_instance(*slot, *synthetic)
+                        }
+                        FacePick::InjectedBold { synthetic } => {
+                            let drawn = self.bold_font_instance.drawn.clone();
+                            let var_slot = u8::from(drawn.is_some());
+                            (drawn, var_slot, *synthetic)
+                        }
+                        FacePick::Primary => (None, 0, key.style),
+                    };
+                // Only CoreText and the Windows hinter take an instance slot.
+                #[cfg(not(any(target_os = "macos", windows)))]
+                let _ = face_var_slot;
                 #[cfg(target_os = "macos")]
                 let (ct, vf_bold_drawn) = {
                     let src: Option<(usize, std::sync::Arc<[u8]>, u32)> = match &pick {
@@ -10820,7 +11183,10 @@ impl Renderer {
                             FacePick::Primary if self.var_coords.is_some() => {
                                 (self.var_coords.clone(), 1)
                             }
-                            _ => (None, 0),
+                            FacePick::Primary => (None, 0),
+                            FacePick::InjectedBold { .. } | FacePick::Styled { .. } => {
+                                (face_vars.clone(), face_var_slot)
+                            }
                         };
                         self.ct_glyph(
                             kp,
@@ -10831,6 +11197,11 @@ impl Renderer {
                             vars.as_deref().unwrap_or(&[]),
                             slot,
                         )
+                    });
+                    let ct = ct.or_else(|| {
+                        vf_bold = matches!(pick, FacePick::Primary)
+                            && key.style.contains(StyleBits::BOLD);
+                        vf_bold.then(|| self.vf_bold_gid_raster(gid)).flatten()
                     });
                     let drawn = vf_bold && ct.is_some();
                     (ct, drawn)
@@ -10849,6 +11220,13 @@ impl Renderer {
                             .clone()
                             .map(|b| (b.as_ptr() as usize, b, self.primary_index)),
                         FacePick::Primary => None,
+                        // An instanced face declines as a varied primary does: the
+                        // instanced outline raster below keeps its cells.
+                        FacePick::InjectedBold { .. } | FacePick::Styled { .. }
+                            if face_vars.is_some() =>
+                        {
+                            None
+                        }
                         FacePick::InjectedBold { .. } => self
                             .bold_font_bytes
                             .clone()
@@ -10893,7 +11271,10 @@ impl Renderer {
                                 FacePick::Primary if self.var_coords.is_some() => {
                                     (self.var_coords.clone(), 1)
                                 }
-                                _ => (None, 0),
+                                FacePick::Primary => (None, 0),
+                                FacePick::InjectedBold { .. } | FacePick::Styled { .. } => {
+                                    (face_vars.clone(), face_var_slot)
+                                }
                             };
                             self.hinted_glyph(
                                 kp,
@@ -10915,12 +11296,28 @@ impl Renderer {
                     let drawn = bold_instance && ct.is_some();
                     (ct, drawn)
                 };
+                let mut face_instanced =
+                    ct.is_some() && face_vars.is_some() && !matches!(pick, FacePick::Primary);
                 let (gw, gh, gxmin, gymin, gadv, mut bytes) = if let Some(t) = ct {
                     t
                 } else if let Some(t) = matches!(pick, FacePick::Primary)
                     .then(|| self.vf_primary_gid_raster(gid))
                     .flatten()
                 {
+                    t
+                } else if let Some(t) = face_vars.as_deref().and_then(|coords| {
+                    let (bytes, index) = match &pick {
+                        FacePick::Styled { slot, .. } => self.styled_faces[*slot]
+                            .as_ref()
+                            .map(|sf| (sf.bytes.clone(), sf.index))?,
+                        FacePick::InjectedBold { .. } => {
+                            (self.bold_font_bytes.clone()?, self.bold_font_index)
+                        }
+                        FacePick::Primary => return None,
+                    };
+                    variation::varied_glyph_raster(&bytes, index, coords, gid, self.px)
+                }) {
+                    face_instanced = true;
                     t
                 } else {
                     if let FacePick::Styled { slot, .. } = pick
@@ -10968,6 +11365,9 @@ impl Renderer {
                 stem_darken(&mut bytes, &self.stem_lut);
                 let synth = match pick {
                     FacePick::Primary => key.style,
+                    FacePick::InjectedBold { .. } | FacePick::Styled { .. } if face_instanced => {
+                        instanced_synth
+                    }
                     FacePick::InjectedBold { synthetic } | FacePick::Styled { synthetic, .. } => {
                         synthetic
                     }
@@ -12311,7 +12711,7 @@ impl Renderer {
                 1,
                 clip_y,
                 clip_x,
-                blend,
+                knock_cover,
             );
             return;
         }
@@ -12332,7 +12732,7 @@ impl Renderer {
                 ys,
                 clip_y,
                 clip_x,
-                blend,
+                knock_cover,
             );
         }
     }

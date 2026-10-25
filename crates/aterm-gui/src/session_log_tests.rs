@@ -6045,7 +6045,6 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         aterm_phase::Program::Codex,
         aterm_phase::Program::Agy,
         aterm_phase::Program::Muse,
-        aterm_phase::Program::Gemini,
         aterm_phase::Program::Generic,
     ]
     .into_iter()

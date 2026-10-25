@@ -181,11 +181,10 @@ impl CursorBeamRod {
         }
         self.blaze = e;
 
-        let dt = self
-            .last
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            .min(0.25);
+        let dt = match self.last {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32().min(0.25),
+            None => 0.0,
+        };
         self.last = Some(now);
         let rate = BREATHE_IDLE + BREATHE_ACTIVE * e;
         let rate = if cfg.shimmer {
@@ -195,9 +194,11 @@ impl CursorBeamRod {
         };
         self.breathe = (self.breathe + dt * rate).fract();
         let phase = self.breathe * std::f32::consts::TAU;
-        let breathe = 0.5 + 0.5 * phase.sin();
+        let breathe = 0.5 + 0.5 * crate::supernova::sin_cos_f32(phase).0;
 
-        let fill = (!cfg.bar).then(|| {
+        let fill = if cfg.bar {
+            None
+        } else {
             let styled = if cfg.dark_theme {
                 lerp_rgb(cfg.color, 0x00FF_FFFF, 0.10 + 0.35 * e)
             } else {
@@ -217,12 +218,12 @@ impl CursorBeamRod {
                     solved
                 }
             };
-            if cfg.pinned {
+            Some(if cfg.pinned {
                 crate::color_math::wear_pinned(cfg.color, styled, e, SETTLED_BLAZE)
             } else {
                 styled
-            }
-        });
+            })
+        };
 
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
@@ -379,7 +380,8 @@ impl CursorBeamRod {
         let reach = (0.28 + 0.30 * e) * (0.85 + 0.15 * breathe) * ch;
         let (rx, ry) = (cw * 0.5 + reach, ch * 0.5);
         let rho_edge = (cw * 0.5) / rx;
-        let f_edge = (1.0 - rho_edge * rho_edge).powi(2);
+        let f_edge_1 = 1.0 - rho_edge * rho_edge;
+        let f_edge = f_edge_1 * f_edge_1;
         let peak = AURA_PEAK_COV * (0.55 + 0.45 * e) * (0.9 + 0.1 * breathe) * cfg.intensity;
         if !(reach >= 1.0 && f_edge > 0.0 && peak >= 0.5) {
             return;
@@ -402,7 +404,7 @@ impl CursorBeamRod {
             let v2 = v * v;
             let w2 = 1.0 - v2;
             if w2 > 0.0 {
-                let half = rx * w2.sqrt();
+                let half = rx * crate::color_math::sqrt_f32(w2);
                 if half > hw {
                     let span = half - hw;
                     let knot = |k: usize| {
@@ -414,12 +416,17 @@ impl CursorBeamRod {
                         }
                         let u = dx * inv_rx;
                         let rho2 = u * u + v2;
-                        let f = (1.0 - rho2).max(0.0).powi(2) * inv_f_edge;
+                        let f_1 = (1.0 - rho2).max(0.0);
+                        let f = f_1 * f_1 * inv_f_edge;
                         let cov = (peak * f).round().min(OVER_INK_COV_CAP) as u8;
                         if cov == 0 {
                             return (rx_i, lx_i, 0, 0);
                         }
-                        let color = lerp_rgb(cfg.color, cfg.haze, 0.75 * rho2.sqrt());
+                        let color = lerp_rgb(
+                            cfg.color,
+                            cfg.haze,
+                            0.75 * crate::color_math::sqrt_f32(rho2),
+                        );
                         (rx_i, lx_i, cov, premul_rgb(color, cov))
                     };
                     let mut prev = knot(0);

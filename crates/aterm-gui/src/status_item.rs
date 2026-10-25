@@ -427,6 +427,8 @@ pub(crate) struct HeraldNotice {
     pub title: &'static str,
     /// `<tab title>: <what>`.
     pub body: String,
+    /// Revoked when this escalation's delivery intent ends.
+    pub(crate) validity: crate::notify::NoticeValidity,
     decided: (),
 }
 
@@ -470,7 +472,7 @@ pub(crate) enum HeraldQuiet {
     Limited,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct HeraldSlot {
     shown: Option<(EscalationKind, u64)>,
     label: Option<String>,
@@ -479,12 +481,14 @@ struct HeraldSlot {
     retry_at: Option<std::time::Instant>,
     owed: u32,
     quiet_logged_at: Option<std::time::Instant>,
+    notice_owner: Option<std::sync::Arc<()>>,
 }
 
 impl HeraldSlot {
-    const fn suppress_desktop_notice(&mut self) {
+    fn suppress_desktop_notice(&mut self) {
         self.owed = 0;
         self.retry_at = None;
+        self.notice_owner = None;
     }
 
     fn first_quiet(&mut self, now: std::time::Instant) -> bool {
@@ -790,6 +794,9 @@ impl Herald {
         }
         let slot = self.slots.entry(session).or_default();
         let ident = current.map(|e| (e.kind, e.key));
+        if slot.shown != ident {
+            slot.notice_owner = None;
+        }
         let label = current.map(|e| e.label.clone());
         let row_moved = slot.label != label;
         slot.label = label;
@@ -816,6 +823,9 @@ impl Herald {
             slot.owed += 1;
         }
         let owed = slot.owed;
+        if spent.is_some() || !desktop_alerts {
+            slot.notice_owner = None;
+        }
         let quiet = |herald: &mut Self, why, first_quiet| {
             herald.last_quiet = Some(why);
             HeraldOutcome {
@@ -865,12 +875,17 @@ impl Herald {
         slot.retry_at = None;
         slot.quiet_logged_at = None;
         self.recent.push_back(now);
+        let validity = crate::notify::NoticeValidity::new(
+            slot.notice_owner
+                .get_or_insert_with(|| std::sync::Arc::new(())),
+        );
         HeraldOutcome {
             row_moved,
             notice: Some(HeraldNotice {
                 session,
                 title: esc.headline,
                 body: esc.body.clone(),
+                validity,
                 decided: (),
             }),
             transition,
@@ -884,6 +899,7 @@ impl Herald {
         let Some(slot) = self.slots.get_mut(&session) else {
             return;
         };
+        slot.notice_owner = None;
         slot.retry_at = Some(now + NOTIFY_RETRY);
         let Some(posted) = slot.notified_at else {
             return;

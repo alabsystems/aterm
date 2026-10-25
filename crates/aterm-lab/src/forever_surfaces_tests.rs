@@ -285,8 +285,8 @@ fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
     assert!(drawn_is_face(&chip("face=cruise-until drawn=\"∞ ⤓18:00\"")));
     assert!(drawn_is_face(&chip("face=unhosted drawn=\"⊘ off\"")));
     assert!(!drawn_is_face(&chip("face=cruise drawn=\"∞ cruise\"")));
-    let g = chip("window=2 program=gemini face=- drawn=- why=no-footer spoken=-");
-    assert!(no_footer(&g) && footless("gemini") && !footless("claude"));
+    let g = chip("window=2 program=codex face=- drawn=- why=no-footer spoken=-");
+    assert!(no_footer(&g));
     assert!(!no_footer(&chip("face=land drawn=- why=no-footer")));
 }
 
@@ -805,18 +805,6 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         matches!(ok(&drawn_blank, Chain::Worker, "claude"), Verdict::Fail(_)),
         "a drawn chip with no title still fails"
     );
-    let g = title_seen(
-        Some(
-            "window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-"
-                .into(),
-        ),
-        None,
-    );
-    let v = ok(&g, Chain::LandB, "gemini");
-    assert!(
-        matches!(v, Verdict::Pass(ref w) if w.contains("no footer")),
-        "{v:?}"
-    );
     let agy = title_seen(
         Some(
             "window=2 program=agy face=master-off drawn=- why=switch-only spoken=- description=- \
@@ -1163,7 +1151,7 @@ fn only_a_chip_the_frame_left_undrawn_is_waited_on() {
     ));
     for read in [
         "autopilot sid=s-ww window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\" description=- title=\"autopilot: land\"",
-        "autopilot sid=s-ww window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-",
+        "autopilot sid=s-ww window=2 program=codex face=- drawn=- why=no-footer spoken=- description=- title=-",
         "autopilot sid=s-ww window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-",
     ] {
         assert!(!undrawn(read), "{read}");

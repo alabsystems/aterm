@@ -642,7 +642,8 @@ pub trait System: Sync {
         Err("lock_screen: not supported".into())
     }
 
-    /// Catch `SIGINT`, `SIGTERM`, and `SIGHUP` until the returned handle drops.
+    /// Catch `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` until the returned handle drops; one the
+    /// process ignores already stays ignored.
     fn catch_stops(&self) -> Box<dyn std::any::Any> {
         Box::new(())
     }

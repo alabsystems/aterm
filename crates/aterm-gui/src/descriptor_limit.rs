@@ -18,7 +18,8 @@ enum SuccessorLane {
     Forked,
 }
 
-/// The one place a successor settles its soft descriptor limit.
+/// The one place a launch settles its soft descriptor limit: a successor's for the sessions it
+/// adopts, any other launch's for the tabs it opens ([`raise_descriptor_limit_for_tabs`]).
 pub(crate) fn settle_incoming_descriptor_limit(env: &crate::handoff_env::HandoffEnv) {
     if let Some(limit) = adopt_carried_launcher_limit(env) {
         aterm_log::info!(
@@ -33,6 +34,7 @@ pub(crate) fn settle_incoming_descriptor_limit(env: &crate::handoff_env::Handoff
     } else if crate::seamless::incoming_offered_in(env) {
         SuccessorLane::Forked
     } else {
+        raise_descriptor_limit_for_tabs();
         return;
     };
     match (raise_descriptor_limit_for_claim(), lane) {
@@ -55,6 +57,28 @@ pub(crate) fn settle_incoming_descriptor_limit(env: &crate::handoff_env::Handoff
         (Err(error), _) => aterm_log::warn!(
             "overlap handoff: could not raise this successor's soft descriptor limit ({error}); \
              a large handoff may not fit it"
+        ),
+    }
+}
+
+/// A launch that adopts no sessions makes the same room for the tabs it opens: a tab holds several
+/// descriptors (8 in v0.138.0), so at launchd's soft limit of 256 (a launch from the Dock) v0.138.0
+/// opened 29 tabs and refused the next with `Too many open files`. The raise is recorded as a park's, so the launcher's limit is
+/// what its shells get and what an older successor of this process starts at; a limit already at
+/// the floor (a cold-lane exec's, which carries its own records) is left with its records.
+fn raise_descriptor_limit_for_tabs() {
+    match raise_descriptor_limit_for_claim() {
+        Ok(Some((from, to))) => {
+            PARK_RAISED_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+            aterm_log::info!(
+                "descriptor limit: raised this launch's soft descriptor limit from {from} to {to} \
+                 for the tabs it opens; new shells keep the launcher's {from}"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => aterm_log::warn!(
+            "descriptor limit: could not raise this launch's soft descriptor limit ({error}); \
+             it opens as many tabs as the launcher's limit holds"
         ),
     }
 }
@@ -685,10 +709,6 @@ pub(crate) mod tests {
             return;
         }
         let low = soft_limit();
-        settle_incoming_descriptor_limit(&crate::handoff_env::HandoffEnv::default());
-        assert_eq!(soft_limit(), low, "a cold launch raises nothing");
-        assert_eq!(launcher_soft_descriptor_limit(), None);
-
         PARK_RAISED_FROM.store(low, std::sync::atomic::Ordering::Relaxed);
         let mut launched = crate::handoff_env::HandoffEnv::default();
         launched.set(crate::seamless::ENV_RENDEZVOUS, "/nonexistent/rendezvous");
@@ -714,6 +734,39 @@ pub(crate) mod tests {
             "room already held is not raised again"
         );
         assert_eq!(park_raised_from(), None, "and the record stays the claim's");
+    }
+
+    #[test]
+    fn a_cold_launch_makes_room_for_its_tabs_and_its_shells_keep_the_launchers_limit() {
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
+            return;
+        }
+        let low = soft_nofile();
+        settle_incoming_descriptor_limit(&crate::handoff_env::HandoffEnv::default());
+        let raised = soft_nofile();
+        assert!(
+            raised > low,
+            "a cold launch makes room for the tabs it opens"
+        );
+        assert_eq!(
+            launcher_soft_descriptor_limit(),
+            Some(low),
+            "its shells get the launcher's limit"
+        );
+        assert_eq!(
+            park_raised_from(),
+            Some(low),
+            "and an older successor starts at it"
+        );
+
+        PARK_RAISED_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
+        settle_incoming_descriptor_limit(&crate::handoff_env::HandoffEnv::default());
+        assert_eq!(
+            soft_nofile(),
+            raised,
+            "room already held is not raised again"
+        );
+        assert_eq!(park_raised_from(), None, "nor recorded again");
     }
 
     #[test]

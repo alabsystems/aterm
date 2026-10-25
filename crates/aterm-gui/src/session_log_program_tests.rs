@@ -17,7 +17,11 @@ use crate::session_timeline::SessionTimeline;
 use crate::{App, WindowId};
 
 fn report(state: W, kind: Option<ProgramBlockedKind>) -> Option<ProgramState> {
-    Some(ProgramState { state, kind })
+    Some(ProgramState {
+        state,
+        kind,
+        app: aterm_core::terminal::program_state::ProgramApp::Codex,
+    })
 }
 
 /// The log's program marks, at the host tier.

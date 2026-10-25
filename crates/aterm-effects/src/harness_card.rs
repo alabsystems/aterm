@@ -2004,20 +2004,40 @@ fn field_spots_at(
             };
             let x = within_x0 + (unit(seed, salt * 2) * within_w) as i64;
             let y = room.y0 + (unit(seed, salt * 2 + 1) * room_h) as i64;
-            let on_kitty = kitty_pad.is_some_and(|r| r.contains(x, y));
-            let crowded = spots[..n]
-                .iter()
-                .map(|o| (o.x, o.y))
-                .chain(glint_slice.iter().map(|o| (o.x, o.y)))
-                .any(|(ox, oy)| (ox - x).abs() < gap && (oy - y).abs() < gap);
+            if let Some(r) = kitty_pad
+                && r.contains(x, y)
+            {
+                continue;
+            }
+            let mut crowded = false;
+            for o in &spots[..n] {
+                if (o.x - x).abs() < gap && (o.y - y).abs() < gap {
+                    crowded = true;
+                    break;
+                }
+            }
+            if !crowded {
+                for o in glint_slice {
+                    if (o.x - x).abs() < gap && (o.y - y).abs() < gap {
+                        crowded = true;
+                        break;
+                    }
+                }
+            }
+            if crowded {
+                continue;
+            }
             let reach = Rect {
                 x0: x - m,
                 y0: y - m,
                 x1: x + m + 1,
                 y1: y + m + 1,
             };
-            let across = trail.is_some_and(|t| across_trail(reach, t));
-            if !on_kitty && !crowded && !across {
+            let across = match trail {
+                Some(t) => across_trail(reach, t),
+                None => false,
+            };
+            if !across {
                 spots[n] = StarSpot {
                     x,
                     y,
@@ -2333,19 +2353,34 @@ impl HarnessCard {
     ) -> CardFrame {
         let (shape, origin) = CardShape::of(scene);
         let local = shape.scene();
-        let geo = Geo::new(local).filter(|_| CardArts::dimensions(local.ch).is_some());
-        let clock = self.step(now, scene, animate, geo.is_some());
-        let (under, over) = match geo.zip(clock) {
-            Some((geo, clock)) => frames.fill(&Emit::new(local, geo, clock, self.seed)),
-            None => CardFrames::nothing(),
+        let geo = if CardArts::dimensions(local.ch).is_some() {
+            Geo::new(local)
+        } else {
+            None
         };
-        let step = clock.and_then(|c| c.flow).map(|f| (f.step, self.grid_gen));
-        frames.keep((self.drew != Drew::Intro).then(|| KeptFrame {
-            shape,
-            step,
-            under: Arc::clone(&under),
-            over: Arc::clone(&over),
-        }));
+        let clock = self.step(now, scene, animate, geo.is_some());
+        let (under, over) = match (geo, clock) {
+            (Some(geo), Some(clock)) => frames.fill(&Emit::new(local, geo, clock, self.seed)),
+            _ => CardFrames::nothing(),
+        };
+        let step = match clock {
+            Some(c) => match c.flow {
+                Some(f) => Some((f.step, self.grid_gen)),
+                None => None,
+            },
+            None => None,
+        };
+        let kept = if self.drew != Drew::Intro {
+            Some(KeptFrame {
+                shape,
+                step,
+                under: Arc::clone(&under),
+                over: Arc::clone(&over),
+            })
+        } else {
+            None
+        };
+        frames.keep(kept);
         CardFrame {
             under,
             over,
@@ -2449,9 +2484,10 @@ impl HarnessCard {
     #[inline]
     fn fade_at(&self, at: Instant) -> f32 {
         const INV_GLINT_FADE_MS: f32 = 1.0 / GLINT_FADE_MS as f32;
-        self.fade0.map_or(1.0, |f| {
-            smooth(ms_between(f, at) as f32 * INV_GLINT_FADE_MS)
-        })
+        match self.fade0 {
+            Some(f) => smooth(ms_between(f, at) as f32 * INV_GLINT_FADE_MS),
+            None => 1.0,
+        }
     }
 
     #[inline]
@@ -2468,7 +2504,10 @@ impl HarnessCard {
             glint: Some((ms, self.fade_at(step_at))),
             flow: Some(Flow {
                 step,
-                hue_ms: self.hue0.map_or(ms, |h| ms_between(h, step_at)),
+                hue_ms: match self.hue0 {
+                    Some(h) => ms_between(h, step_at),
+                    None => ms,
+                },
             }),
         }
     }
@@ -2522,9 +2561,10 @@ impl HarnessCard {
         let phi = clock.line_drift(LINE_DRIFT);
         let env = clock.head_env();
         let pos = (clock.u() * LINE_SWEEPS).fract() * 1.4 - 0.2;
-        let span = f32::from(at.len.saturating_sub(1).max(1));
+        let inv_span = 1.0 / f32::from(at.len.saturating_sub(1).max(1));
         let hero = at.hero.clone();
-        let hero_span = f32::from(hero.end.saturating_sub(hero.start).saturating_sub(1).max(1));
+        let inv_hero_span =
+            1.0 / f32::from(hero.end.saturating_sub(hero.start).saturating_sub(1).max(1));
         let (wc, wr) = at.wand.unwrap_or((at.col, at.row));
         let wc_f = f32::from(wc);
         let dy_rows = f32::from(at.row) - f32::from(wr);
@@ -2538,63 +2578,58 @@ impl HarnessCard {
         };
         const INV_LINE_SWEEP_SIGMA: f32 = 1.0 / LINE_SWEEP_SIGMA;
         let (palette, inks) = (self.palette, &self.inks);
-        out.extend(
-            (0..at.len)
-                .map_while(|i| Some((i, at.col.checked_add(i)?)))
-                .map(|(i, c)| {
-                    let x = f32::from(i) / span;
-                    let sweep = if env == 0.0 {
-                        0.0
-                    } else {
-                        let d = (x - pos) * INV_LINE_SWEEP_SIGMA;
-                        env * (-d * d).exp()
-                    };
-                    let crest = sweep.max(glint_at(c));
-                    let rgb = if hero.contains(&i) {
-                        let k = f32::from(i - hero.start) / hero_span;
-                        let place = tri(k * LINE_HERO_SPREAD + phi);
-                        if dark {
-                            line_floor(
-                                mix_rgb(
-                                    lift_to_luminance(palette.at(place), LINE_HERO_DARK_LUMA_FLOOR),
-                                    WHITE,
-                                    crest * LINE_HERO_SWEEP_GAIN,
-                                ),
-                                ground,
-                            )
-                        } else {
-                            mix_rgb(
-                                inks.at(palette, ground, place),
-                                0,
-                                crest * LINE_SWEEP_GAIN_LIGHT,
-                            )
-                        }
-                    } else {
-                        let place = tri(x + phi);
-                        if dark {
-                            line_floor(
-                                mix_rgb(
-                                    palette.letter(place, true),
-                                    WHITE,
-                                    crest * LINE_SWEEP_GAIN,
-                                ),
-                                ground,
-                            )
-                        } else {
-                            mix_rgb(
-                                inks.at(palette, ground, place),
-                                0,
-                                crest * LINE_SWEEP_GAIN_LIGHT,
-                            )
-                        }
-                    };
-                    InkCell {
-                        row: at.row,
-                        col: c,
-                        color: [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8],
-                    }
-                }),
-        );
+        for i in 0..at.len {
+            let Some(c) = at.col.checked_add(i) else {
+                break;
+            };
+            let x = f32::from(i) * inv_span;
+            let sweep = if env == 0.0 {
+                0.0
+            } else {
+                let d = (x - pos) * INV_LINE_SWEEP_SIGMA;
+                env * crate::color_math::exp_f32(-d * d)
+            };
+            let crest = sweep.max(glint_at(c));
+            let rgb = if hero.contains(&i) {
+                let k = f32::from(i - hero.start) * inv_hero_span;
+                let place = tri(k * LINE_HERO_SPREAD + phi);
+                if dark {
+                    line_floor(
+                        mix_rgb(
+                            lift_to_luminance(palette.at(place), LINE_HERO_DARK_LUMA_FLOOR),
+                            WHITE,
+                            crest * LINE_HERO_SWEEP_GAIN,
+                        ),
+                        ground,
+                    )
+                } else {
+                    mix_rgb(
+                        inks.at(palette, ground, place),
+                        0,
+                        crest * LINE_SWEEP_GAIN_LIGHT,
+                    )
+                }
+            } else {
+                let place = tri(x + phi);
+                if dark {
+                    line_floor(
+                        mix_rgb(palette.letter(place, true), WHITE, crest * LINE_SWEEP_GAIN),
+                        ground,
+                    )
+                } else {
+                    mix_rgb(
+                        inks.at(palette, ground, place),
+                        0,
+                        crest * LINE_SWEEP_GAIN_LIGHT,
+                    )
+                }
+            };
+            out.push(InkCell {
+                row: at.row,
+                col: c,
+                color: [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8],
+            });
+        }
     }
 }
 
@@ -2721,7 +2756,7 @@ fn lay_cut(
     if c.is_empty() {
         return lay_cut(q, k + 1, last, cover, lay);
     }
-    [
+    for piece in [
         Rect { y1: c.y0, ..q },
         Rect { y0: c.y1, ..q },
         Rect {
@@ -2736,9 +2771,12 @@ fn lay_cut(
             y1: c.y1,
             ..q
         },
-    ]
-    .into_iter()
-    .all(|piece| lay_cut(piece, k + 1, last, cover, lay))
+    ] {
+        if !lay_cut(piece, k + 1, last, cover, lay) {
+            return false;
+        }
+    }
+    true
 }
 
 struct Emit<'a> {
@@ -2769,9 +2807,10 @@ impl<'a> Emit<'a> {
             phi: clock.phi(),
             head_env: clock.head_env(),
             head_pos: (clock.u() * HEAD_LAPS).fract(),
-            shimmer_pos: clock
-                .t_ms
-                .map_or(0.0, |t| (t as f32 * INV_SHIMMER_MS).fract() * 1.4 - 0.2),
+            shimmer_pos: match clock.t_ms {
+                Some(t) => (t as f32 * INV_SHIMMER_MS).fract() * 1.4 - 0.2,
+                None => 0.0,
+            },
             kitty: seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(clock))),
             seat,
             star_region,
@@ -2814,7 +2853,7 @@ impl<'a> Emit<'a> {
     }
 
     #[inline]
-    fn border_paint(&self, s: f32, (x, y): (f32, f32)) -> Paint {
+    const fn border_paint(&self, s: f32, (x, y): (f32, f32)) -> Paint {
         const INV_HEAD_SIGMA: f32 = 1.0 / HEAD_SIGMA;
         let base = self
             .scene
@@ -2822,16 +2861,17 @@ impl<'a> Emit<'a> {
             .art_at(tri(2.0 * s + self.phi), self.scene.dark);
         let env = self.head_env;
         let w = if env > 0.0 {
-            let d = (s - self.head_pos).rem_euclid(1.0);
+            let u = s - self.head_pos;
+            let d = u - u.floor();
             let d = d.min(1.0 - d) * INV_HEAD_SIGMA;
-            env * (-d * d).exp()
+            env * crate::color_math::exp_f32(-d * d)
         } else {
             0.0
         };
         let ring = self.ring_at(x, y);
         if self.scene.dark {
             let w = (w * HEAD_GAIN).max(GLINT_CREST_DARK * ring);
-            light(mix_rgb(base, WHITE, w), f32::from(BORDER_COV))
+            light(mix_rgb(base, WHITE, w), BORDER_COV as f32)
         } else {
             let w = w.max(GLINT_CREST_LIGHT * ring);
             ink(
@@ -2912,7 +2952,7 @@ impl<'a> Emit<'a> {
         }
         match self.clock.t_ms {
             Some(t) if t < WAVE_END_MS && amp > 0 => {
-                if (k + (t / WAVE_STEP_MS) as i64).rem_euclid(2) == 0 {
+                if (k + (t / WAVE_STEP_MS) as i64) & 1 == 0 {
                     amp
                 } else {
                     -amp
@@ -3063,7 +3103,8 @@ impl<'a> Emit<'a> {
     #[inline]
     fn rim_paint(&self, (x, y): (f32, f32), (cx, cy): (f32, f32)) -> Paint {
         const INV_TAU: f32 = 1.0 / std::f32::consts::TAU;
-        let s = ((x - cx).atan2(cy - y) * INV_TAU).rem_euclid(1.0);
+        let u = (x - cx).atan2(cy - y) * INV_TAU;
+        let s = u - u.floor();
         let base = self
             .scene
             .palette
@@ -3131,16 +3172,18 @@ impl<'a> Emit<'a> {
         let (rest, flare) = (glints.rest, glints.flare);
         let u = self.clock.u();
         let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) * INV_STAR_SETTLE_SPAN);
-        let riding = self
-            .seat
-            .and_then(|seat| ride_span(&self.geo, self.scene, &seat));
+        let riding = match self.seat {
+            Some(seat) => ride_span(&self.geo, self.scene, &seat)
+                .map(|(from, dist)| (from, 1.0 / dist as f32)),
+            None => None,
+        };
         let t_sec = self.clock.t_ms.map(|t| t as f32 * 0.001);
         let rest_rgb = self.scene.palette.glint_rest();
         let inv_trail_len = 1.0 / trail.len as f32;
         for (i, s) in glints.spots().iter().enumerate() {
             let up = match (self.clock.ride_ms, riding) {
-                (Some(t), Some((from, dist))) => {
-                    let passed = ride_at((s.x + flare + 1 - from) as f32 / dist as f32);
+                (Some(t), Some((from, inv_dist))) => {
+                    let passed = ride_at((s.x + flare + 1 - from) as f32 * inv_dist);
                     smooth((t as f32 - passed) * INV_STAR_REVEAL_MS)
                 }
                 _ => 1.0,
@@ -3192,9 +3235,11 @@ impl<'a> Emit<'a> {
         );
         let u = self.clock.u();
         let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) * INV_STAR_SETTLE_SPAN);
-        let riding = self
-            .seat
-            .and_then(|seat| Some((seat, ride_span(&self.geo, self.scene, &seat)?)));
+        let riding = match self.seat {
+            Some(seat) => ride_span(&self.geo, self.scene, &seat)
+                .map(|(from, dist)| (seat, from, 1.0 / dist as f32)),
+            None => None,
+        };
         let t_sec = self.clock.t_ms.map(|t| t as f32 * 0.001);
         let chf = self.geo.ch as f32;
         let (even_rgb, odd_rgb) = match self.scene.palette {
@@ -3205,8 +3250,8 @@ impl<'a> Emit<'a> {
         for (i, s) in spots[..n].iter().enumerate() {
             let arm = i64::from(star_arm_px(star_arm(chf, s.ratio)));
             let up = match (self.clock.ride_ms, riding) {
-                (Some(t), Some((seat, (from, dist)))) if s.x < seat.rect.x0 => {
-                    let passed = ride_at((s.x + arm + 1 - from) as f32 / dist as f32);
+                (Some(t), Some((seat, from, inv_dist))) if s.x < seat.rect.x0 => {
+                    let passed = ride_at((s.x + arm + 1 - from) as f32 * inv_dist);
                     smooth((t as f32 - passed) * INV_STAR_REVEAL_MS)
                 }
                 _ => 1.0,
@@ -3303,7 +3348,7 @@ impl<'a> Emit<'a> {
                 clip: region,
                 centre,
                 arm,
-                cov: SHED_COV * (1.0 - tau).powf(1.5),
+                cov: SHED_COV * crate::color_math::powf_pos_f32(1.0 - tau, 1.5),
                 gold: false,
                 color: self.mark_ink(k, self.scene.palette.mark(k)),
                 light: dark,
@@ -3379,14 +3424,14 @@ impl<'a> Emit<'a> {
             region,
             centres: std::array::from_fn(|k| {
                 let theta = turn + k as f32 * STEP_THETA;
-                let (sin_t, cos_t) = theta.sin_cos();
+                let (sin_t, cos_t) = crate::supernova::sin_cos_f32(theta);
                 (
                     cx + (cos_t * rx * reach).round() as i64,
                     mid + (sin_t * ry * reach).round() as i64,
                 )
             }),
             arm: i64::from(star_arm_px(star_arm(g.ch as f32, ratio))),
-            cov: BURST_COV * (1.0 - tau).powf(1.2),
+            cov: BURST_COV * crate::color_math::powf_pos_f32(1.0 - tau, 1.2),
         })
     }
 }

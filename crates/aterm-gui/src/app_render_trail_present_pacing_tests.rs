@@ -721,3 +721,53 @@ fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
     );
     assert!(!ok, "an already-due catch-up rearm must be rejected");
 }
+
+/// A mixed tab draws the cursor effects too, so a GPU whose drawable acquire outruns the frame
+/// sheds them there as it does under a terminal tab: its frames charge the wait past one frame to
+/// the load-shed latch. The frame interval is a second, so no host's own frame cost reaches the
+/// latch's threshold of one and a half; the same frames with no wait leave it down.
+#[test]
+fn a_mixed_tab_charges_acquire_backpressure_to_the_shed_latch() {
+    struct ClearInjectedWait;
+    impl Drop for ClearInjectedWait {
+        fn drop(&mut self) {
+            super::ACQUIRE_WAIT_NS_FOR_TEST.with(|wait| wait.set(None));
+        }
+    }
+    let _clear = ClearInjectedWait;
+    let interval = Duration::from_secs(1);
+    let shed_after = |wait: Option<Duration>| {
+        let mut app = App::headless_for_test();
+        let id = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let _ = app.split_active_with_stub_terminal(id, crate::tab_model::SplitAxis::Horizontal);
+        assert_eq!(
+            app.active_visible_frame_layout(id).map(|(_, route)| route),
+            Some(crate::VisibleContentRoute::Heterogeneous),
+            "precondition: a mixed tab"
+        );
+        {
+            let ws = app.windows.get_mut(&id).expect("the window");
+            ws.frame_interval = Some(interval);
+            ws.present = Some(crate::PresentTarget::Cpu {
+                surface: crate::present::CpuSurface::Scripted(Default::default()),
+            });
+        }
+        super::ACQUIRE_WAIT_NS_FOR_TEST.with(|cell| {
+            cell.set(wait.map(|wait| u64::try_from(wait.as_nanos()).expect("ns")));
+        });
+        let t0 = Instant::now();
+        for frame in 0..u64::from(super::PERF_HYSTERESIS_FRAMES) + 2 {
+            app.redraw_window_at(id, t0 + interval * u32::try_from(frame).expect("frame"));
+        }
+        app.perf_reduced
+    };
+    assert!(
+        !shed_after(None),
+        "control: the frames' own cost stays under the latch's threshold"
+    );
+    assert!(
+        shed_after(Some(interval * 3)),
+        "an acquire waiting three frames each mixed frame trips effect shedding"
+    );
+}

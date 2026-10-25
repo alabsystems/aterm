@@ -1405,13 +1405,14 @@ impl App {
         }
     }
 
-    /// Handle a mouse press in `wid` while the menu is open.
+    /// Handle a mouse press in `wid` at `at` while the menu is open.
     pub(crate) fn autopilot_menu_press(
         &mut self,
         wid: WindowId,
         left: bool,
         x: f64,
         y: f64,
+        at: std::time::Instant,
     ) -> bool {
         let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
             return false;
@@ -1431,7 +1432,7 @@ impl App {
                                 wid,
                                 rect,
                                 laid,
-                                at: std::time::Instant::now(),
+                                at,
                             });
                         }
                     } else if let Some(menu) = self.autopilot_menu.as_mut() {
@@ -1448,8 +1449,8 @@ impl App {
         true
     }
 
-    /// Swallow the second press of a double-click on the rect a menu choice just closed.
-    pub(crate) fn spends_menu_follow_up(&mut self, wid: WindowId) -> bool {
+    /// Swallow the second press, at `at`, of a double-click on the rect a menu choice just closed.
+    pub(crate) fn spends_menu_follow_up(&mut self, wid: WindowId, at: std::time::Instant) -> bool {
         let Some(spent) = self.autopilot_menu_spent.take() else {
             return false;
         };
@@ -1458,7 +1459,7 @@ impl App {
             .get(&wid)
             .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
         spent.wid == wid
-            && spent.at.elapsed().as_millis() <= crate::multi_click_ms()
+            && at.saturating_duration_since(spent.at).as_millis() <= crate::multi_click_ms()
             && spent
                 .laid
                 .and_then(|laid| laid.cell_at(x, y))

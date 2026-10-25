@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify cells`: cross-cell lint and type-check across Windows, linux-arm, and wasm32.
+//! `verify cells`: cross-cell lint and type-check of every forge cell but this machine's own
+//! (Windows, Linux, both Mac slices and wasm32, less the host's).
 //!
 //! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
 //! compiles on a rustup toolchain carrying its triple's std (stable first),
@@ -25,7 +26,8 @@ use crate::stages::lane_jobs;
 /// The build-script shims a cell may apply.
 pub const POLICY: &str = "tools/cross-cell-gate.tsv";
 
-/// The triples some machine in this fleet runs natively.
+/// The triples some machine in this fleet runs natively: their OSes' cells are red on any
+/// rustc warning ([`judges_warnings`]).
 pub const FLEET_HOST_TRIPLES: [&str; 3] = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -36,22 +38,25 @@ pub const FLEET_HOST_TRIPLES: [&str; 3] = [
 /// wasm32-unknown-unknown, which no host lint can see.
 const WASM_CLIPPY_CONF: &str = "crates/aterm-time/wasm32";
 
-/// The cells this check compiles by default: forge's own list, less the hosted triples.
+/// The cells this check compiles by default: forge's own list, less the cell of `host`, this
+/// machine's triple, which its own build, test and lint judge. A triple another machine could
+/// host is checked here too: the release ships the Intel Mac slice and x86_64 Linux, and no
+/// other check lints either.
 #[must_use]
-pub fn foreign_cells() -> Vec<Cell> {
+pub fn foreign_cells(host: &str) -> Vec<Cell> {
     aterm_forge::resolve::default_cells()
         .into_iter()
-        .filter(|c| !FLEET_HOST_TRIPLES.contains(&c.triple.as_str()))
+        .filter(|c| c.triple != host)
         .collect()
 }
 
-/// The cells a run checks: each `--cell` named, else [`foreign_cells`].
+/// The cells a run checks: each `--cell` named, else [`foreign_cells`] of `host`.
 ///
 /// # Errors
 /// A name forge's cell list does not have.
-pub fn selected(names: &[String]) -> Result<Vec<Cell>, String> {
+pub fn selected(names: &[String], host: &str) -> Result<Vec<Cell>, String> {
     if names.is_empty() {
-        return Ok(foreign_cells());
+        return Ok(foreign_cells(host));
     }
     aterm_forge::resolve::select(&aterm_forge::resolve::default_cells(), names)
 }
@@ -182,17 +187,17 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             return;
         }
     };
-    let cells = match selected(&ctx.cells) {
-        Ok(c) => c,
-        Err(why) => {
-            r.cannot_run(format!("cells — {why}"));
-            return;
-        }
-    };
     let host = match host_triple(ctx) {
         Ok(h) => h,
         Err(why) => {
             r.cannot_run(format!("cells — this machine's triple: {why}"));
+            return;
+        }
+    };
+    let cells = match selected(&ctx.cells, &host) {
+        Ok(c) => c,
+        Err(why) => {
+            r.cannot_run(format!("cells — {why}"));
             return;
         }
     };
@@ -1556,19 +1561,34 @@ mod tests {
         }
     }
 
-    /// No `--cell` is the foreign cells; a name picks that cell, hosted or
-    /// not; an unknown name is refused.
+    /// No `--cell` is every cell but the host's, a triple another machine could host
+    /// included; a name picks that cell, the host's too; an unknown name is refused.
     #[test]
-    fn a_run_checks_the_foreign_cells_or_each_cell_named() {
-        assert_eq!(selected(&[]).expect("default"), foreign_cells());
-        let named = selected(&["linux".to_string(), "win".to_string()]).expect("named");
+    fn a_run_checks_every_cell_but_the_hosts_or_each_cell_named() {
+        let mac = "aarch64-apple-darwin";
+        let all = aterm_forge::resolve::default_cells();
+        let default = selected(&[], mac).expect("default");
+        assert_eq!(default, foreign_cells(mac));
+        let triples: Vec<&str> = default.iter().map(|c| c.triple.as_str()).collect();
+        assert!(!triples.contains(&mac), "{triples:?}");
+        assert!(
+            triples.contains(&"x86_64-apple-darwin")
+                && triples.contains(&"x86_64-unknown-linux-gnu"),
+            "{triples:?}"
+        );
+        assert_eq!(default.len() + 1, all.len());
+        assert_eq!(
+            selected(&[], "riscv64gc-unknown-linux-gnu").expect("no cell's"),
+            all
+        );
+        let named = selected(&["mac-arm".to_string(), "win".to_string()], mac).expect("named");
         let names: Vec<&str> = named.iter().map(|c| c.name.as_str()).collect();
         assert!(
-            names.contains(&"linux") && names.contains(&"win"),
+            names.contains(&"mac-arm") && names.contains(&"win"),
             "{names:?}"
         );
         assert_eq!(named.len(), 2);
-        assert!(selected(&["plan9".to_string()]).is_err());
+        assert!(selected(&["plan9".to_string()], mac).is_err());
     }
 
     #[test]
@@ -2316,7 +2336,10 @@ mod tests {
             "wasm-cpu",
             "mac-x64"
         ])));
-        assert!(runs_win32_oracles(&foreign_cells()), "the default run");
+        assert!(
+            runs_win32_oracles(&foreign_cells("aarch64-apple-darwin")),
+            "the default run"
+        );
         assert_eq!(
             WIN32_ORACLES.map(|(verb, _)| verb),
             ["oracle", "oracle-052"]

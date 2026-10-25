@@ -1684,3 +1684,60 @@ fn a_bus_brief_names_no_mail_link() {
     .text;
     assert!(given.contains(" mail=@9~"), "CONTROL: {given}");
 }
+
+/// **A WHOLE VIEW COUNTS MAIL FROM ITS NEWEST SNAPSHOT** (D4): a mail mark stays local, so a view
+/// holding every record from its start counts the mail its newest snapshot says, never zero.
+#[test]
+fn a_whole_view_counts_mail_from_its_newest_snapshot() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut view = BusSpace::new(1);
+    drain(&mut log, &mut view, 1);
+    let mail = Fields::new()
+        .word(Key::Dir, "in")
+        .and_then(|f| f.word(Key::MailKind, "note"))
+        .and_then(|f| f.u(Key::Off, 9))
+        .expect("mail fields");
+    log.mark(
+        Mark::new(Kind::Mail, Src::Fabric, Conf::Exact)
+            .at(Node::SESSION)
+            .by(Actor::Bridge)
+            .fields(mail),
+        at(10),
+    )
+    .expect("the mail mark");
+    for i in 0..aterm_slog::SNAP_EVERY {
+        let t = log
+            .open(
+                Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+                at(20 + 2 * i),
+            )
+            .expect("a turn");
+        log.close(
+            t,
+            Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+            at(21 + 2 * i),
+        )
+        .expect("its close");
+    }
+    drain(&mut log, &mut view, 400);
+    assert_eq!(
+        log.fold().state().totals.mail_in,
+        1,
+        "PRECONDITION: counted locally"
+    );
+    let snap = view.snap().expect("PRECONDITION: a snapshot");
+    assert_eq!(
+        snap.f.get_u(Key::MailIn),
+        Some(1),
+        "PRECONDITION: the snapshot counts it"
+    );
+    assert!(view.holds_start(), "PRECONDITION: a whole view");
+    let (bus, partial) = view.fold();
+    assert!(!partial);
+    assert_eq!(
+        (bus.state().totals.mail_in, bus.state().totals.mail_out),
+        (1, 0),
+        "the view counts the snapshot's mail"
+    );
+}

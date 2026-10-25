@@ -38,10 +38,27 @@ pub const fn is_harness(program: &str) -> bool {
 /// kept current once installed, as a vendor row outside the default set is
 /// ([`crate::vendor_direct::VendorSpec::default_set`]). Nothing runs one until aterm serves
 /// harness contract v3, so a harness joins the default set in that aterm change, once it
-/// has a signed release (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D17).
+/// has a signed release (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D17). This rule binds
+/// only the clients built with it: an aterm through v0.135.0 installs every program the index
+/// lists, so the producer pins no harness while one may read the index, unless this holds the
+/// harness, after which every client installs it alike (atpkg-publish `channel::index`, D24).
 #[must_use]
 pub const fn in_default_set(program: &str) -> bool {
     !is_harness(program)
+}
+
+/// The harness a vendor program's `agents/` twin hands its session to once that harness is
+/// installed, as `(program, tool)`: the harness that serves aterm's harness contract 3 for that
+/// agent (`crates/aterm-agent/src/harness/contract.rs`, `ROSTER`;
+/// `docs/DESIGN-harness-repos-2026-10-24.md` §9 step 6). Only grok-alab today: a harness joins
+/// here in the aterm change that rosters it, never before (its claim would be refused and it
+/// would only run the vendor in its place).
+#[must_use]
+pub const fn twin_harness(vendor: &str) -> Option<(&'static str, &'static str)> {
+    match vendor.as_bytes() {
+        b"grok" => Some(("grok-alab", "grok-alab")),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +101,26 @@ mod tests {
             assert!(in_default_set(p), "{p:?} stays in the default set");
         }
         const _: () = assert!(is_harness("x-alab") && !is_harness("-alab"));
+    }
+
+    /// Only grok's twin hands its session to a harness, grok-alab, which is a harness program;
+    /// no other vendor's does yet, and no harness's own name does.
+    #[test]
+    fn only_grok_hands_its_session_to_grok_alab() {
+        assert_eq!(twin_harness("grok"), Some(("grok-alab", "grok-alab")));
+        assert!(is_harness("grok-alab"));
+        for other in [
+            "claude",
+            "codex",
+            "codex-old",
+            "agy",
+            "muse",
+            "kimi",
+            "grok-alab",
+            "Grok",
+            "",
+        ] {
+            assert_eq!(twin_harness(other), None, "{other:?}");
+        }
     }
 }

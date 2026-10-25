@@ -116,7 +116,11 @@ impl VisibilityHold {
             }
             None => {
                 let since = *self.blind_since.get_or_insert(now);
-                (now.saturating_duration_since(since) >= VETO_BLIND_DUR).then_some(false)
+                if now.saturating_duration_since(since) >= VETO_BLIND_DUR {
+                    Some(false)
+                } else {
+                    None
+                }
             }
         };
         match observed {
@@ -143,10 +147,13 @@ impl VisibilityHold {
 
     #[inline]
     fn advance(&mut self, now: Instant) -> f32 {
-        let dt = self
-            .at
-            .map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f32())
-            .clamp(0.0, 2.0);
+        let dt = match self.at {
+            Some(at) => now
+                .saturating_duration_since(at)
+                .as_secs_f32()
+                .clamp(0.0, 2.0),
+            None => 0.0,
+        };
         self.at = Some(now);
         dt
     }
@@ -217,9 +224,42 @@ impl ZHold {
 
     #[inline]
     fn deadline(&self) -> Option<Instant> {
-        self.clear_since.map(|since| since + Z_DWELL_DUR)
+        let since = self.clear_since?;
+        Some(since + Z_DWELL_DUR)
     }
 }
+
+/// What the last [`PetBrain::finish_console_frame`] did to the motes the brain drew; the offer
+/// reads it ([`PetBrain::hidden_mote_offer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoteGate {
+    /// The console drew every mote the brain drew.
+    Open,
+    /// The console dropped every mote, wherever it was: a resident, an incoherent surface, a body
+    /// it does not draw.
+    Shut,
+    /// The console dropped each mote whose box does not clear the ink ([`mote_clears`]).
+    Clearance,
+}
+
+/// Whether the console draws mote `m`: a box a tile's radius around its centre clears the ink by
+/// [`CLEARANCE`].
+#[inline]
+const fn mote_clears(world: &PetWorld, m: &PetMoteSprite, (cell_w, cell_h): (u16, u16)) -> bool {
+    let min_ch = (if cell_h > 6 { cell_h } else { 6 }) as f32;
+    let inv_cw = 1.0 / (if cell_w > 1 { cell_w } else { 1 }) as f32;
+    let inv_ch = 1.0 / (if cell_h > 1 { cell_h } else { 1 }) as f32;
+    let radius = min_ch * m.scale + 1.0;
+    let rw = radius * inv_cw;
+    let rh = radius * inv_ch;
+    world.clear(
+        PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
+        CLEARANCE,
+    )
+}
+
+/// The most edges [`PetBrain::hidden_mote_offer`] walks before it offers the one it reached.
+const HIDDEN_MOTE_EDGES_MAX: u32 = 256;
 
 #[inline]
 const fn passing(frame: &PetFrame) -> bool {
@@ -360,6 +400,18 @@ pub(super) struct ConsoleLife {
     on_glass: bool,
     hold: VisibilityHold,
     z: ZHold,
+    /// What the last frame's console pass did to the brain's motes.
+    mote_gate: MoteGate,
+    /// The mote slots the last frame's console pass dropped while the brain kept them.
+    hidden_motes: [bool; PET_MOTES_MAX],
+    /// A test's old schedule: the offer keeps every hidden mote's own edges
+    /// ([`PetBrain::console_hid_mote`]).
+    #[cfg(test)]
+    pub(super) offer_hidden_motes: bool,
+    /// A test's exact arms: the brain's deadlines without the host's [`ARM_MIN`] floor
+    /// ([`PetBrain::arm_floor`]).
+    #[cfg(test)]
+    pub(super) exact_arms: bool,
     cursor_home: Option<(u16, u16)>,
     contact_changed: bool,
     observed_seq: u64,
@@ -447,6 +499,12 @@ impl ConsoleLife {
             on_glass: false,
             hold: VisibilityHold::DEFAULT,
             z: ZHold::EMPTY,
+            mote_gate: MoteGate::Open,
+            hidden_motes: [false; PET_MOTES_MAX],
+            #[cfg(test)]
+            offer_hidden_motes: false,
+            #[cfg(test)]
+            exact_arms: false,
             cursor_home: None,
             contact_changed: false,
             observed_seq: 0,
@@ -463,14 +521,13 @@ impl ConsoleLife {
 
     /// A fresh console life for a retired coordinate space.
     pub(super) fn retired(&mut self) -> Self {
-        let spare_world = self
-            .world
-            .take()
-            .map(|mut world| {
+        let spare_world = match self.world.take() {
+            Some(mut world) => {
                 world.retire();
-                world
-            })
-            .or_else(|| self.spare_world.take());
+                Some(world)
+            }
+            None => self.spare_world.take(),
+        };
         let mut row_sig = core::mem::take(&mut self.row_sig);
         let mut row_sig_prev = core::mem::take(&mut self.row_sig_prev);
         row_sig.clear();
@@ -487,15 +544,15 @@ impl ConsoleLife {
 impl PetBrain {
     /// Exactly one note per admitted gesture/bundle.
     pub fn note_console_input(&mut self, now: Instant, kind: PetInputKind) {
-        let repair_live = self.console.repair_until.is_some_and(|end| now < end);
+        let repair_live = matches!(self.console.repair_until, Some(end) if now < end);
         let erases = matches!(
             kind,
             PetInputKind::Delete | PetInputKind::Kill | PetInputKind::KillForward
         );
+        let caret_rc = self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c)));
         if erases || (kind == PetInputKind::Text && repair_live) {
             if !repair_live {
-                self.console.repair_target =
-                    self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c)));
+                self.console.repair_target = caret_rc;
             }
             self.console.repair_until = Some(now + EDIT_HOLD_DUR);
         } else {
@@ -509,7 +566,7 @@ impl PetBrain {
             seq: self.console.seq,
             kind,
             at: now,
-            target: self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c))),
+            target: caret_rc,
         });
         if matches!(
             kind,
@@ -661,29 +718,25 @@ impl PetBrain {
         reserve: PetReserve<'_>,
         fill: PetFill,
     ) {
-        let held_center = self
-            .console
-            .cursor_home
-            .and(self.console.last_body)
-            .filter(|_| {
-                !input.cursor_visible
+        let held_center = match (self.console.cursor_home, self.console.last_body) {
+            (Some(_), Some(body))
+                if !input.cursor_visible
                     && self.console.presentable
                     && self.alpha > 0.0
-                    && self
-                        .console
-                        .tick_stamp
-                        .is_some_and(|prior| facts.stamp.preserves_cursor_home(prior))
-            })
-            .map(|body| (body.row + body.rows * 0.5, body.col + body.cols * 0.5));
+                    && matches!(
+                        self.console.tick_stamp,
+                        Some(prior) if facts.stamp.preserves_cursor_home(prior)
+                    ) =>
+            {
+                Some((body.row + body.rows * 0.5, body.col + body.cols * 0.5))
+            }
+            _ => None,
+        };
         // Taking the reading held again ([`PetReading`]) would leave the
         // world, the observation count, the row signatures, the faux caret and
         // the contact as they stand: the same cells give the same world, whose
         // stamp, selection, progress and ink by the body are those it holds.
-        if self
-            .console
-            .world
-            .as_ref()
-            .is_some_and(|w| w.stamp().is_some())
+        if matches!(self.console.world.as_ref(), Some(w) if w.stamp().is_some())
             && self
                 .console
                 .reading
@@ -692,10 +745,12 @@ impl PetBrain {
             self.console.reading.keep(input);
             return;
         }
-        let world = self
-            .console
-            .world
-            .get_or_insert_with(|| self.console.spare_world.take().unwrap_or_default());
+        if self.console.world.is_none() {
+            self.console.world = Some(self.console.spare_world.take().unwrap_or_default());
+        }
+        let Some(world) = &mut self.console.world else {
+            return;
+        };
         let prior_stamp = world.stamp();
         let prior_selection = world.selection_target();
         let prior_progress = world.progress();
@@ -703,9 +758,10 @@ impl PetBrain {
         let old_ink = if self.console.contact_changed {
             None
         } else {
-            self.console
-                .last_body
-                .and_then(|r| local_ink(world, r, typed))
+            match self.console.last_body {
+                Some(r) => local_ink(world, r, typed),
+                None => None,
+            }
         };
         world.observe_with_exclusions_near(input, facts, pane, reserve, held_center);
         if world.stamp().is_some()
@@ -715,12 +771,15 @@ impl PetBrain {
         {
             self.console.observed_seq = self.console.observed_seq.wrapping_add(1).max(1);
         }
-        let fixed_view = prior_stamp.zip(world.stamp()).is_some_and(|(a, b)| {
-            a.surface == b.surface
-                && a.top_absolute_row == b.top_absolute_row
-                && a.display_offset == b.display_offset
-                && a.uniform_up_rows == b.uniform_up_rows
-        });
+        let fixed_view = match (prior_stamp, world.stamp()) {
+            (Some(a), Some(b)) => {
+                a.surface == b.surface
+                    && a.top_absolute_row == b.top_absolute_row
+                    && a.display_offset == b.display_offset
+                    && a.uniform_up_rows == b.uniform_up_rows
+            }
+            _ => false,
+        };
         if fixed_view {
             // Multiple coherent reads may precede one tick. A duplicate
             // observation cannot erase new local ink already observed.
@@ -728,18 +787,24 @@ impl PetBrain {
                 && let Some(r) = self.console.last_body
                 && let Some(new) = local_ink(world, r, typed)
             {
-                self.console.contact_changed |=
-                    old.iter().zip(new).any(|(old, new)| new & !old != 0);
+                let mut i = 0;
+                while i < 8 {
+                    if new[i] & !old[i] != 0 {
+                        self.console.contact_changed = true;
+                        break;
+                    }
+                    i += 1;
+                }
             }
         } else {
             // Moving existing ink through a pane-local mask is not contact
             // from newly displayed text. Reflow/unknown snapshots revoke too.
             self.console.contact_changed = false;
         }
-        if prior_stamp
-            .zip(world.stamp())
-            .is_some_and(|(a, b)| a.surface != b.surface)
-        {
+        if matches!(
+            (prior_stamp, world.stamp()),
+            (Some(a), Some(b)) if a.surface != b.surface
+        ) {
             self.console.input = None;
             self.console.consumed = self.console.seq;
             self.console.repair_until = None;
@@ -754,17 +819,14 @@ impl PetBrain {
             && input.display_offset == 0
             && input.cursor_row + 2 >= pane.row + pane.rows
         {
-            detect_faux_composer_caret(input, pane)
-                .filter(|&(r, _)| pane.row + usize::from(r) < input.cursor_row)
+            match detect_faux_composer_caret(input, pane) {
+                Some((r, c)) if pane.row + usize::from(r) < input.cursor_row => Some((r, c)),
+                _ => None,
+            }
         } else {
             None
         };
-        if self
-            .console
-            .world
-            .as_ref()
-            .is_some_and(|w| w.stamp().is_some())
-        {
+        if matches!(self.console.world.as_ref(), Some(w) if w.stamp().is_some()) {
             self.console
                 .reading
                 .note((input, fill), facts, pane, reserve, held_center);
@@ -780,7 +842,10 @@ impl PetBrain {
         prior: Option<PetWorldStamp>,
     ) {
         let console = &mut self.console;
-        let Some(stamp) = console.world.as_ref().and_then(|w| w.stamp()) else {
+        let Some(stamp) = (match console.world.as_ref() {
+            Some(w) => w.stamp(),
+            None => None,
+        }) else {
             console.row_sig.clear();
             console.row_sig_prev.clear();
             return;
@@ -788,25 +853,30 @@ impl PetBrain {
         let first = pane.row.min(input.cells.len());
         let rows = pane.rows.min(input.cells.len() - first);
         let same_grid =
-            prior.is_some_and(|p| p.surface == stamp.surface) && console.row_sig.len() == rows;
+            matches!(prior, Some(p) if p.surface == stamp.surface) && console.row_sig.len() == rows;
+        let slice = &input.cells[first..first + rows];
         if !same_grid {
             console.row_sig_prev.clear();
             console.row_sig.clear();
             console.row_sig.reserve(rows);
-            for row in &input.cells[first..first + rows] {
-                let end = (pane.col + pane.cols).min(row.len());
-                console
-                    .row_sig
-                    .push(row_signature(row.get(pane.col..end).unwrap_or(&[])));
+            for row in slice {
+                let row_s = row.as_slice();
+                let start = pane.col.min(row_s.len());
+                let end = (pane.col + pane.cols).min(row_s.len());
+                console.row_sig.push(row_signature(&row_s[start..end]));
             }
             return;
         }
         let mut swapped = false;
-        for (i, row) in input.cells[first..first + rows].iter().enumerate() {
-            let end = (pane.col + pane.cols).min(row.len());
-            let sig = row_signature(row.get(pane.col..end).unwrap_or(&[]));
+        let mut i = 0;
+        while i < slice.len() {
+            let row_s = slice[i].as_slice();
+            let start = pane.col.min(row_s.len());
+            let end = (pane.col + pane.cols).min(row_s.len());
+            let sig = row_signature(&row_s[start..end]);
             if !swapped {
                 if console.row_sig[i] == sig {
+                    i += 1;
                     continue;
                 }
                 std::mem::swap(&mut console.row_sig_prev, &mut console.row_sig);
@@ -815,6 +885,7 @@ impl PetBrain {
                 swapped = true;
             }
             console.row_sig[i] = sig;
+            i += 1;
         }
     }
 
@@ -1337,7 +1408,10 @@ impl PetBrain {
         self.console.attention = PetAttention::Rest;
         self.console.reason = "quiet";
         let body = self.console_body(sense);
-        let Some(stamp) = self.console.world.as_ref().and_then(|w| w.stamp()) else {
+        let Some(stamp) = (match self.console.world.as_ref() {
+            Some(w) => w.stamp(),
+            None => None,
+        }) else {
             self.console.cursor_home = None;
             self.console.rest_seat.set(None);
             self.console.rest_seated.set(false);
@@ -1346,9 +1420,10 @@ impl PetBrain {
             return;
         };
         let prior = self.console.tick_stamp.replace(stamp);
-        let same_surface = prior.is_some_and(|p| p.surface == stamp.surface);
-        let new_content = same_surface && prior.is_some_and(|p| p.content_seq != stamp.content_seq);
-        if !prior.is_some_and(|previous| stamp.preserves_cursor_home(previous)) {
+        let same_surface = matches!(prior, Some(p) if p.surface == stamp.surface);
+        let new_content =
+            same_surface && matches!(prior, Some(p) if p.content_seq != stamp.content_seq);
+        if !matches!(prior, Some(previous) if stamp.preserves_cursor_home(previous)) {
             self.console.cursor_home = None;
         }
         if !same_surface {
@@ -1379,17 +1454,23 @@ impl PetBrain {
             self.console.last_seat = None;
             return;
         }
-        if let Some(caret) = sense.caret.filter(|_| sense.caret_drawn) {
+        if sense.caret_drawn
+            && let Some(caret) = sense.caret
+        {
             self.console.cursor_home = Some(caret);
         }
 
-        let pending_input = self
-            .console
-            .input
-            .filter(|e| e.seq != self.console.consumed);
+        let pending_input = match self.console.input {
+            Some(e) if e.seq != self.console.consumed => Some(e),
+            _ => None,
+        };
         self.console.consumed = self.console.seq;
-        let fresh_input = pending_input
-            .filter(|e| sense.now.saturating_duration_since(e.at).as_secs_f32() < INPUT_HOLD);
+        let fresh_input = match pending_input {
+            Some(e) if sense.now.saturating_duration_since(e.at).as_secs_f32() < INPUT_HOLD => {
+                Some(e)
+            }
+            _ => None,
+        };
         if let Some(e) = fresh_input {
             self.console.source_seq = e.seq;
             self.console.anchor = None;
@@ -1415,13 +1496,18 @@ impl PetBrain {
                 self.set_action(PetAction::Waking);
             }
         }
-        let age = |at: Instant| sense.now.saturating_duration_since(at).as_secs_f32();
-        let input_live = self.console.input.is_some_and(|e| age(e.at) < INPUT_HOLD);
-        if self
-            .console
-            .completion
-            .is_some_and(|(at, _)| sense.now.saturating_duration_since(at) >= REACTION_TTL_DUR)
-            || input_live
+        #[inline]
+        fn age_at(now: Instant, at: Instant) -> f32 {
+            now.saturating_duration_since(at).as_secs_f32()
+        }
+        let input_live = matches!(
+            self.console.input,
+            Some(e) if age_at(sense.now, e.at) < INPUT_HOLD
+        );
+        if matches!(
+            self.console.completion,
+            Some((at, _)) if sense.now.saturating_duration_since(at) >= REACTION_TTL_DUR
+        ) || input_live
         {
             self.console.completion = None;
             self.pending_sulk = false;
@@ -1459,14 +1545,12 @@ impl PetBrain {
             return;
         }
 
-        let repairing = self.console.repair_until.is_some_and(|end| sense.now < end)
-            && self
-                .console
-                .repair_target
-                .zip(sense.caret)
-                .is_some_and(|((r, c), (cr, cc))| {
-                    (r - f32::from(cr)).abs() < 0.5 && (c - f32::from(cc)).abs() <= 6.0
-                });
+        let repairing = matches!(self.console.repair_until, Some(end) if sense.now < end)
+            && matches!(
+                (self.console.repair_target, sense.caret),
+                (Some((r, c)), Some((cr, cc)))
+                    if (r - f32::from(cr)).abs() < 0.5 && (c - f32::from(cc)).abs() <= 6.0
+            );
         if input_live || repairing {
             self.console.resident = false;
             self.console.trip = None;
@@ -1480,31 +1564,40 @@ impl PetBrain {
             } else {
                 "committed-input"
             };
-            self.console.gaze = self
-                .console
-                .repair_target
-                .or_else(|| self.console.input.and_then(|e| e.target));
+            self.console.gaze = match self.console.repair_target {
+                Some(t) => Some(t),
+                None => match self.console.input {
+                    Some(e) => e.target,
+                    None => None,
+                },
+            };
             self.console.pose = Some(if repairing {
                 PetGlyphId::PetInspectDown
             } else {
                 PetGlyphId::PetStandEar
             });
-            let caret_overlaps_body = sense.caret.is_some_and(|(cr, cc)| {
-                let cr = f32::from(cr);
-                let cc = f32::from(cc);
-                cr + 1.0 > body.row
-                    && cr < body.row + body.rows
-                    && cc + 1.0 > body.col
-                    && cc < body.col + body.cols
-            });
-            let stand_pushed_past = home.is_some_and(|stand| {
-                (body.row - stand.row).abs() >= 0.25
-                    || if self.wall_side {
-                        body.col > stand.col + ARRIVED
-                    } else {
-                        body.col + ARRIVED < stand.col
-                    }
-            });
+            let caret_overlaps_body = match sense.caret {
+                Some((cr, cc)) => {
+                    let cr = f32::from(cr);
+                    let cc = f32::from(cc);
+                    cr + 1.0 > body.row
+                        && cr < body.row + body.rows
+                        && cc + 1.0 > body.col
+                        && cc < body.col + body.cols
+                }
+                None => false,
+            };
+            let stand_pushed_past = match home {
+                Some(stand) => {
+                    (body.row - stand.row).abs() >= 0.25
+                        || if self.wall_side {
+                            body.col > stand.col + ARRIVED
+                        } else {
+                            body.col + ARRIVED < stand.col
+                        }
+                }
+                None => false,
+            };
             if repairing
                 && !caret_overlaps_body
                 && !stand_pushed_past
@@ -1517,10 +1610,10 @@ impl PetBrain {
             }
             let roomy = world.clear_past_caret(body, CONTACT_MARGIN);
             if roomy
-                && self
-                    .console
-                    .contact_at
-                    .is_none_or(|at| age(at) >= CONTACT_HOLD)
+                && match self.console.contact_at {
+                    Some(at) => age_at(sense.now, at) >= CONTACT_HOLD,
+                    None => true,
+                }
             {
                 self.console.contact_armed = true;
             }
@@ -1528,20 +1621,20 @@ impl PetBrain {
                 && contact_changed
                 && !roomy
                 && self.console.contact_armed
-                && self
-                    .console
-                    .input
-                    .is_some_and(|e| e.kind == PetInputKind::Text && age(e.at) < INPUT_HOLD)
+                && matches!(
+                    self.console.input,
+                    Some(e) if e.kind == PetInputKind::Text && age_at(sense.now, e.at) < INPUT_HOLD
+                )
             {
                 self.console.contact_at = Some(sense.now);
                 self.console.contact_armed = false;
             }
             if let Some(at) = self.console.contact_at
-                && age(at) < CONTACT_HOLD
+                && age_at(sense.now, at) < CONTACT_HOLD
             {
                 self.console.attention = PetAttention::Contact;
                 self.console.reason = "advancing-ink";
-                self.console.pose = Some(if age(at) < 0.14 {
+                self.console.pose = Some(if age_at(sense.now, at) < 0.14 {
                     if self.facing_left && world.clear_past_caret(body, CLEARANCE) {
                         PetGlyphId::PetTailTuck
                     } else {
@@ -1555,9 +1648,11 @@ impl PetBrain {
         }
 
         if self.room_cheer && !self.room_cheer_in_play() {
-            if home.is_some_and(|stand| {
-                world.under_text_clearance_past_caret(stand, CLEARANCE) == Some(false)
-            }) {
+            if matches!(
+                home,
+                Some(stand)
+                    if world.under_text_clearance_past_caret(stand, CLEARANCE) == Some(false)
+            ) {
                 self.room_cheer_leaving = true;
             } else {
                 self.room_cheer = false;
@@ -1569,23 +1664,30 @@ impl PetBrain {
         let cue_ready = self.action.settled()
             && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
             && ((self.pending_room.is_some()
-                && self.room_at.is_some_and(|at| age(at) <= ROOM_CUE_TTL))
+                && matches!(self.room_at, Some(at) if age_at(sense.now, at) <= ROOM_CUE_TTL))
                 || (self.pending_bat.is_some()
-                    && self
-                        .bat_at
-                        .is_some_and(|at| sense.now.saturating_duration_since(at) <= BAT_TTL_DUR))
+                    && matches!(
+                        self.bat_at,
+                        Some(at) if sense.now.saturating_duration_since(at) <= BAT_TTL_DUR
+                    ))
                 || (self.pending_look.is_some()
-                    && self.look_at.is_some_and(|at| {
-                        sense.now.saturating_duration_since(at) <= LOOK_TTL_DUR
-                    }))
-                || self
-                    .pending_perk
-                    .is_some_and(|at| sense.now >= at && age(at) <= V2_PERK_LATE)
+                    && matches!(
+                        self.look_at,
+                        Some(at) if sense.now.saturating_duration_since(at) <= LOOK_TTL_DUR
+                    ))
+                || matches!(
+                    self.pending_perk,
+                    Some(at) if sense.now >= at && age_at(sense.now, at) <= V2_PERK_LATE
+                )
                 || (self.catch_cool <= 0.0
-                    && self
-                        .pending_catch
-                        .is_some_and(|star| age(star.born) <= V2_CATCH_TTL)))
-            && home.is_some_and(|stand| self.caret_seat(world, body, stand) == CaretSeat::Hold);
+                    && matches!(
+                        self.pending_catch,
+                        Some(star) if age_at(sense.now, star.born) <= V2_CATCH_TTL
+                    )))
+            && matches!(
+                home,
+                Some(stand) if self.caret_seat(world, body, stand) == CaretSeat::Hold
+            );
         if self.pending_pet > 0
             || self.pet_hold_t > 0.0
             || self.pending_bell.is_some()
@@ -1603,17 +1705,23 @@ impl PetBrain {
         }
 
         let mut executing = None;
-        for a in world.anchors().iter().flatten() {
-            if a.state == BlockState::Executing {
-                executing = Some(*a);
+        let anchors = world.anchors();
+        let mut ai = 0;
+        while ai < anchors.len() {
+            if let Some(a) = anchors[ai]
+                && a.state == BlockState::Executing
+            {
+                executing = Some(a);
                 break;
             }
+            ai += 1;
         }
-        let completion = self
-            .console
-            .completion
-            .take()
-            .filter(|(at, _)| sense.now.saturating_duration_since(*at) < REACTION_TTL_DUR);
+        let completion = match self.console.completion.take() {
+            Some((at, failed)) if sense.now.saturating_duration_since(at) < REACTION_TTL_DUR => {
+                Some((at, failed))
+            }
+            _ => None,
+        };
         if let Some((_, failed)) = completion {
             self.console.result_at = Some((sense.now, failed));
             self.console.source_seq = self.console.completion_seq;
@@ -1627,10 +1735,10 @@ impl PetBrain {
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
         }
-        let result = self
-            .console
-            .result_at
-            .filter(|(at, _)| age(*at) < RESULT_HOLD);
+        let result = match self.console.result_at {
+            Some((at, failed)) if age_at(sense.now, at) < RESULT_HOLD => Some((at, failed)),
+            _ => None,
+        };
         if result.is_none() {
             self.console.result_at = None;
         }
@@ -1653,7 +1761,8 @@ impl PetBrain {
                     self.console.progress_at = None;
                 }
             }
-            let progress = self.console.progress_at.is_some_and(|at| age(at) < 0.35);
+            let progress =
+                matches!(self.console.progress_at, Some(at) if age_at(sense.now, at) < 0.35);
             self.console.attention = if progress {
                 PetAttention::Progress
             } else {
@@ -1669,20 +1778,27 @@ impl PetBrain {
             } else {
                 stamp.content_seq
             };
-            let interactive_caret = sense.caret.filter(|&(cr, _)| {
-                sense.caret_drawn
-                    && (subject.row > f32::from(cr) + 0.5
-                        || self.console.faux_caret.is_some()
-                        || self.console.input.is_some_and(|e| {
-                            matches!(
-                                e.kind,
-                                PetInputKind::Text
-                                    | PetInputKind::Delete
-                                    | PetInputKind::Navigate
-                                    | PetInputKind::Paste
-                            )
-                        }))
-            });
+            let interactive_caret = match sense.caret {
+                Some((cr, cc))
+                    if sense.caret_drawn
+                        && (subject.row > f32::from(cr) + 0.5
+                            || self.console.faux_caret.is_some()
+                            || matches!(
+                                self.console.input,
+                                Some(e)
+                                    if matches!(
+                                        e.kind,
+                                        PetInputKind::Text
+                                            | PetInputKind::Delete
+                                            | PetInputKind::Navigate
+                                            | PetInputKind::Paste
+                                    )
+                            )) =>
+                {
+                    Some((cr, cc))
+                }
+                _ => None,
+            };
             self.console.gaze = Some(if let Some((cr, cc)) = interactive_caret {
                 (f32::from(cr), f32::from(cc))
             } else {
@@ -1711,25 +1827,40 @@ impl PetBrain {
             };
             self.console.pose = if failed {
                 Some(PetGlyphId::PetInspectDown)
+            } else if self.console_stretch_on_blank() {
+                Some(PetGlyphId::PetStretchHind)
             } else {
-                self.console_stretch_on_blank()
-                    .then_some(PetGlyphId::PetStretchHind)
+                None
             };
             self.console.target =
-                Self::console_may_stand(world, body, CLEARANCE, self.console_ground_passing())
-                    .then_some(body);
+                if Self::console_may_stand(world, body, CLEARANCE, self.console_ground_passing()) {
+                    Some(body)
+                } else {
+                    None
+                };
             self.console.resident = true;
             self.console.still = true;
-        } else if let Some(anchor) = self.console.anchor.and_then(|a| {
-            world.resolve(a).or_else(|| {
-                for current in world.anchors().iter().flatten() {
-                    if current.surface == a.surface && current.block_id == a.block_id {
-                        return Some(*current);
+        } else if let Some(anchor) = match self.console.anchor {
+            Some(a) => match world.resolve(a) {
+                Some(resolved) => Some(resolved),
+                None => {
+                    let mut found = None;
+                    let mut j = 0;
+                    while j < anchors.len() {
+                        if let Some(current) = anchors[j]
+                            && current.surface == a.surface
+                            && current.block_id == a.block_id
+                        {
+                            found = Some(current);
+                            break;
+                        }
+                        j += 1;
                     }
+                    found
                 }
-                None
-            })
-        }) {
+            },
+            None => None,
+        } {
             // One content anchor may survive a completed command; no timer
             // grants another excursion. The perch is a visit, not a tenancy:
             // [`PERCH_DWELL`] bounds it and `console_deadline` offers its end.
@@ -1774,11 +1905,10 @@ impl PetBrain {
         prior: Option<PetWorldStamp>,
     ) {
         let world = self.console.world.as_ref().expect("observed");
-        let retained = self
-            .console
-            .anchor
-            .filter(|a| a.block_id == subject.block_id)
-            .and_then(|a| world.resolve(a));
+        let retained = match self.console.anchor {
+            Some(a) if a.block_id == subject.block_id => world.resolve(a),
+            _ => None,
+        };
         if let Some(anchor) = retained
             && let Some(mut target) = self.console.target
         {
@@ -1797,17 +1927,23 @@ impl PetBrain {
                     let scrolled_off_top = self.row - dy < 0.0;
                     if !scrolled_off_top {
                         self.row -= dy;
-                        if let Some(trip) = self.console.trip.as_mut() {
+                        if let Some(trip) = &mut self.console.trip {
                             trip.from.1 -= dy;
                             trip.to.1 -= dy;
                         }
-                        if let Some(look) = self.adopted_look.as_mut() {
+                        if let Some(look) = &mut self.adopted_look {
                             look.seat.1 -= dy;
                         }
-                        for d in self.departures.iter_mut().flatten() {
-                            if d.still && !d.resight && d.own_glass.is_none() {
+                        let mut i = 0;
+                        while i < self.departures.len() {
+                            if let Some(d) = &mut self.departures[i]
+                                && d.still
+                                && !d.resight
+                                && d.own_glass.is_none()
+                            {
                                 d.row -= dy;
                             }
+                            i += 1;
                         }
                     }
                     leaving_view = dy > 0.0 && (target.row < 2.0 || scrolled_off_top);
@@ -1870,40 +2006,38 @@ impl PetBrain {
                 ..sense
             };
         }
-        let vouched = || {
-            let now = self.console.world.as_ref().and_then(|w| w.stamp());
-            now.zip(self.console.tick_stamp)
-                .is_some_and(|(now, prior)| now.preserves_cursor_home(prior))
+        let now_stamp = match &self.console.world {
+            Some(w) => w.stamp(),
+            None => None,
         };
-        let corner_park = |home: (u16, u16)| {
-            let now = self.console.world.as_ref().and_then(|w| w.stamp());
-            now.zip(self.console.tick_stamp)
-                .is_some_and(|(now, prior)| now.top_absolute_row == prior.top_absolute_row)
-                && sense.caret.is_some_and(|(cr, cc)| {
-                    cc == 0 && cr.saturating_add(1) >= sense.rows && (cr, cc) != home
-                })
-        };
-        match self.console.cursor_home {
-            Some(home)
-                if sense.caret.is_some()
-                    && self.console.presentable
-                    && ((self.console.hidden_hold <= HIDDEN_HOLD_MAX && vouched())
-                        || corner_park(home)) =>
-            {
+        if let Some(home) = self.console.cursor_home
+            && let Some((cr, cc)) = sense.caret
+            && self.console.presentable
+        {
+            let vouched = self.console.hidden_hold <= HIDDEN_HOLD_MAX
+                && matches!(
+                    (now_stamp, self.console.tick_stamp),
+                    (Some(now), Some(prior)) if now.preserves_cursor_home(prior)
+                );
+            let corner_park = matches!(
+                (now_stamp, self.console.tick_stamp),
+                (Some(now), Some(prior)) if now.top_absolute_row == prior.top_absolute_row
+            ) && cc == 0
+                && cr.saturating_add(1) >= sense.rows
+                && (cr, cc) != home;
+            if vouched || corner_park {
                 self.console.caret_held = true;
-                PetSense {
+                return PetSense {
                     caret: Some(home),
                     caret_drawn: true,
                     ..sense
-                }
-            }
-            _ => {
-                if core::mem::take(&mut self.console.caret_held) && sense.caret.is_some() {
-                    self.last_caret = None;
-                }
-                sense
+                };
             }
         }
+        if core::mem::take(&mut self.console.caret_held) && sense.caret.is_some() {
+            self.last_caret = None;
+        }
+        sense
     }
 
     /// New interests use the resident's position, distance-driven gait and authored poses.
@@ -1988,35 +2122,41 @@ impl PetBrain {
         self.pet_hold_t = 0.0;
         self.pending_pet = 0;
         self.pet_at = None;
-        let repairing = self.console.repair_until.is_some_and(|end| sense.now < end);
-        let latched = self.pending_trick.filter(|_| repairing);
+        let repairing = matches!(self.console.repair_until, Some(end) if sense.now < end);
+        let latched = if repairing { self.pending_trick } else { None };
         self.drop_tricks();
         self.pending_trick = latched;
         let body = self.console_body(sense);
         let world = self.console.world.as_ref()?;
         let home = self.console_caret_home(sense, width);
-        let caret_overlaps_body = sense.caret.is_some_and(|(cr, cc)| {
-            let cr = f32::from(cr);
-            let cc = f32::from(cc);
-            cr + 1.0 > body.row
-                && cr < body.row + body.rows
-                && cc + 1.0 > body.col
-                && cc < body.col + body.cols
-        });
-        let stand_pushed_past = |stand: PetRect| {
-            (body.row - stand.row).abs() >= 0.25
-                || if self.wall_side {
-                    body.col > stand.col + ARRIVED
-                } else {
-                    body.col + ARRIVED < stand.col
-                }
+        let caret_overlaps_body = match sense.caret {
+            Some((cr, cc)) => {
+                let cr = f32::from(cr);
+                let cc = f32::from(cc);
+                cr + 1.0 > body.row
+                    && cr < body.row + body.rows
+                    && cc + 1.0 > body.col
+                    && cc < body.col + body.cols
+            }
+            None => false,
+        };
+        let stand_ok = match home {
+            Some(stand) => {
+                (body.row - stand.row).abs() < 0.25
+                    && if self.wall_side {
+                        body.col <= stand.col + ARRIVED
+                    } else {
+                        body.col + ARRIVED >= stand.col
+                    }
+            }
+            None => true,
         };
         let claimed = matches!(self.console.attention, PetAttention::Result)
             || (self.console.attention == PetAttention::Editing
                 && !caret_overlaps_body
-                && home.is_none_or(|stand| !stand_pushed_past(stand)));
-        let target = match home.filter(|_| sense.caret.is_some()) {
-            Some(stand)
+                && stand_ok);
+        let target = match (home, sense.caret.is_some()) {
+            (Some(stand), true)
                 if claimed
                     && Self::near_console_home(body, Some(stand))
                     && Self::console_may_stand(
@@ -2028,7 +2168,7 @@ impl PetBrain {
             {
                 Some(body)
             }
-            Some(stand) => match self.caret_seat(world, body, stand) {
+            (Some(stand), true) => match self.caret_seat(world, body, stand) {
                 CaretSeat::Hold => Some(body),
                 CaretSeat::Escort if !sense.reduced_motion && self.alpha > 0.0 => {
                     self.console.resident = false;
@@ -2039,22 +2179,19 @@ impl PetBrain {
                 CaretSeat::Escort => Some(stand),
                 CaretSeat::Yield => world.nearest_under_text_perch(stand, CLEARANCE, HOME_REACH),
             },
-            None => self
-                .console
-                .target
-                .filter(|r| world.under_text_clear(*r, CLEARANCE))
-                .or_else(|| {
-                    if Self::console_may_stand(
-                        world,
-                        body,
-                        CLEARANCE,
-                        self.console_ground_passing(),
-                    ) {
-                        Some(body)
-                    } else {
-                        world.home_perch(body, CLEARANCE, PERCH_REACH)
-                    }
-                }),
+            _ => match self.console.target {
+                Some(r) if world.under_text_clear(r, CLEARANCE) => Some(r),
+                _ if Self::console_may_stand(
+                    world,
+                    body,
+                    CLEARANCE,
+                    self.console_ground_passing(),
+                ) =>
+                {
+                    Some(body)
+                }
+                _ => world.home_perch(body, CLEARANCE, PERCH_REACH),
+            },
         };
         self.console.target = target;
         let Some(target) = target else {
@@ -2126,16 +2263,35 @@ impl PetBrain {
             && !sense.reduced_motion
             && !self.console.clipped
             && self.console.attention != PetAttention::Reading;
-        let age = |at: Instant| sense.now.saturating_duration_since(at).as_secs_f32();
         self.pending_pounce = false;
         self.pending_big_jump = false;
         self.pending_bell = None;
         self.pending_flow = None;
-        self.pending_perk = prev_v2.0.filter(|at| v2_live && age(*at) <= V2_PERK_LATE);
-        self.pending_catch = prev_v2
-            .1
-            .filter(|star| v2_live && age(star.born) <= V2_CATCH_TTL);
-        if !v2_live || self.room_at.is_none_or(|at| age(at) > ROOM_CUE_TTL) {
+        self.pending_perk = match prev_v2.0 {
+            Some(at)
+                if v2_live
+                    && sense.now.saturating_duration_since(at).as_secs_f32() <= V2_PERK_LATE =>
+            {
+                Some(at)
+            }
+            _ => None,
+        };
+        self.pending_catch = match prev_v2.1 {
+            Some(star)
+                if v2_live
+                    && sense.now.saturating_duration_since(star.born).as_secs_f32()
+                        <= V2_CATCH_TTL =>
+            {
+                Some(star)
+            }
+            _ => None,
+        };
+        if !v2_live
+            || !matches!(
+                self.room_at,
+                Some(at) if sense.now.saturating_duration_since(at).as_secs_f32() <= ROOM_CUE_TTL
+            )
+        {
             self.drop_room_cue();
         }
         self.pending_bat = None;
@@ -2168,22 +2324,22 @@ impl PetBrain {
                     self.console.reason = "protected-displacement";
                 }
             } else {
-                if self.console.trip.is_some_and(|trip| trip.to != destination) {
-                    self.console.trip = None;
-                }
-                let trip = self.console.trip.get_or_insert_with(|| {
-                    let dist = (self.col - destination.0)
-                        .abs()
-                        .max((self.row - destination.1).abs() * ROW_AS_COLS);
-                    let hop = (self.row - destination.1).abs() > 0.25;
-                    PerchTrip {
-                        from: (self.col, self.row),
-                        to: destination,
-                        elapsed: 0.0,
-                        duration: (dist * (1.0 / 22.0)).max(0.22),
-                        hop,
+                let mut trip = match self.console.trip {
+                    Some(trip) if trip.to == destination => trip,
+                    _ => {
+                        let dist = (self.col - destination.0)
+                            .abs()
+                            .max((self.row - destination.1).abs() * ROW_AS_COLS);
+                        let hop = (self.row - destination.1).abs() > 0.25;
+                        PerchTrip {
+                            from: (self.col, self.row),
+                            to: destination,
+                            elapsed: 0.0,
+                            duration: (dist * (1.0 / 22.0)).max(0.22),
+                            hop,
+                        }
                     }
-                });
+                };
                 trip.elapsed += dt;
                 let u = (trip.elapsed / trip.duration).clamp(0.0, 1.0);
                 let s = if trip.hop { u } else { u * u * (3.0 - 2.0 * u) };
@@ -2207,7 +2363,7 @@ impl PetBrain {
                 self.stride = if (0.0..1024.0).contains(&next_stride) {
                     next_stride
                 } else {
-                    next_stride.rem_euclid(1024.0)
+                    next_stride - (next_stride * (1.0 / 1024.0)).floor() * 1024.0
                 };
                 self.console.moving = u < 1.0;
                 let arc = PetRect::new(
@@ -2218,7 +2374,7 @@ impl PetBrain {
                 );
                 self.console.lift =
                     if trip.hop && Self::console_may_stand(world, arc, CLEARANCE, false) {
-                        0.25 * (core::f32::consts::PI * u).sin()
+                        0.25 * crate::supernova::sin_cos_f32(core::f32::consts::PI * u).0
                     } else {
                         0.0
                     };
@@ -2226,6 +2382,7 @@ impl PetBrain {
                     self.console.trip = None;
                     self.console.lift = 0.0;
                 } else {
+                    self.console.trip = Some(trip);
                     self.console.pose = Some(if trip.hop {
                         if u < 0.25 {
                             PetGlyphId::PetLeapRise
@@ -2281,14 +2438,14 @@ impl PetBrain {
                                 || self.pointer_vy != 0.0
                                 || self.pointer_speed != 0.0
                             {
-                                let k = 1.0 - (-dt * (1.0 / DASH_WINDOW)).exp();
+                                let k = 1.0 - crate::color_math::exp_f32(-dt * (1.0 / DASH_WINDOW));
                                 let (vx_inst, vy_inst, inst) = if stationary {
                                     (0.0, 0.0, 0.0)
                                 } else {
                                     let inv_dt = 1.0 / dt;
                                     let vx = (px - lx) * inv_dt;
                                     let vy = (py - ly) * inv_dt;
-                                    (vx, vy, vx.hypot(vy))
+                                    (vx, vy, crate::color_math::hypot_f32(vx, vy))
                                 };
                                 self.pointer_vx += (vx_inst - self.pointer_vx) * k;
                                 self.pointer_vy += (vy_inst - self.pointer_vy) * k;
@@ -2316,17 +2473,17 @@ impl PetBrain {
                     }
                 }
             }
-            let pointer_gaze = (self.pointer_heat > 0.0)
-                .then_some(self.last_pointer)
-                .flatten()
-                .map(|(px, py)| (py, px));
+            let pointer_gaze = match (self.pointer_heat > 0.0, self.last_pointer) {
+                (true, Some((px, py))) => Some((py, px)),
+                _ => None,
+            };
             if let Some((r, c)) = pointer_gaze.or(self.console.gaze) {
                 self.facing_left = c < self.col + width * 0.5;
                 if matches!(
                     self.console.attention,
                     PetAttention::Reading | PetAttention::Output | PetAttention::Exploring
                 ) && (self.console.pose != Some(PetGlyphId::PetSit)
-                    || pointer_gaze.is_some_and(|(pr, _)| (pr - self.row).abs() > 0.5))
+                    || matches!(pointer_gaze, Some((pr, _)) if (pr - self.row).abs() > 0.5))
                 {
                     self.console.pose = Some(if r < self.row - 0.5 {
                         PetGlyphId::PetEdgeLookUp
@@ -2402,17 +2559,15 @@ impl PetBrain {
     fn escorted_within(&self, secs: f32) -> bool {
         self.typed_within(secs)
             || (self.watch_heat < WATCH_GATE
-                && self
-                    .rhythm_at
-                    .is_some_and(|at| ((self.clock - at) as f32) < secs))
+                && matches!(self.rhythm_at, Some(at) if ((self.clock - at) as f32) < secs))
     }
 
     #[inline]
     fn typed_within(&self, secs: f32) -> bool {
-        self.console
-            .typed_at
-            .zip(self.last_now)
-            .is_some_and(|(at, now)| now.saturating_duration_since(at).as_secs_f32() < secs)
+        matches!(
+            (self.console.typed_at, self.last_now),
+            (Some(at), Some(now)) if now.saturating_duration_since(at).as_secs_f32() < secs
+        )
     }
 
     /// The sequence number of the last key the app noted ([`Self::note_console_input`]), when it was an Enter: one Enter, told from the next.
@@ -2428,16 +2583,18 @@ impl PetBrain {
     /// The kind of the last key the app noted ([`Self::note_console_input`]), when it was pressed within `secs`: a letter typed is writing that goes forward before its echo has moved the caret.
     #[inline]
     pub(super) fn key_within(&self, secs: f32) -> Option<PetInputKind> {
-        self.console.typed_kind.filter(|_| self.typed_within(secs))
+        if self.typed_within(secs) {
+            self.console.typed_kind
+        } else {
+            None
+        }
     }
 
     #[inline]
     fn console_ground_passing(&self) -> bool {
         matches!(self.action, PetAction::Walk | PetAction::Run)
             || (self.escorted_within(SIT_AFTER + SIT_FOLD)
-                && self
-                    .last_caret
-                    .is_some_and(|(cr, _)| (self.row - f32::from(cr)).abs() < 1.5))
+                && matches!(self.last_caret, Some((cr, _)) if (self.row - f32::from(cr)).abs() < 1.5))
     }
 
     #[inline]
@@ -2500,9 +2657,12 @@ impl PetBrain {
         let body = Self::console_stand_rect(desired, sense_dims.0, width);
         let from = self.rest_reach_from(world, sense_dims.0, width);
         let escorting = self.console_escorting();
-        let walled = from.is_some_and(|from| {
-            PetWorld::same_ground(from, body) && Self::console_walled(world, from, body, escorting)
-        });
+        let walled = matches!(
+            from,
+            Some(from)
+                if PetWorld::same_ground(from, body)
+                    && Self::console_walled(world, from, body, escorting)
+        );
         if escorting
             && !walled
             && self.flight.is_none()
@@ -2534,20 +2694,20 @@ impl PetBrain {
             let limit = (f32::from(sense_dims.1) - width).max(0.0);
             let steps = (REST_REACH * INV_STEP) as usize;
             let here = Self::console_stand_rect((self.col, self.row), sense_dims.0, width);
-            let may = |c: f32| {
-                let rect = PetRect { col: c, ..body };
-                Self::stand_clearance(world, rect, false) == Some(true)
-                    && !Self::console_walled(world, here, rect, true)
-            };
             let mut k = 1;
             while k <= steps {
                 let offset = STEP * k as f32;
                 for c in [desired.0 - offset, desired.0 + offset] {
-                    if (0.0..=limit).contains(&c) && may(c) {
-                        let seat = (c, desired.1);
-                        self.console.rest_seat.set(Some(seat));
-                        self.console.rest_seated.set(true);
-                        return Some(seat);
+                    if (0.0..=limit).contains(&c) {
+                        let rect = PetRect { col: c, ..body };
+                        if Self::stand_clearance(world, rect, false) == Some(true)
+                            && !Self::console_walled(world, here, rect, true)
+                        {
+                            let seat = (c, desired.1);
+                            self.console.rest_seat.set(Some(seat));
+                            self.console.rest_seated.set(true);
+                            return Some(seat);
+                        }
                     }
                 }
                 k += 1;
@@ -2560,17 +2720,20 @@ impl PetBrain {
             let next = world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH)?;
             return Some((next.col, next.foot_row()));
         }
-        let resting = (self.flight.is_none() && self.alpha > 0.0).then_some((self.col, self.row));
-        let on_the_line = |row: f32| (row - desired.1).abs() < 0.5;
+        let resting = if self.flight.is_none() && self.alpha > 0.0 {
+            Some((self.col, self.row))
+        } else {
+            None
+        };
         let held_seat = self.console.rest_seat.get();
-        if let Some((col, _)) = resting.filter(|&(_, row)| {
-            on_the_line(row) && held_seat.is_none_or(|(_, seat_row)| on_the_line(seat_row))
-        }) {
-            let at = |c: f32| PetRect { col: c, ..body };
+        if let Some((col, row)) = resting
+            && (row - desired.1).abs() < 0.5
+            && !matches!(held_seat, Some((_, seat_row)) if (seat_row - desired.1).abs() >= 0.5)
+        {
             let may = |c: f32| {
-                let rect = at(c);
+                let rect = PetRect { col: c, ..body };
                 Self::stand_clearance(world, rect, escorting) == Some(true)
-                    && from.is_none_or(|from| !Self::console_walled(world, from, rect, escorting))
+                    && !matches!(from, Some(from) if Self::console_walled(world, from, rect, escorting))
             };
             if (desired.0 - col).abs() <= REST_REACH && may(col) {
                 const STEP: f32 = 0.25;
@@ -2593,67 +2756,100 @@ impl PetBrain {
                 return Some(seat);
             }
         }
-        let pane_reach = || {
+        let pane_reach = {
             let across = body
                 .col
                 .abs()
                 .max((f32::from(sense_dims.1) - body.col).abs());
-            (2.0 * f32::from(sense_dims.0)).hypot(across)
+            crate::color_math::hypot_f32(2.0 * f32::from(sense_dims.0), across)
         };
         const REST_REACH_SQ: f32 = REST_REACH * REST_REACH;
-        let keep = |seat: (f32, f32)| {
+        let keep = |seat: (f32, f32)| -> Option<PetRect> {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             let dr = 2.0 * (held.row - body.row);
             let dc = held.col - body.col;
-            (dr * dr + dc * dc <= REST_REACH_SQ)
-                .then(|| world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from))
-                .flatten()
+            if dr * dr + dc * dc <= REST_REACH_SQ {
+                world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from)
+            } else {
+                None
+            }
         };
-        let keep_any_clear = |seat: (f32, f32)| {
+        let keep_any_clear = |seat: (f32, f32)| -> Option<PetRect> {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from)
         };
-        let kept = held_seat.and_then(keep).or_else(|| resting.and_then(keep));
-        if let Some(next) = kept
-            .or_else(|| world.nearest_clear_perch(body, CLEARANCE, REST_REACH, from))
-            .or_else(|| {
-                held_seat
-                    .and_then(keep_any_clear)
-                    .or_else(|| resting.and_then(keep_any_clear))
-            })
-            .or_else(|| {
-                // The search requires a finite reach. Cover the whole pane,
-                // including a stand whose column lies outside it.
-                world.nearest_clear_perch(body, CLEARANCE, pane_reach(), from)
-            })
+        let mut clear_next = match held_seat {
+            Some(s) => keep(s),
+            None => None,
+        };
+        if clear_next.is_none()
+            && let Some(s) = resting
         {
+            clear_next = keep(s);
+        }
+        if clear_next.is_none() {
+            clear_next = world.nearest_clear_perch(body, CLEARANCE, REST_REACH, from);
+        }
+        if clear_next.is_none()
+            && let Some(s) = held_seat
+        {
+            clear_next = keep_any_clear(s);
+        }
+        if clear_next.is_none()
+            && let Some(s) = resting
+        {
+            clear_next = keep_any_clear(s);
+        }
+        if clear_next.is_none() {
+            // The search requires a finite reach. Cover the whole pane,
+            // including a stand whose column lies outside it.
+            clear_next = world.nearest_clear_perch(body, CLEARANCE, pane_reach, from);
+        }
+        if let Some(next) = clear_next {
             let seat = (next.col, next.foot_row());
             self.console.rest_seat.set(Some(seat));
             self.console.rest_seated.set(true);
             return Some(seat);
         }
-        let keep_under = |seat: (f32, f32)| {
+        let keep_under = |seat: (f32, f32)| -> Option<PetRect> {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             let dr = 2.0 * (held.row - body.row);
             let dc = held.col - body.col;
-            (dr * dr + dc * dc <= REST_REACH_SQ)
-                .then(|| world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from))
-                .flatten()
+            if dr * dr + dc * dc <= REST_REACH_SQ {
+                world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from)
+            } else {
+                None
+            }
         };
-        let keep_any_under = |seat: (f32, f32)| {
+        let keep_any_under = |seat: (f32, f32)| -> Option<PetRect> {
             let held = Self::console_stand_rect(seat, sense_dims.0, width);
             world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from)
         };
-        let next = held_seat
-            .and_then(keep_under)
-            .or_else(|| resting.and_then(keep_under))
-            .or_else(|| world.nearest_under_text_perch_from(body, CLEARANCE, HOME_REACH, from))
-            .or_else(|| {
-                held_seat
-                    .and_then(keep_any_under)
-                    .or_else(|| resting.and_then(keep_any_under))
-            })
-            .or_else(|| world.nearest_under_text_perch_from(body, CLEARANCE, pane_reach(), from));
+        let mut next = match held_seat {
+            Some(s) => keep_under(s),
+            None => None,
+        };
+        if next.is_none()
+            && let Some(s) = resting
+        {
+            next = keep_under(s);
+        }
+        if next.is_none() {
+            next = world.nearest_under_text_perch_from(body, CLEARANCE, HOME_REACH, from);
+        }
+        if next.is_none()
+            && let Some(s) = held_seat
+        {
+            next = keep_any_under(s);
+        }
+        if next.is_none()
+            && let Some(s) = resting
+        {
+            next = keep_any_under(s);
+        }
+        if next.is_none() {
+            next = world.nearest_under_text_perch_from(body, CLEARANCE, pane_reach, from);
+        }
         if let Some(next) = next {
             let seat = (next.col, next.foot_row());
             self.console.rest_seat.set(Some(seat));
@@ -2668,10 +2864,10 @@ impl PetBrain {
         if self.alpha <= 0.0 {
             return None;
         }
-        let seat = self
-            .flight
-            .as_ref()
-            .map_or((self.col, self.row), |f| (f.to_col, f.to_row));
+        let seat = match &self.flight {
+            Some(f) => (f.to_col, f.to_row),
+            None => (self.col, self.row),
+        };
         let body = Self::console_stand_rect(seat, rows, width);
         let judged = if self.console_ground_passing() {
             PetWorld::feet_row_of(body)
@@ -2709,16 +2905,19 @@ impl PetBrain {
         if !self.console.presentable {
             return false;
         }
-        let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
+        let Some(world) = &self.console.world else {
             return false;
         };
+        if world.stamp().is_none() {
+            return false;
+        }
         let body = Self::console_stand_rect(desired, rows, width);
-        Self::stand_clearance(world, body, self.console_escorting()) == Some(false)
-            || self
-                .rest_reach_from(world, rows, width)
-                .is_some_and(|from| {
-                    Self::console_walled(world, from, body, self.console_escorting())
-                })
+        let escorting = self.console_escorting();
+        Self::stand_clearance(world, body, escorting) == Some(false)
+            || matches!(
+                self.rest_reach_from(world, rows, width),
+                Some(from) if Self::console_walled(world, from, body, escorting)
+            )
     }
 
     #[inline]
@@ -2871,7 +3070,8 @@ impl PetBrain {
                 row: frame.row + dy,
                 ..*frame
             };
-            if body_rect(&ridden, sense).is_some_and(|r| world.under_text_clear(r, CLEARANCE)) {
+            if matches!(body_rect(&ridden, sense), Some(r) if world.under_text_clear(r, CLEARANCE))
+            {
                 self.carry_console_body(frame, ridden, dy);
                 self.console.reason = "content-ride";
                 return;
@@ -2894,7 +3094,7 @@ impl PetBrain {
             row: ((safe.row * ch).round() + dest_h + (frame.lift * ch).round()) / ch - 1.0,
             ..*frame
         };
-        if body_rect(&shifted, sense).is_none_or(|r| !world.under_text_clear(r, 0.0)) {
+        if !matches!(body_rect(&shifted, sense), Some(r) if world.under_text_clear(r, 0.0)) {
             self.console.clipped = true;
             self.console.reason = "protected-home-rounding";
             return;
@@ -2976,6 +3176,17 @@ impl PetBrain {
     }
 
     pub(super) fn finish_console_frame(&mut self, frame: &mut PetFrame, sense: PetSense) {
+        let drawn = frame.motes;
+        self.console.mote_gate = MoteGate::Open;
+        self.console_frame_pass(frame, sense);
+        let mut i = 0;
+        while i < PET_MOTES_MAX {
+            self.console.hidden_motes[i] = drawn[i].is_some() && frame.motes[i].is_none();
+            i += 1;
+        }
+    }
+
+    fn console_frame_pass(&mut self, frame: &mut PetFrame, sense: PetSense) {
         self.console_posed = false;
         if !self.console.presentable {
             return;
@@ -3000,18 +3211,22 @@ impl PetBrain {
                 frame.lift = self.console.lift;
             }
             frame.motes = [None; PET_MOTES_MAX];
+            self.console.mote_gate = MoteGate::Shut;
         }
         self.place_console_body_at_home(frame, sense);
         let Some(world) = self.console.world.as_ref() else {
-            for (slot, live) in frame.departures.iter_mut().zip(&self.departures) {
-                if live.is_some_and(|d| d.resight) {
-                    *slot = None;
+            let mut i = 0;
+            while i < PET_DEPARTURES_MAX {
+                if matches!(self.departures[i], Some(d) if d.resight) {
+                    frame.departures[i] = None;
                 }
+                i += 1;
             }
             return;
         };
         if world.stamp().is_none() {
             frame.motes = [None; PET_MOTES_MAX];
+            self.console.mote_gate = MoteGate::Shut;
             self.console.attention = PetAttention::Yielding;
             self.console.reason = "incoherent-surface";
             if self.console.on_glass && frame.alpha > 0 {
@@ -3019,10 +3234,12 @@ impl PetBrain {
                 frame.alpha = cover_alpha(frame.alpha, cover);
                 frame.lane_alpha = cover_alpha(frame.lane_alpha, cover);
                 frame.under_ink |= self.console.z.under;
-                for (slot, live) in frame.departures.iter_mut().zip(&self.departures) {
-                    if live.is_some_and(|d| d.resight) {
-                        *slot = None;
+                let mut i = 0;
+                while i < PET_DEPARTURES_MAX {
+                    if matches!(self.departures[i], Some(d) if d.resight) {
+                        frame.departures[i] = None;
                     }
+                    i += 1;
                 }
                 if frame.alpha == 0 {
                     frame.departures = [None; PET_DEPARTURES_MAX];
@@ -3043,9 +3260,10 @@ impl PetBrain {
             self.console.last_body = Some(rect);
             self.console.last_seat = Some((self.col, self.row));
         }
-        let selected = body
-            .zip(world.selection_rect())
-            .is_some_and(|(b, s)| b.overlaps(s));
+        let selected = matches!(
+            (body, world.selection_rect()),
+            (Some(b), Some(s)) if b.overlaps(s)
+        );
         if self.console.clipped || selected {
             frame.alpha = 0;
             frame.lane_alpha = 0;
@@ -3057,11 +3275,14 @@ impl PetBrain {
             }
         } else {
             let ground_passing = self.console_ground_passing();
-            let verdict = body
-                .filter(|_| !passing(frame))
-                .map(|rect| Self::ground_clearance(world, rect, 0.0, ground_passing));
+            let verdict = match body {
+                Some(rect) if !passing(frame) => {
+                    Some(Self::ground_clearance(world, rect, 0.0, ground_passing))
+                }
+                _ => None,
+            };
             let cover = match verdict {
-                Some(verdict) => self.console.hold.update(sense.now, verdict),
+                Some(v) => self.console.hold.update(sense.now, v),
                 None => self.console.hold.idle(sense.now),
             };
             let verdict = verdict.flatten();
@@ -3075,91 +3296,90 @@ impl PetBrain {
                 }
                 self.console.clipped |= frame.alpha == 0;
             }
-            match body.filter(|_| frame.alpha > 0) {
-                Some(rect) => {
+            match body {
+                Some(rect) if frame.alpha > 0 => {
                     let ink = world.ink_clearance(rect, 0.0) != Some(true);
                     frame.under_ink |= self.console.z.update(sense.now, ink);
                 }
-                None => self.console.z = ZHold::default(),
+                _ => self.console.z = ZHold::default(),
             }
         }
         if frame.alpha == 0 {
             frame.motes = [None; PET_MOTES_MAX];
             frame.departures = [None; PET_DEPARTURES_MAX];
+            self.console.mote_gate = MoteGate::Shut;
         }
         self.console.on_glass = frame.alpha > 0;
-        if frame.motes.iter().any(Option::is_some) {
-            let min_ch = f32::from(sense.cell_h.max(6));
-            let inv_cw = 1.0 / f32::from(sense.cell_w.max(1));
-            let inv_ch = 1.0 / f32::from(sense.cell_h.max(1));
-            for mote in &mut frame.motes {
-                if mote.is_some_and(|m| {
-                    let radius = min_ch * m.scale + 1.0;
-                    let rw = radius * inv_cw;
-                    let rh = radius * inv_ch;
-                    !world.clear(
-                        PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
-                        CLEARANCE,
-                    )
-                }) {
-                    *mote = None;
+        let mut i = 0;
+        while i < PET_MOTES_MAX {
+            if let Some(m) = &frame.motes[i] {
+                self.console.mote_gate = MoteGate::Clearance;
+                if !mote_clears(world, m, (sense.cell_w, sense.cell_h)) {
+                    frame.motes[i] = None;
                 }
             }
+            i += 1;
         }
-        if frame.departures.iter().any(Option::is_some) {
-            let base_lane_alpha = frame.lane_alpha;
-            let selection = world.selection_rect();
-            let mut refused = 0u16;
-            let mut handed = 0.0f32;
-            for (departure, live) in frame.departures.iter_mut().zip(self.departures.iter_mut()) {
-                let Some(d) = departure.as_mut() else {
-                    continue;
-                };
-                if live.is_some_and(|l| l.own_glass.is_some()) {
-                    d.under_ink = true;
-                    continue;
-                }
-                let ghost_rect =
-                    (d.alpha != 0 && sense.cell_w != 0 && sense.cell_h != 0).then(|| {
-                        still_body_rect(
-                            (d.col, d.row),
-                            Stance {
-                                scale_x: d.scale_x,
-                                scale_y: d.scale_y,
-                                lift: d.lift,
-                            },
-                            (sense.cell_w, sense.cell_h),
-                            (sense.cols, sense.rows),
-                        )
-                    });
-                let keep = match ghost_rect {
-                    None => false,
-                    Some(rect) if selection.is_some_and(|s| rect.overlaps(s)) => false,
-                    Some(rect) if live.is_some_and(|l| l.resight) => {
-                        d.under_ink = world.ink_clearance(rect, 0.0) != Some(true);
-                        world
-                            .seen_under_text_clearance_past_caret(rect)
-                            .unwrap_or_else(|| live.is_some_and(|l| l.own_clear))
-                    }
-                    Some(_) => true,
-                };
-                if !keep {
-                    if let Some(l) = live.take_if(|l| l.resight) {
-                        refused += u16::from(d.alpha) * u16::from(base_lane_alpha) / 255;
-                        handed += l.envelope((self.lane_clock - l.born) as f32);
-                    }
-                    *departure = None;
-                }
+        let base_lane_alpha = frame.lane_alpha;
+        let selection = world.selection_rect();
+        let mut refused = 0u16;
+        let mut handed = 0.0f32;
+        let mut i = 0;
+        while i < PET_DEPARTURES_MAX {
+            let Some(d) = &mut frame.departures[i] else {
+                i += 1;
+                continue;
+            };
+            if matches!(self.departures[i], Some(l) if l.own_glass.is_some()) {
+                d.under_ink = true;
+                i += 1;
+                continue;
             }
-            if refused > 0 {
-                frame.alpha =
-                    (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
-            }
-            if handed > 0.0 {
-                let remaining = self.arrive_t / self.arrive_in;
-                if remaining > 0.0 {
-                    self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
+            let ghost_rect = if d.alpha != 0 && sense.cell_w != 0 && sense.cell_h != 0 {
+                Some(still_body_rect(
+                    (d.col, d.row),
+                    Stance {
+                        scale_x: d.scale_x,
+                        scale_y: d.scale_y,
+                        lift: d.lift,
+                    },
+                    (sense.cell_w, sense.cell_h),
+                    (sense.cols, sense.rows),
+                ))
+            } else {
+                None
+            };
+            let keep = match ghost_rect {
+                None => false,
+                Some(rect) if matches!(selection, Some(s) if rect.overlaps(s)) => false,
+                Some(rect) if matches!(self.departures[i], Some(l) if l.resight) => {
+                    d.under_ink = world.ink_clearance(rect, 0.0) != Some(true);
+                    match world.seen_under_text_clearance_past_caret(rect) {
+                        Some(clear) => clear,
+                        None => matches!(self.departures[i], Some(l) if l.own_clear),
+                    }
                 }
+                Some(_) => true,
+            };
+            if !keep {
+                if let Some(l) = self.departures[i]
+                    && l.resight
+                {
+                    self.departures[i] = None;
+                    refused += u16::from(d.alpha) * u16::from(base_lane_alpha) / 255;
+                    handed += l.envelope((self.lane_clock - l.born) as f32);
+                }
+                frame.departures[i] = None;
+            }
+            i += 1;
+        }
+        if refused > 0 {
+            frame.alpha = (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
+        }
+        if handed > 0.0 {
+            let remaining = self.arrive_t / self.arrive_in;
+            if remaining > 0.0 {
+                self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
             }
         }
     }
@@ -3215,7 +3435,10 @@ impl PetBrain {
             if let Some(at) = cand
                 && at > floor
             {
-                earliest = Some(earliest.map_or(at, |prev| prev.min(at)));
+                earliest = Some(match earliest {
+                    Some(prev) if prev <= at => prev,
+                    _ => at,
+                });
             }
         };
         if let Some(e) = self.console.input {
@@ -3241,22 +3464,134 @@ impl PetBrain {
         offer(self.console.z.deadline());
         offer(self.console.repair_until);
         offer(self.console.failure_quiet_until);
-        earliest.map(|at| at.max(now + ARM_MIN))
+        let at = earliest?;
+        Some(at.max(now + self.arm_floor()))
+    }
+
+    /// The soonest after now a deadline may fall: the host's [`ARM_MIN`], or no floor under a
+    /// test's exact arms.
+    #[inline]
+    pub(super) const fn arm_floor(&self) -> Duration {
+        #[cfg(test)]
+        if self.console.exact_arms {
+            return Duration::ZERO;
+        }
+        ARM_MIN
+    }
+
+    /// Whether mote slot `i` is one the last frame's console pass dropped while the brain kept it.
+    #[inline]
+    pub(super) const fn console_hid_mote(&self, i: usize) -> bool {
+        #[cfg(test)]
+        if self.console.offer_hidden_motes {
+            return false;
+        }
+        self.console.hidden_motes[i]
+    }
+
+    /// The offer's edge for the motes the console hid, in seconds after the last tick, when it
+    /// comes before `horizon` (the brain's other edges).
+    ///
+    /// A hidden mote's own steps (a whole pixel, a look slice) draw nothing, so the offer does not
+    /// wake for them. It walks them instead, every hidden mote's in time order, as the schedule
+    /// that woke for each would have ticked, and offers the first of those ticks that would have
+    /// changed anything ([`Self::console_motes_change_at`]): a hidden mote clear of the ink again,
+    /// which the console then draws; a drawn mote the ink now covers; or a mote the brain drops
+    /// (its life spent, or a z over ink), which frees its slot for the next.
+    ///
+    /// A tick this skips draws the frame before it and keeps the brain's motes only because the
+    /// rest of the brain changes what it draws only at edges [`Self::next_change_secs`] offers,
+    /// which bound the walk (`horizon`): a glide ends under a whole pixel, a beat counts as its
+    /// offer does, and a still pose's hold offers its end. A skipped tick still changes how the
+    /// brain's `f32` clocks sum, so an edge can fall slightly apart from where a schedule that
+    /// woke for every step meets it; `a_dozing_pet_shows_the_frames_the_every_step_schedule_shows`
+    /// holds the two schedules' frames together.
+    pub(super) fn hidden_mote_offer(&self, horizon: Option<f32>) -> Option<f32> {
+        let limit = horizon.unwrap_or(f32::INFINITY);
+        let mut next = [None; PET_MOTES_MAX];
+        let mut i = 0;
+        while i < PET_MOTES_MAX {
+            if self.console_hid_mote(i)
+                && let Some(m) = self.motes[i]
+                && m.kind.rides_offer()
+            {
+                next[i] = self.mote_own_edge(&m, 0.0);
+            }
+            i += 1;
+        }
+        let mut walked = 0;
+        loop {
+            let mut soonest: Option<(usize, f32)> = None;
+            let mut slot_idx = 0;
+            while slot_idx < PET_MOTES_MAX {
+                if let Some(t) = next[slot_idx]
+                    && !matches!(soonest, Some((_, best)) if t >= best)
+                {
+                    soonest = Some((slot_idx, t));
+                }
+                slot_idx += 1;
+            }
+            let (slot, t) = soonest?;
+            if t >= limit {
+                return None;
+            }
+            walked += 1;
+            if walked >= HIDDEN_MOTE_EDGES_MAX || self.console_motes_change_at(t) {
+                return Some(t);
+            }
+            next[slot] = match self.motes[slot] {
+                Some(m) => self.mote_own_edge(&m, t),
+                None => None,
+            };
+        }
+    }
+
+    /// Whether a tick `t` seconds after the last would find the console's motes changed where no
+    /// edge of their own says so: a hidden mote the brain drops, a hidden mote clear of the ink
+    /// again, or a drawn mote the ink now covers. The console judges a mote's clearance where it
+    /// is, not at the whole pixel it draws at, so that verdict can turn between the mote's own
+    /// edges, on whichever tick comes next.
+    fn console_motes_change_at(&self, t: f32) -> bool {
+        let clock = self.clock + f64::from(t);
+        let world = self.console.world.as_deref();
+        let cells = (self.last_cell_w, self.last_cell_h);
+        let mut i = 0;
+        while i < PET_MOTES_MAX {
+            if let Some(m) = self.motes[i]
+                && m.kind.rides_offer()
+            {
+                let Some(sprite) = self.mote_sprite(&m, m.age(clock)) else {
+                    return true;
+                };
+                if self.console.mote_gate == MoteGate::Clearance
+                    && matches!(world, Some(w) if mote_clears(w, &sprite, cells))
+                        == self.console_hid_mote(i)
+                {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
     pub(super) fn note_console_completion(&mut self, now: Instant, failed: bool) {
         self.console.completion_seq = self.console.completion_seq.wrapping_add(1).max(1);
         self.console.completion = Some((now, failed));
-        self.console.failure_quiet_until = failed.then(|| now + RESULT_HOLD_DUR);
+        self.console.failure_quiet_until = if failed {
+            Some(now + RESULT_HOLD_DUR)
+        } else {
+            None
+        };
     }
 
     #[inline]
     pub(super) fn console_grieving(&self) -> bool {
-        self.console
-            .failure_quiet_until
-            .zip(self.last_now)
-            .is_some_and(|(until, now)| now < until)
+        matches!(
+            (self.console.failure_quiet_until, self.last_now),
+            (Some(until), Some(now)) if now < until
+        )
     }
 }
 
@@ -7917,5 +8252,471 @@ mod tests {
                 "{host:?}: the caret is back, so is the pet"
             );
         }
+    }
+
+    /// The cells and grid [`Dozing`] draws in.
+    const DOZE_CELL: (u16, u16) = (15, 28);
+    const DOZE_GRID: (u16, u16) = (108, 35);
+    /// How many entries of a [`drawn`] key the body takes.
+    const DOZE_BODY_KEY: usize = 8;
+
+    /// A shell's scrollback above a prompt near the top: each z rises into the ink, and the
+    /// console hides it for its whole life.
+    const DOZE_INK: &[u8] =
+        b"\x1b]11;#000000\x07$ echo hi\r\nhi\r\n$ echo hi\r\nhi\r\n$ echo hi\r\nhi\r\n$ ";
+
+    /// What the host draws of `f` (`WordDecorations::pet_cursor`) in `cell`-sized cells on a
+    /// `grid`: the body's pose, look and pixel rect, then each mote it draws, in draw order, by
+    /// kind, pixel box, rotation bucket, alpha and tint. Empty while the lane is off.
+    fn drawn(f: &PetFrame, (cell_w, cell_h): (u16, u16), (cols, rows): (u16, u16)) -> Vec<i64> {
+        let mut key = Vec::new();
+        if f.lane_alpha == 0 {
+            return key;
+        }
+        if let Some((x0, x1, y0, y1)) = f.body_px(cell_w, cell_h, cols, rows) {
+            key.extend([
+                f.pose as i64,
+                i64::from(f.alpha),
+                i64::from(f.facing_left),
+                i64::from(f.under_ink),
+            ]);
+            key.extend([x0, x1, y0, y1].map(i64::from));
+        }
+        if f.alpha > 0 {
+            for m in f.motes.iter().flatten() {
+                let alpha = (f32::from(m.alpha) * (f32::from(f.alpha) / 255.0)) as u8;
+                let Some((x, y, side)) =
+                    mote_box_px((m.col, m.row), m.scale, (cell_w, cell_h), (cols, rows))
+                else {
+                    continue;
+                };
+                if alpha == 0 {
+                    continue;
+                }
+                let turn = m.rot / core::f32::consts::TAU;
+                let bucket = ((turn - turn.floor()) * 12.0) as i64 % 12;
+                key.extend([
+                    m.kind as i64,
+                    i64::from(x),
+                    i64::from(y),
+                    i64::from(side),
+                    bucket,
+                    i64::from(alpha),
+                    m.rgb.map_or(-1, i64::from),
+                ]);
+            }
+        }
+        key
+    }
+
+    /// A pet asleep beside a shell prompt in a console, ticked by hand.
+    struct Dozing {
+        term: Terminal,
+        pet: PetBrain,
+        now: Instant,
+        /// The console's cells, in pixels.
+        cell: (u16, u16),
+        /// The console's columns and rows.
+        grid: (u16, u16),
+    }
+
+    /// One tick of [`Dozing::breathe`].
+    struct Doze {
+        /// When it ran.
+        at: Instant,
+        /// What the host drew ([`drawn`]).
+        key: Vec<i64>,
+        /// Whether it ran at the brain's offer, not on a frame train.
+        offered: bool,
+        /// Whether a mote was born or dropped.
+        motes_moved: bool,
+        /// Whether it ran at the brain's offer and dropped a mote the brain would have dropped
+        /// more than [`ARM_MIN`] before.
+        dropped_late: bool,
+        /// Whether the console drew a mote it hid the tick before.
+        revealed: bool,
+        /// Whether the console hid a mote it drew the tick before.
+        covered: bool,
+        /// How many motes the console hid.
+        hidden: usize,
+    }
+
+    impl Dozing {
+        /// [`Self::in_console`] in [`DOZE_CELL`] cells on a [`DOZE_GRID`].
+        fn new(screen: &[u8], start: Instant, old_schedule: bool) -> Self {
+            Self::in_console(screen, start, old_schedule, DOZE_CELL, DOZE_GRID)
+        }
+
+        /// The pet beside the caret `screen` leaves in a console of `cell`-sized cells on a `grid`,
+        /// ticked at 60 Hz from `start` until it has slept [`SLEEP_AFTER`]. `old_schedule` keeps
+        /// the hidden motes' own edges in its offers.
+        fn in_console(
+            screen: &[u8],
+            start: Instant,
+            old_schedule: bool,
+            cell: (u16, u16),
+            grid: (u16, u16),
+        ) -> Self {
+            let (cols, rows) = grid;
+            let mut term = Terminal::new(rows, cols);
+            term.process(screen);
+            let mut pet = PetBrain::default();
+            pet.console.offer_hidden_motes = old_schedule;
+            let mut doze = Self {
+                term,
+                pet,
+                now: start,
+                cell,
+                grid,
+            };
+            doze.tick();
+            while !(doze.pet.action == PetAction::Sleep && doze.pet.quiet >= SLEEP_AFTER) {
+                doze.now += Duration::from_millis(16);
+                doze.tick();
+                assert!(
+                    doze.now - start < Duration::from_secs(90),
+                    "the pet never slept: {:?}",
+                    doze.pet.action
+                );
+            }
+            doze
+        }
+
+        fn tick(&mut self) -> PetFrame {
+            let ((cell_w, cell_h), (cols, rows)) = (self.cell, self.grid);
+            let input = self.term.cell_frame(usize::from(rows), usize::from(cols));
+            let facts = PetWorldFacts::read(&self.term, 7);
+            self.pet
+                .observe_console(&input, &facts, PetPane::full(&input));
+            self.pet.set_console_presentable(true);
+            let c = self.term.cursor();
+            self.pet.tick(PetSense {
+                caret_drawn: true,
+                now: self.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows,
+                cols,
+                cell_w,
+                cell_h,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+            })
+        }
+
+        /// Ticks the pet at its own offers, or at 60 Hz while it asks for frames, until its breath
+        /// window has closed and deep sleep offers nothing.
+        fn breathe(&mut self) -> Vec<Doze> {
+            self.breathe_through(&[])
+        }
+
+        /// [`Self::breathe`], while the shell writes each of `edits` (bytes, with how long after
+        /// the doze began).
+        ///
+        /// The first tick after a gap integrates at most 0.1 s of it (`PetBrain::tick`'s `dt`), so a
+        /// schedule that slept longer before an edit reacts to it a little further along. Each
+        /// edit is ticked under the old text a microsecond before, as a host ticking at every
+        /// step would have, so every schedule meets it from the same place.
+        fn breathe_through(&mut self, edits: &[(Duration, Vec<u8>)]) -> Vec<Doze> {
+            let t0 = self.now;
+            let mut edits = edits.iter().peekable();
+            let mut out = Vec::new();
+            loop {
+                let offered = !self.pet.needs_frames();
+                let next = if offered {
+                    self.pet.next_change_deadline(self.now)
+                } else {
+                    Some(self.now + Duration::from_millis(16))
+                };
+                if let Some((after, bytes)) =
+                    edits.next_if(|(after, _)| next.is_none_or(|n| n >= t0 + *after))
+                {
+                    let at = (t0 + *after).max(self.now);
+                    self.now = (at - Duration::from_micros(1)).max(self.now);
+                    self.step(false, &mut out);
+                    self.term.process(bytes);
+                    self.now = at;
+                    self.step(false, &mut out);
+                    continue;
+                }
+                let Some(at) = next else {
+                    assert!(
+                        self.pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+                        "only deep sleep offers no change"
+                    );
+                    return out;
+                };
+                self.now = at;
+                self.step(offered, &mut out);
+                assert!(
+                    self.now - t0 < Duration::from_secs(60),
+                    "the breath window closes"
+                );
+            }
+        }
+
+        /// Ticks the pet at [`Self::now`] and notes the tick in `out`.
+        fn step(&mut self, offered: bool, out: &mut Vec<Doze>) {
+            let ids = |pet: &PetBrain| pet.motes.map(|m| m.map(|m| (m.seed, m.born.to_bits())));
+            let (motes, before) = (self.pet.motes, ids(&self.pet));
+            let hid = self.pet.console.hidden_motes;
+            let frame = self.tick();
+            let after = ids(&self.pet);
+            let hides = self.pet.console.hidden_motes;
+            let kept = |i: usize| before[i].is_some() && before[i] == after[i];
+            let earlier = self.pet.clock - ARM_MIN.as_secs_f64();
+            out.push(Doze {
+                at: self.now,
+                key: drawn(&frame, self.cell, self.grid),
+                offered,
+                motes_moved: before != after,
+                dropped_late: offered
+                    && (0..PET_MOTES_MAX).any(|i| {
+                        before[i] != after[i]
+                            && motes[i]
+                                .is_some_and(|m| self.pet.mote_sprite(&m, m.age(earlier)).is_none())
+                    }),
+                revealed: (0..PET_MOTES_MAX).any(|i| kept(i) && hid[i] && !hides[i]),
+                covered: (0..PET_MOTES_MAX).any(|i| kept(i) && !hid[i] && hides[i]),
+                hidden: hides.iter().filter(|h| **h).count(),
+            });
+        }
+    }
+
+    /// The offered ticks of `run` that drew the frame before them and kept every mote.
+    fn idle_wakes(run: &[Doze]) -> usize {
+        run.windows(2)
+            .filter(|w| w[1].offered && w[1].key == w[0].key && !w[1].motes_moved)
+            .count()
+    }
+
+    /// What `run` shows at `t`: the frame of the last tick at or before it.
+    fn shown_at(run: &[Doze], t: Instant) -> Option<&[i64]> {
+        let ran = run.partition_point(|d| d.at <= t);
+        ran.checked_sub(1).map(|i| run[i].key.as_slice())
+    }
+
+    /// The longest stretch `a` and `b` show different frames, and when it began. Each tick's
+    /// frame stays up until the run's next tick, its last one for good.
+    fn longest_disagreement(a: &[Doze], b: &[Doze]) -> (Duration, Option<Instant>) {
+        let mut ticks: Vec<Instant> = a.iter().chain(b).map(|d| d.at).collect();
+        ticks.sort_unstable();
+        ticks.dedup();
+        let (mut since, mut longest) = (None, (Duration::ZERO, None));
+        for t in ticks {
+            match (shown_at(a, t) != shown_at(b, t), since) {
+                (true, None) => since = Some(t),
+                (false, Some(from)) => {
+                    if t - from > longest.0 {
+                        longest = (t - from, Some(from));
+                    }
+                    since = None;
+                }
+                _ => {}
+            }
+        }
+        match since {
+            Some(from) => (Duration::MAX, Some(from)),
+            None => longest,
+        }
+    }
+
+    /// The longest two schedules of the sameness sweep may show different frames: the host's
+    /// shortest arm and an offer's overshoot ([`ARM_MIN`], [`OFFER_PAST`]), what a tick held back
+    /// by the arm's floor costs. The sweep arms its ticks exactly
+    /// ([`ConsoleLife::exact_arms`]); under the floor the two schedules part further, since a z
+    /// born on a tick the floor held back carries that into each step it takes, and a frame train
+    /// rounds it up to a whole frame, which is how the host arms and no edge the offer missed.
+    /// Armed exactly, they part only by how each one's offers round, well inside this; a missed
+    /// edge parts them until the next tick.
+    fn disagreement_slack() -> Duration {
+        ARM_MIN + Duration::from_secs_f32(OFFER_PAST)
+    }
+
+    #[test]
+    fn a_dozing_pet_does_not_wake_for_the_zs_the_ink_hides() {
+        let start = Instant::now();
+        for old_schedule in [false, true] {
+            let run = Dozing::new(DOZE_INK, start, old_schedule).breathe();
+            assert!(
+                run.iter().filter(|d| d.hidden > 0).count() > 20,
+                "the brain keeps z's the console hides through the breath window"
+            );
+            assert!(
+                run.iter().all(|d| d.key.len() == DOZE_BODY_KEY),
+                "the console draws none of them"
+            );
+            let idle = idle_wakes(&run);
+            if old_schedule {
+                assert!(
+                    idle > 100,
+                    "the every-step schedule wakes for each hidden z's steps: {idle} idle wakes"
+                );
+            } else {
+                assert_eq!(
+                    idle, 0,
+                    "each tick the pet asks for draws a new frame, or births or drops a z"
+                );
+            }
+        }
+    }
+
+    /// A seeded linear congruential generator, for [`doze_case`].
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        /// A draw from `lo..=hi`.
+        fn range(&mut self, lo: u64, hi: u64) -> u64 {
+            lo + self.next() % (hi - lo + 1)
+        }
+    }
+
+    /// The cells the sameness sweep draws in, in pixels.
+    const DOZE_CELLS: [(u16, u16); 9] = [
+        (15, 28),
+        (8, 16),
+        (7, 15),
+        (9, 19),
+        (10, 22),
+        (12, 25),
+        (16, 33),
+        (6, 13),
+        (11, 23),
+    ];
+
+    /// A sameness sweep case: up to six words of up to six letters around a prompt, which a z
+    /// rises past, into or clear of; and, if `edit`, up to four edits mid-doze that write over,
+    /// blank out or scroll the page near it.
+    fn doze_case(rng: &mut Lcg, edit: bool) -> (String, Vec<(Duration, Vec<u8>)>) {
+        let prow = rng.range(6, 20);
+        let pcol = rng.range(5, 80);
+        let near = |rng: &mut Lcg| {
+            (
+                rng.range(prow.saturating_sub(5).max(1), prow),
+                rng.range(pcol.saturating_sub(4).max(1), pcol + 14),
+                rng.range(1, 6) as usize,
+            )
+        };
+        let mut screen = String::from("\x1b]11;#000000\x07");
+        for _ in 0..rng.range(1, 6) {
+            let (r, c, len) = near(rng);
+            screen.push_str(&format!("\x1b[{r};{c}H{}", "x".repeat(len)));
+        }
+        screen.push_str(&format!("\x1b[{prow};{pcol}H$ "));
+        let mut edits = Vec::new();
+        if edit {
+            for _ in 0..rng.range(1, 4) {
+                let at = Duration::from_millis(rng.range(50, 9500));
+                let (r, c, len) = near(rng);
+                let bytes = match rng.range(0, 3) {
+                    0 => format!("\x1b7\x1b[{r};{c}H{}\x1b8", "y".repeat(len)),
+                    1 => format!("\x1b7\x1b[{r};{c}H{}\x1b8", " ".repeat(len)),
+                    2 => "\x1b7\x1b[1;1H\x1b[1J\x1b8".to_owned(),
+                    _ => "\x1b7\x1b[1;1H\x1b[1L\x1b8".to_owned(),
+                };
+                edits.push((at, bytes.into_bytes()));
+            }
+            edits.sort_by_key(|e| e.0);
+        }
+        (screen, edits)
+    }
+
+    /// Over a seeded sweep of prompts, words around them, cell sizes and edits mid-doze, a pet
+    /// ticked at its offers shows, at every moment of its doze, the frame shown by one that also
+    /// wakes for each step of the motes the console hides ([`ConsoleLife::offer_hidden_motes`]),
+    /// to within [`disagreement_slack`]: no tick the offer skips would have changed what the host
+    /// draws, of a mote or of the body.
+    #[test]
+    fn a_dozing_pet_shows_the_frames_the_every_step_schedule_shows() {
+        let start = Instant::now();
+        let mut rng = Lcg(0x5eed);
+        let (mut revealed, mut covered, mut skipped, mut rehomed) = (0, 0, 0, 0);
+        for case in 0..600 {
+            let cell = DOZE_CELLS[case % DOZE_CELLS.len()];
+            let (screen, edits) = doze_case(&mut rng, case % 2 == 1);
+            let layout = format!("case {case}, {cell:?} cells: {screen:?}, edits {edits:?}");
+            let mut runs = [true, false].map(|old_schedule| {
+                let mut doze =
+                    Dozing::in_console(screen.as_bytes(), start, old_schedule, cell, (100, 30));
+                doze.pet.console.exact_arms = true;
+                doze
+            });
+            let home = runs[0].pet.home;
+            let [old, new] = runs.each_mut().map(|doze| doze.breathe_through(&edits));
+            rehomed += usize::from(runs[0].pet.home != home);
+            revealed += old.iter().filter(|d| d.revealed).count();
+            covered += old.iter().filter(|d| d.covered).count();
+            for (schedule, run) in [("every-step", &old), ("offered", &new)] {
+                assert!(
+                    !run.iter().any(|d| d.dropped_late),
+                    "{layout}: the {schedule} schedule drops each mote as it ends"
+                );
+            }
+            skipped += old.len().saturating_sub(new.len());
+            assert!(
+                new.len() <= old.len(),
+                "{layout}: no more ticks than the every-step schedule"
+            );
+            let (apart, from) = longest_disagreement(&old, &new);
+            assert!(
+                apart <= disagreement_slack(),
+                "{layout}: {} from {:?} into the doze, the offered schedule shows {:?} where the \
+                 every-step schedule shows {:?}",
+                if apart == Duration::MAX {
+                    "for good".to_owned()
+                } else {
+                    format!("for {apart:?}")
+                },
+                from.map(|t| t - old[0].at),
+                from.and_then(|t| shown_at(&new, t)),
+                from.and_then(|t| shown_at(&old, t)),
+            );
+        }
+        assert!(
+            revealed > 100,
+            "the sweep has hidden z's the console draws again: {revealed}"
+        );
+        assert!(
+            covered > 100,
+            "the sweep has drawn z's the console then hides: {covered}"
+        );
+        assert!(skipped > 10_000, "the sweep's offers skip ticks: {skipped}");
+        assert!(
+            rehomed > 25,
+            "the sweep's edits move the pet's home: {rehomed}"
+        );
+    }
+
+    #[test]
+    fn a_tick_on_a_z_beat_puffs_its_z() {
+        let start = Instant::now();
+        let mut doze = Dozing::new(b"\x1b]11;#000000\x07\x1b[20;10H$ ", start, false);
+        while doze.pet.mote_mark < 3 {
+            doze.now = if doze.pet.needs_frames() {
+                doze.now + Duration::from_millis(16)
+            } else {
+                doze.pet
+                    .next_change_deadline(doze.now)
+                    .expect("light sleep offers its next z")
+            };
+            let _ = doze.tick();
+        }
+        let on_beat = beat_at(SLEEP_AFTER, ZEE_EVERY, 4);
+        assert!(
+            doze.pet.quiet < on_beat && ((on_beat - SLEEP_AFTER) * (1.0 / ZEE_EVERY)).floor() < 4.0,
+            "fixture: beat 4 is to come, and dividing by the beat counts it short ({on_beat})"
+        );
+        doze.pet.quiet = on_beat;
+        let _ = doze.tick();
+        assert_eq!(doze.pet.mote_mark, 4, "a tick on beat 4 puffs its z");
     }
 }

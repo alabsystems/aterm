@@ -1,0 +1,41 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.135.0, `lab instance`, not the lab's jail, whose sandbox answers every non-loopback connect EPERM) running the managed 2.1.310 by path with a scratch `CLAUDE_CONFIG_DIR` (onboarding and folder trust pre-accepted), a dummy `apiKeyHelper` key, `ANTHROPIC_BASE_URL=http://[::2]:443` (an address the kernel answers EHOSTUNREACH without sending a packet) and every other route through a dead local proxy · Claude Code's network retry row with a message queued behind it: No internet route (EHOSTUNREACH), the composer's placeholder Press up to edit queued messages, 120 columns · the scratch path's uid, user and session UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /…/tmp/scratch-00/-Users-user00-trust/00000000-0000-0000-0000-000000000000/scratchpad/wake2/route/proj
+
+
+❯ say hi
+
+❯ also say bye
+  ctrl+enter to send now
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✻ No internet route — check your connection or VPN (EHOSTUNREACH) · Retrying in 9s · attempt 5/10
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt

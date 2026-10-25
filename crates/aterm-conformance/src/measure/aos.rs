@@ -4,7 +4,9 @@
 //! The aos matrix: the main-thread time an `aos repair` takes on the release binary.
 
 use super::Rig;
-use super::instance::{Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field};
+use super::instance::{
+    Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, unanswered,
+};
 use super::starvation::ShapeVerdict;
 
 /// One aos row.
@@ -81,21 +83,21 @@ pub fn judge(row: &AosRow, main_us: &[u64], off_main: bool) -> ShapeVerdict {
 
 /// Measure one row: attach the shipped code, then type and repair `row.repairs` times, reading each repair's `main_us=` and `off_main=`.
 /// # Errors
-/// [`CouldNotRun`] when the instance did not start, a request failed, or a repair answered without the fields.
+/// [`CouldNotRun`] when the instance did not start or a request failed; [`CouldNotRun::Unanswered`] when a repair answered without the fields.
 pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("ataos")
-        .map_err(|e| CouldNotRun(format!("cannot make a scratch world: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
     if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
         scratch.keep();
     }
     let world = World::prepare(scratch.path(), GLOW_ON)
-        .map_err(|e| CouldNotRun(format!("cannot lay out the scratch world: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
     std::fs::write(world.home.join(".shrc"), TYPED_INTO)
-        .map_err(|e| CouldNotRun(format!("cannot write the scratch shell's rc: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot write the scratch shell's rc: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;
     let attached = ctl.ok(&["aos", "attach", "code=shipped"])?;
@@ -113,7 +115,7 @@ pub fn measure(rig: &Rig, row: &AosRow) -> Result<AosReport, CouldNotRun> {
         let us = field(&line, "main_us").and_then(|v| v.parse::<u64>().ok());
         let off = field(&line, "off_main");
         let (Some(us), Some(off)) = (us, off) else {
-            return could_not_run(format!(
+            return unanswered(format!(
                 "aos repair named no main_us= or off_main= ({line})"
             ));
         };

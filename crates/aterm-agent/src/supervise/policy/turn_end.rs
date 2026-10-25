@@ -213,6 +213,9 @@ impl Kept {
 /// How near two readings of one dated reset land: the loop places it on its clock at each read, and another reset names another minute.
 const SAME_RESET: Duration = Duration::from_secs(30);
 
+/// The longest the loop leaves a dialog it backed out of to close before its Esc again ([`TurnEndState::login_closing`]): a dialog still drawn after the Esc is pressed again, never handed to a person.
+pub const BACK_OUT_PAUSE_MAX: Duration = Duration::from_secs(10 * 60);
+
 /// Whether `at` is the reset `kept` was, read again ([`SAME_RESET`]).
 fn same_reset(kept: Option<Instant>, at: Instant) -> bool {
     kept.is_some_and(|k| k.max(at).duration_since(k.min(at)) < SAME_RESET)
@@ -8889,16 +8892,11 @@ pub(super) fn sign_in_how(program: Program, message: &str) -> String {
             || "sign in to Muse Code again with muse login in a shell".to_string(),
             |r| format!("as Muse Code says, {r}"),
         ),
-        Program::Gemini => {
-            "sign Gemini CLI in with /auth in its tab, or run it again with a valid GEMINI_API_KEY"
-                .to_string()
-        }
     }
 }
 
 const fn how_leads(program: Program) -> bool {
     match program {
-        Program::Gemini => true,
         Program::Claude
         | Program::Codex
         | Program::Grok
@@ -8917,7 +8915,6 @@ const fn login_command(program: Program) -> Option<&'static str> {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => None,
     }
 }
@@ -8925,12 +8922,7 @@ const fn login_command(program: Program) -> Option<&'static str> {
 const fn compact_command(program: Program) -> Option<&'static str> {
     match program {
         Program::Claude | Program::Muse => Some("/compact"),
-        Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Gemini
-        | Program::Generic => None,
+        Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Generic => None,
     }
 }
 
@@ -10085,7 +10077,6 @@ const fn auto_continues(program: Program) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => false,
     }
 }
@@ -10118,6 +10109,11 @@ impl Default for TurnEndTiming {
 /// THE LADDER'S DEVELOPMENT SEAM.
 pub const LADDER_SCALE_SEAM: &str = "ATERM_DEV_LADDER_SCALE";
 
+/// THE RESET WAIT'S DEVELOPMENT SEAM: a factor in `(0, 1]` on the grace and jitter the harness
+/// waits past a wall's reset ([`TurnEndTiming::reset_scaled`]), so a world test's carry-on comes
+/// at the wall's own reset and its wait is the hang detector. Only a development build reads it.
+pub const RESET_SCALE_SEAM: &str = "ATERM_DEV_RESET_SCALE";
+
 impl TurnEndTiming {
     /// The same timing, its short back-off ladder scaled by `factor`.
     #[must_use]
@@ -10147,14 +10143,36 @@ impl TurnEndTiming {
         (f.is_finite() && f > 0.0 && f <= 1.0).then_some(f)
     }
 
+    /// The same timing, the wait past a wall's reset ([`Self::reset_grace`] and
+    /// [`Self::reset_jitter`]) scaled by `factor`.
+    #[must_use]
+    pub fn reset_scaled(mut self, factor: f64) -> Self {
+        self.reset_grace = self.reset_grace.mul_f64(factor);
+        self.reset_jitter = self.reset_jitter.mul_f64(factor);
+        self
+    }
+
     /// Construct timing parameters for a session started by this build.
     #[must_use]
     pub fn for_build() -> Self {
-        let shipped = Self::default();
-        match Self::ladder_scale(aterm_types::dev_seam!(LADDER_SCALE_SEAM).as_deref()) {
-            Some(factor) => shipped.ladder_scaled(factor),
-            None => shipped,
+        Self::for_seams(
+            aterm_types::dev_seam!(LADDER_SCALE_SEAM).as_deref(),
+            aterm_types::dev_seam!(RESET_SCALE_SEAM).as_deref(),
+        )
+    }
+
+    /// [`Self::for_build`] under the values its two development seams read
+    /// ([`LADDER_SCALE_SEAM`], [`RESET_SCALE_SEAM`]), each a factor in `(0, 1]`.
+    #[must_use]
+    pub fn for_seams(ladder: Option<&std::ffi::OsStr>, reset: Option<&std::ffi::OsStr>) -> Self {
+        let mut timing = Self::default();
+        if let Some(factor) = Self::ladder_scale(ladder) {
+            timing = timing.ladder_scaled(factor);
         }
+        if let Some(factor) = Self::ladder_scale(reset) {
+            timing = timing.reset_scaled(factor);
+        }
+        timing
     }
 }
 
@@ -10263,7 +10281,6 @@ pub(crate) const fn reads_conversation(program: Program) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => false,
     }
 }
@@ -10271,7 +10288,7 @@ pub(crate) const fn reads_conversation(program: Program) -> bool {
 #[must_use]
 pub(crate) const fn screen_alone(program: Program) -> bool {
     match program {
-        Program::Agy | Program::Muse | Program::Gemini => true,
+        Program::Agy | Program::Muse => true,
         Program::Claude | Program::Codex | Program::Grok | Program::Kimi | Program::Generic => {
             false
         }
@@ -10286,9 +10303,7 @@ pub(crate) fn met_under_another(met: Option<Program>, here: Program) -> bool {
 
 /// THE SEAT A SCREEN NAMES: the model and the login a screen-alone agent
 /// draws ([`screen_alone`]) — agy's footer model and its launch card's login
-/// row (`Gemini API key`, or the signed-in account), Gemini CLI's footer
-/// `/model` value and its banner's login (`Authenticated with
-/// gemini-api-key`).
+/// row (`Gemini API key`, or the signed-in account).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Seat {
     pub model: Option<String>,
@@ -10303,10 +10318,6 @@ impl Seat {
             Program::Agy => Self {
                 model: aterm_phase::agy::launch_card(rows).map(|c| c.model),
                 login: aterm_phase::agy::launch_card_login(rows).map(str::to_owned),
-            },
-            Program::Gemini => Self {
-                model: aterm_phase::gemini::footer_model(rows),
-                login: aterm_phase::gemini::banner_login(rows),
             },
             Program::Claude
             | Program::Codex
@@ -10337,9 +10348,9 @@ impl Seat {
     /// WHETHER `now` IS THIS SEAT'S ACCOUNT BY THE SCREEN'S OWN WORD: both
     /// name the login, alike, and it names an account — an address
     /// (`user@example.com (Google AI Pro)`, `Signed in with Google:
-    /// user@example.com`) — never a key's label (`Gemini API key`,
-    /// `Authenticated with gemini-api-key`), which every key draws alike: a
-    /// relaunch under another key draws the same words.
+    /// user@example.com`) — never a key's label (`Gemini API key`), which
+    /// every key draws alike: a relaunch under another key draws the same
+    /// words.
     fn same_account(&self, now: &Self) -> bool {
         matches!((&self.login, &now.login), (Some(a), Some(b)) if a == b && a.contains('@'))
     }
@@ -10354,13 +10365,12 @@ impl Seat {
     }
 }
 
-/// WHETHER A LIMIT ON `program`'s SCREEN IS A MODEL'S: Gemini CLI's (`Usage
-/// limit reached for <model>.`, its quota per model) and agy's (`You have
+/// WHETHER A LIMIT ON `program`'s SCREEN IS A MODEL'S: agy's (`You have
 /// exhausted your quota on this model.`, its 429's `QuotaFailure` per
 /// model).
 const fn limit_per_model(program: Program) -> bool {
     match program {
-        Program::Gemini | Program::Agy => true,
+        Program::Agy => true,
         Program::Claude
         | Program::Codex
         | Program::Grok
@@ -10545,7 +10555,6 @@ impl TurnEndReading {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         let after = self
@@ -10612,7 +10621,6 @@ impl TurnEndReading {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         let own = reading
@@ -10902,6 +10910,11 @@ pub enum TurnEndAction {
         rule_id: &'static str,
         row: String,
     },
+    /// A fenced Esc at the dialog's own `Esc to cancel` row, out of a dialog the loop opened
+    /// ([`super::login::backs_out`]).
+    Cancel {
+        rule_id: &'static str,
+    },
     Escalate {
         reason: String,
     },
@@ -10922,6 +10935,7 @@ impl TurnEndAction {
             | TurnEndAction::TypeCommand { rule_id, .. }
             | TurnEndAction::Submit { rule_id }
             | TurnEndAction::Confirm { rule_id, .. }
+            | TurnEndAction::Cancel { rule_id }
             | TurnEndAction::Restart { rule_id, .. } => Some(rule_id),
             _ => None,
         }
@@ -11004,7 +11018,7 @@ struct WallTrack {
 
 /// WHAT A LIMIT'S TRACK KEEPS OF ITS AGENT'S RELAUNCH ([`WallTrack::relaunch`],
 /// [`TurnEndState::relaunch_startup`]): a limit met under an agent whose
-/// screen is all its evidence ([`screen_alone`]: Muse Code, agy, Gemini CLI).
+/// screen is all its evidence ([`screen_alone`]: Muse Code, agy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct RelaunchBooks {
     /// The last point of the limit's own program read while the track
@@ -11023,6 +11037,16 @@ struct RelaunchBooks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct LoginBooks {
     cancelled: bool,
+    /// When the loop last pressed the dialog's own Esc to back out of the dialog of the `/login`
+    /// it typed ([`TurnEndAction::Cancel`], [`super::login::backs_out`]).
+    backed_out: Option<Instant>,
+    /// How many of those Escs the loop pressed: each spaces the next one further
+    /// ([`TurnEndState::login_closing`]).
+    backs: u32,
+    /// The dialog the loop backed out of was read gone since its Esc (no dialog drawn, the
+    /// composer back): that `/login` was left ([`TurnEndState::login_typed_left`]), and a dialog
+    /// drawn after it is a person's own.
+    closed: bool,
     hand: bool,
     prompt_at: Option<Instant>,
     prompt: Option<u64>,
@@ -12383,16 +12407,6 @@ impl TurnEndState {
         }
     }
 
-    /// WHETHER THE SCREEN `here` OF `program`'s RELAUNCHED PROCESS NAMES THE
-    /// ACCOUNT THE TAB'S EARLIER SCREENS NAMED ([`Seat::same_account`]): the
-    /// seat vouched for across a relaunch nobody here made.
-    #[must_use]
-    pub(crate) fn seat_vouched(&self, program: Program, here: &Seat) -> bool {
-        self.seat_seen
-            .as_ref()
-            .is_some_and(|(seen_by, seen)| *seen_by == program && seen.same_account(here))
-    }
-
     /// The seat `reading`'s screen names, kept ([`TurnEndState::seat_seen`]):
     /// a screen-alone agent's fields over what the tab's earlier screens of
     /// it named; another agent's screen replaces it (its seat is none of
@@ -12699,13 +12713,70 @@ impl TurnEndState {
             .is_some_and(|t| named_class(t.class) && t.login.cancelled)
     }
 
-    /// WHEN THIS LOOP TYPED `/login` INTO THE LOST LOGIN STANDING ([`LoginBooks::typed_at`]), its sign-in not left.
+    /// WHETHER THE HOST'S CROSS-TAB READ `shared` SAYS THE SESSION'S LOGIN CAME BACK IN ANOTHER TAB FOR THIS TAB ([`LoginShared::Back`]): not once the lost login's track delivered its turn again ([`RULE_LOGIN_BACK`]), after which the wall met again is signed in here and a `Back` still read is the one already delivered. The turn end and the approval loop's picker gate ([`super::login::picker_gate`]) both read it here, so the picker and the hand-off of one `/login` are judged alike.
+    #[must_use]
+    pub fn login_back_from(&self, shared: Option<&LoginShared>) -> bool {
+        matches!(shared, Some(LoginShared::Back { .. }))
+            && !self
+                .wall
+                .as_ref()
+                .is_some_and(|t| t.class == WallClass::Auth && t.login.back_typed)
+    }
+
+    /// WHEN THIS LOOP TYPED `/login` INTO THE LOST LOGIN STANDING ([`LoginBooks::typed_at`]), its sign-in not left ([`Self::login_typed_left`]): a dialog still drawn after the loop's Esc out of it is still the `/login` the loop typed, and one drawn after that dialog was read gone is a person's own.
     #[must_use]
     pub fn login_typed_at(&self) -> Option<Instant> {
         self.wall
             .as_ref()
-            .filter(|t| t.class == WallClass::Auth && t.attempts > 0 && !t.login.cancelled)
+            .filter(|t| {
+                t.class == WallClass::Auth
+                    && t.attempts > 0
+                    && !t.login.cancelled
+                    && !t.login.closed
+            })
             .and_then(|t| t.login.typed_at)
+    }
+
+    /// UNTIL WHEN THE DIALOG THE LOOP BACKED OUT OF MAY STILL BE CLOSING: [`TurnEndTiming::take_within`] from its first Esc, doubled at each Esc since and at most [`BACK_OUT_PAUSE_MAX`], while the dialog is not read gone. Past it, a dialog still drawn gets the Esc again ([`super::login::backs_out`]).
+    #[must_use]
+    pub fn login_closing(&self, now: Instant) -> Option<Instant> {
+        self.wall
+            .as_ref()
+            .filter(|t| t.class == WallClass::Auth && !t.login.cancelled && !t.login.closed)
+            .and_then(|t| {
+                let pause = super::super::ladder::doubling(
+                    self.timing.take_within,
+                    t.login.backs.saturating_sub(1),
+                    BACK_OUT_PAUSE_MAX,
+                );
+                t.login.backed_out.map(|at| later(at, pause))
+            })
+            .filter(|until| now < *until)
+    }
+
+    /// The loop's Esc out of the dialog of the `/login` it typed went in at `now`: the turn end's
+    /// ([`TurnEndAction::Cancel`]), or the approval loop's at the method picker
+    /// ([`super::login::back_out_of_picker`]).
+    pub fn login_backed_out_at(&mut self, now: Instant) {
+        if let Some(t) = self
+            .wall
+            .as_mut()
+            .filter(|t| t.class == WallClass::Auth && t.attempts > 0)
+        {
+            t.login.backed_out = Some(now);
+            t.login.backs = t.login.backs.saturating_add(1);
+        }
+    }
+
+    /// THE `/login` THIS LOOP TYPED INTO THE LOST LOGIN STANDING WAS LEFT: the dialog the loop
+    /// backed out of read gone ([`LoginBooks::closed`]), or `⎿  Login interrupted` read, whether
+    /// the loop's Esc or a person's closed it ([`LoginBooks::cancelled`]). Over a roster row's
+    /// login the tab then waits on the row's own sign-in ([`login_wall_waits`]).
+    #[must_use]
+    pub fn login_typed_left(&self) -> bool {
+        self.wall.as_ref().is_some_and(|t| {
+            t.class == WallClass::Auth && t.attempts > 0 && (t.login.cancelled || t.login.closed)
+        })
     }
 
     /// UNTIL WHEN THE `/login` THIS LOOP TYPED MAY STILL BE OPENING ITS DIALOG ([`TurnEndTiming::take_within`] from the keys).
@@ -13355,9 +13426,13 @@ impl TurnEndState {
             if let Some(n) = &mut w.named {
                 back(&mut n.at);
             }
-            for t in [&mut w.login.prompt_at, &mut w.login.typed_at]
-                .into_iter()
-                .flatten()
+            for t in [
+                &mut w.login.prompt_at,
+                &mut w.login.typed_at,
+                &mut w.login.backed_out,
+            ]
+            .into_iter()
+            .flatten()
             {
                 back(t);
             }
@@ -13748,14 +13823,19 @@ impl TurnEndState {
     /// has no task or its task is done, so the host marks the row signed out and aterm's sign-in
     /// ladder signs it in (`crate::harness::accounts_sync`'s tier 0) — the one route that asks no
     /// person. At a point, and at a sign-in menu drawn in place of the composer
-    /// ([`TurnEndReading::at_sign_in_menu`]), which is no point. Not over a move whose wall the
-    /// session left, an answer still awaited, a login back in another tab, or an upgrade's
-    /// restart.
+    /// ([`TurnEndReading::at_sign_in_menu`]), which is no point; past a `/login` aterm typed and
+    /// left ([`Self::login_typed_left`]) too, whose wall its `Login interrupted` stands below. Not
+    /// over a move whose wall the session left, an answer still awaited, a login back in another
+    /// tab, or an upgrade's restart.
     fn login_end_told(&self, reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
         cfg.logins
             && reading.login_label.is_some()
             && moves_accounts(reading.program)
-            && reading.wall == Some(WallKind::Auth)
+            && (reading.wall == Some(WallKind::Auth)
+                || (reading.wall.is_none()
+                    && reading.login_screen.is_none()
+                    && !reading.login_back
+                    && self.login_typed_left()))
             && (reading.at_point(self.stale_input)
                 || (reading.at_sign_in_menu() && !reading.survey))
             && !reading.upgrading
@@ -14344,13 +14424,10 @@ impl TurnEndState {
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => false,
         };
         let act_opens = match reading.program {
-            aterm_phase::Program::Agy
-            | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini => true,
+            aterm_phase::Program::Agy | aterm_phase::Program::Muse => true,
             aterm_phase::Program::Claude
             | aterm_phase::Program::Codex
             | aterm_phase::Program::Grok
@@ -14849,6 +14926,15 @@ impl TurnEndState {
                 .is_some_and(|t| t.class == WallClass::Context);
         let retry_taken = retried && !met && !compacted_nothing;
         let unmade_seeded = std::mem::take(&mut self.account_unmade_seed);
+        if reading.login_screen.is_none()
+            && reading.composer != Composer::Absent
+            && let Some(t) = self
+                .wall
+                .as_mut()
+                .filter(|t| t.class == WallClass::Auth && t.login.backed_out.is_some())
+        {
+            t.login.closed = true;
+        }
         match reading.wall {
             Some(kind) => {
                 let at_point = true;
@@ -15353,6 +15439,10 @@ impl TurnEndState {
             self.login_confirmed = true;
             return;
         }
+        if matches!(action, TurnEndAction::Cancel { .. }) {
+            self.login_backed_out_at(now);
+            return;
+        }
         let Some(rule) = action.rule_id() else {
             return;
         };
@@ -15562,7 +15652,7 @@ impl TurnEndState {
 
     /// THE RELAUNCH'S START-UP UNDER A LIMIT: a usage limit, spend limit or
     /// model bucket ([`named_class`]) met under an agent whose screen is all
-    /// its evidence ([`screen_alone`]: Muse Code, agy, Gemini CLI), whose
+    /// its evidence ([`screen_alone`]: Muse Code, agy), whose
     /// process came back since the limit was last read — the host names a
     /// start later than that read ([`Self::agent_started`]), or, with no
     /// host's word, a point of no agent's (a shell's prompt: it crashed,
@@ -16637,7 +16727,22 @@ fn decide_unridden(
     if super::login::carried(reading.program)
         && let Some(screen) = &reading.login_screen
     {
-        let act = super::login::dialog_act(state, screen);
+        let act = if super::login::backs_out(state, reading, cfg, screen, now) {
+            TurnEndAction::Cancel {
+                rule_id: super::login::RULE_LOGIN_BACK_OUT,
+            }
+        } else {
+            match (screen, state.login_closing(now)) {
+                (aterm_phase::LoginScreen::Success { .. }, _) | (_, None) => {
+                    super::login::dialog_act(state, screen)
+                }
+                (_, Some(until)) => TurnEndAction::WaitUntil {
+                    until,
+                    why: "the /login dialog aterm backed out of to close".to_string(),
+                    wait: WaitKind::Other,
+                },
+            }
+        };
         if act.rule_id().is_some()
             && let Some((until, why)) = carry_held(state, reading, cfg, now)
         {
@@ -16776,11 +16881,7 @@ fn carry_held(
 }
 
 pub(crate) fn login_back_elsewhere(state: &TurnEndState, reading: &TurnEndReading) -> bool {
-    matches!(reading.login_shared, Some(LoginShared::Back { .. }))
-        && !state
-            .wall
-            .as_ref()
-            .is_some_and(|t| t.class == WallClass::Auth && t.login.back_typed)
+    state.login_back_from(reading.login_shared.as_ref())
 }
 
 fn login_opening_wait(state: &TurnEndState, now: Instant) -> Option<TurnEndAction> {
@@ -17540,7 +17641,10 @@ fn left_undecided_login(t: &WallTrack, reading: &TurnEndReading) -> bool {
 
 fn left_waited_login(state: &TurnEndState, t: &WallTrack, reading: &TurnEndReading) -> bool {
     t.class == WallClass::Auth
-        && t.attempts == 0
+        && (t.attempts == 0
+            || (reading.login_label.is_some()
+                && reading.login_screen.is_none()
+                && state.login_typed_left()))
         && (state.account.is_some() || reading.login_label.is_some())
         && !reading.login_back
 }
@@ -17673,7 +17777,6 @@ const fn moves_accounts(program: Program) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => false,
     }
 }
@@ -17845,7 +17948,9 @@ pub(super) fn login_wall_moves<'a>(
     let untyped = reading.wall == Some(WallKind::Auth)
         && state.wall_attempts(WallKind::Auth).unwrap_or(0) == 0;
     let back = state.login_track().is_some() && login_back_elsewhere(state, reading);
-    ((untyped || back || login_left_renewed(state, reading))
+    let left =
+        reading.login_label.is_some() && reading.login_screen.is_none() && state.login_typed_left();
+    ((untyped || back || left || login_left_renewed(state, reading))
         && (moved || login_move(state, reading, cfg, to))
         && !state.login_left(reading)
         && state.account_moves_of(now).0 < ACCOUNT_MOVES_PER_WINDOW)
@@ -17872,7 +17977,9 @@ fn login_left_renewed(state: &TurnEndState, reading: &TurnEndReading) -> bool {
 /// of the composer ([`sign_in_menu_waits`]). A renewed row's draft is [`renewed_draft_holds`]'s; a
 /// login back in another tab, no renewal behind it, is continued from as that tab's, and a
 /// person's own `/login` left at the wall is theirs (`TurnEndState::login_cancelled`), told as
-/// before.
+/// before. A `/login` aterm typed before the roster named the row is no such ask: once its dialog
+/// is left (aterm backs out of it, `super::login::backs_out`, or a person's Esc closes it,
+/// [`TurnEndState::login_typed_left`]) the tab waits on the row's sign-in as if none was typed.
 pub(super) fn login_wall_waits(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -17883,11 +17990,15 @@ pub(super) fn login_wall_waits(
     let signs_in = reading.login_label.is_some()
         && cfg.logins
         && (reading.login_superseded || !login_back_elsewhere(state, reading));
+    let typed = state.wall_attempts(WallKind::Auth).unwrap_or(0) > 0;
     if reading.wall != Some(WallKind::Auth)
         || !(moved || signs_in)
         || state.login_left(reading)
-        || state.login_cancelled()
-        || state.wall_attempts(WallKind::Auth).unwrap_or(0) > 0
+        || if typed {
+            !(signs_in && state.login_typed_left())
+        } else {
+            state.login_cancelled()
+        }
     {
         return None;
     }
@@ -18099,16 +18210,6 @@ fn wall_action(
 
 fn not_retried(program: Program, kind: WallKind) -> Option<&'static str> {
     match program {
-        Program::Gemini => matches!(
-            kind,
-            WallKind::ApiError {
-                retryable: false,
-                ..
-            }
-        )
-        .then_some(
-            "Gemini CLI retries what time answers; after its usage limit's Stop, see /stats model",
-        ),
         Program::Agy => matches!(
             kind,
             WallKind::ApiError {

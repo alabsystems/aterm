@@ -18,6 +18,13 @@ pub enum Outcome {
     Pass(String),
     Fail(String),
     CouldNotRun(String),
+    /// The subject has no answer to what the row asks: it does not know a verb, or its reply
+    /// lacks a field. Whoever knows which build the subject is decides what that says.
+    #[allow(
+        dead_code,
+        reason = "only the conformance matrices ask a subject that may predate a row; the other benches that mount this runner build what they measure"
+    )]
+    Unanswered(String),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -26,13 +33,14 @@ struct Counts {
     passed: usize,
     failed: usize,
     refused: usize,
+    unanswered: usize,
 }
 
 impl Counts {
     fn exit_code(&self) -> u8 {
         if self.failed != 0 {
             1
-        } else if self.refused != 0 || self.planned == 0 {
+        } else if self.refused != 0 || self.unanswered != 0 || self.planned == 0 {
             3
         } else {
             0
@@ -82,14 +90,18 @@ fn run_into<R>(
                 counts.refused += 1;
                 ("COULD NOT RUN", detail)
             }
+            Outcome::Unanswered(detail) => {
+                counts.unanswered += 1;
+                ("UNANSWERED", detail)
+            }
         };
         writeln!(out, "measure row: {target}::{name} {status}\n{detail}")?;
         out.flush()?;
     }
     writeln!(
         out,
-        "measure result: {target} planned={} passed={} failed={} refused={}",
-        counts.planned, counts.passed, counts.failed, counts.refused
+        "measure result: {target} planned={} passed={} failed={} refused={} unanswered={}",
+        counts.planned, counts.passed, counts.failed, counts.refused, counts.unanswered
     )?;
     Ok(counts)
 }
@@ -100,7 +112,13 @@ mod tests {
     fn every_row_runs_once_in_order_and_a_finding_outweighs_a_refusal() {
         use super::*;
 
-        let rows = [("pass", 0), ("refuse", 1), ("panic", 2), ("last", 3)];
+        let rows = [
+            ("pass", 0),
+            ("refuse", 1),
+            ("panic", 2),
+            ("unasked", 3),
+            ("last", 4),
+        ];
         let mut seen = Vec::new();
         let mut output = Vec::new();
         let counts = run_into(
@@ -109,29 +127,32 @@ mod tests {
             |row| {
                 seen.push(*row);
                 match row {
-                    0 | 3 => Outcome::Pass("measured".into()),
+                    0 | 4 => Outcome::Pass("measured".into()),
                     1 => Outcome::CouldNotRun("no adapter".into()),
                     2 => panic!("broken instrument"),
+                    3 => Outcome::Unanswered("no such verb".into()),
                     _ => unreachable!(),
                 }
             },
             &mut output,
         )
         .unwrap();
-        assert_eq!(seen, [0, 1, 2, 3]);
+        assert_eq!(seen, [0, 1, 2, 3, 4]);
         assert_eq!(
             counts,
             Counts {
-                planned: 4,
+                planned: 5,
                 passed: 2,
                 failed: 1,
                 refused: 1,
+                unanswered: 1,
             }
         );
         assert_eq!(counts.exit_code(), 1);
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("measure row: fixture::panic FAIL\nmeasurement panicked:"));
-        assert!(output.ends_with("fixture planned=4 passed=2 failed=1 refused=1\n"));
+        assert!(output.contains("measure row: fixture::unasked UNANSWERED\nno such verb"));
+        assert!(output.ends_with("fixture planned=5 passed=2 failed=1 refused=1 unanswered=1\n"));
     }
 
     #[test]
@@ -166,5 +187,14 @@ mod tests {
         .unwrap();
         assert_eq!(passed.passed, rows.len());
         assert_eq!(passed.exit_code(), 0);
+        let unanswered = run_into(
+            "unanswered",
+            &rows,
+            |_| Outcome::Unanswered("no such field".into()),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(unanswered.unanswered, rows.len());
+        assert_eq!(unanswered.exit_code(), 3);
     }
 }

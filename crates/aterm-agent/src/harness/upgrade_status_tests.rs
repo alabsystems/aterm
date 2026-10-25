@@ -3186,7 +3186,6 @@ fn moved_state_as(
         upgrade::Agent::Codex => (format!("codex-{TAB}"), "0.157.0", "0.157.1"),
         upgrade::Agent::Muse => unreachable!("Muse Code's quiet upgrade keeps no ladder state"),
         upgrade::Agent::Agy => unreachable!("agy's quiet upgrade keeps no ladder state"),
-        upgrade::Agent::Gemini => unreachable!("Gemini CLI has no upgrade lane"),
     };
     save(
         o,

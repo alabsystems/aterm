@@ -144,13 +144,29 @@ pub(crate) fn offered_for(sid: &str, pid: u32) -> bool {
         .is_some_and(|snap| relaunchable(sid, &snap, aterm_primer::home_dir().as_deref()))
 }
 
+/// WHETHER THE RELAUNCH LINE aterm would type for process `pid` in tab `sid` HAS ROOM FOR THE
+/// USAGE TAP (the Claude Code footer's `weekly ? · until relaunch`, beside [`offered_for`]): the
+/// host's published snapshot names that process and its line, with the longer of the tap's two
+/// values (the one that carries the owner's statusLine) for this aterm's lasting path, fits the
+/// tty's line ([`aterm_agent::harness::relaunch::tap_room`]). `false` where any of that is unread.
+pub(crate) fn tap_room_for(sid: &str, pid: u32) -> bool {
+    use aterm_agent::harness::tap;
+    let Some(value) = tap::stable_exe().and_then(|exe| tap::settings_value_carrying(&exe, true))
+    else {
+        return false;
+    };
+    crate::harness_host::published_snapshot(sid)
+        .filter(|snap| snap.pid == pid)
+        .zip(aterm_primer::home_dir())
+        .is_some_and(|(snap, home)| aterm_agent::harness::relaunch::tap_room(&home, &snap, &value))
+}
+
 const fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> bool {
     match &snap.run {
         aterm_agent::harness::relaunch::AgentRun::Claude
         | aterm_agent::harness::relaunch::AgentRun::Agy(_) => true,
         aterm_agent::harness::relaunch::AgentRun::Codex(_)
-        | aterm_agent::harness::relaunch::AgentRun::Muse(_)
-        | aterm_agent::harness::relaunch::AgentRun::Gemini(_) => false,
+        | aterm_agent::harness::relaunch::AgentRun::Muse(_) => false,
     }
 }
 

@@ -891,7 +891,7 @@ impl Finish {
     #[inline]
     fn keep_sooner(slot: &mut Option<Self>, at: Instant, span_s: f32) {
         let next = Self { at, span_s };
-        if slot.is_none_or(|f| next.ends() < f.ends()) {
+        if !matches!(*slot, Some(f) if next.ends() >= f.ends()) {
             *slot = Some(next);
         }
     }
@@ -990,7 +990,7 @@ impl Star {
     pub fn dead(&self, now: Instant) -> bool {
         self.age_s(now) >= self.life_s()
             || (self.lane == StarLane::Field && self.idle_s(now) >= FIELD_FADE_LIFE_S)
-            || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
+            || matches!(self.finish, Some(f) if f.gain(now) < STAR_CULL_ALPHA)
     }
 
     /// The population envelope at `now`: `1` for the hold, then half-life τ (§5.6), times the
@@ -1004,7 +1004,10 @@ impl Star {
     #[inline]
     #[must_use]
     fn envelope_at_age(&self, age: f32, now: Instant, reduced_motion: bool) -> f32 {
-        let fin = self.finish.map_or(1.0, |f| f.gain(now));
+        let fin = match self.finish {
+            Some(f) => f.gain(now),
+            None => 1.0,
+        };
         if self.lane == StarLane::Field {
             return field_lane_envelope(age, self.idle_s(now), fin, reduced_motion);
         }
@@ -1142,9 +1145,13 @@ impl Star {
             let c = ((k as f32 + 0.5) * inv_nominal - floor) * inv_depth;
             if c > 0.0
                 && c < 1.0
-                && let Some(dt) = next_sine_crossing_s(theta, c.sqrt().asin(), omega)
+                && let Some(dt) =
+                    next_sine_crossing_s(theta, crate::color_math::sqrt_f32(c).asin(), omega)
             {
-                best = Some(best.map_or(dt, |b| b.min(dt)));
+                best = Some(match best {
+                    Some(b) => b.min(dt),
+                    None => dt,
+                });
             }
         }
         best
@@ -1189,7 +1196,10 @@ impl Star {
             let next_ms = ((v * age_ms).round() + 0.5) / v;
             let dt = (next_ms - age_ms) * (1.0 / 1000.0);
             if dt > 0.0 {
-                best = Some(best.map_or(dt, |b| b.min(dt)));
+                best = Some(match best {
+                    Some(b) => b.min(dt),
+                    None => dt,
+                });
             }
         }
         best
@@ -1220,7 +1230,7 @@ impl Star {
         if u >= 1.0 {
             return None;
         }
-        let t_ms = -STREAM_TAU_MS * (1.0 - u * STREAM_SPENT).ln();
+        let t_ms = -STREAM_TAU_MS * crate::color_math::ln_pos_f32(1.0 - u * STREAM_SPENT);
         Some(((t_ms.min(STREAM_END_MS) - age_ms) * (1.0 / 1000.0)).max(0.0))
     }
 
@@ -1328,10 +1338,10 @@ impl StarBudget {
     /// Refill on the frame clock — called once per `Engine::tick`, before any birth is dealt.
     #[inline]
     pub fn refill(&mut self, now: Instant) {
-        let dt = self
-            .at
-            .replace(now)
-            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32());
+        let dt = match self.at.replace(now) {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32(),
+            None => 0.0,
+        };
         self.tokens = (self.tokens + GLINT_REFILL_PER_S * dt).min(GLINT_CAP);
     }
 
@@ -2054,7 +2064,7 @@ impl Stardust {
             return;
         }
         let (vx, vy) = spec.v_head;
-        let speed = vx.hypot(vy).max(f32::EPSILON);
+        let speed = crate::color_math::hypot_f32(vx, vy).max(f32::EPSILON);
         let inv_speed = 1.0 / speed;
         let (ux, uy) = (vx * inv_speed, vy * inv_speed);
         let (along_x, along_y) = (vx * SHED_ALONG_SHARE, vy * SHED_ALONG_SHARE);
@@ -2149,7 +2159,7 @@ impl Stardust {
             let reach = (MINI_FAN_REACH_MIN_PX
                 + (MINI_FAN_REACH_MAX_PX - MINI_FAN_REACH_MIN_PX) * hash01(mix32(s ^ 5)))
                 * scale;
-            let (sa, ca) = a.sin_cos();
+            let (sa, ca) = crate::supernova::sin_cos_f32(a);
             let v = reach * (1.0 / MINI_FAN_THROW_MS);
             let v0 = (ca * v, sa * v);
             let (tint, gold) = class_tint(class, s, ctx.caret_t);
@@ -2528,20 +2538,18 @@ impl Stardust {
             } else {
                 None
             };
-            let rung = (k + 1 == n_cells && !mended)
-                .then(|| ladder_rung(ctx.flow.combo))
-                .flatten();
+            let rung = if k + 1 == n_cells && !mended {
+                ladder_rung(ctx.flow.combo)
+            } else {
+                None
+            };
+            let promoted = match dealt {
+                Some(c) if (c as u8) < (StarClass::M2 as u8) => c,
+                _ => StarClass::M2,
+            };
             let (dealt, earned, tint) = match rung {
-                Some(Rung::Promote) => (
-                    Some(dealt.map_or(StarClass::M2, |c| c.min(StarClass::M2))),
-                    earned,
-                    None,
-                ),
-                Some(Rung::White) => (
-                    Some(dealt.map_or(StarClass::M2, |c| c.min(StarClass::M2))),
-                    earned,
-                    Some((TINT_WHITE_RGB, false)),
-                ),
+                Some(Rung::Promote) => (Some(promoted), earned, None),
+                Some(Rung::White) => (Some(promoted), earned, Some((TINT_WHITE_RGB, false))),
                 Some(Rung::Gold) => (Some(StarClass::M1), true, Some((TINT_GOLD_RGB, true))),
                 None => (dealt, earned, None),
             };
@@ -2617,9 +2625,10 @@ impl Stardust {
         if ctx.cfg.reduced_motion {
             return;
         }
-        let birth_disp = ctx
-            .mend
-            .map_or(ctx.birth_disp, |m| ctx.birth_disp.max(m.disp));
+        let birth_disp = match ctx.mend {
+            Some(m) => ctx.birth_disp.max(m.disp),
+            None => ctx.birth_disp,
+        };
         if birth_disp < STREAM_DISP {
             return;
         }
@@ -2736,7 +2745,7 @@ impl Stardust {
         let reach = (ERASE_REACH_MIN_PX
             + (ERASE_REACH_MAX_PX - ERASE_REACH_MIN_PX) * hash01(mix32(seed ^ 7)))
             * px_scale(ctx.geom.ch as f32);
-        let (sa, ca) = a.sin_cos();
+        let (sa, ca) = crate::supernova::sin_cos_f32(a);
         let v = reach * (1.0 / ERASE_THROW_MS);
         let v0 = (ca * v, sa * v);
         let (tint, gold) = deal_tint(seed, ctx.caret_t);
@@ -2791,18 +2800,20 @@ impl Stardust {
                 class = StarClass::M2;
             }
         }
-        let (tint, gold) = spec
-            .tint
-            .unwrap_or_else(|| class_tint(class, seed, self.field_t(spec.cell, ctx, ribbon)));
+        let (tint, gold) = match spec.tint {
+            Some(tg) => tg,
+            None => class_tint(class, seed, self.field_t(spec.cell, ctx, ribbon)),
+        };
         let from_x = match grabbed {
             Some(Some(i)) => self.stars[i].pos(at, self.reduced).0 as f32,
             Some(None) => x - ctx.geom.cw as f32,
             None => x,
         };
         let pull = (x - from_x).max(0.0);
-        let birth_disp = spec
-            .pull
-            .map_or(ctx.birth_disp, |p| ctx.birth_disp.max(p.disp));
+        let birth_disp = match spec.pull {
+            Some(p) => ctx.birth_disp.max(p.disp),
+            None => ctx.birth_disp,
+        };
         let stream = if birth_disp >= STREAM_DISP {
             self.stream_reach(from_x, y, ctx)
         } else {
@@ -2896,10 +2907,11 @@ impl Stardust {
         // foot (a pixel clear of the row's top at any cell height), which the
         // probe certified blank.
         let cell_top = f32::from(g.origin_y) + f32::from(row) * ch;
-        let top = ribbon
-            .band(row, col)
-            .map_or_else(|| default_band_top(g, ctx.cfg, row), |b| b.top)
-            .min(cell_top);
+        let top = match ribbon.band(row, col) {
+            Some(b) => b.top,
+            None => default_band_top(g, ctx.cfg, row),
+        }
+        .min(cell_top);
         let j = mix32(seed ^ SALT_JITTER);
         let y = (top - ch * (SKY_BOTTOM_CH + (SKY_TOP_CH - SKY_BOTTOM_CH) * hash01(j)))
             .min(cell_top - 1.0);
@@ -3088,7 +3100,7 @@ impl Stardust {
             return false;
         }
         let (dx, dy) = ((rest.0 - origin.0) as f32, (rest.1 - origin.1) as f32);
-        let steps = dx.hypot(dy).ceil().max(1.0) as i32;
+        let steps = crate::color_math::hypot_f32(dx, dy).ceil().max(1.0) as i32;
         let inv_steps = 1.0 / steps as f32;
         let mut p = origin;
         let mut i = steps - 1;
@@ -3236,7 +3248,7 @@ impl Stardust {
         for (i, s) in self.stars.iter().enumerate() {
             if s.finish.is_none() {
                 live += 1;
-                if oldest.is_none_or(|(_, born)| s.born < born) {
+                if !matches!(oldest, Some((_, born)) if s.born >= born) {
                     oldest = Some((i, s.born));
                 }
             }
@@ -3251,12 +3263,15 @@ impl Stardust {
             for (i, s) in self.stars.iter().enumerate() {
                 if let Some(f) = s.finish {
                     let u = f.u(now);
-                    if nearest_end.is_none_or(|(_, best)| u.total_cmp(&best).is_ge()) {
+                    if !matches!(nearest_end, Some((_, best)) if u.total_cmp(&best).is_lt()) {
                         nearest_end = Some((i, u));
                     }
                 }
             }
-            self.stars.remove(nearest_end.map_or(0, |(i, _)| i));
+            self.stars.remove(match nearest_end {
+                Some((i, _)) => i,
+                None => 0,
+            });
         }
     }
 
@@ -3516,7 +3531,7 @@ impl Paint {
         let arm = if held {
             arm_hi
         } else {
-            let s = (std::f32::consts::TAU * star.f * age_s + phase).sin();
+            let s = crate::supernova::sin_cos_f32(std::f32::consts::TAU * star.f * age_s + phase).0;
             ((nominal * (arm_floor + (1.0 - arm_floor) * s * s)).round() as i32).max(min_arm)
         };
         Some(Self {
@@ -3816,13 +3831,14 @@ const fn arm_peak_px(class: StarClass, ch: f32) -> i32 {
 
 #[cfg(test)]
 #[inline]
-fn arm_px_with(star: &Star, ch: f32, held: bool, age_s: f32, phase: f32) -> i32 {
+const fn arm_px_with(star: &Star, ch: f32, held: bool, age_s: f32, phase: f32) -> i32 {
     let (nominal, min, floor, _, arm_hi) = star.class.arms(ch);
     if held {
         return arm_hi;
     }
-    let s = (std::f32::consts::TAU * star.f * age_s + phase).sin();
-    ((nominal * (floor + (1.0 - floor) * s * s)).round() as i32).max(min)
+    let s = crate::supernova::sin_cos_f32(std::f32::consts::TAU * star.f * age_s + phase).0;
+    let rounded = (nominal * (floor + (1.0 - floor) * s * s)).round() as i32;
+    if rounded > min { rounded } else { min }
 }
 
 #[cfg(test)]
@@ -4182,7 +4198,10 @@ impl Veil {
     #[inline]
     #[must_use]
     pub fn envelope(&self, now: Instant, reduced_motion: bool) -> f32 {
-        let fin = self.finish.map_or(1.0, |f| f.gain(now));
+        let fin = match self.finish {
+            Some(f) => f.gain(now),
+            None => 1.0,
+        };
         field_lane_envelope(self.age_s(now), self.idle_s(now), fin, reduced_motion)
     }
 
@@ -4192,7 +4211,7 @@ impl Veil {
     pub fn dead(&self, now: Instant) -> bool {
         self.age_s(now) >= FIELD_LIFE_S
             || self.idle_s(now) >= FIELD_FADE_LIFE_S
-            || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
+            || matches!(self.finish, Some(f) if f.gain(now) < STAR_CULL_ALPHA)
     }
 
     /// Put this cell on a finish ending at `at + span_s`, unless one that ends sooner already

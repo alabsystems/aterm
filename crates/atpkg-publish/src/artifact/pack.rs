@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::lineage_switch::{self, Switch};
 use super::pkgdoc::{self, Header, Kind, Row};
 use super::tools::{HostTools, Run, Tools};
-use super::{arch, sign, tarwrite, toolchain, upload};
+use super::{arch, package, sign, tarwrite, toolchain, upload};
 use crate::api::{Build, PackOutcome, PackRequest, Packer, Signing};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
@@ -282,14 +282,17 @@ pub fn dev_version(own: &str, sha: &str) -> Result<String> {
 }
 
 /// A harness pack's checked metadata and version, from `checkout` at `build`: refused unless
-/// the checkout is clean and `build` is its `HEAD` commit count, so the `+g<sha>` and the
-/// build number both name the commit built.
+/// the checkout is clean, its `HEAD` is on `origin/main` of `<owner>/<repo>` (the staging
+/// owner's repo, as codex's package source is: [`package::check_on_main`]), and `build` is its
+/// `HEAD` commit count, so the `+g<sha>` and the build number both name a commit of the
+/// repo's main.
 fn mint_harness(
     program: &str,
     h: Harness,
     meta: Metadata,
     checkout: &Path,
     build: Build,
+    source: (&str, &str),
 ) -> Result<(Metadata, String)> {
     let meta = held_to_harness(program, h, meta)?;
     let own = meta.own_version.clone().unwrap_or_default();
@@ -300,6 +303,9 @@ fn mint_harness(
             checkout.display()
         )));
     }
+    let (owner, repo) = source;
+    let head = crate::git::head(checkout)?;
+    package::check_on_main(checkout, owner, repo, &format!("{program}'s HEAD"), &head)?;
     let count = crate::git::rev_count(checkout, "HEAD")?;
     if count != build {
         return Err(Error::refused(format!(
@@ -757,7 +763,14 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         )));
     }
     let (meta, version) = match def.harness() {
-        Some(h) => mint_harness(program, h, meta, &request.checkout, build_number)?,
+        Some(h) => mint_harness(
+            program,
+            h,
+            meta,
+            &request.checkout,
+            build_number,
+            (&ctx.accounts.staging, def.repo),
+        )?,
         None => {
             let version = meta.version.clone();
             (meta, version)

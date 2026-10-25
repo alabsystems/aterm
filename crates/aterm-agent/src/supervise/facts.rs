@@ -14,7 +14,8 @@
 //! its condition has been seen clear once ([`FactsState::observe_closed`]), so a restart never
 //! tells it twice.
 //!
-//! Two kinds, in priority order:
+//! Three kinds, in priority order among what a reading names (a wake's line is ranked at a break
+//! by the occupancy door, `occupancy::rules::rank`, not by this order):
 //!
 //! * [`FactKind::NoProgress`]: a live background call of this session's agent that the host's
 //!   jobs reading says has made no progress (the hung-call design's R2 and R3;
@@ -29,6 +30,10 @@
 //! * [`FactKind::Hold`]: the session's wait on its own background work, whose rows the hold
 //!   clock writes (`occupancy::hold`), and the occupancy door's outcome rows under `prompt`
 //!   (`occupancy::door`).
+//! * [`FactKind::Wake`]: a wake the agent declared in its session's book whose condition held
+//!   (`occupancy::wakes`), told once an episode. Its episode is the wake's
+//!   (`occupancy::wakes_seen::wake_episode`: its declaration's stamp and ordinal), which a
+//!   successor names again exactly, so a seed holds it told per episode, never kind-wide.
 //!
 //! [`FactKind`] shares its name with `crate::harness::footer::FactKind` (the footer's fact
 //! lines): name this one by its path, never glob-import both.
@@ -47,11 +52,13 @@ pub enum FactKind {
     /// The session's wait on its own background work: how long it has held, and whether the
     /// agent declared it (`WAITING:`; the occupancy design's §3.1 `hold`).
     Hold,
+    /// A wake of the agent's book whose condition held (`wake@v1`; the occupancy design's §4.1).
+    Wake,
 }
 
 impl FactKind {
     /// Every kind, in priority order.
-    pub const ALL: [FactKind; 2] = [FactKind::NoProgress, FactKind::Hold];
+    pub const ALL: [FactKind; 3] = [FactKind::NoProgress, FactKind::Hold, FactKind::Wake];
 
     /// The ledger rule a row of this kind is booked under, `fact-<kind>@v1`. Stable: a successor
     /// loop seeds by it ([`Self::of_rule`]).
@@ -60,6 +67,7 @@ impl FactKind {
         match self {
             FactKind::NoProgress => "fact-no-progress@v1",
             FactKind::Hold => "fact-hold@v1",
+            FactKind::Wake => "fact-wake@v1",
         }
     }
 
@@ -69,6 +77,7 @@ impl FactKind {
         match self {
             FactKind::NoProgress => "no-progress",
             FactKind::Hold => "hold",
+            FactKind::Wake => "wake",
         }
     }
 
@@ -86,11 +95,14 @@ impl FactKind {
 
     /// Whether a seed holds the whole kind told ([`FactsState::seed`]): a kind whose episode ids
     /// a successor cannot name again exactly. A no-progress episode's id folds the call's group
-    /// and its leader's birth, which survive a restart, so its own key carries it.
-    const fn seeds_whole(self) -> bool {
+    /// and its leader's birth, and a wake's its declaration's stamp and ordinal, which survive a
+    /// restart, so its own key carries it (the slice-2 plan's S3).
+    fn seeds_whole(self) -> bool {
+        use crate::supervise::occupancy::fault::{Fault, armed};
         match self {
             FactKind::NoProgress => false,
             FactKind::Hold => true,
+            FactKind::Wake => armed(Fault::KindWideWakeSeed),
         }
     }
 }
@@ -157,6 +169,9 @@ pub enum SeedOutcome {
     Typed,
     /// The loop meant to and did not (a guard held it at the last moment): untold.
     Skipped,
+    /// A wake the agent's own `await wake` answered, and the loop saw a turn run after it (a
+    /// `fact-wake@v1` row `waiting … told door=await`): told, with nothing typed.
+    Answered,
 }
 
 /// A fact to tell: its episode, its one sentence, and when the reading it came from was taken
@@ -297,9 +312,9 @@ impl FactsState {
     }
 
     /// A successor loop's state from the ledger's fact rows, oldest first, at `now_ms`: each
-    /// episode whose LAST row says it was typed is told, and a kind whose ids a restart does not
-    /// carry exactly ([`FactKind::Hold`]) is held told while that row is younger than
-    /// [`SEED_HOLD_MS`]. An intent with no outcome after it, or a skip, leaves the episode untold
+    /// episode whose LAST row says it was typed (or, a wake's, answered and heard) is told, and a
+    /// kind whose ids a restart does not carry exactly ([`FactKind::Hold`]) is held told while
+    /// that row is younger than [`SEED_HOLD_MS`]. An intent with no outcome after it, or a skip, leaves the episode untold
     /// (`OccupancyDoor`'s `Crash`).
     #[cfg_attr(
         any(test, debug_assertions),
@@ -316,7 +331,7 @@ impl FactsState {
             last.insert(key, (at_ms, outcome));
         }
         for (key, (at_ms, outcome)) in last {
-            let told = outcome == SeedOutcome::Typed
+            let told = matches!(outcome, SeedOutcome::Typed | SeedOutcome::Answered)
                 || (outcome == SeedOutcome::Intent && armed(Fault::SeedIntentAsTold))
                 || (outcome == SeedOutcome::Skipped && armed(Fault::SeedSkipAsTold));
             if !told {

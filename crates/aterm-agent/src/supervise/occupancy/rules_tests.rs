@@ -4,6 +4,7 @@
 //! Tests for the built-in occupancy rules decider.
 
 use super::super::reading::SlotsSeen;
+use super::super::wakes_seen::{AtomKind, Declarer, ExpireWhy, Prio, wake_episode};
 use super::*;
 use crate::supervise::memory::Pressure;
 
@@ -49,9 +50,17 @@ fn verdict(
     if let Some(h) = hold {
         books.hold(h.since_ms);
     }
-    decide(r, hold, &books, g, WAIT_NUDGE_AFTER_MS, now_ms)[rule.index()]
-        .1
-        .clone()
+    decide(
+        r,
+        hold,
+        &books,
+        g,
+        WAIT_NUDGE_AFTER_MS,
+        now_ms,
+        &WakeSight::slice1(),
+    )[rule.index()]
+    .1
+    .clone()
 }
 
 fn cruise() -> Guards {
@@ -97,6 +106,7 @@ fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
         &cruise(),
         WAIT_NUDGE_AFTER_MS,
         HOLD_ROOM_AFTER_MS,
+        &WakeSight::slice1(),
     );
     assert_eq!(v[RuleId::WaitNudge.index()].1, Verdict::Quiet);
     assert!(is_due(&v[RuleId::HoldRoom.index()].1, RuleId::HoldRoom));
@@ -107,6 +117,7 @@ fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
         &cruise(),
         WAIT_NUDGE_AFTER_MS,
         WAIT_NUDGE_AFTER_MS,
+        &WakeSight::slice1(),
     );
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
 }
@@ -320,6 +331,7 @@ fn the_session_pace_holds_a_second_line() {
         &cruise(),
         WAIT_NUDGE_AFTER_MS,
         2 * HOUR,
+        &WakeSight::slice1(),
     );
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
     assert_eq!(
@@ -372,16 +384,19 @@ fn would_rows_read_back_for_this_session() {
                 rule: RuleId::WaitNudge,
                 row_ms: T0,
                 held_ms: 30 * MIN,
+                episode: Some(7),
             },
             WouldRow {
                 rule: RuleId::HoldRoom,
                 row_ms: T0 + 4,
                 held_ms: 2 * HOUR,
+                episode: Some(9),
             },
             WouldRow {
                 rule: RuleId::HoldRoom,
                 row_ms: T0 + 6,
                 held_ms: 2 * HOUR,
+                episode: Some(9),
             },
         ]
     );
@@ -440,7 +455,15 @@ fn the_setups_wait_is_the_nudges() {
     let at = |after_ms, now_ms| {
         let mut b = Books::default();
         b.hold(0);
-        decide(&r, hold(), &b, &cruise(), after_ms, now_ms)
+        decide(
+            &r,
+            hold(),
+            &b,
+            &cruise(),
+            after_ms,
+            now_ms,
+            &WakeSight::slice1(),
+        )
     };
     assert_eq!(
         at(MIN, MIN - 1)[RuleId::WaitNudge.index()].1,
@@ -454,4 +477,270 @@ fn the_setups_wait_is_the_nudges() {
         Verdict::Quiet,
         "the shipped wait at 1 min"
     );
+}
+
+fn untold(_: u64) -> bool {
+    false
+}
+
+/// Wake `ord` of the book, of `prio`, in `state`: on a file, no need.
+fn woken(ord: u16, prio: Prio, state: WakeState) -> WakeSeen {
+    WakeSeen {
+        ord,
+        class: Declarer::Agent,
+        prio,
+        state,
+        declared_ms: T0 + i64::from(ord),
+        ready_since_ms: Some(T0),
+        kinds: vec![AtomKind::File],
+        need: None,
+        need_slots: false,
+        need_met: true,
+        await_only: false,
+    }
+}
+
+fn book(wakes: Vec<WakeSeen>) -> WakesSeen {
+    WakesSeen { wakes }
+}
+
+/// The break's verdicts on `seen` at a young hold (the hold rules quiet), the wall an hour past
+/// `T0`.
+fn at_break(
+    seen: &WakesSeen,
+    books: &Books,
+    g: &Guards,
+    told: &dyn Fn(u64) -> bool,
+) -> [(RuleId, Verdict); RuleId::COUNT] {
+    let sight = WakeSight {
+        seen,
+        wall_ms: T0 + HOUR,
+        told,
+        ranked: true,
+    };
+    decide(
+        &OccupancyReading::default(),
+        hold(),
+        books,
+        g,
+        WAIT_NUDGE_AFTER_MS,
+        MIN,
+        &sight,
+    )
+}
+
+fn wake_said(seen: &WakesSeen, g: &Guards) -> Verdict {
+    at_break(seen, &Books::default(), g, &untold)[RuleId::Wake.index()]
+        .1
+        .clone()
+}
+
+fn due_wake(v: &Verdict) -> Option<String> {
+    match v {
+        Verdict::Due(line) if line.rule() == RuleId::Wake => Some(line.fact().to_string()),
+        _ => None,
+    }
+}
+
+/// A READY WAKE IS CRUISE'S AND LAND'S: due under both, its line naming the wake; held by the
+/// autopilot under Off; and a guard holds it as it holds a nudge.
+#[test]
+fn a_ready_wake_is_due_under_cruise_and_land_and_held_under_off() {
+    let seen = book(vec![woken(1, Prio::Normal, WakeState::Ready)]);
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let said = wake_said(&seen, &Guards::clear(mode));
+        assert!(
+            due_wake(&said).is_some_and(|fact| fact.starts_with("wake #1 (yours): its file")),
+            "{mode:?}: {said:?}"
+        );
+    }
+    assert_eq!(
+        wake_said(&seen, &Guards::clear(Autopilot::Off)),
+        Verdict::Held(Guard::Autopilot)
+    );
+    let mut person = cruise();
+    person.person = true;
+    assert_eq!(wake_said(&seen, &person), Verdict::Held(Guard::Person));
+    assert_eq!(
+        wake_said(&book(Vec::new()), &cruise()),
+        Verdict::Quiet,
+        "an empty book opens nothing"
+    );
+}
+
+/// A NEED THAT DOES NOT HOLD keeps a ready wake quiet. NEGATIVE CONTROL: the same wake with its
+/// need met is due.
+#[test]
+fn an_unmet_need_gives_quiet() {
+    let mut wake = woken(1, Prio::Normal, WakeState::Ready);
+    wake.need = Some("sys slots>=1 for=20m".to_string());
+    wake.need_slots = true;
+    wake.need_met = false;
+    assert_eq!(
+        wake_said(&book(vec![wake.clone()]), &cruise()),
+        Verdict::Quiet
+    );
+    wake.need_met = true;
+    assert!(due_wake(&wake_said(&book(vec![wake]), &cruise())).is_some());
+}
+
+/// A WAKE THAT EXPIRED (its `by=`, an `unless=` atom) LAPSES: the next break opens nothing, as
+/// the model's `Lapse` says; and one still pending was never due.
+#[test]
+fn an_expired_wake_lapses() {
+    let ready = book(vec![woken(1, Prio::Normal, WakeState::Ready)]);
+    assert!(due_wake(&wake_said(&ready, &cruise())).is_some());
+    for why in [ExpireWhy::Due, ExpireWhy::Unless] {
+        let expired = book(vec![woken(1, Prio::Normal, WakeState::Expired { why })]);
+        assert_eq!(wake_said(&expired, &cruise()), Verdict::Quiet, "{why:?}");
+    }
+    let pending = book(vec![woken(1, Prio::Normal, WakeState::Pending)]);
+    assert_eq!(wake_said(&pending, &cruise()), Verdict::Quiet);
+}
+
+/// THE HEAD GOES FIRST: a critical wake before a normal one whatever their ordinals, and among
+/// equals the lower ordinal; a pending wake is passed over.
+#[test]
+fn critical_outranks_ready_and_the_lower_ordinal_goes_first() {
+    let critical = book(vec![
+        woken(1, Prio::Normal, WakeState::Ready),
+        woken(4, Prio::Critical, WakeState::Ready),
+    ]);
+    let said = wake_said(&critical, &cruise());
+    assert!(
+        due_wake(&said).is_some_and(|fact| fact.starts_with("wake #4 ")),
+        "{said:?}"
+    );
+    let equals = book(vec![
+        woken(3, Prio::Normal, WakeState::Ready),
+        woken(1, Prio::Normal, WakeState::Pending),
+        woken(2, Prio::Normal, WakeState::Ready),
+    ]);
+    let said = wake_said(&equals, &cruise());
+    assert!(
+        due_wake(&said).is_some_and(|fact| fact.starts_with("wake #2 ")),
+        "{said:?}"
+    );
+}
+
+/// A TIME-ONLY WAKE IS NEVER DUE: only the agent's own `await wake` answers it. NEGATIVE
+/// CONTROL: the same wake not time-only is due.
+#[test]
+fn await_only_is_never_due() {
+    let mut wake = woken(1, Prio::Critical, WakeState::Ready);
+    wake.kinds = vec![AtomKind::In];
+    wake.await_only = true;
+    assert_eq!(
+        wake_said(&book(vec![wake.clone()]), &cruise()),
+        Verdict::Quiet
+    );
+    wake.await_only = false;
+    assert!(due_wake(&wake_said(&book(vec![wake]), &cruise())).is_some());
+}
+
+/// AN ANSWERED WAKE (S2): heard, it is told and leaves the book; unheard, the door may retell it
+/// only past [`UNHEARD_MS`] from its answer, on the break's wall clock.
+#[test]
+fn an_answered_wake_is_due_only_unheard_past_the_gap() {
+    let answered = |at_ms| book(vec![woken(1, Prio::Normal, WakeState::Answered { at_ms })]);
+    let wall = T0 + HOUR;
+    assert_eq!(
+        wake_said(&answered(wall - UNHEARD_MS + 1), &cruise()),
+        Verdict::Quiet
+    );
+    assert!(due_wake(&wake_said(&answered(wall - UNHEARD_MS), &cruise())).is_some());
+}
+
+/// A WAKE IS TOLD ONCE: an episode told (`told`) or booked would (`Books::woke`) opens nothing,
+/// and the next wake of the book is the head. NEGATIVE CONTROL: neither, and the first is due.
+#[test]
+fn a_told_wake_opens_nothing_and_the_next_one_does() {
+    let two = book(vec![
+        woken(1, Prio::Normal, WakeState::Ready),
+        woken(2, Prio::Normal, WakeState::Ready),
+    ]);
+    let first = two.wakes[0].episode();
+    let said = |books: &Books, told: &dyn Fn(u64) -> bool| {
+        at_break(&two, books, &cruise(), told)[RuleId::Wake.index()]
+            .1
+            .clone()
+    };
+    let opened = |v: Verdict| due_wake(&v).map(|fact| fact[..8].to_string());
+    assert_eq!(
+        opened(said(&Books::default(), &untold)),
+        Some("wake #1 ".into())
+    );
+    assert_eq!(
+        opened(said(&Books::default(), &|ep| ep == first)),
+        Some("wake #2 ".into())
+    );
+    let mut booked = Books::default();
+    booked.woke(first, MIN - SESSION_PACE_MS);
+    assert_eq!(opened(said(&booked, &untold)), Some("wake #2 ".into()));
+    booked.keep_wakes(&book(vec![woken(2, Prio::Normal, WakeState::Ready)]));
+    assert!(
+        !booked.has_woke(first),
+        "a wake gone from the book is forgotten"
+    );
+}
+
+/// THE PICK (D6): a wake's line before `wait-nudge`'s before `hold-room`'s, each loser outranked
+/// and still due. CONTROL: slice 1's pick, on the same verdicts, lets the first in `ALL`'s order
+/// go and paces the rest.
+#[test]
+fn the_rank_puts_a_wake_first_and_the_nudge_before_hold_room() {
+    let seen = book(vec![woken(1, Prio::Normal, WakeState::Ready)]);
+    let at = |seen: &WakesSeen, ranked: bool| {
+        let sight = WakeSight {
+            seen,
+            wall_ms: T0 + HOUR,
+            told: &untold,
+            ranked,
+        };
+        let mut books = Books::default();
+        books.hold(0);
+        decide(
+            &room(),
+            hold(),
+            &books,
+            &cruise(),
+            WAIT_NUDGE_AFTER_MS,
+            2 * HOUR,
+            &sight,
+        )
+        .map(|(_, v)| v)
+    };
+    let [nudge, room_said, wake] = at(&seen, true);
+    assert!(due_wake(&wake).is_some(), "{wake:?}");
+    assert_eq!((nudge, room_said), (Verdict::Outranked, Verdict::Outranked));
+    let [nudge, room_said, wake] = at(&book(Vec::new()), true);
+    assert!(is_due(&nudge, RuleId::WaitNudge), "{nudge:?}");
+    assert_eq!((room_said, wake), (Verdict::Outranked, Verdict::Quiet));
+    let [nudge, room_said, wake] = at(&seen, false);
+    assert!(is_due(&nudge, RuleId::WaitNudge), "{nudge:?}");
+    let paced = Verdict::Paced {
+        next_ms: 2 * HOUR + SESSION_PACE_MS,
+    };
+    assert_eq!((room_said, wake), (paced.clone(), paced));
+}
+
+#[test]
+fn a_wakes_episode_is_the_books_and_its_rule_reads_back() {
+    assert_eq!(episode(RuleId::Wake, T0, 3), wake_episode(T0, 3));
+    assert_eq!(RuleId::of_name("wake@v1"), Some(RuleId::Wake));
+    assert!(!RuleId::Wake.slice1());
+    assert_eq!(modes(RuleId::Wake), &[Autopilot::Cruise, Autopilot::Land]);
+}
+
+/// A READY WAKE WITH ITS NEED MET READS THE SESSION READY (F14). NEGATIVE CONTROL: unmet, or
+/// pending, it does not.
+#[test]
+fn a_met_wake_reads_the_session_ready() {
+    let mut wake = woken(1, Prio::Normal, WakeState::Ready);
+    assert!(wake_met(&book(vec![wake.clone()])));
+    wake.need_met = false;
+    assert!(!wake_met(&book(vec![wake.clone()])));
+    wake.need_met = true;
+    wake.state = WakeState::Pending;
+    assert!(!wake_met(&book(vec![wake])));
 }

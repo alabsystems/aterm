@@ -108,8 +108,8 @@ fn sync(desk: &Desk, fleet: &FleetRoster, machine: &str, default: &str, now: i64
         now,
         (&[], &[]),
     )
-    .expect("the sync publishes")
-    .roster
+    .expect("the sync publishes");
+    Roster::load(&desk.roster()).expect("the published roster admits")
 }
 
 fn displaced(store: &accounts::Store) -> Vec<accounts::Event> {

@@ -1838,6 +1838,14 @@ impl App {
                         .find(|session| session.handoff_local_id == Some(named))?;
                     let sid = g.by_local(session.id)?.sid.as_str().to_string();
                     let adopted = u32::try_from(session.pid).ok()?;
+                    if agent.retired() {
+                        aterm_log::info!(
+                            "handoff @{sid}: the agent that ran here (pid {}) is not watched: {}",
+                            agent.pid,
+                            aterm_phase::RETIRED_AGENT
+                        );
+                        return None;
+                    }
                     Some((sid.clone(), agent.handed_snapshot(sid, adopted)?))
                 })
                 .collect()
@@ -1942,6 +1950,13 @@ impl App {
                     return None;
                 }
                 handed.push((pid, start.to_string()));
+                if agent.retired() {
+                    aterm_log::info!(
+                        "restore @{sid}: the agent that ran here (pid {pid}) is not relaunched: {}",
+                        aterm_phase::RETIRED_AGENT
+                    );
+                    return None;
+                }
                 if !agent.relaunched() {
                     aterm_log::info!(
                         "restore @{sid}: the codex that ran here (pid {pid}) is not relaunched: \

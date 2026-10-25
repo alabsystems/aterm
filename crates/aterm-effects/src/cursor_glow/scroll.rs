@@ -132,29 +132,48 @@ impl CursorGlow {
     /// Translate all row-addressed cursor-glow state through `map`.
     pub(super) fn translate_row_addressed(&mut self, map: &impl Fn(u16) -> Option<u16>) {
         let hand_at_caret = self.hand_types_at_the_caret(self.last);
-        self.last = self
-            .last
-            .and_then(|(row, col)| map(row).map(|row| (row, col)));
-        self.last_visible = self
-            .last_visible
-            .and_then(|((row, col), at)| map(row).map(|row| ((row, col), at)));
-        self.hide_bridge_shown = self
-            .hide_bridge_shown
-            .and_then(|(row, col)| map(row).map(|row| (row, col)));
-        self.v2_stop = self.v2_stop.and_then(|(t, at)| match at {
-            Some((row, col)) => map(row).map(|row| (t, Some((row, col)))),
-            None => Some((t, None)),
-        });
+        if let Some((row, _)) = &mut self.last {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.last = None,
+            }
+        }
+        if let Some(((row, _), _)) = &mut self.last_visible {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.last_visible = None,
+            }
+        }
+        if let Some((row, _)) = &mut self.hide_bridge_shown {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.hide_bridge_shown = None,
+            }
+        }
+        if let Some((_, Some((row, _)))) = &mut self.v2_stop {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.v2_stop = None,
+            }
+        }
         self.forget_anchor_rows();
-        self.hand_row = self
-            .hand_row
-            .and_then(|hand| hand.carried(map, hand_at_caret));
-        self.unowned_caret = self.unowned_caret.and_then(|mut caret| {
-            caret.row = map(caret.row)?;
-            Some(caret)
-        });
+        self.hand_row = match self.hand_row {
+            Some(hand) => hand.carried(map, hand_at_caret),
+            None => None,
+        };
+        if let Some(caret) = &mut self.unowned_caret {
+            match map(caret.row) {
+                Some(r) => caret.row = r,
+                None => self.unowned_caret = None,
+            }
+        }
         self.torn_lay = None;
-        self.wrap_paid_row = self.wrap_paid_row.and_then(map);
+        if let Some(row) = &mut self.wrap_paid_row {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.wrap_paid_row = None,
+            }
+        }
         self.translate_insert_rows(map);
         self.sparks.retain_mut(|s| match map(s.row) {
             Some(r) => {
@@ -182,10 +201,12 @@ impl CursorGlow {
                 p.y0 -= dy;
                 p.y0 > top
             });
-            self.ring = self.ring.take().and_then(|mut r| {
+            if let Some(r) = &mut self.ring {
                 r.cy -= dy;
-                (r.cy > top).then_some(r)
-            });
+                if r.cy <= top {
+                    self.ring = None;
+                }
+            }
             self.fire_meteors.retain_mut(|meteor| {
                 meteor.y0 -= dy;
                 meteor.y1 -= dy;
@@ -205,9 +226,12 @@ impl CursorGlow {
 
         for fade in &mut self.fading {
             fade.engine.translate_scroll_state(rows, cell_h);
-            fade.anchor = fade
-                .anchor
-                .and_then(|(row, col)| row.checked_sub(rows).map(|row| (row, col)));
+            if let Some((row, _)) = &mut fade.anchor {
+                match row.checked_sub(rows) {
+                    Some(r) => *row = r,
+                    None => fade.anchor = None,
+                }
+            }
             fade.engine.last = fade.anchor;
             fade.engine.last_ch = cell_h;
         }
@@ -234,17 +258,34 @@ impl CursorGlow {
     pub(super) fn key_in_flight(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, TYPE_HINT_FRESH_DUR)
             || self.type_press_ring.any_within(now)
-            || self.last_erase.is_some_and(|erase| erase.owed_at(now))
+            || match &self.last_erase {
+                Some(erase) => erase.owed_at(now),
+                None => false,
+            }
     }
 
     /// Lift row- and pixel-addressed state on the active typing line from `from` to `to`.
     pub(super) fn lift_hand_row(&mut self, from: u16, to: u16) {
         let map = |r: u16| if r == from { to } else { r };
-        self.last = self.last.map(|(r, c)| (map(r), c));
-        self.last_visible = self.last_visible.map(|((r, c), at)| ((map(r), c), at));
-        self.hide_bridge_shown = self.hide_bridge_shown.map(|(r, c)| (map(r), c));
-        if let Some((_, Some((row, _)))) = &mut self.v2_stop {
-            *row = map(*row);
+        if let Some((r, _)) = &mut self.last
+            && *r == from
+        {
+            *r = to;
+        }
+        if let Some(((r, _), _)) = &mut self.last_visible
+            && *r == from
+        {
+            *r = to;
+        }
+        if let Some((r, _)) = &mut self.hide_bridge_shown
+            && *r == from
+        {
+            *r = to;
+        }
+        if let Some((_, Some((row, _)))) = &mut self.v2_stop
+            && *row == from
+        {
+            *row = to;
         }
         if let Some(probe) = self.row_prev_meta.as_mut()
             && probe.row == from
@@ -261,27 +302,47 @@ impl CursorGlow {
             probe.below = NbrProbe::Unprobed;
         }
         self.refresh_probed_text_spans();
-        self.hand_row = self.hand_row.map(|hand| {
-            if hand.row == from {
-                HandRow::at(to)
-            } else {
-                hand
-            }
-        });
-        if let Some(caret) = &mut self.unowned_caret {
-            caret.row = map(caret.row);
+        if let Some(hand) = &mut self.hand_row
+            && hand.row == from
+        {
+            *hand = HandRow::at(to);
         }
-        if let Some(run) = &mut self.recent_typed_run {
-            run.row = map(run.row);
+        if let Some(caret) = &mut self.unowned_caret
+            && caret.row == from
+        {
+            caret.row = to;
+        }
+        if let Some(run) = &mut self.recent_typed_run
+            && run.row == from
+        {
+            run.row = to;
         }
         if let Some(lay) = &mut self.torn_lay {
-            lay.row = map(lay.row);
-            lay.seen = lay.seen.map(|(r, c)| (map(r), c));
+            if lay.row == from {
+                lay.row = to;
+            }
+            if let Some((r, _)) = &mut lay.seen
+                && *r == from
+            {
+                *r = to;
+            }
         }
         self.carry_held_park(|r| Some(map(r)));
-        self.last_licensed_row = self.last_licensed_row.map(|(r, at)| (map(r), at));
-        self.last_anchor_sweep = self.last_anchor_sweep.map(|(r, at)| (map(r), at));
-        self.wrap_paid_row = self.wrap_paid_row.map(map);
+        if let Some((r, _)) = &mut self.last_licensed_row
+            && *r == from
+        {
+            *r = to;
+        }
+        if let Some((r, _)) = &mut self.last_anchor_sweep
+            && *r == from
+        {
+            *r = to;
+        }
+        if let Some(r) = &mut self.wrap_paid_row
+            && *r == from
+        {
+            *r = to;
+        }
         self.insert.translate_rows(|r| Some(map(r)));
         for slot in &mut self.anchor_rows {
             match slot {
@@ -311,8 +372,10 @@ impl CursorGlow {
         } else {
             let px = BandPx::new(top, bottom, delta, cell_h, origin_y);
             self.particles.retain_mut(|p| px.point(&mut p.y0));
-            if let Some(mut r) = self.ring.take() {
-                self.ring = px.point(&mut r.cy).then_some(r);
+            if let Some(r) = &mut self.ring
+                && !px.point(&mut r.cy)
+            {
+                self.ring = None;
             }
             self.vapor.retain_mut(|puff| px.point(&mut puff.y0));
             self.fire_meteors
@@ -340,9 +403,12 @@ impl CursorGlow {
         for fade in &mut self.fading {
             fade.engine
                 .translate_band_state(top, bottom, delta, cell_h, origin_y);
-            fade.anchor = fade
-                .anchor
-                .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+            if let Some((row, _)) = &mut fade.anchor {
+                match band_row(*row, top, bottom, delta) {
+                    Some(r) => *row = r,
+                    None => fade.anchor = None,
+                }
+            }
             fade.engine.last = fade.anchor;
             fade.engine.last_ch = cell_h;
             fade.engine.last_origin_y = origin_y;

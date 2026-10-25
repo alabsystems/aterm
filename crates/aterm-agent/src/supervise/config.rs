@@ -292,14 +292,14 @@ pub struct SupervisorConfig {
     /// A file whose text is appended to a continuation (standing rules).
     pub rules_file: Option<PathBuf>,
     /// Answer an API error or an overload, however many, by what it says went wrong (the network, a
-    /// reply cut off, the server), never with an ask, but for a Gemini CLI error other than a 429
-    /// or 5xx and agy's non-retryable 4xx, which go to a person.
+    /// reply cut off, the server), never with an ask, but for agy's non-retryable 4xx, which go
+    /// to a person.
     pub retry_api_errors: bool,
     /// Let the window's host probe API reachability (`api.anthropic.com` TLS handshake) while a session waits on a network API error.
     pub probe_api: bool,
     /// Continue once a session or weekly usage limit has reset.
     pub resume_limits: bool,
-    /// At Claude Code's usage-limit dialog (`What do you want to do?`), choose `Wait here, then continue automatically …` by its label (never a spending row, never `Stop`), arming the vendor's own continue for the reset (`limit-wait@v1`); at Gemini CLI's, wait through the reset it names (or, naming none, the back-off ladder's rung while a person is told), then choose `Keep trying` (`limit-retry@v1`), or on its per-model dialog `Stop` (`limit-stop@v1`, never the switch nor the upgrade) and then the resume. Off: the dialog is a person's.
+    /// At Claude Code's usage-limit dialog (`What do you want to do?`), choose `Wait here, then continue automatically …` by its label (never a spending row, never `Stop`), arming the vendor's own continue for the reset (`limit-wait@v1`). Off: the dialog is a person's.
     pub limit_wait: bool,
     /// At Claude Code's autocompact offer (`We recommend compacting earlier`, 2.1.302), choose `Autocompact at ‹ <size> › tokens` at this size, in kilo-tokens (`autocompact-offer@v1`).
     pub autocompact_offer: Option<u32>,
@@ -323,7 +323,7 @@ pub struct SupervisorConfig {
     pub model_fallback: Option<String>,
     /// Type `/compact` when the worker stops on a full context.
     pub compact_on_context_wall: bool,
-    /// Relaunch a crashed agent (Claude Code, Muse Code, agy, Gemini CLI, or codex-alab) on its validated session or conversation.
+    /// Relaunch a crashed agent (Claude Code, Muse Code, agy, or codex-alab) on its validated session or conversation.
     pub relaunch: bool,
     /// How long an agent stands frozen (not reading its input, nobody's hand on it) before the supervisor restarts it (`restart if-stalled`) for its relaunch (`supervise/stall.rs`).
     pub stall_term_after_s: u32,
@@ -439,7 +439,7 @@ pub struct Rebuilt {
     pub policy: SupervisorConfig,
     /// Each key of [`KEYS`] and each agent's switch the texts did not name (texts from a build before it), left at its full-power default.
     pub supplied: Vec<String>,
-    /// For each key the texts named that this build has retired, the note [`SupervisorConfig::set`] gave as it read it.
+    /// For each key the texts named that this build has retired, the note [`SupervisorConfig::set`] gave as it read it; for each switch of an agent this build retired ([`aterm_phase::RETIRED_AGENTS`]), a note that it set nothing, with its replacement named.
     pub retired: Vec<String>,
     /// For each value [`SupervisorConfig::set`] refused, the note it gave as it read the value the way an owner's file is read (the key's default kept, or an off read as its limit), and the value it read in its place (`…; this build read <key>=<text>`).
     pub refused: Vec<String>,
@@ -1245,6 +1245,7 @@ impl SupervisorConfig {
         let agent_keys: Vec<String> = cfg.agent_texts().into_iter().map(|(k, _)| k).collect();
         let mut supplied = Vec::new();
         let mut retired_keys = Vec::new();
+        let mut retired = Vec::new();
         for (list, names, what) in [(keys, &wanted, "key"), (agents, &agent_keys, "agent")] {
             for name in names {
                 match list.iter().filter(|(k, _)| k == name).count() {
@@ -1271,6 +1272,17 @@ impl SupervisorConfig {
                     }
                 } else if what == "key" && RETIRED_KEYS.contains(&key.as_str()) {
                     retired_keys.push((key, value));
+                } else if what == "agent"
+                    && key
+                        .split_once('.')
+                        .is_some_and(|(head, _)| aterm_phase::retired_agent(head))
+                {
+                    // An older build's switch for an agent this build retired (Gemini CLI's
+                    // `gemini.enabled`): it sets nothing, and the note says so with agy named.
+                    retired.push(format!(
+                        "harness.{key}: the switch of an agent this build retired, read as nothing — {}",
+                        aterm_phase::RETIRED_AGENT
+                    ));
                 } else {
                     return Err(format!(
                         "harness.{key}: no {what} this build has — a policy a newer build wrote"
@@ -1278,7 +1290,6 @@ impl SupervisorConfig {
                 }
             }
         }
-        let mut retired = Vec::new();
         for (key, value) in retired_keys {
             retired.push(match cfg.set(key, value) {
                 Ok(()) => format!("harness.{key}: a retired key"),
@@ -1371,6 +1382,13 @@ pub struct Written {
 }
 
 fn unknown_key(key: &str) -> String {
+    let head = key.split('.').next().unwrap_or(key);
+    if aterm_phase::retired_agent(head) {
+        return format!(
+            "harness.{key}: {UNKNOWN_KEY}, ignored — {}",
+            aterm_phase::RETIRED_AGENT
+        );
+    }
     format!(
         "harness.{key}: {UNKNOWN_KEY}, ignored (known: {})",
         KEYS.join(", ")
@@ -1397,7 +1415,6 @@ fn own_keys(program: Program) -> &'static [&'static str] {
         | Program::Codex
         | Program::Grok
         | Program::Kimi
-        | Program::Gemini
         | Program::Muse
         | Program::Generic => &[],
     }
@@ -1842,6 +1859,32 @@ mod tests {
 
     fn read(text: &str) -> SupervisorConfig {
         SupervisorConfig::from_aterm_toml(text).0
+    }
+
+    /// A `[harness.gemini]` table, Gemini CLI's before it was retired, sets nothing and is
+    /// refused by a note that names agy as its replacement; agy's own table is still read.
+    /// NEGATIVE CONTROL: `[harness.agy] enabled = false` switches agy off.
+    #[test]
+    fn a_retired_agents_table_is_refused_with_its_replacement_named() {
+        for text in [
+            "[harness.gemini]\nenabled = false\n",
+            "[harness]\ngemini.enabled = false\n",
+        ] {
+            let (cfg, notes) = SupervisorConfig::from_aterm_toml(text);
+            assert_eq!(cfg, SupervisorConfig::default(), "{text}: nothing set");
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.starts_with("harness.gemini") && n.contains("agy replaces it")),
+                "{text}: {notes:?}"
+            );
+        }
+        let agy = read("[harness.agy]\nenabled = false\n");
+        assert_ne!(
+            agy,
+            SupervisorConfig::default(),
+            "the control: agy's table is read"
+        );
     }
 
     #[test]
@@ -3115,6 +3158,35 @@ mod tests {
         );
         assert!(back.policy.withheld.rm_breaker);
         assert_eq!(back.retired.len(), 1, "{back:?}");
+    }
+
+    /// AN OLDER BUILD'S SWITCH FOR THE RETIRED GEMINI CLI SETS NOTHING AND IS SAID: texts an
+    /// older build wrote name `gemini.enabled`; they rebuild to the policy without it, the note
+    /// names agy, and no live agent's switch moves. NEGATIVE CONTROL: an agent no build ever had
+    /// is still a newer build's, refused.
+    #[test]
+    fn rebuild_reads_a_retired_agents_switch_as_nothing_and_names_its_replacement() {
+        let mut written = SupervisorConfig::default();
+        written.set("codex.enabled", "false").expect("codex");
+        for value in ["true", "false"] {
+            let mut older = written.policy_texts();
+            older.agents.push(("gemini.enabled".into(), value.into()));
+            let back = SupervisorConfig::rebuild(&older).expect("an older build's texts");
+            assert_eq!(back.policy, written, "{value}: nothing set");
+            assert!(back.supplied.is_empty(), "{value}: {back:?}");
+            assert_eq!(back.retired.len(), 1, "{value}: {back:?}");
+            assert!(
+                back.retired[0].starts_with("harness.gemini.enabled: ")
+                    && back.retired[0].contains(aterm_phase::RETIRED_AGENT),
+                "{value}: {back:?}"
+            );
+            let near = SupervisorConfig::rebuild_nearest(&older).expect("nearest too");
+            assert_eq!(near.policy, written, "{value}");
+        }
+        let mut newer = written.policy_texts();
+        newer.agents.push(("geminix.enabled".into(), "true".into()));
+        let e = SupervisorConfig::rebuild(&newer).expect_err("no build had it");
+        assert!(e.contains("a newer build"), "{e}");
     }
 
     #[test]

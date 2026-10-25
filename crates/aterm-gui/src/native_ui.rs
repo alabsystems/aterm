@@ -407,6 +407,10 @@ pub(crate) struct Control<T> {
     pub(crate) style: StyleRef,
     pub(crate) role: Option<SemanticRole>,
     pub(crate) look_first: bool,
+    /// A text button paints its face centred in its rect, as a navigation chip does, rather
+    /// than at the leading inset: a button that keeps a wider footprint than its face needs
+    /// (System State's Apply, sized for its countdown) shows its words in the middle.
+    pub(crate) centred: bool,
 }
 
 impl<T> Control<T> {
@@ -419,6 +423,7 @@ impl<T> Control<T> {
             style: StyleRef::default(),
             role: None,
             look_first: false,
+            centred: false,
         }
     }
 
@@ -727,7 +732,7 @@ pub(crate) fn display_face_name_typography(
     width: f32,
 ) -> (crate::type_scale::StepPx, crate::widget::TextFace) {
     let face = spec
-        .value
+        .paint
         .as_deref()
         .and_then(|id| {
             aterm_render::DISPLAY_FACES
@@ -1443,7 +1448,12 @@ pub(crate) struct TextViewportSpec {
     pub(crate) cursor_label: Option<String>,
     pub(crate) dirty: bool,
     pub(crate) saving: bool,
+    /// Whether control navigation selects this viewport.
+    /// Editor text input also reaches it while a toolbar control has focus.
     pub(crate) focused: bool,
+    /// Whether the focused viewport draws its outer focus ring.
+    pub(crate) focus_visible: bool,
+    /// Activation focuses this selectable viewport; edits use the document input route.
     pub(crate) action: Option<ActionId>,
 }
 
@@ -1460,8 +1470,115 @@ pub(crate) struct TextViewportGeometry {
     pub(crate) cell_w: f32,
 }
 
-pub(crate) fn text_viewport_geometry(rect: LogicalRect) -> TextViewportGeometry {
-    text_viewport_geometry_at_scale(rect, crate::native_appearance::text_scale())
+/// The geometry of an editor viewport in `rect` whose footer is `footer_rows` rows tall
+/// ([`TextViewportSpec::footer_rows`]).
+pub(crate) fn text_viewport_geometry(
+    rect: LogicalRect,
+    footer_rows: usize,
+) -> TextViewportGeometry {
+    text_viewport_geometry_at_scale(rect, crate::native_appearance::text_scale(), footer_rows)
+}
+
+impl TextViewportSpec {
+    /// The rows the footer paints: the minibuffer's one, else the status's lines
+    /// ([`editor_footer_lines`]).
+    pub(crate) fn footer_rows(&self) -> usize {
+        if self.minibuffer.is_some() {
+            1
+        } else {
+            self.status
+                .as_deref()
+                .map_or(1, |status| status.lines().count())
+                .clamp(1, EDITOR_FOOTER_MAX_ROWS)
+        }
+    }
+
+    /// This viewport's geometry in `rect`.
+    pub(crate) fn geometry(&self, rect: LogicalRect) -> TextViewportGeometry {
+        text_viewport_geometry(rect, self.footer_rows())
+    }
+}
+
+/// The footer rows the editor always leaves room for: its shell keeps the document's
+/// minimum rows under a footer this tall ([`editor_shell_metrics`]).
+pub(crate) const EDITOR_FOOTER_RESERVED_ROWS: usize = 3;
+
+/// The most rows the editor footer ever takes.
+pub(crate) const EDITOR_FOOTER_MAX_ROWS: usize = 8;
+
+/// The rows the footer of an editor in `rect` may take: the rows it always has room for, and
+/// past them every row the document can spare above its minimum rows.
+pub(crate) fn editor_footer_row_cap(rect: LogicalRect) -> usize {
+    let one_row = text_viewport_geometry(rect, 1);
+    let minimum = MINIMUM_EDITOR_DOCUMENT_ROWS as f32 * one_row.line_h;
+    let spare = ((one_row.body_h - minimum).max(0.0)
+        / editor_footer_line_h(crate::native_appearance::text_scale()))
+    .floor() as usize;
+    spare
+        .saturating_add(1)
+        .clamp(EDITOR_FOOTER_RESERVED_ROWS, EDITOR_FOOTER_MAX_ROWS)
+}
+
+/// What the editor header's title wears while the buffer has unsaved changes.
+pub(crate) const EDITOR_DIRTY_MARK: &str = "  •";
+
+/// The width of the editor footer's text slot in an editor `editor_width` wide: inside the
+/// footer's inset on both sides. The view fits the status to it, the painter draws in it and
+/// the paint audit measures against it.
+pub(crate) fn editor_footer_text_width(editor_width: f32) -> f32 {
+    (editor_width - EDITOR_FOOTER_TEXT_INSET * 2.0).max(0.0)
+}
+
+/// The status as the footer of an editor in `rect` paints it: the first of `forms` (the
+/// whole sentence, then shorter ones that leave out what matters least) whose lines, wrapped
+/// at whole words in the footer's slot, fit the rows the footer may take
+/// ([`editor_footer_row_cap`]); where none does, the shortest, its last row cut at a whole
+/// word with `…`.
+pub(crate) fn editor_footer_lines(forms: &[String], rect: LogicalRect) -> Vec<String> {
+    let room = editor_footer_text_width(rect.width);
+    let cap = editor_footer_row_cap(rect);
+    let measure = |text: &str| native_status_label_width(text);
+    let wrap = |form: &str| {
+        let mut lines = crate::native_settings::wrap_to_box(form, room, &measure);
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    };
+    if let Some(lines) = forms
+        .iter()
+        .map(|form| wrap(form))
+        .find(|lines| lines.len() <= cap)
+    {
+        return lines;
+    }
+    let mut lines = wrap(forms.last().map_or("", String::as_str));
+    if lines.len() > cap {
+        let rest = lines.split_off(cap - 1).join(" ");
+        lines.push(fit_native_status_label(&rest, room));
+    }
+    lines
+}
+
+/// Whether the footer's `painted` rows show all of `semantic`: the same words in the same
+/// order, whatever rows they wrapped to (a `·` a row breaks at goes with the break).
+pub(crate) fn footer_shows_whole(semantic: &str, painted: &str) -> bool {
+    let words = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '·')
+            .collect::<String>()
+    };
+    words(semantic) == words(painted)
+}
+
+/// The height each footer row past the first adds: one caption line.
+fn editor_footer_line_h(text_scale: f32) -> f32 {
+    (crate::type_scale::TypeStep::Caption
+        .px(11.0 / crate::type_scale::TypeStep::Caption.factor())
+        .scaled(text_scale)
+        .get()
+        * 1.4)
+        .ceil()
 }
 
 fn editor_caret_rect(
@@ -1515,12 +1632,62 @@ fn editor_minibuffer_caret_rect(
     LogicalRect::new(x, baseline - caption, 1.0, caption + 2.0).intersect(LogicalRect::new(
         rect.x + EDITOR_FOOTER_TEXT_INSET,
         footer_y,
-        (rect.width - EDITOR_FOOTER_TEXT_INSET).max(0.0),
+        editor_footer_text_width(rect.width),
         geometry.footer_h,
     ))
 }
 
 const EDITOR_FOOTER_TEXT_INSET: f32 = 12.0;
+
+/// Where the editor header's marks sit in an editor `rect`, measured at the current text
+/// size: the `EDIT` badge, the title after it, the caret's place and `Saving…` at the right.
+/// The view fits the title to it, and the painter and the paint audit draw and measure by
+/// it, so none of the marks can run into another.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EditorHeaderLayout {
+    pub(crate) badge_x: f32,
+    pub(crate) title_x: f32,
+    pub(crate) title_right: f32,
+    pub(crate) cursor_x: Option<f32>,
+    pub(crate) saving_x: Option<f32>,
+}
+
+/// The room the title keeps before the caret's place gives way to it.
+const EDITOR_TITLE_LEAST: f32 = 96.0;
+
+pub(crate) fn editor_header_layout(
+    rect: LogicalRect,
+    cursor_label: Option<&str>,
+    saving: bool,
+) -> EditorHeaderLayout {
+    use crate::widget::{TextFace, TextWeight};
+
+    let caption = native_type_px(TypeStep::Caption).get();
+    let badge_x = rect.x + 14.0;
+    let badge_w = crate::tray_raster::ui_text_width_for(TextFace::UiBold, "EDIT", caption);
+    let title_x = (badge_x + badge_w + 12.0).max(rect.x + 58.0);
+    let mut right = rect.right() - 12.0;
+    let saving_x = saving.then(|| {
+        let x = (right - crate::tray_raster::ui_text_width_for(TextFace::Ui, "Saving…", caption))
+            .max(title_x);
+        right = x - 12.0;
+        x
+    });
+    let cursor_x = cursor_label.and_then(|cursor| {
+        let x = right - crate::tray_raster::measure_text(cursor, caption, TextWeight::Regular);
+        (x - 8.0 - title_x >= EDITOR_TITLE_LEAST).then(|| {
+            right = x - 8.0;
+            x
+        })
+    });
+    EditorHeaderLayout {
+        badge_x,
+        title_x,
+        title_right: right.max(title_x),
+        cursor_x,
+        saving_x,
+    }
+}
 
 const EDITOR_HEADER_H: f32 = 44.0;
 const EDITOR_FOOTER_H: f32 = 30.0;
@@ -1529,6 +1696,7 @@ const EDITOR_LINE_H: f32 = 20.0;
 pub(crate) fn text_viewport_geometry_at_scale(
     rect: LogicalRect,
     text_scale: f32,
+    footer_rows: usize,
 ) -> TextViewportGeometry {
     const FALLBACK_CELL_W: f32 = 7.8;
 
@@ -1550,7 +1718,12 @@ pub(crate) fn text_viewport_geometry_at_scale(
 
     let chrome_scale = text_scale.min(1.35);
     let header_h = (EDITOR_HEADER_H * chrome_scale).min(rect.height);
-    let footer_h = (EDITOR_FOOTER_H * chrome_scale).min((rect.height - header_h).max(0.0));
+    let footer_h = (EDITOR_FOOTER_H * chrome_scale
+        + footer_rows
+            .clamp(1, EDITOR_FOOTER_MAX_ROWS)
+            .saturating_sub(1) as f32
+            * editor_footer_line_h(text_scale))
+    .min((rect.height - header_h).max(0.0));
     let body_y = rect.y + header_h;
     let body_h = (rect.height - header_h - footer_h).max(0.0);
     let gutter_w = if rect.width < 480.0 * text_scale {
@@ -1816,7 +1989,11 @@ pub(crate) fn editor_shell_metrics_at_scale(
     let palette_header_height = (28.0 * text_scale).clamp(28.0, 40.0);
     let palette_row_height = (34.0 * text_scale).clamp(34.0, 48.0);
     let palette_row_gap = 3.0 * chrome_scale;
-    let editor_chrome_height = (EDITOR_HEADER_H + EDITOR_FOOTER_H) * chrome_scale;
+    // The footer with the rows it always has room for ([`EDITOR_FOOTER_RESERVED_ROWS`]): a
+    // status that wraps to them never costs the document its minimum rows, and the
+    // palette's rows never change with it.
+    let editor_chrome_height = (EDITOR_HEADER_H + EDITOR_FOOTER_H) * chrome_scale
+        + (EDITOR_FOOTER_RESERVED_ROWS - 1) as f32 * editor_footer_line_h(text_scale);
     let minimum_editor_height =
         editor_chrome_height + MINIMUM_EDITOR_DOCUMENT_ROWS as f32 * EDITOR_LINE_H * text_scale;
     let available_palette_height = (viewport.height
@@ -1905,27 +2082,31 @@ fn editor_text_viewport_rect_at_scale(
     )
 }
 
-/// The document rows the editor shows whole.
+/// The document rows the editor shows whole above a footer `footer_rows` rows tall.
 pub(crate) fn editor_visible_line_capacity_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
     toolbar: EditorToolbar,
+    footer_rows: usize,
 ) -> usize {
-    let geometry = text_viewport_geometry(editor_text_viewport_rect_with_palette(
-        viewport, palette, toolbar,
-    ));
+    let geometry = text_viewport_geometry(
+        editor_text_viewport_rect_with_palette(viewport, palette, toolbar),
+        footer_rows,
+    );
     whole_editor_rows(&geometry)
 }
 
-/// The document rows the editor paints.
+/// The document rows the editor paints above a footer `footer_rows` rows tall.
 pub(crate) fn editor_painted_line_capacity_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
     toolbar: EditorToolbar,
+    footer_rows: usize,
 ) -> usize {
-    let geometry = text_viewport_geometry(editor_text_viewport_rect_with_palette(
-        viewport, palette, toolbar,
-    ));
+    let geometry = text_viewport_geometry(
+        editor_text_viewport_rect_with_palette(viewport, palette, toolbar),
+        footer_rows,
+    );
     ((geometry.body_h / geometry.line_h).ceil() as usize)
         .saturating_add(1)
         .clamp(1, 256)
@@ -1945,7 +2126,7 @@ pub(crate) fn text_viewport_byte_at(
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-    let geometry = text_viewport_geometry(rect);
+    let geometry = spec.geometry(rect);
     if geometry.body_h <= 0.0
         || x < geometry.text_x
         || x >= rect.right()
@@ -1974,8 +2155,11 @@ pub(crate) fn text_viewport_byte_at(
 pub(crate) struct AuditedCustomNode {
     pub(crate) audit_id: &'static str,
     pub(crate) role: SemanticRole,
+    /// What a screen reader hears: a custom node speaks its role and label alone.
     pub(crate) label: String,
-    pub(crate) value: Option<String>,
+    /// What the node's painter draws from (a spec, an id, a count), never spoken: a datum
+    /// meant for the painter would read out as the node's words.
+    pub(crate) paint: Option<String>,
     pub(crate) action: Option<ActionId>,
     pub(crate) focusable: bool,
     pub(crate) focused: bool,
@@ -2125,10 +2309,7 @@ impl UiContent {
             Self::Custom(spec) => SemanticProjection {
                 role: spec.role,
                 label: spec.label.clone(),
-                value: spec
-                    .value
-                    .as_ref()
-                    .map_or(SemanticValue::None, |v| SemanticValue::Text(v.clone())),
+                value: SemanticValue::None,
                 state: (spec.action.is_some() || spec.focusable).then(|| ControlState {
                     enabled: spec.action.is_some() || spec.focusable,
                     focused: spec.focused,
@@ -2320,8 +2501,12 @@ impl UiTree {
                 UiContent::Group(_)
                 | UiContent::Text(_)
                 | UiContent::RichText(_)
-                | UiContent::MarkdownBlock(_)
-                | UiContent::TextViewport(_) => None,
+                | UiContent::MarkdownBlock(_) => None,
+                UiContent::TextViewport(spec) => {
+                    spec.focused = spec.selectable && focus == Some(key);
+                    spec.focus_visible = spec.focused && focus_visible;
+                    None
+                }
                 UiContent::SettingsPreview(spec) => {
                     spec.focused = spec.pause_control() && focus == Some(key);
                     spec.focus_visible = spec.focused && focus_visible;
@@ -3068,58 +3253,70 @@ impl CompiledUi {
         )
     }
 
-    /// The focused input's visible caret, in this retained leaf's logical pixels.
+    /// The current text target's visible caret, in this retained leaf's logical pixels.
     pub(crate) fn ime_caret_rect(&self) -> Option<LogicalRect> {
-        self.paint.iter().rev().find_map(|node| {
-            let caret = match &node.content {
-                UiContent::TextField(control) if control.state.focused && control.state.enabled => {
-                    let input = control.spec.input.as_ref()?;
-                    let size = native_type_px(crate::type_scale::TypeStep::Secondary).get();
-                    let rect = text_field_text_rect(control, node.rect);
-                    let geometry = text_field_geometry(control, rect, size);
-                    text_field_caret_rect(input, &geometry, rect, size).intersect(
-                        LogicalRect::new(
-                            geometry.text_x,
-                            rect.y + 2.0,
-                            (geometry.text_right - geometry.text_x).max(0.0),
-                            (rect.height - 4.0).max(0.0),
-                        ),
-                    )?
-                }
-                UiContent::TextViewport(spec) if spec.focused => {
-                    let geometry = text_viewport_geometry(node.rect);
-                    if spec.minibuffer_caret.is_some() {
-                        return editor_minibuffer_caret_rect(spec, node.rect, &geometry)?
-                            .intersect(node.clip)?
-                            .intersect(self.bounds);
-                    }
-                    let projection = spec.projection.as_ref()?;
-                    let (row, line, byte) =
-                        projection
-                            .lines
-                            .iter()
-                            .enumerate()
-                            .find_map(|(row, line)| {
-                                line.carets
-                                    .iter()
-                                    .find(|(_, primary)| *primary)
-                                    .map(|(byte, _)| (row, line, *byte))
-                            })?;
-                    editor_composition_caret_rect(
-                        editor_caret_rect(&geometry, row, line, byte),
-                        spec,
+        // A focused field owns input even when its caret is clipped; only its absence
+        // leaves the editor viewport as the text target during toolbar navigation.
+        let node = self
+            .paint
+            .iter()
+            .rev()
+            .find(|node| {
+                matches!(
+                    &node.content,
+                    UiContent::TextField(control) if control.state.focused && control.state.enabled
+                )
+            })
+            .or_else(|| {
+                self.paint.iter().rev().find(|node| {
+                    matches!(
+                        &node.content, UiContent::TextViewport(spec) if spec.selectable
                     )
-                    .intersect(LogicalRect::new(
-                        node.rect.x,
-                        geometry.body_y,
-                        node.rect.width,
-                        geometry.body_h,
-                    ))?
+                })
+            })?;
+        let caret = match &node.content {
+            UiContent::TextField(control) if control.state.focused && control.state.enabled => {
+                let input = control.spec.input.as_ref()?;
+                let size = native_type_px(crate::type_scale::TypeStep::Secondary).get();
+                let rect = text_field_text_rect(control, node.rect);
+                let geometry = text_field_geometry(control, rect, size);
+                text_field_caret_rect(input, &geometry, rect, size).intersect(LogicalRect::new(
+                    geometry.text_x,
+                    rect.y + 2.0,
+                    (geometry.text_right - geometry.text_x).max(0.0),
+                    (rect.height - 4.0).max(0.0),
+                ))?
+            }
+            UiContent::TextViewport(spec) if spec.selectable => {
+                let geometry = spec.geometry(node.rect);
+                if spec.minibuffer_caret.is_some() {
+                    return editor_minibuffer_caret_rect(spec, node.rect, &geometry)?
+                        .intersect(node.clip)?
+                        .intersect(self.bounds);
                 }
-                _ => return None,
-            };
-            caret.intersect(node.clip)?.intersect(self.bounds)
-        })
+                let projection = spec.projection.as_ref()?;
+                let (row, line, byte) =
+                    projection
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .find_map(|(row, line)| {
+                            line.carets
+                                .iter()
+                                .find(|(_, primary)| *primary)
+                                .map(|(byte, _)| (row, line, *byte))
+                        })?;
+                editor_composition_caret_rect(editor_caret_rect(&geometry, row, line, byte), spec)
+                    .intersect(LogicalRect::new(
+                    node.rect.x,
+                    geometry.body_y,
+                    node.rect.width,
+                    geometry.body_h,
+                ))?
+            }
+            _ => return None,
+        };
+        caret.intersect(node.clip)?.intersect(self.bounds)
     }
 
     /// Topmost enabled control at the point, matching paint order.
@@ -3145,6 +3342,21 @@ impl CompiledUi {
             return None;
         }
         color_wheel_pick_at(paint.rect, x, y)
+    }
+
+    /// Whether `(x, y)` is on the number the slider painted for `key` shows, which a
+    /// click opens for an exact value rather than setting the slider there.
+    pub(crate) fn slider_readout_at(&self, key: &UiKey, x: f32, y: f32) -> bool {
+        let Some(paint) = self.paint.iter().find(|node| &node.key == key) else {
+            return false;
+        };
+        let UiContent::Slider(control) = &paint.content else {
+            return false;
+        };
+        let geometry = slider_geometry(paint.rect);
+        let (left, _) = slider_readout_place(&control.spec.display_value, &geometry);
+        let (top, height) = geometry.value_band;
+        (left - 4.0..=geometry.value_right + 4.0).contains(&x) && (top..=top + height).contains(&y)
     }
 
     /// Snap one pointer x-coordinate through the exact slider track painted for `key`.
@@ -3794,6 +4006,7 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
     spec.dirty.hash(hash);
     spec.saving.hash(hash);
     spec.focused.hash(hash);
+    spec.focus_visible.hash(hash);
     spec.action.hash(hash);
     let Some(projection) = spec.projection.as_ref() else {
         0_u8.hash(hash);
@@ -3960,7 +4173,7 @@ fn navigation_is_chip(control: &Control<ButtonSpec>) -> bool {
 }
 
 const fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
-    matches!(control.style, StyleRef::Navigation | StyleRef::Chip)
+    (control.centred || matches!(control.style, StyleRef::Navigation | StyleRef::Chip))
         && control.spec.visual_icon.is_none()
         && control.spec.visual_label.is_some()
 }
@@ -4419,9 +4632,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 let (size, face) = wordmark_typography(&spec.label, node.rect.width);
                 crate::tray_raster::ui_text_width_for(face, &spec.label, size.get())
             } else if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
-                crate::system_state::BrandSpec::parse(spec.value.as_deref()).width()
+                crate::system_state::BrandSpec::parse(spec.paint.as_deref()).width()
             } else if spec.audit_id == SYSTEM_STATE_CHIP_AUDIT {
-                crate::system_state::Chip::parse(spec.value.as_deref())
+                crate::system_state::Chip::parse(spec.paint.as_deref())
                     .map_or(0.0, crate::system_state::Chip::width)
             } else if spec.audit_id == SYSTEM_STATE_METER_AUDIT {
                 0.0
@@ -4461,67 +4674,71 @@ fn markdown_audit_layout(
 ) -> Option<MarkdownAuditLayout> {
     use crate::widget::TextFace;
 
-    let (mut text_x, mut text_y, mut text_w) = (rect.x, rect.y, rect.width);
-    let (step, face, line_multiplier, preserve_lines) = match &spec.kind {
-        MarkdownBlockKind::Heading(1) => (TypeStep::Display, TextFace::UiBold, 1.32, false),
-        MarkdownBlockKind::Heading(2) => (TypeStep::Title, TextFace::UiBold, 1.35, false),
-        MarkdownBlockKind::Heading(_) => (TypeStep::Body, TextFace::UiBold, 1.45, false),
-        MarkdownBlockKind::Paragraph => (TypeStep::Body, TextFace::Ui, 1.72, false),
-        MarkdownBlockKind::ListItem { depth, .. } => {
-            let indent = (*depth as f32 * 16.0).min(64.0);
-            text_x += 28.0 + indent;
-            text_w = (text_w - 28.0 - indent).max(20.0);
-            (TypeStep::Body, TextFace::Ui, 1.66, false)
-        }
-        MarkdownBlockKind::Quote => {
-            text_x += 18.0;
-            text_y += 8.0;
-            text_w = (text_w - 30.0).max(20.0);
-            (TypeStep::Body, TextFace::Ui, 1.66, false)
-        }
-        MarkdownBlockKind::Code { language } => {
-            text_x += 12.0;
-            text_y += if language.is_some() { 24.0 } else { 10.0 };
-            text_w = (text_w - 24.0).max(20.0);
-            (
-                if spec.dense {
-                    TypeStep::Caption
-                } else {
-                    TypeStep::Body
-                },
-                TextFace::Mono,
-                1.55,
-                true,
-            )
-        }
-        MarkdownBlockKind::Table => {
-            text_x += 12.0;
-            text_y += 8.0;
-            text_w = (text_w - 24.0).max(20.0);
-            (TypeStep::Body, TextFace::Mono, 1.65, true)
-        }
-        MarkdownBlockKind::Rule => return None,
-    };
-    let px = native_type_px(step).get();
-    let line_h = (px * line_multiplier).max(16.0);
-    let max_lines = ((rect.bottom() - text_y).max(0.0) / line_h).ceil().max(1.0) as usize;
-    let average_advance = if face == TextFace::Mono {
-        px * 0.62
-    } else {
-        px * 0.55
-    };
-    let max_columns = (text_w / average_advance.max(1.0)).floor().max(4.0) as usize;
+    let frame = markdown_frame(spec)?;
+    let text_y = rect.y + frame.inset_top;
+    let max_lines = frame.rows_in(rect.height);
     Some(MarkdownAuditLayout {
-        text_x,
+        text_x: rect.x + frame.inset_left,
         text_y,
-        text_w,
-        px,
-        line_h,
-        max_columns,
+        text_w: frame.text_width(rect.width),
+        px: frame.px,
+        line_h: frame.line_h,
+        max_columns: frame.columns(rect.width),
         max_lines,
-        preserve_lines,
-        face,
+        preserve_lines: frame.preserve_lines,
+        face: if frame.mono {
+            TextFace::Mono
+        } else if frame.bold {
+            TextFace::UiBold
+        } else {
+            TextFace::Ui
+        },
     })
+}
+
+/// The reader's type at the current text size, from the type scale every native view
+/// paints with ([`native_type_px`]): the one set of numbers the reader's layout, row
+/// navigation, painter and paint audit all measure a block with.
+pub(crate) fn reader_type() -> crate::native_markdown::ReaderType {
+    crate::native_markdown::ReaderType {
+        scale: crate::native_appearance::text_scale(),
+        display: native_type_px(TypeStep::Display).get(),
+        title: native_type_px(TypeStep::Title).get(),
+        body: native_type_px(TypeStep::Body).get(),
+        caption: native_type_px(TypeStep::Caption).get(),
+    }
+}
+
+/// The frame a Markdown block paints in ([`crate::native_markdown::block_frame`]); `None`
+/// for a rule.
+fn markdown_frame(spec: &MarkdownBlockSpec) -> Option<crate::native_markdown::BlockFrame> {
+    use crate::native_markdown::BlockShape;
+
+    let shape = match &spec.kind {
+        MarkdownBlockKind::Heading(level) => BlockShape::Heading(*level),
+        MarkdownBlockKind::Paragraph => BlockShape::Paragraph,
+        MarkdownBlockKind::ListItem { depth, .. } => BlockShape::ListItem { depth: *depth },
+        MarkdownBlockKind::Quote => BlockShape::Quote,
+        MarkdownBlockKind::Code { language } => BlockShape::Code {
+            labelled: language
+                .as_deref()
+                .is_some_and(|language| !language.is_empty()),
+            dense: spec.dense,
+        },
+        MarkdownBlockKind::Table => BlockShape::Table,
+        MarkdownBlockKind::Rule => BlockShape::Rule,
+    };
+    crate::native_markdown::block_frame(shape, reader_type())
+}
+
+/// The type step a reader frame's text paints at.
+const fn reader_step(step: crate::native_markdown::ReaderStep) -> TypeStep {
+    match step {
+        crate::native_markdown::ReaderStep::Display => TypeStep::Display,
+        crate::native_markdown::ReaderStep::Title => TypeStep::Title,
+        crate::native_markdown::ReaderStep::Body => TypeStep::Body,
+        crate::native_markdown::ReaderStep::Caption => TypeStep::Caption,
+    }
 }
 
 fn markdown_kind_label(kind: &MarkdownBlockKind) -> String {
@@ -4617,7 +4834,7 @@ fn markdown_paint_audit(node: &PaintNode, spec: &MarkdownBlockSpec) -> String {
             spec.text,
         );
     };
-    let painted = wrap_markdown_text_window(
+    let painted = crate::native_markdown::wrap_reader_text_window(
         &spec.text,
         layout.max_columns,
         spec.visual_row,
@@ -4665,7 +4882,7 @@ fn markdown_paint_audit(node: &PaintNode, spec: &MarkdownBlockSpec) -> String {
 }
 
 fn text_viewport_paint_audit(node: &PaintNode, spec: &TextViewportSpec) -> String {
-    let geometry = text_viewport_geometry(node.rect);
+    let geometry = spec.geometry(node.rect);
     let projection = spec.projection.as_ref();
     let painted_rows = projection.map_or(0, |projection| {
         ((geometry.body_h / geometry.line_h).ceil() as usize)
@@ -4708,23 +4925,12 @@ fn text_viewport_paint_audit(node: &PaintNode, spec: &TextViewportSpec) -> Strin
     let footer = minibuffer.unwrap_or(status);
     let modeline = format!("EDIT · {} · {cursor} | EMACS · {footer}", spec.label);
     let title = if spec.dirty {
-        format!("{}  •", spec.label)
+        format!("{}{EDITOR_DIRTY_MARK}", spec.label)
     } else {
         spec.label.clone()
     };
-    let title_x = node.rect.x + 58.0;
-    let mut title_right = node.rect.right();
-    if let Some(cursor) = spec.cursor_label.as_ref() {
-        let reserve = if spec.saving { 122.0 } else { 22.0 };
-        let width = cursor.chars().count() as f32 * 6.6;
-        let x = (node.rect.right() - reserve - width).max(title_x + 120.0);
-        if x < node.rect.right() - 8.0 {
-            title_right = title_right.min(x - 8.0);
-        }
-    }
-    if spec.saving {
-        title_right = title_right.min((node.rect.right() - 84.0).max(title_x) - 8.0);
-    }
+    let header = editor_header_layout(node.rect, spec.cursor_label.as_deref(), spec.saving);
+    let (title_x, title_right) = (header.title_x, header.title_right);
     let title_required = visual_text_width(
         &title,
         native_type_px(TypeStep::Body).get(),
@@ -4736,12 +4942,14 @@ fn text_viewport_paint_audit(node: &PaintNode, spec: &TextViewportSpec) -> Strin
     } else {
         crate::widget::TextFace::Ui
     };
-    let footer_required =
-        visual_text_width(footer, native_type_px(TypeStep::Caption).get(), footer_face);
+    let footer_required = footer
+        .lines()
+        .map(|line| visual_text_width(line, native_type_px(TypeStep::Caption).get(), footer_face))
+        .fold(0.0_f32, f32::max);
     let footer_available = effective_horizontal_width(
         node,
         node.rect.x + EDITOR_FOOTER_TEXT_INSET,
-        node.rect.right(),
+        node.rect.x + EDITOR_FOOTER_TEXT_INSET + editor_footer_text_width(node.rect.width),
     );
     let row_available = effective_horizontal_width(node, geometry.text_x, node.rect.right());
     let row_overflow = projection.map_or(0, |projection| {
@@ -5689,11 +5897,11 @@ fn paint_compiled_node(
             // These custom nodes carry their own raster lowering; every other custom node keeps
             // the plain label projection below.
             if spec.audit_id == MESSAGES_SEVERITY_AUDIT {
-                paint_messages_severity(prims, rect, spec.value.as_deref(), &roles);
+                paint_messages_severity(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == MESSAGES_SCROLL_AUDIT {
-                paint_messages_scroll(prims, rect, spec.value.as_deref(), &roles);
+                paint_messages_scroll(prims, rect, spec.paint.as_deref(), &roles);
                 if spec.focus_visible {
                     prims.push(DrawPrim::Stroke {
                         x: rect.x + 1.0,
@@ -5708,12 +5916,12 @@ fn paint_compiled_node(
                 return;
             }
             if spec.audit_id == PAGE_SCROLL_AUDIT {
-                paint_page_scroll(prims, rect, spec.value.as_deref(), &roles);
+                paint_page_scroll(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == COLOR_CHIP_AUDIT {
                 if let Some(rgb) = spec
-                    .value
+                    .paint
                     .as_deref()
                     .and_then(aterm_types::scheme::parse_hex)
                 {
@@ -5730,7 +5938,7 @@ fn paint_compiled_node(
                 return;
             }
             if spec.audit_id == THEME_SWATCH_AUDIT {
-                let mut words = spec.value.as_deref().unwrap_or("").split_whitespace();
+                let mut words = spec.paint.as_deref().unwrap_or("").split_whitespace();
                 let hex = words.next().and_then(aterm_types::scheme::parse_hex);
                 let changed = words.next() == Some("changed");
                 if let Some(rgb) = hex {
@@ -5768,7 +5976,7 @@ fn paint_compiled_node(
                 crate::settings_preview::theme_card::paint_row_slab(
                     prims,
                     rect,
-                    spec.value.as_deref(),
+                    spec.paint.as_deref(),
                     &roles,
                 );
                 return;
@@ -5786,7 +5994,7 @@ fn paint_compiled_node(
             }
             if spec.audit_id == RAINBOW_BANNER_AUDIT {
                 let (sky, rim) = rainbow_banner_sky(&roles);
-                if let Some(village) = spec.value.as_deref() {
+                if let Some(village) = spec.paint.as_deref() {
                     crate::settings::paint_rainbow_kitty_village(
                         prims,
                         rect.x,
@@ -5811,15 +6019,15 @@ fn paint_compiled_node(
                 return;
             }
             if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
-                crate::system_state::paint_brand(prims, rect, spec.value.as_deref(), &roles);
+                crate::system_state::paint_brand(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == SYSTEM_STATE_CHIP_AUDIT {
-                crate::system_state::paint_chip(prims, rect, spec.value.as_deref(), &roles);
+                crate::system_state::paint_chip(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == SYSTEM_STATE_METER_AUDIT {
-                crate::system_state::paint_meter(prims, rect, spec.value.as_deref(), &roles);
+                crate::system_state::paint_meter(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == WORDMARK_AUDIT {
@@ -5902,6 +6110,19 @@ pub(crate) fn native_status_label_width(value: &str) -> f32 {
         native_type_px(TypeStep::Caption).get(),
         crate::widget::TextFace::Ui,
     )
+}
+
+/// `value` fitted to `max_width` as a [`TextSpec`] of `role` and `style` paints it: whole, or
+/// cut at its last whole word with a closing `…`.
+pub(crate) fn fit_text_label(
+    value: &str,
+    max_width: f32,
+    role: SemanticRole,
+    style: StyleRef,
+) -> String {
+    let (step, face) = text_typography_for(role, style);
+    let fitted = elide_text_label(value, max_width, native_type_px(step).get(), face);
+    whole_word_cut(value, fitted)
 }
 
 /// Bounded visual projection for one-line native status copy.
@@ -6388,105 +6609,88 @@ fn paint_markdown_block(
         return;
     }
 
-    let (mut text_x, mut text_y, mut text_w) = (rect.x, rect.y, rect.width);
-    let (step, face, weight, color, line_multiplier, preserve_lines) = match &spec.kind {
-        Heading(1) => (
-            TypeStep::Display,
-            TextFace::UiBold,
-            TextWeight::Regular,
-            roles.text_primary,
-            1.32,
-            false,
-        ),
-        Heading(2) => (
-            TypeStep::Title,
-            TextFace::UiBold,
-            TextWeight::Regular,
-            roles.text_primary,
-            1.35,
-            false,
-        ),
-        Heading(_) => (
-            TypeStep::Body,
-            TextFace::UiBold,
-            TextWeight::Regular,
-            roles.text_primary,
-            1.45,
-            false,
-        ),
-        Paragraph => (
-            TypeStep::Body,
-            TextFace::Ui,
-            TextWeight::Regular,
-            roles.text_primary,
-            1.72,
-            false,
-        ),
-        ListItem { depth, .. } => {
-            let indent = (*depth as f32 * 16.0).min(64.0);
-            text_x += 28.0 + indent;
-            text_w = (text_w - 28.0 - indent).max(20.0);
-            (
-                TypeStep::Body,
-                TextFace::Ui,
-                TextWeight::Regular,
-                roles.text_primary,
-                1.66,
-                false,
-            )
-        }
+    let Some(frame) = markdown_frame(spec) else {
+        return;
+    };
+    let color = match &spec.kind {
+        Quote => mix_rgb(roles.text_secondary, roles.text_primary, 0.55),
+        _ => roles.text_primary,
+    };
+    // A block the reader shows only part of (scrolled into, or ended at the preview's
+    // last whole row) keeps its panel open at that edge: the panel runs past the block's
+    // rectangle there and is cut by it, so it reads as continuing, never as a block that
+    // ends with the rows shown.
+    let open_top = spec.visual_row > 0;
+    let open_bottom =
+        spec.visual_row.saturating_add(frame.rows_in(rect.height)) < spec.total_visual_rows;
+    let (panel_y, panel_h) = {
+        const RUN_ON: f32 = 16.0;
+        let top = if open_top { rect.y - RUN_ON } else { rect.y };
+        let bottom = if open_bottom {
+            rect.bottom() + RUN_ON
+        } else {
+            rect.bottom()
+        };
+        (top, (bottom - top).max(0.0))
+    };
+    let opened = open_top || open_bottom;
+    if opened && matches!(&spec.kind, Quote | Code { .. } | Table) {
+        prims.push(DrawPrim::ClipPush {
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+        });
+    }
+    match &spec.kind {
         Quote => {
             prims.push(DrawPrim::Panel {
                 x: rect.x,
-                y: rect.y,
+                y: panel_y,
                 w: rect.width,
-                h: rect.height,
+                h: panel_h,
                 radius: 8.0,
                 fill: rgba(mix_rgb(roles.elevated, roles.accent, 0.06), 225),
             });
+            let bar_top = if open_top { rect.y } else { rect.y + 2.0 };
+            let bar_bottom = if open_bottom {
+                rect.bottom()
+            } else {
+                rect.bottom() - 2.0
+            };
             prims.push(DrawPrim::Panel {
                 x: rect.x,
-                y: rect.y + 2.0,
+                y: bar_top,
                 w: 3.0,
-                h: (rect.height - 4.0).max(0.0),
+                h: (bar_bottom - bar_top).max(0.0),
                 radius: 1.5,
                 fill: rgba(roles.accent, 220),
             });
-            text_x += 18.0;
-            text_y += 8.0;
-            text_w = (text_w - 30.0).max(20.0);
-            (
-                TypeStep::Body,
-                TextFace::Ui,
-                TextWeight::Regular,
-                mix_rgb(roles.text_secondary, roles.text_primary, 0.55),
-                1.66,
-                false,
-            )
         }
         Code { language } => {
             prims.push(DrawPrim::Panel {
                 x: rect.x,
-                y: rect.y,
+                y: panel_y,
                 w: rect.width,
-                h: rect.height,
+                h: panel_h,
                 radius: 9.0,
                 fill: rgba(mix_rgb(roles.elevated, roles.surface, 0.20), 255),
             });
             prims.push(DrawPrim::Stroke {
                 x: rect.x + 0.5,
-                y: rect.y + 0.5,
+                y: panel_y + 0.5,
                 w: (rect.width - 1.0).max(0.0),
-                h: (rect.height - 1.0).max(0.0),
+                h: (panel_h - 1.0).max(0.0),
                 radius: 9.0,
                 width: 1.0,
                 color: rgba(roles.separator, 150),
             });
             if let Some(language) = language.as_deref().filter(|value| !value.is_empty()) {
                 let caption = native_type_px(TypeStep::Caption);
+                let label_top = rect.y + (frame.inset_top - frame.label_h) * 5.0 / 8.0;
                 prims.push(text_prim(
-                    rect.x + 12.0,
-                    row_baseline(rect.y + 5.0, 16.0, caption.get()),
+                    rect.x + frame.inset_left,
+                    row_baseline(label_top, frame.label_h, caption.get()),
                     language.to_ascii_uppercase(),
                     caption,
                     TextWeight::Regular,
@@ -6494,65 +6698,48 @@ fn paint_markdown_block(
                     rgba(readable_secondary(&roles), 235),
                 ));
             }
-            text_x += 12.0;
-            text_y += if language.is_some() { 24.0 } else { 10.0 };
-            text_w = (text_w - 24.0).max(20.0);
-            (
-                if spec.dense {
-                    TypeStep::Caption
-                } else {
-                    TypeStep::Body
-                },
-                TextFace::Mono,
-                TextWeight::Regular,
-                roles.text_primary,
-                1.55,
-                true,
-            )
         }
         Table => {
             prims.push(DrawPrim::Panel {
                 x: rect.x,
-                y: rect.y,
+                y: panel_y,
                 w: rect.width,
-                h: rect.height,
+                h: panel_h,
                 radius: 8.0,
                 fill: rgba(roles.elevated, 245),
             });
             prims.push(DrawPrim::Stroke {
                 x: rect.x + 0.5,
-                y: rect.y + 0.5,
+                y: panel_y + 0.5,
                 w: (rect.width - 1.0).max(0.0),
-                h: (rect.height - 1.0).max(0.0),
+                h: (panel_h - 1.0).max(0.0),
                 radius: 8.0,
                 width: 1.0,
                 color: rgba(roles.separator, 150),
             });
-            text_x += 12.0;
-            text_y += 8.0;
-            text_w = (text_w - 24.0).max(20.0);
-            (
-                TypeStep::Body,
-                TextFace::Mono,
-                TextWeight::Regular,
-                roles.text_primary,
-                1.65,
-                true,
-            )
         }
+        Heading(_) | Paragraph | ListItem { .. } => {}
         Rule => unreachable!("rule returned above"),
-    };
-
-    let size = native_type_px(step);
-    let line_h = (size.get() * line_multiplier).max(16.0);
-    let max_lines = ((rect.bottom() - text_y).max(0.0) / line_h).ceil().max(1.0) as usize;
-    let average_advance = if face == TextFace::Mono {
-        size.get() * 0.62
+    }
+    if opened && matches!(&spec.kind, Quote | Code { .. } | Table) {
+        prims.push(DrawPrim::ClipPop);
+    }
+    let face = if frame.mono {
+        TextFace::Mono
+    } else if frame.bold {
+        TextFace::UiBold
     } else {
-        size.get() * 0.55
+        TextFace::Ui
     };
-    let max_columns = (text_w / average_advance.max(1.0)).floor().max(4.0) as usize;
-    let lines = wrap_markdown_text_window(
+    let weight = TextWeight::Regular;
+    let preserve_lines = frame.preserve_lines;
+    let text_x = rect.x + frame.inset_left;
+    let text_y = rect.y + frame.inset_top;
+    let size = native_type_px(reader_step(frame.step));
+    let line_h = frame.line_h;
+    let max_lines = frame.rows_in(rect.height);
+    let max_columns = frame.columns(rect.width);
+    let lines = crate::native_markdown::wrap_reader_text_window(
         &spec.text,
         max_columns,
         spec.visual_row,
@@ -6563,7 +6750,7 @@ fn paint_markdown_block(
     if let ListItem { ordinal, .. } = &spec.kind {
         let marker = ordinal.map_or_else(|| "•".to_string(), |value| format!("{value}."));
         prims.push(text_prim(
-            text_x - 20.0,
+            text_x - 20.0 * reader_type().scale(),
             row_baseline(text_y, line_h, size.get()),
             marker,
             size,
@@ -6684,11 +6871,15 @@ fn paint_styled_markdown_rows(
         TextFace::Mono => measure_text(s, px, weight),
         TextFace::Ui | TextFace::UiBold | TextFace::Display(_) => ui_text_width_for(face, s, px),
     };
+    // One row past the shown ones, so a row the next continues is not ended in `…`
+    // ([`crate::native_markdown::wrap_reader_text_window`]).
     let requested = spec
         .visual_row
         .saturating_add(visible_rows.max(1))
-        .clamp(1, 131_072);
-    let rows = wrap_markdown_text(&spec.text, max_columns, 0, requested, false);
+        .saturating_add(1)
+        .clamp(1, crate::native_markdown::READER_ROW_LIMIT);
+    let rows =
+        crate::native_markdown::wrap_reader_text(&spec.text, max_columns, 0, requested, false);
     let pieces = wrapped_piece_ranges(&spec.text, &rows);
     let space = measure(base.face, base.weight, " ");
     for (line_index, row) in pieces
@@ -6793,212 +6984,6 @@ fn paint_styled_markdown_rows(
     }
 }
 
-fn wrap_markdown_text(
-    text: &str,
-    max_columns: usize,
-    skip: usize,
-    max_lines: usize,
-    preserve_lines: bool,
-) -> Vec<String> {
-    use crate::native_markdown::reader_columns as columns;
-    let max_columns = max_columns.max(1);
-    let max_lines = max_lines.clamp(1, 131_072);
-    let mut output = Vec::with_capacity(max_lines.saturating_sub(skip).min(16));
-    let mut produced = 0usize;
-    let mut produced_chars = 0usize;
-    let mut characters: Vec<char> = Vec::new();
-    let mut cjk_starts: Vec<usize> = Vec::new();
-    let mut words: Vec<(bool, &str)> = Vec::new();
-    for source_line in text.lines().chain(text.is_empty().then_some("")) {
-        if produced >= max_lines {
-            break;
-        }
-        if preserve_lines {
-            characters.clear();
-            characters.extend(source_line.chars());
-            cjk_starts.clear();
-            if !source_line.is_ascii() {
-                let mut breaks = aterm_grapheme::line_breaks(source_line)
-                    .into_iter()
-                    .filter(|brk| brk.kind == aterm_grapheme::BreakKind::Ideographic)
-                    .map(|brk| brk.at)
-                    .peekable();
-                for (index, (byte, _)) in source_line.char_indices().enumerate() {
-                    if breaks.next_if_eq(&byte).is_some() {
-                        cjk_starts.push(index);
-                    }
-                }
-            }
-            if characters.is_empty() {
-                if produced >= skip {
-                    output.push(String::new());
-                }
-                produced += 1;
-            } else {
-                let mut start = 0usize;
-                while start < characters.len() {
-                    if produced >= max_lines {
-                        break;
-                    }
-                    let mut hard_end = start;
-                    let mut used = 0usize;
-                    while let Some(&character) = characters.get(hard_end) {
-                        let width = columns(character);
-                        if hard_end > start && used + width > max_columns {
-                            break;
-                        }
-                        used += width;
-                        hard_end += 1;
-                    }
-                    if hard_end == characters.len() {
-                        if produced >= skip {
-                            output.push(characters[start..hard_end].iter().collect());
-                        }
-                        produced += 1;
-                        produced_chars += hard_end - start;
-                        break;
-                    }
-                    let soft_end = characters[start..=hard_end]
-                        .iter()
-                        .rposition(|character| character.is_whitespace())
-                        .map(|offset| start + offset)
-                        .filter(|end| *end > start);
-                    let cjk_end = cjk_starts[..cjk_starts.partition_point(|at| *at <= hard_end)]
-                        .last()
-                        .copied()
-                        .filter(|end| *end > start);
-                    let end = soft_end.max(cjk_end).unwrap_or(hard_end);
-                    if produced >= skip {
-                        output.push(characters[start..end].iter().collect());
-                    }
-                    produced += 1;
-                    produced_chars += end - start;
-                    start = end;
-                    while start < characters.len() && characters[start].is_whitespace() {
-                        start += 1;
-                    }
-                }
-            }
-            continue;
-        }
-        words.clear();
-        if source_line.is_ascii() {
-            words.extend(source_line.split_whitespace().map(|word| (true, word)));
-        } else {
-            words.extend(
-                aterm_grapheme::pieces(source_line, aterm_grapheme::BreakKind::is_word_boundary)
-                    .into_iter()
-                    .map(|piece| (piece.spaced, piece.text)),
-            );
-        }
-        let mut line = String::new();
-        let mut line_columns = 0usize;
-        let mut line_chars = 0usize;
-        for &(spaced, word) in &words {
-            let separator = usize::from(!line.is_empty() && spaced);
-            let word_columns: usize = word.chars().map(columns).sum();
-            if line_columns + separator + word_columns <= max_columns {
-                if separator == 1 {
-                    line.push(' ');
-                }
-                line.push_str(word);
-                line_columns += separator + word_columns;
-                line_chars += separator + word.chars().count();
-                continue;
-            }
-            if !line.is_empty() {
-                let row = std::mem::take(&mut line);
-                if produced >= skip {
-                    output.push(row);
-                }
-                produced += 1;
-                produced_chars += line_chars;
-                if produced >= max_lines {
-                    break;
-                }
-            }
-            let mut chunk = String::new();
-            let mut chunk_columns = 0usize;
-            let mut chunk_chars = 0usize;
-            for character in word.chars() {
-                let width = columns(character);
-                if chunk_columns + width > max_columns && !chunk.is_empty() {
-                    let row = std::mem::take(&mut chunk);
-                    if produced >= skip {
-                        output.push(row);
-                    }
-                    produced += 1;
-                    produced_chars += chunk_chars;
-                    chunk_columns = 0;
-                    chunk_chars = 0;
-                    if produced >= max_lines {
-                        break;
-                    }
-                }
-                chunk.push(character);
-                chunk_columns += width;
-                chunk_chars += 1;
-                if chunk_columns >= max_columns {
-                    let row = std::mem::take(&mut chunk);
-                    if produced >= skip {
-                        output.push(row);
-                    }
-                    produced += 1;
-                    produced_chars += chunk_chars;
-                    chunk_columns = 0;
-                    chunk_chars = 0;
-                    if produced >= max_lines {
-                        break;
-                    }
-                }
-            }
-            line = chunk;
-            line_columns = chunk_columns;
-            line_chars = chunk_chars;
-        }
-        if produced >= max_lines {
-            break;
-        }
-        if !line.is_empty() || source_line.is_empty() {
-            if produced >= skip {
-                output.push(line);
-            }
-            produced += 1;
-            produced_chars += line_chars;
-        }
-    }
-    if produced == max_lines
-        && text.chars().count() > produced_chars
-        && let Some(last) = output.last_mut()
-    {
-        let keep = max_columns.saturating_sub(1);
-        let mut used = 0usize;
-        *last = last
-            .chars()
-            .take_while(|character| {
-                used += columns(*character);
-                used <= keep
-            })
-            .collect::<String>();
-        last.push('…');
-    }
-    output
-}
-
-fn wrap_markdown_text_window(
-    text: &str,
-    max_columns: usize,
-    visual_row: usize,
-    max_lines: usize,
-    preserve_lines: bool,
-) -> Vec<String> {
-    let take = max_lines.clamp(1, 512);
-    let requested = visual_row.saturating_add(take).clamp(1, 131_072);
-    let mut lines = wrap_markdown_text(text, max_columns, visual_row, requested, preserve_lines);
-    lines.truncate(take);
-    lines
-}
-
 fn paint_text_viewport(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -7021,7 +7006,7 @@ fn paint_text_viewport(
         return;
     }
 
-    let geometry = text_viewport_geometry(rect);
+    let geometry = spec.geometry(rect);
     let header_h = geometry.header_h;
     let footer_h = geometry.footer_h;
     let body_y = geometry.body_y;
@@ -7073,8 +7058,9 @@ fn paint_text_viewport(
     let body = native_type_px(TypeStep::Body);
     let secondary = native_type_px(TypeStep::Secondary);
     let header_baseline = row_baseline(rect.y, header_h, body.get());
+    let header = editor_header_layout(rect, spec.cursor_label.as_deref(), spec.saving);
     prims.push(text_prim(
-        rect.x + 14.0,
+        header.badge_x,
         header_baseline,
         "EDIT".to_string(),
         caption,
@@ -7082,14 +7068,13 @@ fn paint_text_viewport(
         TextFace::UiBold,
         rgba(roles.accent, 255),
     ));
-    let title_x = rect.x + 58.0;
     let title = if spec.dirty {
-        format!("{}  •", spec.label)
+        format!("{}{EDITOR_DIRTY_MARK}", spec.label)
     } else {
         spec.label.clone()
     };
     prims.push(text_prim(
-        title_x,
+        header.title_x,
         header_baseline,
         title,
         body,
@@ -7097,25 +7082,20 @@ fn paint_text_viewport(
         TextFace::UiBold,
         rgba(roles.text_primary, 255),
     ));
-    if let Some(cursor) = spec.cursor_label.as_ref() {
-        let reserve = if spec.saving { 122.0 } else { 22.0 };
-        let width = cursor.chars().count() as f32 * 6.6;
-        let x = (rect.right() - reserve - width).max(title_x + 120.0);
-        if x < rect.right() - 8.0 {
-            prims.push(text_prim(
-                x,
-                row_baseline(rect.y, header_h, caption.get()),
-                cursor.clone(),
-                caption,
-                TextWeight::Regular,
-                TextFace::Mono,
-                rgba(readable_secondary(&roles), 255),
-            ));
-        }
-    }
-    if spec.saving {
+    if let (Some(cursor), Some(x)) = (spec.cursor_label.as_ref(), header.cursor_x) {
         prims.push(text_prim(
-            (rect.right() - 84.0).max(title_x),
+            x,
+            row_baseline(rect.y, header_h, caption.get()),
+            cursor.clone(),
+            caption,
+            TextWeight::Regular,
+            TextFace::Mono,
+            rgba(readable_secondary(&roles), 255),
+        ));
+    }
+    if let Some(x) = header.saving_x {
+        prims.push(text_prim(
+            x,
             row_baseline(rect.y, header_h, caption.get()),
             "Saving…".to_string(),
             caption,
@@ -7271,33 +7251,47 @@ fn paint_text_viewport(
             .or(spec.status.as_ref())
             .map(String::as_str)
             .unwrap_or("Ready");
-        prims.push(text_prim(
-            rect.x + EDITOR_FOOTER_TEXT_INSET,
-            row_baseline(footer_y, footer_h, caption.get()),
-            message.to_string(),
-            caption,
-            TextWeight::Regular,
-            if spec.minibuffer.is_some() {
-                TextFace::Mono
+        // The rows sit centred in the footer, one caption line apart
+        // ([`editor_footer_lines`]).
+        let rows = spec.footer_rows();
+        let row_h = editor_footer_line_h(crate::native_appearance::text_scale());
+        let first_y = footer_y + (footer_h - row_h * rows as f32) / 2.0;
+        for (row, line) in message.lines().take(rows).enumerate() {
+            let baseline = if rows == 1 {
+                row_baseline(footer_y, footer_h, caption.get())
             } else {
-                TextFace::Ui
-            },
-            rgba(readable_secondary(&roles), 255),
-        ));
+                row_baseline(first_y + row as f32 * row_h, row_h, caption.get())
+            };
+            prims.push(text_prim(
+                rect.x + EDITOR_FOOTER_TEXT_INSET,
+                baseline,
+                line.to_string(),
+                caption,
+                TextWeight::Regular,
+                if spec.minibuffer.is_some() {
+                    TextFace::Mono
+                } else {
+                    TextFace::Ui
+                },
+                rgba(readable_secondary(&roles), 255),
+            ));
+        }
     }
 
-    if spec.focused {
-        if let Some(caret) = editor_minibuffer_caret_rect(spec, rect, &geometry) {
-            prims.push(DrawPrim::Stroke {
-                x: caret.x,
-                y: caret.y,
-                w: caret.width,
-                h: caret.height,
-                radius: 0.0,
-                width: 1.0,
-                color: rgba(roles.accent, 255),
-            });
-        }
+    if spec.selectable
+        && let Some(caret) = editor_minibuffer_caret_rect(spec, rect, &geometry)
+    {
+        prims.push(DrawPrim::Stroke {
+            x: caret.x,
+            y: caret.y,
+            w: caret.width,
+            h: caret.height,
+            radius: 0.0,
+            width: 1.0,
+            color: rgba(roles.accent, 255),
+        });
+    }
+    if spec.focused && spec.focus_visible {
         prims.push(DrawPrim::Stroke {
             x: rect.x + 0.5,
             y: rect.y + 0.5,
@@ -8073,6 +8067,29 @@ pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
     out
 }
 
+/// Whether a button's painted words are heard (WCAG 2.5.3, Label in Name): in its name, or,
+/// for a count in parentheses closing its face (`Apply (30)`, a countdown), the words before the
+/// count in its name and the count in its description, which VoiceOver reads after the name. A
+/// count that changes every second is the control's state, never its name.
+#[cfg(debug_assertions)]
+pub(crate) fn visible_label_heard(visual: &str, name: &str, description: Option<&str>) -> bool {
+    visible_label_in_name(visual, name)
+        || closing_count(visual).is_some_and(|(words, count)| {
+            visible_label_in_name(words, name)
+                && description.is_some_and(|said| {
+                    said.split(|ch: char| !ch.is_ascii_digit())
+                        .any(|number| number == count)
+                })
+        })
+}
+
+/// The words and the count of a face that closes on a count in parentheses (`Apply (30)`).
+#[cfg(debug_assertions)]
+fn closing_count(visual: &str) -> Option<(&str, &str)> {
+    let (words, count) = visual.trim_end().strip_suffix(')')?.rsplit_once(" (")?;
+    (!count.is_empty() && count.chars().all(|ch| ch.is_ascii_digit())).then_some((words, count))
+}
+
 /// Whether the words a control paints are in its name (WCAG 2.5.3, Label in Name).
 pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
     // A label painted on lines ([`native_button_label_lines`]) is its words with spaces
@@ -8237,7 +8254,11 @@ impl Compiler {
         if let UiContent::Button(control) = &content
             && !paint_only
             && let Some(visual) = control.spec.visual_label.as_deref()
-            && !visible_label_in_name(visual, &control.spec.label)
+            && !visible_label_heard(
+                visual,
+                &control.spec.label,
+                control.spec.description.as_deref(),
+            )
         {
             return Err(CompileError::VisibleLabelNotInName(key));
         }
@@ -9594,7 +9615,7 @@ pub(crate) mod tests {
             );
         }
         let max_columns = 80;
-        let rows = wrap_markdown_text(&text, max_columns, 0, 131_072, false);
+        let rows = crate::native_markdown::wrap_reader_text(&text, max_columns, 0, 131_072, false);
         let spec = MarkdownBlockSpec {
             text: text.clone(),
             kind: MarkdownBlockKind::Paragraph,
@@ -10135,6 +10156,7 @@ pub(crate) mod tests {
                 dirty: true,
                 saving: false,
                 focused: true,
+                focus_visible: true,
                 action: Some(ActionId::new("editor/focus-buffer")),
             }),
         ))
@@ -10174,6 +10196,7 @@ pub(crate) mod tests {
             dirty: false,
             saving: false,
             focused: true,
+            focus_visible: true,
             action: Some(ActionId::new("editor/focus-buffer")),
         }
     }
@@ -10354,6 +10377,76 @@ pub(crate) mod tests {
             hud.ime_caret_rect().unwrap().y < footer.y,
             "shortcut HUD is not a text input"
         );
+        let mut focus_failures = Vec::new();
+        for prompt in [false, true] {
+            let compile_focus = |focused: bool, focus_visible: bool| {
+                let mut tree = editor_viewport();
+                let UiContent::TextViewport(spec) = &mut tree.root.content else {
+                    panic!("editor")
+                };
+                spec.preedit = "e\u{301}日A本B".to_string();
+                spec.preedit_caret = Some(3);
+                spec.minibuffer = prompt.then(|| label.clone());
+                spec.minibuffer_caret = prompt.then_some(start);
+                let key = UiKey::new("editor/buffer");
+                tree.apply_interaction(focused.then_some(&key), None, None, focus_visible);
+                tree.compile(bounds).unwrap()
+            };
+            let pointer = compile_focus(true, false);
+            let keyboard = compile_focus(true, true);
+            let expected = if prompt {
+                Some(footer)
+            } else {
+                compile(Some(3), None, None).ime_caret_rect()
+            };
+            assert_eq!(
+                pointer.ime_caret_rect(),
+                expected,
+                "pointer style preserves exact caret geometry, prompt={prompt}"
+            );
+            assert_eq!(
+                keyboard.ime_caret_rect(),
+                expected,
+                "keyboard style preserves exact caret geometry, prompt={prompt}"
+            );
+            let has_ring = |compiled: &CompiledUi| {
+                let rect = compiled.paint[0].rect;
+                compiled.tray(aterm_render::Theme::default(), 13.0).prims.iter().any(|prim| matches!(prim,
+                    DrawPrim::Stroke { x, y, w, h, radius, .. }
+                        if (*x, *y, *w, *h, *radius) == (rect.x + 0.5, rect.y + 0.5, rect.width - 1.0, rect.height - 1.0, 10.0)
+                ))
+            };
+            if has_ring(&pointer) {
+                focus_failures.push(format!(
+                    "pointer style drew a keyboard focus ring, prompt={prompt}"
+                ));
+            }
+            assert!(
+                has_ring(&keyboard),
+                "keyboard focus retains its ring, prompt={prompt}"
+            );
+            if pointer.fingerprint() == keyboard.fingerprint() {
+                focus_failures.push(format!(
+                    "focus-ring visibility did not change the paint fingerprint, prompt={prompt}"
+                ));
+            }
+            let toolbar = compile_focus(false, false);
+            if toolbar.ime_caret_rect() != expected {
+                focus_failures.push(format!(
+                    "toolbar navigation lost the text target's exact IME caret, prompt={prompt}"
+                ));
+            }
+            assert!(
+                !has_ring(&toolbar),
+                "toolbar focus does not outline the viewport"
+            );
+            if prompt && !toolbar.tray(aterm_render::Theme::default(), 13.0).prims.iter().any(|prim| matches!(prim,
+                DrawPrim::Stroke { x, y, w, h, .. }
+                    if (*x, *y, *w, *h) == (footer.x, footer.y, footer.width, footer.height)
+            )) {
+                focus_failures.push("toolbar navigation lost the painted minibuffer caret".to_string());
+            }
+        }
         let mut clipped = typed;
         clipped.paint[0].clip.height = footer.y;
         assert!(
@@ -10365,7 +10458,94 @@ pub(crate) mod tests {
             panic!("editor")
         };
         spec.focused = false;
-        assert!(unfocused.ime_caret_rect().is_none(), "an unfocused editor");
+        if unfocused.ime_caret_rect() != compile(Some(3), None, None).ime_caret_rect() {
+            focus_failures.push(
+                "document text remains the input target during toolbar navigation".to_string(),
+            );
+        }
+        let mut unavailable = unfocused.clone();
+        let UiContent::TextViewport(spec) = &mut unavailable.paint[0].content else {
+            panic!("editor")
+        };
+        spec.projection = None;
+        assert!(
+            unavailable.ime_caret_rect().is_none(),
+            "no loaded document has no body caret"
+        );
+        let UiContent::TextViewport(spec) = &mut unfocused.paint[0].content else {
+            panic!("editor")
+        };
+        spec.selectable = false;
+        assert!(
+            unfocused.ime_caret_rect().is_none(),
+            "a nonselectable viewport is not a text target"
+        );
+
+        let input = crate::native_text_input::TextInputState::new("query".to_string()).projection();
+        let field = UiNode::new(
+            "query",
+            UiContent::TextField(Control::new(
+                TextFieldSpec {
+                    label: "Query".to_string(),
+                    placeholder: None,
+                    secret: false,
+                    visual_value: None,
+                    input: Some(input),
+                    swatch: None,
+                    swatch_line: false,
+                    trailing_hint: None,
+                    description: None,
+                    end_button: false,
+                },
+                ActionId::new("set/query"),
+            )),
+        )
+        .layout(Layout::default().height(Length::Fixed(40.0)));
+        let mut tree = UiTree::new(
+            UiNode::new(
+                "root",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column())
+            .children(vec![
+                field,
+                editor_viewport()
+                    .root
+                    .layout(Layout::default().height(Length::Fill)),
+            ]),
+        );
+        tree.apply_interaction(Some(&UiKey::new("query")), None, None, true);
+        let mut both = tree.compile(bounds).unwrap();
+        let mut field_only = both.clone();
+        field_only
+            .paint
+            .retain(|node| matches!(node.content, UiContent::TextField(_)));
+        let field_caret = field_only
+            .ime_caret_rect()
+            .expect("the focused text field has a caret");
+        let mut viewport_only = both.clone();
+        viewport_only
+            .paint
+            .retain(|node| matches!(node.content, UiContent::TextViewport(_)));
+        if viewport_only.ime_caret_rect().is_none() {
+            focus_failures
+                .push("the priority control must retain a usable viewport fallback".to_string());
+        }
+        if both.ime_caret_rect() != Some(field_caret) {
+            focus_failures
+                .push("the focused text field must precede a viewport text target".to_string());
+        }
+        both.paint
+            .iter_mut()
+            .find(|node| node.key.as_str() == "query")
+            .unwrap()
+            .clip
+            .width = 0.0;
+        assert!(
+            both.ime_caret_rect().is_none(),
+            "a hidden focused field cannot lend IME to the viewport"
+        );
+        assert!(focus_failures.is_empty(), "{}", focus_failures.join("\n"));
     }
 
     #[test]
@@ -10405,7 +10585,7 @@ pub(crate) mod tests {
             },
         ];
         let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
-        let geometry = text_viewport_geometry(rect);
+        let geometry = spec.geometry(rect);
         let prims = UiTree::new(UiNode::new("editor/unicode", UiContent::TextViewport(spec)))
             .compile(rect)
             .unwrap()
@@ -10494,7 +10674,7 @@ pub(crate) mod tests {
         use crate::widget::DrawPrim;
 
         let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
-        let geometry = text_viewport_geometry(rect);
+        let geometry = text_viewport_geometry(rect, 1);
         let close = |left: f32, right: f32| (left - right).abs() < 0.01;
         for (preedit, cells) in [("e\u{301}", 1usize), ("中", 2), ("👩‍💻", 2)] {
             let mut spec = one_line_viewport(0..0, 0, "");
@@ -10643,6 +10823,13 @@ pub(crate) mod tests {
                 "{visual:?} in {name:?}"
             );
         }
+        // A countdown closing the face is heard in the description, at the count painted.
+        let counting = Some("Applies by itself in 30 seconds");
+        assert!(visible_label_heard("Apply (30)", "Apply", counting));
+        assert!(!visible_label_heard("Apply (30)", "Apply", None));
+        assert!(!visible_label_heard("Apply (29)", "Apply", counting));
+        assert!(!visible_label_heard("Apply (30)", "Cancel", counting));
+        assert!(!visible_label_heard("Apply 30", "Apply", counting));
         let compile = |visual: &str, name: &str| {
             UiTree::new(UiNode::new(
                 "button",
@@ -11159,6 +11346,43 @@ pub(crate) mod tests {
             None,
             "the numeric readout focuses the slider without inventing a value"
         );
+        let (readout_x, _) = slider_readout_place("14", &geometry);
+        assert!(compiled.slider_readout_at(&key, readout_x + 2.0, paint.rect.y + 20.0));
+        assert!(!compiled.slider_readout_at(&key, x, paint.rect.y + 20.0));
+
+        // A narrow slider stacks its number over the track: a click on the number is the
+        // number's, though the track runs under it.
+        let narrow = Control::new(
+            SliderSpec {
+                description: None,
+                track: None,
+                label: "Font size".to_string(),
+                step: 2.0,
+                display_value: "14".to_string(),
+            },
+            ActionId::new("set/font-size"),
+        )
+        .value(SemanticValue::Number {
+            value: 14.0,
+            minimum: 6.0,
+            maximum: 32.0,
+        });
+        let compiled = UiTree::new(UiNode::new("font-size", UiContent::Slider(narrow)))
+            .compile(LogicalRect::new(0.0, 0.0, 90.0, 60.0))
+            .unwrap();
+        let rect = compiled
+            .paint
+            .iter()
+            .find(|paint| paint.key == key)
+            .unwrap()
+            .rect;
+        let geometry = slider_geometry(rect);
+        let (band_top, band_height) = geometry.value_band;
+        assert!(band_top + band_height <= geometry.track_y, "stacked");
+        let (readout_x, width) = slider_readout_place("14", &geometry);
+        let on_number = (readout_x + width / 2.0, band_top + band_height / 2.0);
+        assert!(compiled.slider_readout_at(&key, on_number.0, on_number.1));
+        assert!(!compiled.slider_readout_at(&key, on_number.0, geometry.track_y));
         let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
         let readout = prims.iter().find_map(|prim| match prim {
             crate::widget::DrawPrim::Text { s, face, .. } if s == "14" => Some(*face),
@@ -11233,15 +11457,15 @@ pub(crate) mod tests {
     #[test]
     fn preserved_markdown_source_soft_wraps_at_words_before_hard_chunks() {
         assert_eq!(
-            wrap_markdown_text("alpha beta gamma", 10, 0, 4, true),
+            crate::native_markdown::wrap_reader_text("alpha beta gamma", 10, 0, 4, true),
             ["alpha beta", "gamma"]
         );
         assert_eq!(
-            wrap_markdown_text("supercalifragilistic", 5, 0, 8, true),
+            crate::native_markdown::wrap_reader_text("supercalifragilistic", 5, 0, 8, true),
             ["super", "calif", "ragil", "istic"]
         );
         assert_eq!(
-            wrap_markdown_text("  let value = exact;", 14, 0, 4, true),
+            crate::native_markdown::wrap_reader_text("  let value = exact;", 14, 0, 4, true),
             ["  let value =", "exact;"]
         );
     }
@@ -11264,7 +11488,9 @@ pub(crate) mod tests {
             for columns in (1..=24).chain([32, 40, 80]) {
                 for preserve in [false, true] {
                     for lines in [2usize, 131_072] {
-                        let rows = wrap_markdown_text(text, columns, 0, lines, preserve);
+                        let rows = crate::native_markdown::wrap_reader_text(
+                            text, columns, 0, lines, preserve,
+                        );
                         out.push_str(&format!(
                             "W {text:?} {columns} {preserve} {lines} => {rows:?}\n"
                         ));
@@ -11293,6 +11519,99 @@ pub(crate) mod tests {
             .collect();
         assert!(moved.is_empty(), "moved wraps (was, is): {moved:#?}");
         assert_eq!(golden.lines().count(), now.lines().count());
+    }
+
+    /// A BLOCK THE READER SHOWS ONLY PART OF KEEPS ITS PANEL OPEN AT THAT
+    /// EDGE: a code block, table or quote ended at the preview's last whole
+    /// row (or scrolled into) runs its panel past its rectangle there, cut
+    /// by it, so its border never closes under the rows shown as if the
+    /// block ended with them. A block shown whole keeps its panel closed.
+    #[test]
+    fn a_block_the_reader_cuts_keeps_its_panel_open_at_the_cut() {
+        use crate::widget::DrawPrim;
+
+        let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
+        let text = (0..12)
+            .map(|line| format!("let line_{line} = {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for kind in [
+            MarkdownBlockKind::Code {
+                language: Some("rust".to_string()),
+            },
+            MarkdownBlockKind::Table,
+            MarkdownBlockKind::Quote,
+        ] {
+            let spec = |visual_row: usize| MarkdownBlockSpec {
+                text: text.clone(),
+                kind: kind.clone(),
+                dense: false,
+                selectable: true,
+                action: None,
+                selected: false,
+                source: 0..text.len(),
+                estimated_height: 0.0,
+                visual_row,
+                total_visual_rows: 12,
+                inline: Vec::new(),
+            };
+            let frame = markdown_frame(&spec(0)).expect("a block with text");
+            // (first row shown, rows shown, the block's rectangle): whole, ended at the
+            // preview's last whole row, scrolled into and shown to its end.
+            for (row, rows, open_top, open_bottom) in [
+                (0, 12, false, false),
+                (0, 4, false, true),
+                (5, 7, true, false),
+                (5, 3, true, true),
+            ] {
+                let height = frame.inset_top
+                    + rows as f32 * frame.line_h
+                    + if row + rows == 12 {
+                        frame.inset_bottom
+                    } else {
+                        0.0
+                    };
+                let rect = LogicalRect::new(10.0, 40.0, 320.0, height);
+                let mut prims = Vec::new();
+                paint_markdown_block(&mut prims, rect, &spec(row), roles);
+                let context = format!("{kind:?} rows {row}+{rows}");
+                // The panel: the first fill as wide as the block.
+                let (top, bottom) = prims
+                    .iter()
+                    .find_map(|prim| match prim {
+                        DrawPrim::Panel { y, w, h, .. } if (*w - rect.width).abs() < 0.01 => {
+                            Some((*y, *y + *h))
+                        }
+                        _ => None,
+                    })
+                    .expect("the block's panel");
+                assert_eq!(top < rect.y - 0.5, open_top, "{context}: its top edge");
+                assert_eq!(
+                    bottom > rect.bottom() + 0.5,
+                    open_bottom,
+                    "{context}: its bottom edge"
+                );
+                if open_top || open_bottom {
+                    assert!(
+                        matches!(
+                            prims.first(),
+                            Some(DrawPrim::ClipPush { y, h, .. })
+                                if (*y - rect.y).abs() < 0.01 && (*h - rect.height).abs() < 0.01
+                        ),
+                        "{context}: the panel is cut by the block's rectangle: {prims:?}"
+                    );
+                }
+                let pushes = prims
+                    .iter()
+                    .filter(|prim| matches!(prim, DrawPrim::ClipPush { .. }))
+                    .count();
+                let pops = prims
+                    .iter()
+                    .filter(|prim| matches!(prim, DrawPrim::ClipPop))
+                    .count();
+                assert_eq!(pushes, pops, "{context}");
+            }
+        }
     }
 
     #[test]
@@ -11383,9 +11702,12 @@ pub(crate) mod tests {
         ];
         for (text, columns, preserve) in CASES {
             for total in 1..=8usize {
-                let full = wrap_markdown_text(text, columns, 0, total, preserve);
+                let full =
+                    crate::native_markdown::wrap_reader_text(text, columns, 0, total, preserve);
                 for skip in 0..=total + 1 {
-                    let windowed = wrap_markdown_text(text, columns, skip, total, preserve);
+                    let windowed = crate::native_markdown::wrap_reader_text(
+                        text, columns, skip, total, preserve,
+                    );
                     let expected = full.get(skip.min(full.len())..).unwrap_or_default();
                     assert_eq!(
                         windowed, expected,
@@ -11423,7 +11745,7 @@ pub(crate) mod tests {
 
         let measured = crate::tray_raster::measure_text("M", 13.0, TextWeight::Regular);
         assert!(measured.is_finite() && measured > 0.0);
-        let geometry = text_viewport_geometry(LogicalRect::new(0.0, 0.0, 760.0, 420.0));
+        let geometry = text_viewport_geometry(LogicalRect::new(0.0, 0.0, 760.0, 420.0), 1);
         assert_eq!(geometry.cell_w, measured);
     }
 
@@ -11499,7 +11821,7 @@ pub(crate) mod tests {
                         EditorToolbar::default(),
                         1.0,
                     );
-                    let geometry = text_viewport_geometry_at_scale(editor, 1.0);
+                    let geometry = text_viewport_geometry_at_scale(editor, 1.0, 1);
                     let rows = (geometry.body_h / geometry.line_h).floor() as usize;
                     assert!(
                         rows >= MINIMUM_EDITOR_DOCUMENT_ROWS,
@@ -11512,7 +11834,7 @@ pub(crate) mod tests {
         let large_type = LogicalRect::new(0.0, 0.0, 744.0, 760.0);
         let editor =
             editor_text_viewport_rect_at_scale(large_type, 8_usize, EditorToolbar::default(), 2.0);
-        let geometry = text_viewport_geometry_at_scale(editor, 2.0);
+        let geometry = text_viewport_geometry_at_scale(editor, 2.0, 1);
         assert!(
             (geometry.body_h / geometry.line_h).floor() as usize >= MINIMUM_EDITOR_DOCUMENT_ROWS,
             "2× landing paints {} px of body over {} px lines",
@@ -11527,7 +11849,7 @@ pub(crate) mod tests {
 
         let spec = one_line_viewport(100..105, 0, "α\tβ");
         let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
-        let geometry = text_viewport_geometry(rect);
+        let geometry = spec.geometry(rect);
         let y = geometry.body_y + geometry.line_h * 0.5;
 
         assert_eq!(text_viewport_byte_at(&spec, rect, 10.0, y), None);
@@ -11801,7 +12123,7 @@ pub(crate) mod tests {
                 audit_id: "",
                 role: SemanticRole::Button,
                 label: "Novel".to_string(),
-                value: None,
+                paint: None,
                 action: Some(ActionId::new("novel")),
                 focusable: true,
                 focused: false,

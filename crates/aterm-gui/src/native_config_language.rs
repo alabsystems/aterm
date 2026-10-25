@@ -423,6 +423,15 @@ impl ConfigAnalysis {
     }
 
     pub(crate) fn summary_at(&self, index: usize) -> Option<String> {
+        self.summary_forms_at(index)
+            .and_then(|forms| forms.into_iter().next())
+    }
+
+    /// The diagnostic at `index` as the whole summary first, then shorter forms for a
+    /// footer too small for it: without its key hint and count, then without its place
+    /// too, and last the message alone (the underline in the buffer still marks the
+    /// problem). Every form keeps the message whole.
+    pub(crate) fn summary_forms_at(&self, index: usize) -> Option<Vec<String>> {
         let count = self.diagnostic_count();
         let index = index.min(count.saturating_sub(1));
         let diagnostic = self.diagnostic_at(index)?;
@@ -440,10 +449,16 @@ impl ConfigAnalysis {
         } else {
             format!(" · {} more not shown", self.omitted_diagnostics)
         };
-        Some(format!(
-            "Config {level} · Ln {}, Col {} · {}{navigation}{omitted}",
+        let place = format!(
+            "Config {level} · Ln {}, Col {} · {}",
             diagnostic.line, diagnostic.column, diagnostic.message,
-        ))
+        );
+        Some(vec![
+            format!("{place}{navigation}{omitted}"),
+            place,
+            format!("Config {level} · {}", diagnostic.message),
+            diagnostic.message.clone(),
+        ])
     }
 
     pub(crate) fn summary(&self) -> Option<String> {
@@ -1170,13 +1185,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Muse Code supervision",
         ConfigSchemaKind::Table,
         &["harness", "muse", "muse code", "agent"],
-        false,
-    ),
-    manual(
-        "harness.gemini",
-        "Gemini CLI supervision",
-        ConfigSchemaKind::Table,
-        &["harness", "gemini", "gemini cli", "agent"],
         false,
     ),
     manual(

@@ -940,7 +940,7 @@ pub const HELD_WORDS: &[&str] = &["person", "remote", "local", "bridge"];
 
 /// Closed `task fact_rule=` vocabulary: the rule of the fact word a worker's task record carries
 /// (aterm-agent's `occupancy::RuleId::name`, whose ordinal is `fact_n=`). Append only.
-pub const FACT_RULE_WORDS: &[&str] = &["wait-nudge@v1", "hold-room@v1"];
+pub const FACT_RULE_WORDS: &[&str] = &["wait-nudge@v1", "hold-room@v1", "wake@v1"];
 
 /// Closed `render healed_by=` vocabulary.
 pub const HEALED_BY_WORDS: &[&str] = &["app", "undo", "nudge"];

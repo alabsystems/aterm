@@ -442,10 +442,6 @@ fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
             "Its Muse Code account is out of credits or at a spend limit, and no time window ends that.",
             "Do what Muse Code's notice in this tab says to lift the account's limit.",
         ),
-        Program::Gemini => (
-            "Its Gemini CLI account is out of quota or at a spend limit, and no time window ends that.",
-            "Do what Gemini CLI's notice in this tab says to lift the account's limit.",
-        ),
         Program::Codex | Program::Grok | Program::Kimi | Program::Generic => (
             "Its account is out of credits or at a spend limit, and no time window ends that.",
             "Do what the program's notice in this tab says to lift the account's limit.",
@@ -460,7 +456,6 @@ const fn futile_action(program: Program) -> &'static str {
         Program::Muse => {
             "Run /upgrade in this tab for increased limits, as Muse Code's usage wall says."
         }
-        Program::Gemini => "Run /stats model in this tab to see which limit holds it.",
         Program::Codex | Program::Grok | Program::Kimi | Program::Generic => {
             "Check the program's account usage for what holds it."
         }
@@ -478,11 +473,6 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
         ),
         Program::Muse => (
             "Its Muse Code login is gone, and only your own sign-in restores it.",
-            format!("{}.", title(&sign_in_how(program, message))),
-            "the agent working",
-        ),
-        Program::Gemini => (
-            "Its Gemini CLI key or login was refused, and only your own sign-in restores it.",
             format!("{}.", title(&sign_in_how(program, message))),
             "the agent working",
         ),
@@ -699,26 +689,32 @@ fn claude_login(
     };
     match &reading.login_screen {
         Some(LoginScreen::Success { .. }) => return Some(None),
+        // The dialog of the `/login` aterm typed whose sign-in nobody needs (a roster row's
+        // login, one back in another tab, or one a followed renewal replaced): aterm backs out of
+        // it by itself and the tab goes on (it waits on the row's sign-in, continues its turn, or
+        // relaunches onto the renewed login), so nobody is told to sign in there or to close it.
+        Some(screen)
+            if super::login::backs_out(state, reading, cfg, screen, now)
+                || state.login_closing(now).is_some() =>
+        {
+            return Some(None);
+        }
+        // A person's own dialog (one drawn after the dialog aterm backed out of was read gone
+        // included): theirs, told nothing.
         Some(LoginScreen::Picker(_) | LoginScreen::ConsoleMenu | LoginScreen::Browser) if !own => {
             return Some(None);
         }
+        // A dialog a person is in whose login came back in another tab, which aterm presses
+        // nothing in: Console's menu, which only a person's pick at aterm's picker opens, or the
+        // message a person's own `/login` stopped on. Every other dialog of aterm's own `/login`
+        // over a login back elsewhere is backed out of above.
         Some(_) if super::turn_end::login_back_elsewhere(state, reading) => {
             return told(&notice::LOGIN_BACK_DIALOG, None, None);
         }
-        Some(_)
-            if own
-                && super::login::renewal_followed(
-                    reading.login_superseded,
-                    cfg,
-                    reading.restartable || reading.upgrading,
-                ) =>
-        {
-            return told(
-                &notice::LOGIN_RENEWED_DIALOG,
-                reading.login_label.as_deref(),
-                None,
-            );
-        }
+        // aterm's own `/login` whose sign-in nobody needs, at a state aterm presses nothing in
+        // (Console's menu, which only a person's pick at aterm's picker opens): no person is told
+        // to sign the login in there either.
+        Some(_) if own && super::login::nobody_signs_in(state, reading, cfg) => return Some(None),
         Some(LoginScreen::Picker(picker)) => {
             return match super::login::picks(picker, reading.login_method) {
                 Ok(_) => Some(None),

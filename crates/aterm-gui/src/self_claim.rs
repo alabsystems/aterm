@@ -85,8 +85,7 @@ pub(crate) fn fronts_claimant(program: Option<&str>) -> bool {
                 | Program::Kimi
                 | Program::Generic
                 | Program::Agy
-                | Program::Muse
-                | Program::Gemini,
+                | Program::Muse,
             ) => false,
             None => {
                 let word = program.split_whitespace().next().unwrap_or(program);

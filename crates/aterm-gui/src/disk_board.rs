@@ -273,8 +273,32 @@ pub(crate) struct Board {
     /// or a manager's worker), as its worker found it at its last turn break: the ask seats none
     /// of these while the finding holds ([`Unfit::bars`], `crate::harness_disk_ask`).
     pub(crate) unfit: BTreeMap<String, Unfit>,
+    /// The usage-limit wall a session of this process stands at (`sid -> wall`), as its loop
+    /// opened its limit episode there and dated it, and its worker published it
+    /// (`crate::harness_host`'s `WorkerIdle::limit_wall`, again whenever the loop moves its
+    /// reset) until the episode closed: while the wall holds ([`Wall::holds`])
+    /// and the session's agent reads `limited`, the ask holds it out of its seats and waits for
+    /// it to be past rather than running out (`crate::harness_disk_ask`).
+    pub(crate) walls: BTreeMap<String, Wall>,
     /// The next demand's id.
     next_demand: u64,
+}
+
+/// A usage-limit wall a session's loop has open ([`Board::walls`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Wall {
+    /// When the loop takes the wall as spent and rests there, able to take a line (the reset its
+    /// limit episode holds the wall to, or where it knows none the one its transcript names, plus
+    /// the loop's grace, unix seconds); `None`: its reset is not known, so it holds until the loop
+    /// closes its episode.
+    pub(crate) until_s: Option<i64>,
+}
+
+impl Wall {
+    /// Whether the wall holds the session from a line at `now_s` (unix seconds).
+    pub(crate) fn holds(&self, now_s: i64) -> bool {
+        self.until_s.is_none_or(|until| now_s < until)
+    }
 }
 
 /// Why a session's worker found it may not be asked to free space at its last turn break
@@ -341,6 +365,7 @@ impl Board {
             freed: FreedTally::new(),
             asks: BTreeMap::new(),
             unfit: BTreeMap::new(),
+            walls: BTreeMap::new(),
             next_demand: 1,
         }
     }

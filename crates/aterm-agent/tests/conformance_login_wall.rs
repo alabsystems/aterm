@@ -17,9 +17,9 @@ use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::approval::Decision;
 use aterm_agent::supervise::policy::exception::{Exception, Urgency, exception_for};
 use aterm_agent::supervise::policy::login::{
-    LoginShared, PickerGate, pick_method, picker_gate, renewal_followed,
+    LoginShared, PickerGate, RULE_LOGIN_BACK_OUT, pick_method, picker_gate, renewal_followed,
 };
-use aterm_agent::supervise::policy::notice::{LOGIN_BACK_DIALOG, LOGIN_RENEWED_DIALOG};
+use aterm_agent::supervise::policy::notice::LOGIN_BACK_DIALOG;
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
     AccountAdvice, AccountAt, Composer, RULE_CONTINUE, RULE_LOGIN, RULE_LOGIN_BACK, Restart,
@@ -444,7 +444,8 @@ fn advised(st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReadin
 fn gate_at(st: &TurnEndState, r: &TurnEndReading) -> PickerGate {
     picker_gate(
         st.login_typed_at().is_some(),
-        r.login_shared.as_ref(),
+        st.login_back_from(r.login_shared.as_ref()),
+        r.login_label.is_some(),
         renewal_followed(
             r.login_superseded,
             &SupervisorConfig::default(),
@@ -455,7 +456,7 @@ fn gate_at(st: &TurnEndState, r: &TurnEndReading) -> PickerGate {
 
 /// The state the tab walled in: another tab's sign-in was still carried there before it came
 /// back, and a `/login` aterm typed was typed before the roster knew the login's row (a roster
-/// row's lost login types none: `RenewAtLogin`).
+/// row's lost login types none: `RenewAtLogin`, `EnrolAtLogin`).
 fn earlier(s: &S) -> S {
     let mut then = s.clone();
     if then["elsewhere"] == 2 {
@@ -593,6 +594,7 @@ fn supervisor_action(a: &TurnEndAction) -> Option<&'static str> {
             AccountAt::Wall => "Relaunch",
             AccountAt::Ahead => "Follow",
         }),
+        TurnEndAction::Cancel { rule_id } if *rule_id == RULE_LOGIN_BACK_OUT => Some("BackOut"),
         _ => None,
     }
 }
@@ -601,7 +603,7 @@ fn tells_now(e: Option<&Exception>) -> Option<&'static str> {
     e.filter(|e| e.kind == ExceptionKind::Login && e.when == Urgency::Now && !e.escalated)
         .and_then(|e| e.notice.as_ref())
         .map(|n| {
-            if n.id == LOGIN_BACK_DIALOG.id || n.id == LOGIN_RENEWED_DIALOG.id {
+            if n.id == LOGIN_BACK_DIALOG.id {
                 "TellClose"
             } else {
                 "TellNow"
@@ -647,13 +649,13 @@ impl Supervised {
     fn at(s: &S) -> Self {
         let (decided, exception, gate) = supervisor_at(s);
         let carry = gate == PickerGate::Carried;
+        // The picker is a box: the approval loop, not the turn end, backs out of it.
+        let backs = s["picker"] == 1 && dialog_up(s) && gate.backs_out();
         let ask = tells_now(exception.as_ref());
         let waits = matches!(decided, TurnEndAction::WaitUntil { .. });
-        let sup = supervisor_action(&decided).or((s["wall"] == 1
-            && s["track"] == 0
-            && ask.is_none()
-            && !waits)
-            .then_some("Rest"));
+        let sup = supervisor_action(&decided)
+            .or(backs.then_some("BackOut"))
+            .or((s["wall"] == 1 && s["track"] == 0 && ask.is_none() && !waits).then_some("Rest"));
         Self {
             decided,
             exception,
@@ -702,9 +704,16 @@ fn agrees(
     let upgrade_ok = ["Announce", "GiveUp", "Restart"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (taken == Some(*a)));
-    let supervisor_ok = ["TypeLogin", "Continue", "Relaunch", "Follow", "Rest"]
-        .iter()
-        .all(|a| m.action_enabled(a, s) == (*sup == Some(*a)));
+    let supervisor_ok = [
+        "TypeLogin",
+        "Continue",
+        "Relaunch",
+        "Follow",
+        "Rest",
+        "BackOut",
+    ]
+    .iter()
+    .all(|a| m.action_enabled(a, s) == (*sup == Some(*a)));
     let ask_ok = ["TellNow", "TellClose"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (*ask == Some(*a)));
@@ -852,6 +861,7 @@ fn defective() -> Vec<(&'static str, Model)> {
         ("Buggy5", aterm_spec::interp::with_buggy(&model, 5)),
         ("Buggy6", aterm_spec::interp::with_buggy(&model, 6)),
         ("Buggy7", aterm_spec::interp::with_buggy(&model, 7)),
+        ("Buggy8", aterm_spec::interp::with_buggy(&model, 8)),
     ]
     .into_iter()
     .chain(
@@ -876,6 +886,8 @@ fn defective() -> Vec<(&'static str, Model)> {
             "PickAfterBack",
             "NoFollowAfterLogin",
             "SignInOverRenewed",
+            "SignInAsRow",
+            "AskToClose",
         ]
         .into_iter()
         .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
@@ -950,8 +962,8 @@ fn the_real_code_conforms_to_the_login_wall_model() {
             "Continue",
             "Relaunch",
             "Follow",
+            "BackOut",
             "TellNow",
-            "TellClose",
             "PickMethod",
             "Renew",
         ]),
@@ -1034,4 +1046,61 @@ fn a_roster_rows_sign_in_menu_conforms_to_the_login_wall_model() {
         ]),
         "the menu both waits and relaunches somewhere, with a move made before it and without"
     );
+}
+
+/// A person told to sign a roster row in at the dialog of the `/login` aterm typed before the
+/// roster named the row (the `SignInAsRow` knob: the notice aterm raised there before it backed
+/// out of that dialog by itself) breaks `NoRosterRowSignedInByAPerson`, which the model as
+/// written keeps.
+#[test]
+fn a_person_told_to_sign_a_roster_row_in_breaks_its_law() {
+    let model = harness_login_wall_model();
+    let law = "NoRosterRowSignedInByAPerson";
+    assert!(
+        !aterm_spec::interp::violated_invariants(&model).contains(law),
+        "the model as written"
+    );
+    let told = aterm_spec::interp::with_consts(&model, &[("SignInAsRow", 1)]);
+    assert!(
+        aterm_spec::interp::violated_invariants(&told).contains(law),
+        "the knob that tells the person"
+    );
+}
+
+/// A person told to close the dialog of the `/login` aterm typed, the login back in another tab
+/// (Buggy=8 and the `AskToClose` knob: the notice aterm raised there before it closed that dialog
+/// by itself) breaks `NoPersonClosesAtermsDialog`, which the model as written keeps; in the model as written
+/// aterm's own back-out closes that dialog wherever it stands over a login back elsewhere.
+#[test]
+fn a_person_told_to_close_aterms_dialog_breaks_its_law() {
+    let model = harness_login_wall_model();
+    let law = "NoPersonClosesAtermsDialog";
+    assert!(
+        !aterm_spec::interp::violated_invariants(&model).contains(law),
+        "the model as written"
+    );
+    for (mutant, told) in [
+        (
+            "the knob",
+            aterm_spec::interp::with_consts(&model, &[("AskToClose", 1)]),
+        ),
+        ("Buggy=8", aterm_spec::interp::with_buggy(&model, 8)),
+    ] {
+        assert!(
+            aterm_spec::interp::violated_invariants(&told).contains(law),
+            "{mutant} that tells the person"
+        );
+    }
+    let back_elsewhere = reachable(&model)
+        .into_iter()
+        .filter(|s| dialog_up(s) && s["elsewhere"] == 2 && s["back"] == 0)
+        .collect::<Vec<_>>();
+    assert!(
+        !back_elsewhere.is_empty(),
+        "aterm's dialog over a login back elsewhere is reachable"
+    );
+    for s in &back_elsewhere {
+        assert!(model.action_enabled("BackOut", s), "{s:?}");
+        assert!(!model.action_enabled("TellClose", s), "{s:?}");
+    }
 }

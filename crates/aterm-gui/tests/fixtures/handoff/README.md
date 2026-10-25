@@ -343,7 +343,9 @@ v0.100.0).
   the differ's `below`, and its leaf the agent the host supervises, under its
   own Claude home and login. Sessions 3 to 6 are restored tabs whose Muse
   Code, agy, Gemini CLI and Claude Code relaunches are owed, the last for the
-  explicit restart (`cause`, the tab it ran in). Session 7's agent cannot be
+  explicit restart (`cause`, the tab it ran in); Gemini CLI is retired (agy
+  replaces it), so a consumer reads session 5's leaf as no agent's and
+  relaunches nothing there, and desks after v0.138.0 write it as a plain shell. Session 7's agent cannot be
   brought back (the leaf's `lost`). A second window co-views session 0. The
   first window is zoomed two steps, and its band holds a wire notice posted
   twice, a row restated a mark worse than it was posted, an unanswered

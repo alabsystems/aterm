@@ -1278,11 +1278,15 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
         }
     };
     let is_said = |i: &Item| matches!(i.record(), Some(EffectRecord::Emit { door, .. }) if door == "host.occupancy_said");
+    let is_book = |i: &Item| matches!(i.record(), Some(EffectRecord::Exchange { door, .. }) if door == "host.wakes");
     let mut removed = vec![false; items.len()];
-    let (mut journals, mut ledgers, mut saids) = (0, 0, 0);
+    let (mut journals, mut ledgers, mut saids, mut books) = (0, 0, 0, 0);
     for (at, item) in items.iter().enumerate() {
         if is_board(item) {
             removed[at] = true;
+        } else if is_book(item) {
+            removed[at] = true;
+            books += 1;
         } else if is_said(item) {
             removed[at] = true;
             saids += 1;
@@ -1306,10 +1310,11 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     assert_eq!(journals, 1, "the nudge's journal row");
     assert_eq!(ledgers, 1, "the nudge's would row");
     assert!(saids >= 1, "the door told its host");
+    assert!(books >= 1, "the loop read the book at the open hold");
     assert_eq!(
         removed.iter().filter(|gone| **gone).count(),
-        asks + saids + 2 * (journals + ledgers),
-        "only board exchanges, the host's tells and identified row/stamp pairs"
+        asks + books + saids + 2 * (journals + ledgers),
+        "only board exchanges, the book's reads, the host's tells and identified row/stamp pairs"
     );
     let before_door: Vec<Item> = items
         .iter()
@@ -1500,6 +1505,47 @@ const SLICE2_DOORS: [&str; 5] = [
     "host.task_fact",
 ];
 
+/// `items`, a recording of this build's with no wake in its book, as a slice-1 build recorded
+/// them: no effect at slice 2's doors (this build's loop reads the book at an open hold's settled
+/// reads), and each told word without the wake rule slice 2 lists last (`said::told_rules`).
+fn slice_one_items(
+    items: &[crate::supervise::tape::codec::Item],
+) -> Vec<crate::supervise::tape::codec::Item> {
+    use crate::supervise::tape::codec::Item;
+    use astream_effects::EffectRecord;
+    items
+        .iter()
+        .filter(|item| {
+            !matches!(item.record(), Some(EffectRecord::Exchange { door, .. } | EffectRecord::Emit { door, .. })
+                if SLICE2_DOORS.contains(&door.as_str()))
+        })
+        .map(|item| match item {
+            Item::Effect {
+                record: EffectRecord::Emit { door, bytes },
+                stamp,
+            } if door == "host.occupancy_said" => {
+                let text = String::from_utf8(bytes.clone()).expect("the told word is UTF-8");
+                assert!(!text.contains("wake: Some"), "no wake was judged: {text}");
+                let text = match text.find(", SaidRule { rule: Wake") {
+                    Some(from) => {
+                        let to = from + text[from..].find(']').expect("the list ends");
+                        format!("{}{}", &text[..from], &text[to..])
+                    }
+                    None => text,
+                };
+                Item::Effect {
+                    record: EffectRecord::Emit {
+                        door: door.clone(),
+                        bytes: text.into_bytes(),
+                    },
+                    stamp: *stamp,
+                }
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
 /// A slice-1 tape (no slice-2 doors in its header) reproduces, every told word compared byte for
 /// byte at `host.occupancy_said`, as does the same tape under this build's header. A told word
 /// with a rule left out of its list diverges there.
@@ -1540,9 +1586,16 @@ fn a_slice_one_tape_replays_unchanged() {
         "the door told its host: {crossed:?}"
     );
     assert!(
-        !crossed.iter().any(|d| SLICE2_DOORS.contains(&d.as_str())),
+        crossed.iter().any(|d| d == "host.wakes"),
+        "this build's loop reads the book: {crossed:?}"
+    );
+    assert!(
+        !crossed
+            .iter()
+            .any(|d| d != "host.wakes" && SLICE2_DOORS.contains(&d.as_str())),
         "{crossed:?}"
     );
+    let slice_one = slice_one_items(&items);
     let older: String = header
         .lines()
         .map(|line| match line.strip_prefix("host_doors=") {
@@ -1562,13 +1615,19 @@ fn a_slice_one_tape_replays_unchanged() {
         })
         .collect();
     assert_ne!(older, header, "the header named the doors");
-    for header in [&older, &header] {
-        let report = replay(&written(header, &items), &Options::default()).expect("replayed");
+    for (header, items) in [(&older, &slice_one), (&header, &items)] {
+        let report = replay(&written(header, items), &Options::default()).expect("replayed");
         assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
     }
+    let report = replay(&written(&older, &items), &Options::default()).expect("replayed");
+    assert!(
+        matches!(report.verdict, Verdict::Diverged(_)),
+        "CONTROL: a slice-1 build's loop reads no book: {}",
+        report.render()
+    );
 
     let mut cut = false;
-    let edited: Vec<Item> = items
+    let edited: Vec<Item> = slice_one
         .iter()
         .map(|item| match item {
             Item::Effect {
@@ -1612,7 +1671,6 @@ fn a_slice_one_tape_of_a_managed_workers_early_line_replays_unchanged() {
     use crate::supervise::tape::replay::{Options, replay};
     use crate::supervise::tape::report::Verdict;
     use crate::supervise::tape::testing::written;
-    use astream_effects::EffectRecord;
 
     let record = |tag: &str| {
         let (dir, ledger) = ledger_at(tag);
@@ -1654,17 +1712,7 @@ fn a_slice_one_tape_of_a_managed_workers_early_line_replays_unchanged() {
         Vec::<String>::new(),
         "the older build read no record"
     );
-    let door_of = |i: &Item| match i.record() {
-        Some(EffectRecord::Exchange { door, .. } | EffectRecord::Emit { door, .. }) => {
-            Some(door.clone())
-        }
-        _ => None,
-    };
-    let older_items: Vec<Item> = items
-        .iter()
-        .filter(|i| door_of(i).is_none_or(|d| !SLICE2_DOORS.contains(&d.as_str())))
-        .cloned()
-        .collect();
+    let older_items = slice_one_items(&items);
     let older = as_recorded(
         &header,
         Some(crate::supervise::occupancy::due::K_LOOKS),
@@ -1814,9 +1862,11 @@ fn a_tape_from_before_the_k_clock_replays_unraised() {
     use crate::supervise::tape::testing::written;
 
     let (header, items) = unraised_watch("door-k-before");
+    let slice_one = slice_one_items(&items);
     let replayed = |k: Option<i64>, slice1: bool| {
         let header = as_recorded(&header, k, slice1);
-        replay(&written(&header, &items), &Options::default()).expect("replayed")
+        let items = if slice1 { &slice_one } else { &items };
+        replay(&written(&header, items), &Options::default()).expect("replayed")
     };
     for slice1 in [false, true] {
         let report = replayed(None, slice1);
@@ -1836,10 +1886,12 @@ fn a_slice_one_tape_tells_no_ready_idle_line_whatever_its_k() {
     use crate::supervise::tape::testing::written;
 
     let (header, items) = unraised_watch("door-k-slice-one");
+    let slice_one = slice_one_items(&items);
     let k = Some(crate::supervise::occupancy::due::K_LOOKS);
     let replayed = |slice1: bool| {
         let header = as_recorded(&header, k, slice1);
-        replay(&written(&header, &items), &Options::default()).expect("replayed")
+        let items = if slice1 { &slice_one } else { &items };
+        replay(&written(&header, items), &Options::default()).expect("replayed")
     };
     let report = replayed(true);
     assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());

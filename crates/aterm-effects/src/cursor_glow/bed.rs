@@ -751,7 +751,16 @@ pub(crate) fn lay_dark_bed(
         let ink = &inks[at..at + run.len()];
         let rail = rails.get(at..at + run.len());
         at += run.len();
-        let one_row = run.iter().all(|s| s.y == run[0].y);
+        let mut one_row = true;
+        let y0 = run[0].y;
+        let mut si = 1;
+        while si < run.len() {
+            if run[si].y != y0 {
+                one_row = false;
+                break;
+            }
+            si += 1;
+        }
         let dir = if run.len() > 1 && run[run.len() - 1].x < run[0].x {
             -1.0
         } else {
@@ -779,7 +788,10 @@ pub(crate) fn lay_dark_bed(
             tail * wedge
         };
         taper.clear();
-        taper.extend(run.iter().map(|s| taper_at(s.x)));
+        taper.reserve(run.len());
+        for s in run {
+            taper.push(taper_at(s.x));
+        }
         if ledger.is_on() {
             let mut prev: Option<((i32, i32), u32)> = None;
             for ((s, &rgb), &k) in run.iter().zip(ink).zip(taper.iter()) {
@@ -825,7 +837,7 @@ pub(crate) fn lay_dark_bed(
             }
             let head_k = if air_head { 0.0 } else { taper_at(head_x) };
             verts.push(vertex(head_x, &last, ink[ink.len() - 1], head_k));
-            let left = caret.is_some_and(|c| c != (head_row, head_col)) && head_k > 0.0;
+            let left = matches!(caret, Some(c) if c != (head_row, head_col)) && head_k > 0.0;
             let feather_span = dir * cwf * DARK_BED_HEAD_FEATHER_CELLS;
             let from = head_x - feather_span;
             let taper_from = taper_at(from);
@@ -841,7 +853,8 @@ pub(crate) fn lay_dark_bed(
             };
             let feather_over =
                 |verts: &mut Vec<RibbonVertex>, at: &dyn Fn(f32, f32) -> RibbonVertex| {
-                    while verts.len() > 1 && verts.last().is_some_and(|v| (v.x - from) * dir >= 0.0)
+                    while verts.len() > 1
+                        && matches!(verts.last(), Some(v) if (v.x - from) * dir >= 0.0)
                     {
                         verts.pop();
                     }
@@ -1026,6 +1039,45 @@ pub(crate) fn lay_dark_bed(
     under.truncate(quad_budget);
 }
 
+/// How many cells back a jump's wedge reaches from its `head` on its row, and which way it
+/// points (`1.0`: toward higher columns, from `back`'s guess): over the piece it laid from
+/// `tail`, and over the live jump's whole laid path around the head (`leaps`,
+/// [`CursorGlow::gather_leap_spans`]), its faded tail cells included: the path Trail length cut.
+pub(super) fn leap_wedge(
+    leaps: &[(Instant, u16, u16, u16)],
+    geom: Geom,
+    head: CometSample,
+    tail: CometSample,
+    back: f32,
+) -> (f32, f32) {
+    let (inv_cw, inv_ch) = (1.0 / geom.cw as f32, 1.0 / geom.ch as f32);
+    let mut cells = (head.x - tail.x).abs() * inv_cw + 1.0;
+    let mut back = back;
+    let row = ((head.y - f32::from(geom.origin_y)) * inv_ch)
+        .floor()
+        .clamp(0.0, f32::from(u16::MAX)) as u16;
+    let col = ((head.x - f32::from(geom.origin_x)) * inv_cw).floor();
+    let mut found_leap = None;
+    let mut li = 0;
+    while li < leaps.len() {
+        let (_, r, first, last) = leaps[li];
+        if r == row && col >= f32::from(first) - 1.0 && col <= f32::from(last) + 1.0 {
+            found_leap = Some((first, last));
+            break;
+        }
+        li += 1;
+    }
+    if let Some((first, last)) = found_leap {
+        let (first, last) = (f32::from(first), f32::from(last));
+        if last - col > col - first {
+            back = 1.0;
+        }
+        let far = if back > 0.0 { last } else { first };
+        cells = cells.max((col - far).abs() + 1.0);
+    }
+    (cells, back)
+}
+
 /// A wedge's runs ([`BedShape::wedge`]) into the pool `out`, returning how
 /// many are live.
 fn wedge_runs(
@@ -1038,8 +1090,7 @@ fn wedge_runs(
     lengths: &mut Vec<f32>,
 ) -> usize {
     lengths.clear();
-    let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
-    let (inv_cw, inv_ch) = (1.0 / cwf, 1.0 / chf);
+    let cwf = geom.cw as f32;
     let wedge = shape.wedge;
     let knots = (wedge * 4.0).ceil().max(1.0) as usize;
     let mut n = 0usize;
@@ -1056,13 +1107,25 @@ fn wedge_runs(
         let Some(&head) = run.last() else {
             continue;
         };
-        if !run.iter().all(|s| s.y == head.y) {
+        let mut same_row = true;
+        let mut si = 0;
+        while si + 1 < run.len() {
+            if run[si].y != head.y {
+                same_row = false;
+                break;
+            }
+            si += 1;
+        }
+        if !same_row {
             let at = next(out);
             out[at].extend_from_slice(run);
             lengths.push(wedge);
             continue;
         }
-        let kinds = typing.get(index).map_or(&[][..], Vec::as_slice);
+        let kinds = match typing.get(index) {
+            Some(v) => v.as_slice(),
+            None => &[],
+        };
         let typed = |i: usize| !shape.leap_path || kinds.get(i).copied().unwrap_or(true);
         let mut start = 0;
         while start < run.len() {
@@ -1075,29 +1138,16 @@ fn wedge_runs(
             let at = next(out);
             let head = piece[piece.len() - 1];
             let tail = piece[0];
-            let mut back = if piece.len() > 1 && tail.x > head.x {
+            let back = if piece.len() > 1 && tail.x > head.x {
                 1.0
             } else {
                 -1.0
             };
-            let mut cells = wedge;
-            if !kind {
-                cells = (head.x - tail.x).abs() * inv_cw + 1.0;
-                let row = ((head.y - f32::from(geom.origin_y)) * inv_ch)
-                    .floor()
-                    .clamp(0.0, f32::from(u16::MAX)) as u16;
-                let col = ((head.x - f32::from(geom.origin_x)) * inv_cw).floor();
-                if let Some(&(_, _, first, last)) = leaps.iter().find(|(_, r, first, last)| {
-                    *r == row && col >= f32::from(*first) - 1.0 && col <= f32::from(*last) + 1.0
-                }) {
-                    let (first, last) = (f32::from(first), f32::from(last));
-                    if last - col > col - first {
-                        back = 1.0;
-                    }
-                    let far = if back > 0.0 { last } else { first };
-                    cells = cells.max((col - far).abs() + 1.0);
-                }
-            }
+            let (cells, back) = if kind {
+                (wedge, back)
+            } else {
+                leap_wedge(leaps, geom, head, tail, back)
+            };
             let knots = if kind {
                 knots
             } else {
@@ -1229,14 +1279,16 @@ pub(crate) fn split_air_runs(
     let mut n = 0usize;
     for (ri, run) in runs.iter().enumerate() {
         let head = caret && ri + 1 == runs.len();
-        let lit = |i: usize| {
-            typed.is_none_or(|kinds| {
-                kinds
-                    .get(ri)
-                    .and_then(|kinds| kinds.get(i))
-                    .copied()
-                    .unwrap_or(true)
-            })
+        let row_kinds = match typed {
+            Some(kinds) => Some(match kinds.get(ri) {
+                Some(v) => v.as_slice(),
+                None => &[],
+            }),
+            None => None,
+        };
+        let lit = |i: usize| match row_kinds {
+            Some(kinds) => kinds.get(i).copied().unwrap_or(true),
+            None => true,
         };
         let is_air = |i: usize| lit(i) && ((head && i + 1 == run.len()) || !over_text(&run[i]));
         let mut i = 0;
@@ -1359,6 +1411,31 @@ pub(crate) fn bridge_word_gaps(
 }
 
 impl CursorGlow {
+    /// Each live jump's laid path into [`CursorGlow::leap_spans`], `(born, row, first col, last
+    /// col)` with its faded tail cells: the extent a jump's wedge reaches back over, the path
+    /// Trail length cut.
+    pub(super) fn gather_leap_spans(&mut self) {
+        self.leap_spans.clear();
+        for spark in &self.sparks {
+            if spark.typing {
+                continue;
+            }
+            let mut found = false;
+            for (born, row, first, last) in &mut self.leap_spans {
+                if *born == spark.born && *row == spark.row {
+                    *first = (*first).min(spark.col);
+                    *last = (*last).max(spark.col);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                self.leap_spans
+                    .push((spark.born, spark.row, spark.col, spark.col));
+            }
+        }
+    }
+
     /// Lay the dark bed under `self.comet_runs[..runs_len]`.
     #[allow(
         clippy::too_many_arguments,
@@ -1383,21 +1460,7 @@ impl CursorGlow {
         let mut wedges = std::mem::take(&mut self.wedge_runs);
         self.leap_spans.clear();
         if shape.leap_path {
-            for spark in self.sparks.iter().filter(|spark| !spark.typing) {
-                match self
-                    .leap_spans
-                    .iter_mut()
-                    .find(|(born, row, ..)| *born == spark.born && *row == spark.row)
-                {
-                    Some((_, _, first, last)) => {
-                        *first = (*first).min(spark.col);
-                        *last = (*last).max(spark.col);
-                    }
-                    None => self
-                        .leap_spans
-                        .push((spark.born, spark.row, spark.col, spark.col)),
-                }
-            }
+            self.gather_leap_spans();
         }
         scratch.wedges.clear();
         let runs: &[Vec<CometSample>] = if shape.wedge > 0.0 {
@@ -1475,7 +1538,7 @@ impl CursorGlow {
             bridge_word_gaps(
                 runs,
                 geom,
-                |row, col| ft.pair(row, col).is_some_and(|(ink, _)| ink.is_some()),
+                |row, col| matches!(ft.pair(row, col), Some((Some(_), _))),
                 &mut scratch.inks,
             );
         }

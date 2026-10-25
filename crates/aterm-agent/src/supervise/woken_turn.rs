@@ -25,13 +25,21 @@
 //!   [`WOKEN_SHORTEST_WAIT_S`] are left;
 //! * the Mac is in a full wake, not a dark one ([`super::fx::Fx::full_wake`]);
 //! * the host measured the API up since the wake ([`Reach::Up`]), and [`WOKEN_MARGIN`] has passed
-//!   since, so the vendor's own retry after the wake had its chance; where the row counts the try
-//!   in flight, that try has waited longer than the API has been up (it went out before);
+//!   since, so the vendor's own retry after the wake had its chance;
+//! * a no-response row (`No response from the API after 3m · retrying once, waiting up to 10m`)
+//!   names the first-byte window of the try that failed and the retry's, never when the retry
+//!   now in flight went out. A retry sent once the network was back may be waiting on a gateway
+//!   that buffers its stream, which the vendor's longer wait is for, so the loop cuts the row
+//!   only where the same row stood at the last busy read before the Mac slept and at every busy
+//!   read since: that retry went out before the sleep and crossed it (the vendor's own suspend
+//!   watchdog drops such a try only after a sleep longer than half its window). A no-response
+//!   row first read since the wake is left to the vendor's wait, however long the API is up;
 //! * the composer holds no draft (a queued message under Claude Code's placeholder is none);
 //! * the server can fence the press on the person's keys (`if-human=`).
 //!
-//! The press is guarded on the row itself ([`aterm_phase::ApiRetryRow::guard`]). Only a press the
-//! server took spends the wake's one Esc: a skipped one (the row moved on) or a yielded one (a
+//! The press is guarded on the row itself ([`aterm_phase::ApiRetryRow::guard`]; a no-response
+//! row's whole text, so the Esc never lands on a later try's row). Only a press the server took
+//! spends the wake's one Esc: a skipped one (the row moved on) or a yielded one (a
 //! person typed since the read) is tried again at the next read. Claude Code then sends what was
 //! queued itself; with nothing queued it stops at a point the turn-end policy decides as the
 //! harness's own Esc, not a person's ([`TurnEndState::woken_esc`]): the vendor's continuation after
@@ -57,7 +65,7 @@ pub(super) const WOKEN_MARGIN: Duration = Duration::from_secs(10);
 pub(super) const WOKEN_SHORTEST_WAIT_S: u64 = 5;
 
 /// A wake the loop measured while the worker's turn ran ([`Session::watch_sleep`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WokenTurn {
     /// The sleep the loop measured: its wall clock (unix ms) before and after, and the loop's own
     /// clock after.
@@ -66,6 +74,9 @@ pub(super) struct WokenTurn {
     mono_now: Instant,
     /// When the Mac woke, on the loop's clock, once read ([`Session::woken_at`]).
     at: Option<Instant>,
+    /// The no-response retry row, as drawn, that the last busy read before the sleep showed, while
+    /// every busy read since shows it ([`Session::note_retry_row`]): a try that crossed the sleep.
+    carried: Option<String>,
     /// When this wake's one Esc was taken, on the loop's clock.
     pressed_at: Option<Instant>,
     /// The turn it stopped was the vendor's continuation after a usage limit.
@@ -75,13 +86,20 @@ pub(super) struct WokenTurn {
 }
 
 impl WokenTurn {
-    /// The sleep the loop measured from `wall_then` to `wall_now` (unix ms), at `mono_now`.
-    pub(super) const fn measured(wall_then: i64, wall_now: i64, mono_now: Instant) -> Self {
+    /// The sleep the loop measured from `wall_then` to `wall_now` (unix ms), at `mono_now`, with
+    /// the no-response row the last busy read before it showed.
+    pub(super) const fn measured(
+        wall_then: i64,
+        wall_now: i64,
+        mono_now: Instant,
+        carried: Option<String>,
+    ) -> Self {
         Self {
             wall_then,
             wall_now,
             mono_now,
             at: None,
+            carried,
             pressed_at: None,
             resume: false,
             said: false,
@@ -96,19 +114,36 @@ impl WokenTurn {
 }
 
 impl<C: Ctl> Session<'_, C> {
+    /// A busy read: keep the no-response retry row it shows ([`Session::retry_seen`]). A
+    /// no-response row stands unchanged while its retry waits, so any other row, or none, ends
+    /// it, and with it the wake's carried row ([`WokenTurn::carried`]): a later try's row drawn
+    /// the same is never taken for the try that crossed the sleep.
+    pub(super) fn note_retry_row(&mut self, screen: &Screen) {
+        let row = aterm_phase::api_retry_row(&screen.rows)
+            .filter(|r| r.cause == RetryCause::NoResponse)
+            .map(|r| r.text);
+        if row.is_some() && row == self.retry_seen {
+            return;
+        }
+        if let Some(w) = self.woken.as_mut() {
+            w.carried = None;
+        }
+        self.retry_seen = row;
+    }
+
     /// THE WAKE, ON THE LOOP'S CLOCK: the kernel's record of it where that falls inside the sleep
     /// the loop measured, else the moment the loop measured it (later than the wake, so a
     /// measure of the API taken in between never reads as after it).
     fn woken_at(&mut self) -> Option<Instant> {
-        let w = self.woken?;
-        if let Some(at) = w.at {
-            return Some(at);
-        }
+        let (wall_then, wall_now, mono_now) = match self.woken.as_ref()? {
+            WokenTurn { at: Some(at), .. } => return Some(*at),
+            w => (w.wall_then, w.wall_now, w.mono_now),
+        };
         let at = match self.fx.last_sleep() {
-            Some((_, woke)) if w.wall_then < woke && woke <= w.wall_now => {
-                self.instant_of_ms(woke).min(w.mono_now)
+            Some((_, woke)) if wall_then < woke && woke <= wall_now => {
+                self.instant_of_ms(woke).min(mono_now)
             }
-            _ => w.mono_now,
+            _ => mono_now,
         };
         if let Some(w) = self.woken.as_mut() {
             w.at = Some(at);
@@ -128,14 +163,16 @@ impl<C: Ctl> Session<'_, C> {
         let Some(row) = aterm_phase::api_retry_row(&screen.rows) else {
             return Ok(());
         };
-        let Some(w) = self.woken else {
+        let Some(w) = self.woken.as_ref() else {
             return Ok(());
         };
+        let carried = w.carried.as_deref() == Some(row.text.as_str());
         if let Some(at) = w.pressed_at {
             // The Esc's own row still reads live: Claude Code has not taken the key yet, and the
             // point it stops stays the harness's ([`TurnEndState::woken_esc`]).
+            let resume = w.resume;
             if self.fx.since(at) < WOKEN_MARGIN {
-                self.turn_end.woken_esc(w.resume);
+                self.turn_end.woken_esc(resume);
             }
             return Ok(());
         }
@@ -146,14 +183,14 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         if !claude || !opts.policy.retry_api_errors || screen.human_seq.is_none() {
             return Ok(());
         }
         let cuts_a_wait = match (row.cause, row.next_try_s) {
-            (RetryCause::NoResponse, _) => true,
+            // The row names no time its retry went out: only one that crossed the sleep.
+            (RetryCause::NoResponse, _) => carried,
             (RetryCause::Unreachable | RetryCause::Stalled, next) => {
                 next.is_some_and(|s| s >= WOKEN_SHORTEST_WAIT_S)
             }
@@ -179,11 +216,14 @@ impl<C: Ctl> Session<'_, C> {
         if up_for < WOKEN_MARGIN {
             return Ok(());
         }
-        if row.cause == RetryCause::NoResponse
-            && row.waited_s.is_none_or(|waited| waited <= up_for.as_secs())
-        {
-            return Ok(());
-        }
+        let why = match row.cause {
+            RetryCause::Unreachable | RetryCause::Stalled => {
+                "the API is measured up since the wake"
+            }
+            RetryCause::NoResponse => {
+                "its try crossed the sleep, and the API is measured up since the wake"
+            }
+        };
         let reading = reader.read(&screen.rows, Some(screen.cursor_col));
         let read = self.composer_read(&reading, screen);
         let composer = TurnEndReading::of(&reading, &screen.rows, read, None, None, None).composer;
@@ -200,8 +240,7 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 self.turn_end.woken_esc(resume);
                 review.say(&format!(
-                    "{UNSTUCK} seq={seq} the turn slept in the vendor's API retry ({}); the API is \
-                     measured up since the wake: Esc",
+                    "{UNSTUCK} seq={seq} the turn slept in the vendor's API retry ({}); {why}: Esc",
                     clip(&row.text)
                 ))?;
             }

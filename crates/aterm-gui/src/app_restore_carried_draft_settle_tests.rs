@@ -218,8 +218,10 @@ fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
     }
 }
 
+/// A slider row takes a carried draft into its exact field, so the draft is held, not
+/// said lost.
 #[test]
-fn a_draft_for_a_slider_row_is_said_not_taken() {
+fn a_draft_for_a_slider_row_comes_back_in_its_exact_field() {
     let mut app = App::headless_for_test();
     app.native_config_service =
         crate::native_config_service::VersionedConfigService::new("font_px = 14\n".into())
@@ -235,16 +237,19 @@ fn a_draft_for_a_slider_row_is_said_not_taken() {
     else {
         panic!("the Settings leaf reopened");
     };
-    assert!(
-        !state.field_inputs.contains_key(crate::prefs::EDIT_FONT_PX),
-        "the slider row holds no text draft"
+    assert_eq!(
+        state
+            .field_inputs
+            .get(crate::prefs::EDIT_FONT_PX)
+            .map(crate::native_text_input::TextInputState::value),
+        Some("17 px, maybe"),
+        "the slider row holds the draft in its exact field"
     );
     app.settle_carried_settings_drafts();
     let rows = loss_rows(&app);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(
-        rows[0].detail[0],
-        format!("{}: 17 px, maybe", crate::prefs::EDIT_FONT_PX)
+    assert!(
+        rows.is_empty(),
+        "a draft its view holds is not lost: {rows:?}"
     );
 }
 

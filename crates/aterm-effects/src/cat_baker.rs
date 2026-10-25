@@ -234,11 +234,17 @@ impl CatBaker {
     #[inline]
     fn touch(&mut self, key: SlotKey) -> Option<CatTile> {
         let clock = self.clock;
-        let slot = self.slots.iter_mut().flatten().find(|s| s.key == key)?;
-        slot.last_used = clock;
-        Some(CatTile {
-            art: Arc::clone(&slot.art),
-        })
+        for slot in &mut self.slots {
+            if let Some(s) = slot
+                && s.key == key
+            {
+                s.last_used = clock;
+                return Some(CatTile {
+                    art: Arc::clone(&s.art),
+                });
+            }
+        }
+        None
     }
 
     /// Spend one bake from this frame's budget and pick the slot to bake into: a
@@ -948,10 +954,11 @@ pub const fn accessory_attach(acc: CatGlyphId) -> (f32, f32, f32) {
 /// aspect: a wide bow gets shorter, a tall bell narrower.
 #[inline]
 const fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
+    const INV_1000: f32 = 1.0 / 1000.0;
     let (cx, cy, s) = accessory_attach(acc);
     let max_w = s * w as f32;
     let max_h = s * h as f32;
-    let aspect = (GLYPHS[acc as usize].aspect_x1000 as f32 / 1000.0).max(0.001);
+    let aspect = (GLYPHS[acc as usize].aspect_x1000 as f32 * INV_1000).max(0.001);
     let (bw, bh) = if max_w / max_h > aspect {
         (max_h * aspect, max_h)
     } else {
@@ -1295,10 +1302,10 @@ fn paint_open_eye_reflections(
     }
     let mut painted_mask = false;
 
-    for reflection in meta.reflections[..usize::from(meta.reflection_count)]
-        .iter()
-        .flatten()
-    {
+    for slot in &meta.reflections[..usize::from(meta.reflection_count)] {
+        let Some(reflection) = slot else {
+            continue;
+        };
         let eye_w = reflection.eye_w_norm * xform.scale_x;
         let eye_h = reflection.eye_h_norm * xform.scale_y;
         let minor = eye_w.min(eye_h);
@@ -1358,20 +1365,23 @@ fn paint_glyph(
     let idx = id as usize;
     let def = &GLYPHS[idx];
     let meta = &GLYPH_META[idx];
-    let coat_lum = meta
-        .needs_coat_lum
-        .then(|| relative_luminance(packed_rgb(fills.coat)));
-    let eye_xform = (!matches!(eyes, EyesFrame::Open))
-        .then_some(meta.eye_line)
-        .flatten()
-        .map_or(xform, |yc| {
-            let openness = eyes.openness();
-            PathTransform {
-                scale_y: openness * xform.scale_y,
-                dy: xform.dy + yc * (1.0 - openness) * xform.scale_y,
-                ..xform
-            }
-        });
+    let coat_lum = if meta.needs_coat_lum {
+        Some(relative_luminance(packed_rgb(fills.coat)))
+    } else {
+        None
+    };
+    let eye_xform = if !matches!(eyes, EyesFrame::Open)
+        && let Some(yc) = meta.eye_line
+    {
+        let openness = eyes.openness();
+        PathTransform {
+            scale_y: openness * xform.scale_y,
+            dy: xform.dy + yc * (1.0 - openness) * xform.scale_y,
+            ..xform
+        }
+    } else {
+        xform
+    };
     for layer in def.layers {
         // A shut eye shows no iris or catch-light.
         if matches!(eyes, EyesFrame::Blink)

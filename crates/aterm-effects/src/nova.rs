@@ -310,17 +310,22 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     let extent = 2.0 * re;
     let bands = ring_band_count(extent);
     let top = env.cy as f32 - re;
-    let base_cov = (fade.max(0.0).sqrt() * env.intensity).clamp(0.0, 1.0);
+    let base_cov = (crate::color_math::sqrt_f32(fade.max(0.0)) * env.intensity).clamp(0.0, 1.0);
     if base_cov == 0.0 {
         return;
     }
     let fringe = vivid_fringe(env.core, env.fringe);
     let cxf = env.cx as f32;
-    let rings = [(r, env.core, 1.0f32), (r + chroma, fringe, 0.55)].map(|(rr, color, scale)| {
-        let ro = rr + 0.5 * thick;
-        let ri = (rr - 0.5 * thick).max(0.0);
-        (ro * ro, ri * ri, color, base_cov * scale)
-    });
+    let half_thick = 0.5 * thick;
+    let ro0 = r + half_thick;
+    let ri0 = (r - half_thick).max(0.0);
+    let rr1 = r + chroma;
+    let ro1 = rr1 + half_thick;
+    let ri1 = (rr1 - half_thick).max(0.0);
+    let rings = [
+        (ro0 * ro0, ri0 * ri0, env.core, base_cov),
+        (ro1 * ro1, ri1 * ri1, fringe, base_cov * 0.55),
+    ];
     let inv_bands = 1.0 / bands as f32;
     let mut prev_y1f = 0.0f32;
     for i in 0..bands {
@@ -339,9 +344,13 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
             if d2_o <= 0.0 {
                 continue;
             }
-            let wo = d2_o.sqrt();
+            let wo = crate::color_math::sqrt_f32(d2_o);
             let d2_i = ri2 - dy2;
-            let wi = if d2_i > 0.0 { d2_i.sqrt() } else { 0.0 };
+            let wi = if d2_i > 0.0 {
+                crate::color_math::sqrt_f32(d2_i)
+            } else {
+                0.0
+            };
             if wo - wi < 0.05 {
                 continue;
             }
@@ -424,7 +433,7 @@ fn emit_rays(
             dir
         } else {
             let ang = std::f32::consts::TAU * (rot_turn + k as f32 / nrays_f);
-            ang.sin_cos()
+            crate::supernova::sin_cos_f32(ang)
         };
         let major_x = dx.abs() >= dy.abs();
         let maj = dx.abs().max(dy.abs());
@@ -488,7 +497,7 @@ fn emit_rays(
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     const INV_FLASH_SPAN_MS: f32 = 1.0 / (FLASH_END_MS - DIP_MS) as f32;
     let e = (t_ms.saturating_sub(DIP_MS)) as f32 * INV_FLASH_SPAN_MS;
-    let envl = (std::f32::consts::PI * e.clamp(0.0, 1.0)).sin();
+    let envl = crate::supernova::sin_cos_f32(std::f32::consts::PI * e.clamp(0.0, 1.0)).0;
     let ch = env.cell_h as f32;
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
     let r = 1.3 * ch;
@@ -546,14 +555,20 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     let fringe = vivid_fringe(env.core, env.fringe);
     const INV_2_TWINKLE_GRID_MS: f32 = 1.0 / (2.0 * TWINKLE_GRID_MS as f32);
     let tw_base = t_ms as f32 * INV_2_TWINKLE_GRID_MS;
-    let tw_pair = [0.0f32, 0.5].map(|grid_phase| {
-        0.35 + 0.65 * (0.5 + 0.5 * (std::f32::consts::TAU * (tw_base + grid_phase)).sin())
-    });
-    let alpha_pair = tw_pair.map(|tw| (env.intensity * fade * tw).clamp(0.0, 1.0));
+    let tw_sin = crate::supernova::sin_cos_f32(std::f32::consts::TAU * tw_base).0;
+    let tw0 = 0.35 + 0.65 * (0.5 + 0.5 * tw_sin);
+    let tw1 = 0.35 + 0.65 * (0.5 - 0.5 * tw_sin);
+    let alpha_pair = [
+        (env.intensity * fade * tw0).clamp(0.0, 1.0),
+        (env.intensity * fade * tw1).clamp(0.0, 1.0),
+    ];
     if alpha_pair[0] <= 0.01 && alpha_pair[1] <= 0.01 {
         return;
     }
-    let alpha_u8_pair = alpha_pair.map(|a| (a * 255.0).round() as u8);
+    let alpha_u8_pair = [
+        (alpha_pair[0] * 255.0).round() as u8,
+        (alpha_pair[1] * 255.0).round() as u8,
+    ];
     let sing_contract = if singularity { 1.0 - ease_out(qn) } else { 0.0 };
     let ch_f = env.cell_h as f32;
     let grav_drop = 0.5 * (2.2 * ch_f) * age * age;
@@ -575,7 +590,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
         let r1 = ((s >> 16) & 0xffff) as f32 * INV_65535;
         let r2 = ((s >> 32) & 0xff) as f32 * INV_255;
         let ang = std::f32::consts::TAU * r0;
-        let (sin_a, cos_a) = ang.sin_cos();
+        let (sin_a, cos_a) = crate::supernova::sin_cos_f32(ang);
         let (x, y) = if singularity {
             let rr = env.r_max * (0.6 + 0.4 * r1) * sing_contract;
             (cxf + cos_a * rr, cyf + sin_a * rr)

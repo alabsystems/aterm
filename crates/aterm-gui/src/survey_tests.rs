@@ -1070,25 +1070,24 @@ fn the_header_names_this_machine_and_its_instances() {
 
 #[test]
 fn an_agent_with_no_excerpts_shows_its_last_rows() {
-    let gemini = crate::session_store::test_handle(4);
+    let agy = crate::session_store::test_handle(4);
     {
         const PGID: i32 = 4343;
-        let mut tl = gemini.ctx.timeline.lock().unwrap();
+        let mut tl = agy.ctx.timeline.lock().unwrap();
         tl.note_foreground_group(PGID);
-        tl.set_program(PGID, Some("gemini".into()));
+        tl.set_program(PGID, Some("agy".into()));
         tl.publish_agent(
             "idle",
             None,
             None,
-            Some(aterm_phase::Program::Gemini),
+            Some(aterm_phase::Program::Agy),
             crate::session_timeline::AgentStamp {
                 generation: crate::control::ScreenGen { epoch: 1, seq: 3 },
                 fp: 0x6e,
             },
         );
     }
-    gemini
-        .term
+    agy.term
         .lock()
         .unwrap()
         .process(b"The build is green.\r\nmy token is password=hunter2\r\n");
@@ -1100,20 +1099,20 @@ fn an_agent_with_no_excerpts_shows_its_last_rows() {
         .unwrap()
         .process(b"a row on the Claude Code screen\r\n");
     let store = crate::session_store::new_store();
-    store.write().unwrap().register(gemini);
+    store.write().unwrap().register(agy);
     store.write().unwrap().register(claude);
 
     let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
     let lines: Vec<&str> = out.lines().collect();
-    let (gemini_row, claude_row) = (fields(lines[2]), fields(lines[3]));
-    assert_eq!(gemini_row["program"], "gemini", "{out}");
-    assert_eq!(gemini_row["program_kind"], "agent", "{out}");
+    let (agy_row, claude_row) = (fields(lines[2]), fields(lines[3]));
+    assert_eq!(agy_row["program"], "agy", "{out}");
+    assert_eq!(agy_row["program_kind"], "agent", "{out}");
     assert!(
-        gemini_row["rows"].contains("The build is green."),
+        agy_row["rows"].contains("The build is green."),
         "{}",
         lines[2]
     );
-    assert!(!gemini_row["rows"].contains("hunter2"), "{}", lines[2]);
+    assert!(!agy_row["rows"].contains("hunter2"), "{}", lines[2]);
     assert_eq!(claude_row["said"], "Running the tests now.", "{out}");
     assert_eq!(claude_row["rows"], "-", "{}", lines[3]);
 }
@@ -1200,7 +1199,11 @@ fn shown(
     state: aterm_core::terminal::program_state::ProgramStateWord,
     kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
 ) -> Option<aterm_core::terminal::program_state::ProgramState> {
-    Some(aterm_core::terminal::program_state::ProgramState { state, kind })
+    Some(aterm_core::terminal::program_state::ProgramState {
+        state,
+        kind,
+        app: aterm_core::terminal::program_state::ProgramApp::Codex,
+    })
 }
 
 /// A codex row: its agent word is what codex-alab says of itself (OSC 7501) and its model,

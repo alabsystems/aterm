@@ -247,9 +247,9 @@ fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Option<Plan> {
     })
 }
 
-/// Whether [`upgrade_provisional_setup`] has work: the saved plan is aterm's own
-/// provisional one, which it widens once this Mac shows the ALab signal. Reads
-/// aterm's records only: no probe. An error when they cannot be read just now (a
+/// Whether a look for the ALab signal has work ([`provisional_setup_widened`]): the saved
+/// plan is aterm's own provisional one, which it offers to widen once this Mac shows the ALab
+/// signal. Reads aterm's records only: no probe. An error when they cannot be read just now (a
 /// pass writing them, say) or whose person is not settled yet.
 pub fn provisional_setup_widens() -> Result<bool, String> {
     if aterm_types::dirs::runs_under_private_state_root() {
@@ -326,8 +326,8 @@ impl InitialSetupUpgrade {
         self.attempt = None;
     }
 
-    /// Widen the provisional plan ([`upgrade_provisional_setup`]), or finish the held
-    /// attempt's commit: what it widened, or `None` when nothing changed.
+    /// Widen the provisional plan once its review admits it ([`provisional_setup_widened`]), or
+    /// finish the held attempt's commit: what it widened, or `None` when nothing changed.
     pub fn persist(&mut self) -> Result<Option<SetupUpgrade>, String> {
         if aterm_types::dirs::runs_under_private_state_root() {
             self.attempt = None;
@@ -376,13 +376,60 @@ impl InitialSetupUpgrade {
     }
 }
 
-/// Widen a provisional plan to the whole profile when this launch finds the ALab
-/// signal, as a new revision bound by its own reviewed-state ticket. Returns the
-/// admitted revision, or `None` when nothing changed.
-pub fn upgrade_provisional_setup() -> Result<Option<u64>, String> {
-    InitialSetupUpgrade::default()
-        .persist()
-        .map(|upgrade| upgrade.map(|upgrade| upgrade.to))
+/// The provisional plan in force and the plan it would widen to on this Mac now, saving
+/// nothing: the whole profile, in the vault a fresh offer names, once this Mac shows the ALab
+/// signal. `None` when the plan stays as it is ([`upgrade_of`]) or no signal is heard yet.
+/// System State offers it as a review of its own before anything is widened (design §3.5); the
+/// review's answer then widens it ([`InitialSetupUpgrade::persist`]) or declines it
+/// ([`decline_provisional_setup_widen`]). It may probe the network for a few seconds, so call
+/// it off the UI thread.
+pub fn provisional_setup_widened() -> Result<Option<(Plan, Plan)>, String> {
+    if aterm_types::dirs::runs_under_private_state_root() {
+        return Ok(None);
+    }
+    match person_scope() {
+        PersonScope::Refused(_) => return Ok(None),
+        PersonScope::Unresolved(why) => return Err(why),
+        PersonScope::Person => {}
+    }
+    widened_at(&state_root()?, alab_mac, live_configured_vault)
+}
+
+fn widened_at(
+    root: &Path,
+    alab: impl FnOnce() -> bool,
+    read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
+) -> Result<Option<(Plan, Plan)>, String> {
+    let Some((ticket, full)) = prepare_upgrade(root, alab, read)? else {
+        return Ok(None);
+    };
+    let in_force = ticket
+        .baseline_records()?
+        .presented_plan_record()
+        .map(|(plan, _)| plan)
+        .ok_or("the provisional plan in force is no longer saved")?;
+    Ok(Some((in_force, full)))
+}
+
+/// A person's Cancel of the review that offered to widen the provisional plan in force
+/// ([`provisional_setup_widened`]): that plan becomes theirs, saved as it is and no longer
+/// provisional, so no look or launch widens it or offers to again (design §3.5). One write of
+/// the plan's record, under the profile lock; its run, finished or not, stays as it was.
+/// `Ok(false)` when the plan in force is no longer aterm's provisional one.
+pub fn decline_provisional_setup_widen() -> Result<bool, String> {
+    observe_person_choice(decline_widen_at).result
+}
+
+fn decline_widen_at(root: &Path) -> Result<bool, String> {
+    let records = Records::read(root)?;
+    let Some((plan, true)) = records.plan else {
+        return Ok(false);
+    };
+    if !records.provisional {
+        return Ok(false);
+    }
+    save_plan_as(root, &plan, false)?;
+    Ok(true)
 }
 
 fn prepare_upgrade(
@@ -1054,6 +1101,46 @@ mod tests {
         assert!(widens_at(root.path()).is_err());
     }
 
+    /// A look that hears the ALab signal saves nothing: it names the plan in force and the plan
+    /// System State's review offers to widen it to (design §3.5). A person's Cancel of that
+    /// review keeps the plan in force as it is, theirs for good: no look offers it again, its
+    /// run stays as it was, and only its record changes.
+    #[test]
+    fn a_widen_is_offered_before_anything_widens_and_a_cancel_keeps_the_plan_for_good() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let narrow = provisional(root.path());
+        let before = observation_at(root.path()).unwrap();
+        assert_eq!(
+            widened_at(root.path(), || true, || Ok(None)).unwrap(),
+            Some((narrow.clone(), Plan::default()))
+        );
+        assert_eq!(
+            widened_at(root.path(), || false, || panic!("no signal reads no vault")).unwrap(),
+            None
+        );
+        assert_eq!(
+            observation_at(root.path()).unwrap(),
+            before,
+            "a look saves nothing"
+        );
+        let revision = revision_at(root.path()).unwrap();
+        let progress_before = std::fs::read(root.path().join("initial-setup.json")).unwrap();
+        assert!(decline_widen_at(root.path()).unwrap());
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(narrow));
+        assert!(!widens_at(root.path()).unwrap(), "the person's plan now");
+        assert_eq!(widened_at(root.path(), || true, || Ok(None)).unwrap(), None);
+        assert_eq!(revision_at(root.path()).unwrap(), revision);
+        assert_eq!(
+            std::fs::read(root.path().join("initial-setup.json")).unwrap(),
+            progress_before,
+            "its run stays as it was"
+        );
+        assert!(
+            !decline_widen_at(root.path()).unwrap(),
+            "nothing left to decline"
+        );
+    }
+
     /// An upgrade whose commit stops part-way is held, saying the revision it widens, and the
     /// next look finishes that commit, not a fresh one, from the revision it began from.
     #[test]
@@ -1366,6 +1453,7 @@ mod tests {
             restored: None,
             provisional,
             stop_request: None,
+            cancelled: None,
         };
         let widened = upgrade_of(&records(true, Decision::Pending), || true).unwrap();
         assert_eq!(widened.selection, Selection::all());

@@ -156,7 +156,7 @@ fn tracer_on_caret_row(
     dense.clear();
     for w in verts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        let n = ((b.x - a.x).hypot(b.y - a.y) * (1.0 / TRACER_STEP_PX))
+        let n = (crate::color_math::hypot_f32(b.x - a.x, b.y - a.y) * (1.0 / TRACER_STEP_PX))
             .ceil()
             .max(1.0) as u32;
         let inv_n = 1.0 / n as f32;
@@ -170,29 +170,36 @@ fn tracer_on_caret_row(
             });
         }
     }
-    dense.extend(verts.last().copied());
+    if let Some(&last_v) = verts.last() {
+        dense.push(last_v);
+    }
     let reach = half + TRACER_CLEAR_PX;
     let reach2 = reach * reach;
     let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
-    let crosses = dense.iter().any(|v| {
+    let mut crosses = false;
+    'verts: for v in dense.iter() {
         let (row, col) = (
             ((v.y - oy) * inv_ch).floor() as i32,
             ((v.x - ox) * inv_cw).floor() as i32,
         );
-        (row - 1..=row + 1)
-            .filter(|&r| Some(r) != caret_row)
-            .any(|r| {
-                (col - 1..=col + 1).any(|c| {
-                    if !(text.covers_cell(r, c) || text.covers_cell(r, c - 1)) {
-                        return false;
-                    }
-                    let (x0, y0) = (ox + c as f32 * cw, oy + r as f32 * ch);
-                    let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
-                    let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
-                    dx * dx + dy * dy < reach2
-                })
-            })
-    });
+        for r in row - 1..=row + 1 {
+            if Some(r) == caret_row {
+                continue;
+            }
+            for c in col - 1..=col + 1 {
+                if !(text.covers_cell(r, c) || text.covers_cell(r, c - 1)) {
+                    continue;
+                }
+                let (x0, y0) = (ox + c as f32 * cw, oy + r as f32 * ch);
+                let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
+                let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
+                if dx * dx + dy * dy < reach2 {
+                    crosses = true;
+                    break 'verts;
+                }
+            }
+        }
+    }
     if !crosses {
         return;
     }
@@ -204,30 +211,37 @@ fn tracer_on_caret_row(
         return;
     };
     let (top, bottom) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
-    let out_of_row = |v: &BeamVertex| v.y - half < top || v.y + half > bottom;
     // The edge the run enters the caret's row by: where it lies walking back
     // from the caret, the run's last vertex.
-    let from_below = !top_only
-        && dense
-            .iter()
-            .rev()
-            .find(|v| out_of_row(v))
-            .is_some_and(|v| v.y + half > bottom);
-    let inside = |v: &BeamVertex| {
-        if from_below {
-            bottom - (v.y + half)
-        } else {
-            v.y - half - top
+    let mut from_below = false;
+    if !top_only {
+        let mut idx = dense.len();
+        while idx > 0 {
+            idx -= 1;
+            let v = &dense[idx];
+            if v.y - half < top || v.y + half > bottom {
+                from_below = v.y + half > bottom;
+                break;
+            }
         }
+    }
+    let room = match dense.last() {
+        Some(v) if from_below => bottom - (v.y + half),
+        Some(v) => v.y - half - top,
+        None => leave,
     };
-    let room = dense.last().map_or(leave, inside);
     let span = leave.min(room).max(1.0);
     let inv_span = 1.0 / span;
     for v in dense.iter_mut() {
-        let k = if out_of_row(v) {
+        let k = if v.y - half < top || v.y + half > bottom {
             0.0
         } else {
-            let u = (inside(v) * inv_span).clamp(0.0, 1.0);
+            let inside = if from_below {
+                bottom - (v.y + half)
+            } else {
+                v.y - half - top
+            };
+            let u = (inside * inv_span).clamp(0.0, 1.0);
             u * u * (3.0 - 2.0 * u)
         };
         v.cov = (f32::from(v.cov) * k).round() as u8;
@@ -392,12 +406,12 @@ impl ClassicWake {
             }
             None => false,
         });
-        self.ring = self
-            .ring
-            .and_then(|r| map(r.row).map(|row| Ring { row, ..r }));
-        self.last = self
-            .last
-            .and_then(|(row, col)| map(row).map(|row| (row, col)));
+        if let Some(r) = self.ring {
+            self.ring = map(r.row).map(|row| Ring { row, ..r });
+        }
+        if let Some((row, col)) = self.last {
+            self.last = map(row).map(|r| (r, col));
+        }
     }
 
     /// Advances one frame and emits wake quads and halos.
@@ -438,9 +452,10 @@ impl ClassicWake {
         if let Some(t0) = self.heat_at
             && self.heat > 0.0
         {
+            const INV_HEAT_DECAY_TAU: f32 = 1.0 / ClassicWake::HEAT_DECAY_TAU;
             let dt = now.saturating_duration_since(t0).as_secs_f32();
             if dt > 0.0 {
-                self.heat *= (-dt / Self::HEAT_DECAY_TAU).exp();
+                self.heat *= crate::color_math::exp_f32(-dt * INV_HEAT_DECAY_TAU);
                 if self.heat < 0.005 {
                     self.heat = 0.0;
                 }
@@ -486,7 +501,7 @@ impl ClassicWake {
         {
             self.ring = None;
         }
-        if self.crown_until.is_some_and(|t| now >= t) {
+        if matches!(self.crown_until, Some(t) if now >= t) {
             self.crown_until = None;
         }
 
@@ -521,10 +536,11 @@ impl ClassicWake {
             self.emit_light_comet(now, cfg, geom, cur, under, ink.text);
             under.truncate(Self::MAX_QUADS);
             if let Some(ring) = &mut self.ring
-                && let Some(at) =
-                    cur.filter(|&(r, c)| usize::from(r) < geom.rows && usize::from(c) < geom.cols)
+                && let Some((r, c)) = cur
+                && usize::from(r) < geom.rows
+                && usize::from(c) < geom.cols
             {
-                ring.caret = at;
+                ring.caret = (r, c);
             }
             self.emit_light_ring(now, cfg, geom, cur, halos);
             halos.truncate(CursorGlow::MAX_HALOS);
@@ -577,10 +593,10 @@ impl ClassicWake {
         geom: Geom,
     ) {
         let gap = if typing {
-            let gap = self
-                .last_type
-                .map(|t| now.saturating_duration_since(t).as_secs_f32())
-                .unwrap_or(f32::MAX);
+            let gap = match self.last_type {
+                Some(t) => now.saturating_duration_since(t).as_secs_f32(),
+                None => f32::MAX,
+            };
             let cadence = 1.0
                 - ((gap - Self::HEAT_GAP_FULL) / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL))
                     .clamp(0.0, 1.0);
@@ -652,13 +668,14 @@ impl ClassicWake {
 
     #[inline]
     fn spark_tf(s: &Spark, now: Instant) -> f32 {
+        const PI_OVER_045: f32 = std::f32::consts::PI / 0.45;
         let age = now.saturating_duration_since(s.born).as_secs_f32();
         let frac = (age / s.life).clamp(0.0, 1.0);
         if s.typing {
             if frac < 0.55 {
                 1.0
             } else {
-                0.5 * (1.0 + (std::f32::consts::PI * (frac - 0.55) / 0.45).cos())
+                0.5 * (1.0 + crate::supernova::sin_cos_f32((frac - 0.55) * PI_OVER_045).1)
             }
         } else {
             1.0 - frac
@@ -853,7 +870,10 @@ impl ClassicWake {
             under,
         );
         self.bed_scratch = scratch;
-        let caret = cur.is_some_and(|(r, c)| (r as usize) < geom.rows && (c as usize) < geom.cols);
+        let caret = matches!(
+            cur,
+            Some((r, c)) if (r as usize) < geom.rows && (c as usize) < geom.cols
+        );
         let n = split_air_runs(
             &self.comet_runs[..live],
             geom,
@@ -869,9 +889,12 @@ impl ClassicWake {
         let clip = geom.beam_clip();
         let caret_cell = cur.map(|(cr, cc)| CursorGlow::caret_box(geom, cr, cc));
         for (i, r) in self.air_runs[..n].iter().enumerate() {
-            let stub = (caret && i + 1 == n && matches!(r.as_slice(), [knee, _] if knee.cov == 0))
-                .then_some(caret_cell)
-                .flatten();
+            let stub = if caret && i + 1 == n && matches!(r.as_slice(), [knee, _] if knee.cov == 0)
+            {
+                caret_cell
+            } else {
+                None
+            };
             let from = out.len();
             if r.len() < 2 {
                 let s0 = r[0];
@@ -1221,8 +1244,15 @@ impl ClassicWake {
         let unbound = false;
         #[cfg(test)]
         let unbound = self.veil_unbound;
-        let on = |&(r, c): &(u16, u16)| usize::from(r) < geom.rows && usize::from(c) < geom.cols;
-        let on_grid = cur.filter(on).or(Some(ring.caret).filter(on));
+        let on_grid = match cur {
+            Some((r, c)) if usize::from(r) < geom.rows && usize::from(c) < geom.cols => {
+                Some((r, c))
+            }
+            _ if usize::from(ring.caret.0) < geom.rows && usize::from(ring.caret.1) < geom.cols => {
+                Some(ring.caret)
+            }
+            _ => None,
+        };
         let (centre, radii, cap) = match on_grid {
             Some((r, c)) if !unbound => {
                 let (cw, ch) = (geom.cw as f32, chf_of(geom));

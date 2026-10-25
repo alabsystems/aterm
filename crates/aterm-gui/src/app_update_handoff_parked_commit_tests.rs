@@ -968,6 +968,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
             restore: || false,
             status: crate::SetupStatus::default,
             observe: |_| false,
+            look_for_token: |_| false,
             stop: || {},
             settle: || {
                 if SETTLE_WAITS.get() {

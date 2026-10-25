@@ -4328,7 +4328,7 @@ mod tests {
         let word = |tree: &SplitTree<(u8, Option<Program>)>, id| {
             agent_pane_word(tree, |leaf| leaf.0 == id, |leaf| leaf.1)
         };
-        let ordinary = split((1, Some(Program::Claude)), (2, Some(Program::Gemini)));
+        let ordinary = split((1, Some(Program::Claude)), (2, Some(Program::Agy)));
         assert_eq!(word(&ordinary, 1).as_deref(), Some("left pane"));
         assert_eq!(word(&ordinary, 2).as_deref(), Some("right pane"));
         let refused = split((1, Some(Program::Claude)), (2, None));

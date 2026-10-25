@@ -75,7 +75,7 @@ pub(crate) fn launch_transition(
                 assert!(why.contains("holds its own"), "{why}");
             }
             if case == 10 {
-                assert!(why.contains("could not record fresh usage"), "{why}");
+                assert!(why.contains(accounts::LOCK_HELD), "{why}");
             }
             2
         }
@@ -87,6 +87,20 @@ pub(crate) fn launch_transition(
     next.insert("phase", 2);
     next.insert("outcome", outcome);
     next
+}
+
+#[test]
+fn a_lost_binding_snapshot_holds_launch_before_usage_is_read() {
+    let world = World::new("launch-lost-bindings");
+    world.two(Cli::Codex);
+    let store = world.seat().store(Cli::Codex);
+    store.save_logins(&accounts::Logins::default()).unwrap();
+    std::fs::rename(store.logins_file(), world.root.join("kept-bindings.json")).unwrap();
+    let no_read =
+        |_: Cli, _: &Path, _: i64| -> Option<Usage> { panic!("unknown binding usage read") };
+    let why = super::super::launch_env(&world.seat(), Cli::Codex, &no_read).unwrap_err();
+    assert!(why.contains("logins.seen"), "{why}");
+    assert!(!store.logins_file().exists());
 }
 
 #[test]

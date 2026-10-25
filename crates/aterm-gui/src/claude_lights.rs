@@ -656,7 +656,7 @@ pub(crate) enum Target {
     Chip(Chip),
     Fact(Fact),
     /// The harness switch on the top rule ([`BorderSwitch`]), the keyboard's
-    /// last stop in a pane whose rule draws one (a Gemini pane's only one).
+    /// last stop in a pane whose rule draws one.
     Switch,
 }
 
@@ -3521,22 +3521,25 @@ impl App {
         })
     }
 
-    /// A press of session `session`'s harness switch in window `wid`.
+    /// A press, at `at`, of session `session`'s harness switch in window `wid`.
     pub(crate) fn press_harness_switch(
         &mut self,
         wid: WindowId,
         session: u64,
         shown: crate::autopilot::HarnessSwitch,
+        at: Instant,
     ) {
         use crate::autopilot::HarnessSwitch;
-        let now = Instant::now();
         if self
             .windows
             .get(&wid)
-            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, now))
+            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, at))
         {
             return;
         }
+        // `at` places the press in a run of presses; the settle deadline runs on the clock the
+        // frames that end it read.
+        let now = Instant::now();
         let (_, view, _) = self.session_autopilot(session);
         let turning = |app: &mut Self, on: bool| {
             if let Some(ws) = app.windows.get_mut(&wid) {
@@ -3576,7 +3579,7 @@ impl App {
                     .sessions
                     .entry(session)
                     .or_default()
-                    .switch_pressed = Some(now);
+                    .switch_pressed = Some(at);
             }
             redraw(ws);
         }
@@ -3590,23 +3593,24 @@ impl App {
         wid: WindowId,
         session: u64,
         face: crate::autopilot::HarnessSwitch,
+        at: Instant,
     ) {
         if self.inline_rename_edit(wid).is_some() {
             self.clear_strip_press(wid);
             self.settle_rename_edit(wid);
         }
-        self.press_harness_switch(wid, session, face);
+        self.press_harness_switch(wid, session, face, at);
     }
 
-    /// A left press on a chip acts on it ([`Self::press_claude_chip`]).
-    pub(crate) fn press_claude_light(&mut self, wid: WindowId) -> bool {
+    /// A left press at `at` on a chip acts on it ([`Self::press_claude_chip`]).
+    pub(crate) fn press_claude_light(&mut self, wid: WindowId, at: Instant) -> bool {
         let (x, y) = self
             .windows
             .get(&wid)
             .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-        let Some((session, at)) = self.claude_glass_at(wid, x, y) else {
+        let Some((session, glass)) = self.claude_glass_at(wid, x, y) else {
             if let Some((session, url)) = self.claude_notice_at(wid, x, y) {
-                return self.press_claude_notice(wid, session, url);
+                return self.press_claude_notice(wid, session, url, at);
             }
             return false;
         };
@@ -3615,15 +3619,15 @@ impl App {
                 .windows
                 .get(&wid)
                 .is_some_and(|ws| ws.mods.control_key());
-        match at {
+        match glass {
             GlassAt::Chip(chip) => {
                 if secondary && self.open_autopilot_menu_at(wid, x, y) {
                     return true;
                 }
-                self.press_visible_claude_chip(wid, session, chip)
+                self.press_visible_claude_chip(wid, session, chip, at)
             }
             GlassAt::Switch(face) => {
-                self.press_switch_as_clicked(wid, session, face);
+                self.press_switch_as_clicked(wid, session, face, at);
                 true
             }
             GlassAt::Fact(..) if secondary => {
@@ -3676,6 +3680,7 @@ impl App {
         wid: WindowId,
         session: u64,
         url: Option<&'static str>,
+        at: Instant,
     ) -> bool {
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
             return false;
@@ -3708,7 +3713,7 @@ impl App {
             && self
                 .windows
                 .get_mut(&wid)
-                .is_some_and(|ws| !ws.claude_card.link_press_repeats(session, Instant::now()))
+                .is_some_and(|ws| !ws.claude_card.link_press_repeats(session, at))
         {
             crate::app_mouse::open_url_external(url);
         }
@@ -3721,6 +3726,7 @@ impl App {
         wid: WindowId,
         session: u64,
         chip: Option<Chip>,
+        at: Instant,
     ) -> bool {
         let shown = self.windows.get(&wid).is_some_and(|ws| {
             ws.claude_lights.hits.iter().any(|hit| {
@@ -3737,30 +3743,36 @@ impl App {
             self.settle_rename_edit(wid);
         }
         if let Some(chip) = chip {
-            self.press_claude_chip(wid, session, chip);
+            self.press_claude_chip(wid, session, chip, at);
         }
         true
     }
 
-    /// What a click on `chip` of `session` does.
-    pub(crate) fn press_claude_chip(&mut self, wid: WindowId, session: u64, chip: Chip) {
+    /// What a click at `at` on `chip` of `session` does.
+    pub(crate) fn press_claude_chip(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        chip: Chip,
+        at: Instant,
+    ) {
         match chip {
             Chip::Light(light) => self.toggle_claude_light(wid, session, light),
-            Chip::Autopilot => self.press_autopilot_chip(wid, session),
+            Chip::Autopilot => self.press_autopilot_chip(wid, session, at),
             Chip::Team => self.press_team_chip(wid, session),
         }
     }
 
-    /// The Autopilot chip's click.
-    fn press_autopilot_chip(&mut self, wid: WindowId, session: u64) {
-        let now = Instant::now();
+    /// The Autopilot chip's click at `at`.
+    fn press_autopilot_chip(&mut self, wid: WindowId, session: u64, at: Instant) {
         if self
             .windows
             .get(&wid)
-            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, now))
+            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, at))
         {
             return;
         }
+        let now = Instant::now();
         let in_flight = self
             .windows
             .get(&wid)
@@ -3778,7 +3790,7 @@ impl App {
                         .windows
                         .get(&wid)
                         .map_or(face, |ws| ws.claude_lights.switch_shown(session, face).0);
-                    self.press_harness_switch(wid, session, shown);
+                    self.press_harness_switch(wid, session, shown, at);
                 }
                 None => {
                     self.open_harness_settings(
@@ -4187,7 +4199,7 @@ impl App {
                 redraw(ws);
                 return match face {
                     Some(face) if clicks => {
-                        self.press_switch_as_clicked(wid, session, face);
+                        self.press_switch_as_clicked(wid, session, face, Instant::now());
                         true
                     }
                     _ => escape,
@@ -4243,7 +4255,7 @@ impl App {
             Key::Named(NamedKey::Enter | NamedKey::Space) if plain => {
                 ws.claude_lights.select(None);
                 redraw(ws);
-                self.press_claude_chip(wid, session, chip);
+                self.press_claude_chip(wid, session, chip, Instant::now());
                 true
             }
             Key::Named(NamedKey::Escape) => {
@@ -4511,7 +4523,7 @@ impl App {
                         })
                 });
                 if let Some(face) = shown {
-                    self.press_switch_as_clicked(wid, session, face);
+                    self.press_switch_as_clicked(wid, session, face, Instant::now());
                 }
                 return;
             }
@@ -4537,7 +4549,7 @@ impl App {
                 return;
             }
         };
-        self.press_visible_claude_chip(wid, session, Some(chip));
+        self.press_visible_claude_chip(wid, session, Some(chip), Instant::now());
     }
 
     /// A screen reader asked for session `session`'s Autopilot chip's menu on window `wid`.

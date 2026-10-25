@@ -549,7 +549,7 @@ pub(super) fn palette_blocks(
                         audit_id: crate::native_ui::THEME_SWATCH_AUDIT,
                         role: SemanticRole::Group,
                         label: String::new(),
-                        value: Some(if changed {
+                        paint: Some(if changed {
                             format!("{hex} changed")
                         } else {
                             hex

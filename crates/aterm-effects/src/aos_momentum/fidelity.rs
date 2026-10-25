@@ -49,8 +49,12 @@ fn instant(origin: Instant, at: u64) -> Instant {
 
 /// A recorded call's offset as the lane's `u64`.
 #[inline]
-fn offset(at: i128) -> u64 {
-    u64::try_from(at).unwrap_or(u64::MAX)
+const fn offset(at: i128) -> u64 {
+    if at >= 0 && at <= u64::MAX as i128 {
+        at as u64
+    } else {
+        u64::MAX
+    }
 }
 
 /// The `momentum-glow.lane-fidelity` contract, version 1.
@@ -144,13 +148,20 @@ impl LaneFidelity {
                 MomentumEvent::Tick { cur, at, geom, cfg } => (cur, offset(at), geom, cfg),
             };
             let cursor = n;
-            let Some(tick) = ticks.get(n).filter(|t| t.call == i && t.at == at) else {
+            let Some(tick) = ticks.get(n) else {
                 return fail(
                     cursor,
                     LANE_SETTLES,
                     format!("call {i}, a tick at {at} ns, is not the run's tick {n}"),
                 );
             };
+            if tick.call != i || tick.at != at {
+                return fail(
+                    cursor,
+                    LANE_SETTLES,
+                    format!("call {i}, a tick at {at} ns, is not the run's tick {n}"),
+                );
+            }
             n += 1;
             let p = at;
             let (geom, cfg) = (geom.geom(), cfg.config());
@@ -190,13 +201,18 @@ impl LaneFidelity {
                     format!("the settle wake at {w} ns is not after the tick at {p} ns"),
                 );
             }
-            while inputs.get(next_input).is_some_and(|&(t, _)| t <= p) {
+            while let Some(&(t, _)) = inputs.get(next_input)
+                && t <= p
+            {
                 next_input += 1;
             }
-            let latest = next_input
-                .checked_sub(1)
-                .and_then(|j| inputs.get(j))
-                .map_or(0, |&(t, _)| t);
+            let latest = if next_input > 0
+                && let Some(&(t, _)) = inputs.get(next_input - 1)
+            {
+                t
+            } else {
+                0
+            };
             if p.saturating_sub(latest) > HANG_NS {
                 return fail(
                     cursor,
@@ -215,15 +231,17 @@ impl LaneFidelity {
                     format!("the lane stopped after the tick at {p} ns: {fault}"),
                 );
             }
-            let next = [
-                ticks.get(n).map(|t| t.at),
-                inputs.get(next_input).map(|&(t, _)| t),
-                Some(scenario.end_ns()),
-            ]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(p);
+            let mut next = scenario.end_ns();
+            if let Some(t) = ticks.get(n)
+                && t.at < next
+            {
+                next = t.at;
+            }
+            if let Some(&(t, _)) = inputs.get(next_input)
+                && t < next
+            {
+                next = t;
+            }
             // An interval ending within a frame and δ of `p` is not judged: a probe clamped to `p + f` sees the step a shipped wake one margin later was armed for.
             let floor = p.saturating_add(f);
             // The drawn step only decays between lane events, so one probe δ before the next event sees any step slept through.

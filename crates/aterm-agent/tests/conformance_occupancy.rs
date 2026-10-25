@@ -3,8 +3,11 @@
 
 //! Tier-1 conformance of `OccupancyDoor` to `occupancy::decide`, `write_held`, `HoldClock` and
 //! `Books`; in its stuck runs (`Key = 1`), to `FactsState` and `stuck_at_break` under the
-//! `[harness] stuck_break_note` grant; in its hold-rule runs, `age` and `esc` to the K clock
-//! (`DueClock`), whose `sample` its `Sample` and `SampleLast` drive in their own evidence windows.
+//! `[harness] stuck_break_note` grant; in its wake runs (`due = 2`), to the book's head a break
+//! tells (`rules::wake_opens`, which `OpenWake` drives in its own evidence window), the wake's
+//! episode told per episode (`FactsState`) and the hold a pending wake declares; in its hold-rule
+//! runs, `age` and `esc` to the K clock (`DueClock`), whose `sample` its `Sample` and `SampleLast`
+//! drive in their own evidence windows.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -15,10 +18,12 @@ use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_agent::supervise::occupancy::reading::LOOK_EVERY_MS;
 use aterm_agent::supervise::occupancy::rules::{
     HOLD_ROOM_AFTER_MS, HOLD_ROOM_APART_MS, SESSION_PACE_MS, WAIT_NUDGE_AFTER_MS, episode,
+    wake_opens,
 };
+use aterm_agent::supervise::occupancy::wakes_seen::{AtomKind, Declarer, Prio, WakeState};
 use aterm_agent::supervise::occupancy::{
     AtWrite, Books, Guards, HoldClock, HoldEvent, HoldSeen, OccupancyReading, RuleId, SlotsSeen,
-    StuckVerdict, Verdict, decide, stuck_at_break, write_held,
+    StuckVerdict, Verdict, WakeSeen, WakeSight, WakesSeen, decide, stuck_at_break, write_held,
 };
 use aterm_agent::supervise::{Autopilot, BackgroundCall, Guard, SupervisorConfig};
 use aterm_models_harness::occupancy_door_model;
@@ -64,6 +69,9 @@ struct Real {
     look: i64,
     /// The episode the K clock was last fed, if any.
     k_key: Option<EpisodeKey>,
+    /// The session's book of wakes as the loop reads it: in a wake run, the episode's wake (its
+    /// condition held and its need met where the model's `cond` holds); empty otherwise.
+    wakes: WakesSeen,
 }
 
 /// How a walk departs from the committed real code, for the negative controls.
@@ -105,6 +113,42 @@ fn facts_read(r: &Real, names: bool) -> FactsReading {
         } else {
             Vec::new()
         },
+    }
+}
+
+/// Wake `ord` as declared at `T0 + ord`, pending, its need named: the episode a wake run walks.
+fn declared(ord: u16) -> WakeSeen {
+    WakeSeen {
+        ord,
+        class: Declarer::Agent,
+        prio: Prio::Normal,
+        state: WakeState::Pending,
+        declared_ms: T0 + i64::from(ord),
+        ready_since_ms: None,
+        kinds: vec![AtomKind::File],
+        need: Some(String::from("sys slots>=1 for=1200000ms")),
+        need_slots: true,
+        need_met: false,
+        await_only: false,
+    }
+}
+
+/// The book's head as a break reads it at `r`: the wake whose line it tells, if any.
+fn sight<'a>(r: &'a Real, told: &'a dyn Fn(u64) -> bool) -> WakeSight<'a> {
+    WakeSight {
+        seen: &r.wakes,
+        wall_ms: r.now,
+        told,
+        ranked: true,
+    }
+}
+
+/// The wake episodes `r`'s rows say were typed.
+fn wake_told(r: &Real) -> impl Fn(u64) -> bool + '_ {
+    |id| {
+        r.rows.iter().any(|(key, _, outcome)| {
+            key.kind == FactKind::Wake && key.id == id && *outcome == SeedOutcome::Typed
+        })
     }
 }
 
@@ -237,9 +281,9 @@ fn stuck_said(m: &Model, st: &State, r: &Real, run: Run) -> Said {
 }
 
 /// The decider's verdicts at `st` on the real side.
-fn verdicts(m: &Model, st: &State, r: &Real, run: Run) -> [(RuleId, Verdict); 2] {
+fn verdicts(m: &Model, st: &State, r: &Real, run: Run) -> [(RuleId, Verdict); RuleId::COUNT] {
     let reading = match run.rule {
-        RuleId::WaitNudge => OccupancyReading::default(),
+        RuleId::WaitNudge | RuleId::Wake => OccupancyReading::default(),
         RuleId::HoldRoom => board(st["cond"] == 1),
     };
     let hold = r.clock.since_ms().map(|since_ms| HoldSeen {
@@ -247,7 +291,16 @@ fn verdicts(m: &Model, st: &State, r: &Real, run: Run) -> [(RuleId, Verdict); 2]
         declared: r.clock.declared(),
     });
     let g = guards(st, autopilot(m), run.variant);
-    decide(&reading, hold, &r.books, &g, WAIT_NUDGE_AFTER_MS, r.now)
+    let told = wake_told(r);
+    decide(
+        &reading,
+        hold,
+        &r.books,
+        &g,
+        WAIT_NUDGE_AFTER_MS,
+        r.now,
+        &sight(r, &told),
+    )
 }
 
 /// What the door's write is told at the break: the host's line and the upgrade's notice.
@@ -279,6 +332,7 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
             Verdict::Held(g) => Said::Held(term(g)),
             Verdict::Paced { .. } => Said::Paced,
             Verdict::Spent => Said::Other(String::from("spent")),
+            Verdict::Outranked => Said::Other(String::from("outranked")),
         };
     }
     said
@@ -288,7 +342,7 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
 /// episode with the guard holding it (for a due line, the one its write finds; for a paced one,
 /// none), or nothing for a quiet or spent line. The stuck fact's line does not feed it.
 fn k_feed(m: &Model, st: &State, r: &mut Real, run: Run) {
-    if run.stuck {
+    if run.stuck || run.rule == RuleId::Wake {
         return;
     }
     let held = verdicts(m, st, r, run)
@@ -297,7 +351,7 @@ fn k_feed(m: &Model, st: &State, r: &mut Real, run: Run) {
         .and_then(|(rule, verdict)| match verdict {
             Verdict::Held(g) => Some(Some(g)),
             Verdict::Due(_) => Some(write_held(rule, at_write(r))),
-            Verdict::Paced { .. } => Some(None),
+            Verdict::Paced { .. } | Verdict::Outranked => Some(None),
             Verdict::Quiet | Verdict::Spent => None,
         });
     let named: Vec<(EpisodeKey, Option<Guard>)> = held
@@ -311,9 +365,11 @@ fn k_feed(m: &Model, st: &State, r: &mut Real, run: Run) {
 
 /// Whether the walk holds `age` and `esc` to the K clock: in a hold rule's run, committed or with
 /// a defect planted in the clock. A defect in the decider or the hold already shows through `held`
-/// and the verdict, so the clock downstream of it is not checked there.
+/// and the verdict, so the clock downstream of it is not checked there. A wake's line feeds the
+/// window's own wake K clock, never the loop's.
 fn k_projected(run: Run) -> bool {
     !run.stuck
+        && run.rule != RuleId::Wake
         && run.fault.is_none_or(|f| {
             matches!(
                 f,
@@ -330,9 +386,13 @@ fn person_holds(r: &Real) -> bool {
         .is_some_and(|due| due.last == Some(Guard::Person))
 }
 
-fn agrees(m: &Model, st: &State, said: &Said, stuck: bool) -> bool {
+fn agrees(m: &Model, st: &State, said: &Said, run: Run) -> bool {
     let mut s = st.clone();
-    let open = if stuck { "OpenStuck" } else { "OpenNudge" };
+    let open = match (run.stuck, run.rule) {
+        (true, _) => "OpenStuck",
+        (false, RuleId::Wake) => "OpenWake",
+        (false, _) => "OpenNudge",
+    };
     if m.action_enabled(open, &s) {
         m.fire(open, &mut s);
     }
@@ -382,12 +442,13 @@ fn realizable(st: &State, action: &str, r: &Real, run: Run) -> bool {
         // A successor raises a line again at its first look, which a person's hand holds: the
         // Entry is down while they are at the tab.
         "Crash" if !run.stuck && st["esc"] == 1 => !person_holds(r),
-        "OpenWake" => false,
-        "OpenNudge" => !run.stuck,
+        "OpenWake" => !run.stuck && rule == RuleId::Wake,
+        "OpenNudge" => !run.stuck && rule != RuleId::Wake,
         "OpenStuck" => run.stuck,
         "Intend" | "Type" => st["door"] == 1,
         "UpgradeTypes" => st["held"] == 1,
-        "HoldAges" => st["told"] == 0 && st["paced"] == 0,
+        // A wake's line is of no hold's age: the hold a wake run opens never ages for it.
+        "HoldAges" => rule != RuleId::Wake && st["told"] == 0 && st["paced"] == 0,
         // A stuck line typed in a young hold: the pace's lapse must not age it unseen.
         "PaceLapses" if run.stuck => {
             st["held"] == 1
@@ -395,11 +456,11 @@ fn realizable(st: &State, action: &str, r: &Real, run: Run) -> bool {
                     .held_ms(r.now + SESSION_PACE_MS)
                     .is_none_or(|ms| ms < age_ms(rule))
         }
-        "Holds" => run.stuck || rule == RuleId::HoldRoom,
-        "Fails" => run.stuck || rule == RuleId::HoldRoom || st["owed"] == 0,
+        "Holds" => run.stuck || rule != RuleId::WaitNudge,
+        "Fails" => run.stuck || rule != RuleId::WaitNudge || st["owed"] == 0,
         // A door's second line is held by the pace its first one set, which the real door says
         // and the model's `lines` term does not tell apart: an episode closes past the door.
-        "Close" if run.stuck => st["lines"] == 0,
+        "Close" if run.stuck || rule == RuleId::Wake => st["lines"] == 0,
         "Close" => {
             rule == RuleId::WaitNudge
                 || (st["paced"] == 0
@@ -414,6 +475,7 @@ fn age_ms(rule: RuleId) -> i64 {
     match rule {
         RuleId::WaitNudge => WAIT_NUDGE_AFTER_MS,
         RuleId::HoldRoom => HOLD_ROOM_AFTER_MS,
+        RuleId::Wake => i64::MAX,
     }
 }
 
@@ -433,9 +495,32 @@ fn break_read(r: &mut Real, rule: RuleId) {
         r.clock.step(HoldEvent::HarnessLine);
         r.clock.step(HoldEvent::AnswerTail { waiting_line: true });
     }
+    // The book names a wake still to be told: the loop's settled read declares the hold.
+    if rule == RuleId::Wake && r.wakes.pending() > 0 {
+        r.clock.declare();
+    }
+}
+
+/// The wake the episode is of: the last the book holds.
+fn wake_now(r: &mut Real) -> &mut WakeSeen {
+    r.wakes
+        .wakes
+        .last_mut()
+        .expect("a wake run's book holds its wake")
 }
 
 fn episode_now(r: &Real, rule: RuleId) -> EpisodeKey {
+    if rule == RuleId::Wake {
+        let wake = r
+            .wakes
+            .wakes
+            .last()
+            .expect("a wake run's book holds its wake");
+        return EpisodeKey {
+            kind: FactKind::Wake,
+            id: wake.episode(),
+        };
+    }
     let since = r.clock.since_ms().expect("an open hold");
     EpisodeKey {
         kind: FactKind::Hold,
@@ -515,6 +600,23 @@ fn mirror(
             }
         }
         "Fails" if run.stuck => {}
+        "Holds" if rule == RuleId::Wake => {
+            let now = r.now;
+            let wake = wake_now(r);
+            if wake.state == WakeState::Pending {
+                wake.state = WakeState::Ready;
+                wake.ready_since_ms = Some(now);
+            }
+            wake.need_met = true;
+        }
+        "Fails" if rule == RuleId::Wake => wake_now(r).need_met = false,
+        "OpenWake" => {
+            let told = wake_told(r);
+            let opened = ev.step(action, || wake_opens(&sight(r, &told), &r.books).cloned());
+            if opened.is_none() {
+                return false;
+            }
+        }
         "Fails" if rule == RuleId::WaitNudge => {
             r.clock.step(HoldEvent::HarnessLine);
             r.clock.step(HoldEvent::AnswerTail { waiting_line: true });
@@ -527,6 +629,11 @@ fn mirror(
             }
             if run.stuck && run.variant % 2 == 1 {
                 r.birth += 1;
+            }
+            if rule == RuleId::Wake && !run.stuck {
+                // The told wake leaves the book, and the agent declares its next.
+                let next = r.wakes.wakes.last().map_or(1, |w| w.ord + 1);
+                r.wakes.wakes = vec![declared(next)];
             }
             r.episode = None;
         }
@@ -545,11 +652,16 @@ fn mirror(
             if run.stuck {
                 r.books.lined(r.now);
                 r.facts.told(key, r.now);
+            } else if rule == RuleId::Wake {
+                r.books.woke(key.id, r.now);
             } else {
                 r.books.fired(rule, r.now, true);
             }
             r.rows.push((key, r.now, SeedOutcome::Typed));
-            r.clock.step(HoldEvent::HarnessLine);
+            // A wake's line answers no hold (the model's `owed = held`, a wake's hold never old).
+            if rule != RuleId::Wake {
+                r.clock.step(HoldEvent::HarnessLine);
+            }
         }
         "Skip" => {
             let key = r.intent.take().expect("an intent row");
@@ -628,7 +740,7 @@ impl Walked {
         let mut ok = stepped && vars.iter().all(|v| real[v] == st[v]);
         let said = (st["door"] == 1).then(|| decided(m, st, r, run));
         if let Some(said) = &said {
-            ok &= agrees(m, st, said, run.stuck);
+            ok &= agrees(m, st, said, run);
             self.said.insert(format!("{said:?}"));
         }
         if !ok {
@@ -668,6 +780,13 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
             due: DueClock::default(),
             look: T0,
             k_key: None,
+            wakes: if run.rule == RuleId::Wake && !run.stuck {
+                WakesSeen {
+                    wakes: vec![declared(1)],
+                }
+            } else {
+                WakesSeen::default()
+            },
         };
         let mut w = Walked {
             states: HashSet::new(),
@@ -756,13 +875,12 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
         } else {
             format!("{rule:?}")
         };
+        let wake = !stuck && rule == RuleId::Wake;
         let mut own = vec![
             "Turn",
             "Break",
             "Point",
-            "HoldAges",
             "IdleRead",
-            "HoldCloses",
             "PersonIn",
             "PersonOut",
             "TaskEnds",
@@ -773,8 +891,11 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
             "ActTaken",
             "Fails",
             "UpgradeDue",
-            "UpgradeTypes",
-            if stuck { "OpenStuck" } else { "OpenNudge" },
+            match (stuck, wake) {
+                (true, _) => "OpenStuck",
+                (false, true) => "OpenWake",
+                (false, false) => "OpenNudge",
+            },
             "Intend",
             "Skip",
             "Lapse",
@@ -782,10 +903,15 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
             "Sample",
             "SampleLast",
         ];
-        if stuck || rule == RuleId::HoldRoom {
+        // A wake's line is of no hold's age: its run's hold never ages, closes or takes the
+        // upgrade's notice (which a due wake goes over).
+        if !wake {
+            own.extend(["HoldAges", "HoldCloses", "UpgradeTypes"]);
+        }
+        if stuck || rule != RuleId::WaitNudge {
             own.push("Holds");
         }
-        let types = mode == 1 || (stuck && mode == 2);
+        let types = mode == 1 || ((stuck || wake) && mode == 2);
         if types {
             own.extend(["Type", "PaceLapses", "Close"]);
         } else {
@@ -801,7 +927,17 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
                 w.fired
             );
         }
-        let want: &[&str] = if types {
+        let want: &[&str] = if types && wake {
+            &[
+                "Quiet",
+                "Due",
+                "Held(\"person\")",
+                "Held(\"task\")",
+                "Held(\"brake\")",
+                "Held(\"untaken\")",
+                "Paced",
+            ]
+        } else if types {
             &[
                 "Quiet",
                 "Due",
@@ -833,7 +969,7 @@ type Shows = fn(&State) -> bool;
 
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 12] = [
+    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 13] = [
         (
             Fault::DedupeByRule,
             Some(RuleId::WaitNudge),
@@ -899,13 +1035,22 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             |st| st["due"] > 0 && st["age"] > 0,
             Some(|st| st["intent"] == 0),
         ),
+        // The wake's: a successor's seed that holds the whole kind told from one wake's typed
+        // row, so the next wake's episode reads told at a crash (S3).
+        (
+            Fault::KindWideWakeSeed,
+            Some(RuleId::Wake),
+            |st| st["told"] == 0 && st["due"] > 0,
+            Some(|st| st["intent"] == 0),
+        ),
     ];
     let mut runs = Vec::new();
     let mut checks = Vec::new();
     for (fault, only, shows, among) in controls {
+        // A control of the hold rules' walks the hold rules alone; the wake's names its rule.
         for rule in RuleId::ALL
             .into_iter()
-            .filter(|r| only.is_none_or(|o| o == *r))
+            .filter(|r| only.map_or(*r != RuleId::Wake, |o| o == *r))
         {
             for variant in 0..3 {
                 runs.push((
@@ -984,6 +1129,7 @@ fn tier1_the_anchors_name_what_the_code_implements() {
             "IdleRead",
             "Intend",
             "Lapse",
+            "OpenWake",
             "Sample",
             "SampleLast",
             "Skip",
@@ -996,7 +1142,7 @@ fn tier1_the_anchors_name_what_the_code_implements() {
 #[test]
 fn tier1_sample_and_sample_last_enter_the_k_clock_in_their_own_windows() {
     let mut ev = Ev(Some(StepEvidence::new("OccupancyDoor")));
-    for rule in RuleId::ALL {
+    for rule in RuleId::ALL.into_iter().filter(|r| *r != RuleId::Wake) {
         let run = Run {
             rule,
             variant: 0,
@@ -1019,5 +1165,33 @@ fn tier1_sample_and_sample_last_enter_the_k_clock_in_their_own_windows() {
     assert!(audit.ambiguous.is_empty(), "{audit:?}");
     assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
     assert!(audit.stray.is_empty(), "{audit:?}");
+    assert!(audit.witnessed_steps > 0, "{audit:?}");
+}
+
+/// `OpenWake` ENTERS THE BOOK'S HEAD IN ITS OWN WINDOW: a wake run's every `OpenWake` step drives
+/// `rules::wake_opens` alone, which opens the wake the model opens (the mirror's own check), and
+/// no other anchored function is entered there.
+#[test]
+fn tier1_open_wake_enters_the_books_head_in_its_own_window() {
+    let mut ev = Ev(Some(StepEvidence::new("OccupancyDoor")));
+    for mode in [1, 2] {
+        let run = Run {
+            rule: RuleId::Wake,
+            variant: 0,
+            fault: None,
+            key: 0,
+            stuck: false,
+        };
+        walk(&under(mode, 0), true, run, &mut ev);
+    }
+    let audit = ev.0.expect("the audited walk's evidence").audit();
+    assert!(
+        audit.actions.contains("OpenWake") && !audit.undriven.contains(&"OpenWake"),
+        "{audit:?}"
+    );
+    assert!(!audit.unwitnessed.contains(&"OpenWake"), "{audit:?}");
+    assert!(!audit.blind_steps.contains(&"OpenWake"), "{audit:?}");
+    assert!(audit.stray.is_empty(), "{audit:?}");
+    assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
     assert!(audit.witnessed_steps > 0, "{audit:?}");
 }

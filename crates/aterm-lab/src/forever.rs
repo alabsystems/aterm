@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `forever` ([`cmd_forever`]): Autopilot Land and Cruise live on every harness aterm supervises.
-//! The real Claude Code, Gemini CLI, agy and Muse Code TUIs run under a private aterm with the
+//! The real Claude Code, agy and Muse Code TUIs run under a private aterm with the
 //! harness on (its defaults), against the stub, each conversation scripted turn by turn
 //! ([`crate::stub::scripted_reply`]: the custom mode `forever`, whose rules pick a turn's reply by
 //! the scenario's word in the conversation and the act of the harness it answers).
@@ -94,9 +94,6 @@ const PAST_NEXT_STEP_MS: i64 = 60_000;
 const QUIET_UNDER_OFF_MS: i64 = 270_000;
 const CHAIN_LIMIT_MS: i64 = 16 * 60 * 1000;
 const CRUISE_N_LIMIT_MS: i64 = 20 * 60 * 1000;
-const WALL_DAY_LIMIT_MS: i64 = 45 * 60 * 1000;
-const WALL_CLIMB_LIMIT_MS: i64 = 3 * 60 * 60 * 1000;
-const WALL_SHIFT_LIMIT_MS: i64 = 35 * 60 * 1000;
 const WALL_REDRAW_LIMIT_MS: i64 = 30 * 60 * 1000;
 const WALL_SWITCH_LIMIT_MS: i64 = 30 * 60 * 1000;
 const WALL_UNREAD_LIMIT_MS: i64 = 100 * 60 * 1000;
@@ -196,33 +193,18 @@ const WALL_LIFT_EARLY_MS: i64 = 3_000;
 const WALL_LOST_MS: i64 = 5 * 60_000;
 
 /// The grace past a reset the harness waits on `program` ([`Harness::name`]) before it goes on
-/// (`TurnEndTiming::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy, Gemini
-/// CLI), 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
+/// (`TurnEndTiming::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy),
+/// 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
 #[must_use]
 pub fn wall_grace_ms(program: &str) -> i64 {
     use aterm_phase::Program;
     let p = match Harness::of(program) {
         Some(Harness::Claude) => Program::Claude,
-        Some(Harness::Gemini) => Program::Gemini,
         Some(Harness::Agy) => Program::Agy,
         Some(Harness::Muse) => Program::Muse,
         None => Program::Generic,
     };
     i64::try_from(turn_end::TurnEndTiming::default().grace_for(p).as_millis()).unwrap_or(i64::MAX)
-}
-
-/// The claim the stub's wall is raised with on harness `h` ([`wall_step`]): a five-hour window,
-/// which Claude Code reads off the unified-limit headers and Muse Code off the
-/// `usage_limit_reached` body; on agy's Gemini API key the claim names nothing and the stub
-/// answers the key's spent per-day quota; Gemini CLI gets a Google account's spent usage limit
-/// ([`crate::stub::gemini::ACCOUNT_CLAIM`]), whose 429 makes its usage-limit dialog name the
-/// reset.
-#[must_use]
-pub const fn wall_claim(h: Harness) -> &'static str {
-    match h {
-        Harness::Gemini => crate::stub::gemini::ACCOUNT_CLAIM,
-        Harness::Claude | Harness::Agy | Harness::Muse => WALL_CLAIM,
-    }
 }
 
 /// The unix second a wall raised at `now` (ms) resets at: the first whole minute at least `ahead`
@@ -233,15 +215,6 @@ pub const fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
 }
 
 const WALL_HID_AHEAD_MS: i64 = 420_000;
-const WALL_DAY_AHEAD_MS: i64 = 25 * 60 * 1000;
-const WALL_CLIMB_AHEAD_MS: i64 = 45 * 60 * 1000;
-/// G3's shift ([`Chain::shifts`]): each raise again moves the reset this far on, past the loop's
-/// back-off after a try the dialog came back on (2 min, then 4: `approval_loop.rs`'s
-/// `LIMIT_RETRY_BACKOFF_S`), so each try waits the reset the dialog names.
-pub const SHIFT_STEP_MS: i64 = 5 * 60 * 1000;
-/// How many times G3's wall is raised again at its reset: the dialog drawn again with a new reset
-/// after each of two tries, the third getting through.
-pub const SHIFT_TIMES: usize = 2;
 /// W4's redraw: the resume typed past the first reset meets the wall raised again this far on.
 pub const REDRAW_AHEAD_MS: i64 = 5 * 60 * 1000;
 const WALL_SWITCH_AHEAD_MS: i64 = 15 * 60 * 1000;
@@ -286,11 +259,6 @@ pub const AGY_HIDE_COMMAND: &str = "/title";
 /// The words of agy's quota wall: the Gemini API's message in its `⚠ agent executor error: …`
 /// block, and the block's last row (`Error ID: <id>`), the last to scroll off the screen.
 pub const AGY_WALL_WORDS: [&str; 2] = ["exceeded your current quota", "Error ID: "];
-/// The option of Gemini CLI's usage-limit dialog that takes the dialog away.
-pub const GEMINI_HIDE_OPTION: &str = "2. Stop";
-/// The words of Gemini CLI's usage-limit dialog: its title, and the reset row a Google account's
-/// spent quota draws under it.
-pub const GEMINI_WALL_WORDS: [&str; 2] = ["Usage limit reached", "Access resets at"];
 /// Claude Code's local command whose output scrolls the notice away once its countdown is
 /// cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿ Session renamed to: <name>` under
 /// its own `❯ /rename <name>` row and sends no request; the composer's top rule carries the name
@@ -381,15 +349,14 @@ pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
 }
 
 /// F3's tool call on harness `h`: a read of the chain's own `README.md` (`file`, its physical
-/// path), which each CLI runs with no confirm in the lab's jail: Claude Code's `Read`, Gemini CLI's
-/// `read_file`, agy's `view_file`, Muse Code's `read_file` (with a path relative to its workspace
+/// path), which each CLI runs with no confirm in the lab's jail: Claude Code's `Read`, agy's
+/// `view_file`, Muse Code's `read_file` (with a path relative to its workspace
 /// root: its file policy allows an absolute one only in some places).
 #[must_use]
 pub fn read_call(h: Harness, file: &Path) -> J {
     let abs = file.to_string_lossy().into_owned();
     let (name, input) = match h {
         Harness::Claude => ("Read", J::obj([("file_path", J::s(abs))])),
-        Harness::Gemini => ("read_file", J::obj([("file_path", J::s(abs))])),
         Harness::Agy => (
             "view_file",
             J::obj([
@@ -420,41 +387,19 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Wall => None,
         Mode::WallHid => hide_of(h).err(),
-        Mode::WallDay | Mode::WallClimb => match h {
-            Harness::Gemini => None,
-            Harness::Agy => Some(
-                "agy draws a key's spent per-day quota as an inline error with its RetryInfo's delay, W1's own wall (`--mode wall`): no dialog, no ladder",
-            ),
-            Harness::Claude | Harness::Muse => Some(
-                "the stub's per-day quota is the Gemini API's: only Gemini CLI draws it as a usage-limit dialog that names no reset",
-            ),
-        },
-        Mode::WallShift => match h {
-            Harness::Gemini => None,
-            Harness::Claude | Harness::Agy | Harness::Muse => Some(
-                "only Gemini CLI's usage-limit dialog takes a try (its Keep trying) that the quota answers by drawing it again: the others' resume meeting a new reset is `--mode wall-redraw`",
-            ),
-        },
         Mode::WallRedraw => hide_of(h).err(),
         Mode::WallSwitch => None,
         Mode::WallUnread => match h {
             Harness::Claude => None,
-            Harness::Gemini | Harness::Agy | Harness::Muse => Some(
+            Harness::Agy | Harness::Muse => Some(
                 "only Claude Code's conversation is read (its transcript): another agent's limit is the screen's, never held unread",
             ),
         },
-        Mode::WallDayStop => wall_out_of_reach(h, Mode::WallDay),
         Mode::WallCruise => None,
         Mode::WallRelaunch => match h {
-            Harness::Gemini | Harness::Agy | Harness::Muse => None,
+            Harness::Agy | Harness::Muse => None,
             Harness::Claude => Some(
-                "Claude Code's limit is its conversation's (its transcript), read again after any relaunch: the relaunch rule is the screen-alone agents' (Muse Code, agy, Gemini CLI)",
-            ),
-        },
-        Mode::WallBucket => match h {
-            Harness::Gemini => None,
-            Harness::Claude | Harness::Agy | Harness::Muse => Some(
-                "only Gemini CLI draws a per-model bucket's dialog (a Pro model's spent quota with a model to fall back to)",
+                "Claude Code's limit is its conversation's (its transcript), read again after any relaunch: the relaunch rule is the screen-alone agents' (Muse Code, agy)",
             ),
         },
         Mode::Land
@@ -468,12 +413,13 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
 }
 
 /// How W2 takes the wall's notice off harness `h`'s screen while the wait stands ([`hide_step`]):
-/// a local command entered again and again (it sends no request), or the dialog's option chosen
-/// once.
+/// a local command entered again and again (it sends no request).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hide {
-    /// What takes the notice away.
-    pub by: HideBy,
+    /// The local command that takes the notice away, typed into the empty composer and entered
+    /// once the menu offers it first ([`menu_offers`]), again and again until the notice has
+    /// scrolled away.
+    pub command: &'static str,
     /// The words of the harness's usage wall: a screen holding none of them has lost the notice
     /// ([`notice_gone`]).
     pub words: &'static [&'static str],
@@ -494,47 +440,21 @@ pub struct Cancel {
     pub cancelled: &'static str,
 }
 
-/// What takes a harness's notice away ([`Hide::by`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HideBy {
-    /// A local command, typed into the empty composer and entered once the menu offers it first
-    /// ([`menu_offers`]), again and again until the notice has scrolled away.
-    Command(&'static str),
-    /// The dialog's option, chosen once: focus moved onto it (Down), then Enter once the dialog
-    /// draws it focused ([`dialog_focus`]).
-    Option(&'static str),
-}
-
-impl Hide {
-    /// The command or the option, as the report names it.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self.by {
-            HideBy::Command(c) | HideBy::Option(c) => c,
-        }
-    }
-}
-
 /// [`Hide`] of harness `h`, or why none takes its notice away.
 pub const fn hide_of(h: Harness) -> Result<Hide, &'static str> {
     match h {
         Harness::Muse => Ok(Hide {
-            by: HideBy::Command(HIDE_COMMAND),
+            command: HIDE_COMMAND,
             words: &[WALL_WORDS],
             cancel: None,
         }),
         Harness::Agy => Ok(Hide {
-            by: HideBy::Command(AGY_HIDE_COMMAND),
+            command: AGY_HIDE_COMMAND,
             words: &AGY_WALL_WORDS,
             cancel: None,
         }),
-        Harness::Gemini => Ok(Hide {
-            by: HideBy::Option(GEMINI_HIDE_OPTION),
-            words: &GEMINI_WALL_WORDS,
-            cancel: None,
-        }),
         Harness::Claude => Ok(Hide {
-            by: HideBy::Command(CLAUDE_HIDE_COMMAND),
+            command: CLAUDE_HIDE_COMMAND,
             words: &CLAUDE_WALL_WORDS,
             cancel: Some(CLAUDE_CANCEL),
         }),
@@ -545,19 +465,13 @@ pub const fn hide_of(h: Harness) -> Result<Hide, &'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Harness {
     Claude,
-    Gemini,
     Agy,
     Muse,
 }
 
 impl Harness {
     /// Every harness, in the order `all` runs them.
-    pub const ALL: [Harness; 4] = [
-        Harness::Claude,
-        Harness::Gemini,
-        Harness::Agy,
-        Harness::Muse,
-    ];
+    pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Agy, Harness::Muse];
 
     /// The verb's word, the lab's `agent`, the reader's program word (the needs entry's
     /// `<program>`: `Program::name`).
@@ -565,7 +479,6 @@ impl Harness {
     pub const fn name(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
-            Harness::Gemini => "gemini",
             Harness::Agy => "agy",
             Harness::Muse => "muse",
         }
@@ -578,7 +491,6 @@ impl Harness {
     pub(crate) fn bin_ver(self, run: &Run) -> (&str, &str) {
         match self {
             Harness::Claude => (&run.claude_bin, &run.claude_ver),
-            Harness::Gemini => (&run.gemini_bin, &run.gemini_ver),
             Harness::Agy => (&run.agy_bin, &run.agy_ver),
             Harness::Muse => (&run.muse_bin, &run.muse_ver),
         }
@@ -602,15 +514,6 @@ pub enum Mode {
     Resid,
     /// The back-off ladder past its fourth step, scaled (`ladder`).
     Ladder,
-    /// W1 on the usage-limit dialog that names no reset (`wall-day`): Gemini CLI's on a key's spent
-    /// per-day quota.
-    WallDay,
-    /// W1 on that dialog, its quota standing past the ladder's first rung (`wall-climb`): the
-    /// ladder climbed while NEEDS YOU stands.
-    WallClimb,
-    /// W3, G3's climb across a changed reset (`wall-shift`): Gemini CLI's usage-limit dialog drawn
-    /// again with a new reset after each try.
-    WallShift,
     /// W4, the redraw after a typed resume (`wall-redraw`): the resume typed past the reset meets
     /// the wall again, under a new reset.
     WallRedraw,
@@ -620,17 +523,11 @@ pub enum Mode {
     /// W6, the unread limit told (`wall-unread`): Claude Code's limit held unread past its reset by
     /// `FUTILE_AFTER`.
     WallUnread,
-    /// W7, the per-day dialog answered Stop (`wall-day-stop`): Gemini CLI's usage-limit dialog
-    /// that names no reset, answered `2. Stop` as a person would, kept trying on its ladder while
-    /// NEEDS YOU stands.
-    WallDayStop,
     /// W8, a usage wall under Cruise (`wall-cruise`).
     WallCruise,
     /// W9, the agent ended and launched again by a person under its standing wall
     /// (`wall-relaunch`).
     WallRelaunch,
-    /// W10, Gemini CLI's per-model bucket (`wall-bucket`): its dialog's `Stop`, never its switch.
-    WallBucket,
 }
 
 impl Mode {
@@ -645,16 +542,11 @@ impl Mode {
             "wall-hid" => Mode::WallHid,
             "resid" => Mode::Resid,
             "ladder" => Mode::Ladder,
-            "wall-day" => Mode::WallDay,
-            "wall-climb" => Mode::WallClimb,
-            "wall-shift" => Mode::WallShift,
             "wall-redraw" => Mode::WallRedraw,
             "wall-switch" => Mode::WallSwitch,
             "wall-unread" => Mode::WallUnread,
-            "wall-day-stop" => Mode::WallDayStop,
             "wall-cruise" => Mode::WallCruise,
             "wall-relaunch" => Mode::WallRelaunch,
-            "wall-bucket" => Mode::WallBucket,
             _ => return None,
         })
     }
@@ -664,16 +556,13 @@ impl Mode {
     #[must_use]
     pub const fn walled(self) -> Option<Scenario> {
         match self {
-            Mode::Wall | Mode::WallDay | Mode::WallClimb => Some(Scenario::W1),
+            Mode::Wall => Some(Scenario::W1),
             Mode::WallHid => Some(Scenario::W2),
-            Mode::WallShift => Some(Scenario::W3),
             Mode::WallRedraw => Some(Scenario::W4),
             Mode::WallSwitch => Some(Scenario::W5),
             Mode::WallUnread => Some(Scenario::W6),
-            Mode::WallDayStop => Some(Scenario::W7),
             Mode::WallCruise => Some(Scenario::W8),
             Mode::WallRelaunch => Some(Scenario::W9),
-            Mode::WallBucket => Some(Scenario::W10),
             Mode::Land
             | Mode::Cruise
             | Mode::Both
@@ -816,26 +705,16 @@ pub enum Chain {
     ToolEnd,
     /// LADDER (the back-off ladder doubled to its cap, scaled).
     Ladder,
-    /// W1 on Gemini CLI's usage-limit dialog that names no reset (`--mode wall-day`).
-    WallDay,
-    /// W1 on that dialog, its quota standing past the ladder's first rung (`--mode wall-climb`).
-    WallClimb,
-    /// W3 (`--mode wall-shift`, [`Chain::shifts`]).
-    ShiftWall,
     /// W4 (`--mode wall-redraw`).
     RedrawWall,
     /// W5 (`--mode wall-switch`, [`switch_step`]).
     SwitchWall,
     /// W6 (`--mode wall-unread`, [`unread_step`]).
     UnreadWall,
-    /// W7 (`--mode wall-day-stop`).
-    DayStopWall,
     /// W8 (`--mode wall-cruise`).
     CruiseWall,
     /// W9 (`--mode wall-relaunch`, [`relaunch_step`]).
     RelaunchWall,
-    /// W10 (`--mode wall-bucket`, [`crate::stub::gemini::BUCKET_CLAIM`]).
-    BucketWall,
     /// HL (Land: one defense to every act over an untracked file, held at its second answer).
     SameLand,
     /// HC (Cruise: one reply to every done check, held at its second answer).
@@ -872,22 +751,16 @@ pub enum Scenario {
     Cap,
     W1,
     W2,
-    /// G3's climb across a changed reset (`--mode wall-shift`).
-    W3,
     /// The redraw after a typed resume (`--mode wall-redraw`).
     W4,
     /// The cross-program end (`--mode wall-switch`).
     W5,
     /// The unread limit told past `FUTILE_AFTER` (`--mode wall-unread`).
     W6,
-    /// The per-day dialog answered Stop (`--mode wall-day-stop`).
-    W7,
     /// A usage wall under Cruise (`--mode wall-cruise`).
     W8,
     /// The relaunch under a standing wall (`--mode wall-relaunch`).
     W9,
-    /// Gemini CLI's per-model bucket (`--mode wall-bucket`).
-    W10,
     L16,
     L17,
     N1,
@@ -924,14 +797,11 @@ impl Scenario {
     pub const fn id(self) -> &'static str {
         match self {
             Scenario::W2 => "W2",
-            Scenario::W3 => "W3",
             Scenario::W4 => "W4",
             Scenario::W5 => "W5",
             Scenario::W6 => "W6",
-            Scenario::W7 => "W7",
             Scenario::W8 => "W8",
             Scenario::W9 => "W9",
-            Scenario::W10 => "W10",
             Scenario::L12 => "L12",
             Scenario::L13 => "L13",
             Scenario::L14 => "L14",
@@ -1018,9 +888,6 @@ impl Scenario {
             Scenario::W2 => {
                 "its notice scrolled away: the remembered wall waited out, resumed, landed"
             }
-            Scenario::W3 => {
-                "the dialog drawn again with a new reset after each try: each waited out, landed"
-            }
             Scenario::W4 => {
                 "the typed resume meets the wall again: the new reset waited out, landed"
             }
@@ -1028,17 +895,11 @@ impl Scenario {
                 "another agent in the tab under the first's limit: acted on at once, landed"
             }
             Scenario::W6 => "a limit held unread an hour past its reset: told, still held",
-            Scenario::W7 => {
-                "the per-day dialog answered Stop: kept trying, NEEDS YOU up, then down, landed"
-            }
             Scenario::W8 => {
                 "a usage wall under Cruise: nothing typed into it, resumed, Cruise goes on"
             }
             Scenario::W9 => {
                 "the agent launched again under its wall: nothing typed into it, resumed, landed"
-            }
-            Scenario::W10 => {
-                "the per-model bucket's dialog: its Stop at its due, never the switch, landed"
             }
             Scenario::F18 => "a person's key into an instant turn: LEFT, theirs, nothing typed",
             Scenario::Rewrap => "a judged opener re-wrapped by a resize: not judged again",
@@ -1131,14 +992,6 @@ impl Chain {
     /// The ladder's chain (`--mode ladder`, on a lab of its own: the scale is the instance's,
     /// [`ladder_env`]) and the Off control.
     pub const LADDER: [Chain; 2] = [Chain::Ladder, Chain::Off];
-    /// The per-day quota's chain (`--mode wall-day`, alone on a lab of its own for W1's reason).
-    pub const WALL_DAY: [Chain; 1] = [Chain::WallDay];
-
-    /// The climbing quota's chain (`--mode wall-climb`, alone on a lab of its own for W1's reason).
-    pub const WALL_CLIMB: [Chain; 1] = [Chain::WallClimb];
-
-    /// G3's chain (`--mode wall-shift`, alone on a lab of its own for W1's reason).
-    pub const WALL_SHIFT: [Chain; 1] = [Chain::ShiftWall];
 
     /// The redraw's chain (`--mode wall-redraw`, alone for W1's reason).
     pub const WALL_REDRAW: [Chain; 1] = [Chain::RedrawWall];
@@ -1149,17 +1002,11 @@ impl Chain {
     /// The unread limit's chain (`--mode wall-unread`, alone for W1's reason).
     pub const WALL_UNREAD: [Chain; 1] = [Chain::UnreadWall];
 
-    /// The per-day dialog's Stop's chain (`--mode wall-day-stop`, alone for W1's reason).
-    pub const WALL_DAY_STOP: [Chain; 1] = [Chain::DayStopWall];
-
     /// The Cruise wall's chain (`--mode wall-cruise`, alone for W1's reason).
     pub const WALL_CRUISE: [Chain; 1] = [Chain::CruiseWall];
 
     /// The relaunch's chain (`--mode wall-relaunch`, alone for W1's reason).
     pub const WALL_RELAUNCH: [Chain; 1] = [Chain::RelaunchWall];
-
-    /// The bucket's chain (`--mode wall-bucket`, alone for W1's reason).
-    pub const WALL_BUCKET: [Chain; 1] = [Chain::BucketWall];
 
     /// Every chain of every mode, each once: what `--chains` may name.
     #[must_use]
@@ -1172,16 +1019,11 @@ impl Chain {
             .chain(Chain::WALL_HID)
             .chain(Chain::RESID)
             .chain(Chain::LADDER)
-            .chain(Chain::WALL_DAY)
-            .chain(Chain::WALL_CLIMB)
-            .chain(Chain::WALL_SHIFT)
             .chain(Chain::WALL_REDRAW)
             .chain(Chain::WALL_SWITCH)
             .chain(Chain::WALL_UNREAD)
-            .chain(Chain::WALL_DAY_STOP)
             .chain(Chain::WALL_CRUISE)
             .chain(Chain::WALL_RELAUNCH)
-            .chain(Chain::WALL_BUCKET)
         {
             if !v.contains(&c) {
                 v.push(c);
@@ -1200,16 +1042,11 @@ impl Chain {
             Mode::WallHid => Chain::WALL_HID.to_vec(),
             Mode::Resid => Chain::RESID.to_vec(),
             Mode::Ladder => Chain::LADDER.to_vec(),
-            Mode::WallDay => Chain::WALL_DAY.to_vec(),
-            Mode::WallClimb => Chain::WALL_CLIMB.to_vec(),
-            Mode::WallShift => Chain::WALL_SHIFT.to_vec(),
             Mode::WallRedraw => Chain::WALL_REDRAW.to_vec(),
             Mode::WallSwitch => Chain::WALL_SWITCH.to_vec(),
             Mode::WallUnread => Chain::WALL_UNREAD.to_vec(),
-            Mode::WallDayStop => Chain::WALL_DAY_STOP.to_vec(),
             Mode::WallCruise => Chain::WALL_CRUISE.to_vec(),
             Mode::WallRelaunch => Chain::WALL_RELAUNCH.to_vec(),
-            Mode::WallBucket => Chain::WALL_BUCKET.to_vec(),
             Mode::Land | Mode::Cruise | Mode::Both => Chain::ALL
                 .into_iter()
                 .filter(|c| match c.autopilot() {
@@ -1230,70 +1067,59 @@ impl Chain {
             .filter(|c| match c {
                 Chain::WallHid => wall_out_of_reach(h, Mode::WallHid).is_none(),
                 Chain::ToolEnd => tool_end_out_of_reach(h).is_none(),
-                Chain::WallDay => wall_out_of_reach(h, Mode::WallDay).is_none(),
-                Chain::WallClimb => wall_out_of_reach(h, Mode::WallClimb).is_none(),
-                Chain::ShiftWall => wall_out_of_reach(h, Mode::WallShift).is_none(),
                 Chain::RedrawWall => wall_out_of_reach(h, Mode::WallRedraw).is_none(),
                 Chain::UnreadWall => wall_out_of_reach(h, Mode::WallUnread).is_none(),
-                Chain::DayStopWall => wall_out_of_reach(h, Mode::WallDayStop).is_none(),
                 Chain::RelaunchWall => wall_out_of_reach(h, Mode::WallRelaunch).is_none(),
-                Chain::BucketWall => wall_out_of_reach(h, Mode::WallBucket).is_none(),
                 _ => true,
             })
             .collect()
     }
 
-    /// It meets the stub's usage wall ([`wall_step`]): W1's chains, W2's, and W3's to W10's.
+    /// It meets the stub's usage wall ([`wall_step`]): W1's chain, W2's, and W4's to W9's.
     #[must_use]
     pub const fn walled(self) -> bool {
         matches!(
             self,
             Chain::Wall
                 | Chain::WallHid
-                | Chain::WallDay
-                | Chain::WallClimb
-                | Chain::ShiftWall
                 | Chain::RedrawWall
                 | Chain::SwitchWall
                 | Chain::UnreadWall
-                | Chain::DayStopWall
                 | Chain::CruiseWall
                 | Chain::RelaunchWall
-                | Chain::BucketWall
         )
     }
 
     /// How many times the lab raises its wall again at the reset instead of lifting it
-    /// ([`wall_move`]): G3's [`SHIFT_TIMES`], W4's once (under the resume typed past the first
-    /// reset), none for the other chains.
+    /// ([`wall_move`]): W4's once (under the resume typed past the first reset), none for the
+    /// other chains.
     #[must_use]
     pub fn shifts(self) -> usize {
         match self {
-            Chain::ShiftWall => SHIFT_TIMES,
             Chain::RedrawWall => 1,
             _ => 0,
         }
     }
 
     /// How far each raise again moves the reset on ([`wall_move`]): whole minutes, so each reset
-    /// stays on the minute the dialog and the notices name.
+    /// stays on the minute the notices name; nothing for a chain that never raises its wall again
+    /// ([`Chain::shifts`] 0).
     #[must_use]
     pub fn shift_step_ms(self) -> i64 {
         match self {
             Chain::RedrawWall => REDRAW_AHEAD_MS,
-            _ => SHIFT_STEP_MS,
+            _ => 0,
         }
     }
 
     /// W2's hide runs on its tab on harness `h` ([`hide_step`]): W2's own, W6's (its notice gone
-    /// before the conversation is made unread), W7's (the per-day dialog answered Stop), and W4's
-    /// where the resume is typed only past it (Claude Code's countdown cancelled, Gemini CLI's
-    /// dialog answered Stop).
+    /// before the conversation is made unread), and W4's where the resume is typed only past it
+    /// (Claude Code's countdown cancelled).
     #[must_use]
     pub fn hides_on(self, h: Harness) -> bool {
         match self {
-            Chain::WallHid | Chain::UnreadWall | Chain::DayStopWall => true,
-            Chain::RedrawWall => matches!(h, Harness::Claude | Harness::Gemini),
+            Chain::WallHid | Chain::UnreadWall => true,
+            Chain::RedrawWall => matches!(h, Harness::Claude),
             _ => false,
         }
     }
@@ -1303,25 +1129,10 @@ impl Chain {
     pub const fn wall_ahead_ms(self) -> i64 {
         match self {
             Chain::WallHid => WALL_HID_AHEAD_MS,
-            Chain::WallDay | Chain::DayStopWall => WALL_DAY_AHEAD_MS,
-            Chain::WallClimb => WALL_CLIMB_AHEAD_MS,
             Chain::RelaunchWall => WALL_RELAUNCH_AHEAD_MS,
             Chain::RedrawWall | Chain::UnreadWall => WALL_HID_AHEAD_MS,
             Chain::SwitchWall => WALL_SWITCH_AHEAD_MS,
             _ => WALL_AHEAD_MS,
-        }
-    }
-
-    /// The claim its wall is raised with on harness `h` ([`wall_step`]): [`wall_claim`]'s, but on
-    /// the per-day quota's chains [`WALL_CLAIM`], on which the stub answers the Gemini API key a
-    /// spent per-day quota (it names no Code Assist limit) whose dialog names no reset; on the
-    /// bucket's, the account's limit on the Pro model ([`crate::stub::gemini::BUCKET_CLAIM`]).
-    #[must_use]
-    pub const fn wall_claim_on(self, h: Harness) -> &'static str {
-        match self {
-            Chain::WallDay | Chain::WallClimb | Chain::DayStopWall => WALL_CLAIM,
-            Chain::BucketWall => crate::stub::gemini::BUCKET_CLAIM,
-            _ => wall_claim(h),
         }
     }
 
@@ -1343,11 +1154,8 @@ impl Chain {
             Chain::Cap => CAP_LIMIT_MS,
             Chain::CruiseN => CRUISE_N_LIMIT_MS,
             Chain::Ladder => LADDER_LIMIT_MS,
-            Chain::WallDay | Chain::DayStopWall => WALL_DAY_LIMIT_MS,
             Chain::CruiseWall => WALL_CRUISE_LIMIT_MS,
             Chain::RelaunchWall => WALL_RELAUNCH_LIMIT_MS,
-            Chain::WallClimb => WALL_CLIMB_LIMIT_MS,
-            Chain::ShiftWall => WALL_SHIFT_LIMIT_MS,
             Chain::RedrawWall => WALL_REDRAW_LIMIT_MS,
             Chain::SwitchWall => WALL_SWITCH_LIMIT_MS,
             Chain::UnreadWall => WALL_UNREAD_LIMIT_MS,
@@ -1397,16 +1205,11 @@ impl Chain {
             Chain::TallScroll => "tall-scroll",
             Chain::ToolEnd => "tool-end",
             Chain::Ladder => "ladder",
-            Chain::WallDay => "day-wall",
-            Chain::WallClimb => "climb-wall",
-            Chain::ShiftWall => "shift-wall",
             Chain::RedrawWall => "redraw-wall",
             Chain::SwitchWall => "switch-wall",
             Chain::UnreadWall => "unread-wall",
-            Chain::DayStopWall => "day-stop-wall",
             Chain::CruiseWall => "cruise-wall",
             Chain::RelaunchWall => "relaunch-wall",
-            Chain::BucketWall => "bucket-wall",
             Chain::SameLand => "same-land",
             Chain::SameCruise => "same-cruise",
         }
@@ -1474,15 +1277,11 @@ impl Chain {
             Chain::TallScroll => &[Scenario::Scrolled],
             Chain::ToolEnd => &[Scenario::F3],
             Chain::Ladder => &[Scenario::Ladder],
-            Chain::WallDay | Chain::WallClimb => &[Scenario::W1],
-            Chain::ShiftWall => &[Scenario::W3],
             Chain::RedrawWall => &[Scenario::W4],
             Chain::SwitchWall => &[Scenario::W5],
             Chain::UnreadWall => &[Scenario::W6],
-            Chain::DayStopWall => &[Scenario::W7],
             Chain::CruiseWall => &[Scenario::W8],
             Chain::RelaunchWall => &[Scenario::W9],
-            Chain::BucketWall => &[Scenario::W10],
             Chain::SameLand => &[Scenario::HL],
             Chain::SameCruise => &[Scenario::HC],
         }
@@ -1523,15 +1322,10 @@ impl Chain {
                 | Chain::Worker
                 | Chain::Wall
                 | Chain::WallHid
-                | Chain::WallDay
-                | Chain::WallClimb
-                | Chain::ShiftWall
                 | Chain::RedrawWall
                 | Chain::SwitchWall
                 | Chain::UnreadWall
-                | Chain::DayStopWall
                 | Chain::RelaunchWall
-                | Chain::BucketWall
         )
     }
 
@@ -1753,15 +1547,10 @@ impl Chain {
             ],
             Chain::Wall
             | Chain::WallHid
-            | Chain::WallDay
-            | Chain::WallClimb
-            | Chain::ShiftWall
             | Chain::RedrawWall
             | Chain::SwitchWall
             | Chain::UnreadWall
-            | Chain::DayStopWall
-            | Chain::RelaunchWall
-            | Chain::BucketWall => vec![
+            | Chain::RelaunchWall => vec![
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule(MARK, CLEAN),
@@ -2032,7 +1821,7 @@ pub struct Cover {
     pub hidden: Option<Hidden>,
     /// W2: why the notice was not taken off the screen, where it was not.
     pub hide_gave_up: Option<String>,
-    /// W3, W4: each time the lab raised the wall again at its reset instead of lifting it
+    /// W4: each time the lab raised the wall again at its reset instead of lifting it
     /// ([`wall_move`]), and the unix second the new wall resets at, in order.
     pub shifted: Vec<(i64, i64)>,
     /// W5: the switch to the second agent ([`switch_step`]).
@@ -2071,23 +1860,6 @@ impl Cover {
     pub fn reset_now(&self) -> Option<i64> {
         let (_, first) = self.wall?;
         Some(self.shifted.last().map_or(first, |(_, r)| *r))
-    }
-
-    /// The unix second the wall answering a request at `t` (ms) named: the last raise at or before
-    /// it; `None` before the wall was raised and from its lift on ([`Cover::lifted_ms`]).
-    #[must_use]
-    pub fn reset_at(&self, t: i64) -> Option<i64> {
-        let (raised, first) = self.wall?;
-        if t < raised || self.lifted_ms.is_some_and(|l| t >= l) {
-            return None;
-        }
-        Some(
-            self.shifted
-                .iter()
-                .rev()
-                .find(|(at, _)| *at <= t)
-                .map_or(first, |(_, r)| *r),
-        )
     }
 }
 
@@ -2189,14 +1961,11 @@ pub struct Hidden {
     /// That screen's content seq (`status seq=`, the journal's `seq=`): a point read at it or after
     /// is a screen without the notice.
     pub seq: Option<u64>,
-    /// The hiding commands entered, or the dialog's option chosen (once) ([`Hide::by`]).
+    /// The hiding commands entered ([`Hide::command`]).
     pub commands: usize,
-    /// That command or option ([`Hide::label`]): Muse Code's [`HIDE_COMMAND`], agy's
-    /// [`AGY_HIDE_COMMAND`], Gemini CLI's [`GEMINI_HIDE_OPTION`].
+    /// That command ([`Hide::command`]): Muse Code's [`HIDE_COMMAND`], agy's
+    /// [`AGY_HIDE_COMMAND`], Claude Code's [`CLAUDE_HIDE_COMMAND`].
     pub command: &'static str,
-    /// The notice was taken by choosing the dialog's option ([`HideBy::Option`]), which leaves the
-    /// turn's error on the screen ([`notice_gone`]).
-    pub stopped: bool,
     /// The notice's words ([`Hide::words`]).
     pub words: &'static [&'static str],
 }
@@ -2525,9 +2294,6 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::P5 => cover::judge_startup(seen, t0),
             Scenario::L15 => cover::judge_spawned(seen, land, program, t0),
             Scenario::Cap => cover::judge_cap(seen, t0),
-            Scenario::W1 if chain == Chain::WallClimb => {
-                cover::judge_wall_climb(seen, land, program, t0)
-            }
             Scenario::W1 => cover::judge_wall(seen, land, program, t0),
             Scenario::L16 | Scenario::L17 => judge_long_landing(seen, land, t0),
             Scenario::N1 => surfaces::judge_needs_step(seen, t0, 0),
@@ -2536,14 +2302,11 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::N4 => surfaces::judge_needs_step(seen, t0, 3),
             Scenario::End => continue,
             Scenario::W2 => cover::judge_wall_hidden(seen, land, program, t0),
-            Scenario::W3 => walls::judge_wall_shift(seen, land, program, t0),
             Scenario::W4 => walls::judge_wall_redraw(seen, land, program, t0),
             Scenario::W5 => walls::judge_wall_switch(seen, land, program, t0),
             Scenario::W6 => walls::judge_wall_unread(seen, land, program, t0),
-            Scenario::W7 => walls::judge_wall_day_stopped(seen, land, program, t0),
             Scenario::W8 => walls::judge_wall_cruise(seen, program, t0),
             Scenario::W9 => walls::judge_wall_relaunch(seen, land, program, t0),
-            Scenario::W10 => walls::judge_wall_bucket(seen, land, program, t0),
             Scenario::F18 => cover::judge_person_instant(seen, t0),
             Scenario::Rewrap => cover::judge_rewrap(seen, t0),
             Scenario::Scrolled => cover::judge_scrolled(seen, t0),
@@ -4185,27 +3948,12 @@ fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
     .map_err(|e| could_not(&format!("{}: {e}", p.display())))
 }
 
-/// Gemini CLI's `trustedFolders.json` trusting the lab's project (`proj`, as named and as resolved)
-/// and every folder under it: the manager's and the other chains' folders, under L15's folder trust
-/// ([`launcher`]).
-#[must_use]
-pub fn gemini_trusted_project(proj: &str) -> String {
-    let real = std::fs::canonicalize(proj)
-        .map_or_else(|_| proj.to_string(), |p| p.to_string_lossy().into_owned());
-    let mut rows = vec![(proj.to_string(), J::s("TRUST_FOLDER"))];
-    if real != proj {
-        rows.push((real, J::s("TRUST_FOLDER")));
-    }
-    J::Obj(rows).dump(crate::pyjson::PY)
-}
-
 pub(crate) fn launcher(
     run: &Run,
     h: Harness,
     dirs: &[PathBuf],
-    (walled, worker): (bool, bool),
+    walled: bool,
 ) -> Result<PathBuf, Fail> {
-    use crate::gemini::Agent;
     let put = |p: &Path, mode: u32, text: &str| {
         crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
             .map_err(|e| could_not(&format!("{}: {e}", p.display())))
@@ -4223,36 +3971,15 @@ pub(crate) fn launcher(
             };
             crate::lab::launcher(run, &l)
         }
-        Harness::Gemini => {
-            crate::gemini::seed(run, Agent::Gemini, &crate::gemini::Launch::default())?;
-            if worker {
-                let home = run.w.join(Agent::Gemini.home()).join(".gemini");
-                put(
-                    &home.join("settings.json"),
-                    0o600,
-                    &crate::gemini::gemini_settings(true),
-                )?;
-                put(
-                    &home.join("trustedFolders.json"),
-                    0o600,
-                    &gemini_trusted_project(&run.proj),
-                )?;
-            }
-            let tz = walled
-                .then(|| format!("TZ={}", foreign_tz(crate::util::now_ms() / 1000)))
-                .into_iter()
-                .collect::<Vec<_>>();
-            crate::gemini::launcher(run, Agent::Gemini, &tz, &[])
-        }
         Harness::Agy => {
-            crate::gemini::seed(run, Agent::Agy, &crate::gemini::Launch::default())?;
+            crate::agy::seed(run, &crate::agy::Launch::default())?;
             let dir = run.w.join("agy-home/.gemini/antigravity-cli");
             put(
                 &dir.join("settings.json"),
                 0o600,
-                &crate::gemini::agy_settings_with(&agy_trusted(dirs), &[]),
+                &crate::agy::agy_settings_with(&agy_trusted(dirs), &[]),
             )?;
-            crate::gemini::launcher(run, Agent::Agy, &[], &[])
+            crate::agy::launcher(run, &[], &[])
         }
         Harness::Muse => crate::muse::launcher(run, &[], &["--trust-workspace".to_string()]),
     };
@@ -4281,10 +4008,6 @@ pub const SCROLL_CLAUDE_ENV: &str = "CLAUDE_CODE_NO_FLICKER=1";
 /// agy's `tall-scroll` home under the run's scratch ([`SCROLL_CLAUDE_ENV`]'s reason): its settings
 /// the run's with `altScreenMode` `always`, and its onboarding done.
 pub const SCROLL_AGY_HOME: &str = "agy-scroll-home";
-/// The system settings Gemini CLI's `tall-scroll` tab reads ([`SCROLL_CLAUDE_ENV`]'s reason).
-pub const SCROLL_GEMINI_SETTINGS: &str = "{\"ui\":{\"useAlternateBuffer\":true}}";
-/// Where [`SCROLL_GEMINI_SETTINGS`] is written, under the run's scratch.
-pub const SCROLL_GEMINI_FILE: &str = "gemini-scroll-settings.json";
 
 fn scroll_launcher(
     run: &Run,
@@ -4292,7 +4015,6 @@ fn scroll_launcher(
     dirs: &[PathBuf],
     walled: bool,
 ) -> Result<Option<PathBuf>, Fail> {
-    use crate::gemini::Agent;
     let put = |p: &Path, mode: u32, text: &str| {
         crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
             .map_err(|e| could_not(&format!("{}: {e}", p.display())))
@@ -4306,25 +4028,13 @@ fn scroll_launcher(
                 ..crate::lab::Launch::default()
             },
         ),
-        Harness::Gemini => {
-            let settings = run.w.join(SCROLL_GEMINI_FILE);
-            put(&settings, 0o644, SCROLL_GEMINI_SETTINGS)?;
-            let mut envs = vec![format!(
-                "GEMINI_CLI_SYSTEM_SETTINGS_PATH={}",
-                settings.to_string_lossy()
-            )];
-            if walled {
-                envs.push(format!("TZ={}", foreign_tz(crate::util::now_ms() / 1000)));
-            }
-            crate::gemini::launcher(run, Agent::Gemini, &envs, &[])
-        }
         Harness::Agy => {
             let home = run.w.join(SCROLL_AGY_HOME);
             let dir = home.join(".gemini/antigravity-cli");
             put(
                 &dir.join("settings.json"),
                 0o600,
-                &crate::gemini::agy_settings_with(
+                &crate::agy::agy_settings_with(
                     &agy_trusted(dirs),
                     &[("altScreenMode".to_string(), J::s("always"))],
                 ),
@@ -4332,33 +4042,15 @@ fn scroll_launcher(
             put(
                 &dir.join("cache/onboarding.json"),
                 0o600,
-                &crate::gemini::agy_onboarded(),
+                &crate::agy::agy_onboarded(),
             )?;
-            crate::gemini::launcher(
-                run,
-                Agent::Agy,
-                &[format!("HOME={}", home.to_string_lossy())],
-                &[],
-            )
+            crate::agy::launcher(run, &[format!("HOME={}", home.to_string_lossy())], &[])
         }
         Harness::Muse => return Ok(None),
     };
     let script = run.run.join(format!("forever-{}-scroll.sh", h.name()));
     put(&script, 0o755, &text)?;
     Ok(Some(script))
-}
-
-/// The zone a walled run's Gemini CLI runs in ([`launcher`]): one whose offset at the unix second
-/// `now` is not the machine's, and a half-hour one (a guess of the machine's zone, or any whole
-/// hour off it, never lands on it): `Asia/Kolkata` (GMT+5:30, no daylight saving), or
-/// `America/St_Johns` (GMT-2:30 or -3:30) on a machine at +5:30.
-#[must_use]
-pub fn foreign_tz(now: i64) -> &'static str {
-    if crate::sys::local_offset_s(now) == 19_800 {
-        "America/St_Johns"
-    } else {
-        "Asia/Kolkata"
-    }
 }
 
 struct Tab {
@@ -4694,14 +4386,6 @@ fn worker_shell(run: &Run, h: Harness) -> Result<Option<String>, Fail> {
         .join("home/Library/Application Support/aterm/pkg/agents");
     let (rc, laid) = match h {
         Harness::Claude => return Ok(None),
-        Harness::Gemini => {
-            let wrapper = run.run.join("gbin/gemini");
-            put(&wrapper, 0o755, &gemini_wrapper(&run.gemini_bin))?;
-            (
-                crate::relaunch_gemini::shell_exports(run),
-                format!("{} -> {}", wrapper.display(), run.gemini_bin),
-            )
-        }
         Harness::Agy => {
             let twin = pkg.join("agy");
             put(
@@ -4729,16 +4413,6 @@ fn worker_shell(run: &Run, h: Harness) -> Result<Option<String>, Fail> {
     };
     put(&run.w.join("home/.zshrc"), 0o644, &rc)?;
     Ok(Some(laid))
-}
-
-/// The lab's `gemini` on the worker shell's `PATH` (`<run>/gbin`, out of the jail's reach): `exec`
-/// the lab's build, so the process is `node` running its script, as the manager's is.
-#[must_use]
-pub fn gemini_wrapper(bin: &str) -> String {
-    format!(
-        "#!/bin/sh\n# aterm-lab forever: the worker shell's gemini\nexec {} \"$@\"\n",
-        shell_quote(bin)
-    )
 }
 
 fn spawn_worker(
@@ -5406,15 +5080,13 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
 
 /// The end (ms) of the walled chain's window no harness text may reach the stub in
 /// ([`Cover::window_stub`]), from the land act that met its wall: the wall's reset (W1, W2, W4's
-/// first wall: the resume past it meets the redraw), the last raise again's (W3: a try resends its
-/// turn, no new text), the first agent's exit (W5: the second's conversation is its own; W9: the
+/// first wall: the resume past it meets the redraw), the first agent's exit (W5: the second's conversation is its own; W9: the
 /// agent launched again opens a new one, judged by its acts), the conversation read again (W6: held
 /// unread past the reset).
 #[must_use]
 pub fn wall_window_end(chain: Chain, cover: &Cover) -> Option<i64> {
     let (_, reset_s) = cover.wall?;
     Some(match chain {
-        Chain::ShiftWall => cover.reset_now()? * 1000,
         Chain::SwitchWall => cover.switch.as_ref()?.exited_ms,
         Chain::RelaunchWall => cover
             .relaunch
@@ -5463,7 +5135,7 @@ pub fn wall_move(chain: Chain, cover: &Cover, now: i64) -> WallMove {
     }
 }
 
-fn wall_step(run: &Run, h: Harness, tab: &mut Tab, now: i64) -> Result<(), Fail> {
+fn wall_step(run: &Run, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     if !tab.chain.walled() {
         return Ok(());
     }
@@ -5476,7 +5148,7 @@ fn wall_step(run: &Run, h: Harness, tab: &mut Tab, now: i64) -> Result<(), Fail>
                 return Ok(());
             }
             let reset = reset_s_ahead(now, tab.chain.wall_ahead_ms());
-            let claim = tab.chain.wall_claim_on(h);
+            let claim = WALL_CLAIM;
             let answer = crate::verbs::set_mode(run, &format!("limit:{claim}:{reset}"))?;
             tab.seen.cover.wall = Some((now, reset));
             println!(
@@ -5490,7 +5162,7 @@ fn wall_step(run: &Run, h: Harness, tab: &mut Tab, now: i64) -> Result<(), Fail>
         Some(_) => match wall_move(tab.chain, &tab.seen.cover, now) {
             WallMove::Hold => {}
             WallMove::Shift(reset) => {
-                let claim = tab.chain.wall_claim_on(h);
+                let claim = WALL_CLAIM;
                 let answer = crate::verbs::set_mode(run, &format!("limit:{claim}:{reset}"))?;
                 tab.seen.cover.shifted.push((now, reset));
                 println!(
@@ -5537,9 +5209,7 @@ fn waits_on_the_wall(s: &Seen) -> bool {
 }
 
 /// Whether harness `h`'s screen `text` no longer draws the wall's notice: its composer drawn, no
-/// row holding any of the wall's words ([`Hide::words`]), and its reader reading no wall — at
-/// Gemini CLI, no usage-limit dialog (its Stop leaves `✕ [API Error: An unknown error occurred.]`,
-/// a wall that no longer names the limit).
+/// row holding any of the wall's words ([`Hide::words`]), and its reader reading no wall.
 #[must_use]
 pub fn notice_gone(h: Harness, text: &str) -> bool {
     let Ok(hide) = hide_of(h) else {
@@ -5554,11 +5224,6 @@ pub fn notice_gone(h: Harness, text: &str) -> bool {
         Harness::Agy => (
             aterm_phase::agy::composer_draft(&rows).is_some(),
             aterm_phase::agy::wall(&rows).is_some(),
-        ),
-        Harness::Gemini => (
-            aterm_phase::gemini::composer_draft(&rows).is_some(),
-            aterm_phase::gemini::prompt(&rows)
-                .is_some_and(|p| p.kind == aterm_phase::PromptKind::UsageLimit),
         ),
         Harness::Claude => (
             claude_composer(&rows).is_some(),
@@ -5578,23 +5243,6 @@ pub fn claude_composer(rows: &[String]) -> Option<String> {
     let first = rows.get(top + 1..bottom)?.first()?;
     let first = first.replace('\u{a0}', " ");
     Some(first.strip_prefix('❯').unwrap_or(&first).trim().to_string())
-}
-
-/// The option a dialog on `text` draws focused (`● 2. Stop` inside its box's `│` borders reads
-/// `2. Stop`), or `None` where no row draws one.
-#[must_use]
-pub fn dialog_focus(text: &str) -> Option<String> {
-    text.lines().find_map(|r| {
-        let inner = r
-            .trim()
-            .trim_start_matches('│')
-            .trim_end_matches('│')
-            .trim();
-        inner
-            .strip_prefix("● ")
-            .map(|o| o.trim().to_string())
-            .filter(|o| !o.is_empty())
-    })
 }
 
 /// Whether harness `h`'s composer holds `cmd` as typed and its command menu's first row is that
@@ -5638,7 +5286,6 @@ pub fn menu_offers(h: Harness, text: &str, cmd: &str) -> bool {
                     .iter()
                     .any(|r| r.starts_with(' ') && r.trim_start().starts_with("❯ /"))
         }
-        Harness::Gemini => false,
     }
 }
 
@@ -5656,7 +5303,7 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
             return Ok(());
         }
     };
-    let cmd = hide.label();
+    let cmd = hide.command;
     let Some((_, reset_s)) = tab.seen.cover.wall else {
         return Ok(());
     };
@@ -5681,7 +5328,6 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
             seq,
             commands,
             command: cmd,
-            stopped: matches!(hide.by, HideBy::Option(_)),
             words: hide.words,
         };
         say(
@@ -5694,30 +5340,6 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
         );
         tab.seen.cover.hidden = Some(hidden);
     };
-    if let HideBy::Option(option) = hide.by {
-        let why = match choose_option(door, &at_tab, &tab.sid, option, deadline)? {
-            Ok(enter) => {
-                say(tab, &format!("{option} chosen"));
-                let mut left = false;
-                for _ in 0..10 {
-                    stop::sleep(Duration::from_millis(1000))?;
-                    if notice_gone(h, &on(door, &tab.sid, &["text"])) {
-                        left = true;
-                        break;
-                    }
-                }
-                if left {
-                    gone(tab, enter, enter, 1);
-                    return Ok(());
-                }
-                format!("the notice still in sight 10 s after {option}")
-            }
-            Err(why) => why,
-        };
-        say(tab, &format!("the notice NOT taken off the screen: {why}"));
-        tab.seen.cover.hide_gave_up = Some(why);
-        return Ok(());
-    }
     let mut commands = 0;
     let mut first = None;
     let mut enter = now;
@@ -5835,61 +5457,22 @@ fn cancel_countdown(
     Ok(Ok(at_key))
 }
 
-fn choose_option(
-    door: &Door<'_>,
-    at_tab: &str,
-    sid: &str,
-    option: &str,
-    deadline: i64,
-) -> Result<Result<i64, String>, Fail> {
-    if now_ms() >= deadline {
-        return Ok(Err(format!(
-            "the reset under {} away before {option} was chosen",
-            at(0, HIDE_BEFORE_RESET_MS)
-        )));
-    }
-    let focus = dialog_focus(&on(door, sid, &["text"]));
-    if focus.as_deref() != Some("1. Keep trying") {
-        return Ok(Err(format!(
-            "the dialog's focus read {focus:?}, not its first option: nothing pressed"
-        )));
-    }
-    if door.ctl(&[at_tab, "key", "down"])?.code != 0 {
-        return Ok(Err("`key down` refused".to_string()));
-    }
-    stop::sleep(Duration::from_millis(1000))?;
-    let focus = dialog_focus(&on(door, sid, &["text"]));
-    if focus.as_deref() != Some(option) {
-        let _ = door.ctl(&[at_tab, "key", "up"]);
-        return Ok(Err(format!(
-            "Down moved the focus to {focus:?}, not {option}: Enter not pressed"
-        )));
-    }
-    let enter = now_ms();
-    if door.ctl(&[at_tab, "key", "enter"])?.code != 0 {
-        return Ok(Err("`key enter` refused".to_string()));
-    }
-    Ok(Ok(enter))
-}
-
 /// The agent W5 starts in harness `h`'s tab under `h`'s remembered limit ([`switch_step`]): one
 /// whose limits the loop reads and decides on too (`turn_end.rs`'s `met_under_another`), on another
-/// account: Muse Code after Claude Code, Gemini CLI or agy, Claude Code after Muse Code — the
+/// account: Muse Code after Claude Code or agy, Claude Code after Muse Code — the
 /// measured pairs, in which each holds the other.
 #[must_use]
 pub fn switch_to(h: Harness) -> Harness {
     match h {
         Harness::Muse => Harness::Claude,
-        Harness::Claude | Harness::Gemini | Harness::Agy => Harness::Muse,
+        Harness::Claude | Harness::Agy => Harness::Muse,
     }
 }
 
 /// How W5 ends harness `h`'s agent at its wall ([`exit_agent`]): Muse Code takes ctrl+c twice (its
 /// `exit-confirm` capture); Claude Code too (`footers.rs`'s quit), but its usage limit's countdown
 /// takes the first ctrl+c for its cancel, so the countdown is cancelled first where it stands
-/// armed ([`CLAUDE_CANCEL`], measured on 2.1.308); agy takes `/quit`; Gemini CLI's usage-limit
-/// dialog takes the keys first, so it is answered `2. Stop` ([`GEMINI_HIDE_OPTION`]) and then
-/// `/quit`.
+/// armed ([`CLAUDE_CANCEL`], measured on 2.1.308); agy takes `/quit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// ctrl+c, half a second, ctrl+c.
@@ -5899,8 +5482,6 @@ pub enum Exit {
     CancelThenCtrlCTwice(Cancel),
     /// The command, then Enter.
     Command(&'static str),
-    /// The dialog's option chosen, then the command.
-    OptionThenCommand(&'static str, &'static str),
 }
 
 /// [`Exit`] of harness `h`.
@@ -5910,7 +5491,6 @@ pub fn exit_of(h: Harness) -> Exit {
         Harness::Claude => Exit::CancelThenCtrlCTwice(CLAUDE_CANCEL),
         Harness::Muse => Exit::CtrlCTwice,
         Harness::Agy => Exit::Command("/quit"),
-        Harness::Gemini => Exit::OptionThenCommand(GEMINI_HIDE_OPTION, "/quit"),
     }
 }
 
@@ -5971,16 +5551,6 @@ fn exit_agent(door: &Door<'_>, sid: &str, h: Harness) -> Result<Result<(i64, i64
         Exit::Command(cmd) => {
             if !command(door, cmd)? {
                 return Ok(Err(format!("`{cmd}` not entered")));
-            }
-            last = now_ms();
-        }
-        Exit::OptionThenCommand(option, cmd) => {
-            if let Err(why) = choose_option(door, &at_tab, sid, option, i64::MAX)? {
-                return Ok(Err(why));
-            }
-            stop::sleep(Duration::from_millis(2000))?;
-            if !command(door, cmd)? {
-                return Ok(Err(format!("{option} chosen, but `{cmd}` not entered")));
             }
             last = now_ms();
         }
@@ -6097,7 +5667,7 @@ fn agent_again(
     } else {
         None
     };
-    let script = launcher(run, to, std::slice::from_ref(&tab.dir), (!lift, false))?;
+    let script = launcher(run, to, std::slice::from_ref(&tab.dir), !lift)?;
     let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
     let _ = on(door, &tab.sid, &["send", &line]);
     let _ = on(door, &tab.sid, &["key", "enter"]);
@@ -6348,15 +5918,10 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::Worker
         | Chain::Wall
         | Chain::WallHid
-        | Chain::WallDay
-        | Chain::WallClimb
-        | Chain::ShiftWall
         | Chain::RedrawWall
         | Chain::SwitchWall
         | Chain::UnreadWall
-        | Chain::DayStopWall
-        | Chain::RelaunchWall
-        | Chain::BucketWall => false,
+        | Chain::RelaunchWall => false,
         Chain::CruiseWall => walls::cruise_went_on(s).is_some_and(|t| now - t >= 10_000),
         Chain::Mgr => true,
         Chain::LandT => done_since(20_000),
@@ -6534,7 +6099,7 @@ fn run_check(
         dirs.push(d);
     }
     let walled = chains.iter().any(|c| c.walled());
-    let script = launcher(&run, h, &dirs, (walled, chains.contains(&Chain::Worker)))?;
+    let script = launcher(&run, h, &dirs, walled)?;
     let scroll_script = if chains.contains(&Chain::TallScroll) {
         scroll_launcher(&run, h, &dirs, walled)?
     } else {
@@ -6803,7 +6368,7 @@ fn run_check(
                     tab.seen.ask_refused_ms = Some(asked);
                 }
             }
-            wall_step(&run, h, tab, now)?;
+            wall_step(&run, tab, now)?;
             hide_step(&door, h, tab, now)?;
             switch_step(&run, &door, h, tab)?;
             relaunch_step(&run, &door, h, tab)?;
@@ -7096,9 +6661,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                     Harness::ALL.to_vec()
                 } else {
                     vec![Harness::of(w).ok_or_else(|| {
-                        usage(&format!(
-                            "unknown harness '{w}' (claude, gemini, agy, muse, all)"
-                        ))
+                        usage(&format!("unknown harness '{w}' (claude, agy, muse, all)"))
                     })?]
                 });
             }
@@ -7106,7 +6669,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let w = it.next().map(String::as_str);
                 mode = w.and_then(Mode::of).ok_or_else(|| {
                     usage(&format!(
-                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-day, wall-climb, wall-shift, wall-redraw, wall-switch, wall-unread, wall-day-stop, wall-cruise, wall-relaunch, wall-bucket, resid or ladder, not {w:?}"
+                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, resid or ladder, not {w:?}"
                     ))
                 })?;
             }
@@ -7145,7 +6708,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             s => tag = Some(s.to_string()),
         }
     }
-    let harnesses = harnesses.ok_or_else(|| usage("say --harness claude|gemini|agy|muse|all"))?;
+    let harnesses = harnesses.ok_or_else(|| usage("say --harness claude|agy|muse|all"))?;
     let asked = Asked {
         harnesses,
         mode,
@@ -7171,11 +6734,10 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     Ok(Some(asked))
 }
 
-/// `forever --harness <claude|gemini|agy|muse|all> [--mode MODE] [--chains a,b] [--no-surfaces]
+/// `forever --harness <claude|agy|muse|all> [--mode MODE] [--chains a,b] [--no-surfaces]
 /// [--window] [tag] [--keep]`, `MODE` one of `land`, `cruise`, `both`, `cover`, `cap`, `wall`,
-/// `wall-hid`, `wall-day`, `wall-climb`, `wall-shift`, `wall-redraw`, `wall-switch`,
-/// `wall-unread`, `wall-day-stop`, `wall-cruise`, `wall-relaunch`, `wall-bucket`, `resid` or
-/// `ladder`.
+/// `wall-hid`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-cruise`, `wall-relaunch`,
+/// `resid` or `ladder`.
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);

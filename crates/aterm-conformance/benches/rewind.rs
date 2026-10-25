@@ -13,6 +13,7 @@ mod measuring {
     use std::time::Duration;
 
     use aterm_conformance::measure::Rig;
+    use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::rewind::{RewindRow, RewindScene, measure};
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
@@ -45,6 +46,7 @@ mod measuring {
     fn take(rig: &Rig, row: &RewindRow) -> Outcome {
         let report = match measure(rig, row) {
             Ok(report) => report,
+            Err(CouldNotRun::Unanswered(why)) => return Outcome::Unanswered(why),
             Err(why) => {
                 return Outcome::CouldNotRun(format!(
                     "REWIND COULD NOT RUN: the probe decided nothing: {why}"

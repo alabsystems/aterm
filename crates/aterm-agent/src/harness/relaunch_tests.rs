@@ -1302,70 +1302,6 @@ fn the_persons_grace_left_is_read_off_the_status_stamp() {
 }
 
 #[test]
-fn a_gemini_clis_own_restart_is_read_as_the_exit_is_seen() {
-    let look = |running: bool, crashed: Option<bool>, itself: bool| ExitLook {
-        running,
-        record: None,
-        agent: upgrade::Agent::Gemini,
-        crashed,
-        refused: crashed == Some(false),
-        restarted_itself: itself,
-    };
-    let mut seq = vec![
-        look(true, None, false),
-        look(false, None, false),
-        look(false, Some(true), true),
-    ]
-    .into_iter();
-    let mut waits = 0;
-    assert!(restarted_itself(
-        || seq.next(),
-        |_| {
-            waits += 1;
-            true
-        }
-    ));
-    assert_eq!(waits, 2);
-    assert!(!restarted_itself(
-        || Some(look(false, Some(true), false)),
-        |_| true
-    ));
-    assert!(!restarted_itself(
-        || Some(look(false, Some(false), false)),
-        |_| true
-    ));
-    assert!(!restarted_itself(|| None, |_| true));
-    let mut looks = 0;
-    assert!(!restarted_itself(
-        || {
-            looks += 1;
-            Some(look(true, None, false))
-        },
-        |_| true
-    ));
-    assert_eq!(
-        looks,
-        usize::try_from(EXIT_GONE.as_millis() / EXIT_LOOK.as_millis()).unwrap() + 1
-    );
-    assert!(!restarted_itself(
-        || Some(look(false, None, true)),
-        |_| true
-    ));
-    assert!(!restarted_itself(
-        || Some(look(false, None, false)),
-        |_| false
-    ));
-    let kept = exit_record(|| Some(look(false, Some(true), true)), |_| true);
-    assert_eq!(kept, ExitRecord::Restarted);
-    assert!(kept.crashed());
-    assert_eq!(kept.word(), "restarted");
-    assert_eq!(
-        exit_record(|| Some(look(false, Some(true), false)), |_| true),
-        ExitRecord::Crashed
-    );
-}
-
-#[test]
 fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
     let look = |agent| ExitLook {
         running: false,
@@ -1373,7 +1309,6 @@ fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
         agent,
         crashed: Some(true),
         refused: false,
-        restarted_itself: false,
     };
     {
         let agent = upgrade::Agent::Codex;
@@ -1391,11 +1326,7 @@ fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
         exit_record(|| Some(look(upgrade::Agent::Claude)), |_| true),
         ExitRecord::Removed
     );
-    for lane in [
-        upgrade::Agent::Muse,
-        upgrade::Agent::Agy,
-        upgrade::Agent::Gemini,
-    ] {
+    for lane in [upgrade::Agent::Muse, upgrade::Agent::Agy] {
         let shell = |crashed: Option<bool>, refused: bool| ExitLook {
             crashed,
             refused,
@@ -1451,7 +1382,6 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             agent: upgrade::Agent::Claude,
             crashed: None,
             refused: false,
-            restarted_itself: false,
         })
     };
     let steps =
@@ -1505,7 +1435,6 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
                 agent: upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
-                restarted_itself: false,
             })
         },
         |_| {
@@ -1524,7 +1453,6 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
                 agent: upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
-                restarted_itself: false,
             })
         },
         |_| true,
@@ -1719,7 +1647,6 @@ fn a_muse_exit_is_decided_on_its_shells_word() {
             agent: upgrade::Agent::Muse,
             crashed,
             refused: false,
-            restarted_itself: false,
         })
     };
     assert_eq!(
@@ -1758,7 +1685,6 @@ fn a_muse_exit_is_decided_on_its_shells_word() {
             agent: upgrade::Agent::Claude,
             crashed: None,
             refused: false,
-            restarted_itself: false,
         })
     };
     assert_eq!(exit_record(claude, |_| true), ExitRecord::Removed);
@@ -1804,9 +1730,14 @@ fn the_relaunch_line_carries_the_login_in_every_shells_form() {
             Ok(format!(" {posix} {survey} {tail}").as_str()),
             "{dialect:?}"
         );
+        let opens = if dialect == Dialect::Bash {
+            crate::harness::upgrade::BASH_LINE_OPENS
+        } else {
+            ""
+        };
         assert_eq!(
             login_line(dialect, Some("/w"), &argv, &login).as_deref(),
-            Ok(format!(" ( cd -- '/w' && {posix} {survey} exec {tail} )").as_str()),
+            Ok(format!(" {opens}( cd -- '/w' && {posix} {survey} exec {tail} )").as_str()),
             "{dialect:?}"
         );
     }
@@ -3099,6 +3030,248 @@ fn the_tap_is_dropped_before_the_required_login() {
     assert!(line(fits_bare + 1).is_err());
 }
 
+/// The person's `~/.claude/settings.json` on the measured machine (2026-10-24, Claude Code
+/// 2.1.310): another app's statusLine, a plain command line of 337 bytes here (333 there).
+#[cfg(unix)]
+const OWNER_SETTINGS_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-user-settings.json");
+
+/// THE MEASURED MACHINE'S RELAUNCH LINE CARRIES THE TAP (the review of 864de5a37b, 2026-10-24):
+/// zsh with atpkg's heal hook, the managed twin, `--dangerously-skip-permissions`, a resumed
+/// conversation, and the owner's own statusLine from the measured 2.1.310 `settings.json`. The
+/// carrying value of 864de5a37b put that command, hex-encoded, on the typed line, past a Darwin
+/// tty's 1000-byte cap, so every relaunch there fell back to no tap without a word and the footer
+/// kept saying `weekly ?`. The carrying value names no command, so the tapped line fits with room
+/// to spare; and the control, 864de5a37b's value for the same command, is dropped on a Darwin tty
+/// with its reason given ([`line_tap_kept`]), never silently.
+#[cfg(unix)]
+#[test]
+fn the_measured_machines_relaunch_line_carries_the_tap() {
+    use super::super::netwatch::Source;
+    use super::super::tap;
+    let argv = args(&["claude", "--dangerously-skip-permissions"]);
+    let settings = vec![
+        ("managed".to_string(), Source::Missing),
+        (
+            "user".to_string(),
+            Source::Text(OWNER_SETTINGS_2_1_310.to_string()),
+        ),
+    ];
+    let value = tap::gate(&tap::GateFacts {
+        exe: Some(Path::new("/Applications/aterm.app/Contents/MacOS/aterm")),
+        stored_login: true,
+        login: None,
+        lone_login: None,
+        home: None,
+        argv: &argv,
+        settings: &settings,
+        user_settings: Some("user"),
+        profile_store: false,
+    })
+    .expect("the measured machine's settings admit the tap");
+    let heal = Path::new("/Users//example/.aterm/shell.d/00-atpkg.zsh");
+    let twin = Path::new("/Users//example/Library/Application Support/aterm/pkg/agents/claude");
+    let kept = |tap: &str| {
+        line_tap_kept(
+            Dialect::Zsh,
+            Some(heal),
+            None,
+            twin,
+            &argv,
+            Some(LOGIN_ID),
+            None,
+            None,
+            &[],
+            None,
+            Some(tap),
+        )
+        .unwrap_or_else(|_| panic!("a relaunch line"))
+    };
+    let (line, dropped) = kept(&value);
+    assert_eq!(dropped, None, "{line}");
+    assert!(
+        line.contains(&format!("'--settings' '{value}' '--resume' '{LOGIN_ID}'")),
+        "{line}"
+    );
+    assert!(line.contains(" harness tap --carry"), "{line}");
+    assert!(
+        line.len() + 400 < 1000,
+        "room to spare on a Darwin tty: {}",
+        line.len()
+    );
+    let owner = tap::owner_command(OWNER_SETTINGS_2_1_310).expect("the owner's command");
+    let hex: String = owner.bytes().map(|b| format!("{b:02x}")).collect();
+    let legacy = value.replacen(" --carry", &format!(" --then {hex}"), 1);
+    assert!(
+        tap::is_ours(&legacy),
+        "the control is 864de5a37b's exact value"
+    );
+    let (line, dropped) = kept(&legacy);
+    if cfg!(target_os = "linux") {
+        assert_eq!(dropped, None, "a Linux tty keeps 4000 bytes: {line}");
+    } else {
+        assert!(!line.contains("--settings"), "{line}");
+        let why = dropped.expect("the drop is reported, never silent");
+        assert!(
+            why.starts_with("the usage tap left this relaunch line: with it, the line would be ")
+                && why.contains("(max 1000); without it, "),
+            "{why}"
+        );
+    }
+}
+
+/// A RELAUNCH THAT DROPS THE TAP SAYS SO IN THE LEDGER ([`note_tap_dropped`]): one row, step
+/// [`TAP_DROPPED`], with the reason; nothing where the line kept it, and nothing on a dry run.
+#[cfg(unix)]
+#[test]
+fn a_dropped_tap_is_recorded_in_the_ledger() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tmp");
+    let opts = super::super::upgrade_drive::Opts {
+        home: tmp.path().join("home"),
+        state: tmp.path().join("state"),
+        sock: None,
+        token: None,
+        only_sid: Some("s-1".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        usage_tap: None,
+        instances: super::super::upgrade_drive::Instances::Machine,
+        agents_off: Vec::new(),
+        land: false,
+        timings: super::super::Timings::for_build(),
+    };
+    let r = Report {
+        pid: 4242,
+        tab: "s-1".to_string(),
+        session: LOGIN_ID.to_string(),
+        from: "2.1.310".to_string(),
+        to: "2.1.310(same)".to_string(),
+        step: "exited".to_string(),
+    };
+    let ledger = super::super::upgrade_drive::ledger_path(&opts);
+    let rows = || {
+        std::fs::read_to_string(&ledger)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    note_tap_dropped(&opts, &r, None);
+    assert_eq!(rows(), Vec::<String>::new(), "a line that kept the tap");
+    note_tap_dropped(
+        &super::super::upgrade_drive::Opts {
+            dry_run: true,
+            ..opts.clone()
+        },
+        &r,
+        Some("why"),
+    );
+    assert_eq!(rows(), Vec::<String>::new(), "a dry run");
+    note_tap_dropped(&opts, &r, Some("the usage tap left this relaunch line"));
+    let rows = rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row: Value = aterm_json::from_str(&rows[0]).expect("a JSON row");
+    assert_eq!(row["step"].as_str(), Some(TAP_DROPPED));
+    assert_eq!(row["tab"].as_str(), Some("s-1"));
+    assert_eq!(
+        row["detail"].as_str(),
+        Some("the usage tap left this relaunch line")
+    );
+}
+
+/// THE FOOTER'S PROMISE ASKS THE LINE'S ROOM ([`tap_room`]): the measured machine's restart line
+/// (zsh, atpkg's heal hook, the managed twin, a resumed conversation) has room for the carrying
+/// tap and for a model and permission mode besides; the same agent started in a directory so long
+/// that its line keeps no room for the tap has none, so the footer never promises a tap the line
+/// would drop; and a snapshot no line can be built from has none.
+#[cfg(unix)]
+#[test]
+fn the_footers_promise_asks_whether_the_line_has_room_for_the_tap() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tmp");
+    let home = tmp.path();
+    let hooks = home.join(".aterm").join("shell.d");
+    std::fs::create_dir_all(&hooks).expect("mkdir");
+    std::fs::write(hooks.join("00-atpkg.zsh"), "# hook\n").expect("hook");
+    assert!(
+        atpkg::hooks::hook_file(home, "zsh").is_some(),
+        "the heal hook"
+    );
+    let value = super::super::tap::settings_value_carrying(
+        Path::new("/Applications/aterm.app/Contents/MacOS/aterm"),
+        true,
+    )
+    .expect("a value");
+    let snap = |cwd: &str| Snapshot {
+        tab: "s-1".to_string(),
+        pid: 4242,
+        start: "Thu Sep 24 01:02:03 2026".to_string(),
+        shell: NO_SHELL,
+        program: PathBuf::from(
+            "/Users//example/Library/Application Support/aterm/pkg/agents/claude",
+        ),
+        argv: words(&[
+            "/Users//example/Library/Application Support/aterm/pkg/agents/claude",
+            "--dangerously-skip-permissions",
+        ]),
+        session: Some(LOGIN_ID.to_string()),
+        cwd: cwd.to_string(),
+        version: Some("2.1.310".to_string()),
+        run: crate::harness::relaunch::AgentRun::Claude,
+        dialect: Some(Dialect::Zsh),
+        login: None,
+        home: None,
+        claude_dir: None,
+        stored_login: true,
+        profile: None,
+    };
+    assert!(tap_room(home, &snap("/Users//example/trust"), &value));
+    let heal = atpkg::hooks::hook_file(home, "zsh").map(|(p, _)| p);
+    let model = "m".repeat(TAP_ROOM_MODEL);
+    let typed = |cwd: &str, tap: Option<&str>| {
+        let s = snap(cwd);
+        line_tap_kept(
+            Dialect::Zsh,
+            heal.as_deref(),
+            Some(cwd),
+            &s.program,
+            &s.argv,
+            Some(LOGIN_ID),
+            Some(&model),
+            Some(TAP_ROOM_MODE),
+            &[],
+            None,
+            tap,
+        )
+    };
+    let base = typed("/Users//example/d", None)
+        .unwrap_or_else(|_| panic!("a line"))
+        .0
+        .len();
+    let deep = format!(
+        "/Users//example/d{}",
+        "d".repeat(upgrade::MAX_LINE - base - 1)
+    );
+    let (line, dropped) = typed(&deep, Some(&value)).unwrap_or_else(|_| panic!("a line"));
+    assert!(
+        dropped.is_some() && !line.contains("--settings"),
+        "CONTROL: the deep agent's relaunch still runs, without the tap: {line}"
+    );
+    assert!(!tap_room(home, &snap(&deep), &value));
+    assert!(!tap_room(
+        home,
+        &Snapshot {
+            session: None,
+            ..snap("/Users//example/trust")
+        },
+        &value
+    ));
+}
+
 /// A PROVEN SELF-CLAIMED CODEX-ALAB'S RELAUNCH AFTER ATERM ENDED IS THE CRASH RULE'S (the self-claim contract, §4; [`CodexRun::self_claimed`]): a snapshot that carries the line aterm's copy of its record validated — off a crash journal's or a restart's leaf, or owed at a seamless update's Commit — is relaunched by [`after_host_ended`] on that line, through the crash rule's own relaunch, its once-per-witness ledger read: a witness handled already is `ended:handled`, and one that is not would be typed (`would-relaunch`, a dry run).
 #[cfg(unix)]
 #[test]
@@ -4185,12 +4358,7 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
     use crate::supervise::policy::turn_end::DONE_CHECK;
     assert!(upgrade::CARRY_ON.ends_with(NEEDS_HINT));
     assert!(!upgrade::CARRY_ON.contains("ATERM-TASK-DONE"));
-    let agents = [
-        "Claude Code",
-        upgrade::Agent::Gemini.product(),
-        upgrade::Agent::Agy.product(),
-        "Muse Code",
-    ];
+    let agents = ["Claude Code", upgrade::Agent::Agy.product(), "Muse Code"];
     let causes = [
         CAUSE_EXIT,
         CAUSE_MEMORY,

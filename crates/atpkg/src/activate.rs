@@ -225,13 +225,15 @@ pub fn reconcile_agents(layout: &Layout) {
         let prelude = if dev_link {
             String::new()
         } else {
-            platform::twin_prelude(
+            let mut prelude = platform::twin_prelude(
                 name,
                 &layout.prefix,
                 atpkg.as_deref(),
                 crate::selfupdate::verbs_of(name),
                 &crate::yolo::policy_of(name),
-            )
+            );
+            prelude.push_str(&crate::launch_tap::sh_prelude(name, atpkg.as_deref()));
+            prelude
         };
         if (exec.managed.is_some() || (!dev_link && !prelude.is_empty()))
             && let Err(e) =
@@ -1622,6 +1624,85 @@ mod tests {
                 .unwrap_or(true),
             "agents/ is empty after the only agent program is gone"
         );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A MANAGED CLAUDE CODE TWIN CARRIES THE USAGE TAP'S LAUNCH BLOCK
+    /// ([`crate::launch_tap::sh_prelude`]), naming the aterm beside the atpkg the twin names,
+    /// after its `--yolo` block, in `bin/` too; a twin laid before the block is re-laid with it on
+    /// the next pass (so a machine gains it with no relaunch and nothing typed), and a pass after
+    /// that writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_twin_carries_the_launch_tap_block_and_a_standing_twin_gains_it() {
+        let layout = temp_prefix("agents-twin-launch-tap");
+        let claude = tool("claude");
+        let env = crate::shim_env::ShimEnv::NONE;
+        let bundle = layout.prefix.join("bundle/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let live = bundle.join("aterm");
+        std::fs::write(&live, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("aterm", bundle.join("atpkg")).unwrap();
+        let atpkg = bundle.join("atpkg");
+        let c1 = make_build(&layout, "claude", 2026091601, &["claude"]);
+        let twin = layout.agent_shim(&claude);
+        crate::stub::with_current_exe(&live, || {
+            install_tools_env(
+                &layout,
+                &c1,
+                std::slice::from_ref(&claude),
+                Aliases::Off,
+                &env,
+            )
+            .unwrap();
+            let named = crate::stub::Embedder::this_process().embed(None);
+            assert_eq!(
+                named
+                    .as_deref()
+                    .map(|p| p.file_name().unwrap().to_os_string()),
+                Some("atpkg".into()),
+                "the twin names the atpkg beside the running aterm"
+            );
+            let named = named.unwrap();
+            let yolo = platform::twin_prelude(
+                "claude",
+                &layout.prefix,
+                Some(&named),
+                crate::selfupdate::verbs_of("claude"),
+                &crate::yolo::policy_of("claude"),
+            );
+            let block = crate::launch_tap::sh_prelude("claude", Some(&named));
+            assert!(block.contains("harness tap --launch --"), "{block}");
+            let today = platform::sh_shim_content_twin(
+                &c1.join("bin/claude"),
+                &env,
+                None,
+                &format!("{yolo}{block}"),
+            );
+            assert_eq!(std::fs::read_to_string(&twin).unwrap(), today);
+            assert_eq!(
+                std::fs::read_to_string(layout.shim(&claude)).unwrap(),
+                today,
+                "bin/ carries the twin's block"
+            );
+            let before_the_block =
+                platform::sh_shim_content_twin(&c1.join("bin/claude"), &env, None, &yolo);
+            std::fs::write(&twin, &before_the_block).unwrap();
+            reconcile_agents(&layout);
+            assert_eq!(
+                std::fs::read_to_string(&twin).unwrap(),
+                today,
+                "a twin laid before the block gains it on the next pass"
+            );
+            let before = std::fs::metadata(&twin).unwrap().modified().unwrap();
+            reconcile_agents(&layout);
+            assert_eq!(
+                std::fs::metadata(&twin).unwrap().modified().unwrap(),
+                before
+            );
+        });
+        assert_eq!(atpkg.canonicalize().unwrap(), live.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 

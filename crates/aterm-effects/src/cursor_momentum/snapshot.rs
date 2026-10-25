@@ -436,20 +436,21 @@ impl MomentumGlow {
     /// # Errors
     /// [`SnapshotRefusal::OffsetUnrepresentable`], which no std `Instant` pair reaches (an `i128` holds every `Duration`'s nanoseconds).
     pub fn snapshot(&self, epoch: Instant) -> Result<MomentumGlowSnapshot, SnapshotRefusal> {
+        let rate_at = match self.rate.at {
+            Some(at) => Some(offset_from(epoch, at, SnapshotField::RateAt)?),
+            None => None,
+        };
+        let stamp = match self.stamp {
+            Some(stamp) => Some(offset_from(epoch, stamp, SnapshotField::Stamp)?),
+            None => None,
+        };
         Ok(MomentumGlowSnapshot {
             rate_value: self.rate.value.to_bits(),
-            rate_at: self
-                .rate
-                .at
-                .map(|at| offset_from(epoch, at, SnapshotField::RateAt))
-                .transpose()?,
+            rate_at,
             fp_last: self.fp_last,
             fp_prev: self.fp_prev,
             latched: self.latched.to_bits(),
-            stamp: self
-                .stamp
-                .map(|stamp| offset_from(epoch, stamp, SnapshotField::Stamp))
-                .transpose()?,
+            stamp,
             tau: self.tau.to_bits(),
         })
     }
@@ -460,27 +461,32 @@ impl MomentumGlow {
     /// an offset lands outside the `Instant` range, or a stamp's settle schedule
     /// (`stamp + τ·ln 255 + SETTLE_MARGIN`) would.
     pub fn restore(s: &MomentumGlowSnapshot, epoch: Instant) -> Result<Self, SnapshotRefusal> {
+        const LN_255: f32 = crate::color_math::ln_pos_f32(255.0);
         s.validate()?;
-        let at = s
-            .rate_at
-            .map(|offset| instant_at(epoch, offset, SnapshotField::RateAt))
-            .transpose()?;
-        let stamp = s
-            .stamp
-            .map(|offset| {
+        let at = match s.rate_at {
+            Some(offset) => Some(instant_at(epoch, offset, SnapshotField::RateAt)?),
+            None => None,
+        };
+        let stamp = match s.stamp {
+            Some(offset) => {
                 let refused = SnapshotRefusal::Instant {
                     field: SnapshotField::Stamp,
                     offset,
                 };
                 let stamp = instant_at(epoch, offset, SnapshotField::Stamp)?;
-                let reach = Duration::try_from_secs_f32(f32::from_bits(s.tau) * 255f32.ln())
-                    .ok()
-                    .and_then(|d| d.checked_add(SETTLE_MARGIN))
-                    .ok_or(refused)?;
-                stamp.checked_add(reach).ok_or(refused)?;
-                Ok(stamp)
-            })
-            .transpose()?;
+                let Ok(d) = Duration::try_from_secs_f32(f32::from_bits(s.tau) * LN_255) else {
+                    return Err(refused);
+                };
+                let Some(reach) = d.checked_add(SETTLE_MARGIN) else {
+                    return Err(refused);
+                };
+                if stamp.checked_add(reach).is_none() {
+                    return Err(refused);
+                }
+                Some(stamp)
+            }
+            None => None,
+        };
         Ok(Self {
             rate: TypingRate {
                 value: f32::from_bits(s.rate_value),

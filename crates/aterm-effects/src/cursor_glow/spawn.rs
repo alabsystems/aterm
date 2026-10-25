@@ -431,14 +431,15 @@ impl CursorGlow {
         const ONE_SEC: Duration = Duration::from_secs(1);
         let n = Self::BOLT_FLASHES_PER_S;
         let oldest = self.bolt_onsets[self.bolt_onset_next];
-        if oldest.is_some_and(|t| now.saturating_duration_since(t) <= ONE_SEC) {
+        if let Some(t) = oldest
+            && now.saturating_duration_since(t) <= ONE_SEC
+        {
             return false;
         }
         let last = self.bolt_onsets[(self.bolt_onset_next + n - 1) % n];
         if crackle
-            && last.is_some_and(|t| {
-                now.saturating_duration_since(t).as_secs_f32() < Self::CRACKLE_REFRACTORY_S
-            })
+            && let Some(t) = last
+            && now.saturating_duration_since(t).as_secs_f32() < Self::CRACKLE_REFRACTORY_S
         {
             return false;
         }
@@ -498,7 +499,7 @@ impl CursorGlow {
                     }
                 };
                 let (x0, y0) = geom.cell_center(rr, rc);
-                let (sin_a, cos_a) = a.sin_cos();
+                let (sin_a, cos_a) = crate::supernova::sin_cos_f32(a);
                 self.spawn_bolt(
                     (x0, y0),
                     (x0 + cos_a * len, y0 + sin_a * len),
@@ -622,7 +623,7 @@ impl CursorGlow {
             let cwf = geom.cw as f32;
             let hue0 = self.hue;
             let laser_cov_scale = if burst > 0 {
-                (burst as f32).sqrt().recip()
+                1.0 / crate::color_math::sqrt_f32(burst as f32)
             } else {
                 1.0
             };
@@ -634,11 +635,13 @@ impl CursorGlow {
             let drip_p = 0.75 - 0.55 * heat;
             let comet_drift = {
                 let (mvx, mvy) = (ox - leap_from.0, oy - leap_from.1);
-                let ml = (mvx * mvx + mvy * mvy).sqrt();
-                (ml > 0.5).then(|| {
+                let ml = crate::color_math::hypot_f32(mvx, mvy);
+                if ml > 0.5 {
                     let inv_ml = 1.0 / ml;
-                    (-mvx * inv_ml, -mvy * inv_ml)
-                })
+                    Some((-mvx * inv_ml, -mvy * inv_ml))
+                } else {
+                    None
+                }
             };
             for _ in 0..burst {
                 let r0 = self.frand();
@@ -768,7 +771,8 @@ impl CursorGlow {
                         }
                     }
                     GlowStyle::Laser => {
-                        let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
+                        let (sin_a, cos_a) =
+                            crate::supernova::sin_cos_f32(r0 * std::f32::consts::TAU);
                         let speed = (1.1 + r1 * 2.6) * cell;
                         Particle {
                             x0: ox,
@@ -811,10 +815,14 @@ impl CursorGlow {
                         } else {
                             (ox + (r0 - 0.5) * cwf, oy)
                         };
-                        let (tx, ty) = comet_drift.unwrap_or_else(|| {
-                            let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
-                            (cos_a, sin_a)
-                        });
+                        let (tx, ty) = match comet_drift {
+                            Some(d) => d,
+                            None => {
+                                let (sin_a, cos_a) =
+                                    crate::supernova::sin_cos_f32(r0 * std::f32::consts::TAU);
+                                (cos_a, sin_a)
+                            }
+                        };
                         let speed = (0.25 + r1 * 0.55) * cell;
                         Particle {
                             x0: bx,
@@ -829,7 +837,8 @@ impl CursorGlow {
                         }
                     }
                     GlowStyle::Sparkle => {
-                        let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
+                        let (sin_a, cos_a) =
+                            crate::supernova::sin_cos_f32(r0 * std::f32::consts::TAU);
                         let speed = (0.35 + r1 * 1.3) * cell;
                         let (bx, by) = if dist >= 2.0 {
                             let (fx, fy) = leap_from;
@@ -853,7 +862,8 @@ impl CursorGlow {
                         }
                     }
                     _ => {
-                        let (sin_a, cos_a) = (r0 * std::f32::consts::TAU).sin_cos();
+                        let (sin_a, cos_a) =
+                            crate::supernova::sin_cos_f32(r0 * std::f32::consts::TAU);
                         let speed = (0.4 + r1 * 1.6) * cell;
                         let (bx, by) = if dist >= 2.0 {
                             let (fx, fy) = leap_from;
@@ -899,7 +909,7 @@ impl CursorGlow {
         now: Instant,
     ) {
         let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-        let len = (dx * dx + dy * dy).sqrt();
+        let len = crate::color_math::hypot_f32(dx, dy);
         if len < 1.0 {
             return;
         }
@@ -913,7 +923,7 @@ impl CursorGlow {
             for w in pts.windows(2) {
                 let (a, b) = (w[0], w[1]);
                 let (sx, sy) = (b.0 - a.0, b.1 - a.1);
-                let inv_sl = 1.0 / (sx * sx + sy * sy).sqrt().max(1e-3);
+                let inv_sl = 1.0 / crate::color_math::hypot_f32(sx, sy).max(1e-3);
                 let kick_sl = (self.frand() - 0.5) * 2.0 * amp * inv_sl;
                 next.push(a);
                 next.push((
@@ -932,9 +942,9 @@ impl CursorGlow {
                 let root = pts[i];
                 let prevp = pts[i - 1];
                 let (tx, ty) = (root.0 - prevp.0, root.1 - prevp.1);
-                let inv_tl = 1.0 / (tx * tx + ty * ty).sqrt().max(1e-3);
+                let inv_tl = 1.0 / crate::color_math::hypot_f32(tx, ty).max(1e-3);
                 let bend = (self.frand() - 0.5) * 1.9;
-                let (bs, bc) = bend.sin_cos();
+                let (bs, bc) = crate::supernova::sin_cos_f32(bend);
                 let (ux, uy) = (tx * inv_tl, ty * inv_tl);
                 let (bx, by) = (ux * bc - uy * bs, ux * bs + uy * bc);
                 let blen = (len * (0.14 + self.frand() * 0.22)).max(cell);
@@ -981,7 +991,7 @@ impl CursorGlow {
     pub(super) fn meteor_strike_fountain(&mut self, m: &Meteor, now: Instant, geom: Geom) {
         let cell = geom.ch as f32;
         let (dx, dy) = (m.x1 - m.x0, m.y1 - m.y0);
-        let len = (dx * dx + dy * dy).sqrt().max(1.0);
+        let len = crate::color_math::hypot_f32(dx, dy).max(1.0);
         let inv_len = 1.0 / len;
         let dist_cells = len / geom.cw.max(1) as f32;
         let (ux, uy) = (dx * inv_len, dy * inv_len);
@@ -995,7 +1005,7 @@ impl CursorGlow {
             let r2 = self.frand();
             let r3 = self.frand();
             let r4 = self.frand();
-            let t = 1.0 - Self::STRIKE_DEBRIS_REACH * (1.0 - r0.sqrt());
+            let t = 1.0 - Self::STRIKE_DEBRIS_REACH * (1.0 - crate::color_math::sqrt_f32(r0));
             let speed = (1.6 + 1.6 * m.mom) * cell * (0.4 + 0.6 * r2);
             self.particles.push(Particle {
                 x0: m.x0 + dx * t,
@@ -1018,15 +1028,13 @@ impl CursorGlow {
         }
         // Expire a stale hint: it keeps the animation timer armed
         // (`is_active`), so an unconsumed one must self-disarm.
-        if self
-            .kill_hint
-            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH)
+        if let Some(t) = self.kill_hint
+            && now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH
         {
             self.kill_hint = None;
         }
-        if self
-            .bs_poof_hint
-            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH)
+        if let Some(t) = self.bs_poof_hint
+            && now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH
         {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
@@ -1036,9 +1044,10 @@ impl CursorGlow {
             return;
         }
         let fresh_kill = true;
-        let gap_ok = self
-            .last_poof
-            .is_none_or(|t| now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_MIN_GAP);
+        let gap_ok = match self.last_poof {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_MIN_GAP,
+            None => true,
+        };
         let bs_only = self.kill_hint.is_none();
         let voice = if bs_only {
             PoofVoice::Puff
@@ -1097,10 +1106,10 @@ impl CursorGlow {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        let erasure_proven = self
-            .row_prev_meta
-            .zip(self.row_cur_meta)
-            .is_some_and(|(prev, cur)| prev.row == cur.row && cur.fill < prev.fill);
+        let erasure_proven = matches!(
+            (self.row_prev_meta, self.row_cur_meta),
+            (Some(prev), Some(cur)) if prev.row == cur.row && cur.fill < prev.fill
+        );
         let erase_on_glass = self.poof_erase_witnessed();
         let bs_erased = erase_on_glass
             || matches!(
@@ -1112,9 +1121,12 @@ impl CursorGlow {
             && !poofed
             && (!bs_only || erasure_proven || bs_erased)
             && (erase_on_glass
-                || poof_hint_at.is_some_and(|t| {
-                    now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
-                }))
+                || match poof_hint_at {
+                    Some(t) => {
+                        now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
+                    }
+                    None => false,
+                })
             && let Some(cur) = self.row_cur_meta
             && cur.trust == ProbeTrust::Full
         {
@@ -1235,7 +1247,7 @@ impl CursorGlow {
                 }
             }
             GlowStyle::Fire => {
-                let puffs = ((1.0 + nf.sqrt()) as usize).clamp(1, 5);
+                let puffs = ((1.0 + crate::color_math::sqrt_f32(nf)) as usize).clamp(1, 5);
                 let inv_puffs = 1.0 / (puffs as f32);
                 let x_at = |k: usize| span_x0 + ((k as f32 + 0.5) * inv_puffs) * span_w;
                 self.spawn_quench_steam(puffs, x_at, oy, cell, cwf, now);
@@ -1331,7 +1343,7 @@ impl CursorGlow {
         n: u16,
         now: Instant,
     ) {
-        let puffs = ((1.0 + f32::from(n).sqrt() * 1.4) as usize).clamp(1, 8);
+        let puffs = ((1.0 + crate::color_math::sqrt_f32(f32::from(n)) * 1.4) as usize).clamp(1, 8);
         let inv_puffs = 1.0 / (puffs as f32);
         let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
         for k in 0..puffs {

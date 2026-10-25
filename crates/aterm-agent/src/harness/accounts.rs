@@ -290,7 +290,7 @@ pub struct Row {
     pub dir: Option<String>,
     /// The account's email ([`email_matches`]).
     pub email: Option<String>,
-    /// Codex's expected `account/read` email, when its login address is an alias.
+    /// Claude's or Codex's expected provider email, when its login address is an alias.
     /// This explicit expectation is not proof of a login or budget authority.
     pub identity_email: Option<String>,
     /// The browser profile that holds the account's claude.ai session.
@@ -312,7 +312,7 @@ pub struct Vendor {
 }
 
 impl Row {
-    /// The email Codex must report for this row, independently of its login address.
+    /// The email the provider must report for this row, independently of its login address.
     #[must_use]
     pub fn expected_identity_email(&self) -> Option<&str> {
         self.identity_email.as_deref().or(self.email.as_deref())
@@ -450,7 +450,7 @@ impl Roster {
     /// As [`Roster::parse`], and: a vendor key this CLI does not take (Claude Code takes none);
     /// a `region` other than `global` or `mainland-cn`, or a Kimi row with an `email` and no
     /// `region`; a `flow` other than `browser` or `device`; `identity_email` outside
-    /// Codex, an invalid identity address, or two Codex rows expecting the same identity.
+    /// Claude or Codex, an invalid identity address, or two rows expecting the same identity.
     pub fn parse_for(cli: Cli, text: &str) -> Result<Roster, String> {
         let file = cli.accounts().roster_file;
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| {
@@ -514,7 +514,7 @@ impl Roster {
                     twin.label, row.label
                 ));
             }
-            if cli == Cli::Codex
+            if matches!(cli, Cli::Claude | Cli::Codex)
                 && let Some(twin) = rows.iter().find(|r| {
                     r.expected_identity_email()
                         .zip(row.expected_identity_email())
@@ -656,14 +656,14 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
     };
     if let Some(key) = table.keys().find(|k| {
         !matches!(k.as_str(), "label" | "class" | "dir" | "email" | "browser")
-            && !(cli == Cli::Codex && k.as_str() == "identity_email")
+            && !(matches!(cli, Cli::Claude | Cli::Codex) && k.as_str() == "identity_email")
             && Some(k.as_str()) != vendor_key
     }) {
         let holds = vendor_key.map_or_else(
             || "email and browser".to_owned(),
             |key| format!("email, browser and {key}"),
         );
-        let holds = if cli == Cli::Codex {
+        let holds = if matches!(cli, Cli::Claude | Cli::Codex) {
             format!("{holds}, and identity_email")
         } else {
             holds
@@ -1364,8 +1364,9 @@ pub fn footer_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a st
 /// The logins' file name, in the store beside `state.json` ([`State::to_json`]).
 pub const LOGINS_FILE: &str = "logins.json";
 
-/// [`LOGINS_FILE`]'s schema.
-pub const LOGINS_SCHEMA: u64 = 1;
+/// [`LOGINS_FILE`]'s schema. Schemas 1 and 2 are read for migration; schema 3 prevents
+/// older writers from moving or replacing bindings without advancing their generations.
+pub const LOGINS_SCHEMA: u64 = 3;
 
 /// The most bytes of [`LOGINS_FILE`] that are read.
 pub const MAX_LOGINS_BYTES: u64 = 256 * 1024;
@@ -1403,6 +1404,54 @@ const SUBSCRIPTION_MAX: usize = 32;
 pub(super) const RENEWAL_CHECKPOINT_FILE: &str = ".aterm-renewal.json";
 const RENEWAL_CHECKPOINT_MAX: u64 = 4096;
 
+/// The binding a completed sign-in is allowed to replace. An absent or legacy binding has
+/// no unique generation, so any intervening renewal conservatively invalidates its proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RenewalParent {
+    generation: Option<u64>,
+    clock: u64,
+}
+
+impl RenewalParent {
+    pub(super) fn capture(logins: &Logins, label: &str) -> Self {
+        Self {
+            generation: logins.get(label).map(|binding| binding.renewal_generation),
+            clock: logins.generation_clock,
+        }
+    }
+
+    pub(super) fn matches(self, logins: &Logins, label: &str) -> bool {
+        let current = Self::capture(logins, label);
+        self.generation == current.generation
+            && if self.generation.is_some_and(|generation| generation > 0) {
+                current.clock >= self.clock
+            } else {
+                current.clock == self.clock
+            }
+    }
+
+    /// Reject a result whose captured parent is no longer current.
+    /// # Errors
+    /// The binding generation or the required legacy store counter changed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountAttemptGeneration",
+            action = "Commit",
+            project = "aterm_agent::harness::cli::tests::attempt_generation::attempt_transition"
+        )
+    )]
+    pub(super) fn require_current(self, logins: &Logins, label: &str) -> Result<(), String> {
+        if self.matches(logins, label) {
+            Ok(())
+        } else {
+            Err(format!(
+                "account `{label}` login changed during sign-in; nothing recorded"
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenewalCheckpoint {
     pub label: String,
@@ -1411,6 +1460,7 @@ pub(super) struct RenewalCheckpoint {
     pub checked_at: i64,
     pub subscription: Option<String>,
     pub proved_by: Option<Proof>,
+    pub parent: RenewalParent,
 }
 
 impl RenewalCheckpoint {
@@ -1419,6 +1469,10 @@ impl RenewalCheckpoint {
             && email_refusal(&self.email).is_none()
             && dir_refusal(&self.dir).is_none()
             && self.checked_at > 0
+            && self
+                .parent
+                .generation
+                .is_none_or(|generation| generation <= self.parent.clock)
             && self.subscription.as_ref().is_none_or(|s| {
                 !s.is_empty() && s.len() <= SUBSCRIPTION_MAX && one_line(s, SUBSCRIPTION_MAX) == *s
             })
@@ -1426,6 +1480,8 @@ impl RenewalCheckpoint {
 }
 
 /// Saves the bounded, private result of a successful fresh sign-in check before binding it.
+/// The caller holds the account lock and supplies its current, unedited bindings, so the
+/// checkpoint identifies the parent of this renewal rather than its eventual replacement.
 /// # Errors
 /// The scope is invalid, staging cannot be canonicalized, the reserved name already exists, or
 /// writing, publishing or flushing the private checkpoint fails.
@@ -1435,6 +1491,7 @@ pub(super) fn write_renewal_checkpoint(
     staging_text: &str,
     subscription: Option<&str>,
     checked_at: i64,
+    logins: &Logins,
 ) -> io::Result<()> {
     write_renewal_checkpoint_for(
         Cli::Claude,
@@ -1444,6 +1501,7 @@ pub(super) fn write_renewal_checkpoint(
         subscription,
         None,
         checked_at,
+        logins,
     )
 }
 
@@ -1451,6 +1509,10 @@ pub(super) fn write_renewal_checkpoint(
 /// program, so only that CLI's recovery reads it back ([`read_renewal_checkpoint_for`]).
 /// # Errors
 /// As [`write_renewal_checkpoint`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "checkpoint fields and the locked parent are explicit at each publication site"
+)]
 pub(super) fn write_renewal_checkpoint_for(
     cli: Cli,
     label: &str,
@@ -1459,6 +1521,7 @@ pub(super) fn write_renewal_checkpoint_for(
     subscription: Option<&str>,
     proved_by: Option<Proof>,
     checked_at: i64,
+    logins: &Logins,
 ) -> io::Result<()> {
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
@@ -1469,6 +1532,7 @@ pub(super) fn write_renewal_checkpoint_for(
         checked_at,
         subscription: subscription.map(str::to_owned),
         proved_by,
+        parent: RenewalParent::capture(logins, label),
     };
     if !checkpoint.valid() {
         return Err(io::Error::new(
@@ -1477,12 +1541,17 @@ pub(super) fn write_renewal_checkpoint_for(
         ));
     }
     let mut doc = Map::new();
-    doc.insert("schema".into(), Value::from(1));
+    doc.insert("schema".into(), Value::from(2));
     doc.insert("program".into(), Value::from(cli.id()));
     doc.insert("label".into(), Value::from(checkpoint.label));
     doc.insert("email".into(), Value::from(checkpoint.email));
     doc.insert("dir".into(), Value::from(checkpoint.dir));
     doc.insert("checked_at".into(), Value::from(checkpoint.checked_at));
+    doc.insert(
+        "parent_generation".into(),
+        Value::from(checkpoint.parent.generation),
+    );
+    doc.insert("parent_clock".into(), Value::from(checkpoint.parent.clock));
     doc.insert(
         "subscription".into(),
         checkpoint.subscription.map_or(Value::Null, Value::from),
@@ -1544,7 +1613,9 @@ pub(super) fn read_renewal_checkpoint_for(
         return None;
     }
     let doc: Value = aterm_json::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
-    if doc.get("schema")?.as_u64()? != 1 || doc.get("program")?.as_str()? != cli.id() {
+    // A schema 1 checkpoint has no parent evidence. Preserve it for inspection, but do not
+    // infer a parent from wall time or upgrade an old proof into a recoverable one.
+    if doc.get("schema")?.as_u64()? != 2 || doc.get("program")?.as_str()? != cli.id() {
         return None;
     }
     let checkpoint = RenewalCheckpoint {
@@ -1560,6 +1631,13 @@ pub(super) fn read_renewal_checkpoint_for(
             None | Some(Value::Null) => None,
             Some(value) => Some(Proof::parse(value.as_str()?)?),
         },
+        parent: RenewalParent {
+            generation: match doc.get("parent_generation")? {
+                Value::Null => None,
+                value => Some(value.as_u64()?),
+            },
+            clock: doc.get("parent_clock")?.as_u64()?,
+        },
     };
     (checkpoint.valid()
         && checkpoint.checked_at <= now
@@ -1574,6 +1652,10 @@ pub struct Binding {
     pub dir: Option<String>,
     /// When the bound login was renewed (its staging check answered).
     pub renewed_at: Option<i64>,
+    /// Generation allocated by the local store when renewed or its binding identity changes.
+    /// Unlike `renewed_at`, this distinguishes replacements even when the clock does not advance.
+    /// It is not a provider identity, and zero also admits a legacy binding.
+    pub renewal_generation: u64,
     /// The lifetime a renewal is forecast by, as learned ([`Binding::lifetime`],
     /// [`LIFETIME_MIN_S`], [`LIFETIME_MAX_S`]).
     pub lifetime_s: i64,
@@ -1739,6 +1821,7 @@ impl Default for Binding {
         Binding {
             dir: None,
             renewed_at: None,
+            renewal_generation: 0,
             lifetime_s: LIFETIME_START_S,
             notice_end: None,
             ended_at: None,
@@ -1823,6 +1906,9 @@ impl Binding {
 /// Machine-local `logins.json` map from account label to [`Binding`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Logins {
+    /// Last allocated renewal generation. Retained even when labels move or disappear;
+    /// only the store transaction allocates from this machine-local counter.
+    pub generation_clock: u64,
     /// The bindings, by label.
     pub labels: BTreeMap<String, Binding>,
 }
@@ -1848,6 +1934,10 @@ impl Logins {
     pub fn to_json(&self) -> String {
         let mut o = Map::new();
         o.insert("schema".to_owned(), Value::from(LOGINS_SCHEMA));
+        o.insert(
+            "generation_clock".to_owned(),
+            Value::from(self.generation_clock),
+        );
         let labels = self
             .labels
             .iter()
@@ -1855,6 +1945,10 @@ impl Logins {
                 let mut m = Map::new();
                 m.insert("dir".to_owned(), Value::from(b.dir.clone()));
                 m.insert("renewed_at".to_owned(), Value::from(b.renewed_at));
+                m.insert(
+                    "renewal_generation".to_owned(),
+                    Value::from(b.renewal_generation),
+                );
                 m.insert("lifetime_s".to_owned(), Value::from(b.lifetime_s));
                 m.insert("notice_end".to_owned(), Value::from(b.notice_end));
                 m.insert("ended_at".to_owned(), Value::from(b.ended_at));
@@ -1908,15 +2002,16 @@ impl Logins {
         if !doc.is_object() {
             return Err(Unread::NotOurs("not a JSON object".to_string()));
         }
-        match doc.get("schema").and_then(Value::as_u64) {
-            Some(LOGINS_SCHEMA) => {}
+        let legacy = match doc.get("schema").and_then(Value::as_u64) {
+            Some(2 | LOGINS_SCHEMA) => false,
+            Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schema {LOGINS_SCHEMA}"
+                    "schema {other}; this build reads schemas 1, 2 and {LOGINS_SCHEMA}"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
-        }
+        };
         let entries = doc
             .get("labels")
             .and_then(Value::as_object)
@@ -1985,6 +2080,14 @@ impl Logins {
             let binding = Binding {
                 dir,
                 renewed_at: stamp(v.get("renewed_at"), now),
+                renewal_generation: match v.get("renewal_generation") {
+                    None if legacy => 0,
+                    value => value.and_then(Value::as_u64).ok_or_else(|| {
+                        Unread::NotOurs(format!(
+                            "binding `{label}` has an invalid renewal generation"
+                        ))
+                    })?,
+                },
                 lifetime_s: int(v.get("lifetime_s"))
                     .unwrap_or(LIFETIME_START_S)
                     .clamp(LIFETIME_MIN_S, LIFETIME_MAX_S),
@@ -2013,8 +2116,82 @@ impl Logins {
             };
             labels.insert(label.clone(), binding);
         }
-        Ok(Logins { labels })
+        let highest = labels
+            .values()
+            .map(|binding| binding.renewal_generation)
+            .max()
+            .unwrap_or(0);
+        let generation_clock = match doc.get("generation_clock") {
+            None if legacy => highest,
+            value => value
+                .and_then(Value::as_u64)
+                .filter(|clock| *clock >= highest)
+                .ok_or_else(|| Unread::NotOurs("invalid renewal generation clock".into()))?,
+        };
+        Ok(Logins {
+            labels,
+            generation_clock,
+        })
     }
+}
+
+/// Allocate at most one new generation per affected label in this publication. Renewals,
+/// insertion, removal and changes to location or proved identity invalidate old parents.
+/// Removal consumes a generation even though no binding remains to hold it. Multiple edits
+/// expose only the final binding. Exhaustion refuses before either account file is saved.
+fn advance_renewal_generations(
+    before: &Logins,
+    after: &mut Logins,
+    events: &[Event],
+) -> Result<(), String> {
+    let mut changed: BTreeSet<_> = events
+        .iter()
+        .filter(|event| event.kind == Kind::Renewed)
+        .map(|event| event.account.clone())
+        .collect();
+    for label in &changed {
+        if !after
+            .labels
+            .get(label)
+            .is_some_and(|binding| binding.dir.is_some())
+        {
+            return Err(format!(
+                "account `{label}` renewal has no binding; account records unchanged"
+            ));
+        }
+    }
+    changed.extend(
+        before
+            .labels
+            .keys()
+            .chain(after.labels.keys())
+            .filter(
+                |label| match (before.labels.get(*label), after.labels.get(*label)) {
+                    (Some(a), Some(b)) => {
+                        a.dir != b.dir
+                            || a.proved_by != b.proved_by
+                            || a.proved_email != b.proved_email
+                            || a.proved_dir != b.proved_dir
+                            || a.renewal_generation != b.renewal_generation
+                    }
+                    (None, None) => false,
+                    _ => true,
+                },
+            )
+            .cloned(),
+    );
+    let mut clock = before.generation_clock;
+    for label in changed {
+        let next = clock.checked_add(1).ok_or_else(|| {
+            format!("account `{label}` renewal generation is exhausted; account records unchanged")
+        })?;
+        if let Some(binding) = after.labels.get_mut(&label) {
+            binding.renewal_generation = next;
+        }
+        clock = next;
+    }
+    after.generation_clock = clock;
+    Ok(())
 }
 
 /// Applies machine-local renewal bindings in `logins` to `roster`.
@@ -2343,6 +2520,8 @@ pub fn note_signed_back(
 }
 
 /// Binds `label` to the newly authenticated staging directory `dir` after a verified renewal.
+/// The store advances its publication generation when committing the returned renewal event.
+/// A persistent caller must return these events from its enclosing login transaction.
 pub fn note_renewed(
     state: &mut State,
     logins: &mut Logins,
@@ -2849,6 +3028,16 @@ impl Auth {
     }
 }
 
+/// A local pooled sample's SHA-256 cache key, with no credential material in its input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleContext(pub(super) String);
+
+impl SampleContext {
+    fn parse(text: &str) -> Option<Self> {
+        aterm_codec::hex::is_lower(text, 64).then(|| Self(text.to_owned()))
+    }
+}
+
 /// Per-account observations persisted in `state.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Account {
@@ -2856,6 +3045,9 @@ pub struct Account {
     pub walls: BTreeMap<String, Wall>,
     /// Observation: the newest sample.
     pub sample: Option<Sample>,
+    /// The pooled reader's configuration and login fingerprint for `sample`. This is a local
+    /// cache key, never evidence of a provider identity or permission to clear a limit.
+    pub sample_context: Option<SampleContext>,
     /// Observation: the sample before it (for the burn rate).
     pub before: Option<Sample>,
     /// Observation: the reset offer last seen.
@@ -3409,6 +3601,10 @@ fn account_json(a: &Account) -> Value {
     );
     let sample = |s: &Option<Sample>| s.as_ref().map_or(Value::Null, sample_json);
     o.insert("sample".to_owned(), sample(&a.sample));
+    o.insert(
+        "sample_context".to_owned(),
+        Value::from(a.sample_context.as_ref().map(|context| context.0.as_str())),
+    );
     o.insert("before".to_owned(), sample(&a.before));
     o.insert(
         "offer".to_owned(),
@@ -3564,6 +3760,10 @@ fn account_of(v: &Value, now: i64) -> Account {
         windows: windows.into_iter().collect(),
         walls: walls.into_iter().collect(),
         sample: v.get("sample").and_then(|s| sample_of(s, cap)),
+        sample_context: v
+            .get("sample_context")
+            .and_then(Value::as_str)
+            .and_then(SampleContext::parse),
         before: v.get("before").and_then(|s| sample_of(s, cap)),
         offer: v.get("offer").and_then(|o| offer_of(o, cap)),
         auth: v
@@ -5154,6 +5354,7 @@ pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -
         shown(sample.week_pct)
     ));
     record.before = record.sample.replace(sample);
+    record.sample_context = None;
     vec![event]
 }
 
@@ -5236,6 +5437,7 @@ pub fn note_reading_held(
         let Account {
             walls: _,
             sample: _,
+            sample_context: _,
             before: _,
             offer: _,
             auth,
@@ -5377,6 +5579,7 @@ pub fn note_reading_held(
     };
     record.before = record.sample.take();
     record.sample = Some(next);
+    record.sample_context = None;
     (events, held_back)
 }
 
@@ -6181,6 +6384,8 @@ const STATE_FILE: &str = "state.json";
 
 const STATE_WITNESS_FILE: &str = "state.seen";
 
+const LOGINS_WITNESS_FILE: &str = "logins.seen";
+
 const LEDGER_FILE: &str = "ledger.jsonl";
 
 const WAKE_FILE: &str = "wake";
@@ -6251,6 +6456,38 @@ pub struct Store {
     cli: Cli,
 }
 
+/// The account a process observation was read against. The row is from a bound roster;
+/// recording checks it against the raw roster and current bindings again under the lock.
+#[derive(Debug, Clone, Copy)]
+pub struct LoginObservation<'a> {
+    /// The raw roster file, whose current contents must still describe this account.
+    pub roster_path: &'a Path,
+    /// The complete effective row at observation time, including its login and identity.
+    pub row: &'a Row,
+    /// The observed process's login and credential-routing facts.
+    pub who: &'a ProcessLogin,
+}
+
+impl LoginObservation<'_> {
+    /// Whether this observation still describes the current row in an effective roster.
+    pub(super) fn matches_current(&self, current: &Roster) -> bool {
+        let me = self.who.me(current);
+        me.default_home
+            && me.stored_login
+            && me.account == Some(self.row.label.as_str())
+            && current.row(&self.row.label) == Some(self.row)
+    }
+}
+
+/// The raw roster, effective target and bindings captured before a renewal starts.
+#[derive(Clone, Copy)]
+pub(super) struct RenewalPolicy<'a> {
+    pub roster_path: &'a Path,
+    pub roster: &'a Roster,
+    pub row: &'a Row,
+    pub logins: &'a Logins,
+}
+
 /// The machine-wide sign-in lock's file, in Claude Code's store ([`Store::signin_within`]).
 pub const SIGNIN_LOCK_FILE: &str = "signin.lock";
 
@@ -6262,13 +6499,13 @@ pub const SIGNIN_HELD: &str = "another sign-in holds the machine's sign-in lock"
 #[derive(Debug)]
 pub struct Lock(std::fs::File);
 
-// Inspect the opened handle before locking it. Unix opens must neither follow a link nor
-// wait on a special file before the caller's bounded lock wait even begins.
-fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+// Inspect the opened handle before using it as a lock or publication witness. Unix opens
+// must neither follow a link nor wait on a special file before the caller can reject it.
+fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
     let not_regular = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{}: lock is not a regular file", path.display()),
+            format!("{}: {kind} is not a regular file", path.display()),
         )
     };
     #[cfg(not(any(unix, windows)))]
@@ -6438,10 +6675,11 @@ impl Store {
     fn signin_on(&self, ladder: &[std::time::Duration]) -> io::Result<Option<Lock>> {
         let shared = self.shared_dir();
         aterm_types::fs_restricted::ensure_private_dir(&shared)?;
-        let mut file = match Self::try_take(open_lock_file(&shared.join(SIGNIN_LOCK_FILE))?)? {
-            Ok(lock) => return Ok(Some(lock)),
-            Err(file) => file,
-        };
+        let mut file =
+            match Self::try_take(open_retained_file(&shared.join(SIGNIN_LOCK_FILE), "lock")?)? {
+                Ok(lock) => return Ok(Some(lock)),
+                Err(file) => file,
+            };
         for pause in ladder {
             std::thread::sleep(*pause);
             file = match Self::try_take(file)? {
@@ -6469,7 +6707,7 @@ impl Store {
 
     fn lock_file(&self) -> io::Result<std::fs::File> {
         self.ensure()?;
-        open_lock_file(&self.dir.join(LOCK_FILE))
+        open_retained_file(&self.dir.join(LOCK_FILE), "lock")
     }
 
     /// Acquires `accounts.lock`, blocking until the lock is available.
@@ -6589,6 +6827,24 @@ impl Store {
         self.dir.join(LOGINS_FILE)
     }
 
+    /// Retained evidence that a login binding snapshot was prepared for publication.
+    #[must_use]
+    pub fn logins_witness_file(&self) -> PathBuf {
+        self.dir.join(LOGINS_WITNESS_FILE)
+    }
+
+    fn absent_logins(&self) -> Result<(Logins, Option<String>), String> {
+        let path = self.logins_witness_file();
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => Err(format!(
+                "{LOGINS_FILE} is missing but {} remains; account login bindings are unknown",
+                path.display()
+            )),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok((Logins::default(), None)),
+            Err(why) => Err(format!("{}: {why}", path.display())),
+        }
+    }
+
     /// Creates a fresh `0700` staging directory `<label>+<n>` in the logins directory.
     /// # Errors
     /// A label no roster could carry; the logins directory or the staging
@@ -6620,13 +6876,24 @@ impl Store {
         Err(io::Error::other("every staging name is taken"))
     }
 
-    /// Loads `logins.json` as of `now`; an absent file holds no bindings.
+    /// Loads `logins.json` as of `now`; an absent file holds no bindings only when its
+    /// publication witness is also absent. A lost snapshot must never select an old roster
+    /// login as though no renewal had happened.
     /// # Errors
     /// A file that cannot be read, is larger than [`MAX_LOGINS_BYTES`], is not UTF-8, or that
     /// [`Logins::from_json`] refuses (not JSON, or JSON of another schema or of none).
+    /// Also refuses an absent snapshot whose witness remains or cannot be inspected.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountBindingRetention",
+            action = "Read",
+            project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
+        )
+    )]
     pub fn load_logins(&self, now: i64) -> Result<(Logins, Option<String>), String> {
         match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
-            Ok(None) => Ok((Logins::default(), None)),
+            Ok(None) => self.absent_logins(),
             Ok(Some(text)) => match Logins::from_json(&text, now) {
                 Ok(logins) => Ok((logins, None)),
                 Err(Unread::Torn(why) | Unread::NotOurs(why)) => {
@@ -6666,14 +6933,45 @@ impl Store {
             .map(|(logins, _)| bound(roster, &logins))
     }
 
-    /// Atomically writes `logins.json` (`0600`) via a sibling temporary file.
+    /// Prepares and durably flushes `logins.json` (`0600`), retains a publication witness,
+    /// then replaces the snapshot and flushes its directory. Transactions load first; an
+    /// explicit restore of known-good bindings may call this directly.
     /// # Errors
-    /// The directory cannot be made or the write or rename failed.
+    /// The directory or witness cannot be opened, the witness is not a regular file, or a
+    /// write, rename or flush failed. Failure after retaining the witness can leave an absent
+    /// snapshot unreadable until an explicit restore succeeds.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountBindingRetention",
+            action = "Save",
+            project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountBindingRetention",
+            action = "InterruptedSave",
+            project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountBindingRetention",
+            action = "Restore",
+            project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
+        )
+    )]
     pub fn save_logins(&self, logins: &Logins) -> io::Result<()> {
         self.ensure()?;
         let mut text = logins.to_json();
         text.push('\n');
-        super::upgrade_models::write_atomic(&self.logins_file(), &text)
+        super::upgrade_models::write_atomic_before_publish(&self.logins_file(), &text, || {
+            self.retain_witness(&self.logins_witness_file())
+        })?;
+        aterm_durable::durable_dir(&self.dir)
     }
 
     /// Atomically replaces the `wake` marker file so watchers detect an inode change.
@@ -6876,32 +7174,26 @@ impl Store {
             project = "aterm_agent::harness::cli::tests::retention::retention_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountBindingRetention",
+            action = "Fresh",
+            project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
+        )
+    )]
     pub fn save(&self, state: &State) -> io::Result<()> {
         self.ensure()?;
         let mut text = state.to_json();
         text.push('\n');
         super::upgrade_models::write_atomic_before_publish(&self.state_file(), &text, || {
-            self.retain_state_witness()
+            self.retain_witness(&self.state_witness_file())
         })?;
         aterm_durable::durable_dir(&self.dir)
     }
 
-    fn retain_state_witness(&self) -> io::Result<()> {
-        let mut open = std::fs::OpenOptions::new();
-        open.write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let witness = open.open(self.state_witness_file())?;
-        if !witness.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "state witness is not a regular file",
-            ));
-        }
+    fn retain_witness(&self, path: &Path) -> io::Result<()> {
+        let witness = open_retained_file(path, "publication witness")?;
         aterm_durable::durable(&witness)?;
         aterm_durable::durable_dir(&self.dir)
     }
@@ -7068,8 +7360,11 @@ impl Store {
 
     /// Runs an atomic transaction over both `state.json` and `logins.json` under `accounts.lock`
     /// ([`Store::transact`]).
+    /// A renewal or change to a binding's location, proved identity or existence consumes
+    /// a generation. Multiple changes to one label consume it once per transaction.
     /// # Errors
-    /// As [`Store::transact`], for either file.
+    /// As [`Store::transact`], for either file, or a renewed binding is missing or its
+    /// generation is exhausted. The edit's own external effects are not rolled back.
     pub fn transact_logins(
         &self,
         now: i64,
@@ -7099,7 +7394,105 @@ impl Store {
         self.transact_logins_held(&held, now, note, edit)
     }
 
+    /// Records a process observation only while its own current login still matches the
+    /// observed account. Historical logins can attribute usage, but cannot prove or change
+    /// the lifecycle of a replacement login. Reads the raw roster inside the same lock as
+    /// the binding/state transaction, then compares the complete effective row.
+    ///
+    /// This validates local routing evidence, not the provider's identity or a process's
+    /// in-memory token. Roster writers do not share this lock, so the check describes the
+    /// roster read here rather than guaranteeing it cannot change after the read.
+    /// # Errors
+    /// As [`Self::transact_logins_within`], an unreadable roster, or a changed row, historical
+    /// login or credential override. A failed observation check runs no edit and publishes
+    /// no account records; subsequent edit or write failures have the transaction's usual
+    /// guarantees.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountLoginObservation",
+            action = "Record",
+            project = "aterm_agent::harness::accounts::observation_tests::observation_transition"
+        )
+    )]
+    pub fn observe_login_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        observation: LoginObservation<'_>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.transact_logins_within(ladder, now, &mut None, |state, logins| {
+            let raw = Roster::load_for(self.cli, observation.roster_path)?;
+            let current = bound(&raw, logins);
+            if !observation.matches_current(&current) {
+                return Err(format!(
+                    "account `{}` login changed since observation; nothing recorded",
+                    observation.row.label
+                ));
+            }
+            edit(state, logins)
+        })
+    }
+
+    /// Publishes a renewal only while its captured roster and effective target row still
+    /// match, including the captured target generation. The roster read, binding check,
+    /// completion checkpoint supplied by `edit`, and
+    /// account edits share the account lock. A noncooperating filesystem writer can still
+    /// change the roster after its read; this does not prove provider identity.
+    /// # Errors
+    /// As [`Self::transact_logins_within`], an unreadable or changed roster, or a changed
+    /// effective target row or login generation. A refused policy runs no edit; subsequent edit or write failures
+    /// retain the transaction's ordinary multi-file publication guarantees.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountRenewalPolicy",
+            action = "Publish",
+            project = "aterm_agent::harness::accounts::renewal_policy_tests::renewal_transition"
+        )
+    )]
+    pub(super) fn transact_renewal_within(
+        &self,
+        ladder: &[std::time::Duration],
+        now: i64,
+        note: &mut Option<String>,
+        policy: RenewalPolicy<'_>,
+        edit: impl FnOnce(&mut State, &mut Logins) -> Result<Vec<Event>, String>,
+    ) -> Result<Vec<Event>, String> {
+        self.transact_logins_within(ladder, now, note, |state, logins| {
+            let raw = Roster::load_for(self.cli, policy.roster_path)?;
+            if raw != *policy.roster
+                || bound(&raw, logins).row(&policy.row.label) != Some(policy.row)
+            {
+                return Err(format!(
+                    "account `{}` configuration or login changed during sign-in; nothing recorded",
+                    policy.row.label
+                ));
+            }
+            RenewalParent::capture(policy.logins, &policy.row.label)
+                .require_current(logins, &policy.row.label)?;
+            edit(state, logins)
+        })
+    }
+
     /// The logins' transaction itself ([`Store::transact_held`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountRenewalGeneration",
+            action = "Commit",
+            project = "aterm_agent::harness::accounts::generation_tests::generation_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountBindingRetention",
+            action = "Edit",
+            project = "aterm_agent::harness::cli::tests::binding_retention::binding_transition"
+        )
+    )]
     pub(super) fn transact_logins_held(
         &self,
         held: &Lock,
@@ -7117,6 +7510,7 @@ impl Store {
         let mut saved = Ok(());
         let events = self.transact_held(held, now, note, |state| {
             let events = edit(state, &mut logins)?;
+            advance_renewal_generations(&before, &mut logins, &events)?;
             if logins != before {
                 saved = self.save_logins(&logins);
             }
@@ -7643,6 +8037,160 @@ pub fn account_signin_lock_environment() {}
 #[doc(hidden)]
 pub fn account_state_retention_environment() {}
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountBindingRetention",
+        action = "Legacy",
+        reason = "Bounded environment scenario: the store holds the bindings an older aterm wrote, which the conformance test writes as bytes"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountBindingRetention",
+        action = "LoseBindings",
+        reason = "Environment: the bindings file vanishes from under the store (the conformance test renames it away)"
+    )
+)]
+#[doc(hidden)]
+pub fn account_binding_retention_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLoginObservation",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for Record"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLoginObservation",
+        action = "Choose",
+        reason = "Model bookkeeping: the model fixes the case it checks before the bound Record"
+    )
+)]
+#[doc(hidden)]
+pub fn account_login_observation_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalPolicy",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for the bound Publish"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalPolicy",
+        action = "Choose",
+        reason = "Model bookkeeping: the model fixes the case it checks before the bound Publish"
+    )
+)]
+#[doc(hidden)]
+pub fn account_renewal_policy_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalGeneration",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for the bound Commit"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalGeneration",
+        action = "Choose",
+        reason = "Model bookkeeping: the model fixes the case it checks before the bound Commit"
+    )
+)]
+#[doc(hidden)]
+pub fn account_renewal_generation_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountAttemptGeneration",
+        action = "AnotherProvider",
+        reason = "Model bookkeeping: select the provider whose real login and renewal paths the conformance fixture drives"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountAttemptGeneration",
+        action = "AnotherMode",
+        reason = "Model bookkeeping: select login or renewal before running the native fixture"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountAttemptGeneration",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: select the concurrent binding change staged by the native fixture"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountAttemptGeneration",
+        action = "Choose",
+        reason = "Model bookkeeping: fix the case before the native Commit"
+    )
+)]
+#[doc(hidden)]
+pub fn account_attempt_generation_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPolicy",
+        action = "AnotherOutcome",
+        reason = "Model bookkeeping: select successful authentication, wrong identity, a human step or failed manual login for the native fixture"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPolicy",
+        action = "AnotherProvider",
+        reason = "Model bookkeeping: select a vendor whose real sign-in paths the conformance fixture drives"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPolicy",
+        action = "AnotherMode",
+        reason = "Model bookkeeping: select manual login or renewal for the native fixture"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPolicy",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: select the roster edit staged during authentication"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountSignInPolicy",
+        action = "Choose",
+        reason = "Model bookkeeping: fix the case before the native Publish"
+    )
+)]
+#[doc(hidden)]
+pub fn account_signin_policy_environment() {}
+
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
 mod tests;
@@ -7650,6 +8198,22 @@ mod tests;
 #[cfg(test)]
 #[path = "accounts_logins_tests.rs"]
 mod logins_tests;
+
+#[cfg(test)]
+#[path = "accounts_binding_tests.rs"]
+mod binding_tests;
+
+#[cfg(test)]
+#[path = "accounts_observation_tests.rs"]
+mod observation_tests;
+
+#[cfg(test)]
+#[path = "accounts_renewal_policy_tests.rs"]
+mod renewal_policy_tests;
+
+#[cfg(test)]
+#[path = "accounts_generation_tests.rs"]
+mod generation_tests;
 
 #[cfg(test)]
 #[path = "accounts_lock_tests.rs"]

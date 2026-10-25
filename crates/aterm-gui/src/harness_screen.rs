@@ -2943,7 +2943,6 @@ fn ai_product_for_name(name: &str) -> Option<&'static str> {
         "grok" | "grok-build" | "grok build" => Some("Grok"),
         "kimi" | "kimi-code" | "kimi-cli" | "kimi code" => Some("Kimi Code"),
         "muse" | "muse-code" => Some("Muse Code"),
-        "gemini" | "gemini-cli" => Some("Gemini CLI"),
         _ => None,
     }
 }

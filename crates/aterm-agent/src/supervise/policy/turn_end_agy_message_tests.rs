@@ -544,12 +544,12 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
         }
         st.standing_needs().to_vec()
     };
-    let gemini: Vec<String> = screen(aterm_phase::gemini::fixtures::END_OF_TURN)
+    let muse: Vec<String> = screen(aterm_phase::muse::fixtures::END_OF_TURN_1_4_10)
         .into_iter()
-        .skip_while(|r| !r.starts_with('✦'))
+        .skip_while(|r| !r.starts_with('◆'))
         .map(|r| {
-            if r.starts_with('✦') {
-                format!("✦ {own}")
+            if r.starts_with('◆') {
+                format!("◆ {own}")
             } else {
                 r
             }
@@ -575,7 +575,7 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
             })
             .collect()
     };
-    for (name, program, rows) in [("gemini", "gemini", gemini), ("claude", "claude", claude)] {
+    for (name, program, rows) in [("muse", "muse", muse), ("claude", "claude", claude)] {
         let reading = aterm_phase::read(Some(program), &rows, None);
         assert!(reading.program.reader().bounds_messages(), "{name}");
         let r = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);

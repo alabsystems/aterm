@@ -861,6 +861,23 @@ impl Fold {
         true
     }
 
+    /// THE MAIL COUNTS A BUS VIEW READS (§5.5, D4): mail marks stay local, so a remote fold
+    /// counts no mail of its own, and a snapshot's `mail_in=` and `mail_out=` are the counts it
+    /// knows; a count only grows, so the larger of the fold's and `snap`'s stands.
+    pub fn adopt_mail_counts(&mut self, snap: &Rec) {
+        if snap.op != Op::Snap {
+            return;
+        }
+        let count = |k: Key| {
+            snap.f
+                .get_u(k)
+                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        let t = &mut self.st.totals;
+        t.mail_in = t.mail_in.max(count(Key::MailIn));
+        t.mail_out = t.mail_out.max(count(Key::MailOut));
+    }
+
     /// A VIEW THAT LOST RECORDS (phase 4, `crate::bus`), folded from its start up to `snap` — a snapshot past every record it lost: the open needs as of the snapshot are the snapshot's (a claim or a failed run's close the view never held raised one; a clear it never held lifted one), and the rest of this fold (its totals, its close, its open nodes) is what the held records made of it.
     pub fn reseed_needs(&mut self, snap: &Rec) -> bool {
         let mut seeded = Fold::new(self.st.ep);

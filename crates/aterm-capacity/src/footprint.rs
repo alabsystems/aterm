@@ -30,10 +30,20 @@ pub const EVERY: Duration = Duration::from_secs(60);
 /// among them, never following a link.
 #[must_use]
 pub fn allocated(paths: &[PathBuf]) -> u64 {
+    allocated_until(paths, &|| false)
+}
+
+/// [`allocated`], walked by a wait ([`crate::Relief`]) that an interrupt can end: once `stopped`
+/// says so, the walk ends with what it has counted.
+#[must_use]
+pub fn allocated_until(paths: &[PathBuf], stopped: &dyn Fn() -> bool) -> u64 {
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut total = 0u64;
     let mut stack: Vec<PathBuf> = paths.to_vec();
     while let Some(path) = stack.pop() {
+        if stopped() {
+            break;
+        }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };

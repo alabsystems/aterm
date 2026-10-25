@@ -1000,11 +1000,6 @@ fn facts_with_doors(
             value: facts.limit_reset_passed.to_string(),
             door: memory("this dialog's mount"),
         },
-        Fact {
-            name: "limit_retry",
-            value: facts.limit_retry.to_string(),
-            door: memory("the reset the dialog names, past its grace"),
-        },
     ];
     if let Some(trusted) = &facts.trusted_cwd {
         out.push(Fact {
@@ -1112,6 +1107,13 @@ fn facts_with_doors(
             name: "login_back",
             value: "the login came back in another tab".to_string(),
             door: host("login_shared"),
+        });
+    }
+    if facts.login_roster {
+        out.push(Fact {
+            name: "login_roster",
+            value: "a roster row's login, which aterm signs in by itself".to_string(),
+            door: host("login_label"),
         });
     }
     if facts.login_carry {

@@ -231,6 +231,10 @@ fn handlers() -> InitialSetupHandlers {
             note(format!("observe {}", plan.vault_url));
             true
         },
+        look_for_token: |plan| {
+            note(format!("token look {}", plan.vault_url));
+            true
+        },
         stop: || note("stop".to_owned()),
         settle: || note("settle".to_owned()),
         sync_on: || {
@@ -1105,8 +1109,8 @@ fn startup_review_cancel_discards_drafts_without_closing_or_stopping_and_manual_
         unreachable!()
     };
     assert!(
-        !state.plan_known(),
-        "no saved plan has arrived on this fresh install"
+        state.plan_known() && state.reviewed_plan().selection.is_empty(),
+        "after the Cancel every group reads Leave as is (§3.3)"
     );
     let mut selection = aterm_types::macos_setup::Selection::none();
     selection.set(Setting::Permissions, true);
@@ -1278,8 +1282,9 @@ fn startup_review_real_pointer_motion_does_not_stop_but_click_and_key_do() {
                 .unwrap()
                 .semantic(&UiKey::new("system-state/apply"))
                 .unwrap()
-                .label,
-            "Apply (1)"
+                .description
+                .as_deref(),
+            Some("Applies by itself in 1 second")
         );
         if click {
             app.pointer_cmd(PointerAction::Click).unwrap();
@@ -1320,8 +1325,8 @@ fn startup_review_real_pointer_motion_does_not_stop_but_click_and_key_do() {
                 .unwrap()
                 .semantic(&UiKey::new("system-state/apply"))
                 .unwrap()
-                .label,
-            "Apply"
+                .description,
+            None
         );
     }
 }
@@ -1393,7 +1398,10 @@ fn startup_review_apply_survives_the_press_repaint_at_its_right_edge() {
     let apply = compiled
         .semantic(&UiKey::new("system-state/apply"))
         .unwrap();
-    assert_eq!(apply.label, "Apply (30)");
+    assert_eq!(
+        apply.description.as_deref(),
+        Some("Applies by itself in 30 seconds")
+    );
     let rect = apply.rect;
     app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Point(
         rect.x + rect.width - 2.0,
@@ -1402,13 +1410,11 @@ fn startup_review_apply_survives_the_press_repaint_at_its_right_edge() {
     .unwrap();
     app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
     assert!(app.commit_glassless_native_frame(wid));
+    let stopped = app.compiled_native_ui(wid).unwrap();
+    let stopped = stopped.semantic(&UiKey::new("system-state/apply")).unwrap();
     assert_eq!(
-        app.compiled_native_ui(wid)
-            .unwrap()
-            .semantic(&UiKey::new("system-state/apply"))
-            .unwrap()
-            .label,
-        "Apply"
+        (stopped.label.as_str(), stopped.description.as_deref()),
+        ("Apply", None)
     );
     assert!(receive.try_recv().is_err(), "press only stops the timer");
     app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
@@ -2504,6 +2510,7 @@ mod observation_start {
 
     thread_local! {
         static READS: RefCell<Vec<Plan>> = const { RefCell::new(Vec::new()) };
+        static LOOKS: RefCell<Vec<Plan>> = const { RefCell::new(Vec::new()) };
         static ACCEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
@@ -2511,14 +2518,23 @@ mod observation_start {
         READS.with(|reads| reads.borrow().clone())
     }
 
+    fn looks() -> Vec<Plan> {
+        LOOKS.with(|looks| looks.borrow().clone())
+    }
+
     fn setup(accept: bool) -> (App, WindowId, AppInstanceId, ViewId, Plan) {
         READS.with(|reads| reads.borrow_mut().clear());
+        LOOKS.with(|looks| looks.borrow_mut().clear());
         ACCEPT.with(|accepted| accepted.set(accept));
         let mut app = App::headless_for_test();
         app.set_system_state_handlers_for_test(InitialSetupHandlers {
             observe: |plan| {
                 READS.with(|reads| reads.borrow_mut().push(plan));
                 ACCEPT.with(std::cell::Cell::get)
+            },
+            look_for_token: |plan| {
+                LOOKS.with(|looks| looks.borrow_mut().push(plan));
+                true
             },
             ..InitialSetupHandlers::inert_for_test()
         });
@@ -2693,11 +2709,12 @@ mod observation_start {
     }
 
     /// While the GitHub repositories need a person, their remedy is the vault's (a token
-    /// renewed there and synced here), which tells the page nothing: a shown page reads its
-    /// rows again by itself once a minute, and stops once the row no longer needs anyone
+    /// renewed there and synced here), which tells the page nothing: a shown page looks once a
+    /// minute for a renewed token, a look whose worker reads that row alone and only once the
+    /// vault's mark moved, never every row, and stops once the row no longer needs anyone
     /// (System State design §3.6).
     #[test]
-    fn a_shown_page_reads_github_again_while_it_needs_a_person() {
+    fn a_shown_page_looks_for_a_renewed_github_token_while_it_needs_a_person() {
         use aterm_types::macos_setup::{Observation, Standing, Subject};
 
         let (mut app, _, _, _, mut saved) = setup(true);
@@ -2719,25 +2736,34 @@ mod observation_start {
         fresh(&mut app, reading(Standing::NeedsYou));
         let start = Instant::now();
         tick(&mut app, start);
-        assert_eq!(reads().len(), 1, "showing the page reads it");
+        assert_eq!(
+            (reads().len(), looks().len()),
+            (1, 0),
+            "showing the page reads it"
+        );
         for seconds in [1, 30, 59] {
             tick(&mut app, start + Duration::from_secs(seconds));
         }
-        assert_eq!(reads().len(), 1, "no sooner than a minute");
-        tick(&mut app, start + PERSON_REREAD);
-        assert_eq!(reads().len(), 2, "a minute on, it reads again");
-        tick(&mut app, start + PERSON_REREAD + Duration::from_secs(1));
-        assert_eq!(reads().len(), 2);
-        tick(&mut app, start + PERSON_REREAD * 2);
-        assert_eq!(reads().len(), 3);
-        // The renewed token synced: the row is in place, and nothing reads it again by itself.
+        assert_eq!(looks().len(), 0, "no sooner than a minute");
+        tick(&mut app, start + TOKEN_LOOK);
+        assert_eq!(
+            looks(),
+            [saved.clone()],
+            "a minute on, it looks for a token"
+        );
+        tick(&mut app, start + TOKEN_LOOK + Duration::from_secs(1));
+        assert_eq!(looks().len(), 1);
+        tick(&mut app, start + TOKEN_LOOK * 2);
+        assert_eq!(looks().len(), 2);
+        assert_eq!(reads().len(), 1, "no look reads every row");
+        // The renewed token synced: the row is in place, and nothing looks again by itself.
         fresh(&mut app, reading(Standing::InPlace));
         for minutes in 3..=6 {
-            tick(&mut app, start + PERSON_REREAD * minutes);
+            tick(&mut app, start + TOKEN_LOOK * minutes);
         }
         assert_eq!(
-            reads().len(),
-            3,
+            (reads().len(), looks().len()),
+            (1, 2),
             "a settled row is read on focus and Check again alone"
         );
     }
@@ -3780,12 +3806,71 @@ fn closing_the_page_never_cancels_and_never_holds_an_update() {
     app.close_active_native_tab(wid).unwrap();
     assert_eq!(
         receive.try_recv().unwrap().decision,
-        WorkstationSetupDecision::Unavailable
+        WorkstationSetupDecision::Closed
     );
     app.tick_system_state(Instant::now());
     assert!(app.system_state_host.pending.is_none());
     assert!(app.system_state_host.next_tick.is_none());
     assert!(app.structural_invariants_ok());
+}
+
+/// The person closes the first-launch review tab and goes back to their terminal tab: that is
+/// not this launch (§3.3), so the worker hears Closed, not a window it could not show, and an
+/// offer that comes after a review was shown opens its tab behind the person's terminal and
+/// waits there, never taking the tab they are in (§6).
+#[test]
+fn a_closed_review_is_not_this_launch_and_a_later_offer_waits_behind_the_terminal() {
+    let mut app = App::headless_for_test();
+    let (wid, _, _) = page(&mut app);
+    app.headless = false;
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    let (send, receive) = mpsc::channel();
+    app.attach_system_state_offer(Request::new(Plan::default(), send));
+    app.close_active_native_tab(wid).unwrap();
+    assert_eq!(
+        receive.try_recv().unwrap().decision,
+        WorkstationSetupDecision::Closed
+    );
+    app.tick_system_state(Instant::now());
+    assert!(
+        app.active_native_view(wid).is_none(),
+        "the person's terminal is the active tab"
+    );
+    let (send, receive) = mpsc::channel();
+    app.offer_system_state(Request::new(Plan::default(), send));
+    assert!(receive.try_recv().is_err(), "the offer waits in its tab");
+    assert!(
+        app.native_runtime
+            .instance_by_kind(AppKind::SystemState)
+            .is_some(),
+        "System State is open"
+    );
+    assert!(
+        app.active_native_view(wid).is_none(),
+        "the offer did not take the person's terminal"
+    );
+}
+
+/// The review of the groups the ALab signal adds (§3.5) opens behind the person's tab, waits
+/// there, and holds none of aterm's own permissions: they are in the plan in force, whose run
+/// carries them.
+#[test]
+fn a_widen_review_waits_behind_the_persons_tab_and_holds_no_permissions() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.headless = false;
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    let mut narrow = aterm_types::macos_setup::Selection::none();
+    narrow.set(Setting::Permissions, true);
+    let (send, receive) = mpsc::channel();
+    app.offer_system_state(Request::widen(Plan::default(), Plan::from(narrow), send));
+    assert!(receive.try_recv().is_err(), "the review waits in its tab");
+    assert!(app.system_state_host.pending.is_some());
+    assert!(
+        app.active_native_view(wid).is_none(),
+        "the review did not take the person's tab"
+    );
+    assert!(!app.workstation_setup.suppresses_permissions());
 }
 
 mod closed_startup_review {
@@ -3860,7 +3945,7 @@ mod closed_startup_review {
         app.close_active_native_tab(wid).unwrap();
         assert_eq!(
             receive.try_recv().unwrap().decision,
-            WorkstationSetupDecision::Unavailable
+            WorkstationSetupDecision::Closed
         );
         assert!(!request.pending());
         assert!(app.native_runtime.app(old_instance).is_none());
@@ -3892,6 +3977,114 @@ mod closed_startup_review {
         assert_eq!(
             app.system_state_host.latest_status.plan,
             Some(changed_plan())
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    fn needs_disk_access(plan: Plan, revision: u64, admitted: bool) -> SetupStatus {
+        use aterm_types::macos_setup::{Observation, Standing, Subject};
+        SetupStatus {
+            plan: Some(plan),
+            permissions: Some(crate::InitialSetupPermissionPolicy {
+                revision,
+                allowed: admitted,
+            }),
+            run: Some(crate::InitialSetupRunPolicy {
+                revision,
+                allowed: admitted,
+            }),
+            observed: vec![Observation {
+                standing: Standing::NeedsYou,
+                now: Some("Off".into()),
+                ..Observation::unknown(Subject::Access(Access::FullDiskAccess))
+            }],
+            ..SetupStatus::default()
+        }
+    }
+
+    fn calm_unanswered_page(app: &App, instance: AppInstanceId) {
+        let Some(NativeApp::SystemState(state)) = app.native_runtime.app(instance) else {
+            panic!("the reopened page is System State")
+        };
+        let headline = state.headline();
+        assert!(
+            headline.start && headline.open.is_none(),
+            "an unanswered review offers Set up now, never an unapproved permission step"
+        );
+        assert!(!state.needs_attention(), "unapproved rows light no diamond");
+        assert!(
+            app.system_state_menu_line().is_none(),
+            "unapproved rows light no menu line"
+        );
+    }
+
+    #[test]
+    fn closed_review_reopen_is_calm_before_the_worker_reads_closed_and_until_real_admission() {
+        let (mut app, wid, old_instance, _, request, receive) = review();
+        let before_closed = needs_disk_access(saved_plan(), 8, false);
+        fresh(&mut app, before_closed.clone());
+        app.close_active_native_tab(wid).unwrap();
+        assert!(!request.pending());
+        assert!(app.native_runtime.app(old_instance).is_none());
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        assert_ne!(instance, old_instance);
+        // The worker has not consumed its Closed answer, nor published that it heard it.
+        calm_unanswered_page(&app, instance);
+        fresh(&mut app, before_closed);
+        calm_unanswered_page(&app, instance);
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Closed
+        );
+        calls();
+        act(&mut app, view, "system-state/group/3/leave").unwrap();
+        assert_eq!(calls(), ["manual apply"]);
+        receipt().accept();
+        app.resolve_system_state_apply();
+        fresh(&mut app, needs_disk_access(changed_plan(), 9, true));
+        let Some(NativeApp::SystemState(state)) = app.native_runtime.app(instance) else {
+            panic!("the manual choice keeps its controller")
+        };
+        assert_eq!(state.headline().open, Some(Access::FullDiskAccess));
+        assert!(
+            state.needs_attention(),
+            "a later admitted run keeps its actionable needs"
+        );
+        assert!(app.system_state_menu_line().is_some());
+        assert_eq!(app.access_revision(), Some(9));
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn closed_review_reopen_of_a_widen_keeps_the_existing_admitted_needs() {
+        let mut app = App::headless_for_test();
+        let (wid, old_instance, _) = page(&mut app);
+        app.set_system_state_handlers_for_test(handlers());
+        let admitted = needs_disk_access(saved_plan(), 8, true);
+        fresh(&mut app, admitted.clone());
+        let (send, receive) = mpsc::channel();
+        let request = Request::widen(Plan::default(), saved_plan(), send);
+        app.attach_system_state_offer(request.clone());
+        fresh(&mut app, admitted.clone());
+        app.close_active_native_tab(wid).unwrap();
+        assert!(!request.pending());
+        assert!(app.native_runtime.app(old_instance).is_none());
+        assert!(app.open_system_state_tab());
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let Some(NativeApp::SystemState(state)) = app.native_runtime.app(instance) else {
+            panic!("the existing plan is still shown")
+        };
+        assert_eq!(state.headline().open, Some(Access::FullDiskAccess));
+        assert!(state.needs_attention());
+        // The menu cache is refreshed by an ordinary status publication. The worker has
+        // still not consumed Closed, and that read keeps the existing admission.
+        fresh(&mut app, admitted);
+        assert!(app.system_state_menu_line().is_some());
+        assert_eq!(app.access_revision(), Some(8));
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Closed
         );
         assert!(app.structural_invariants_ok());
     }
@@ -4758,4 +4951,69 @@ fn records_that_keep_changing_show_on_the_page_alone() {
     );
     assert!(app.workstation_setup.suppresses_permissions());
     assert!(app.admitted_access().is_none());
+}
+
+/// While the first launch's review is up its headline is the one signal (design §3.3, §3.6):
+/// readings that light the tab and give the menu bar a System State line light neither while
+/// the review waits for its answer, and do once nothing is offered.
+#[test]
+fn the_review_lights_neither_the_tab_nor_the_menu_line() {
+    let status = fixture_status("needs-you").unwrap();
+    let mut app = App::headless_for_test();
+    let (_, instance, view) = page(&mut app);
+    fresh(&mut app, status.clone());
+    assert!(app.system_state_menu_line().is_some());
+    assert!(indicators(&app, instance, view).attention);
+
+    let mut app = App::headless_for_test();
+    let (_, instance, view) = page(&mut app);
+    let (send, _receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.attach_system_state_offer(request.clone());
+    fresh(&mut app, status);
+    assert!(request.pending());
+    assert_eq!(app.system_state_menu_line(), None);
+    assert!(!indicators(&app, instance, view).attention);
+}
+
+/// A newer aterm's setup names no plan this aterm reads, yet the page reads the rows as they
+/// stand (design §3.5): an observation with nothing set up, so no account and no network read.
+/// A page that knows no plan, and is told of no newer aterm's setup, reads nothing.
+#[test]
+fn a_newer_aterms_setup_is_read_as_it_stands() {
+    fn reads() -> InitialSetupHandlers {
+        InitialSetupHandlers {
+            observe: |plan| {
+                note(format!(
+                    "observe nothing set up {}",
+                    plan.selection == Selection::none()
+                ));
+                true
+            },
+            ..handlers()
+        }
+    }
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_system_state_tab());
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    assert_eq!(
+        app.observe_system_state_with(instance, Some(reads())),
+        Observe::NoPlan
+    );
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: None,
+            rows: vec![crate::system_state::calm_setup_row(
+                crate::system_state::NEWER_SETUP_NOTE,
+            )],
+            ..SetupStatus::default()
+        },
+    );
+    assert_eq!(
+        app.observe_system_state_with(instance, Some(reads())),
+        Observe::Started
+    );
+    assert_eq!(calls(), ["observe nothing set up true"]);
 }

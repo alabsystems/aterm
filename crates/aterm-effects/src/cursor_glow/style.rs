@@ -223,7 +223,8 @@ pub struct KnobContext {
     pub ring: bool,
     /// The classic wake draws its one-colour face (a trail colour is set, or the old `classic mono` spelling is saved).
     pub classic_tinted: bool,
-    /// The move crosses text cells only.
+    /// The move hops across text cells only, on its own row and short of a leap (a jump
+    /// [`GlowStyle::jump_reach`] calls one flies over whatever it crosses).
     pub over_text: bool,
 }
 
@@ -282,6 +283,38 @@ impl GlowStyle {
                 RainbowKitty | Fire | Laser | Beam | Water => false,
             },
             TrailKnob::FireShimmer => matches!(self, Fire),
+        }
+    }
+
+    /// The Trail length from which a licensed jump draws alike at every longer length (`None`:
+    /// Length shapes nothing it draws). The jump moves `rows` rows and `cols` columns across
+    /// cells `aspect` times as tall as they are wide, onto the ground `ctx` names: along its row,
+    /// or off it as an Enter does, much farther across than down. Length cuts the
+    /// path a jump lays along its longer axis, from the cell it leaves to the one before the
+    /// caret: most styles drop the cell it leaves, where Classic's wake and Comet's trail cells
+    /// keep it. Phaser lays none off its row; Fire flies a leap (off its row, or of
+    /// `METEOR_MIN_COLS` columns or more) as a meteor whose streak leans no shallower than
+    /// `METEOR_SLOPE`; and on a dark ground Length also grows Sparkle's bed under a jump, up to
+    /// `SPARKLE_LEAP_WEDGE_GROWTH` times the default length.
+    #[must_use]
+    pub fn jump_reach(self, rows: u16, cols: u16, aspect: f32, ctx: KnobContext) -> Option<f32> {
+        let (dr, dc) = (f32::from(rows), f32::from(cols));
+        let leap = rows > 0 || i32::from(cols) >= CursorGlow::METEOR_MIN_COLS;
+        let path = match self {
+            GlowStyle::Classic | GlowStyle::Comet => dr.max(dc),
+            _ => dr.max(dc) - 1.0,
+        };
+        match self {
+            GlowStyle::Fire if leap && rows > 0 => {
+                Some(dc.min(CursorGlow::METEOR_SLOPE * dr * aspect).max(dr))
+            }
+            GlowStyle::Fire if leap => Some(dc),
+            GlowStyle::Phaser if rows > 0 => None,
+            GlowStyle::Sparkle if ctx.dark => {
+                Some(path.max(CursorGlow::SPARKLE_LEAP_WEDGE_GROWTH * GLOW_LENGTH_DEFAULT as f32))
+            }
+            _ if self.reads_knob(TrailKnob::Length, ctx) => Some(path),
+            _ => None,
         }
     }
 

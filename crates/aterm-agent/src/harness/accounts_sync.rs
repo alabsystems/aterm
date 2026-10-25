@@ -1124,18 +1124,28 @@ pub fn build_machine_roster(
         return existing.cloned().unwrap_or_default();
     }
     let default_email = default_email.map(str::trim).filter(|de| !de.is_empty());
+    let matches_identity = |acct: &FleetAccount, email: &str| {
+        let expected = existing
+            .and_then(|roster| roster.row(&acct.label))
+            .filter(|row| {
+                row.email
+                    .as_deref()
+                    .is_some_and(|login| accounts::email_matches(login, &acct.email))
+            })
+            .and_then(Row::expected_identity_email)
+            .unwrap_or(&acct.email);
+        accounts::email_matches(expected, email)
+    };
     let unlisted = default_email
         .filter(|de| {
-            !fleet_rows
-                .iter()
-                .any(|r| accounts::email_matches(&r.email, de))
+            !fleet_rows.iter().any(|r| matches_identity(r, de))
                 && fleet_rows.len() < accounts::MAX_ACCOUNTS
         })
         .and_then(|de| {
             fleet
                 .accounts
                 .iter()
-                .find(|a| accounts::email_matches(&a.email, de))
+                .find(|a| matches_identity(a, de))
                 .cloned()
                 .or_else(|| {
                     let mut used: BTreeSet<String> =
@@ -1143,19 +1153,20 @@ pub fn build_machine_roster(
                     let kept = existing
                         .and_then(|ex| {
                             ex.rows.iter().find(|r| {
-                                r.email
-                                    .as_deref()
+                                r.expected_identity_email()
                                     .is_some_and(|re| accounts::email_matches(re, de))
                             })
                         })
-                        .map(|r| r.label.clone())
-                        .filter(|label| !used.contains(label));
+                        .filter(|row| !used.contains(&row.label));
                     if let Some(kept) = kept {
-                        return local_account(de, machine, &BTreeSet::new()).map(|acct| {
-                            FleetAccount {
-                                label: kept,
-                                ..acct
-                            }
+                        return local_account(
+                            kept.email.as_deref().unwrap_or(de),
+                            machine,
+                            &BTreeSet::new(),
+                        )
+                        .map(|acct| FleetAccount {
+                            label: kept.label.clone(),
+                            ..acct
                         });
                     }
                     used.extend(
@@ -1174,7 +1185,7 @@ pub fn build_machine_roster(
         .and_then(|de| {
             fleet_rows
                 .iter()
-                .find(|r| accounts::email_matches(&r.email, de))
+                .find(|r| matches_identity(r, de))
                 .map(|r| r.label.clone())
         })
         .or_else(|| {
@@ -1206,7 +1217,13 @@ pub fn build_machine_roster(
             class: acct.class,
             dir,
             email: Some(acct.email.clone()),
-            identity_email: None,
+            identity_email: existing_row
+                .filter(|row| {
+                    row.email
+                        .as_deref()
+                        .is_some_and(|email| accounts::email_matches(email, &acct.email))
+                })
+                .and_then(|row| row.identity_email.clone()),
             browser,
             was: Vec::new(),
             vendor: Default::default(),
@@ -2142,7 +2159,6 @@ pub fn normalize_google_sheet_url(url: &str) -> String {
 }
 
 struct SyncedAccounts {
-    roster: Roster,
     fleet_path: PathBuf,
     state: accounts::State,
     note: Option<String>,
@@ -2270,7 +2286,7 @@ fn persist_accounts_sync(
     let default_matched = default_email.is_some_and(|de| {
         roster
             .row_for_login(None)
-            .and_then(|r| r.email.as_deref())
+            .and_then(Row::expected_identity_email)
             .is_some_and(|re| accounts::email_matches(re, de))
     });
     let mut note = None;
@@ -2419,7 +2435,6 @@ fn persist_accounts_sync(
         note = read;
     }
     Ok(SyncedAccounts {
-        roster,
         fleet_path,
         state,
         note,
@@ -2488,7 +2503,6 @@ fn run_accounts_sync_with(
         .map(|dir| find_transcript_walls_by_email(&dir, &prelim_roster, env.now))
         .unwrap_or_default();
     let SyncedAccounts {
-        roster,
         fleet_path,
         state,
         note,
@@ -2511,19 +2525,28 @@ fn run_accounts_sync_with(
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
-    let (state, bound) =
-        if recover_interrupted_staging_renewals(&store, &roster, &AUTO_RENEW_GUARD, env.now) {
-            let state = store.load(env.now).map(|(s, _)| s).unwrap_or(state);
-            let bound = store
-                .bound(&roster, env.now)
-                .unwrap_or_else(|_| roster.clone());
-            (state, bound)
-        } else {
-            let bound = store
-                .bound(&roster, env.now)
-                .unwrap_or_else(|_| roster.clone());
-            (state, bound)
-        };
+    let recovered = recover_interrupted_staging_renewals_for(
+        Cli::Claude,
+        &store,
+        &roster_path,
+        &AUTO_RENEW_GUARD,
+        env.now,
+    );
+    let roster = match Roster::load(&roster_path) {
+        Ok(roster) => roster,
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts sync: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let state = if recovered {
+        store.load(env.now).map(|(s, _)| s).unwrap_or(state)
+    } else {
+        state
+    };
+    let bound = store
+        .bound(&roster, env.now)
+        .unwrap_or_else(|_| roster.clone());
     let enrolled = accounts::enrolled(&bound);
     let needs_renew: Vec<String> = roster
         .rows
@@ -4152,15 +4175,8 @@ fn sync_cli_with(
             .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
     }
     drop(lock);
-    let recovered = Roster::load_for(cli, &write_to).is_ok_and(|roster| {
-        recover_interrupted_staging_renewals_for(
-            cli,
-            &store,
-            (&roster, Some(&write_to)),
-            &AUTO_RENEW_GUARD,
-            now,
-        )
-    });
+    let recovered =
+        recover_interrupted_staging_renewals_for(cli, &store, &write_to, &AUTO_RENEW_GUARD, now);
     // A sync that added nothing wrote nothing, and wakes no watcher.
     if !added.is_empty() || recovered {
         let _ = store.touch_wake();
@@ -4309,7 +4325,9 @@ fn run_cli_accounts_sync_with(
     if !synced.added.is_empty() {
         let _ = writeln!(
             out,
-            "next step to sign them in: aterm harness accounts renew {} {flag}",
+            "not signed in yet: {}; aterm signs one in by itself once a session needs it \
+             (`aterm harness accounts renew {} {flag}` runs that now)",
+            synced.added.join(", "),
             synced.added.join(" ")
         );
     }
@@ -4478,20 +4496,12 @@ fn renew_pool_due(
     if let Some(pending) = resume_pending_pin_for(cli, home, state_dir, roster_path, now, fx) {
         return pending.progressed();
     }
-    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
-        return false;
-    };
-    if file_roster.rows.is_empty() {
-        return false;
-    }
     let store = accounts::Store::at_for(state_dir, cli, home);
-    let recovered = recover_interrupted_staging_renewals_for(
-        cli,
-        &store,
-        (&file_roster, Some(roster_path)),
-        fx.renew_guard,
-        now,
-    );
+    let recovered =
+        recover_interrupted_staging_renewals_for(cli, &store, roster_path, fx.renew_guard, now);
+    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
+        return recovered;
+    };
     let (Ok((state, _)), Ok((logins, _))) = (store.load(now), store.load_logins(now)) else {
         return recovered;
     };
@@ -5134,14 +5144,17 @@ pub(super) fn next_auto_renew_target(
 
 fn complete_staging_renewal_result(
     store: &accounts::Store,
-    file_roster: &Roster,
-    requested_label: &str,
+    policy: accounts::RenewalPolicy<'_>,
     staging: &Path,
     staging_text: &str,
-    status_got: &super::align::Captured,
+    (status_got, success_route): (&super::align::Captured, Option<&str>),
     now_done: i64,
 ) -> super::cli::Renewal {
     use super::cli::Renewal;
+    let file_roster = policy.roster;
+    let captured_logins = policy.logins;
+    let captured_rows = accounts::bound(file_roster, captured_logins);
+    let requested_label = policy.row.label.as_str();
 
     // A failed status cannot qualify any row, irrespective of the store's bindings.
     let facts = super::cli::status_facts(status_got, "");
@@ -5158,27 +5171,25 @@ fn complete_staging_renewal_result(
     }
     let mut note = None;
     let mut outcome = Renewal::Failed;
-    let result = (|| {
-        let held = store.acquire().map_err(|why| why.to_string())?;
-        let (_, read) = store.load(now_done)?;
-        if let Some(why) = read {
-            return Err(why);
-        }
-        store.transact_logins_held(&held, now_done, &mut note, |state, logins| {
+    let result = store.transact_renewal_within(
+        &accounts::LOCK_LADDER,
+        now_done,
+        &mut note,
+        policy,
+        |state, logins| {
             let roster = accounts::bound(file_roster, logins);
             let enrolled = accounts::enrolled(&roster);
             let Some(next_row) = roster.row(requested_label) else {
                 return Ok(Vec::new());
             };
             let wrong_account = next_row
-                .email
-                .as_deref()
+                .expected_identity_email()
                 .and_then(|email| super::cli::status_facts(status_got, email))
                 .is_some_and(|facts| facts.signed_in && facts.claude_ai && !facts.email_matches);
             let matched = std::iter::once(next_row)
                 .chain(roster.rows.iter().filter(|r| r.label != requested_label))
                 .find_map(|row| {
-                    let email = row.email.as_deref()?;
+                    let email = row.expected_identity_email()?;
                     let facts = super::cli::status_facts(status_got, email)?;
                     if !facts.renews()
                         || state
@@ -5217,19 +5228,27 @@ fn complete_staging_renewal_result(
                     Vec::new()
                 });
             };
+            accounts::RenewalParent::capture(captured_logins, &matched_label)
+                .require_current(logins, &matched_label)?;
+            if captured_rows.row(&matched_label) != roster.row(&matched_label) {
+                return Err(format!(
+                    "account `{matched_label}` changed during sign-in; nothing recorded"
+                ));
+            }
             accounts::write_renewal_checkpoint(
                 &matched_label,
                 &matched_email,
                 staging_text,
                 subscription.as_deref(),
                 now_done,
+                logins,
             )
             .map_err(|why| why.to_string())?;
             let own_dir = file_roster
                 .row(&matched_label)
                 .and_then(|r| r.dir.as_deref());
             outcome = Renewal::Renewed;
-            Ok(accounts::note_renewed(
+            let mut events = accounts::note_renewed(
                 state,
                 logins,
                 &matched_label,
@@ -5237,9 +5256,19 @@ fn complete_staging_renewal_result(
                 staging_text,
                 subscription.as_deref(),
                 now_done,
-            ))
-        })
-    })();
+            );
+            if let Some(route) = success_route {
+                events.extend(accounts::note_sign_in_attempt(
+                    logins,
+                    requested_label,
+                    accounts::AttemptOutcome::SignedIn,
+                    route,
+                    now_done,
+                ));
+            }
+            Ok(events)
+        },
+    );
     match result {
         Ok(_) if outcome == Renewal::Renewed => outcome,
         Ok(_) => {
@@ -5269,13 +5298,27 @@ fn complete_staging_renewal(
     status_got: &super::align::Captured,
     now_done: i64,
 ) -> bool {
+    let fixture = aterm_tempfile::TempDir::new().unwrap();
+    let roster_path = fixture.path().join(accounts::ACCOUNTS_FILE);
+    fs::write(&roster_path, format_roster_toml(file_roster).unwrap()).unwrap();
+    let Ok((logins, _)) = store.load_logins(now_done) else {
+        return false;
+    };
+    let captured = accounts::bound(file_roster, &logins);
+    let Some(row) = captured.row(requested_label) else {
+        return false;
+    };
     complete_staging_renewal_result(
         store,
-        file_roster,
-        requested_label,
+        accounts::RenewalPolicy {
+            roster_path: &roster_path,
+            roster: file_roster,
+            row,
+            logins: &logins,
+        },
         staging,
         staging_text,
-        status_got,
+        (status_got, None),
         now_done,
     ) == super::cli::Renewal::Renewed
 }
@@ -5297,25 +5340,31 @@ fn select_auto_renew_browser(
     })
 }
 
+#[cfg(test)]
 fn recover_interrupted_staging_renewals(
     store: &accounts::Store,
     file_roster: &Roster,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
 ) -> bool {
-    recover_interrupted_staging_renewals_for(
-        Cli::Claude,
-        store,
-        (file_roster, None),
-        renew_guard,
-        now,
-    )
+    let fixture = aterm_tempfile::TempDir::new().unwrap();
+    let path = fixture.path().join(accounts::ACCOUNTS_FILE);
+    fs::write(&path, format_roster_toml(file_roster).unwrap()).unwrap();
+    recover_interrupted_staging_renewals_for(Cli::Claude, store, &path, renew_guard, now)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountRecoveryPolicy",
+        action = "Recover",
+        project = "aterm_agent::harness::accounts_sync::recovery_policy_tests::recovery_transition"
+    )
+)]
 fn recover_interrupted_staging_renewals_for(
     cli: Cli,
     store: &accounts::Store,
-    (file_roster, roster_path): (&Roster, Option<&Path>),
+    roster_path: &Path,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     now: i64,
 ) -> bool {
@@ -5411,15 +5460,9 @@ fn recover_interrupted_staging_renewals_for(
         if store
             .transact_logins(now, &mut note, |state, logins| {
                 // A checkpoint can outlive the configuration read by upkeep.
-                // Resolve Codex's identity policy again under its writer lock.
-                let current = if cli == Cli::Codex {
-                    let path =
-                        roster_path.ok_or("Codex recovery requires the current roster path")?;
-                    Some(Roster::load_for(cli, path)?)
-                } else {
-                    None
-                };
-                let file_roster = current.as_ref().unwrap_or(file_roster);
+                // Every provider resolves its identity policy under the writer lock.
+                let current = Roster::load_for(cli, roster_path)?;
+                let file_roster = &current;
                 let referenced = file_roster
                     .rows
                     .iter()
@@ -5445,7 +5488,7 @@ fn recover_interrupted_staging_renewals_for(
                     if cli == Cli::Codex && proof.proved_by != Some(accounts::Proof::Status) {
                         return false;
                     }
-                    let expected = if cli == Cli::Codex {
+                    let expected = if matches!(cli, Cli::Claude | Cli::Codex) {
                         r.expected_identity_email()
                     } else {
                         r.email.as_deref()
@@ -5455,6 +5498,11 @@ fn recover_interrupted_staging_renewals_for(
                     return Ok(Vec::new());
                 };
                 let account = state.accounts.get(&row.label);
+                // Wall time can move backward. Only the binding captured under the writer
+                // lock when this checkpoint was created can accept its completion.
+                if !proof.parent.matches(logins, &row.label) {
+                    return Ok(Vec::new());
+                }
                 let is_limited = account.is_some_and(|a| a.limited_until(now).is_some());
                 let newer_auth =
                     account.is_some_and(|a| a.auth_at.is_some_and(|at| at >= proof.checked_at));
@@ -5474,9 +5522,7 @@ fn recover_interrupted_staging_renewals_for(
                     .accounts
                     .get(&row.label)
                     .is_some_and(|a| a.auth == accounts::Auth::SignedOut);
-                let needs_recovery = !enrolled.contains(&row.label)
-                    || is_signed_out
-                    || !logins.labels.contains_key(&row.label);
+                let needs_recovery = !enrolled.contains(&row.label) || is_signed_out;
                 if is_limited || newer_auth || newer_binding || !needs_recovery {
                     return Ok(Vec::new());
                 }
@@ -5516,14 +5562,17 @@ fn auto_renew_next_account(
     if let Some(pending) = resume_pending_pin(home, state_dir, roster_path, now, fx) {
         return pending.progressed();
     }
-    let Ok(file_roster) = Roster::load(roster_path) else {
-        return false;
-    };
-    if file_roster.rows.is_empty() {
-        return false;
-    }
     let store = accounts::Store::at(state_dir);
-    let recovered = recover_interrupted_staging_renewals(&store, &file_roster, fx.renew_guard, now);
+    let recovered = recover_interrupted_staging_renewals_for(
+        Cli::Claude,
+        &store,
+        roster_path,
+        fx.renew_guard,
+        now,
+    );
+    let Ok(file_roster) = Roster::load(roster_path) else {
+        return recovered;
+    };
     let Ok((state, _)) = store.load(now) else {
         return recovered;
     };
@@ -5624,24 +5673,10 @@ fn unclaimed_emails(
 pub(super) fn recover_staging_renewals_for(
     cli: Cli,
     store: &accounts::Store,
-    (file_roster, roster_path): (&Roster, &Path),
+    roster_path: &Path,
     now: i64,
 ) -> bool {
-    recover_interrupted_staging_renewals_for(
-        cli,
-        store,
-        (file_roster, Some(roster_path)),
-        &AUTO_RENEW_GUARD,
-        now,
-    )
-}
-
-pub(super) fn recover_staging_renewals(
-    store: &accounts::Store,
-    file_roster: &Roster,
-    now: i64,
-) -> bool {
-    recover_interrupted_staging_renewals(store, file_roster, &AUTO_RENEW_GUARD, now)
+    recover_interrupted_staging_renewals_for(cli, store, roster_path, &AUTO_RENEW_GUARD, now)
 }
 
 /// Start an interactive non-blocking staging login for the next un-enrolled successor at a wall.
@@ -5666,20 +5701,12 @@ pub fn auto_renew_next_account_interactive_for(
     if let Some(pending) = resume_pending_pin_for(cli, home, state_dir, roster_path, now, &fx) {
         return pending.progressed();
     }
-    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
-        return false;
-    };
-    if file_roster.rows.is_empty() {
-        return false;
-    }
     let store = accounts::Store::at_for(state_dir, cli, home);
-    let recovered = recover_interrupted_staging_renewals_for(
-        cli,
-        &store,
-        (&file_roster, Some(roster_path)),
-        &AUTO_RENEW_GUARD,
-        now,
-    );
+    let recovered =
+        recover_interrupted_staging_renewals_for(cli, &store, roster_path, &AUTO_RENEW_GUARD, now);
+    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
+        return recovered;
+    };
     let Ok((state, _)) = store.load(now) else {
         return recovered;
     };
@@ -5841,22 +5868,16 @@ fn renew_requested_pin_for(
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
 ) -> RenewalDispatch {
-    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
-        return RenewalDispatch::Failed;
-    };
     let store = accounts::Store::at_for(state_dir, cli, home);
     match store.load(now) {
         Ok((state, _)) if state.pending_pin.as_ref() == Some(&request) => {}
         Ok(_) => return RenewalDispatch::Superseded,
         Err(_) => return RenewalDispatch::Failed,
     }
-    recover_interrupted_staging_renewals_for(
-        cli,
-        &store,
-        (&file_roster, Some(roster_path)),
-        renew_guard,
-        now,
-    );
+    recover_interrupted_staging_renewals_for(cli, &store, roster_path, renew_guard, now);
+    let Ok(file_roster) = Roster::load_for(cli, roster_path) else {
+        return RenewalDispatch::Failed;
+    };
     let mut disposition = RenewalDispatch::Superseded;
     let mut target = None;
     if store
@@ -6039,7 +6060,6 @@ fn ladder_read(
 fn ladder_route(
     home: &Path,
     store: &accounts::Store,
-    logins: &accounts::Logins,
     row: &accounts::Row,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
@@ -6053,6 +6073,12 @@ fn ladder_route(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+    // Another row's route observation can insert a binding and advance the global
+    // counter. Capture this probe separately; its publication still checks the parent.
+    let Ok((logins, _)) = store.load_logins(now) else {
+        return LadderStep::Held;
+    };
+    let logins = &logins;
     let mut read = ladder_read(home, store, logins, row, ctx);
     let inputs = format!("{}|{}", read.words(), ladder_inputs(home, store));
     let at = Instant::now();
@@ -6126,8 +6152,8 @@ fn ladder_route(
 }
 
 /// Records `label`'s attempt ([`accounts::note_sign_in_attempt`]) unless `logins` (as read
-/// before) already holds the same one; a store that cannot be written now records it on the
-/// next attempt.
+/// before) already holds the same one or that captured generation is no longer current.
+/// A store that cannot be written now records it on the next attempt.
 fn note_attempt(
     store: &accounts::Store,
     logins: &accounts::Logins,
@@ -6136,6 +6162,7 @@ fn note_attempt(
     routes: &str,
     now: i64,
 ) {
+    let parent = accounts::RenewalParent::capture(logins, label);
     let same = logins
         .get(label)
         .and_then(|b| b.sign_in_attempt.as_ref())
@@ -6146,6 +6173,7 @@ fn note_attempt(
         return;
     }
     let _ = store.transact_logins_within(&accounts::LOCK_LADDER, now, &mut None, |_, logins| {
+        parent.require_current(logins, label)?;
         Ok(accounts::note_sign_in_attempt(
             logins, label, outcome, routes, now,
         ))
@@ -6196,7 +6224,7 @@ fn spawn_row_renewal(
     // The automatic ladder ([`ladder_route`]) decides an upkeep's renewal and records how it
     // ends; a person's own choice (a pin request, a click) takes the routes it always took.
     let (has_mailbox, has_headless_profile, unattended) = match ladder {
-        Some(ctx) => match ladder_route(home, &store, logins, &next_row, now, renew_guard, ctx) {
+        Some(ctx) => match ladder_route(home, &store, &next_row, now, renew_guard, ctx) {
             LadderStep::Go {
                 route,
                 read,
@@ -6280,6 +6308,7 @@ fn spawn_row_renewal(
     permit.wake_pending = Some(state_dir.to_path_buf());
     let home_owned = home.to_path_buf();
     let state_owned = state_dir.to_path_buf();
+    let roster_owned = roster_path.to_path_buf();
     let ladder_guard = std::sync::Arc::clone(renew_guard);
     let started_by = unattended.as_ref().map(|(route, _, _, log)| {
         (
@@ -6298,9 +6327,29 @@ fn spawn_row_renewal(
             // How the last run's `claude auth login` exited, for the words of one that made no
             // login (`sign_in_ladder::how_it_ended`).
             let exited: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+            let attempt_snapshot = std::cell::RefCell::new(None);
             let live_attempt = |browser: &super::cli::RenewBrowser,
-                                force_headless: bool|
+                                force_headless: bool,
+                                attempt_logins: &accounts::Logins|
              -> Renewal {
+                let policy = accounts::RenewalPolicy {
+                    roster_path: &roster_owned,
+                    roster: &file_roster,
+                    row: &next_row,
+                    logins: attempt_logins,
+                };
+                if store
+                    .transact_renewal_within(
+                        &accounts::LOCK_LADDER,
+                        now,
+                        &mut None,
+                        policy,
+                        |_, _| Ok(Vec::new()),
+                    )
+                    .is_err()
+                {
+                    return Renewal::Failed;
+                }
                 let Ok(staging) = store.claim_staging_dir(&next_label) else {
                     return Renewal::Failed;
                 };
@@ -6383,11 +6432,13 @@ fn spawn_row_renewal(
                 let now_done = crate::supervise::limit::unix_now().max(now);
                 complete_staging_renewal_result(
                     &store,
-                    &file_roster,
-                    &next_row.label,
+                    policy,
                     &staging,
                     &staging_text,
-                    &status_got,
+                    (
+                        &status_got,
+                        unattended.as_ref().map(|(route, _, _, _)| route.as_str()),
+                    ),
                     now_done,
                 )
             };
@@ -6395,10 +6446,32 @@ fn spawn_row_renewal(
                 if store.check_signin_state(now).is_err() {
                     return Renewal::Failed;
                 }
+                let Ok((snapshot, _)) = store.load_logins(now) else {
+                    return Renewal::Failed;
+                };
+                *attempt_snapshot.borrow_mut() = Some(snapshot.clone());
                 exited.set(None);
-                match &run_seam {
+                let result = match &run_seam {
                     Some(run) => run(browser, force_headless),
-                    None => live_attempt(browser, force_headless),
+                    None => live_attempt(browser, force_headless, &snapshot),
+                };
+                if result != Renewal::Renewed
+                    && store
+                        .transact_logins_within(
+                            &accounts::LOCK_LADDER,
+                            now,
+                            &mut None,
+                            |_, current| {
+                                accounts::RenewalParent::capture(&snapshot, &next_label)
+                                    .require_current(current, &next_label)?;
+                                Ok(Vec::new())
+                            },
+                        )
+                        .is_err()
+                {
+                    Renewal::Failed
+                } else {
+                    result
                 }
             };
             let how = |renewal: Renewal| super::sign_in_ladder::how_it_ended(renewal, exited.get());
@@ -6457,11 +6530,13 @@ fn spawn_row_renewal(
                         super::sign_in_ladder::failed_words(*route, how, read),
                     ),
                 };
-                let logins_now = store
-                    .load_logins(now_done)
-                    .map(|(logins, _)| logins)
-                    .unwrap_or_default();
-                note_attempt(&store, &logins_now, &next_label, outcome, &routes, now_done);
+                // A live success records its summary in the same transaction as its binding.
+                // Failed attempts and the scripted test seam still name their original parent.
+                if (!renewed || run_seam.is_some())
+                    && let Some(observed) = attempt_snapshot.borrow().as_ref()
+                {
+                    note_attempt(&store, observed, &next_label, outcome, &routes, now_done);
+                }
                 let mut guard = ladder_guard
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6647,6 +6722,7 @@ fn spawn_vendor_renewal_with(
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
     let roster_path = roster_path.to_path_buf();
     let parker = std::sync::Arc::clone(renew_guard);
+    let captured_logins = logins.clone();
     start_auto_renew(
         permit,
         move || {
@@ -6655,7 +6731,7 @@ fn spawn_vendor_renewal_with(
                 now,
                 &super::cli::LiveAccounts,
                 &store,
-                (&next_row, &roster_path),
+                (&next_row, &roster_path, &captured_logins),
                 own_dir.as_deref(),
                 &mut io::sink(),
                 &mut io::sink(),
@@ -7271,6 +7347,37 @@ fn pools_html(pools: &[CliPool], now: i64) -> String {
     out
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRecoveryPolicy",
+        action = "AnotherProvider",
+        reason = "Model bookkeeping: the model steps through its fixed providers, and the conformance test stages each provider's fixture for the bound Recover"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRecoveryPolicy",
+        action = "AnotherCase",
+        reason = "Model bookkeeping: the model steps through its fixed cases, and the conformance test stages each case's fixture for the bound Recover"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRecoveryPolicy",
+        action = "Choose",
+        reason = "Model bookkeeping: the model fixes the case it checks before the bound Recover"
+    )
+)]
+#[doc(hidden)]
+pub fn account_recovery_policy_environment() {}
+
+#[cfg(test)]
+#[path = "accounts_recovery_policy_tests.rs"]
+mod recovery_policy_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7540,6 +7647,69 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
+    fn fleet_sync_keeps_an_explicit_claude_alias_only_for_the_same_login_address() {
+        let w = World::new();
+        let store = accounts::Store::at(&w.state);
+        let mut fleet = parse_accounting_csv(
+            "email,computer,claude\nfirst@example.test,m8,1\nalias@example.test,m8,1\n",
+            "aliases.csv",
+        )
+        .unwrap();
+        let mut existing = build_machine_roster(&fleet, "m8", &store, None, None);
+        let alias = existing
+            .rows
+            .iter_mut()
+            .find(|row| row.email.as_deref() == Some("alias@example.test"))
+            .unwrap();
+        alias.identity_email = Some("canonical@example.test".into());
+        let label = alias.label.clone();
+        let synced = build_machine_roster(
+            &fleet,
+            "m8",
+            &store,
+            Some(&existing),
+            Some("canonical@example.test"),
+        );
+        assert_eq!(synced.rows.len(), 2, "no duplicate canonical account");
+        assert_eq!(synced.row_for_login(None).unwrap().label, label);
+        assert_eq!(
+            synced.row(&label).unwrap().identity_email.as_deref(),
+            Some("canonical@example.test")
+        );
+        assert_eq!(
+            Roster::parse(&format_roster_toml(&synced).unwrap()).unwrap(),
+            synced
+        );
+
+        let mut omitted = fleet.clone();
+        omitted.accounts.retain(|row| row.label != label);
+        let unlisted = build_machine_roster(
+            &omitted,
+            "m8",
+            &store,
+            Some(&synced),
+            Some("canonical@example.test"),
+        );
+        assert_eq!(unlisted.rows.len(), 2);
+        let own = unlisted.row_for_login(None).unwrap();
+        assert_eq!(own.label, label);
+        assert_eq!(own.email.as_deref(), Some("alias@example.test"));
+        assert_eq!(
+            own.identity_email.as_deref(),
+            Some("canonical@example.test")
+        );
+
+        fleet
+            .accounts
+            .iter_mut()
+            .find(|row| row.label == label)
+            .unwrap()
+            .email = "replacement@example.test".into();
+        let changed = build_machine_roster(&fleet, "m8", &store, Some(&synced), None);
+        assert_eq!(changed.row(&label).unwrap().identity_email, None);
+    }
+
+    #[test]
     fn builds_machine_roster_adopting_current_default_profile_email() {
         let fleet = parse_accounting_csv(SAMPLE_CSV, "sample.csv").expect("valid csv");
         let tmp = std::env::temp_dir().join(format!("aterm-sync-test-{}", std::process::id()));
@@ -7681,16 +7851,17 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .is_some(),
             "a different live wall is still adopted"
         );
-        assert_eq!(saved.roster.row_for_login(None).unwrap().label, "m8-2");
+        let saved_roster = Roster::load(&roster_path).unwrap();
+        assert_eq!(saved_roster.row_for_login(None).unwrap().label, "m8-2");
         assert_eq!(
-            saved.roster.row("m8").unwrap().dir.as_deref(),
+            saved_roster.row("m8").unwrap().dir.as_deref(),
             Some(login.as_str())
         );
         assert_eq!(
-            saved.roster.row("m8").unwrap().browser.as_deref(),
+            saved_roster.row("m8").unwrap().browser.as_deref(),
             Some("kept profile")
         );
-        assert_eq!(Roster::load(&target).unwrap(), saved.roster);
+        assert_eq!(Roster::load(&target).unwrap(), saved_roster);
         assert!(
             store.try_acquire().unwrap().is_some(),
             "the publication released its lock"
@@ -7713,7 +7884,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             );
         }
 
-        let kept = persist_accounts_sync(
+        persist_accounts_sync(
             &store,
             &roster_path,
             (&fleet, OptIn::Named),
@@ -7723,7 +7894,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             (&[], &[]),
         )
         .expect("preserve the current default without a profile hint");
-        assert_eq!(kept.roster.row_for_login(None).unwrap().label, "m8-2");
+        assert_eq!(
+            Roster::load(&roster_path)
+                .unwrap()
+                .row_for_login(None)
+                .unwrap()
+                .label,
+            "m8-2"
+        );
         let before_roster = fs::read(&target).unwrap();
         let before_fleet = fs::read(&saved.fleet_path).unwrap();
         let malformed = b"[[account]\nlabel = \"broken\"\n";
@@ -7807,7 +7985,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         );
         assert!(saved.fleet_path.is_dir());
         fs::remove_dir(&saved.fleet_path).unwrap();
-        let reset = persist_accounts_sync(
+        persist_accounts_sync(
             &store,
             &roster_path,
             (&fleet, OptIn::Named),
@@ -7817,6 +7995,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             (&[], &[]),
         )
         .unwrap();
+
+        let reset = Roster::load(&roster_path).unwrap();
 
         let source = root.join("source.csv");
         fs::write(&source, csv).unwrap();
@@ -7863,7 +8043,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(out.is_empty());
         assert!(!err.is_empty());
         assert!(store.wake_path().is_dir());
-        assert_eq!(Roster::load(&target).unwrap(), reset.roster);
+        assert_eq!(Roster::load(&target).unwrap(), reset);
     }
 
     #[test]
@@ -9352,6 +9532,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                         checked.to_str().unwrap(),
                         Some("max"),
                         UPKEEP_NOW + 51,
+                        &store.load_logins(UPKEEP_NOW + 51).unwrap().0,
                     )
                     .unwrap();
                     let (_, rows, _, fleet_rows) = sync_accounts_for_init(
@@ -9615,6 +9796,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 staging.to_str().unwrap(),
                 Some("max"),
                 UPKEEP_NOW,
+                &store.load_logins(UPKEEP_NOW).unwrap().0,
             )
             .unwrap();
             let valid_bytes = fs::read(&path).unwrap();
@@ -9640,6 +9822,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     staging.to_str().unwrap(),
                     Some("max"),
                     UPKEEP_NOW,
+                    &store.load_logins(UPKEEP_NOW).unwrap().0,
                 )
                 .is_err(),
                 "{kind}"
@@ -9670,6 +9853,12 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             "missing",
             "malformed",
             "schema",
+            "legacy-schema",
+            "parent-missing",
+            "parent-negative",
+            "parent-clock-missing",
+            "parent-clock-null",
+            "parent-exceeds-clock",
             "program",
             "label",
             "email",
@@ -9707,12 +9896,23 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             let profile = br#"{"oauthAccount":{"emailAddress":"sol-m27@example.test"}}"#;
             fs::write(staging.join(".claude.json"), profile).unwrap();
             let checked_at = UPKEEP_NOW - 10;
+            // Keep the parent unchanged while testing independent timestamp, limit and
+            // checkpoint-shape guards; adding a binding must not mask those refusals.
+            store
+                .transact_logins(UPKEEP_NOW, &mut None, |_, logins| {
+                    logins
+                        .labels
+                        .insert("m27".into(), accounts::Binding::default());
+                    Ok(Vec::new())
+                })
+                .unwrap();
             accounts::write_renewal_checkpoint(
                 "m27",
                 "sol-m27@example.test",
                 staging.to_str().unwrap(),
                 Some("max"),
                 checked_at,
+                &store.load_logins(UPKEEP_NOW).unwrap().0,
             )
             .unwrap();
             let proof_path = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
@@ -9726,10 +9926,29 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     fs::remove_file(&proof_path).unwrap();
                     fs::create_dir(&proof_path).unwrap();
                 }
-                "schema" | "program" | "label" | "email" | "dir" | "future" | "zero"
+                "schema"
+                | "legacy-schema"
+                | "parent-missing"
+                | "parent-negative"
+                | "parent-clock-missing"
+                | "parent-clock-null"
+                | "parent-exceeds-clock"
+                | "program"
+                | "label"
+                | "email"
+                | "dir"
+                | "future"
+                | "zero"
                 | "subscription" => {
                     let (key, value) = match case {
-                        "schema" => ("schema", Value::from(2)),
+                        "schema" => ("schema", Value::from(3)),
+                        "legacy-schema" => ("schema", Value::from(1)),
+                        "parent-missing" => ("parent_generation", Value::Null),
+                        "parent-negative" => ("parent_generation", Value::from(-1)),
+                        "parent-clock-missing" | "parent-clock-null" => {
+                            ("parent_clock", Value::Null)
+                        }
+                        "parent-exceeds-clock" => ("parent_generation", Value::from(1)),
                         "program" => ("program", Value::from("other")),
                         "label" => ("label", Value::from("m28")),
                         "email" => ("email", Value::from("someone@example.test")),
@@ -9739,6 +9958,12 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                         _ => ("subscription", Value::from("x".repeat(33))),
                     };
                     proof.as_object_mut().unwrap().insert(key.into(), value);
+                    if case == "parent-missing" {
+                        proof.as_object_mut().unwrap().remove("parent_generation");
+                    }
+                    if case == "parent-clock-missing" {
+                        proof.as_object_mut().unwrap().remove("parent_clock");
+                    }
                     fs::write(&proof_path, proof.to_string()).unwrap();
                 }
                 _ => {
@@ -9815,7 +10040,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .map(|(label, email)| Row {
                     label: label.into(),
                     class: Class::Dedicated,
-                    dir: None,
+                    dir: Some(store.login_dir(label).unwrap().to_str().unwrap().into()),
                     was: Vec::new(),
                     vendor: Default::default(),
                     email: Some(email.into()),
@@ -9867,6 +10092,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     login_text,
                     facts.subscription.as_deref(),
                     checked_at,
+                    &store.load_logins(UPKEEP_NOW).unwrap().0,
                 )
                 .unwrap();
                 assert!(!store.state_file().exists());
@@ -9896,10 +10122,86 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
+    fn claude_alias_completion_and_recovery_require_the_canonical_identity() {
+        for recover in [false, true] {
+            for reported in ["canonical@example.test", "alias@example.test"] {
+                let w = World::new();
+                let store = accounts::Store::at(&w.state);
+                let roster = Roster {
+                    rows: vec![Row {
+                        label: "m27".into(),
+                        email: Some("alias@example.test".into()),
+                        identity_email: Some("canonical@example.test".into()),
+                        dir: Some(store.login_dir("m27").unwrap().to_str().unwrap().into()),
+                        ..Row::default()
+                    }],
+                };
+                let staging = store.claim_staging_dir("m27").unwrap();
+                let staging_text = staging.to_str().unwrap();
+                fs::write(
+                    staging.join(".claude.json"),
+                    format!(r#"{{"oauthAccount":{{"emailAddress":"{reported}"}}}}"#),
+                )
+                .unwrap();
+                let accepted = if recover {
+                    accounts::write_renewal_checkpoint(
+                        "m27",
+                        reported,
+                        staging_text,
+                        Some("max"),
+                        UPKEEP_NOW - 1,
+                        &store.load_logins(UPKEEP_NOW).unwrap().0,
+                    )
+                    .unwrap();
+                    let guard =
+                        std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+                    recover_interrupted_staging_renewals(&store, &roster, &guard, UPKEEP_NOW)
+                } else {
+                    let status = super::super::align::Captured {
+                        stdout: format!(
+                            r#"{{"loggedIn":true,"authMethod":"claude.ai","email":"{reported}","subscriptionType":"max"}}"#
+                        )
+                        .into_bytes(),
+                        code: Some(0),
+                    };
+                    complete_staging_renewal(
+                        &store,
+                        &roster,
+                        "m27",
+                        &staging,
+                        staging_text,
+                        &status,
+                        UPKEEP_NOW,
+                    )
+                };
+                let canonical = reported == "canonical@example.test";
+                assert_eq!(
+                    accepted, canonical,
+                    "recover={recover}, reported={reported}"
+                );
+                let logins = store.load_logins(UPKEEP_NOW).unwrap().0;
+                assert_eq!(
+                    logins.get("m27").and_then(|binding| binding.dir.as_deref()),
+                    canonical.then_some(staging_text)
+                );
+                if canonical {
+                    let proof = accounts::read_renewal_checkpoint(
+                        &staging,
+                        &fs::canonicalize(&staging).unwrap(),
+                        UPKEEP_NOW,
+                    )
+                    .unwrap();
+                    assert_eq!(proof.email, "canonical@example.test");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn recover_interrupted_staging_renewals_adopts_completed_login_and_preserves_other_work() {
         let w = World::new();
         let store = accounts::Store::at(&w.state);
-        let mut roster = Roster {
+        let roster = Roster {
             rows: vec![
                 Row {
                     label: "m27".to_owned(),
@@ -9970,6 +10272,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             completed.to_str().unwrap(),
             facts.subscription.as_deref(),
             checked_at,
+            &store.load_logins(UPKEEP_NOW).unwrap().0,
         )
         .unwrap();
         assert!(completed.join(accounts::RENEWAL_CHECKPOINT_FILE).is_file());
@@ -10072,15 +10375,17 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             another.to_str().unwrap(),
             Some("max"),
             UPKEEP_NOW + 35,
+            &store.load_logins(UPKEEP_NOW + 35).unwrap().0,
         )
         .unwrap();
-        roster.rows[1]
-            .was
-            .push(Some(another.to_string_lossy().into_owned()));
         let alias = completed.join(".").to_string_lossy().into_owned();
         store
             .transact_logins(UPKEEP_NOW + 30, &mut None, |state, logins| {
-                logins.labels.get_mut("m27-2").unwrap().dir = Some(alias.clone());
+                let binding = logins.labels.get_mut("m27-2").unwrap();
+                binding.dir = Some(alias.clone());
+                binding
+                    .was
+                    .push(Some(another.to_string_lossy().into_owned()));
                 Ok(accounts::note_auth(
                     state,
                     "m27-2",
@@ -10386,6 +10691,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             staging.to_str().unwrap(),
             Some("max"),
             UPKEEP_NOW - 5,
+            &store.load_logins(UPKEEP_NOW).unwrap().0,
         )
         .unwrap();
         let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
@@ -10506,6 +10812,16 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         .unwrap();
 
         let store = accounts::Store::at(&state_dir);
+        store
+            .transact(UPKEEP_NOW - 20, &mut None, |state| {
+                Ok(accounts::note_auth(
+                    state,
+                    "m27",
+                    accounts::Auth::SignedOut,
+                    UPKEEP_NOW - 20,
+                ))
+            })
+            .unwrap();
         let staged_m27 = store.claim_staging_dir("m27").unwrap();
         fs::write(staged_m27.join(".credentials.json"), b"{}").unwrap();
         accounts::write_renewal_checkpoint(
@@ -10514,6 +10830,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             staged_m27.to_str().unwrap(),
             Some("max"),
             UPKEEP_NOW - 10,
+            &store.load_logins(UPKEEP_NOW).unwrap().0,
         )
         .unwrap();
 
@@ -10626,6 +10943,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             staged_m27_2.to_str().unwrap(),
             Some("max"),
             UPKEEP_NOW,
+            &store.load_logins(UPKEEP_NOW).unwrap().0,
         )
         .unwrap();
         out.clear();
@@ -10704,6 +11022,246 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
+    fn automatic_attempt_summary_refuses_a_replacement_binding() {
+        for changed in [false, true] {
+            let w = World::new();
+            let store = accounts::Store::at(&w.state);
+            let path = store.login_dir("main").unwrap();
+            let renew = || {
+                store
+                    .transact_logins(UPKEEP_NOW, &mut None, |state, logins| {
+                        Ok(accounts::note_renewed(
+                            state,
+                            logins,
+                            "main",
+                            path.to_str(),
+                            path.to_str().unwrap(),
+                            None,
+                            UPKEEP_NOW,
+                        ))
+                    })
+                    .unwrap()
+            };
+            renew();
+            let captured = store.load_logins(UPKEEP_NOW).unwrap().0;
+            if changed {
+                renew();
+            }
+            let files = [
+                store.state_file(),
+                store.logins_file(),
+                store.ledger_path(),
+                store.wake_path(),
+            ];
+            let before = files.each_ref().map(|path| fs::read(path).ok());
+            note_attempt(
+                &store,
+                &captured,
+                "main",
+                accounts::AttemptOutcome::Failed,
+                "fixture route",
+                UPKEEP_NOW,
+            );
+            if changed {
+                assert_eq!(files.each_ref().map(|path| fs::read(path).ok()), before);
+            } else {
+                assert_eq!(
+                    store
+                        .load_logins(UPKEEP_NOW)
+                        .unwrap()
+                        .0
+                        .get("main")
+                        .unwrap()
+                        .sign_in_attempt
+                        .as_ref()
+                        .unwrap()
+                        .outcome,
+                    accounts::AttemptOutcome::Failed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_completion_checks_the_generation_of_the_account_it_actually_matches() {
+        for changed in [None, Some("main"), Some("other")] {
+            let w = World::new();
+            let store = accounts::Store::at(&w.state);
+            let raw = Roster {
+                rows: [
+                    ("main", "first@example.test"),
+                    ("other", "matched@example.test"),
+                ]
+                .into_iter()
+                .map(|(label, email)| Row {
+                    label: label.into(),
+                    email: Some(email.into()),
+                    dir: Some(store.login_dir(label).unwrap().to_str().unwrap().into()),
+                    ..Default::default()
+                })
+                .collect(),
+            };
+            let path = w.roster();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format_roster_toml(&raw).unwrap()).unwrap();
+            store
+                .transact_logins(UPKEEP_NOW - 10, &mut None, |state, logins| {
+                    let mut events = Vec::new();
+                    for row in &raw.rows {
+                        events.extend(accounts::note_renewed(
+                            state,
+                            logins,
+                            &row.label,
+                            row.dir.as_deref(),
+                            row.dir.as_deref().unwrap(),
+                            None,
+                            UPKEEP_NOW - 10,
+                        ));
+                    }
+                    Ok(events)
+                })
+                .unwrap();
+            let captured_logins = store.load_logins(UPKEEP_NOW).unwrap().0;
+            let captured_rows = accounts::bound(&raw, &captured_logins);
+            if let Some(label) = changed {
+                store
+                    .transact_logins(UPKEEP_NOW - 10, &mut None, |state, logins| {
+                        let old = logins.get(label).unwrap().clone();
+                        let events = accounts::note_renewed(
+                            state,
+                            logins,
+                            label,
+                            old.dir.as_deref(),
+                            old.dir.as_deref().unwrap(),
+                            None,
+                            UPKEEP_NOW - 10,
+                        );
+                        logins.labels.get_mut(label).unwrap().was = old.was;
+                        Ok(events)
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                accounts::bound(&raw, &store.load_logins(UPKEEP_NOW).unwrap().0),
+                captured_rows
+            );
+            let staging = store.claim_staging_dir("main").unwrap();
+            fs::write(staging.join(".claude.json"), b"verified alternate account").unwrap();
+            let files = [
+                store.state_file(),
+                store.logins_file(),
+                store.ledger_path(),
+                store.wake_path(),
+            ];
+            let before = files.each_ref().map(|path| fs::read(path).ok());
+            let status = super::super::align::Captured {
+                stdout: br#"{"loggedIn":true,"authMethod":"claude.ai","email":"matched@example.test","subscriptionType":"max"}"#.to_vec(),
+                code: Some(0),
+            };
+            let outcome = complete_staging_renewal_result(
+                &store,
+                accounts::RenewalPolicy {
+                    roster_path: &path,
+                    roster: &raw,
+                    row: captured_rows.row("main").unwrap(),
+                    logins: &captured_logins,
+                },
+                &staging,
+                staging.to_str().unwrap(),
+                (&status, Some("fixture route")),
+                UPKEEP_NOW,
+            );
+            if changed.is_none() {
+                assert_eq!(outcome, super::super::cli::Renewal::Renewed);
+                assert_eq!(
+                    store
+                        .load_logins(UPKEEP_NOW)
+                        .unwrap()
+                        .0
+                        .get("main")
+                        .unwrap()
+                        .sign_in_attempt
+                        .as_ref()
+                        .unwrap()
+                        .outcome,
+                    accounts::AttemptOutcome::SignedIn,
+                );
+                assert_eq!(
+                    store
+                        .load_logins(UPKEEP_NOW)
+                        .unwrap()
+                        .0
+                        .get("other")
+                        .unwrap()
+                        .dir
+                        .as_deref(),
+                    staging.to_str()
+                );
+            } else {
+                assert_eq!(outcome, super::super::cli::Renewal::Failed);
+                assert_eq!(files.each_ref().map(|path| fs::read(path).ok()), before);
+                assert!(!staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+            }
+            assert_eq!(
+                fs::read(staging.join(".claude.json")).unwrap(),
+                b"verified alternate account"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_completion_refuses_removed_policy_without_recoverable_evidence() {
+        for email in ["owner@example.test", "foreign@example.test"] {
+            let w = World::new();
+            let store = accounts::Store::at(&w.state);
+            let raw = Roster {
+                rows: vec![Row {
+                    label: "main".into(),
+                    email: Some("owner@example.test".into()),
+                    ..Row::default()
+                }],
+            };
+            let roster_path = w.roster();
+            fs::create_dir_all(roster_path.parent().unwrap()).unwrap();
+            fs::write(&roster_path, format_roster_toml(&raw).unwrap()).unwrap();
+            let captured = raw.row("main").unwrap();
+            let staging = store.claim_staging_dir("main").unwrap();
+            fs::write(staging.join(".claude.json"), b"completed private login").unwrap();
+            fs::write(&roster_path, "").unwrap();
+            let status = super::super::align::Captured {
+                stdout: format!(
+                    r#"{{"loggedIn":true,"authMethod":"claude.ai","email":"{email}"}}"#
+                )
+                .into_bytes(),
+                code: Some(0),
+            };
+            assert_eq!(
+                complete_staging_renewal_result(
+                    &store,
+                    accounts::RenewalPolicy {
+                        roster_path: &roster_path,
+                        roster: &raw,
+                        row: captured,
+                        logins: &accounts::Logins::default(),
+                    },
+                    &staging,
+                    staging.to_str().unwrap(),
+                    (&status, None),
+                    UPKEEP_NOW,
+                ),
+                super::super::cli::Renewal::Failed
+            );
+            assert!(!store.logins_file().exists());
+            assert!(!store.state_file().exists());
+            assert!(!staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+            assert_eq!(
+                fs::read(staging.join(".claude.json")).unwrap(),
+                b"completed private login"
+            );
+        }
+    }
+
+    #[test]
     fn staging_completion_failures_stop_fallback_and_keep_verified_logins() {
         use super::super::cli::Renewal;
 
@@ -10728,6 +11286,8 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     ..Row::default()
                 }],
             };
+            let roster_path = dir.path().join(accounts::ACCOUNTS_FILE);
+            fs::write(&roster_path, format_roster_toml(&roster).unwrap()).unwrap();
             let staging = store.claim_staging_dir("main").unwrap();
             let profile = b"private verified login fixture";
             fs::write(staging.join(".claude.json"), profile).unwrap();
@@ -10762,11 +11322,15 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             };
             let outcome = complete_staging_renewal_result(
                 &store,
-                &roster,
-                "main",
+                accounts::RenewalPolicy {
+                    roster_path: &roster_path,
+                    roster: &roster,
+                    row: roster.row("main").unwrap(),
+                    logins: &accounts::Logins::default(),
+                },
                 &staging,
                 staging.to_str().unwrap(),
-                &status,
+                (&status, None),
                 UPKEEP_NOW,
             );
             match case {
@@ -11435,6 +11999,7 @@ totp = "JBSWY3DPEHPK3PXP"
             use_staging_text,
             Some("max"),
             UPKEEP_NOW + 50,
+            &store.load_logins(UPKEEP_NOW + 50).unwrap().0,
         )
         .unwrap();
         let env_use = w.env(UPKEEP_NOW + 55);

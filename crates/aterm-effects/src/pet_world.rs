@@ -253,13 +253,16 @@ impl PetWorldStamp {
         {
             return false;
         }
-        let counters = |stamp: Self| ContentScrollState {
-            uniform_up_rows: stamp.uniform_up_rows,
-            invalidation_epoch: stamp.surface.scroll_invalidation,
-            band_batches: stamp.scroll_band_batches,
-            band_seq: stamp.scroll_band_seq,
-            ..ContentScrollState::default()
-        };
+        #[inline]
+        fn counters(stamp: PetWorldStamp) -> ContentScrollState {
+            ContentScrollState {
+                uniform_up_rows: stamp.uniform_up_rows,
+                invalidation_epoch: stamp.surface.scroll_invalidation,
+                band_batches: stamp.scroll_band_batches,
+                band_seq: stamp.scroll_band_seq,
+                ..ContentScrollState::default()
+            }
+        }
         match ContentScrollState::delta_since(Some(counters(previous)), counters(self)) {
             ContentScrollDelta::Bands { .. } => true,
             ContentScrollDelta::Unchanged | ContentScrollDelta::Translate(_) => {
@@ -610,14 +613,14 @@ impl PetWorld {
             || pane.cols != s.cols
             || pane.rows == 0
             || pane.cols == 0
-            || pane
-                .row
-                .checked_add(pane.rows)
-                .is_none_or(|n| n > input.rows)
-            || pane
-                .col
-                .checked_add(pane.cols)
-                .is_none_or(|n| n > input.cols)
+            || match pane.row.checked_add(pane.rows) {
+                Some(n) => n > input.rows,
+                None => true,
+            }
+            || match pane.col.checked_add(pane.cols) {
+                Some(n) => n > input.cols,
+                None => true,
+            }
             || input.selections.len() > MAX_REGIONS
             || exclusions.len() > MAX_REGIONS
             || !all_valid(exclusions)
@@ -631,19 +634,28 @@ impl PetWorld {
         self.stamp = Some(facts.stamp);
         self.progress = facts.progress;
         self.selection_target = selection_target(input, pane);
-        let held_center = held_center.filter(|&(row, col)| {
-            input.display_offset == 0
-                && row.is_finite()
-                && col.is_finite()
-                && row >= 0.0
-                && col >= 0.0
-                && row < pane.rows as f32
-                && col < pane.cols as f32
-        });
+        let held_center = match held_center {
+            Some((row, col))
+                if input.display_offset == 0
+                    && row.is_finite()
+                    && col.is_finite()
+                    && row >= 0.0
+                    && col >= 0.0
+                    && row < pane.rows as f32
+                    && col < pane.cols as f32 =>
+            {
+                Some((row, col))
+            }
+            _ => None,
+        };
         let center = if input.display_offset != 0 || !input.cursor_visible {
-            self.selection_target
-                .or(held_center)
-                .unwrap_or((pane.rows as f32 * 0.5, pane.cols as f32 * 0.5))
+            match self.selection_target {
+                Some(t) => t,
+                None => match held_center {
+                    Some(h) => h,
+                    None => (pane.rows as f32 * 0.5, pane.cols as f32 * 0.5),
+                },
+            }
         } else {
             (
                 (input.cursor_row.saturating_sub(pane.row)).min(pane.rows - 1) as f32,
@@ -785,13 +797,15 @@ impl PetWorld {
                     && input.selection_contains_cell(
                         frame_r,
                         frame_c,
-                        row.get(frame_c + 1).is_some_and(|n| n.wide),
+                        matches!(row.get(frame_c + 1), Some(n) if n.wide),
                         cell.wide,
                     );
                 if selected {
                     let rect = PetRect::new(local_r as f32, local_c as f32, 1.0, 1.0);
-                    self.selection_rect =
-                        Some(self.selection_rect.map_or(rect, |old| old.union(rect)));
+                    self.selection_rect = Some(match self.selection_rect {
+                        Some(old) => old.union(rect),
+                        None => rect,
+                    });
                 }
                 let cursor = cursor_row_near && frame_c.abs_diff(input.cursor_col) <= 1;
                 let bg = (u32::from(cell.bg[0]) << 16)
@@ -826,21 +840,25 @@ impl PetWorld {
                                 || (input.cluster_at(frame_r, column).is_none()
                                     && input.combining_at(frame_r, column).is_none()))
                     };
-                self.glyphs[row_base + c] = (line == LineSize::SingleWidth).then_some(if !glyph {
-                    PetGlyph::Blank
-                } else if speck {
-                    PetGlyph::Speck
-                } else if if cell.wide {
-                    c > 0 && self.glyphs[row_base + c - 1] == Some(PetGlyph::Letter)
-                } else if cell.ch.is_ascii() {
-                    cell.ch.is_ascii_alphanumeric()
+                self.glyphs[row_base + c] = if line == LineSize::SingleWidth {
+                    Some(if !glyph {
+                        PetGlyph::Blank
+                    } else if speck {
+                        PetGlyph::Speck
+                    } else if if cell.wide {
+                        c > 0 && self.glyphs[row_base + c - 1] == Some(PetGlyph::Letter)
+                    } else if cell.ch.is_ascii() {
+                        cell.ch.is_ascii_alphanumeric()
+                    } else {
+                        cell.ch.is_alphanumeric()
+                    } {
+                        PetGlyph::Letter
+                    } else {
+                        PetGlyph::Substantive
+                    })
                 } else {
-                    cell.ch.is_alphanumeric()
-                } {
-                    PetGlyph::Letter
-                } else {
-                    PetGlyph::Substantive
-                });
+                    None
+                };
                 let lasting = line != LineSize::SingleWidth
                     || span_contains(spans, local_c)
                     || scan.image(frame_c).is_some();
@@ -2552,10 +2570,10 @@ impl<'a, T> SparseRow<'a, T> {
             return None;
         }
         if !self.ordered {
-            return items
-                .binary_search_by_key(&col, |(c, _)| *c)
-                .ok()
-                .map(|i| &items[i].1);
+            let Ok(i) = items.binary_search_by_key(&col, |(c, _)| *c) else {
+                return None;
+            };
+            return Some(&items[i].1);
         }
         while self.cursor < items.len() && items[self.cursor].0 < col {
             self.cursor += 1;
@@ -2715,12 +2733,14 @@ impl<'a> RowScan<'a> {
 
     #[inline]
     fn cluster(&mut self, col: usize) -> Option<&'a str> {
-        self.clusters.get(col).map(AsRef::as_ref)
+        let s = self.clusters.get(col)?;
+        Some(s.as_ref())
     }
 
     #[inline]
     fn combining(&mut self, col: usize) -> Option<&'a [char]> {
-        self.combining.get(col).map(AsRef::as_ref)
+        let s = self.combining.get(col)?;
+        Some(s.as_ref())
     }
 
     #[inline]
@@ -2728,9 +2748,8 @@ impl<'a> RowScan<'a> {
         if self.images.is_empty() {
             return None;
         }
-        aterm_core::render::images_in_row_at(self.images, col)
-            .last()
-            .map(|(_, image)| image)
+        let (_, image) = aterm_core::render::images_in_row_at(self.images, col).last()?;
+        Some(image)
     }
 }
 
@@ -2801,6 +2820,52 @@ const fn intersects_cell(rect: PetRect, row: usize, col: usize) -> bool {
 }
 
 #[inline]
+fn project_selection_target(
+    selection: &TextSelection,
+    offset: i32,
+    clip: SelectionClip,
+    max_col: u16,
+    pane: PetPane,
+) -> Option<(f32, f32)> {
+    let bounds = selection.project_range(max_col)?;
+    let first = i64::from(bounds.start_row) + i64::from(offset);
+    let last = i64::from(bounds.end_row) + i64::from(offset);
+    let row_start = first.max(pane.row.max(clip.row_start) as i64);
+    let row_end = last.min((pane.row + pane.rows).min(clip.row_end) as i64 - 1);
+    let col_start = pane.col.max(clip.col_start);
+    let col_end = (pane.col + pane.cols).min(clip.col_end);
+    if row_start > row_end || col_start >= col_end {
+        return None;
+    }
+    let end = selection.end();
+    let preferred = (i64::from(end.row) + i64::from(offset)).clamp(row_start, row_end);
+    let rows = [preferred, row_start, row_end, row_start + 1, row_end - 1];
+    let mut i = 0;
+    while i < rows.len() {
+        let row = rows[i];
+        i += 1;
+        if row < row_start || row > row_end {
+            continue;
+        }
+        let lo = if bounds.is_block || row == first {
+            usize::from(bounds.start_col).max(col_start)
+        } else {
+            col_start
+        };
+        let hi = if bounds.is_block || row == last {
+            usize::from(bounds.end_col).min(col_end - 1)
+        } else {
+            col_end - 1
+        };
+        if lo <= hi {
+            let col = usize::from(end.col).clamp(lo, hi);
+            return Some(((row as usize - pane.row) as f32, (col - pane.col) as f32));
+        }
+    }
+    None
+}
+
+#[inline]
 fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
     let max_col = u16::try_from(input.cols.saturating_sub(1)).unwrap_or(u16::MAX);
     let default_clip = SelectionClip::new(
@@ -2809,48 +2874,19 @@ fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
         pane.col,
         pane.col + pane.cols,
     );
-    let project = |selection: &TextSelection, offset: i32, clip: Option<SelectionClip>| {
-        let bounds = selection.project_range(max_col)?;
-        let clip = clip.unwrap_or(default_clip);
-        let first = i64::from(bounds.start_row) + i64::from(offset);
-        let last = i64::from(bounds.end_row) + i64::from(offset);
-        let row_start = first.max(pane.row.max(clip.row_start) as i64);
-        let row_end = last.min((pane.row + pane.rows).min(clip.row_end) as i64 - 1);
-        let col_start = pane.col.max(clip.col_start);
-        let col_end = (pane.col + pane.cols).min(clip.col_end);
-        if row_start > row_end || col_start >= col_end {
-            return None;
-        }
-        let end = selection.end();
-        let preferred = (i64::from(end.row) + i64::from(offset)).clamp(row_start, row_end);
-        for row in [preferred, row_start, row_end, row_start + 1, row_end - 1] {
-            if row < row_start || row > row_end {
-                continue;
-            }
-            let lo = if bounds.is_block || row == first {
-                usize::from(bounds.start_col).max(col_start)
-            } else {
-                col_start
-            };
-            let hi = if bounds.is_block || row == last {
-                usize::from(bounds.end_col).min(col_end - 1)
-            } else {
-                col_end - 1
-            };
-            if lo <= hi {
-                let col = usize::from(end.col).clamp(lo, hi);
-                return Some(((row as usize - pane.row) as f32, (col - pane.col) as f32));
-            }
-        }
-        None
-    };
     if input.selections.is_empty() {
-        project(&input.selection, input.display_offset, input.selection_clip)
+        project_selection_target(
+            &input.selection,
+            input.display_offset,
+            input.selection_clip.unwrap_or(default_clip),
+            max_col,
+            pane,
+        )
     } else {
         let limit = input.selections.len().min(MAX_REGIONS);
         for s in &input.selections[..limit] {
             if !s.inactive
-                && let Some(pos) = project(&s.selection, 0, Some(s.clip))
+                && let Some(pos) = project_selection_target(&s.selection, 0, s.clip, max_col, pane)
             {
                 return Some(pos);
             }

@@ -56,8 +56,10 @@ impl RowMatch for AgySpinner {
     }
 }
 
-/// Gemini CLI's status row, as its reader's busy guard spells it (`^\s?[⠀-⣿]\s\S`): a
-/// braille spinner in column 0 or 1, a blank, then a word.
+/// The status row of Gemini CLI 0.46.0, whose capture this is, as aterm's reader of it
+/// spelled its busy guard (`^\s?[⠀-⣿]\s\S`) before agy replaced Gemini CLI: a braille
+/// spinner in column 0 or 1, a blank, then a word. The engine's settle is what the capture
+/// tests; no agent support rides on it.
 #[derive(Debug)]
 struct GeminiSpinner;
 impl RowMatch for GeminiSpinner {

@@ -165,12 +165,14 @@ impl TypedKittySummon {
         lexicon.scan_into_with_scratch(&buf[start..], opts, chars, matches, scratch);
         let end = self.chars.len();
         let mut hit = None;
-        for m in self.matches.iter().filter(|m| m.end == end) {
-            if m.class == Class::Profanity {
-                hit = Some(Class::Profanity);
-                break;
+        for m in &self.matches {
+            if m.end == end {
+                if m.class == Class::Profanity {
+                    hit = Some(Class::Profanity);
+                    break;
+                }
+                hit = Some(m.class);
             }
-            hit = Some(m.class);
         }
         let Some(class) = hit else {
             return TypedHit::NONE;
@@ -182,9 +184,10 @@ impl TypedKittySummon {
                 ..TypedHit::NONE
             },
             Class::Feline => {
-                let records = !self
-                    .last_summon
-                    .is_some_and(|at| now.saturating_duration_since(at) < TYPED_SUMMON_COOLDOWN);
+                let records = !matches!(
+                    self.last_summon,
+                    Some(at) if now.saturating_duration_since(at) < TYPED_SUMMON_COOLDOWN
+                );
                 if records {
                     self.last_summon = Some(now);
                 }
@@ -248,7 +251,10 @@ impl TypedKittySummon {
                     {
                         rev.next();
                     } else {
-                        return rev.next().map_or(0, |(idx, _)| idx);
+                        return match rev.next() {
+                            Some((idx, _)) => idx,
+                            None => 0,
+                        };
                     }
                 } else {
                     break;
@@ -256,7 +262,10 @@ impl TypedKittySummon {
             }
         }
         let _ = rev.next();
-        rev.next().map_or(0, |(idx, _)| idx)
+        match rev.next() {
+            Some((idx, _)) => idx,
+            None => 0,
+        }
     }
 
     /// Pop the most recent char on a plain Backspace.

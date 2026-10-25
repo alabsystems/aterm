@@ -849,7 +849,7 @@ impl DeclaredWake {
         true
     }
 
-    fn seen(&self) -> WakeSeen {
+    fn seen(&self, need_met: bool) -> WakeSeen {
         WakeSeen {
             ord: self.ord,
             class: self.by,
@@ -860,6 +860,7 @@ impl DeclaredWake {
             kinds: self.when.iter().map(|a| a.atom.kind()).collect(),
             need: self.need.as_ref().map(|n| n.canonical().to_string()),
             need_slots: self.need.as_ref().is_some_and(SysWait::names_slots),
+            need_met,
             await_only: self.await_only,
         }
     }
@@ -1459,15 +1460,22 @@ impl WakeBook {
         self.wakes.iter().any(DeclaredWake::open)
     }
 
-    /// THE BOOK AS THE LOOP SEES IT: each wake still to be told, closed words and numbers.
+    /// THE BOOK AS THE LOOP SEES IT: each wake still to be told, closed words and numbers, a need
+    /// read as met only where the wake has none ([`Self::seen_by`] takes the host's judgement).
     #[must_use]
     pub fn seen(&self) -> WakesSeen {
+        self.seen_by(|w| w.need.is_none())
+    }
+
+    /// [`Self::seen`], each wake's need judged by `need_met` (the host's latch at its last look).
+    #[must_use]
+    pub fn seen_by(&self, need_met: impl Fn(&DeclaredWake) -> bool) -> WakesSeen {
         WakesSeen {
             wakes: self
                 .wakes
                 .iter()
                 .filter(|w| w.state.live())
-                .map(DeclaredWake::seen)
+                .map(|w| w.seen(need_met(w)))
                 .collect(),
         }
     }

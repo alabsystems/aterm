@@ -10,9 +10,9 @@ use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
     ComposerRead, Conversation, CreditsCarry, LOGIN_SHARED_LOOK, MENU_DIVERTS, OWN_WORDS_STAND,
-    ProbeGate, RULE_ACCOUNT, RULE_LAND, RULE_LEFT, RULE_LIMIT_RESUME, RULE_LOGIN, RULE_USAGE_PROBE,
-    RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, act_turn_work, budget_frees,
-    conversation_mark, decide_turn_end, decide_turn_end_traced, done_row_work, reads_conversation,
+    ProbeGate, RULE_ACCOUNT, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_USAGE_PROBE, RecordTurn,
+    Restart, TRY_ANSWER_SLACK, WAKE_KEPT, act_turn_work, budget_frees, conversation_mark,
+    decide_turn_end, decide_turn_end_traced, done_row_work, reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -573,7 +573,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         let windows = UsageWindow::of_wall(kind, message);
@@ -742,7 +741,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         if !signs_in || !wall.is_some_and(moves_with_login) {
@@ -941,16 +939,6 @@ impl<C: Ctl> Session<'_, C> {
             self.scope_limit_conversation(reader.program(), opts.idle_host.is_some(), screen.seq);
         }
         let mut reading = reader.read(&screen.rows, Some(screen.cursor_col));
-        self.limit_stopped_adopt(&reading, opts);
-        self.limit_stopped_seat(&reading, &screen.rows);
-        let stopped = self.limit_stopped(&reading, &screen.rows);
-        if let Some(s) = &stopped {
-            reading.phase = Phase::Limited {
-                message: s.wall.message.clone(),
-                reset: s.wall.reset.clone(),
-            };
-            reading.wall = Some(s.wall.clone());
-        }
         if reading.phase == Phase::Busy && self.transcript_over_seq == Some(screen.seq) {
             reading.phase = Phase::Idle;
         }
@@ -973,7 +961,6 @@ impl<C: Ctl> Session<'_, C> {
                 | Program::Kimi
                 | Program::Agy
                 | Program::Muse
-                | Program::Gemini
                 | Program::Generic => false,
             }
             && let Some(said) = aterm_phase::phase::last_said_notice(&screen.rows)
@@ -986,15 +973,8 @@ impl<C: Ctl> Session<'_, C> {
         let wall_was_hidden = reading.wall.is_none();
         self.wall_memory_step(reader, &screen.rows, &mut reading, screen.seq);
         let remembered_wall = (wall_was_hidden || standing_remembered) && reading.wall.is_some();
-        let reset_at = match (&stopped, &reading.wall) {
-            (Some(s), _) => {
-                self.wall_reset = Some((
-                    reset_key(s.wall.kind, s.wall.reset.as_deref()),
-                    Some(s.reset_unix),
-                ));
-                Some(self.instant_of(s.reset_unix))
-            }
-            (None, Some(w)) => {
+        let reset_at = match &reading.wall {
+            Some(w) => {
                 let text = w.reset.clone();
                 let session_window = w.kind == aterm_phase::WallKind::UsageSession
                     && limit::names_a_session_window(&w.message);
@@ -1045,7 +1025,7 @@ impl<C: Ctl> Session<'_, C> {
                     None => notice,
                 }
             }
-            (None, None) => {
+            None => {
                 if worked.is_some() {
                     self.wall_reset = None;
                     self.reprint_jumps = 0;
@@ -1118,22 +1098,44 @@ impl<C: Ctl> Session<'_, C> {
         self.memory_wall = measured.is_some();
         self.memory_over_wall =
             self.memory_wall && (r.wall.is_some() || matches!(r.phase, Phase::Limited { .. }));
-        let login_label = host
-            .filter(|_| {
-                opts.policy.logins
-                    && match r.program {
-                        Program::Claude => true,
-                        Program::Codex
-                        | Program::Grok
-                        | Program::Kimi
-                        | Program::Agy
-                        | Program::Muse
-                        | Program::Gemini
-                        | Program::Generic => false,
-                    }
-            })
-            .and_then(|h| h.login_label());
+        let logins = host.filter(|_| {
+            opts.policy.logins
+                && match r.program {
+                    Program::Claude => true,
+                    Program::Codex
+                    | Program::Grok
+                    | Program::Kimi
+                    | Program::Agy
+                    | Program::Muse
+                    | Program::Generic => false,
+                }
+        });
+        let mut login_label = logins.and_then(|h| h.login_label());
         let login_track = self.turn_end.login_track().is_some();
+        // A lost login no roster row names yet, before any `/login` is typed into it: the host's
+        // discovery runs once (the upkeep's sync, which adopts the default login's address as a
+        // row at once), so a login whose address aterm can read takes the roster row's wait, and
+        // its sign-in ladder's, in place of a `/login` only a person could finish.
+        let unnamed = r.wall == Some(aterm_phase::WallKind::Auth)
+            && self
+                .turn_end
+                .wall_attempts(aterm_phase::WallKind::Auth)
+                .unwrap_or(0)
+                == 0;
+        if !unnamed && !login_track {
+            self.login_discovered = false;
+        }
+        if check == Check::Decide
+            && unnamed
+            && login_label.is_none()
+            && !self.login_discovered
+            && !self.fx.replay_lacks_host_door("host.login_discover")
+            && let Some(h) = logins
+        {
+            self.login_discovered = true;
+            h.login_discover();
+            login_label = h.login_label();
+        }
         let lost = host.filter(|_| {
             login_label.is_some()
                 && (r.wall == Some(aterm_phase::WallKind::Auth)
@@ -1329,7 +1331,6 @@ impl<C: Ctl> Session<'_, C> {
                 | Program::Kimi
                 | Program::Agy
                 | Program::Muse
-                | Program::Gemini
                 | Program::Generic => false,
             }
             && reading.phase == Phase::Idle
@@ -1371,7 +1372,6 @@ impl<C: Ctl> Session<'_, C> {
                     | Program::Kimi
                     | Program::Agy
                     | Program::Muse
-                    | Program::Gemini
                     | Program::Generic => None,
                 };
                 let wall = left.as_ref().map(|l| l.wall.clone());
@@ -1823,7 +1823,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => None,
         };
         ComposerRead { typed, menu_fg }
@@ -1885,22 +1884,6 @@ impl<C: Ctl> Session<'_, C> {
         if !self.held {
             self.turn_end_due = None;
         }
-        let rows = &point.screen.rows;
-        let limit_dialog = point.phase == Phase::Prompt
-            && self
-                .reader(rows)
-                .prompt(rows)
-                .is_some_and(|p| p.kind == aterm_phase::PromptKind::UsageLimit);
-        let stopped = || {
-            aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w))
-        };
-        let program = self.reader(rows).program();
-        if !limit_dialog && !stopped() {
-            self.limit_dialog_read = None;
-            if !self.limit_ladder_kept() && !self.limit_retry_away(program, rows, opts) {
-                self.limit_retry = None;
-            }
-        }
         self.draft_held = None;
         if self.claim.watching_behind().is_some() {
             return Ok(TurnEndAction::Nothing);
@@ -1934,25 +1917,8 @@ impl<C: Ctl> Session<'_, C> {
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
         self.fold_point(&mut r, now, point.screen.seq, opts);
-        self.limit_episode_folded(point);
         self.task_seed(opts)?;
         self.decide_to_act(r, opts, now, &point.screen)
-    }
-
-    /// Update usage-limit dialog retry tracking after folding `point`.
-    fn limit_episode_folded(&mut self, point: &Turn) {
-        let rows = &point.screen.rows;
-        let limit_dialog = point.phase == Phase::Prompt
-            && self
-                .reader(rows)
-                .prompt(rows)
-                .is_some_and(|p| p.kind == aterm_phase::PromptKind::UsageLimit);
-        let stopped =
-            aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w));
-        if !limit_dialog && !stopped && !self.limit_ladder_kept() && !self.limit_retry_is_away() {
-            self.limit_retry = None;
-        }
-        self.limit_retry_back();
     }
 
     /// Infer turn work from a Claude Code done row when no intermediate busy read was seen
@@ -1969,7 +1935,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => {
                 return None;
             }
@@ -2036,7 +2001,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         let by_done = if claude && done_row_work(rows).is_some_and(|w| w <= TRY_ANSWER_SLACK) {
@@ -2297,10 +2261,6 @@ impl<C: Ctl> Session<'_, C> {
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
         self.fold_point(&mut r, now, turn.screen.seq, opts);
-        self.limit_episode_folded(&turn);
-        if self.limit_badge_off_ended() {
-            self.close_box(turn.screen.seq, review)?;
-        }
         self.task_seed(opts)?;
         self.probe_shut(&turn, ProbeGate::NotNew, None, review)?;
         let action = self.decide_to_act(r, opts, now, &turn.screen)?;
@@ -2618,7 +2578,9 @@ impl<C: Ctl> Session<'_, C> {
                     .unwrap_or_default(),
                 *rule_id,
             ),
-            TurnEndAction::Confirm { rule_id, .. } => (String::new(), *rule_id),
+            TurnEndAction::Confirm { rule_id, .. } | TurnEndAction::Cancel { rule_id } => {
+                (String::new(), *rule_id)
+            }
         };
         if !self.speaks_to_its_agent(seq, rule, review) {
             return Ok(());
@@ -2630,7 +2592,18 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         if let TurnEndAction::Confirm { rule_id, row } = &action {
-            return self.confirm_dialog(point, &action, rule_id, row, opts, review);
+            return self.confirm_dialog(point, &action, rule_id, (row, "enter"), opts, review);
+        }
+        if let TurnEndAction::Cancel { rule_id } = &action {
+            let Some(row) = super::super::policy::login::cancel_row(&point.screen.rows).cloned()
+            else {
+                review.note(&format!(
+                    "SKIPPED seq={seq} rule={rule_id} esc: the judged read draws no dialog row \
+                     to cancel at"
+                ));
+                return Ok(());
+            };
+            return self.confirm_dialog(point, &action, rule_id, (&row, "esc"), opts, review);
         }
         if matches!(action, TurnEndAction::Submit { .. }) && self.probe_left_stands(&point.screen) {
             return self.probe_left_enter(point, review);
@@ -2672,9 +2645,6 @@ impl<C: Ctl> Session<'_, C> {
                 self.fact_rode(fact, Some(why), seq, review);
             }
             return Ok(());
-        }
-        if rule == RULE_LIMIT_RESUME {
-            self.limit_resume_typed(&point.screen.rows);
         }
         let r = self.turn_end_reread(&point.screen, opts);
         let land = self.turn_end.land_episode().0;
@@ -3991,7 +3961,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => {
                 return Ok(Some(ProbeGate::NotClaude));
             }
@@ -4446,47 +4415,49 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Press a fenced Enter to dismiss a confirmation dialog ([`TurnEndAction::Confirm`]).
+    /// Press a fenced `key` at `row` of a dialog: Enter to dismiss a confirmation
+    /// ([`TurnEndAction::Confirm`]), Esc to back out of one the loop opened
+    /// ([`TurnEndAction::Cancel`]), fenced on the judged read and on no person's keys since it.
     fn confirm_dialog(
         &mut self,
         point: &Turn,
         action: &TurnEndAction,
         rule: &'static str,
-        row: &str,
+        (row, key): (&str, &'static str),
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let seq = point.screen.seq;
         let skipped = |why: &str, review: &mut dyn Review| {
-            review.note(&format!("SKIPPED seq={seq} rule={rule} enter: {why}"));
+            review.note(&format!("SKIPPED seq={seq} rule={rule} {key}: {why}"));
         };
         let Some(generation) = point.screen.generation.clone() else {
-            skipped("the judged read carries no fence for its Enter", review);
+            skipped("the judged read carries no fence for its key", review);
             return Ok(());
         };
         let Some(human_seq) = point.screen.human_seq else {
             skipped(
-                "the judged read carries no person count for its Enter",
+                "the judged read carries no person count for its key",
                 review,
             );
             return Ok(());
         };
         let guard = super::super::policy::row_guard(row);
         let person = format!("if-human={human_seq}");
-        let (r, args) = self.fenced_key(&guard, "enter", &generation, Some(&person))?;
+        let (r, args) = self.fenced_key(&guard, key, &generation, Some(&person))?;
         match self.refused_press(&r, &args)? {
             None if !r.skipped() => {
                 let reread = self.turn_end_reread(&point.screen, opts);
                 self.turn_end.acted(action, &reread, self.fx.mono());
                 review.say(&format!(
-                    "TYPED seq={seq} rule={rule} enter at {}",
+                    "TYPED seq={seq} rule={rule} {key} at {}",
                     clip(row)
                 ))?;
-                self.ledger_row(rule, approvals::Outcome::Typed, "enter", row.trim(), seq);
+                self.ledger_row(rule, approvals::Outcome::Typed, key, row.trim(), seq);
             }
             None if r.skipped_person() || r.skipped_changed() => {
-                skipped("a person keyed or the screen moved before Enter", review);
-                self.redecide_soon("the dialog's Enter was not pressed");
+                skipped("a person keyed or the screen moved before the key", review);
+                self.redecide_soon("the dialog's key was not pressed");
             }
             None => skipped("its row matched no row of the judged screen", review),
             Some(Pressing::Lost { why, .. }) => return Err(Fail::Lost(why)),
@@ -4730,6 +4701,7 @@ pub(super) fn turn_end_outcome(action: &TurnEndAction, at: &dyn Fn(Instant) -> S
         | TurnEndAction::TypeCommand { .. }
         | TurnEndAction::Submit { .. }
         | TurnEndAction::Confirm { .. }
+        | TurnEndAction::Cancel { .. }
         | TurnEndAction::Escalate { .. } => format!("{action:?}"),
     }
 }

@@ -75,29 +75,3 @@ pub(crate) fn build_version(path: &str) -> Option<String> {
         .1;
     version_in(version.trim().trim_matches('"'))
 }
-
-/// Loads Gemini CLI's npm `.js` bundle and version from `bin`.
-pub(crate) fn gemini_bundle(bin: &std::path::Path) -> Option<(String, Vec<u8>, Option<String>)> {
-    let script = std::fs::canonicalize(bin).ok()?;
-    let dir = script.parent()?;
-    let package = std::fs::read_to_string(dir.parent()?.join("package.json")).ok()?;
-    if !package.contains("\"@google/gemini-cli\"") {
-        return None;
-    }
-    let version = package
-        .split_once("\"version\"")
-        .and_then(|(_, rest)| rest.split('"').nth(1))
-        .map(str::to_string);
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "js"))
-        .collect();
-    files.sort();
-    let mut bytes = Vec::new();
-    for file in files {
-        bytes.extend(std::fs::read(file).ok()?);
-        bytes.push(0);
-    }
-    Some((dir.display().to_string(), bytes, version))
-}

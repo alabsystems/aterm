@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::Rig;
 use super::instance::{
-    Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, uint_field,
+    Budget, CouldNotRun, Instance, Scratch, World, could_not_run, field, uint_field, unanswered,
 };
 use super::starvation::ShapeVerdict;
 
@@ -150,21 +150,21 @@ pub fn chain_text(bytes: usize) -> String {
 
 /// Measure one row: record `row.chain_bytes` of output in one chain, open the view on it, then step or idle.
 /// # Errors
-/// [`CouldNotRun`] when the instance did not start, a request failed, the output was not one chain, or a step's fold was never shown.
+/// [`CouldNotRun`] when the instance did not start, a request failed, the output was not one chain, or a step's fold was never shown; [`CouldNotRun::Unanswered`] when the subject lacks a verb or a field the row reads.
 pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let budget = Budget::from_now(BUDGET_SECS);
     let mut scratch = Scratch::new("atrewind")
-        .map_err(|e| CouldNotRun(format!("cannot make a scratch world: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
     if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
         scratch.keep();
     }
     let world = World::prepare(scratch.path(), "temporal_recording = true")
-        .map_err(|e| CouldNotRun(format!("cannot lay out the scratch world: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
     std::fs::write(world.home.join("chain.txt"), chain_text(row.chain_bytes))
-        .map_err(|e| CouldNotRun(format!("cannot write the chain file: {e}")))?;
+        .map_err(|e| CouldNotRun::Refused(format!("cannot write the chain file: {e}")))?;
     let inst = Instance::launch(&rig.aterm, &world, budget)?;
     let ctl = &inst.ctl;
     ctl.ok(&["await", "idle", "500", "timeout=60000"])?;
@@ -172,8 +172,9 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
     ctl.ok(&["key", "enter"])?;
     ctl.ok(&["await", "idle", "1000", "timeout=120000"])?;
     let status = ctl.ok(&["temporal", "status"])?;
-    let keyframes = uint_field(&status, "keyframes")
-        .ok_or_else(|| CouldNotRun(format!("temporal status named no keyframes= ({status})")))?;
+    let keyframes = uint_field(&status, "keyframes").ok_or_else(|| {
+        CouldNotRun::Unanswered(format!("temporal status named no keyframes= ({status})"))
+    })?;
     let open = ctl.ok(&["rewind", "open"])?;
     if field(&open, "view") != Some("open") {
         return could_not_run(format!("the Rewind view did not open ({open})"));
@@ -181,7 +182,9 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
     let states = field(&open, "state")
         .and_then(|s| s.split_once('/'))
         .and_then(|(_, n)| n.parse::<u64>().ok())
-        .ok_or_else(|| CouldNotRun(format!("rewind open named no state=<n>/<N> ({open})")))?;
+        .ok_or_else(|| {
+            CouldNotRun::Unanswered(format!("rewind open named no state=<n>/<N> ({open})"))
+        })?;
     std::thread::sleep(SETTLE);
     ctl.ok(&["metrics", "reset"])?;
     let mut report = RewindReport {
@@ -199,6 +202,12 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
     };
     match row.scene {
         RewindScene::Steps { steps, .. } => {
+            // A subject that books no step-to-shown sample (0.138.0 predates it) has no answer to
+            // this row: the wait below would only run out its minute.
+            let booked = ctl.ok(&["metrics", "percentiles"])?;
+            if uint_field(&booked, "n_rewind_shown").is_none() {
+                return unanswered("ctl metrics percentiles does not report n_rewind_shown");
+            }
             let half = u64::from(steps / 2).max(1);
             let stride = (states.saturating_sub(1) / half).max(1);
             for i in 0..steps {
@@ -218,7 +227,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
             let metrics = ctl.ok(&["metrics", "percentiles"])?;
             report.booked = uint_field(&metrics, "n_rewind_shown").unwrap_or(0);
             report.p99_us = ms_field_us(&metrics, "rewind_shown_p99_ms").ok_or_else(|| {
-                CouldNotRun(format!(
+                CouldNotRun::Unanswered(format!(
                     "ctl metrics percentiles named no rewind_shown_p99_ms= ({metrics})"
                 ))
             })?;
@@ -227,8 +236,9 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
             std::thread::sleep(window);
             let metrics = ctl.ok(&["metrics"])?;
             report.done_wakes = variant_wakes(&metrics, "RewindDone");
-            report.frames = uint_field(&metrics, "frames")
-                .ok_or_else(|| CouldNotRun(format!("ctl metrics named no frames= ({metrics})")))?;
+            report.frames = uint_field(&metrics, "frames").ok_or_else(|| {
+                CouldNotRun::Unanswered(format!("ctl metrics named no frames= ({metrics})"))
+            })?;
             report.timer_wakes = uint_field(&metrics, "timer_wakes").unwrap_or(0);
             report.wakes = field(&metrics, "wakes_by_variant")
                 .unwrap_or("none")

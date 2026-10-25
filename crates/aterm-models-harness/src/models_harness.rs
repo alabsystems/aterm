@@ -805,7 +805,7 @@ pub fn harness_upgrade_work_end_model() -> Model {
 
 /// The login wall (`aterm_agent::harness::upgrade`: `gate_announce`, `next_step`, `announce_asks`, `transcript_login`, `clock_held` and the driver's `login_facts`; `aterm_agent::supervise::policy::turn_end`: `decide_turn_end`'s auth arm, its login hold and `login_wall_waits`; both over `aterm_phase`'s wall reader).
 ///
-/// A roster row's lost login (`rostered`) is signed in by aterm itself (`Renew`, the sign-in ladder; the owner, 2026-10-24: sign-in is autonomous, and no person is asked): the tab types no `/login`, whose browser sign-in only a person could finish (`NoRosterRowSignedInByAPerson`), and is relaunched onto the login the renewal made. `RenewAtLogin` is the roster learning, and the ladder renewing, the row of a login whose `/login` aterm typed before the row was known (the dialog it opened still up), which the relaunch then follows; its guard leaves out the states a mutant already broke a law in (`relooped`, `overrode`), which keeps Buggy=4's space inside the interpreter's budget.
+/// A roster row's lost login (`rostered`) is signed in by aterm itself (`Renew`, the sign-in ladder; the owner, 2026-10-24: sign-in is autonomous, and no person is asked): the tab types no `/login`, whose browser sign-in only a person could finish, and is relaunched onto the login the renewal made. `RenewAtLogin` is the roster learning, and the ladder renewing, the row of a login whose `/login` aterm typed before the row was known (the dialog it opened still up), which the relaunch then follows; its guard leaves out the states a mutant already broke a law in (`relooped`, `overrode`), which keeps Buggy=4's space inside the interpreter's budget. `EnrolAtLogin` is the roster learning that row alone, the ladder's renewal still to come. Over such a row the dialog of that `/login` asks no person either, and its picker is not answered: aterm backs out of it (`BackOut`, the dialog's own Esc, pressed again while the dialog stays drawn, the roster's row named before the dialog was decided or after) and the tab waits on the row's sign-in, so `NoRosterRowSignedInByAPerson` forbids both a `/login` typed over a roster row and a person told to sign one in at aterm's `/login` (`TellNow` at `track` 1; the `SignInAsRow` knob tells them); a person's own `/login` left over the row (`track` 0) is theirs, told as before. The dialog of aterm's `/login` over a login back in another tab (`elsewhere` 2) is backed out of by aterm the same way, and the tab continues its turn: `NoPersonClosesAtermsDialog` forbids telling a person to close that dialog (`TellClose`, which Buggy=8 and the `AskToClose` knob enable; a person may still close it, `Dismiss`). The model's dialog is aterm's picker, browser hand-off or message: it draws no Console menu, which only a person's pick at aterm's picker opens and where that person is still told the sign-in can be closed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_login_wall_model() -> Model {
@@ -832,6 +832,8 @@ pub fn harness_login_wall_model() -> Model {
             const PickAfterBack = 0;
             const NoFollowAfterLogin = 0;
             const SignInOverRenewed = 0;
+            const SignInAsRow = 0;
+            const AskToClose = 0;
             const MaxAsks = 2;
             var login = 1;
             var wall = 0;
@@ -870,6 +872,7 @@ pub fn harness_login_wall_model() -> Model {
             var misled = 0;
             var reasked = 0;
             var asked = 0;
+            var closer = 0;
 
             action Expire when (login == 1 && picker <= 1 && elsewhere == 0) {
                 login = 0;
@@ -963,6 +966,13 @@ pub fn harness_login_wall_model() -> Model {
                 known = 1;
                 renewed = 1;
             }
+            action EnrolAtLogin when (
+                rostered == 0 && track == 1 && wall == 1 && back == 0 && elsewhere == 0 &&
+                left == 0 && done == 0 && relooped == 0 && overrode == 0
+            ) {
+                rostered = 1;
+                known = 1;
+            }
             action Profiled when (known == 0) {
                 known = 1;
             }
@@ -997,21 +1007,29 @@ pub fn harness_login_wall_model() -> Model {
                 back == 0 && (track == 1 || (left == 1 && renewed == 0)) &&
                 (elsewhere <= 1 || Buggy == 6 || NoCarrierBack == 1 ||
                     (wall == 1 && track == 1 && SignInOverBack == 1)) &&
-                (track == 0 || renewed == 0 ||
+                (track == 0 || (renewed == 0 && (rostered == 0 || SignInAsRow == 1)) ||
                     (wall == 1 && (SignInOverRenewed == 1 || Buggy == 7)) ||
                     (wall == 0 && NoFollowAfterLogin == 1))
             ) {
                 misled = if (elsewhere == 2) { 1 } else { misled };
                 reasked = if (track == 1 && wall == 1 && renewed == 1) { 1 } else { reasked };
                 stranded = if (track == 1 && wall == 0 && renewed == 1) { 1 } else { stranded };
+                asked = if (track == 1 && rostered == 1) { 1 } else { asked };
                 told = 1;
             }
             action TellClose when (
-                back == 0 && track == 1 && wall == 1 &&
-                ((elsewhere == 2 && SignInOverBack == 0) ||
-                    (renewed == 1 && SignInOverRenewed == 0))
+                back == 0 && track == 1 && wall == 1 && elsewhere == 2 &&
+                (AskToClose == 1 || Buggy == 8)
             ) {
+                closer = 1;
                 told = 1;
+            }
+            action BackOut when (
+                track == 1 && wall == 1 && back == 0 && left == 0 &&
+                (rostered == 1 || elsewhere == 2)
+            ) {
+                wall = 0;
+                picker = 0;
             }
             action Rest when (
                 wall == 1 && track == 0 && told == 0 && renewed == 0 && done == 1 &&
@@ -1020,7 +1038,8 @@ pub fn harness_login_wall_model() -> Model {
                 silent = 1;
             }
             action PickMethod when (
-                (picker == 1 && ((elsewhere <= 1 && renewed == 0) || PickAfterBack == 1) &&
+                (picker == 1 &&
+                    ((elsewhere <= 1 && renewed == 0 && rostered == 0) || PickAfterBack == 1) &&
                     (known == 1 || Buggy == 5 || GuessMethod == 1)) ||
                 (picker == 2 && (Buggy == 5 || PickAnyPicker == 1))
             ) {
@@ -1168,11 +1187,12 @@ pub fn harness_login_wall_model() -> Model {
             invariant NoSignInAskedOfALoginBack: misled == 0;
             invariant NoSignInAskedOverARenewal: reasked == 0;
             invariant NoRosterRowSignedInByAPerson: asked == 0;
+            invariant NoPersonClosesAtermsDialog: closer == 0;
         }
     }
 }
 
-/// The usage tap (aterm-agent's `harness::tap`; the accounts design v2 §3.1, §3.2): one tab's Claude Code across aterm's relaunches, the status-line tap aterm may put on the line, the readings it writes, and the host's read of them at its decided turn ends. The owner's own statusLine (`userline`) no longer keeps the tap off (owner ruling R-12): the line carries it (`tap --then`), so the owner's row still shows; `NoChainLook` is a gate that taps without looking at the settings chain, putting the plain tap over that row (`displaced`).
+/// The usage tap (aterm-agent's `harness::tap`; the accounts design v2 §3.1, §3.2): one tab's Claude Code across aterm's relaunches, the status-line tap aterm may put on the line, the readings it writes, and the host's read of them at its decided turn ends. The owner's own statusLine (`userline`) no longer keeps the tap off (owner ruling R-12): the line carries it (`tap --carry`), so the owner's row still shows; `NoChainLook` is a gate that taps without looking at the settings chain, putting the plain tap over that row (`displaced`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_usage_tap_model() -> Model {

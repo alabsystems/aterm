@@ -374,7 +374,6 @@ pub(crate) fn agent_switch_label(product: &str) -> String {
             Program::Claude
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Grok
             | Program::Kimi
             | Program::Generic,
@@ -386,8 +385,6 @@ pub(crate) fn agent_switch_label(product: &str) -> String {
 pub(crate) const EDIT_HARNESS_AGY_ENABLED: &str = "harness.agy.enabled";
 /// `[harness.muse] enabled` — [`EDIT_HARNESS_CLAUDE_ENABLED`] for Muse Code.
 pub(crate) const EDIT_HARNESS_MUSE_ENABLED: &str = "harness.muse.enabled";
-/// `[harness.gemini] enabled` — [`EDIT_HARNESS_CLAUDE_ENABLED`] for Gemini CLI.
-pub(crate) const EDIT_HARNESS_GEMINI_ENABLED: &str = "harness.gemini.enabled";
 
 /// The agent a `harness.<agent>.enabled` row switches, read from its key.
 pub(crate) fn agent_switch(key: &str) -> Option<Program> {
@@ -617,11 +614,6 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     NestedLeaf {
         key: EDIT_HARNESS_MUSE_ENABLED,
         label: "Supervise Muse Code sessions",
-        kind: EditKind::Bool,
-    },
-    NestedLeaf {
-        key: EDIT_HARNESS_GEMINI_ENABLED,
-        label: "Supervise Gemini CLI sessions",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -1976,13 +1968,23 @@ pub(crate) fn typed_toml_item(
     typed_item(key, raw)
 }
 
-/// The value that means unset.
+/// The value that means unset. A number's is the one its placeholder marks
+/// "(default)", or "(automatic)" where the platform chooses it: an explicit
+/// font size equal to the automatic one resolves, scales and draws exactly as
+/// no `font_px` does.
 pub(crate) fn unset_literal(field: &EditField) -> Option<String> {
     if field.key == "ai" || field.key.starts_with("ai.") {
         return None;
     }
     let placeholder = field.placeholder.trim();
-    let marked = placeholder.strip_suffix(" (default)").map(str::trim);
+    let marked = placeholder
+        .strip_suffix(" (default)")
+        .or_else(|| {
+            matches!(field.kind, EditKind::Float | EditKind::Integer)
+                .then(|| placeholder.strip_suffix(" (automatic)"))
+                .flatten()
+        })
+        .map(str::trim);
     match field.kind {
         EditKind::Bool => field.seed.clone(),
         EditKind::Enum { options } => {

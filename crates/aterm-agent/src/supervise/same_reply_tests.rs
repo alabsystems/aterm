@@ -666,15 +666,12 @@ fn worded(answers: usize) -> Vec<String> {
 #[test]
 fn a_wall_no_reader_names_answered_after_a_long_spell_that_ran_no_tool_is_held_all_the_same() {
     let held = Some(format!("stalled {}", Exception::repeats().why));
-    let walls: [(&'static str, WallRows); 4] = [
+    let walls: [(&'static str, WallRows); 3] = [
         ("muse", |k| unnamed(&vec![None; k])),
         ("claude", |k| {
             vendor_walled("claude", &vec![None; k], claude_wall)
         }),
         ("agy", |k| vendor_walled("agy", &vec![None; k], agy_wall)),
-        ("node", |k| {
-            vendor_walled("node", &vec![None; k], gemini_wall)
-        }),
     ];
     // Claude Code's measured no-work error turn (`Brewed for 2m 52s`), and Muse Code's 8 min of provider attempts.
     for (program, rows) in walls {
@@ -725,45 +722,31 @@ fn vendor_walled(
     asks: &[Option<&str>],
     wall: impl Fn(usize) -> Vec<String>,
 ) -> Vec<String> {
-    use aterm_phase::{agy::fixtures as agy, gemini::fixtures as gemini};
+    use aterm_phase::agy::fixtures as agy;
     let (base, opens) = match program {
         "claude" => (
             screen(aterm_phase::prompt::fixtures::API_ERROR_TWICE_MEASURED),
             "❯ ",
         ),
         "agy" => (screen(agy::ERROR_TURN), "> "),
-        _ => (screen(gemini::END_OF_TURN), " > "),
+        other => panic!("no measured turn of {other}'s"),
     };
     let first = base
         .iter()
         .position(|r| r.starts_with(opens))
         .expect("the first message");
-    let composer = match program {
-        // Gemini CLI's message band opens a row above its text; its composer's status rows sit over its band.
-        "node" => base
-            .iter()
-            .position(|r| r.trim_end().ends_with("? for shortcuts"))
-            .expect("the status row"),
-        _ => (first..base.len())
-            .find(|&i| base[i].starts_with("────"))
-            .expect("the composer"),
-    };
+    let composer = (first..base.len())
+        .find(|&i| base[i].starts_with("────"))
+        .expect("the composer");
     let message = |text: &str| match program {
-        "node" => vec![
-            base[first - 1].clone(),
-            format!(" > {text}"),
-            base[first + 1].clone(),
-        ],
         "claude" => vec![format!("❯ {text}"), String::new()],
         _ => vec![format!("> {text}"), String::new()],
     };
-    let head = if program == "node" { first - 1 } else { first };
-    let mut out = base[..head].to_vec();
+    let mut out = base[..first].to_vec();
     out.extend(message("Run the division suite again on the lane fix."));
     out.push(match program {
         "claude" => "⏺ Suites are running; I'll report the number when it lands.".to_owned(),
-        "agy" => "Suites are running; I'll report the number when it lands.".to_owned(),
-        _ => "✦ Suites are running; I'll report the number when it lands.".to_owned(),
+        _ => "Suites are running; I'll report the number when it lands.".to_owned(),
     });
     out.push(String::new());
     for (k, ask) in asks.iter().enumerate() {
@@ -801,35 +784,19 @@ fn agy_wall(k: usize) -> Vec<String> {
     ]
 }
 
-/// Gemini CLI's `✕` row in words no reader names, with its measured failure notice under it.
-fn gemini_wall(_: usize) -> Vec<String> {
-    vec![
-        "✕ Allowance spent for now. Back on Oct 25 at 5:00 PM.".to_owned(),
-        String::new(),
-        String::new(),
-        "ℹ This request failed. Press F12 for diagnostics, or run /settings and change \"Error \
-         Verbosity\" to full for full details."
-            .to_owned(),
-    ]
-}
-
 fn reader_of(program: &str) -> &'static dyn aterm_phase::ScreenReader {
     match program {
         "claude" => aterm_phase::Program::Claude.reader(),
         "agy" => aterm_phase::Program::Agy.reader(),
         "muse" => aterm_phase::Program::Muse.reader(),
-        _ => aterm_phase::Program::Gemini.reader(),
+        other => panic!("no reader named {other}"),
     }
 }
 
 #[test]
 fn a_vendor_row_no_reader_names_is_typed_into_at_most_once_more_then_held() {
     let held = Some(format!("stalled {}", Exception::repeats().why));
-    let walls: [(&'static str, WallRows); 3] = [
-        ("claude", claude_wall),
-        ("agy", agy_wall),
-        ("node", gemini_wall),
-    ];
+    let walls: [(&'static str, WallRows); 2] = [("claude", claude_wall), ("agy", agy_wall)];
     for (program, wall) in walls {
         let rows = |asks: &[Option<&str>]| vendor_walled(program, asks, wall);
         let reader = reader_of(program);
@@ -3117,7 +3084,7 @@ fn held_wall<'a>(
         "claude-said" => ("claude", claude_said),
         "agy" => ("agy", agy_wall),
         "muse" => ("muse", claude_wall),
-        _ => ("node", gemini_wall),
+        other => panic!("no held wall for {other}"),
     };
     let mut d = Driver::new(m, program, ledger, autopilot, (CAPTURED, 0), false);
     if program == "muse" {
@@ -3224,7 +3191,7 @@ fn person_at(
 
 #[test]
 fn a_person_at_a_held_wall_lifts_its_hold_only_by_a_turn_a_point_saw_busy() {
-    for program in ["muse", "claude", "claude-said", "agy", "node"] {
+    for program in ["muse", "claude", "claude-said", "agy"] {
         for (autopilot, took_hi, takeover, keys) in [Autopilot::Cruise, Autopilot::Land]
             .into_iter()
             .flat_map(|a| [Some(2), None].map(|t| (a, t)))
@@ -3471,7 +3438,7 @@ fn keys_over_a_claude_hold_scrolled_past_its_prompt_lift_nothing_whatever_histor
 
 #[test]
 fn keys_over_a_taller_pane_lift_nothing_at_a_takeover() {
-    for program in ["muse", "claude", "agy", "node"] {
+    for program in ["muse", "claude", "agy"] {
         for (autopilot, entered) in [Autopilot::Cruise, Autopilot::Land]
             .into_iter()
             .flat_map(|a| [false, true].map(|e| (a, e)))
@@ -3620,7 +3587,7 @@ fn a_persons_message_said_again_no_point_saw_busy_is_judged_as_one_in_new_words(
 #[test]
 fn a_lead_agents_prompt_lets_one_act_go_only_above_claude_codes_reply_with_no_person_at_the_keys() {
     const LEAD: &str = "Rerun the division suite on the lane fix and report the number.";
-    for (program, autopilot, person, took) in ["claude-said", "agy", "node"]
+    for (program, autopilot, person, took) in ["claude-said", "agy"]
         .into_iter()
         .flat_map(|p| [Autopilot::Cruise, Autopilot::Land].map(|a| (p, a)))
         .flat_map(|(p, a)| [false, true].map(|k| (p, a, k)))
@@ -3633,7 +3600,7 @@ fn a_lead_agents_prompt_lets_one_act_go_only_above_claude_codes_reply_with_no_pe
         let (drawn, wall): (&str, WallRows) = match program {
             "claude-said" => ("claude", claude_said),
             "agy" => ("agy", agy_wall),
-            _ => ("node", gemini_wall),
+            other => panic!("no held wall for {other}"),
         };
         let rows = |asks: &[Option<&str>]| vendor_walled(drawn, asks, wall);
         let (sent_rows, resumed) = (

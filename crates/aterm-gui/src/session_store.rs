@@ -2804,7 +2804,7 @@ title = \"zsh\"
             .timeline
             .lock()
             .unwrap()
-            .set_task_worker(aterm_phase::Program::Gemini, Some(folder.to_string()));
+            .set_task_worker(aterm_phase::Program::Agy, Some(folder.to_string()));
         let mut done = TaskMark::new(TaskState::Done);
         done.why = Some("marker");
         done.result_bytes = 5;
@@ -2816,12 +2816,12 @@ title = \"zsh\"
         assert!(row.starts_with("rev=2 state=done from=ctl since="), "{row}");
         assert!(
             row.ends_with(&format!(
-                " agent=gemini trusted_cwd={}",
+                " agent=agy trusted_cwd={}",
                 crate::control::pct_encode(folder)
             )),
             "a mark keeps the agent and the trusted folder: {row}"
         );
-        assert_eq!(record.agent, Some(aterm_phase::Program::Gemini));
+        assert_eq!(record.agent, Some(aterm_phase::Program::Agy));
         assert_eq!(record.trusted_cwd.as_deref(), Some(folder));
         let wire = manifest.to_toml().expect("serializes");
         assert_eq!(
@@ -2875,7 +2875,7 @@ title = \"zsh\"
             let seeded = other.ctx.timeline.lock().unwrap().task().cloned();
             let seeded = seeded.unwrap_or_else(|| panic!("{bad}: the record crosses"));
             assert_eq!(seeded.trusted_cwd, None, "{bad}");
-            assert_eq!(seeded.agent, Some(aterm_phase::Program::Gemini), "{bad}");
+            assert_eq!(seeded.agent, Some(aterm_phase::Program::Agy), "{bad}");
         }
         let other = handle(11, None);
         seed_carried(

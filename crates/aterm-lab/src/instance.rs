@@ -277,11 +277,15 @@ fn line(l: &Launch, via: Via, keeper: &Path, sock: &Path) -> Vec<String> {
 /// A windowed `l`'s quiet claim, taken before it starts: a window's frames and input are timed, so
 /// it starts alone among quiet claims on a quiet machine ([`crate::admission`]). A headless
 /// instance takes none.
-fn windowed_quiet(l: &Launch) -> Option<aterm_capacity::Claim> {
+/// # Errors
+/// An interrupt ended the wait: why, and the run's interrupt path has it, so the run ends NOT
+/// RUN ([`crate::stop::note`]).
+fn windowed_quiet(l: &Launch) -> Result<Option<aterm_capacity::Claim>, String> {
     if l.headless {
-        return None;
+        return Ok(None);
     }
     crate::admission::quiet(&format!("a window of {}", l.aterm.display()))
+        .map_err(|f| f.msg.unwrap_or_default())
 }
 
 /// A running private instance.
@@ -387,7 +391,7 @@ impl Instance {
     /// # Errors
     /// The log, the lifeline or the process could not be made.
     pub fn start(world: &World, l: Launch) -> Result<Instance, String> {
-        let quiet = windowed_quiet(&l);
+        let quiet = windowed_quiet(&l)?;
         let log = world.dir.join("aterm.log");
         let out = std::fs::File::create(&log)
             .map_err(|e| format!("cannot create {}: {e}", log.display()))?;
@@ -433,7 +437,7 @@ impl Instance {
         if Via::of(&l, band)? == Via::Child {
             return Instance::start(world, l);
         }
-        let quiet = windowed_quiet(&l);
+        let quiet = windowed_quiet(&l)?;
         let log = world.dir.join("aterm.log");
         std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
         let line = line(&l, Via::Job, &paths().exe, &world.sock);

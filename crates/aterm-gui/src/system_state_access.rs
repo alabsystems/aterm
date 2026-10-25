@@ -110,6 +110,8 @@ pub(crate) struct StepsReach {
     pub(crate) record: fn(u64, Access, AccessOutcome) -> std::io::Result<()>,
     /// The latest outcome recorded for a row in a revision.
     pub(crate) recorded: fn(u64, Access) -> Option<AccessOutcome>,
+    /// Whether the record holds a row's `handed` in a revision: its macOS page came up then.
+    pub(crate) handed: fn(u64, Access) -> bool,
     /// Whether System State is the visible view of a focused window.
     pub(crate) frontmost: fn(&App) -> bool,
     /// The quiet-moment rules ([`App::devtools_moment_is_quiet`]).
@@ -137,6 +139,7 @@ impl StepsReach {
         open_pane: |_, _| false,
         record: |_, _, _| Ok(()),
         recorded: |_, _| None,
+        handed: |_, _| false,
         frontmost: |_| false,
         quiet: |_, _| false,
         dialog_up: || false,
@@ -150,6 +153,7 @@ impl StepsReach {
             open_pane: live_open_access_pane,
             record: live_record,
             recorded: live_recorded,
+            handed: live_handed,
             frontmost: App::system_state_frontmost,
             quiet: App::devtools_moment_is_quiet,
             dialog_up: aterm_types::macos_setup::macos_dialog_up,
@@ -346,8 +350,12 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
 /// back, alone, reads `System State: Restore failed for <row>`. The note is the Secrets row's
 /// while it needs you (a waiting vault approval code, or a move to Applications), else the
 /// GitHub repositories row's while it needs you (its token's remedy, in the page's words).
-/// `None` when nothing does.
+/// `None` when nothing does, and while a review closed unanswered waits for an answer: nobody
+/// approved its permission steps, so none of them needs anyone yet (§3.3).
 pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
+    if status.unanswered {
+        return None;
+    }
     let selection = status
         .plan
         .as_ref()
@@ -481,13 +489,47 @@ impl App {
         }
     }
 
+    /// Whether the access record holds the access revision's `handed` for `access`: the row's
+    /// macOS page came up in the revision, whichever door brought it. The record names no TCC
+    /// identity and no Mac.
+    pub(crate) fn handed_this_revision(&self, access: Access) -> bool {
+        self.access_revision()
+            .is_some_and(|revision| (self.access_steps.reach.handed)(revision, access))
+    }
+
+    /// Whether the window's own Developer Tools page came up in the access revision: its marker
+    /// names the revision's step, or the record holds its `handed`. `aterm doctor --fix` rewrites
+    /// the one-line marker under the running version, so the marker alone would bring the page
+    /// up a second time in the revision. That marker names no bundle or Mac, nor does the
+    /// record. (Full Disk Access's marker names both, so a page brought up while no revision
+    /// stands keeps the revision's step there instead: `devtools_helper::fda_opened_word`.)
+    pub(crate) fn devtools_shown_this_revision(&self) -> bool {
+        let key = self.access_marks().devtools;
+        (self.devtools_helper.reach().last_opened)().is_some_and(|(word, _)| word == key)
+            || self.handed_this_revision(Access::DeveloperTools)
+    }
+
+    /// Whether `fda-pane-opened` names the approved revision's step for this bundle and Mac
+    /// (`atpkg::devtools::same_step`): the window's own Full Disk Access page came up under it.
+    pub(crate) fn fda_shown_this_revision(&self) -> bool {
+        let key = self.access_marks().fda;
+        (self.devtools_helper.fda_reach().last_opened)()
+            .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &key))
+    }
+
     /// Whether one of the window's own access gestures is up: a hand-over panel,
-    /// a folder warm-up walking, the Local Network alert's hold, or a pane's.
+    /// a folder warm-up walking, an installer terminal, or an alert or pane's hold.
     fn access_gesture_up(&self, now: Instant) -> bool {
-        self.devtools_helper.panel().is_some()
+        self.developer_tools_install_active()
+            || self.devtools_helper.panel().is_some()
             || self.consent_warmup.is_live()
             || self.access_steps.local_network_alert_up(now)
             || self.access_steps.pane_up(now)
+    }
+
+    /// Whether another macOS gesture owns the dialog slot (inert in headless tests).
+    pub(crate) fn access_dialog_up(&self) -> bool {
+        (self.access_steps.reach.dialog_up)()
     }
 
     /// Reserve the worker's dialog slot before a pane, panel or folder worker
@@ -690,6 +732,7 @@ impl App {
         // never the other way around. Saving a completed step raises no prompt.
         self.retry_access_records(now);
         self.debugger_launch.retry_records(now);
+        self.release_kept_steps(now);
         self.rearm_access_steps(now);
         if !self.access_steps.retired {
             self.access_steps.retired = true;
@@ -751,7 +794,13 @@ impl App {
     pub(crate) fn refresh_system_state_menu_line(&mut self) {
         let regressed = self.access_steps.fda_regressed && !self.fda_declined_in_revision();
         let status = self.system_state_host.latest_status();
-        let line = menu_line(status, regressed);
+        // While the first launch's review is up its headline is the one signal, on a tab in
+        // front: no menu line, as no diamond (§3.3, §3.6).
+        let line = if self.system_state_review_pending() {
+            None
+        } else {
+            menu_line(status, regressed)
+        };
         let secrets_read = status.plan.as_ref().is_some_and(|plan| {
             plan.selection.contains(Setting::Secrets)
                 && status
@@ -1160,6 +1209,25 @@ impl App {
         let _ = self.consent.debugger(gate);
     }
 
+    /// A revision stands: the window's own steps kept waiting through a page brought up while
+    /// none stood (`devtools_helper::Lane::page_came_up`) look at once where this revision brought
+    /// their page up already, so a step that can only be refused as shown holds nothing behind it
+    /// for the rest of that page's ten minutes (`devtools_helper::Lane::revision_stands`).
+    fn release_kept_steps(&mut self, now: Instant) {
+        if self.access_revision().is_none() {
+            return;
+        }
+        let kept = self.devtools_helper.kept();
+        if kept == [false, false] {
+            return;
+        }
+        let shown = [
+            kept[0] && self.devtools_shown_this_revision(),
+            kept[1] && self.fda_shown_this_revision(),
+        ];
+        self.devtools_helper.revision_stands(now, shown);
+    }
+
     /// A new access revision approved while aterm runs (Permissions off and on, or Set up)
     /// brings back the window's own Full Disk Access and Developer Tools pages, as the next
     /// launch would ([`Self::rearm_fda_step`], [`Self::rearm_devtools_step`]), each queued for
@@ -1254,7 +1322,7 @@ impl App {
         let window = atpkg::devtools::REOPEN_AFTER_S;
         if let Some(ago) = (self.devtools_helper.fda_reach().opened_within)(window) {
             self.devtools_helper
-                .defer_fda(now + Duration::from_secs(window.saturating_sub(ago).max(1)));
+                .fda_wait_out_page(now + Duration::from_secs(window.saturating_sub(ago).max(1)));
         }
         // The folders wait behind it again, as at launch.
         self.consent_launch
@@ -1274,17 +1342,16 @@ impl App {
         if self.devtools_reading().grant != aterm_containment::DevToolGrant::NotGranted {
             return;
         }
-        let reach = self.devtools_helper.reach();
-        let key = self.access_marks().devtools;
-        if (reach.last_opened)().is_some_and(|(word, _)| word == key) {
+        if self.devtools_shown_this_revision() {
             return;
         }
+        let reach = self.devtools_helper.reach();
         self.devtools_helper
             .queue(devtools_helper::Origin::Automatic, now);
         let window = atpkg::devtools::REOPEN_AFTER_S;
         if let Some(ago) = (reach.opened_within)(window) {
             self.devtools_helper
-                .defer(now + Duration::from_secs(window.saturating_sub(ago).max(1)));
+                .wait_out_page(now + Duration::from_secs(window.saturating_sub(ago).max(1)));
         }
     }
 
@@ -1480,6 +1547,13 @@ fn live_record(revision: u64, access: Access, outcome: AccessOutcome) -> std::io
 fn live_recorded(revision: u64, access: Access) -> Option<AccessOutcome> {
     let state = aterm_types::dirs::state_dir()?;
     aterm_types::macos_setup::access_record::latest(&state, revision, access)
+}
+
+fn live_handed(revision: u64, access: Access) -> bool {
+    aterm_types::dirs::state_dir().is_some_and(|state| {
+        aterm_types::macos_setup::access_record::read(&state, revision)
+            .contains(&(access, AccessOutcome::Handed))
+    })
 }
 
 #[cfg(test)]

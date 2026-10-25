@@ -2050,13 +2050,6 @@ read	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	os2	-	weight=295 width=5 style=Normal
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	outline.0	-	n=1020 fnv=8ce0e2474b7231d9
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	outline.1024	-	n=303 fnv=80d5401eb3aa4eaa
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	vmtx	-	n=1328 fnv=06d108c116b8b645
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	bbox	-	n=1323 fnv=24b936626994b932
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	coords	-	0,0
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1077 cap=1443 ul=-200,100 st=600,100 sub=685,1045,204,192 sup=685,1045,104,590
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	outline.0	-	n=1020 fnv=8ce0e2474b7231d9
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	outline.1024	-	n=303 fnv=80d5401eb3aa4eaa
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	vmtx	-	n=1328 fnv=06d108c116b8b645
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	bbox	-	n=1323 fnv=7b27fbb9f707a076
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	coords	-	0,2850
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
@@ -2064,20 +2057,34 @@ read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	metrics	-	asc=
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	outline.0	-	n=1020 fnv=43584d1cc341add5
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	outline.1024	-	n=303 fnv=afe293286999a7d1
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	vmtx	-	n=1328 fnv=06d108c116b8b645
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	bbox	-	n=1323 fnv=2f3fafea2bd9ad97
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	coords	-	0,10970
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1101 cap=1443 ul=-200,100 st=600,100 sub=825,1079,161,234 sup=825,1079,105,598
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	outline.0	-	n=1020 fnv=a5d5d7003343b772
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	outline.1024	-	n=303 fnv=1a355c98cbca472e
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	vmtx	-	n=1328 fnv=06d108c116b8b645
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	bbox	-	n=1323 fnv=2258df71b23c7905
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	coords	-	0,16384
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1113 cap=1443 ul=-200,100 st=600,100 sub=895,1096,140,256 sup=895,1096,106,603
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	outline.0	-	n=1020 fnv=fad13a8f42058bbd
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	outline.1024	-	n=303 fnv=1e40540e9ac00ae3
-read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	vmtx	-	n=1328 fnv=06d108c116b8b645
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	bbox	-	n=1323 fnv=6a23aa5c41d84308
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	coords	-	802,0
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1077 cap=1443 ul=-200,100 st=600,100 sub=685,1045,204,192 sup=685,1045,104,590
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	outline.0	-	n=1020 fnv=feb7e220bf2bc81b
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	outline.1024	-	n=303 fnv=b20c049e9395b99a
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	vmtx	-	n=1328 fnv=06d108c116b8b645
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	bbox	-	n=1323 fnv=99d940f0f394858b
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	coords	-	802,2850
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1083 cap=1443 ul=-200,100 st=600,100 sub=721,1053,192,203 sup=721,1053,104,592
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	outline.0	-	n=1020 fnv=83b46c6c78d30968
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	outline.1024	-	n=303 fnv=0cfb187baeb2abe7
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	vmtx	-	n=1328 fnv=06d108c116b8b645
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	bbox	-	n=1323 fnv=4ae51c2d8ab5540e
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	coords	-	802,10970
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1101 cap=1443 ul=-200,100 st=600,100 sub=825,1079,161,234 sup=825,1079,105,598
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	outline.0	-	n=1020 fnv=7c7f44715a728d3a
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	outline.1024	-	n=303 fnv=00cc3bc0dfc4fe9e
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	vmtx	-	n=1328 fnv=06d108c116b8b645
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	bbox	-	n=1323 fnv=8d6aaab62911592b
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	coords	-	802,16384
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	metrics	-	asc=1980 desc=-432 gap=0 height=2412 typo=1980,-432,0 vert=-,-,-,- x=1113 cap=1443 ul=-200,100 st=600,100 sub=895,1096,140,256 sup=895,1096,106,603
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	outline.0	-	n=1020 fnv=af06064f618a18d5
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	outline.1024	-	n=303 fnv=c97cc960b189fc1b
+read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	vmtx	-	n=1328 fnv=06d108c116b8b645
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=900.0,wght=400.0	-	bbox	-	n=1323 fnv=72e066cd2400a950
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=900.0,wght=400.0	-	coords	-	16384,2850
 read	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=900.0,wght=400.0	-	hmtx	-	n=1328 fnv=7d7db58ded83a130
@@ -2405,16 +2412,18 @@ vary	SFNSMono	c11a9e80e64611c6#0	YAXS=324.3341,wght=900.0	-	raster13	-	glyphs=19
 vary	SFNSMono	c11a9e80e64611c6#0	YAXS=900.0,wght=400.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
 vary	SFNSMono	c11a9e80e64611c6#0	YAXS=900.0,wght=400.0	-	raster13	-	glyphs=190 fnv=a9d3a828497d2571
 vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	probe	-	axes=YAXS:294.6731,294.6731,900.0 wght:294.6731,294.6731,900.0 regular=None
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	probe	-	axes=YAXS:294.6731,294.6731,900.0 wght:294.6731,294.6731,900.0 regular=Some([324.3341, 400.0])
 vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	-	-	raster13	-	glyphs=190 fnv=f218a3cd00b34f1c
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=294.6731	-	raster13	-	glyphs=190 fnv=f218a3cd00b34f1c
 vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
 vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=400.0	-	raster13	-	glyphs=190 fnv=d498aa96f7004763
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=700.0	-	raster13	-	glyphs=190 fnv=924d5a5cba81fcc7
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
-vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=294.6731,wght=900.0	-	raster13	-	glyphs=190 fnv=b7ad74d574a933e3
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=294.6731	-	raster13	-	glyphs=190 fnv=37a5f567990ff2b7
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=400.0	-	raster13	-	glyphs=190 fnv=25eaea0e2d55456e
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=700.0	-	raster13	-	glyphs=190 fnv=f10fe24c2ee2ecc1
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
+vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=324.3341,wght=900.0	-	raster13	-	glyphs=190 fnv=9b3fae4da399aeb1
 vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=900.0,wght=400.0	-	metrics13	-	asc=12.568359 desc=-2.7421875 gap=0.0 m_adv=8.036133
 vary	SFNSMonoItalic	ee9c5d69d84d83d4#0	YAXS=900.0,wght=400.0	-	raster13	-	glyphs=190 fnv=09a85a5f846973f2
 vary	fixture-colr_1_variable	5da171d56d9d21bb#0	-	-	metrics13	-	-

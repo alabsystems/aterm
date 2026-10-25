@@ -2616,16 +2616,8 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             t.set("roots", Jv::u(ctx.roots.len() as u64));
             t.set(
                 "root_bytes",
-                ctx.disk.map_or_else(
-                    || Jv::why("not_sampled"),
-                    |d| {
-                        if d.walking {
-                            Jv::at_least(d.exclusive, "walking")
-                        } else {
-                            Jv::u(d.exclusive)
-                        }
-                    },
-                ),
+                ctx.disk
+                    .map_or_else(|| Jv::why("not_sampled"), |d| d.figure_json(d.exclusive)),
             );
             t.set("footprint_slope_bytes_per_min", Jv::why("not_sampled"));
             o.set("tab", t);

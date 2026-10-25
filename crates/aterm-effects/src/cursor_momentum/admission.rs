@@ -249,14 +249,19 @@ pub const fn admit_time(
 /// # Errors
 /// [`AdmitRefusal::Geometry`], [`AdmitRefusal::Tau`], [`AdmitRefusal::Radius`].
 #[inline]
-pub fn admit_tick(
+pub const fn admit_tick(
     p: &MomentumProfile,
     cur: Option<(u16, u16)>,
     geom: &Geom,
     cfg: &MomentumGlowConfig,
 ) -> Result<ScratchBudget, AdmitRefusal> {
-    let grid = admit_geometry(p, geom)?;
-    admit_tau(p, cfg.tau_s)?;
+    let grid = match admit_geometry(p, geom) {
+        Ok(g) => g,
+        Err(e) => return Err(e),
+    };
+    if let Err(e) = admit_tau(p, cfg.tau_s) {
+        return Err(e);
+    }
     let r = cfg.radius_cells;
     let radius_ok = r.is_finite()
         && r >= 0.0
@@ -269,22 +274,26 @@ pub fn admit_tick(
         return Err(AdmitRefusal::Intensity(cfg.intensity.to_bits()));
     }
     if let Some((first, end)) = cfg.glyph_span
-        && !(0 <= first && first <= end && i64::from(end) <= i64::from(grid.cols))
+        && !(0 <= first && first <= end && (end as i64) <= (grid.cols as i64))
     {
         return Err(AdmitRefusal::GlyphSpan(first, end));
     }
     let Some((cr, cc)) = cur else {
-        return Ok(ScratchBudget::default());
+        return Ok(ScratchBudget { out: 0, under: 0 });
     };
     if !cfg.enabled || cfg.intensity <= 0.0 || cr >= grid.rows || cc >= grid.cols {
-        return Ok(ScratchBudget::default());
+        return Ok(ScratchBudget { out: 0, under: 0 });
     }
     let unbounded = AdmitRefusal::Geometry(GeometryFault::Unbounded);
     if cfg.dark_theme {
-        let out = dark_halo_budget((cr, cc), geom, &grid, r).ok_or(unbounded)?;
+        let Some(out) = dark_halo_budget((cr, cc), geom, &grid, r) else {
+            return Err(unbounded);
+        };
         Ok(ScratchBudget { out, under: 0 })
     } else {
-        let under = light_halo_budget((cr, cc), geom, &grid, r).ok_or(unbounded)?;
+        let Some(under) = light_halo_budget((cr, cc), geom, &grid, r) else {
+            return Err(unbounded);
+        };
         Ok(ScratchBudget { out: 0, under })
     }
 }
@@ -373,7 +382,12 @@ const DARK_CALLS_PER_ROW: usize = 2 * HALO_SEGMENTS;
 /// `emit_halo`'s worst case over every amplitude: the
 /// engine's row grid at `s = 1`, eight calls per working row, one quad per
 /// `ch`-band each call's clipped row meets.
-fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
+const fn dark_halo_budget(
+    (cr, cc): (u16, u16),
+    geom: &Geom,
+    g: &Grid,
+    radius: f32,
+) -> Option<usize> {
     let (cw, ch) = (geom.cw as f32, geom.ch as f32);
     let (_, cy) = geom.cell_center(cr, cc);
     let rx = cw * (0.55 + radius * WIDEST);
@@ -382,37 +396,89 @@ fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) ->
         // Narrower at every amplitude: `emit_halo` returns before any push.
         return Some(0);
     }
-    let row_h = i64::from(((ch / HALO_ROW_DIV) as i32).max(2));
+    let raw_row_h = (ch / HALO_ROW_DIV) as i32;
+    let row_h = (if raw_row_h > 2 { raw_row_h } else { 2 }) as i64;
     let half_row_h = row_h as f32 * 0.5;
-    let band = i64::from(g.ch);
-    let oy = i64::from(g.origin_y);
-    let cell_y0 = oy.checked_add(i64::from(cr).checked_mul(band)?)?;
-    let top = i64::from((cy - ry).floor() as i32);
-    let bot = i64::from((cy + ry).ceil() as i32);
-    let fx_top = oy.checked_sub(i64::from(g.head))?;
-    let fx_bot = oy.checked_add(i64::from(g.rows).checked_mul(band)?)?;
-    let back = cell_y0
-        .checked_sub(top)?
-        .checked_add(row_h)?
-        .checked_sub(1)?
-        .div_euclid(row_h);
-    let mut y = cell_y0.checked_sub(back.checked_mul(row_h)?)?;
+    let band = g.ch as i64;
+    let oy = g.origin_y as i64;
+    let Some(cr_px) = (cr as i64).checked_mul(band) else {
+        return None;
+    };
+    let Some(cell_y0) = oy.checked_add(cr_px) else {
+        return None;
+    };
+    let top = (cy - ry).floor() as i32 as i64;
+    let bot = (cy + ry).ceil() as i32 as i64;
+    let Some(fx_top) = oy.checked_sub(g.head as i64) else {
+        return None;
+    };
+    let Some(rows_px) = (g.rows as i64).checked_mul(band) else {
+        return None;
+    };
+    let Some(fx_bot) = oy.checked_add(rows_px) else {
+        return None;
+    };
+    let Some(d0) = cell_y0.checked_sub(top) else {
+        return None;
+    };
+    let Some(d1) = d0.checked_add(row_h) else {
+        return None;
+    };
+    let Some(d2) = d1.checked_sub(1) else {
+        return None;
+    };
+    let back = d2.div_euclid(row_h);
+    let Some(back_px) = back.checked_mul(row_h) else {
+        return None;
+    };
+    let Some(mut y) = cell_y0.checked_sub(back_px) else {
+        return None;
+    };
     let mut total = 0usize;
     while y < bot {
         let v = (y as f32 + half_row_h - cy) / ry;
         let v2 = v * v;
         let w2 = 1.0 - v2;
         if w2 > 0.0 {
-            let lo = y.max(fx_top);
-            let hi = y.checked_add(row_h)?.min(fx_bot);
+            let lo = if y > fx_top { y } else { fx_top };
+            let Some(y_end) = y.checked_add(row_h) else {
+                return None;
+            };
+            let hi = if y_end < fx_bot { y_end } else { fx_bot };
             if hi > lo {
-                let first = lo.checked_sub(oy)?.div_euclid(band);
-                let last = hi.checked_sub(1)?.checked_sub(oy)?.div_euclid(band);
-                let bands = usize::try_from(last.checked_sub(first)?.checked_add(1)?).ok()?;
-                total = total.checked_add(DARK_CALLS_PER_ROW.checked_mul(bands)?)?;
+                let Some(lo_off) = lo.checked_sub(oy) else {
+                    return None;
+                };
+                let first = lo_off.div_euclid(band);
+                let Some(hi_m1) = hi.checked_sub(1) else {
+                    return None;
+                };
+                let Some(hi_off) = hi_m1.checked_sub(oy) else {
+                    return None;
+                };
+                let last = hi_off.div_euclid(band);
+                let Some(span_m1) = last.checked_sub(first) else {
+                    return None;
+                };
+                let Some(bands_i64) = span_m1.checked_add(1) else {
+                    return None;
+                };
+                if bands_i64 < 0 || (bands_i64 as u64) > (usize::MAX as u64) {
+                    return None;
+                }
+                let Some(row_calls) = DARK_CALLS_PER_ROW.checked_mul(bands_i64 as usize) else {
+                    return None;
+                };
+                let Some(next_total) = total.checked_add(row_calls) else {
+                    return None;
+                };
+                total = next_total;
             }
         }
-        y = y.checked_add(row_h)?;
+        let Some(next_y) = y.checked_add(row_h) else {
+            return None;
+        };
+        y = next_y;
     }
     Some(total)
 }
@@ -420,44 +486,108 @@ fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) ->
 /// `emit_light_halo`'s worst case over every amplitude: the
 /// slabs that can meet the clip at `s = 1` times the rows a slab can cover,
 /// capped by `ribbon_beam`'s own budget.
-fn light_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
+const fn light_halo_budget(
+    (cr, cc): (u16, u16),
+    geom: &Geom,
+    g: &Grid,
+    radius: f32,
+) -> Option<usize> {
     let cw = geom.cw as f32;
     let (cx, _) = geom.cell_center(cr, cc);
     let rx_full = cw * (0.55 + radius * WIDEST);
     let x_first = cx - rx_full;
     let x_last = cx + rx_full;
-    let (start, end) = (
-        i64::from(x_first.ceil() as i32),
-        i64::from(x_last.ceil() as i32),
-    );
-    let width = end.checked_sub(start)?.max(0);
-    let left = i64::from(g.origin_x);
-    let right = left.checked_add(i64::from(g.cols).checked_mul(i64::from(g.cw))?)?;
-    let in_clip = end.min(right).checked_sub(start.max(left))?.max(0);
-    let stride = i64::from((g.cw / 8).max(1));
-    let every = width
-        .checked_add(LIGHT_ELLIPSE_SEGMENTS.checked_mul(stride.checked_sub(1)?)?)?
-        .div_euclid(stride);
+    let (start, end) = (x_first.ceil() as i32 as i64, x_last.ceil() as i32 as i64);
+    let Some(raw_w) = end.checked_sub(start) else {
+        return None;
+    };
+    let width = if raw_w > 0 { raw_w } else { 0 };
+    let left = g.origin_x as i64;
+    let Some(cols_px) = (g.cols as i64).checked_mul(g.cw as i64) else {
+        return None;
+    };
+    let Some(right) = left.checked_add(cols_px) else {
+        return None;
+    };
+    let clip_hi = if end < right { end } else { right };
+    let clip_lo = if start > left { start } else { left };
+    let Some(raw_in_clip) = clip_hi.checked_sub(clip_lo) else {
+        return None;
+    };
+    let in_clip = if raw_in_clip > 0 { raw_in_clip } else { 0 };
+    let raw_stride = g.cw / 8;
+    let stride = (if raw_stride > 1 { raw_stride } else { 1 }) as i64;
+    let Some(stride_m1) = stride.checked_sub(1) else {
+        return None;
+    };
+    let Some(seg_pad) = LIGHT_ELLIPSE_SEGMENTS.checked_mul(stride_m1) else {
+        return None;
+    };
+    let Some(every_num) = width.checked_add(seg_pad) else {
+        return None;
+    };
+    let every = every_num.div_euclid(stride);
     let meeting = if in_clip == 0 {
         0
     } else {
-        in_clip
-            .checked_add(
-                LIGHT_ELLIPSE_SEGMENTS.checked_mul(stride.checked_mul(2)?.checked_sub(2)?)?,
-            )?
-            .div_euclid(stride)
+        let Some(s2) = stride.checked_mul(2) else {
+            return None;
+        };
+        let Some(s2_m2) = s2.checked_sub(2) else {
+            return None;
+        };
+        let Some(m_pad) = LIGHT_ELLIPSE_SEGMENTS.checked_mul(s2_m2) else {
+            return None;
+        };
+        let Some(m_num) = in_clip.checked_add(m_pad) else {
+            return None;
+        };
+        m_num.div_euclid(stride)
     };
-    let slabs = every.min(meeting);
-    let oy = i64::from(g.origin_y);
-    let band = i64::from(g.ch);
-    let cell_top = oy.checked_add(i64::from(cr).checked_mul(band)?)?;
-    let fx_top = oy.checked_sub(i64::from(g.head))?;
-    let fx_bot = oy.checked_add(i64::from(g.rows).checked_mul(band)?)?;
-    let rows_lo = cell_top.checked_sub(1)?.max(fx_top);
-    let rows_hi = cell_top.checked_add(band)?.checked_add(1)?.min(fx_bot);
-    let rows = rows_hi.checked_sub(rows_lo)?.max(0);
-    let quads = usize::try_from(slabs.checked_mul(rows)?).ok()?;
-    Some(quads.min(LIGHT_MARK_QUADS.checked_sub(1)?))
+    let slabs = if every < meeting { every } else { meeting };
+    let oy = g.origin_y as i64;
+    let band = g.ch as i64;
+    let Some(cr_px) = (cr as i64).checked_mul(band) else {
+        return None;
+    };
+    let Some(cell_top) = oy.checked_add(cr_px) else {
+        return None;
+    };
+    let Some(fx_top) = oy.checked_sub(g.head as i64) else {
+        return None;
+    };
+    let Some(rows_px) = (g.rows as i64).checked_mul(band) else {
+        return None;
+    };
+    let Some(fx_bot) = oy.checked_add(rows_px) else {
+        return None;
+    };
+    let Some(ct_m1) = cell_top.checked_sub(1) else {
+        return None;
+    };
+    let rows_lo = if ct_m1 > fx_top { ct_m1 } else { fx_top };
+    let Some(ct_band) = cell_top.checked_add(band) else {
+        return None;
+    };
+    let Some(ct_p1) = ct_band.checked_add(1) else {
+        return None;
+    };
+    let rows_hi = if ct_p1 < fx_bot { ct_p1 } else { fx_bot };
+    let Some(raw_rows) = rows_hi.checked_sub(rows_lo) else {
+        return None;
+    };
+    let rows = if raw_rows > 0 { raw_rows } else { 0 };
+    let Some(prod) = slabs.checked_mul(rows) else {
+        return None;
+    };
+    if prod < 0 || (prod as u64) > (usize::MAX as u64) {
+        return None;
+    }
+    let quads = prod as usize;
+    let Some(cap) = LIGHT_MARK_QUADS.checked_sub(1) else {
+        return None;
+    };
+    Some(if quads < cap { quads } else { cap })
 }
 
 #[cfg(test)]

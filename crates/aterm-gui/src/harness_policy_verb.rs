@@ -100,7 +100,9 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
 }
 
 /// The reply line, newline-terminated: `OK effective=<on|off>` alone for an edge token, the whole
-/// policy for the owner.
+/// policy for the owner, opening with the harness contracts this aterm serves (`contract=2,3`:
+/// codex-alab's self-claim and a rostered harness's scoped claim,
+/// [`aterm_agent::harness::contract::SERVED`]).
 #[must_use]
 pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> String {
     let (on, why) = facts.effective;
@@ -115,7 +117,11 @@ pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> St
             crate::control::pct_encode(v)
         }
     };
-    let mut line = format!("OK gen={} effective={on} why={why}", facts.generation);
+    let mut line = format!(
+        "OK gen={} effective={on} why={why} contract={}",
+        facts.generation,
+        aterm_agent::harness::contract::served_word()
+    );
     for (key, value) in facts.policy.texts() {
         let value = if key == "continue_text" {
             continuation_text(&facts.policy, rules)
@@ -136,6 +142,19 @@ pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> St
     }
     line.push('\n');
     line
+}
+
+/// The agent a session's policy answers for: the one with a `[harness.<agent>]` table
+/// ([`crate::harness_host::agent_of`]), else the agent a rostered harness runs (Grok Build under
+/// grok-alab, contract v3 §8.1 item 7: its `agent-off` follows the row's program, which no table
+/// switches off), else Codex, the agent that asks for itself.
+fn policy_agent(publication: &crate::session_timeline::AgentPublication) -> Program {
+    crate::harness_host::agent_of(publication)
+        .or_else(|| {
+            crate::harness_host::identified_agent(publication)
+                .filter(|p| aterm_agent::harness::contract::row_for(*p).is_some())
+        })
+        .unwrap_or(Program::Codex)
 }
 
 /// The verb's control-thread half: `harness policy` (any other form is its usage line), the facts fetched by `fetch`, the rules file read here.
@@ -172,7 +191,7 @@ impl crate::App {
         };
         let agent = {
             let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            crate::harness_host::agent_of(timeline.agent()).unwrap_or(Program::Codex)
+            policy_agent(timeline.agent())
         };
         let posture = Posture {
             hosted: self.harness.is_some(),
@@ -366,7 +385,7 @@ mod tests {
             .expect("a list");
         let line = reply(&facts(cfg.clone()), None, true);
         assert!(
-            line.starts_with("OK gen=7 effective=on why=enabled "),
+            line.starts_with("OK gen=7 effective=on why=enabled contract=2,3 "),
             "{line}"
         );
         assert!(line.ends_with('\n') && !line.trim_end().contains('\n'));
@@ -374,7 +393,7 @@ mod tests {
         let keys: Vec<&str> = line
             .trim_end()
             .split(' ')
-            .skip(4)
+            .skip(5)
             .filter_map(|kv| kv.split_once('=').map(|(k, _)| k))
             .collect();
         let want: Vec<&str> = aterm_agent::supervise::config::KEYS
@@ -402,6 +421,41 @@ mod tests {
             field(&line, "continue_text").map(|v| aterm_control::wire::pct_decode(&v)),
             Some(cfg.continue_text.clone())
         );
+    }
+
+    /// THE HANDSHAKE (contract v3 §8.1 item 1): the owner's reply lists the contracts this aterm
+    /// serves, codex-alab's 2 and the roster's 3, effective or not; an edge token's reply, which
+    /// can claim nothing, does not.
+    #[test]
+    fn the_owners_reply_lists_the_served_contracts() {
+        let on = reply(&facts(SupervisorConfig::default()), None, true);
+        assert_eq!(field(&on, "contract").as_deref(), Some("2,3"), "{on}");
+        let off = PolicyFacts {
+            effective: (false, "autopilot-off"),
+            ..facts(SupervisorConfig::default())
+        };
+        assert_eq!(
+            field(&reply(&off, None, true), "contract").as_deref(),
+            Some("2,3")
+        );
+        assert_eq!(field(&reply(&off, None, false), "contract"), None);
+    }
+
+    /// The policy answers for the agent a rostered harness runs (Grok Build under grok-alab, whose
+    /// program name maps to Grok), for an agent with a table by its own name, and for Codex when
+    /// nothing is identified.
+    #[test]
+    fn the_policy_answers_for_the_agent_the_harness_runs() {
+        let named = |program: Option<&str>| crate::session_timeline::AgentPublication {
+            program: program.map(str::to_string),
+            ..crate::session_timeline::AgentPublication::default()
+        };
+        assert_eq!(policy_agent(&named(Some("grok-alab"))), Program::Grok);
+        assert_eq!(policy_agent(&named(Some("grok"))), Program::Grok);
+        assert_eq!(policy_agent(&named(Some("claude"))), Program::Claude);
+        assert_eq!(policy_agent(&named(Some("kimi"))), Program::Codex);
+        assert_eq!(policy_agent(&named(Some("zsh"))), Program::Codex);
+        assert_eq!(policy_agent(&named(None)), Program::Codex);
     }
 
     #[test]

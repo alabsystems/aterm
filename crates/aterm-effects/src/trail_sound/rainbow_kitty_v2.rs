@@ -1237,20 +1237,31 @@ impl MelodyV2 {
                 && i32::from(self.text.run_stride) == sounded
             {
                 let away = -sounded.signum();
-                if let Some(alt) = (1..=WORD_HEAD_SNAP_DEG + 1)
-                    .map(|k| from + away * k)
-                    .find(|c| (TUNE_DEG_LO..=TUNE_DEG_HI).contains(c) && self.deg_is_lit(*c))
-                {
-                    deg = alt;
+                let mut k = 1;
+                while k <= WORD_HEAD_SNAP_DEG + 1 {
+                    let c = from + away * k;
+                    if (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&c) && self.deg_is_lit(c) {
+                        deg = c;
+                        break;
+                    }
+                    k += 1;
                 }
             }
-            if matches!(said, MARK_PERIOD | MARK_BANG)
-                && deg == from
-                && let Some(alt) = (1..=STEER_MAX_DEG)
-                    .flat_map(|k| [from + k, from - k])
-                    .find(|c| (TUNE_DEG_LO..=TUNE_DEG_HI).contains(c) && self.deg_is_lit(*c))
-            {
-                deg = alt;
+            if matches!(said, MARK_PERIOD | MARK_BANG) && deg == from {
+                let mut k = 1;
+                while k <= STEER_MAX_DEG {
+                    let c_hi = from + k;
+                    if (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&c_hi) && self.deg_is_lit(c_hi) {
+                        deg = c_hi;
+                        break;
+                    }
+                    let c_lo = from - k;
+                    if (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&c_lo) && self.deg_is_lit(c_lo) {
+                        deg = c_lo;
+                        break;
+                    }
+                    k += 1;
+                }
             }
         }
         let opens = word_head || !self.text.prev_shifted;
@@ -1300,8 +1311,13 @@ impl MelodyV2 {
             } else {
                 (from + WORD_LEAP_MAX_DEG).min(TUNE_DEG_HI)
             };
-            if let Some(up) = (deg..=top).find(|c| self.deg_is_lit(*c)) {
-                deg = up;
+            let mut c = deg;
+            while c <= top {
+                if self.deg_is_lit(c) {
+                    deg = c;
+                    break;
+                }
+                c += 1;
             }
             self.text.quote_deg = deg as i8;
             quote = QUOTE_OPENS;
@@ -1342,12 +1358,15 @@ impl MelodyV2 {
         self.note_run(deg - from);
         if !first && usize::from(self.text.motif_len) < MOTIF_LEN && self.text.motif_play == 0 {
             let iv = (deg - from).clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG) as i8;
-            let ramp = usize::from(self.text.motif_len) == MOTIF_LEN - 1
-                && self.text.motif[..usize::from(self.text.motif_len)]
-                    .iter()
-                    .all(|&m| m == iv);
+            let motif_len = usize::from(self.text.motif_len);
+            let mut ramp = motif_len == MOTIF_LEN - 1;
+            let mut m_idx = 0;
+            while ramp && m_idx < motif_len {
+                ramp = self.text.motif[m_idx] == iv;
+                m_idx += 1;
+            }
             if iv != 0 && !ramp {
-                self.text.motif[usize::from(self.text.motif_len)] = iv;
+                self.text.motif[motif_len] = iv;
                 self.text.motif_len += 1;
             }
         }
@@ -2155,9 +2174,10 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_velocity(&mut self, db: f32) -> f32 {
+    const fn v2_velocity(&mut self, db: f32) -> f32 {
+        const LN10_OVER_20: f32 = core::f32::consts::LN_10 * 0.05;
         let u = self.rnd_in(-1.0, 1.0);
-        (10.0f32).powf(u * db * 0.05)
+        crate::color_math::exp_f32(u * db * LN10_OVER_20)
     }
 
     #[inline]
@@ -2188,15 +2208,21 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_live_ting_at(&self, f: f32) -> bool {
+    const fn v2_live_ting_at(&self, f: f32) -> bool {
+        const RATIO_HI: f32 =
+            crate::color_math::exp_f32(SAME_PITCH_CENTS * (core::f32::consts::LN_2 / 1200.0));
+        const RATIO_LO: f32 =
+            crate::color_math::exp_f32(-SAME_PITCH_CENTS * (core::f32::consts::LN_2 / 1200.0));
         let Some((slot, born)) = self.v2.lift else {
             return false;
         };
-        let v = &self.voices[usize::from(slot)];
+        let v = &self.voices[slot as usize];
+        let f0 = v.p[0].f0;
         v.on && v.born == born
             && v.lane == LANE_TING
             && v.damp <= 0.0
-            && (1200.0 * (v.p[0].f0 / f).log2()).abs() < SAME_PITCH_CENTS
+            && f0 > f * RATIO_LO
+            && f0 < f * RATIO_HI
     }
 
     #[inline]
@@ -2224,13 +2250,15 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_spawn(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<(u8, u32)> {
-        let idx = self.spawn(proto, gain, pan)?;
+    const fn v2_spawn(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<(u8, u32)> {
+        let Some(idx) = self.spawn(proto, gain, pan) else {
+            return None;
+        };
         Some((idx as u8, self.voices[idx].born))
     }
 
     #[inline]
-    fn v2_spawn_ph0(
+    const fn v2_spawn_ph0(
         &mut self,
         proto: Voice,
         gain: f32,
@@ -2239,37 +2267,57 @@ impl TrailSynth {
     ) -> Option<(u8, u32)> {
         let tw_ph = self.rnd();
         let drawn = [self.rnd(), self.rnd(), self.rnd()];
-        let ph = [ph0.unwrap_or(drawn[0]), drawn[1], drawn[2]];
-        let idx = self.spawn_seeded(proto, gain, pan, tw_ph, ph)?;
+        let ph = [
+            match ph0 {
+                Some(p) => p,
+                None => drawn[0],
+            },
+            drawn[1],
+            drawn[2],
+        ];
+        let Some(idx) = self.spawn_seeded(proto, gain, pan, tw_ph, ph) else {
+            return None;
+        };
         Some((idx as u8, self.voices[idx].born))
     }
 
     #[inline]
-    fn v2_flow_echo_phase(&self, fundamental: f32, delay_s: f32) -> Option<f32> {
-        let (slot, born) = self.v2.lead?;
-        let lead = &self.voices[usize::from(slot)];
+    const fn v2_flow_echo_phase(&self, fundamental: f32, delay_s: f32) -> Option<f32> {
+        let Some((slot, born)) = self.v2.lead else {
+            return None;
+        };
+        let lead = &self.voices[slot as usize];
         let p2 = lead.p[1];
-        (lead.on
+        if lead.on
             && lead.born == born
             && lead.lane == LANE_TUNE
             && p2.lvl > 0.0
             && p2.glide <= 0.0
-            && p2.f0 == fundamental)
-            .then(|| (p2.ph + p2.f0 * delay_s + FLOW_ECHO_PHASE).fract())
+            && p2.f0 == fundamental
+        {
+            Some((p2.ph + p2.f0 * delay_s + FLOW_ECHO_PHASE).fract())
+        } else {
+            None
+        }
     }
 
     #[inline]
-    fn v2_lock_hammer(&mut self, who: Option<(u8, u32)>, turn: f32) {
+    const fn v2_lock_hammer(&mut self, who: Option<(u8, u32)>, turn: f32) {
         let Some((slot, born)) = who else { return };
-        let v = &mut self.voices[usize::from(slot)];
+        let v = &mut self.voices[slot as usize];
         if v.on && v.born == born && v.p[0].fm_ratio > 0.0 {
             v.p[0].fm_ph = (v.p[0].fm_ratio * v.p[0].ph + turn).fract();
         }
     }
 
     #[inline]
-    fn v2_spawn_decoration(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<(u8, u32)> {
-        if self.voices.iter().all(|v| v.on) {
+    const fn v2_spawn_decoration(
+        &mut self,
+        proto: Voice,
+        gain: f32,
+        pan: f32,
+    ) -> Option<(u8, u32)> {
+        if self.all_voices_on() {
             return None;
         }
         self.v2_spawn(proto, gain, pan)
@@ -2309,12 +2357,14 @@ impl TrailSynth {
     }
 
     #[cfg(test)]
-    fn mute_all_lanes_but(&mut self, lane: u8) {
-        for v in &mut self.voices {
-            if v.lane != lane {
-                v.gl = 0.0;
-                v.gr = 0.0;
+    const fn mute_all_lanes_but(&mut self, lane: u8) {
+        let mut i = 0;
+        while i < self.voices.len() {
+            if self.voices[i].lane != lane {
+                self.voices[i].gl = 0.0;
+                self.voices[i].gr = 0.0;
             }
+            i += 1;
         }
     }
 
@@ -2338,7 +2388,7 @@ impl TrailSynth {
             let arc = hue_arc(ev.hue);
             if self.v2_latched {
                 const INV_BED_HUE_TAU_S: f32 = -1.0 / BED_HUE_TAU_S;
-                let k = 1.0 - (self.since_event * INV_BED_HUE_TAU_S).exp();
+                let k = 1.0 - crate::color_math::exp_f32(self.since_event * INV_BED_HUE_TAU_S);
                 self.bed.hue_s += (arc - self.bed.hue_s) * k;
             } else {
                 self.bed.hue_s = arc;
@@ -2355,7 +2405,7 @@ impl TrailSynth {
             self.kick_bed(kind, ev.gain);
         }
         const INV_RATE_TAU: f32 = -1.0 / 0.6;
-        self.rate = self.rate * (self.since_event * INV_RATE_TAU).exp() + 1.0;
+        self.rate = self.rate * crate::color_math::exp_f32(self.since_event * INV_RATE_TAU) + 1.0;
         self.since_event = 0.0;
         let at = self.v2_at_ms(meta);
 
@@ -2669,7 +2719,7 @@ impl TrailSynth {
         let struck = plan.touch == Touch::Step && !plan.mallet_only;
         let ring_deg = deg + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG;
         let rings = hammer.ring && !self.v2_live_ting_at(penta(TINE_BASE_HZ, ring_deg));
-        if ev.shifted && struck && !rings && !self.voices.iter().all(|v| v.on) {
+        if ev.shifted && struck && !rings && !self.all_voices_on() {
             for _ in 0..4 {
                 let _ = self.rnd();
             }
@@ -2737,7 +2787,7 @@ impl TrailSynth {
         }
     }
 
-    fn v2_air_cloud(
+    const fn v2_air_cloud(
         &mut self,
         deg: i32,
         roof: f32,
@@ -2746,7 +2796,8 @@ impl TrailSynth {
         after: f32,
         shifted: bool,
     ) {
-        for k in 0..AIR_TAP_DELAY_S.len() {
+        let mut k = 0;
+        while k < AIR_TAP_DELAY_S.len() {
             let mut tap = bloom(deg, roof, TAU_V_MAX_S);
             tap.lp_cut = shifted_roof(tap.lp_cut, shifted);
             tap.delay = after + AIR_TAP_DELAY_S[k];
@@ -2756,20 +2807,21 @@ impl TrailSynth {
                 AIR_TAP_PAN
             };
             self.v2_spawn(tap, bloom_gain * AIR_TAP_LEVEL[k], pan + side);
+            k += 1;
         }
     }
 
-    fn v2_space(&mut self, ev: &SoundEvent, at: u32) {
+    const fn v2_space(&mut self, ev: &SoundEvent, at: u32) {
         self.v2.ring = None;
         self.v2.graft = None;
         self.v2.prev_class = LETTER;
         let head = self.v2.on_space(at);
         let g = g_ioi(self.v2.ioi_ms * 0.001);
-        let ci = usize::from(self.v2.text.chord);
+        let ci = self.v2.text.chord as usize;
         let chord = CHORD_LOOP[ci];
         let root = penta(
             BASS_BASE_HZ * CHORD_ROOT_RATIO[chord.root],
-            self.song_key.into(),
+            self.song_key as i32,
         );
         if head {
             self.v2_damp(self.v2.bass, LANE_FADE_STEAL_S);
@@ -2786,7 +2838,7 @@ impl TrailSynth {
         if !head && at.saturating_sub(self.v2.last_step_ms) >= SPACE_STEP_MIN_GAP_MS {
             self.v2.last_step_ms = at;
             self.v2.space_steps = self.v2.space_steps.saturating_add(1);
-            let f = indent_step_hz(ci, root, self.v2.space_steps, self.song_key.into());
+            let f = indent_step_hz(ci, root, self.v2.space_steps, self.song_key as i32);
             let mut step = tine(
                 f,
                 Touch::Step,
@@ -2801,26 +2853,26 @@ impl TrailSynth {
         }
     }
 
-    fn v2_shift(&mut self, ev: &SoundEvent) {
+    const fn v2_shift(&mut self, ev: &SoundEvent) {
         const _: () = assert!(TING_PICK.len() == super::SHIFT_ROTATION.len());
         self.v2_damp(self.v2.lift, LANE_FADE_STEAL_S);
-        let k = usize::from(self.shift_step);
+        let k = self.shift_step as usize;
         self.shift_step = (self.shift_step + 1) % super::SHIFT_ROTATION.len() as u8;
-        let class = TING_TONES[CHORD_LOOP[usize::from(self.v2.text.chord)].root][TING_PICK[k]];
-        let f = ting_fold(penta(TINE_BASE_HZ, class + i32::from(self.song_key)));
+        let class = TING_TONES[CHORD_LOOP[self.v2.text.chord as usize].root][TING_PICK[k]];
+        let f = ting_fold(penta(TINE_BASE_HZ, class + (self.song_key as i32)));
         let pan = self.v2_pan(ev.pan);
         self.v2.lift = self.v2_spawn(ting(f), ev.gain * KEY_TINE_TRIM * TING_LEVEL, pan);
     }
 
-    fn v2_secret(&mut self, ev: &SoundEvent) {
-        let f = penta(TINE_BASE_HZ, SECRET_DEG + i32::from(self.song_key));
+    const fn v2_secret(&mut self, ev: &SoundEvent) {
+        let f = penta(TINE_BASE_HZ, SECRET_DEG + (self.song_key as i32));
         self.v2_damp_same_pitch(LANE_TUNE, f);
         let voice = tine(f, Touch::Step, SECRET_TAU_S, ROOF_PLAIN_LO_HZ, false, 0.0);
         self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM, 0.0);
     }
 
-    fn v2_nav_tick(&mut self, ev: &SoundEvent) {
-        let deg = i32::from(self.v2.text.walk) + i32::from(self.song_key);
+    const fn v2_nav_tick(&mut self, ev: &SoundEvent) {
+        let deg = (self.v2.text.walk as i32) + (self.song_key as i32);
         let f = penta(TINE_BASE_HZ, deg);
         self.v2_damp_same_pitch(LANE_TUNE, f);
         let voice = Voice {
@@ -2830,7 +2882,7 @@ impl TrailSynth {
             p: p1_sine(f),
             lp_cut: ROOF_PLAIN_LO_HZ,
             lane: LANE_TUNE,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = self.v2_pan(ev.pan);
         self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM * NAV_LEVEL, pan);
@@ -2847,7 +2899,7 @@ impl TrailSynth {
         roof_hz(cps, true, ev.heat, arc, Touch::Step)
     }
 
-    fn v2_cascade(&mut self, ev: &SoundEvent, at: u32) {
+    const fn v2_cascade(&mut self, ev: &SoundEvent, at: u32) {
         self.v2_hand_back_key(at);
         let Some(head) = self.v2.on_jump(at) else {
             return;
@@ -2860,10 +2912,11 @@ impl TrailSynth {
         } else {
             0.0
         };
-        let base = i32::from(self.v2.text.walk) + i32::from(self.song_key);
+        let base = (self.v2.text.walk as i32) + (self.song_key as i32);
         if head {
             let roof = roof_hz(cps, true, ev.heat, arc, Touch::Step);
-            for k in 0..CASCADE_DEGREES.len() {
+            let mut k = 0;
+            while k < CASCADE_DEGREES.len() {
                 let f = penta(TINE_BASE_HZ, base + CASCADE_DEGREES[k]);
                 let mut voice = tine(f, Touch::Step, tau, roof, false, self.v2.flow);
                 voice.delay = CASCADE_DELAYS_S[k];
@@ -2871,6 +2924,7 @@ impl TrailSynth {
                 let pan = if k & 1 == 0 { ev.pan } else { -ev.pan };
                 let gain = ev.gain * KEY_TINE_TRIM * CASCADE_LEVELS[k];
                 self.v2_spawn(voice, gain, pan);
+                k += 1;
             }
         } else {
             let f = penta(TINE_BASE_HZ, base + CASCADE_RESTRIKE_DEG);
@@ -2888,22 +2942,24 @@ impl TrailSynth {
         }
     }
 
-    fn v2_strum(&mut self, ev: &SoundEvent) {
+    const fn v2_strum(&mut self, ev: &SoundEvent) {
         self.v2.ring = None;
         self.v2.graft = None;
         self.v2.prev_class = LETTER;
-        let lit = sky_bed_degrees(usize::from(self.v2.text.chord));
+        let lit = sky_bed_degrees(self.v2.text.chord as usize);
         let degrees = [lit[0], lit[1], lit[2], lit[0] + 5];
         let tau = tau_v_s(self.v2.ioi_ms * 0.001);
         let roof = self.v2_lit_roof(ev);
-        let base = i32::from(self.song_key);
-        for k in 0..degrees.len() {
+        let base = self.song_key as i32;
+        let mut k = 0;
+        while k < degrees.len() {
             let f = penta(TINE_BASE_HZ, base + degrees[k]);
             let mut voice = tine(f, Touch::Step, tau, roof, false, self.v2.flow);
             voice.delay = STRUM_DELAYS_S[k];
             voice.lane = LANE_CASCADE;
             let gain = ev.gain * KEY_TINE_TRIM * STRUM_TRIM * STRUM_SHAPE[k];
             self.v2_spawn(voice, gain, ev.pan);
+            k += 1;
         }
     }
 
@@ -3038,19 +3094,26 @@ impl TrailSynth {
     }
 
     #[inline]
-    fn v2_glint(&mut self, ev: &SoundEvent, twinkle_hz: u8) {
+    const fn v2_glint(&mut self, ev: &SoundEvent, twinkle_hz: u8) {
         let vel = self.v2_velocity(VEL_DB_RESTRIKE);
         self.v2_glint_at(ev, twinkle_hz, GLINT_LEVEL, vel, 0.0);
     }
 
     #[inline]
-    fn v2_glint_at(&mut self, ev: &SoundEvent, twinkle_hz: u8, level: f32, vel: f32, delay: f32) {
-        let deg = self.v2.next_glint_deg() + i32::from(self.song_key);
+    const fn v2_glint_at(
+        &mut self,
+        ev: &SoundEvent,
+        twinkle_hz: u8,
+        level: f32,
+        vel: f32,
+        delay: f32,
+    ) {
+        let deg = self.v2.next_glint_deg() + (self.song_key as i32);
         self.v2_glint_deg_at(ev, deg, twinkle_hz, level, vel, delay);
     }
 
     #[inline]
-    fn v2_tink(&mut self, deg: i32, roof: f32, gain: f32, pan: f32) -> Option<(u8, u32)> {
+    const fn v2_tink(&mut self, deg: i32, roof: f32, gain: f32, pan: f32) -> Option<(u8, u32)> {
         let voice = Voice {
             delay: TINK_DELAY_S,
             dur: TINK_DUR_S,
@@ -3059,12 +3122,12 @@ impl TrailSynth {
             p: p1_sine(penta(TINE_BASE_HZ, deg)),
             lp_cut: roof,
             lane: LANE_GRAFT,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         self.v2_spawn_decoration(voice, gain * TINK_LEVEL, pan)
     }
 
-    fn v2_glint_deg_at(
+    const fn v2_glint_deg_at(
         &mut self,
         ev: &SoundEvent,
         deg: i32,
@@ -3077,7 +3140,7 @@ impl TrailSynth {
         let rate = if twinkle_hz == 0 {
             GLINT_TWINKLE_DEFAULT_HZ
         } else {
-            f32::from(twinkle_hz)
+            twinkle_hz as f32
         };
         let voice = Voice {
             delay,
@@ -3089,7 +3152,7 @@ impl TrailSynth {
             tw_depth: GLINT_TWINKLE_DEPTH,
             lp_cut: shifted_roof(GLINT_LP_HZ, ev.shifted),
             lane: LANE_GLINT,
-            ..Voice::default()
+            ..Voice::DEFAULT
         };
         let pan = self.v2_pan(ev.pan);
         self.v2_damp_same_pitch(LANE_GLINT, f);
@@ -3098,7 +3161,7 @@ impl TrailSynth {
 }
 
 impl TrailSynth {
-    fn v2_meteor_arm(&mut self, ev: &SoundEvent, meta: EventMeta, dir: i8) {
+    const fn v2_meteor_arm(&mut self, ev: &SoundEvent, meta: EventMeta, dir: i8) {
         let pan = meta.pan_from;
         let mut tick = met_tick();
         tick.arm_ttl = MET_ARM_TTL_S;
@@ -3162,13 +3225,16 @@ impl TrailSynth {
         }
     }
 
-    fn v2_claim_arm(&mut self, ev: &SoundEvent, dir: i8, t: f32) -> Option<u32> {
+    const fn v2_claim_arm(&mut self, ev: &SoundEvent, dir: i8, t: f32) -> Option<u32> {
         let target = self.v2_core_voice(dir, t);
         let vel = self.v2_velocity(VEL_DB_MOTION);
         let claimed_gain = ev.gain * KEY_TINE_TRIM * MET_CORE_LEVEL * vel;
         let dt = self.inv_sr;
         let mut claimed = None;
-        for v in &mut self.voices {
+        let mut i = 0;
+        while i < self.voices.len() {
+            let v = &mut self.voices[i];
+            i += 1;
             if !(v.on && v.lane == LANE_METEOR && v.arm_ttl > 0.0) {
                 continue;
             }
@@ -3185,12 +3251,12 @@ impl TrailSynth {
             };
             p.f1 = target.p[0].f1;
             p.glide = target.p[0].glide.max(1e-4);
-            p.k_g = (-dt / p.glide).exp();
-            p.f0 = p.f1 + (cur - p.f1) * (now / p.glide).exp();
+            p.k_g = crate::color_math::exp_f32(-dt / p.glide);
+            p.f0 = p.f1 + (cur - p.f1) * crate::color_math::exp_f32(now / p.glide);
             let env_now = if v.env_run { v.env_d } else { 1.0 };
             v.decay = target.decay.max(1e-3);
-            v.k_d = (-dt / v.decay).exp();
-            let env_new = (-now / v.decay).exp();
+            v.k_d = crate::color_math::exp_f32(-dt / v.decay);
+            let env_new = crate::color_math::exp_f32(-now / v.decay);
             let comp = env_now / env_new.max(1e-6);
             v.gl *= comp;
             v.gr *= comp;
@@ -3366,15 +3432,16 @@ impl TrailSynth {
         if b.sky_glide_dt != dt {
             const INV_BED_GLIDE_TAU_S: f32 = -1.0 / BED_GLIDE_TAU_S;
             b.sky_glide_dt = dt;
-            b.sky_glide = 1.0 - (dt * INV_BED_GLIDE_TAU_S).exp();
+            b.sky_glide = 1.0 - crate::color_math::exp_f32(dt * INV_BED_GLIDE_TAU_S);
         }
         let glide = b.sky_glide;
         let arc = b.hue_s.clamp(0.0, 1.0);
         if b.sky_detune <= 0.0 || b.sky_detune_arc != arc {
-            const INV_1200: f32 = 1.0 / 1200.0;
+            const LN2_OVER_1200: f32 = core::f32::consts::LN_2 / 1200.0;
             b.sky_detune_arc = arc;
-            b.sky_detune =
-                (2.0f32).powf(lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) * INV_1200);
+            b.sky_detune = crate::color_math::exp_f32(
+                lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) * LN2_OVER_1200,
+            );
         }
         let detune = b.sky_detune;
         let tone = |ph: f32| -> f32 {

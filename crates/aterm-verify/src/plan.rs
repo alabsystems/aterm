@@ -91,7 +91,7 @@ pub const WINDOWED: [(StageId, &str); 3] = [
 ];
 
 /// Stages that run under `--no-windows` and emit named skips for their windowed rows.
-pub const WINDOWED_ROWS: [StageId; 1] = [StageId::BrowserLane];
+pub const WINDOWED_ROWS: [StageId; 2] = [StageId::BrowserLane, StageId::MeasuringTests];
 
 /// Stages whose verdicts depend on host timing: each runs on the quiet machine, a claim in the
 /// per-user capacity ledger (`docs/DESIGN-adaptive-build-2026-10-24.md`, QUIET-ADMIT).

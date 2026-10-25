@@ -343,6 +343,81 @@ fn a_codex_alab_own_line_package_is_tapped_at_its_client_version() {
     );
 }
 
+/// codex-alab's COMPOUND version (codex-alab Decision 8, amended 2026-10-24), in the forms of the
+/// first build on its own line that the lab measured (aterm 51a670f35a): the manifest and the
+/// marker's `version` say `0.1.0-dev.13665+codex.0.164.0.g1eb102688`, the marker's
+/// `client_version` says `0.165.0-dev.13665+g1eb102688`, and the rollout's `cli_version` says
+/// the client version. The
+/// tap is armed with the client version and binds; a record whose client version names a
+/// measured build the package does not run (another count and commit), or a compound package
+/// that names no client version, arms it with no build, so it binds nothing (unmeasured).
+#[test]
+fn a_compound_package_is_tapped_at_its_client_version_and_never_at_a_build_it_does_not_run() {
+    use crate::harness::codex_alab::{ALAB_BUILD_JSON, PACKAGE_JSON, alab_build};
+    const CLIENT: &str = "0.165.0-dev.13665+g1eb102688";
+    const OWN: &str = "0.1.0-dev.13665+codex.0.164.0.g1eb102688";
+    assert!(CODEX_MEASURED_BUILDS.contains(&CLIENT) && CODEX_MEASURED_BUILDS.contains(&ALAB));
+    let pkg = scratch_home("compound-package");
+    let root = pkg.path().join(OWN);
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe is never run");
+    std::fs::write(
+        root.join(PACKAGE_JSON),
+        format!(r#"{{"layoutVersion":1,"version":"{OWN}","entrypoint":"bin/codex"}}"#),
+    )
+    .expect("manifest");
+    let record = |client: Option<&str>| {
+        let client = client.map_or_else(String::new, |c| format!(r#","client_version":"{c}""#));
+        std::fs::write(
+            root.join(ALAB_BUILD_JSON),
+            format!(
+                r#"{{"source":"1eb102688","version":"{OWN}"{client},"baseline":"0.164.0","upstream":{{"release":"rust-v0.164.0","commit":"{}"}}}}"#,
+                "0".repeat(40)
+            ),
+        )
+        .expect("marker");
+    };
+    let home = scratch_home("compound");
+    let path = rollout_in(home.path(), DAY, THREAD);
+    append(
+        &path,
+        &[opening(THREAD, CLIENT), ctx(T0 + 1000, "turn-1")].concat(),
+    );
+    record(Some(CLIENT));
+    let running = alab_build(&exe);
+    assert_eq!(running.as_deref(), Some(CLIENT), "the client version");
+    let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
+    tap.arm(0, None, running.as_deref());
+    assert!(
+        tap.read(FOLD_BUDGET).is_some_and(|r| r.complete),
+        "running {running:?}, refused {:?}",
+        tap.refused()
+    );
+    assert!(tap.is_bound() && tap.refused().is_none());
+    assert_eq!(
+        words(&said(&mut tap)),
+        ["bind 0", "prompt turn-1", "model gpt-5.5 0.165.0-dev.13665"]
+    );
+    let other = scratch_home("compound-other");
+    let path = rollout_in(other.path(), DAY, THREAD);
+    append(
+        &path,
+        &[opening(THREAD, ALAB), ctx(T0 + 1000, "turn-1")].concat(),
+    );
+    for client in [Some(ALAB), None, Some(OWN)] {
+        record(client);
+        let running = alab_build(&exe);
+        assert_eq!(running, None, "{client:?}");
+        let mut tap = RolloutTap::new(THREAD, other.path()).expect("a thread id");
+        tap.arm(0, None, running.as_deref());
+        assert!(tap.read(FOLD_BUDGET).is_none(), "{client:?}");
+        assert!(!tap.is_bound(), "{client:?}");
+        assert_eq!(tap.refused(), Some(Refusal::Unmeasured), "{client:?}");
+        assert!(said(&mut tap).is_empty(), "{client:?}");
+    }
+}
+
 #[test]
 fn a_claimant_running_an_unmeasured_build_binds_nothing() {
     let home = scratch_home("running");

@@ -212,20 +212,23 @@ impl CursorDroplet {
         }
         self.surge = e;
 
-        let dt = self
-            .last
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
-            .min(0.25);
+        let dt = match self.last {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32().min(0.25),
+            None => 0.0,
+        };
         self.last = Some(now);
         self.slosh = (self.slosh + dt * (SLOSH_IDLE + SLOSH_ACTIVE * e)).fract();
         self.ripple = (self.ripple + dt * (RIPPLE_IDLE + RIPPLE_ACTIVE * e)).fract();
         self.drip = (self.drip + dt * (DRIP_IDLE + DRIP_ACTIVE * e)).fract();
         let phase = self.slosh * std::f32::consts::TAU;
-        let (phase_sin, phase_cos) = phase.sin_cos();
-        let shimmer = 0.5 + 0.35 * phase_sin + 0.15 * (phase * 2.7 + 1.3).sin();
+        let (phase_sin, phase_cos) = crate::supernova::sin_cos_f32(phase);
+        let shimmer =
+            0.5 + 0.35 * phase_sin + 0.15 * crate::supernova::sin_cos_f32(phase * 2.7 + 1.3).0;
 
-        let dark = cfg.ground.is_none_or(aterm_render::theme_is_dark);
+        let dark = match cfg.ground {
+            Some(ground) => aterm_render::theme_is_dark(ground),
+            None => true,
+        };
         let caustic = 0.05 * (shimmer - 0.5);
         let t = if dark {
             0.36 + 0.42 * e + caustic
@@ -374,7 +377,7 @@ impl CursorDroplet {
             for half in [0.0f32, 0.5] {
                 let u = (self.ripple + half).fract();
                 let one_minus_u = 1.0 - u;
-                let env = one_minus_u * one_minus_u.sqrt() * e;
+                let env = one_minus_u * crate::color_math::sqrt_f32(one_minus_u) * e;
                 let cov = (cov_core * 0.55 * env).min(COV_CAP) as u8;
                 if cov == 0 {
                     continue;

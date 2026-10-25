@@ -56,7 +56,6 @@ const fn title_witness(p: Program) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => false,
     }
 }
@@ -93,7 +92,6 @@ fn background_alone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => reader.background_wait(rows).is_some(),
     }
 }
@@ -876,7 +874,6 @@ fn names_claude(stdout: &str) -> bool {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic,
         )
         | None => false,

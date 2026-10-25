@@ -408,7 +408,7 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
 fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     let _echo = crate::echo_rtt::fresh_for_test();
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
-    let _arms = crate::echo_rtt::deferred_arms_for_test(&sink);
+    let _arms = crate::echo_rtt::arms_for_test(&sink);
     let wid = WindowId(0);
     let pin = paste_order::pin_ordering_for_test(&sink);
     let probe = app.echo_probe_open(wid, None);
@@ -439,6 +439,53 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
         "the bracket did not arm for a write it did not make: {echo:?}"
     );
     drop(pin);
+    drop(app);
+    close_pipe(sink, pipe);
+}
+
+/// A direct key's echo that the PTY reader sees before the dispatch's bracket closes is that
+/// key's sample. Arming only at the close left the slot open for the session's next output, so
+/// a fast echo read as the gap to whatever the program printed next.
+#[test]
+fn a_direct_keys_echo_that_beats_the_bracket_close_is_its_sample() {
+    let _echo = crate::echo_rtt::fresh_for_test();
+    let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+    let _arms = crate::echo_rtt::arms_for_test(&sink);
+    let wid = WindowId(0);
+    let session = app.front_terminal(wid).expect("a terminal").session;
+    let probe = app.echo_probe_open(wid, None);
+    let key = InputEvent::Key {
+        key: aterm_types::keyboard::Key::Character('q'),
+        mods: aterm_types::keyboard::Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: aterm_types::keyboard::KeyEventType::Press,
+    };
+    assert_eq!(app.input(wid, key, Source::Human), InputOutcome::Ok);
+    let mut got = Vec::new();
+    assert!(wait_until(MUST_HAPPEN, || {
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            got.extend_from_slice(&buf[..n as usize]);
+        }
+        !got.is_empty()
+    }));
+    assert_eq!(got, b"q", "the key was written directly");
+    crate::echo_rtt::note_output_burst(session);
+    app.echo_probe_close(probe);
+    let echo = crate::echo_rtt::snapshot();
+    assert_eq!(
+        (echo.arms, echo.total),
+        (1, 1),
+        "the echo that beat the close is the key's sample: {echo:?}"
+    );
+    crate::echo_rtt::note_output_burst(session);
+    assert_eq!(
+        crate::echo_rtt::snapshot().total,
+        1,
+        "the session's next output answers nothing"
+    );
     drop(app);
     close_pipe(sink, pipe);
 }

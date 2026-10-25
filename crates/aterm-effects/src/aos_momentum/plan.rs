@@ -284,7 +284,7 @@ impl SchedulePlan {
     /// # Errors
     /// [`PlanRefusal::Gap`], [`PlanRefusal::Period`]: a parameter outside its range.
     #[inline]
-    pub fn new(split: Split, wake: Wake) -> Result<SchedulePlan, PlanRefusal> {
+    pub const fn new(split: Split, wake: Wake) -> Result<SchedulePlan, PlanRefusal> {
         Self::decode(&raw(split, wake))
     }
 
@@ -294,27 +294,17 @@ impl SchedulePlan {
     /// [`PlanRefusal::WakeTag`], [`PlanRefusal::Reserved`], the gap ([`PlanRefusal::Gap`] or
     /// [`PlanRefusal::Unused`]) and the period ([`PlanRefusal::Period`] or
     /// [`PlanRefusal::Unused`]).
-    pub fn decode(bytes: &[u8]) -> Result<SchedulePlan, PlanRefusal> {
-        let Ok(b) = <[u8; PLAN_LEN]>::try_from(bytes) else {
+    pub const fn decode(bytes: &[u8]) -> Result<SchedulePlan, PlanRefusal> {
+        if bytes.len() != PLAN_LEN {
             return Err(PlanRefusal::Length {
                 expected: PLAN_LEN,
                 found: bytes.len(),
             });
-        };
-        let [
-            format,
-            split,
-            wake,
-            reserved,
-            g0,
-            g1,
-            g2,
-            g3,
-            p0,
-            p1,
-            p2,
-            p3,
-        ] = b;
+        }
+        let format = bytes[0];
+        let split = bytes[1];
+        let wake = bytes[2];
+        let reserved = bytes[3];
         if format != PLAN_FORMAT {
             return Err(PlanRefusal::Format { found: format });
         }
@@ -334,7 +324,7 @@ impl SchedulePlan {
         if reserved != 0 {
             return Err(PlanRefusal::Reserved { found: reserved });
         }
-        let gap_us = u32::from_le_bytes([g0, g1, g2, g3]);
+        let gap_us = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let split = if settle_at_step {
             if gap_us > MAX_GAP_US {
                 return Err(PlanRefusal::Gap { gap_us });
@@ -349,10 +339,10 @@ impl SchedulePlan {
             }
             Split::Shipped
         };
-        let period_us = u32::from_le_bytes([p0, p1, p2, p3]);
+        let period_us = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let wake = match wake {
             None => {
-                if !(MIN_PERIOD_US..=MAX_PERIOD_US).contains(&period_us) {
+                if period_us < MIN_PERIOD_US || period_us > MAX_PERIOD_US {
                     return Err(PlanRefusal::Period { period_us });
                 }
                 Wake::Poll { period_us }
@@ -415,11 +405,11 @@ impl SchedulePlan {
     /// Whether a changed hot frame settles at once under this plan's split.
     #[inline]
     fn settles_at_step(&self, v: &PlanView) -> bool {
-        match self.split {
-            Split::Shipped => false,
-            Split::SettleAtStep { gap_us } => v
-                .gap()
-                .is_some_and(|gap| gap >= Duration::from_micros(u64::from(gap_us))),
+        match (self.split, v.gap()) {
+            (Split::SettleAtStep { gap_us }, Some(gap)) => {
+                gap >= Duration::from_micros(u64::from(gap_us))
+            }
+            _ => false,
         }
     }
 
@@ -448,25 +438,34 @@ impl SchedulePlan {
         if !v.hot {
             return None;
         }
-        let floor = now.checked_add(frame_interval);
         if self.is_active(v) {
-            return floor;
+            return now.checked_add(frame_interval);
         }
         match self.wake {
-            Wake::NextStep => floor.map(|floor| {
-                v.forecast
-                    .and_then(|at| at.checked_add(SETTLE_MARGIN))
-                    .map_or(floor, |at| at.max(floor))
-            }),
-            Wake::ColdOnly => floor.map(|floor| {
-                v.cold_at
-                    .and_then(|cold| cold.checked_add(SETTLE_MARGIN))
-                    .map_or(floor, |cold| cold.max(floor))
-            }),
+            Wake::NextStep => {
+                let floor = now.checked_add(frame_interval)?;
+                Some(match v.forecast {
+                    Some(at) => match at.checked_add(SETTLE_MARGIN) {
+                        Some(w) if w > floor => w,
+                        _ => floor,
+                    },
+                    None => floor,
+                })
+            }
+            Wake::ColdOnly => {
+                let floor = now.checked_add(frame_interval)?;
+                Some(match v.cold_at {
+                    Some(cold) => match cold.checked_add(SETTLE_MARGIN) {
+                        Some(w) if w > floor => w,
+                        _ => floor,
+                    },
+                    None => floor,
+                })
+            }
             Wake::Poll { period_us } => {
                 now.checked_add(Duration::from_micros(u64::from(period_us)))
             }
-            Wake::Cadence => floor,
+            Wake::Cadence => now.checked_add(frame_interval),
             Wake::Never => None,
         }
     }

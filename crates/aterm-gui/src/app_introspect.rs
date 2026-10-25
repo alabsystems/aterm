@@ -275,21 +275,12 @@ impl App {
         let mut index = 0;
         while index < self.deferred_gpu_captures.len() {
             let capture = &self.deferred_gpu_captures[index];
-            let current = self
-                .windows
-                .get(&capture.window)
-                .and_then(|window| window.current_gpu_acquire_id());
-            let parked = self
-                .windows
-                .get(&capture.window)
-                .is_some_and(|window| window.present_retry.parked);
-            if !parked
-                && deferred_capture_identity_matches(
-                    capture.surface,
-                    current,
-                    capture.request.cancellation().is_some(),
-                )
-            {
+            let window = self.windows.get(&capture.window);
+            let window_live = window.is_some();
+            let current = window.and_then(|window| window.current_gpu_acquire_id());
+            let parked = window.is_some_and(|window| window.present_retry.parked);
+            let cancelled = capture.request.cancellation().is_some();
+            if !parked && deferred_capture_identity_matches(capture.surface, current, cancelled) {
                 index += 1;
                 continue;
             }
@@ -297,12 +288,16 @@ impl App {
                 .deferred_gpu_captures
                 .remove(index)
                 .expect("indexed queued capture");
+            let refusal = format!(
+                "capture cancelled, window closed, or surface became unavailable while waiting: window={} window_live={window_live} expected_acquire={} current_acquire={} parked={parked} cancelled={cancelled}",
+                capture.window.0,
+                capture.surface,
+                current.map_or_else(|| "none".to_string(), |id| id.to_string()),
+            );
             if deferred_capture_owns_current_tap(capture.exact_tap, capture.surface, current) {
                 self.discard_presented_client_capture(capture.window);
             }
-            capture.request.reject(
-                "capture cancelled, window closed, or surface became unavailable while waiting",
-            );
+            capture.request.reject(&refusal);
         }
     }
 
@@ -4507,10 +4502,11 @@ impl App {
     > {
         use crate::app_render::CapturePreparation;
         self.sample_native_preview_for_capture(wid, &plan);
+        // Every route splices the message band, so each captures it at the capture instant.
+        let capture_now = Instant::now();
+        self.prepare_band_motion(wid, capture_now);
         let (plan, terminal_grid) = match route {
             crate::VisibleContentRoute::Terminal { .. } => {
-                let capture_now = Instant::now();
-                self.prepare_band_motion(wid, capture_now);
                 let clock = self.composed_capture_cursor_fx_clock(wid, capture_now);
                 let (grid, plan) = match self
                     .prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(wid, plan, clock)
@@ -4536,7 +4532,7 @@ impl App {
                 (plan, None)
             }
             crate::VisibleContentRoute::Heterogeneous => {
-                let clock = self.composed_capture_cursor_fx_clock(wid, Instant::now());
+                let clock = self.composed_capture_cursor_fx_clock(wid, capture_now);
                 match self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
                     wid,
                     Some(clock),
@@ -15012,5 +15008,59 @@ mod headless_settings_preview_capture_tests {
             "a still preview is the same frame at every capture"
         );
         assert_eq!(drawn_preview(&app).phase_ms, still.phase_ms);
+    }
+}
+
+#[cfg(test)]
+mod headless_capture_band_tests {
+    use crate::{App, WindowId};
+    use std::time::{Duration, Instant};
+
+    /// A headless capture of a native or mixed front prepares the message band at the capture
+    /// instant, as a terminal front's does, instead of splicing whatever frame the band last
+    /// held (a live row's elapsed, ETA and stalled state frozen at it).
+    #[test]
+    fn a_headless_capture_of_any_front_prepares_the_band_now() {
+        for mixed in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.announce_toolchain_pass("installing 10 ALab program(s)", true);
+            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            if mixed {
+                let _ = app
+                    .split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+            }
+            let (plan, route) = app
+                .active_visible_frame_layout(wid)
+                .expect("a visible frame");
+            assert!(
+                matches!(
+                    (mixed, route),
+                    (false, crate::VisibleContentRoute::Native { .. })
+                        | (true, crate::VisibleContentRoute::Heterogeneous)
+                ),
+                "PRECONDITION: the front's route ({route:?}, mixed={mixed})"
+            );
+            let stale = Instant::now() + Duration::from_secs(120);
+            app.prepare_band_motion(wid, stale);
+            let held = app.windows[&wid]
+                .band
+                .motion()
+                .expect("PRECONDITION: a live row's band frame")
+                .at;
+            assert!(
+                app.stage_headless_capture(wid, plan, route).is_ok(),
+                "the capture stages (mixed={mixed})"
+            );
+            let at = app.windows[&wid]
+                .band
+                .motion()
+                .expect("the band's frame")
+                .at;
+            assert!(
+                at < held,
+                "the capture prepared the band now, not at the held frame (mixed={mixed})"
+            );
+        }
     }
 }

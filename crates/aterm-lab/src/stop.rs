@@ -54,6 +54,37 @@ pub fn install() {
     });
 }
 
+/// Set by [`note`]: an interrupt ended one of this run's waits.
+static WAIT_ENDED: AtomicBool = AtomicBool::new(false);
+
+/// Note `sig` as an interrupt of this run, as the handler [`install`] sets would: a wait for
+/// capacity or a lock that ended on it ([`aterm_toolchain::interrupt`]) hands it on, so the run's
+/// own interrupt path ([`check`]) ends what it started, and a second interrupt ends it at once.
+/// The run then ends NOT RUN ([`ended_a_wait`]).
+pub fn note(sig: i32) {
+    WAIT_ENDED.store(true, Ordering::SeqCst);
+    let _ = STOPPED.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+    ring();
+}
+
+/// Whether an interrupt ended one of this run's waits ([`note`]): what waited started nothing,
+/// so the run is NOT RUN ([`status`]).
+pub fn ended_a_wait() -> bool {
+    WAIT_ENDED.load(Ordering::SeqCst)
+}
+
+/// The run's exit status for a verb that ended with `code`: NOT RUN once an interrupt ended one
+/// of its waits ([`ended_a_wait`]), whatever its verb made of that (a refusal, a window that
+/// never started, rows cut short, the interrupt's own 128 + signal), unless its own verdict was
+/// a failure it found (`found`: it returned 1), which stays.
+pub fn status(code: i32, found: bool) -> i32 {
+    if ended_a_wait() && !found {
+        crate::linux::NOT_RUN
+    } else {
+        code
+    }
+}
+
 /// `Err` once an interrupt arrived.
 ///
 /// # Errors

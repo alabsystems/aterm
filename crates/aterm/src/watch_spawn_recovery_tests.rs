@@ -4,9 +4,9 @@
 //! Scratch plans at the common worker, park poll and retiring-watch boundaries.
 
 use super::{
-    AlabWatch, SetupWatch, WatchMaintenance, WatchReservation, maintain_setup_watch_with,
-    read_setup_park_mark_with, run_reserved_alab_watch, wait_for_setup_park_change,
-    widen_on_alab_signal, with_setup_watch,
+    AlabWatch, SetupWatch, WatchMaintenance, WatchReservation, WidenReview,
+    maintain_setup_watch_with, read_setup_park_mark_with, run_reserved_alab_watch,
+    wait_for_setup_park_change, widen_on_alab_signal, with_setup_watch,
 };
 use aterm_cli::macos_doctor::ProvisionalSetupWatchTest;
 use std::cell::Cell;
@@ -77,6 +77,9 @@ impl AlabWatch for ScratchWatch<'_, '_> {
         self.harness.setup.widens()
     }
     fn wait(&mut self, _: Duration, _: Duration) {}
+    fn review(&mut self) -> Result<WidenReview, String> {
+        Ok(WidenReview::Applied)
+    }
     fn look(&mut self) -> Result<Option<u64>, String> {
         // No write faults: the held old watch returns for Stop before any attempt.
         ProvisionalSetupWatchTest::at(self.harness.root).upgrade(None)

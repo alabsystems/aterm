@@ -979,7 +979,8 @@ impl App {
         );
     }
 
-    fn type_into_new_session(&mut self, sid: &str, line: &str) {
+    /// Type `line` and Enter into the session `sid` a tab just opened.
+    pub(crate) fn type_into_new_session(&mut self, sid: &str, line: &str) {
         let found = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
             store

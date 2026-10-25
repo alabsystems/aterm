@@ -2169,7 +2169,7 @@ fn feed_tab_at(app: &crate::App, tab: u64, bytes: &[u8], clock: impl FnOnce() ->
 
 const MUSE_RESET: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[5;3H";
 
-const GEMINI_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
+const BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 
 #[test]
 fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
@@ -2189,7 +2189,7 @@ fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
         "the prompt moved the screen: read in its wake"
     );
 
-    for (n, bytes) in (1_u64..).zip([MUSE_RESET, GEMINI_QUERY, MUSE_RESET]) {
+    for (n, bytes) in (1_u64..).zip([MUSE_RESET, BACKGROUND_QUERY, MUSE_RESET]) {
         let at = t0 + Duration::from_millis(400 * n);
         feed(&app, bytes);
         app.on_output_wake(0, at);
@@ -2230,7 +2230,7 @@ fn a_write_whose_wake_meets_the_term_lock_held_is_judged_by_what_the_reader_fed(
         "the prompt moved the screen: read in its wake"
     );
     let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
-    for (n, bytes) in (1_u64..).zip([MUSE_RESET, GEMINI_QUERY, MUSE_RESET]) {
+    for (n, bytes) in (1_u64..).zip([MUSE_RESET, BACKGROUND_QUERY, MUSE_RESET]) {
         let at = t0 + Duration::from_millis(400 * n);
         feed(&app, bytes);
         let held = term.lock().unwrap_or_else(PoisonError::into_inner);

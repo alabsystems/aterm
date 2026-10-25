@@ -6,11 +6,16 @@
 use std::path::{Path, PathBuf};
 
 /// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
-/// compiles the foreign cells for, on upstream stable.
-pub const FOREIGN_CELL_TARGETS: [&str; 4] = [
+/// compiles its cells for, on upstream stable: every forge cell's triple (this
+/// machine's own is stable's host std, there already). The x86_64 Mac's is also the
+/// shipped binary's x86_64 slice.
+pub const CELL_TARGETS: [&str; 7] = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
-    "aarch64-unknown-linux-gnu",
     "wasm32-unknown-unknown",
 ];
 
@@ -292,14 +297,10 @@ fn observe(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
     }
 }
 
-/// What this row asks stable for on this host: the foreign cells' stds, on macOS the
-/// shipped binary's x86_64 slice first, and with `linux` (`--linux`) the Linux lane's
-/// [`LINUX_LANE_TARGETS`] last.
+/// What this row asks stable for: the cells' stds ([`CELL_TARGETS`]), and with `linux`
+/// (`--linux`) the Linux lane's [`LINUX_LANE_TARGETS`] last.
 fn stable_targets(linux: bool) -> Vec<&'static str> {
-    let mut targets: Vec<&str> = FOREIGN_CELL_TARGETS.to_vec();
-    if cfg!(target_os = "macos") {
-        targets.insert(0, "x86_64-apple-darwin");
-    }
+    let mut targets: Vec<&str> = CELL_TARGETS.to_vec();
     if linux {
         targets.extend(LINUX_LANE_TARGETS);
     }
@@ -715,11 +716,7 @@ mod stateful {
         let rustup = FakeRustup::default();
         let pin = pin();
         {
-            let mut targets: Vec<String> = FOREIGN_CELL_TARGETS
-                .iter()
-                .map(|t| (*t).to_string())
-                .collect();
-            targets.push("x86_64-apple-darwin".into());
+            let targets: Vec<String> = CELL_TARGETS.iter().map(|t| (*t).to_string()).collect();
             let mut s = rustup.0.borrow_mut();
             s.rustup = true;
             s.auto_install_off = true;

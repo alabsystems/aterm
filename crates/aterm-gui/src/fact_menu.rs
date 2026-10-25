@@ -202,6 +202,14 @@ pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
             "Code's settings have one of them, so the",
             "harness reads no figure for it.",
         ],
+        WeeklyGap::Unoffered(Refusal::Room) => &[
+            "The line aterm would type to relaunch",
+            "this Claude Code has no room left on the",
+            "tty for its usage tap (a long directory",
+            "or many options), so a relaunch would",
+            "not add it and the harness reads no",
+            "figure for it.",
+        ],
         WeeklyGap::Untapped => &[
             "This Claude Code was started without",
             "aterm's usage tap, and the next relaunch",
@@ -947,15 +955,13 @@ pub(crate) fn account_menu_rows_from(
     let session_row = match session.label.as_deref().or(session_account) {
         Some(label) => roster.row(label).filter(|row| {
             session_email.is_none_or(|email| {
-                row.email
-                    .as_deref()
+                row.expected_identity_email()
                     .is_none_or(|expected| accounts::email_matches(expected, email))
             })
         }),
         None => session_email.and_then(|email| {
             roster.rows.iter().find(|row| {
-                row.email
-                    .as_deref()
+                row.expected_identity_email()
                     .is_some_and(|expected| accounts::email_matches(expected, email))
             })
         }),
@@ -1092,7 +1098,6 @@ impl App {
                     | aterm_phase::Program::Codex
                     | aterm_phase::Program::Grok
                     | aterm_phase::Program::Kimi
-                    | aterm_phase::Program::Gemini
                     | aterm_phase::Program::Generic,
                 ) => true,
             };

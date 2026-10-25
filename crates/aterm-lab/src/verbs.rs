@@ -891,25 +891,13 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
             run.muse_ver
         );
     }
-    if matches!(run.agent(), "gemini" | "agy") {
-        let (name, ver, how) = if run.agent() == "gemini" {
-            (
-                "gemini-cli",
-                &run.gemini_ver,
-                "the real Gemini CLI, launched by path with a scratch `HOME` whose settings select the API-key auth,",
-            )
-        } else {
-            (
-                "agy",
-                &run.agy_ver,
-                "the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API \
-                 provider, its Google hosts black-holed,",
-            )
-        };
+    if run.agent() == "agy" {
         return format!(
-            "# {name} {ver} · MEASURED {day}, `aterm ctl text` of a private headless aterm ({size}, aterm {av}) running \
-             {how} a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the \
-             Gemini API, crates/aterm-lab) · {what}"
+            "# agy {} · MEASURED {day}, `aterm ctl text` of a private headless aterm ({size}, aterm {av}) running \
+             the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API \
+             provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and \
+             `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · {what}",
+            run.agy_ver
         );
     }
     if run.agent() == "codex" {

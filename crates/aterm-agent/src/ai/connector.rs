@@ -175,7 +175,7 @@ impl Cli {
             Program::Codex => Some(Cli::Codex),
             Program::Grok => Some(Cli::Grok),
             Program::Kimi => Some(Cli::Kimi),
-            Program::Agy | Program::Muse | Program::Gemini | Program::Generic => None,
+            Program::Agy | Program::Muse | Program::Generic => None,
         }
     }
 

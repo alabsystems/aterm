@@ -196,3 +196,36 @@ fn a_keys_proven_prediction_on_glass_closes_its_input_slice() {
         );
     }
 }
+
+/// A mixed tab (a terminal leaf beside a Settings leaf) paints no predictions, so its keys arm
+/// none: a guess nothing draws would only expire, owe and wake frames for nothing. The same key
+/// in a terminal tab arms one.
+#[test]
+fn a_mixed_tab_arms_no_prediction_it_cannot_paint() {
+    let at = crate::app_input::past_timeline_start();
+    let mut control = rig("always", false);
+    press_at(&mut control, glyph('c'), at);
+    assert!(
+        !control.windows[&WID].predictor.idle(),
+        "precondition: a terminal tab's key arms a guess"
+    );
+
+    let mut app = scripted_app();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let _ = app.split_active_with_stub_terminal(WID, crate::tab_model::SplitAxis::Horizontal);
+    app.windows.get_mut(&WID).expect("window").focused = true;
+    app.config.predictive_echo = Some("always".to_string());
+    app.predict_mode_cache = None;
+    feed(&app, "$ ");
+    app.redraw_window(WID);
+    assert_eq!(
+        app.active_visible_frame_layout(WID).map(|(_, route)| route),
+        Some(crate::VisibleContentRoute::Heterogeneous),
+        "precondition: a mixed tab with its terminal leaf focused"
+    );
+    press_at(&mut app, glyph('c'), at);
+    assert!(
+        app.windows[&WID].predictor.idle(),
+        "the mixed tab's key arms no guess"
+    );
+}

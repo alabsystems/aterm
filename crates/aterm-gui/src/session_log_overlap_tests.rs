@@ -763,7 +763,11 @@ fn program_report(
     state: aterm_core::terminal::program_state::ProgramStateWord,
     kind: Option<aterm_core::terminal::program_state::ProgramBlockedKind>,
 ) -> aterm_core::terminal::program_state::ProgramState {
-    aterm_core::terminal::program_state::ProgramState { state, kind }
+    aterm_core::terminal::program_state::ProgramState {
+        state,
+        kind,
+        app: aterm_core::terminal::program_state::ProgramApp::Codex,
+    }
 }
 
 /// THE PROGRAM MARKS ARE THE ROWS UNDER THEIR RETENTION RULE (6F-4; U39,

@@ -2702,7 +2702,7 @@ mod tests {
             atpkg::state::shadowed(1971, p("/Users//dev/.local/bin/ay")),
             atpkg::state::system(p("/opt/homebrew/bin/gh"), None),
             atpkg::state::AGENT_INSTALLING.to_string(),
-            "extra — not installed (opt in: aterm pkg install gemini)".to_string(),
+            "extra — not installed (opt in: aterm pkg install ty)".to_string(),
             "needs admin — run: aterm pkg install clt".to_string(),
             "unavailable on x86_64-apple-darwin: no build is published for this target".to_string(),
             "blocked by clt: needs admin — run: aterm pkg install clt".to_string(),

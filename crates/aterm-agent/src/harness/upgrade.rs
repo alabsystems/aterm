@@ -162,7 +162,6 @@ pub enum Agent {
     Codex,
     Agy,
     Muse,
-    Gemini,
 }
 
 const fn next_agent(agent: Agent) -> Option<Agent> {
@@ -170,8 +169,7 @@ const fn next_agent(agent: Agent) -> Option<Agent> {
         Agent::Claude => Some(Agent::Codex),
         Agent::Codex => Some(Agent::Agy),
         Agent::Agy => Some(Agent::Muse),
-        Agent::Muse => Some(Agent::Gemini),
-        Agent::Gemini => None,
+        Agent::Muse => None,
     }
 }
 
@@ -187,13 +185,7 @@ const _: () = {
 };
 
 impl Agent {
-    pub const ALL: [Agent; 5] = [
-        Agent::Claude,
-        Agent::Codex,
-        Agent::Agy,
-        Agent::Muse,
-        Agent::Gemini,
-    ];
+    pub const ALL: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Agy, Agent::Muse];
 
     /// All non-Claude agents in the fixed order visited by live upgrade passes.
     #[must_use]
@@ -209,7 +201,6 @@ impl Agent {
             Agent::Codex => Some("codex-"),
             Agent::Muse => Some("muse-"),
             Agent::Agy => Some("agy-"),
-            Agent::Gemini => Some("gemini-"),
         }
     }
 
@@ -242,7 +233,6 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::Agy => "agy",
             Agent::Muse => "muse",
-            Agent::Gemini => "gemini",
         }
     }
 
@@ -254,7 +244,6 @@ impl Agent {
             "codex" => Some(Agent::Codex),
             "agy" => Some(Agent::Agy),
             "muse" => Some(Agent::Muse),
-            "gemini" => Some(Agent::Gemini),
             _ => None,
         }
     }
@@ -273,7 +262,6 @@ impl Agent {
             Agent::Codex => aterm_phase::Program::Codex,
             Agent::Agy => aterm_phase::Program::Agy,
             Agent::Muse => aterm_phase::Program::Muse,
-            Agent::Gemini => aterm_phase::Program::Gemini,
         }
     }
 
@@ -285,7 +273,6 @@ impl Agent {
             aterm_phase::Program::Codex => Some(Agent::Codex),
             aterm_phase::Program::Agy => Some(Agent::Agy),
             aterm_phase::Program::Muse => Some(Agent::Muse),
-            aterm_phase::Program::Gemini => Some(Agent::Gemini),
             aterm_phase::Program::Grok
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Generic => None,
@@ -512,8 +499,25 @@ pub(super) fn carried_names(argv: &[String]) -> Result<Vec<&str>, ArgvRefusal> {
     Ok(carried(argv)?.into_iter().map(|(name, _)| name).collect())
 }
 
-fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
+/// Each option of an argv as [`parsed`] reads it: its name, its fate where a table knows it, and
+/// its tokens (the name and the values it took).
+type Options<'a> = Vec<(&'a str, Option<Fate>, &'a [String])>;
+
+fn parsed(argv: &[String]) -> Options<'_> {
+    walked(argv).0
+}
+
+/// The first operand of `argv` (`argv[0]` first) before a literal `--`, as Claude's parser
+/// reads one: a token no option takes as its value (a prompt, or a subcommand's name).
+#[must_use]
+pub(super) fn first_operand(argv: &[String]) -> Option<&str> {
+    walked(argv).1
+}
+
+/// [`parsed`]'s options, and the first operand it stepped over ([`first_operand`]).
+fn walked(argv: &[String]) -> (Options<'_>, Option<&str>) {
     let mut out = Vec::new();
+    let mut operand = None;
     let mut i = 1;
     while i < argv.len() {
         let tok = &argv[i];
@@ -521,6 +525,7 @@ fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
             break;
         }
         if !maybe_option(tok) {
+            operand = operand.or(Some(tok.as_str()));
             i += 1;
             continue;
         }
@@ -558,7 +563,7 @@ fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
         }
         out.push((name, known.map(|(_, fate)| fate), &argv[start..i]));
     }
-    out
+    (out, operand)
 }
 
 const ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
@@ -828,6 +833,13 @@ fn with_store_env(
     })
 }
 
+/// What a bash relaunch line that changes directory opens with when no heal precedes it: a
+/// simple command. bash's DEBUG trap fires before simple commands only, and bash before 5.3 has
+/// no PS0 hook (5.3's sees only a line bash saved to history, never a space-led one), so a line
+/// that opened with its subshell ran with no command block, no `cmd` run and no exit code: the
+/// relaunch's own run never opened, and nothing could lift the failure it followed (6C-1).
+pub(super) const BASH_LINE_OPENS: &str = "builtin :; ";
+
 fn relaunch_line_on(
     tty: LineDiscipline,
     dialect: Dialect,
@@ -952,6 +964,9 @@ fn relaunch_line_exact(
         }
         Some(dir) => match dialect {
             Dialect::Zsh | Dialect::Bash => {
+                if dialect == Dialect::Bash && heal.is_none() {
+                    line.push_str(BASH_LINE_OPENS);
+                }
                 let _ = write!(
                     line,
                     "( cd -- {} && {vars}exec {cmd} )",

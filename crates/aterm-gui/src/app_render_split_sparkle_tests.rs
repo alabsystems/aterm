@@ -571,3 +571,30 @@ fn translate_ink_and_nova_shift_and_clip_at_the_divider() {
     );
     assert_eq!(nova[0].row, 2, "a top pane's row hint is unshifted");
 }
+
+/// A mixed tab never ticks or draws the word decorations, so once a mixed frame was drawn their
+/// live episodes buy the window no frame cadence; under a terminal frame they do.
+#[test]
+fn a_mixed_frame_buys_word_decorations_no_frame_cadence() {
+    let t0 = Instant::now();
+    let (mut app, wid, _) = split_app(t0);
+    let route = app
+        .active_visible_content_route(wid)
+        .expect("a visible route");
+    let _ = app.prepare_layout_coordinate_space(wid, route);
+    compose(&mut app, wid, t0);
+    let ws = app.windows.get_mut(&wid).expect("window");
+    assert!(ws.fx.decos().is_active(t0), "PRECONDITION: live episodes");
+    assert!(
+        ws.cursor_dependents_need_frame_cadence(t0, true),
+        "control: under the terminal frame the episodes buy cadence"
+    );
+    ws.last_layout_coordinate_space
+        .as_mut()
+        .expect("PRECONDITION: the frame's coordinate space")
+        .route = crate::VisibleContentRoute::Heterogeneous;
+    assert!(
+        !ws.cursor_dependents_need_frame_cadence(t0, true),
+        "a mixed frame's undrawn episodes buy none"
+    );
+}

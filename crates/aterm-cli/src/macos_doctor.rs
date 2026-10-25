@@ -21,15 +21,16 @@ pub use initial::{
     SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, alab_mac, apply_initial_setup,
     apply_initial_setup_observed, automatic_plan, bring_forward_restored_setup,
     bring_forward_restored_setup_observing, check_initial_setup, check_initial_setup_observed,
-    forget_set_aside_setup, initial_setup_access_revision, initial_setup_access_step,
-    initial_setup_admission, initial_setup_finished, initial_setup_keeps_vault_sync,
-    initial_setup_observation, initial_setup_park_mark, initial_setup_review_revision,
-    initial_setup_revision, initial_setup_snapshot, observe_initial_setup,
-    probe_local_network_again, provisional_setup_widens, put_back_held_initial_setup,
+    decline_provisional_setup_widen, forget_set_aside_setup, initial_setup_access_revision,
+    initial_setup_access_step, initial_setup_admission, initial_setup_finished,
+    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_park_mark,
+    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_snapshot_offering, observe_initial_setup, probe_local_network_again,
+    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
     request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
     run_initial_setup_pass, set_aside_unreadable_setup, set_aside_unreadable_setup_observing,
-    setup_is_newer, setup_records_held, upgrade_provisional_setup, validate_initial_setup_plan,
-    vault_config_unread, with_initial_setup_vault_sync,
+    setup_is_newer, setup_records_held, validate_initial_setup_plan, vault_config_unread,
+    with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -140,20 +141,13 @@ impl Report {
             .map(|row| row.detail.as_str())
     }
 
-    /// Whether a setting or account remains out of policy, blocked, unverified or failed, for
-    /// now or for good.
+    /// Whether a setting or account remains out of policy, blocked, unverified or failed.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         self.rows.iter().any(|r| {
             matches!(
                 r.status.as_str(),
-                "drift"
-                    | "error"
-                    | "blocked"
-                    | "waiting"
-                    | "unreached"
-                    | "unverified"
-                    | aterm_types::macos_setup::FAILED_FOR_GOOD
+                "drift" | "error" | "blocked" | "waiting" | "unreached" | "unverified"
             )
         })
     }

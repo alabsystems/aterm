@@ -252,6 +252,65 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         (result, ticket.join_unread())
     }
 
+    /// The startup review's Cancel of this scratch plan, through the ticket's real writer
+    /// ([`InitialSetupAuthorization::cancel_observed`]): whether it recorded the Cancel.
+    pub fn cancel(&mut self) -> Result<bool, String> {
+        let plan = self.plan.clone();
+        let Owner::Startup(ticket) = &mut self.owner else {
+            panic!("the scratch owner is a choice, not a startup review");
+        };
+        observe_mutation_at(self.root, None, Err("busy".into()), |root| {
+            ticket.cancel_at(root, &plan)
+        })
+        .result
+    }
+
+    /// Set up now, as System State sends it (no group changed), through the real writer.
+    pub fn set_up_now(&self) -> Result<Option<u64>, String> {
+        observe_mutation_at(self.root, None, Err("busy".into()), |root| {
+            InitialSetupRestart::default()
+                .changing(Some(Selection::none()))
+                .persist_with(
+                    root,
+                    &Plan::from(Selection::none()),
+                    false,
+                    || Ok(None),
+                    save_progress,
+                    |root| observation_at(root).map_err(|error| error.to_string()),
+                )
+        })
+        .result
+    }
+
+    /// A group choice of `settings` set up, sent as System State sends one after a Cancel (the
+    /// page's plan with the pressed group, that group changed), through the real writer.
+    pub fn choose_group(&self, settings: &[Setting]) -> Result<Option<u64>, String> {
+        let mut changed = Selection::none();
+        for setting in settings {
+            changed.set(*setting, true);
+        }
+        // A page still showing every group at Set up sends them all: only the press counts.
+        let plan = Plan::default();
+        observe_mutation_at(self.root, None, Err("busy".into()), |root| {
+            InitialSetupRestart::chosen()
+                .changing(Some(changed))
+                .persist_with(
+                    root,
+                    &plan,
+                    false,
+                    || Ok(None),
+                    save_progress,
+                    |root| observation_at(root).map_err(|error| error.to_string()),
+                )
+        })
+        .result
+    }
+
+    /// The plan the saved records hold, as written (not as presented).
+    pub fn saved_plan(&self) -> Result<Option<Plan>, String> {
+        saved_plan(self.root)
+    }
+
     pub fn snapshot(&self) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
         snapshot_at(self.root, Plan::default())
     }

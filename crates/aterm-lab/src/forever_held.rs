@@ -348,8 +348,8 @@ pub fn with_held(s: Scenario, seen: &Seen, cx: &Ctx<'_>, v: Verdict) -> Verdict 
 /// THE HOLD STANDS (limit 1, §14.10: a tab aterm stopped stays stopped): no lift before the next
 /// act ([`lift_of`]), or one on a request of its conversation the stub read between the hold and
 /// the lift (the agent working, someone's turn: [`Seen::lift_stub`]). A lift with none is aterm
-/// reading a reply nobody gave (Gemini CLI redrawing land-d's tall reply as its tab comes in
-/// front): HELD, THEN LIFTED WITH NO NEW REPLY.
+/// reading a reply nobody gave (an agent redrawing its tall reply as its tab comes in front):
+/// HELD, THEN LIFTED WITH NO NEW REPLY.
 #[must_use]
 pub fn stands(seen: &Seen, cx: &Ctx<'_>, (ts, _): &(i64, String)) -> Verdict {
     let Some((tl, ll)) = lift_of(seen, *ts) else {
@@ -389,8 +389,8 @@ pub fn stands(seen: &Seen, cx: &Ctx<'_>, (ts, _): &(i64, String)) -> Verdict {
 
 /// WHAT IT SAYS: every look in front from [`SETTLE_MS`] past the hold to its lift carries
 /// [`STOP_WORD`] on the chip's description and title where the chip is drawn, and, where a look
-/// read the footless line (`face=- drawn=- why=no-footer`: Gemini CLI's composer has no footer,
-/// until 2c), every hover read in that span does; at least one look within [`PAST_NEXT_STEP_MS`]
+/// read the footless line (`face=- drawn=- why=no-footer`: a program whose composer draws no
+/// footer), every hover read in that span does; at least one look within [`PAST_NEXT_STEP_MS`]
 /// of the hold. A look whose chip a footer would draw but did not (`why=not-drawn` past the
 /// capture's hang detector, `hidden`, `switch-only`) reads nothing: a named UNOBSERVED, never the
 /// hover in its place.

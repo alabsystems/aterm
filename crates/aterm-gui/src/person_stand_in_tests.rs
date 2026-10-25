@@ -481,13 +481,21 @@ fn a_stand_in_press_goes_where_a_click_goes() {
         .and_then(|l| l.split_once("\" enabled=yes"))
         .map(|(label, _)| format!("{label}\""))
         .unwrap_or_else(|| panic!("an action row: {line}"));
+    // The row's age is said from the wall clock, so it may tick between the
+    // read and the press ("landed 0s", then "landed 1s"): the row is the same.
+    let unaged = |said: &str| {
+        said.rsplit_once(" landed ")
+            .map_or_else(|| said.to_string(), |(row, _)| row.to_string())
+    };
     let mut posted = Vec::new();
+    let pressed = app.person_menubar_press(&at, &mut |wake| {
+        posted.push(wake);
+        true
+    });
+    assert!(label.contains(" landed "), "the row says its age: {label}");
     assert_eq!(
-        app.person_menubar_press(&at, &mut |wake| {
-            posted.push(wake);
-            true
-        }),
-        Ok(format!("pressed {label}"))
+        pressed.map(|said| unaged(&said)),
+        Ok(unaged(&format!("pressed {label}")))
     );
     assert!(app.end_unseen(0), "nothing ran before the wake");
     assert_eq!(posted.len(), 1, "one click posted: {posted:?}");

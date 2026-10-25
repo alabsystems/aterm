@@ -757,12 +757,18 @@ struct Terms {
 }
 
 #[inline]
-fn wide(n: usize) -> u64 {
-    u64::try_from(n).unwrap_or(u64::MAX)
+const fn wide(n: usize) -> u64 {
+    n as u64
 }
 
 impl Terms {
     fn v1() -> Terms {
+        let mut grid = Vec::with_capacity(GRID_V1.len());
+        for &(split, wake) in &GRID_V1 {
+            if let Ok(plan) = SchedulePlan::new(split, wake) {
+                grid.push(plan);
+            }
+        }
         Terms {
             stranded_light: NoStrandedLight::artifact(),
             lane_fidelity: LaneFidelity::artifact(),
@@ -782,10 +788,7 @@ impl Terms {
             held_out: HELD_OUT_COUNT,
             items: ITEMS_V1.to_vec(),
             baseline_code: SHIPPED_CODE_NAME,
-            grid: GRID_V1
-                .iter()
-                .filter_map(|&(split, wake)| SchedulePlan::new(split, wake).ok())
-                .collect(),
+            grid,
             rounds: MAX_ROUNDS,
             distinct: MAX_DISTINCT,
             proposal_bytes: MAX_PROPOSAL_BYTES,
@@ -918,7 +921,11 @@ impl AcceptancePolicy {
         let corpus = Corpus::generate().map_err(|_| PolicyRefusal::CorpusDrift {
             item: policy.refused_item(),
         })?;
-        let facts: Vec<ItemFacts<'_>> = corpus.items().iter().map(ItemFacts::of).collect();
+        let items = corpus.items();
+        let mut facts = Vec::with_capacity(items.len());
+        for item in items {
+            facts.push(ItemFacts::of(item));
+        }
         policy.check_corpus(&facts)?;
         policy.check_baseline(&measure(&facts, origin))?;
         Ok(policy)
@@ -941,15 +948,23 @@ impl AcceptancePolicy {
     /// The baseline's `T`, `P` and `Z` summed over `split`.
     #[must_use]
     pub fn totals(&self, split: CorpusSplit) -> Totals {
-        self.terms
-            .items
-            .iter()
-            .filter(|i| i.split == split)
-            .fold(Totals::default(), |t, i| Totals {
-                ticks: t.ticks.saturating_add(i.baseline.ticks),
-                presented: t.presented.saturating_add(i.baseline.presented),
-                wasted: t.wasted.saturating_add(i.baseline.wasted),
-            })
+        let items = self.terms.items.as_slice();
+        let mut t = Totals {
+            ticks: 0,
+            presented: 0,
+            wasted: 0,
+        };
+        let mut i = 0;
+        while i < items.len() {
+            let pin = items[i];
+            if pin.split == split {
+                t.ticks = t.ticks.saturating_add(pin.baseline.ticks);
+                t.presented = t.presented.saturating_add(pin.baseline.presented);
+                t.wasted = t.wasted.saturating_add(pin.baseline.wasted);
+            }
+            i += 1;
+        }
+        t
     }
 
     /// The grid, in [`GRID_V1`]'s order.
@@ -981,11 +996,13 @@ impl AcceptancePolicy {
     #[must_use]
     pub fn base(&self, live: Sched) -> Option<Replace> {
         let code = live.prebuilt()?;
-        self.terms
-            .bases
-            .iter()
-            .find(|&&(name, _)| name == code.artifact_name())
-            .map(|&(_, how)| how)
+        let target = code.artifact_name();
+        for &(name, how) in &self.terms.bases {
+            if name == target {
+                return Some(how);
+            }
+        }
+        None
     }
 
     /// The grade a result under this policy can carry, at most.
@@ -1027,23 +1044,29 @@ impl AcceptancePolicy {
         if let Some(extra) = found.get(self.terms.items.len()) {
             return Err(drift(extra.id));
         }
-        let count = |split| found.iter().filter(|f| f.split == split).count();
-        if count(CorpusSplit::Train) != self.terms.train
-            || count(CorpusSplit::HeldOut) != self.terms.held_out
-        {
+        let mut train_count = 0usize;
+        let mut held_out_count = 0usize;
+        let mut golden = None;
+        let mut parts = Vec::with_capacity(found.len());
+        for f in found {
+            match f.split {
+                CorpusSplit::Train => train_count += 1,
+                CorpusSplit::HeldOut => held_out_count += 1,
+            }
+            match f.body {
+                Body::Trace(bytes) => {
+                    if golden.is_none() {
+                        golden = Some(Digest::of(GOLDEN_TRACE_DOMAIN, &[bytes]));
+                    }
+                }
+                Body::Lane(s) => {
+                    parts.push(item_part(f.kind, f.split, &s.encode()));
+                }
+            }
+        }
+        if train_count != self.terms.train || held_out_count != self.terms.held_out {
             return Err(drift(CORPUS_FOLD));
         }
-        let golden = found.iter().find_map(|f| match f.body {
-            Body::Trace(bytes) => Some(Digest::of(GOLDEN_TRACE_DOMAIN, &[bytes])),
-            Body::Lane(_) => None,
-        });
-        let parts: Vec<Vec<u8>> = found
-            .iter()
-            .filter_map(|f| match f.body {
-                Body::Lane(s) => Some(item_part(f.kind, f.split, &s.encode())),
-                Body::Trace(_) => None,
-            })
-            .collect();
         match golden {
             Some(golden) if corpus_digest(&golden, &parts) == self.terms.corpus => Ok(()),
             _ => Err(drift(CORPUS_FOLD)),
@@ -1058,8 +1081,9 @@ impl AcceptancePolicy {
         };
         let items = &self.terms.items;
         for (k, pin) in items.iter().enumerate() {
-            if measured.get(k).is_none_or(|m| m.id != pin.id) {
-                return Err(drift(pin.id, BaselineField::Row));
+            match measured.get(k) {
+                Some(m) if m.id == pin.id => {}
+                _ => return Err(drift(pin.id, BaselineField::Row)),
             }
         }
         if let Some(extra) = measured.get(items.len()) {
@@ -1067,12 +1091,18 @@ impl AcceptancePolicy {
         }
         let classes: [fn(&Measured, &ItemPin) -> Option<BaselineField>; 4] = [
             |m, pin| {
-                (!m.admitted && pin.kind != ItemKind::GoldenTrace)
-                    .then_some(BaselineField::Admitted)
+                if !m.admitted && pin.kind != ItemKind::GoldenTrace {
+                    Some(BaselineField::Admitted)
+                } else {
+                    None
+                }
             },
             |m, pin| {
-                (!m.admitted && pin.kind == ItemKind::GoldenTrace)
-                    .then_some(BaselineField::GoldenHead)
+                if !m.admitted && pin.kind == ItemKind::GoldenTrace {
+                    Some(BaselineField::GoldenHead)
+                } else {
+                    None
+                }
             },
             |m, pin| {
                 let (b, p) = (&m.baseline, &pin.baseline);
@@ -1108,16 +1138,17 @@ impl AcceptancePolicy {
     }
 
     fn refused_item(&self) -> String {
-        self.terms
-            .items
-            .iter()
-            .find(|i| match i.kind {
+        for i in &self.terms.items {
+            let refused = match i.kind {
                 ItemKind::Generated { seed, .. } => scenario(seed).is_err(),
                 ItemKind::M3Story => s0().validate().is_err(),
                 ItemKind::GoldenTrace => false,
-            })
-            .map_or(CORPUS_FOLD, |i| i.id)
-            .to_owned()
+            };
+            if refused {
+                return i.id.to_owned();
+            }
+        }
+        CORPUS_FOLD.to_owned()
     }
 }
 
@@ -1315,20 +1346,19 @@ impl AcceptancePolicy {
 
 /// The shipped baseline on every item of `facts`.
 pub(super) fn measure(facts: &[ItemFacts<'_>], origin: Instant) -> Vec<Measured> {
-    facts
-        .iter()
-        .map(|f| {
-            let (baseline, admitted) = match f.body {
-                Body::Lane(s) => measure_lane(s, origin),
-                Body::Trace(bytes) => measure_trace(bytes, origin),
-            };
-            Measured {
-                id: f.id.to_owned(),
-                baseline,
-                admitted,
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(facts.len());
+    for f in facts {
+        let (baseline, admitted) = match f.body {
+            Body::Lane(s) => measure_lane(s, origin),
+            Body::Trace(bytes) => measure_trace(bytes, origin),
+        };
+        out.push(Measured {
+            id: f.id.to_owned(),
+            baseline,
+            admitted,
+        });
+    }
+    out
 }
 
 const UNMEASURED: Baseline = Baseline {

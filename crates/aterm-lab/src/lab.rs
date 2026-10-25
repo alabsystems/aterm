@@ -197,23 +197,6 @@ pub fn find_codex() -> Option<String> {
     executable_at(c)
 }
 
-/// The Gemini CLI under test: `$LAB_GEMINI` alone, by its physical path.
-#[must_use]
-pub fn find_gemini() -> Option<String> {
-    gemini_named(std::env::var("LAB_GEMINI").ok())
-}
-
-/// [`find_gemini`] on `$LAB_GEMINI`'s value, read by the caller.
-fn gemini_named(named: Option<String>) -> Option<String> {
-    gemini_named_by(named, crate::sys::executable)
-}
-
-/// [`gemini_named`], with `runs` saying which paths are executable.
-fn gemini_named_by(named: Option<String>, runs: impl Fn(&str) -> bool) -> Option<String> {
-    let c = named.filter(|c| !c.is_empty())?;
-    executable_by(crate::paths::from_caller(&c), runs)
-}
-
 /// The Antigravity CLI under test.
 #[must_use]
 pub fn find_agy() -> Option<String> {
@@ -244,29 +227,6 @@ pub fn clean_ver(text: &str) -> String {
     if ok { text.to_string() } else { "?".into() }
 }
 
-/// Gemini CLI's version.
-#[must_use]
-pub fn gemini_version(run: &Run, bin: &str) -> String {
-    let v = Path::new(bin)
-        .ancestors()
-        .skip(1)
-        .take(4)
-        .filter_map(|d| {
-            crate::sys::scratch_read(&d.join("package.json"))
-                .ok()
-                .flatten()
-        })
-        .filter_map(|b| J::parse_bytes(&b).ok())
-        .find(|j| j.get("name").and_then(J::as_str) == Some("@google/gemini-cli"))
-        .and_then(|j| j.get("version").and_then(J::as_str).map(str::to_string))
-        .unwrap_or_default();
-    if v.is_empty() {
-        seeded_version(run, crate::gemini::Agent::Gemini, bin)
-    } else {
-        clean_ver(&v)
-    }
-}
-
 /// agy's version: the `version = "…"` of the record atpkg keeps beside its store build, else
 /// `--version`'s last word ([`seeded_version`]).
 #[must_use]
@@ -280,18 +240,18 @@ pub fn agy_version(run: &Run, bin: &str) -> String {
         .map(|b| vendor_version(&String::from_utf8_lossy(&b)))
         .unwrap_or_default();
     if v.is_empty() {
-        seeded_version(run, crate::gemini::Agent::Agy, bin)
+        seeded_version(run, bin)
     } else {
         clean_ver(&v)
     }
 }
 
-/// `--version`'s last word of Gemini CLI or agy ([`crate::gemini::seed`]).
-fn seeded_version(run: &Run, agent: crate::gemini::Agent, bin: &str) -> String {
-    if crate::gemini::seed(run, agent, &crate::gemini::Launch::default()).is_err() {
+/// `--version`'s last word of agy, run on its seeded scratch home ([`crate::agy::seed`]).
+fn seeded_version(run: &Run, bin: &str) -> String {
+    if crate::agy::seed(run, &crate::agy::Launch::default()).is_err() {
         return "?".into();
     }
-    jailed_version_in(run, bin, &run.w.join(agent.home()), |l| {
+    jailed_version_in(run, bin, &run.w.join(crate::agy::HOME), |l| {
         l.split_whitespace().last()
     })
 }
@@ -1119,9 +1079,6 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     if let Some(c) = find_codex() {
         run.codex_bin = outside("Codex", c)?;
     }
-    if let Some(c) = find_gemini() {
-        run.gemini_bin = outside("Gemini CLI", c)?;
-    }
     if let Some(c) = find_agy() {
         run.agy_bin = outside("agy", c)?;
     }
@@ -1160,8 +1117,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         ),
     );
     let _ = fs::write(
-        w.join(crate::gemini_proof::DECOY),
-        "lab decoy: Gemini CLI and agy run with HOME=gemini-home or agy-home; nothing may be written here\n",
+        w.join(crate::agy_proof::DECOY),
+        "lab decoy: agy runs with HOME=agy-home; nothing may be written here\n",
     );
     run.sockdir = crate::sys::make_temp_dir("/tmp/at.XXXX")
         .map_err(|e| abort(&run, &[], &format!("cannot make a socket dir: {e}")))?;
@@ -1190,7 +1147,6 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         &run.sockdir,
         &run.mark,
     );
-    spec.gemini.clone_from(&run.gemini_bin);
     spec.agy.clone_from(&run.agy_bin);
     spec.muse.clone_from(&run.muse_bin);
     let jail = crate::jail::render(&spec).map_err(|e| abort(&run, &[], &e))?;
@@ -1338,7 +1294,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         "cfg/aterm/aterm.toml",
         &scratch_aterm_toml(&o.aterm_toml, &o.harness_keys),
     );
-    put_tab_shell(&w, &run.run, &run.gemini_bin, &run.port);
+    put_tab_shell(&w, &run.port);
 
     if let Err(e) = start_instance(&mut run, o.scale.as_deref(), o.lifeline) {
         eprint!(
@@ -1389,9 +1345,6 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     }
     if !run.codex_bin.is_empty() {
         run.codex_ver = codex_version(&run, &run.codex_bin);
-    }
-    if !run.gemini_bin.is_empty() {
-        run.gemini_ver = gemini_version(&run, &run.gemini_bin);
     }
     if !run.agy_bin.is_empty() {
         run.agy_ver = agy_version(&run, &run.agy_bin);
@@ -1524,12 +1477,6 @@ pub fn cmd_up(args: &[String]) -> Res {
     }
     for (name, bin, ver, how) in [
         (
-            "gemini",
-            &run.gemini_bin,
-            &run.gemini_ver,
-            "LAB_GEMINI names one; aterm installs none",
-        ),
-        (
             "agy",
             &run.agy_bin,
             &run.agy_ver,
@@ -1565,7 +1512,7 @@ pub fn cmd_up(args: &[String]) -> Res {
 /// # Errors
 /// No such lab, or an `env.sh` whose scratch is not its own.
 pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
-    let mut r = Run::load(tag)?;
+    let mut r = Run::read(tag)?;
     if r.w != r.run.join("scratch") {
         return Err(Fail::die(format!(
             "env.sh of lab '{tag}' names a scratch dir that is not {}/scratch ({}): not touching it",
@@ -1656,7 +1603,6 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         "claude.sh",
         "codex.sh",
         "codex-run.sh",
-        "gemini.sh",
         "agy.sh",
         "muse.sh",
         "jailed.pids",
@@ -1746,38 +1692,22 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
 }
 
 /// What `lab up` writes for its tab shells in scratch `w` ([`tab_profile`]).
-fn put_tab_shell(w: &Path, run: &Path, gemini_bin: &str, port: &str) {
-    let gbin = (!gemini_bin.is_empty()).then(|| run.join("gbin"));
-    if let Some(dir) = &gbin {
-        let _ = crate::sys::put(
-            &dir.join("gemini"),
-            0o755,
-            &crate::sys::PutSrc::Bytes(crate::forever::gemini_wrapper(gemini_bin).as_bytes()),
-        );
-    }
-    let _ = crate::util::atomic_write(
-        &w.join("home/.zshrc"),
-        tab_profile(port, gbin.as_deref()).as_bytes(),
-    );
+fn put_tab_shell(w: &Path, port: &str) {
+    let _ = crate::util::atomic_write(&w.join("home/.zshrc"), tab_profile(port).as_bytes());
 }
 
-/// The lab's tab shells' `.zshrc`, with Gemini CLI pointed at the stub
-/// ([`crate::gemini::LAB_GEMINI_KEY`]).
+/// The lab's tab shells' `.zshrc`: a Gemini API client typed in a tab (agy, which reads
+/// these) is pointed at the stub with the lab's fake key ([`crate::agy::LAB_GEMINI_KEY`]),
+/// never Google's.
 #[must_use]
-pub fn tab_profile(port: &str, gbin: Option<&Path>) -> String {
+pub fn tab_profile(port: &str) -> String {
     let mut s = String::from("PROMPT='lab$ '\n");
-    if let Some(dir) = gbin {
-        s.push_str(&format!(
-            "export PATH={}:\"$PATH\"\n",
-            shell_quote(&dir.to_string_lossy())
-        ));
-    }
     s.push_str(
         "unset GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI GOOGLE_CLOUD_PROJECT GOOGLE_APPLICATION_CREDENTIALS\n",
     );
     s.push_str(&format!(
-        "export GEMINI_API_KEY={} GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{port} NO_BROWSER=true\n",
-        crate::gemini::LAB_GEMINI_KEY
+        "export GEMINI_API_KEY={} GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{port}\n",
+        crate::agy::LAB_GEMINI_KEY
     ));
     s
 }
@@ -1809,7 +1739,7 @@ pub fn cmd_down(args: &[String]) -> Res {
 
 /// One lab's pids, and which of them live.
 fn ps_one(tag: &str) -> Result<(), Fail> {
-    let r = Run::load(tag)?;
+    let r = Run::read(tag)?;
     let roots: Vec<String> = procs::jailed_roots(&r.run, false)
         .iter()
         .map(ToString::to_string)
@@ -2091,67 +2021,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gemini_cli_is_the_one_lab_gemini_names() {
-        let asked = std::cell::RefCell::new(Vec::<String>::new());
-        let every = |p: &str| {
-            asked.borrow_mut().push(p.to_owned());
-            true
-        };
-        assert_eq!(gemini_named_by(None, every), None);
-        assert_eq!(gemini_named_by(Some(String::new()), every), None);
-        assert_eq!(*asked.borrow(), Vec::<String>::new(), "no path asked after");
-        let brew = "/opt/homebrew/bin/gemini";
-        let at =
-            fs::canonicalize(brew).map_or(brew.to_owned(), |p| p.to_string_lossy().into_owned());
-        assert_eq!(gemini_named_by(Some(brew.to_owned()), every), Some(at));
-        assert_eq!(*asked.borrow(), [brew], "the named path, and it alone");
+    fn a_line_typed_in_a_tab_shell_reaches_the_stub_with_the_labs_key() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
-        let build = dir.join("gemini");
-        std::fs::write(&build, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
-        let link = dir.join("link");
-        std::os::unix::fs::symlink(&build, &link).unwrap();
-        let named = |p: &Path| gemini_named(Some(p.to_string_lossy().into_owned()));
-        let physical = Some(build.to_string_lossy().into_owned());
-        assert_eq!(named(&build), physical);
-        assert_eq!(named(&link), physical);
-        assert_eq!(gemini_named(None), None);
-        assert_eq!(gemini_named(Some(String::new())), None);
-        let plain = dir.join("plain");
-        std::fs::write(&plain, "not a program").unwrap();
-        assert_eq!(named(&plain), None);
-    }
-
-    #[test]
-    fn a_line_typed_in_a_tab_shell_runs_gemini_with_the_labs_key() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let dir = tmp.path().canonicalize().unwrap();
-        let build = dir.join("gemini-build");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let build = bin.join("client");
         std::fs::write(
             &build,
-            "#!/bin/sh\nprintf 'key=%s url=%s home=%s args=%s\\n' \"$GEMINI_API_KEY\" \"$GOOGLE_GEMINI_BASE_URL\" \"$HOME\" \"$*\"\n",
+            "#!/bin/sh\nprintf 'key=%s url=%s google=%s args=%s\\n' \"$GEMINI_API_KEY\" \"$GOOGLE_GEMINI_BASE_URL\" \"${GOOGLE_API_KEY-unset}\" \"$*\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
-        let (w, run) = (dir.join("scratch"), dir.join("run"));
-        put_tab_shell(&w, &run, &build.to_string_lossy(), "4242");
+        let w = dir.join("scratch");
+        put_tab_shell(&w, "4242");
         let written = std::fs::read_to_string(w.join("home/.zshrc")).unwrap();
-        let gbin = run.join("gbin");
-        assert_eq!(written, tab_profile("4242", Some(&gbin)));
+        assert_eq!(written, tab_profile("4242"));
+        assert!(!written.contains("PATH"), "{written}");
         let typed = |profile: &str| {
             let rc = dir.join("zshrc");
             std::fs::write(&rc, profile).unwrap();
             let out = aterm_uds::spawnfd::command("/bin/zsh")
-                .args([
-                    "-f",
-                    "-c",
-                    "source \"$1\"; HOME=/elsewhere/gemini-home gemini --resume abc",
-                ])
+                .args(["-f", "-c", "source \"$1\"; client --resume abc"])
                 .arg("zsh")
                 .arg(&rc)
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin")
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("GOOGLE_API_KEY", "an-owner-key")
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -2159,20 +2055,14 @@ mod tests {
         assert_eq!(
             typed(&written),
             format!(
-                "key={} url=http://127.0.0.1:4242 home=/elsewhere/gemini-home args=--resume abc",
-                crate::gemini::LAB_GEMINI_KEY
+                "key={} url=http://127.0.0.1:4242 google=unset args=--resume abc",
+                crate::agy::LAB_GEMINI_KEY
             )
         );
-        assert_eq!(typed("PROMPT='lab$ '\n"), "", "the profile before");
-        let (w, run) = (dir.join("scratch-none"), dir.join("run-none"));
-        put_tab_shell(&w, &run, "", "4242");
-        let none = std::fs::read_to_string(w.join("home/.zshrc")).unwrap();
-        assert_eq!(none, tab_profile("4242", None));
-        assert!(!run.join("gbin").exists(), "no wrapper");
-        assert!(!none.contains("PATH"), "{none}");
-        assert!(
-            none.contains(&format!("GEMINI_API_KEY={}", crate::gemini::LAB_GEMINI_KEY)),
-            "{none}"
+        assert_eq!(
+            typed("PROMPT='lab$ '\n"),
+            "key= url= google=an-owner-key args=--resume abc",
+            "the profile before"
         );
     }
 

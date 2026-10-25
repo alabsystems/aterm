@@ -703,30 +703,41 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 }
 
 /// `base.clt` ([`aterm_machines::init_clt`]): its probe is atpkg's C toolchain probe over
-/// this process's `PATH`, which raises no Apple dialog, and its root half runs from this
-/// executable. `None` when this executable cannot name itself.
+/// this process's `PATH`, which raises no Apple dialog, beside whether Command Line Tools git
+/// is there; its root half runs from this executable. `None` when this executable cannot name
+/// itself.
 #[cfg(target_os = "macos")]
 fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
     let aterm = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
         .ok()?;
     Some(aterm_machines::init_clt::CommandLineTools::new(
-        Box::new(|_: &dyn aterm_machines::port::System| {
-            clt_found(&atpkg::prereq::probe(std::env::var_os("PATH").as_deref()))
+        Box::new(|sys: &dyn aterm_machines::port::System| {
+            clt_found(
+                &atpkg::prereq::probe(std::env::var_os("PATH").as_deref()),
+                aterm_machines::init_github::git_installed(sys),
+            )
         }),
         aterm,
     ))
 }
 
-/// What `base.clt` reads in a C toolchain verdict ([`atpkg::prereq::CcVerdict`]): a
-/// missing developer directory or `cc` is what the install supplies; a compiler that
-/// refuses is installed already (an unaccepted Xcode license, a PATH-first `cc` without an
-/// SDK); a compiler that did not answer is unknown.
+/// What `base.clt` reads in a C toolchain verdict ([`atpkg::prereq::CcVerdict`]) and whether
+/// Command Line Tools git is there (`clt_git`): a missing developer directory or `cc` is what
+/// the install supplies, and so is the tools' git beside a compiler that answers (an
+/// Xcode.app's toolchain alone, which the GitHub setup's clones cannot use: they run the
+/// tools' own git); a compiler that refuses with the tools installed is theirs already (an
+/// unaccepted Xcode license, a PATH-first `cc` without an SDK); a compiler that did not answer
+/// is unknown.
 #[cfg(target_os = "macos")]
-fn clt_found(verdict: &atpkg::prereq::CcVerdict) -> aterm_machines::init_clt::Found {
+fn clt_found(verdict: &atpkg::prereq::CcVerdict, clt_git: bool) -> aterm_machines::init_clt::Found {
     use aterm_machines::init_clt::Found;
     use atpkg::prereq::CcVerdict;
     match verdict {
+        CcVerdict::Ready { .. } | CcVerdict::Broken { .. } if !clt_git => Found::Missing(format!(
+            "Command Line Tools git is not installed ({})",
+            verdict.line()
+        )),
         CcVerdict::Ready { .. } => Found::Present(verdict.line()),
         CcVerdict::NoDeveloperDir => Found::Missing(
             "not installed: no developer directory holds a clang (`/usr/bin/cc` is macOS's \

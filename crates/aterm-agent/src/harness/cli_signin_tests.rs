@@ -1269,8 +1269,12 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
             0,
             &host,
             &store,
-            (&row, &tmp.path().join("accounts-kimi.toml")),
-            None,
+            (
+                &row,
+                &tmp.path().join("accounts-kimi.toml"),
+                &store.load_logins(env.now).unwrap().0,
+            ),
+            row.dir.as_deref(),
             &mut out,
             &mut err,
         )
@@ -1314,8 +1318,12 @@ fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discar
             0,
             &host,
             &store,
-            (row, &tmp.path().join("accounts-kimi.toml")),
-            None,
+            (
+                row,
+                &tmp.path().join("accounts-kimi.toml"),
+                &store.load_logins(env.now).unwrap().0
+            ),
+            row.dir.as_deref(),
             &mut io::sink(),
             &mut io::sink()
         ),
@@ -1468,14 +1476,13 @@ fn codex_signin_staging_adopts_startup_sqlite_and_due_renewals_order_ready_rows_
         db_bytes: "",
         order: std::cell::RefCell::new(Vec::new()),
     };
-    for label in ["kimi-one", "kimi-two"] {
-        let (code, out, err) = renew(
-            &format!("accounts renew {label} --cli kimi"),
-            &kimi_env,
-            &seed,
-        );
-        assert_eq!(code, exit(0), "{out}{err}");
-    }
+    let (code, out, err) = renew(
+        "accounts renew kimi-one kimi-two --cli kimi",
+        &kimi_env,
+        &seed,
+    );
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(*seed.order.borrow(), ["kimi-one", "kimi-two"]);
     kimi_env.now += 40 * 86_400;
     let kimi_store = kimi_env.accounts_store_for(Cli::Kimi).expect("kimi store");
     let mut note = None;

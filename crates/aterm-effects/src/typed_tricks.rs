@@ -51,27 +51,43 @@ pub struct Commands<'a> {
     cuts: Cuts,
 }
 
+/// Iterator over the command surfaces inside a [`Commands`].
+#[derive(Clone, Copy, Debug)]
+pub struct CommandsIter<'a> {
+    word: &'a str,
+    at: u128,
+    name_first: bool,
+}
+
+impl<'a> Iterator for CommandsIter<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at == 0 {
+            return None;
+        }
+        let cut = self.at.trailing_zeros() as usize;
+        self.at &= self.at - 1;
+        let half = if self.name_first {
+            self.word.get(cut..)
+        } else {
+            self.word.get(..cut)
+        };
+        Some(half.unwrap_or(self.word))
+    }
+}
+
 impl<'a> Commands<'a> {
     /// Each command surface as typed: at least one, never empty, never the name.
     #[inline]
-    pub fn iter(self) -> impl Iterator<Item = &'a str> {
-        let Commands {
-            word,
-            cuts: Cuts { mut at, name_first },
-        } = self;
-        std::iter::from_fn(move || {
-            if at == 0 {
-                return None;
-            }
-            let cut = usize::try_from(at.trailing_zeros()).unwrap_or(usize::MAX);
-            at &= at - 1;
-            let half = if name_first {
-                word.get(cut..)
-            } else {
-                word.get(..cut)
-            };
-            Some(half.unwrap_or(word))
-        })
+    #[must_use]
+    pub const fn iter(self) -> CommandsIter<'a> {
+        CommandsIter {
+            word: self.word,
+            at: self.cuts.at,
+            name_first: self.cuts.name_first,
+        }
     }
 }
 
@@ -261,7 +277,7 @@ const fn is_unspaced_script(c: char) -> bool {
 const GLUED_NAME_CHARS: usize = 2;
 
 fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(Trick, Cuts)> {
-    if token.as_bytes().first().is_none_or(u8::is_ascii) {
+    if token.is_empty() || token.as_bytes()[0].is_ascii() {
         return None;
     }
     let mut chars = 0usize;
@@ -275,7 +291,12 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
         return None;
     }
     let mut found: Option<(Trick, Cuts)> = None;
-    for (head_chars, (at, _)) in token.char_indices().enumerate().skip(1) {
+    let mut head_chars = 0usize;
+    for (at, _) in token.char_indices() {
+        if head_chars == 0 {
+            head_chars = 1;
+            continue;
+        }
         let (head, tail) = token.split_at_checked(at)?;
         let head_role = lexicon.classify_glued_half(head, scratch);
         let name_first = match head_role {
@@ -285,12 +306,16 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
             {
                 false
             }
-            Some(_) | None => continue,
+            Some(_) | None => {
+                head_chars += 1;
+                continue;
+            }
         };
         let ((Some(TrickRole::Vocative), Some(TrickRole::Trick { trick, .. }))
         | (Some(TrickRole::Trick { trick, .. }), Some(TrickRole::Vocative))) =
             (head_role, lexicon.classify_glued_half(tail, scratch))
         else {
+            head_chars += 1;
             continue;
         };
         let cut = 1u128.checked_shl(u32::try_from(at).ok()?)?;
@@ -309,6 +334,7 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
             }
             Some(_) => return None,
         }
+        head_chars += 1;
     }
     found
 }
@@ -754,9 +780,19 @@ impl TrickListener {
         if self.line.poisoned || self.line.line_chars == 0 {
             return TrickFeed::NONE;
         }
-        let after_space = self.line.left.is_none_or(char::is_whitespace);
-        let plain_token = self.line.token_is_live()
-            && self.line.token.as_str().chars().all(char::is_alphanumeric);
+        let after_space = match self.line.left {
+            None => true,
+            Some(c) => c.is_whitespace(),
+        };
+        let mut plain_token = self.line.token_is_live();
+        if plain_token {
+            for c in self.line.token.as_str().chars() {
+                if !c.is_alphanumeric() {
+                    plain_token = false;
+                    break;
+                }
+            }
+        }
         let out = if after_space && plain_token {
             self.line.line_chars = self.line.line_chars.saturating_sub(self.line.token_chars);
             self.line.token.clear();
@@ -859,7 +895,7 @@ impl TrickListener {
         } else {
             let run = self.line.gap_chars as usize;
             if (2..=GAP_WINDOW).contains(&run) {
-                self.line.left = self.line.gap.get(run.saturating_sub(2)).copied();
+                self.line.left = Some(self.line.gap[run - 2]);
             } else {
                 out = self.go_impure();
             }
@@ -950,7 +986,7 @@ impl TrickListener {
                 return self.poison();
             }
             let glued = self.line.tail.is_some()
-                || self.line.left.is_some_and(|l| kind_of(l) == Kind::Stop);
+                || matches!(self.line.left, Some(l) if kind_of(l) == Kind::Stop);
             if glued {
                 out = self.go_impure();
             }
@@ -984,7 +1020,7 @@ impl TrickListener {
         match edge {
             Edge::Open => self.deliver_tail(now, fed),
             Edge::Stop => {
-                let run_continues = self.line.left.is_some_and(|l| kind_of(l) == Kind::Stop);
+                let run_continues = matches!(self.line.left, Some(l) if kind_of(l) == Kind::Stop);
                 if run_continues || self.line.any_word || !self.line.pure {
                     None
                 } else {
@@ -1080,10 +1116,10 @@ impl TrickListener {
                 cuts,
             )) => {
                 self.line.any_word = true;
-                let in_phrase = self
-                    .line
-                    .last_fire
-                    .is_some_and(|at| now.saturating_duration_since(at) <= PHRASE_GAP);
+                let in_phrase = matches!(
+                    self.line.last_fire,
+                    Some(at) if now.saturating_duration_since(at) <= PHRASE_GAP
+                );
                 let attention_only =
                     self.line.last_trick == Some(Trick::Look) && trick != Trick::Look;
                 if in_phrase && !attention_only {
@@ -1241,7 +1277,11 @@ impl TrickListener {
         self.line.held = None;
         self.line.tail = None;
         self.line.guess = None;
-        self.line.tentative.take().map(|_| Outcome::Revoke)
+        if self.line.tentative.take().is_some() {
+            Some(Outcome::Revoke)
+        } else {
+            None
+        }
     }
 
     #[cfg_attr(
@@ -1259,7 +1299,11 @@ impl TrickListener {
         self.line.tail = None;
         self.line.guess = None;
         self.snapshot = None;
-        self.line.tentative.take().map(|_| Outcome::Revoke)
+        if self.line.tentative.take().is_some() {
+            Some(Outcome::Revoke)
+        } else {
+            None
+        }
     }
 
     #[inline]

@@ -1016,6 +1016,13 @@ pub(crate) const LOGKEY: &str = "logkey";
 /// The floor of the bus mirror's lifetime total ([`StateDir::logfloor`]).
 pub(crate) const LOGFLOOR: &str = "logfloor";
 
+/// The mode every file of the state directory is made with: the owner's alone, as its records
+/// (`inflight/`, mode 0600) and its key (`logkey`) always were. A post's `key=` (`keys/<sid>`)
+/// and a session's topic names (`topics/<sid>`) are caller text the session log keeps only in a
+/// 0600 journal or as a fingerprint (DESIGN-session-log §10, Phase 6), so the bridge keeps them no
+/// wider; the directory is 0700 besides (`aterm fabric on`'s root step).
+pub(crate) const STATE_FILE_MODE: u32 = 0o600;
+
 /// What [`StateDir::reconcile_logpin`] did with the mirror's pin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Reconciled {
@@ -1387,7 +1394,7 @@ impl StateDir {
                     LOGFLOOR,
                     bytes.as_bytes(),
                     Some(aterm_durable::Flush::Durable),
-                    0o666,
+                    STATE_FILE_MODE,
                     std::convert::identity,
                 )?;
                 self.floor_admitted
@@ -1402,7 +1409,7 @@ impl StateDir {
         match self.logfloor()? {
             Some(floor) if floor >= top => Ok(floor),
             _ => {
-                self.replace(LOGFLOOR, &top.to_string(), true, 0o666)?;
+                self.replace(LOGFLOOR, &top.to_string(), true, STATE_FILE_MODE)?;
                 Ok(top)
             }
         }
@@ -1647,11 +1654,11 @@ impl StateDir {
     }
 
     fn write(&self, name: &str, value: &str) -> io::Result<()> {
-        self.replace(name, value, false, 0o666)
+        self.replace(name, value, false, STATE_FILE_MODE)
     }
 
     fn write_durable(&self, name: &str, value: &str) -> io::Result<()> {
-        self.replace(name, value, true, 0o666)
+        self.replace(name, value, true, STATE_FILE_MODE)
     }
 
     /// Whether what reads at `name` is on the media as far as this open knows.
@@ -2041,7 +2048,7 @@ impl StateDir {
             "acked",
             AckedLog::render(set.iter().skip(over).copied()).as_bytes(),
             false,
-            0o666,
+            STATE_FILE_MODE,
         )
     }
 
@@ -2061,7 +2068,7 @@ impl StateDir {
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
-            .mode(0o666)
+            .mode(STATE_FILE_MODE)
             .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
             .open(&path)?;
         let metadata = file.metadata()?;
@@ -2683,7 +2690,13 @@ impl StateDir {
             (true, false) => Some(Flush::Ordered),
             (true, true) => Some(tier),
         };
-        self.replace_bytes_as_with("run", &bytes, flush, 0o666, std::convert::identity)?;
+        self.replace_bytes_as_with(
+            "run",
+            &bytes,
+            flush,
+            STATE_FILE_MODE,
+            std::convert::identity,
+        )?;
         match flush {
             Some(Flush::Durable) => flushed.note(flush, 2),
             Some(Flush::Ordered) => {
@@ -2800,7 +2813,7 @@ impl StateDir {
         };
         let mut record = clean.render().into_bytes();
         record.push(b'\n');
-        self.replace_bytes_as("run", &record, Some(Flush::Ordered), 0o666)?;
+        self.replace_bytes_as("run", &record, Some(Flush::Ordered), STATE_FILE_MODE)?;
         flushed.note(Some(Flush::Ordered), 1);
         self.flush_dir_as(&self.root, Flush::Durable)?;
         flushed.note(Some(Flush::Durable), 1);
@@ -3639,6 +3652,59 @@ mod tests {
         assert_eq!(st.topics("s-x"), good, "the neighbours survive");
         st.forget_topics("s-x");
         assert!(st.topics("s-x").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EVERY FILE THE STATE DIRECTORY HOLDS IS THE OWNER'S ALONE ([`STATE_FILE_MODE`]): a post's
+    /// `key=` and a session's topic names are caller text, kept no wider than the 0600 journal
+    /// keeps the key, whatever the umask lets a plain create make.
+    #[test]
+    fn every_file_the_state_directory_holds_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("modes");
+        let st = StateDir::open(&dir).expect("open");
+        st.set_key_seq("s-x", "QZP6KEY", 7).expect("a key");
+        let mut topics = BTreeMap::new();
+        topics.insert("build.done".to_string(), TopicCursor { next: 3 });
+        st.set_topics("s-x", &topics).expect("topics");
+        let mut floors = BTreeMap::new();
+        floors.insert("build.done".to_string(), 3);
+        st.set_topic_floors("s-x", &floors).expect("floors");
+        st.set_seen_off("s-x", 9).expect("seen");
+        st.set_halt_acked(4).expect("halt-acked");
+        st.set_inbox_owed(5).expect("inbox-owed");
+        st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 8)
+            .expect("acked");
+        st.append_self_acked(3).expect("acked, appended");
+        st.raise_logfloor(11).expect("logfloor");
+        let mut seen = Vec::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("a dir").flatten() {
+                let meta = e.metadata().expect("meta");
+                if meta.is_dir() {
+                    stack.push(e.path());
+                } else {
+                    let rel = e.path().strip_prefix(&dir).expect("under").to_path_buf();
+                    seen.push((rel, meta.permissions().mode() & 0o777));
+                }
+            }
+        }
+        seen.sort();
+        for want in [
+            "keys/s-x",
+            "topics/s-x",
+            "unhandled/s-x",
+            "acked",
+            "logfloor",
+        ] {
+            assert!(
+                seen.iter().any(|(rel, _)| rel == Path::new(want)),
+                "{want} written: {seen:?}"
+            );
+        }
+        let wide: Vec<_> = seen.iter().filter(|(_, m)| m & 0o077 != 0).collect();
+        assert!(wide.is_empty(), "files others may read: {wide:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

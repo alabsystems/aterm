@@ -121,10 +121,6 @@ pub fn composer_row(agent: &str, screen: &str) -> Option<String> {
         }
         return Some(rows[at].trim_start_matches('›').trim().to_string());
     }
-    if agent == "gemini" {
-        let (_, lines) = aterm_phase::gemini::composer_draft(&rows)?;
-        return lines.into_iter().next();
-    }
     if agent == "agy" {
         let (_, lines) = aterm_phase::agy::composer_draft(&rows)?;
         return lines.into_iter().next();
@@ -315,31 +311,6 @@ mod tests {
             composer_row("codex", &idle).as_deref(),
             Some("Ask Codex to do anything")
         );
-    }
-
-    #[test]
-    fn gemini_cli_s_composer_is_the_band_its_reader_finds() {
-        use aterm_phase::gemini::fixtures as f;
-        let body = |fixture: &str| fixture.split_once('\n').map_or("", |(_, b)| b).to_string();
-        for (fixture, draft) in [
-            (f::DRAFT, "a draft the lab never sends"),
-            (f::NARROW_DRAFT, "count in a narrow pane"),
-            (f::YOLO_DRAFT, "hello in yolo"),
-            (f::DETAILS_HIDDEN_DRAFT, "a hidden draft"),
-            (f::IDLE, ""),
-            (f::NARROW_IDLE, ""),
-            (f::END_OF_TURN, ""),
-        ] {
-            assert_eq!(
-                composer_row("gemini", &body(fixture)).as_deref(),
-                Some(draft),
-                "{}",
-                fixture.lines().next().unwrap_or_default()
-            );
-        }
-        assert_eq!(composer_row("gemini", &body(f::BOX_SHELL)), None);
-        assert_eq!(composer_row("gemini", &body(f::SHELL_MODE_DRAFT)), None);
-        assert_eq!(composer_row("gemini", "no frame"), None);
     }
 
     /// agy 1.4.0: a sent prompt sits under a 60-column rule, the composer

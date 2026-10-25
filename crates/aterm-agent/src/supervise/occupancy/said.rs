@@ -4,7 +4,8 @@
 //! What the door says to its host (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6).
 
 use super::door::PaceGrant;
-use super::reading::OccupancyReading;
+use super::due::K_LOOKS;
+use super::reading::{LOOK_EVERY_MS, OccupancyReading};
 use super::rules::{self, Guards, RuleId};
 use crate::harness::disk::Level;
 use crate::supervise::Guard;
@@ -33,6 +34,8 @@ pub enum SaidVerdict {
     Paced,
     /// Its cap is spent.
     Spent,
+    /// Due, and a line ranked before it went at the break ([`rules::rank`]): it stays due.
+    Outranked,
     /// Under `prompt`: typed.
     Typed,
     /// Under `prompt`: its write wrote nothing, and why.
@@ -53,6 +56,7 @@ impl SaidVerdict {
             SaidVerdict::Held(guard) => format!("held:{}", guard.word()),
             SaidVerdict::Paced => "paced".to_string(),
             SaidVerdict::Spent => "spent".to_string(),
+            SaidVerdict::Outranked => "outranked".to_string(),
             SaidVerdict::Typed => "typed".to_string(),
             SaidVerdict::Skipped(why) => format!("skipped why={why}"),
             SaidVerdict::Told => "told".to_string(),
@@ -88,6 +92,16 @@ pub struct SaidReadyIdle {
     pub since_ms: i64,
 }
 
+/// The wake the break judged ([`rules::wake_opens`]), as the host is told it: its ordinal and
+/// when its condition first held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaidWake {
+    /// Its ordinal in the session's book.
+    pub ord: u16,
+    /// When its condition first held, unix ms (its declaration's, where the book has none).
+    pub since_ms: i64,
+}
+
 /// The door's state as the host is told it, once per change.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OccupancySaid {
@@ -110,10 +124,14 @@ pub struct OccupancySaid {
     /// replay of a recording without slice 2's doors (`Fx::slice2_recorded`), so its told words
     /// compare as recorded.
     pub ready_idle: Option<SaidReadyIdle>,
+    /// The wake the last break judged ([`SaidWake`]): `None` on a replay of a recording without
+    /// slice 2's doors, as `ready_idle` is.
+    pub wake: Option<SaidWake>,
 }
 
-/// The derived form, with `ready_idle` printed only when set: a told word without it prints as
-/// slice 1's builds printed it, so a tape that compares a told word's `Debug` replays unchanged.
+/// The derived form, with `ready_idle` and `wake` printed only when set: a told word without
+/// them prints as slice 1's builds printed it, so a tape that compares a told word's `Debug`
+/// replays unchanged.
 impl std::fmt::Debug for OccupancySaid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("OccupancySaid");
@@ -126,6 +144,9 @@ impl std::fmt::Debug for OccupancySaid {
             .field("reading", &self.reading);
         if let Some(ready_idle) = &self.ready_idle {
             s.field("ready_idle", ready_idle);
+        }
+        if let Some(wake) = &self.wake {
+            s.field("wake", wake);
         }
         s.finish()
     }
@@ -141,6 +162,7 @@ impl OccupancySaid {
             && self.guards == other.guards
             && self.rules == other.rules
             && self.ready_idle == other.ready_idle
+            && self.wake == other.wake
     }
 
     /// The due line past K looks the tab's `ready-idle` Entry names: under `prompt` alone, with
@@ -188,8 +210,8 @@ impl OccupancySaid {
 
 /// The rules a told word carries ([`OccupancySaid::rules`]), in [`RuleId::ALL`]'s order: every
 /// rule when the recording's host had slice 2's doors (`slice2`), else slice 1's alone
-/// ([`RuleId::slice1`]), so an older tape's told words replay byte for byte. Every rule is
-/// slice 1's so far.
+/// ([`RuleId::slice1`]), so an older tape's told words replay byte for byte: `wake@v1` is slice
+/// 2's.
 #[must_use]
 pub fn told_rules(slice2: bool) -> Vec<RuleId> {
     RuleId::ALL
@@ -204,6 +226,7 @@ pub fn cap_words(rule: RuleId) -> String {
     match rule {
         RuleId::WaitNudge => format!("{} nudges today", rules::NUDGES_PER_DAY),
         RuleId::HoldRoom => format!("{} hold-room asks this hold", rules::HOLD_ROOM_PER_HOLD),
+        RuleId::Wake => "1 line a wake".to_string(),
     }
 }
 
@@ -256,12 +279,28 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
         } else {
             String::new()
         };
+        if let (RuleId::Wake, Some(wake), SaidVerdict::Held(guard)) =
+            (said_rule.rule, said.wake, said_rule.verdict)
+        {
+            lines.push(wake_held_line(wake, guard, offset_s));
+            continue;
+        }
         let head = format!(
             "{} rev=builtin {}{when}:",
             said_rule.rule.name(),
             said_rule.verdict.words()
         );
         let terms = match said_rule.rule {
+            RuleId::Wake => said.wake.map_or_else(
+                || "no wake ready".to_string(),
+                |wake| {
+                    format!(
+                        "wake #{} since {}",
+                        wake.ord,
+                        clock_words(wake.since_ms, offset_s)
+                    )
+                },
+            ),
             RuleId::WaitNudge => format!(
                 "hold {} {}  undeclared {}",
                 span_words(held),
@@ -305,6 +344,21 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
     }
     lines.push(guards_line(said.guards));
     lines
+}
+
+/// F14's wake line: `wake #<n> held: <guard> (since HH:MM; K at HH:MM)`, K the window's K looks
+/// past the wake's condition holding.
+fn wake_held_line(wake: SaidWake, guard: Guard, offset_s: i64) -> String {
+    let k_ms = wake
+        .since_ms
+        .saturating_add(K_LOOKS.saturating_mul(LOOK_EVERY_MS));
+    format!(
+        "wake #{} held: {} (since {}; K at {})",
+        wake.ord,
+        guard.word(),
+        clock_words(wake.since_ms, offset_s),
+        clock_words(k_ms, offset_s)
+    )
 }
 
 fn guards_line(guards: Option<Guards>) -> String {

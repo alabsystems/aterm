@@ -548,6 +548,7 @@ fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
 
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     let env = crate::findings::rerun_env(cmd, ctx.test_threads);
+    let cmd = &cmd.clone().counting_waits();
     run_child(ctx, r, label, cmd, |r, run, label| {
         r.decide_test_child(run, label, &env);
     })
@@ -732,7 +733,7 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     let (k, v) = TRAIL_LAWS_FULL;
     [
         cmd(test_compile_args(&ctx.scope)).demoted(),
-        cmd(test_run_args(&ctx.scope)).env(k, v),
+        cmd(test_run_args(&ctx.scope)).env(k, v).counting_waits(),
     ]
 }
 
@@ -796,17 +797,30 @@ fn test(ctx: &Ctx, r: &mut Report) {
 }
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
-pub const NO_APP: &str = "(no release bundle to judge — fix: pass --app <path to aterm.app>)";
+pub const NO_APP: &str = "(no release bundle to judge — fix: pass --app <path to aterm.app>; \
+                          `targo --unverified ship dev-app --no-install` assembles this checkout's \
+                          as dist/aterm (dev).app)";
 
 const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
 const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
 
+/// `--no-windows` for the measuring matrices: each leaves out its rows that open a window.
+const MEASURE_NO_WINDOWS: &str = "ATERM_MEASURE_NO_WINDOWS";
+
+/// The named skip of the measuring rows `--no-windows` leaves out.
+const MEASURE_WINDOW_ROWS_SKIP: &str = "spin's window row (--no-windows: it opens a window on the \
+                                        desktop — fix: run without --no-windows when the desktop \
+                                        is free)";
+
 fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
     let label = format!("targo {}", args[1..].join(" "));
     let bin = artifact.bin("aterm");
-    let cmd = main_targo(ctx, args)
+    let mut cmd = main_targo(ctx, args)
         .env(RELEASE_PAINT_BIN, bin.as_os_str())
         .env(RELEASE_SPIN_BIN, bin.as_os_str());
+    if ctx.no_windows {
+        cmd = cmd.env(MEASURE_NO_WINDOWS, "1");
+    }
     (label, cmd)
 }
 
@@ -833,9 +847,71 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let (label, cmd) = measuring_cmd(ctx, artifact, measuring_args());
+    let subject = Subject::of(ctx, artifact);
+    if ctx.no_windows {
+        r.skip(MEASURE_WINDOW_ROWS_SKIP);
+    }
+    // Not `counting_waits`, though cargo runs its matrices as benches: each takes the machine's
+    // quiet claim (aterm-conformance's `benches/support/quiet.rs`), at once where this run's own
+    // claim covers it. Any wait for it is behind other runs, not on a scratch lock of its own, so
+    // the ceiling leaves it out, as it does a lab's.
     run_child(ctx, r, &label, &cmd, |r, run, label| {
-        decide_measuring_child(r, run, label);
+        decide_measuring_child(r, run, label, &subject);
     });
+}
+
+/// The bundle `measure` asked, as its rows' decisions need it.
+pub(crate) struct Subject {
+    /// [`crate::MeasureArtifact::describe`].
+    name: String,
+    /// This checkout's HEAD, in full, when git names it.
+    head: Option<String>,
+    /// HEAD built the bundle, so every row must have an answer. Another build, such as an
+    /// installed release, may predate a row: what it has no answer to is named, not judged.
+    own: bool,
+}
+
+impl Subject {
+    pub(crate) fn of(ctx: &Ctx, artifact: &crate::MeasureArtifact) -> Self {
+        let head = crate::head_commit(&ctx.root, &ctx.path_env);
+        Self {
+            name: artifact.describe(),
+            own: head.as_deref().is_some_and(|h| artifact.built_from(h)),
+            head,
+        }
+    }
+
+    /// Record what the subject had no answer to (`rows`, each named with its reason), under the
+    /// check's `label`: a finding when HEAD built it, else one skip line naming each row.
+    pub(crate) fn unanswered(
+        &self,
+        r: &mut Report,
+        run: Option<&exec::Run>,
+        label: &str,
+        rows: &[String],
+    ) {
+        let rows = rows.join("; ");
+        if self.own {
+            let label = format!(
+                "{label} — {}, built from this checkout's HEAD, has no answer to {rows}",
+                self.name
+            );
+            match run {
+                Some(run) => r.record_child(run, Outcome::Fail(Severity::GateFailed), label),
+                None => r.fail(label),
+            }
+        } else {
+            let head = self
+                .head
+                .as_deref()
+                .map_or("unknown", |h| &h[..h.len().min(12)]);
+            r.skip(format!(
+                "{label} — not judged on {}, which this checkout's HEAD ({head}) did not build: \
+                 it has no answer to {rows}",
+                self.name
+            ));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -844,6 +920,7 @@ struct MeasuringCounts {
     passed: usize,
     failed: usize,
     refused: usize,
+    unanswered: usize,
 }
 
 impl MeasuringCounts {
@@ -855,6 +932,7 @@ impl MeasuringCounts {
             passed: count("passed=")?,
             failed: count("failed=")?,
             refused: count("refused=")?,
+            unanswered: count("unanswered=")?,
         };
         fields.next().is_none().then_some(counts)
     }
@@ -865,11 +943,32 @@ impl MeasuringCounts {
                 .passed
                 .checked_add(self.failed)
                 .and_then(|n| n.checked_add(self.refused))
+                .and_then(|n| n.checked_add(self.unanswered))
                 == Some(self.planned)
     }
 }
 
-fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str) {
+/// Each `measure row: <target>::<row> UNANSWERED` in `output`, with the first line of its reason.
+fn unanswered_rows(output: &str) -> Vec<String> {
+    let mut lines = output.lines();
+    let mut rows = Vec::new();
+    while let Some(line) = lines.next() {
+        if let Some(row) = line
+            .strip_prefix("measure row: ")
+            .and_then(|l| l.strip_suffix(" UNANSWERED"))
+        {
+            rows.push(format!("{row} ({})", lines.next().unwrap_or("").trim()));
+        }
+    }
+    rows
+}
+
+fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject: &Subject) {
+    let unanswered = unanswered_rows(&run.output);
+    if subject.own && !unanswered.is_empty() {
+        subject.unanswered(r, Some(run), label, &unanswered);
+        return;
+    }
     let mut incomplete = Vec::new();
     let mut refused = Vec::new();
     let mut any_failed = false;
@@ -909,8 +1008,13 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str) {
             "{label} — {}: the instrument could not decide every row",
             refused.join(", ")
         ));
+    } else if incomplete.is_empty() && !unanswered.is_empty() {
+        r.pass(format!("{label} — every row the subject answered"));
     } else {
         r.decide_child(run, label);
+    }
+    if !unanswered.is_empty() {
+        subject.unanswered(r, None, label, &unanswered);
     }
 }
 
@@ -1638,7 +1742,7 @@ pub enum NotRun {
     CouldNotRun,
 }
 
-/// How the ladder reads a lab lane's exit (`codex-alab-proof`, `linux proof`): `0` pass, `1` a finding (`finding` says where it is shown), `3` the lab's `NOT RUN:` reason read as `not_run` says, never a pass; any other code a finding, and no status decided nothing.
+/// How the ladder reads a lab lane's exit (`codex-alab-proof`, `linux proof`): `0` pass, `1` a finding (`finding` says where it is shown), `3` the lab's `NOT RUN:` reason read as `not_run` says, never a pass; any other code a finding, and no status decided nothing: where the ceiling ended it, the row says how long it worked and waited ([`crate::findings::CEILING_KILL`]).
 #[must_use]
 pub fn lab_lane_outcome(
     name: &str,
@@ -1671,7 +1775,13 @@ pub fn lab_lane_outcome(
         ),
         None => (
             Outcome::Fail(Severity::CouldNotRun),
-            format!("{name}: no exit status — killed by a signal, or never spawned"),
+            transcript
+                .lines()
+                .find_map(|l| l.split_once(crate::findings::CEILING_KILL))
+                .map_or_else(
+                    || format!("{name}: no exit status — killed by a signal, or never spawned"),
+                    |(_, kill)| format!("{name}: no exit status — ended at the ceiling{kill}"),
+                ),
         ),
     }
 }
@@ -1896,8 +2006,8 @@ fn glue_row(
     }
 }
 
-/// The `cells` check ([`crate::cells`]): the forge cells no fleet machine
-/// hosts (or each `--cell`), each linted for its own triple on rustup's
+/// The `cells` check ([`crate::cells`]): every forge cell but this machine's
+/// own (or each `--cell`), each linted for its own triple on rustup's
 /// toolchain (a STOCK EXCEPTION), one row per cell.
 fn foreign_cells(ctx: &Ctx, r: &mut Report) {
     if in_checkout(ctx, r, "cells") {
@@ -2011,9 +2121,7 @@ mod tests {
     #[test]
     fn the_measuring_stage_hands_paint_and_spin_the_bundle_it_was_handed() {
         let c = ctx(Scope::workspace());
-        let artifact = crate::MeasureArtifact {
-            app: PathBuf::from("/release/aterm.app"),
-        };
+        let artifact = crate::MeasureArtifact::unnamed("/release/aterm.app");
         let env_of = |cmd: &Cmd, key: &str| {
             cmd.envs
                 .iter()
@@ -2030,6 +2138,18 @@ mod tests {
             );
             assert_eq!(env_of(&prebuild, var), env_of(&run, var), "{var}");
         }
+        assert_eq!(
+            env_of(&run, "ATERM_MEASURE_NO_WINDOWS"),
+            None,
+            "windows by default"
+        );
+        let quiet = ctx(Scope::workspace()).with_no_windows(true);
+        let (_, quiet_run) = measuring_cmd(&quiet, &artifact, measuring_args());
+        assert_eq!(
+            env_of(&quiet_run, "ATERM_MEASURE_NO_WINDOWS"),
+            Some(PathBuf::from("1")),
+            "--no-windows leaves the window rows out"
+        );
         assert!(
             !run.argv().iter().any(|a| a == "build"),
             "the stage runs the suites and builds nothing: {:?}",
@@ -2684,9 +2804,7 @@ mod tests {
             let [compile, run] = test_cmds(&c, bind);
             assert!(compile.demoted, "targo test --no-run");
             assert!(!run.demoted, "targo test --tests runs code");
-            let artifact = crate::MeasureArtifact {
-                app: PathBuf::from("/release/aterm.app"),
-            };
+            let artifact = crate::MeasureArtifact::unnamed("/release/aterm.app");
             let (_, measuring) = measuring_cmd(&c, &artifact, measuring_args());
             assert!(
                 !measuring.demoted,
@@ -3081,28 +3199,51 @@ mod tests {
         }
     }
 
+    fn measured_result(
+        target: &str,
+        planned: usize,
+        passed: usize,
+        failed: usize,
+        refused: usize,
+    ) -> String {
+        format!(
+            "measure result: {target} planned={planned} passed={passed} \
+             failed={failed} refused={refused} unanswered=0\n"
+        )
+    }
+
+    fn measured_subject(own: bool) -> Subject {
+        Subject {
+            name: "aterm 0.137.0 (22cb722a2ec9) at /Applications/aterm.app".into(),
+            head: Some("215fb53331abd9acb2a33e7d7a21d1fa3c2bd8f2".into()),
+            own,
+        }
+    }
+
+    /// Every ladder row `decide_measuring_child` records for `output`.
+    fn decide_measured(ok: bool, output: String, subject: &Subject) -> Vec<(Outcome, String)> {
+        let run = exec::Run {
+            ok,
+            output,
+            code: Some(if ok { 0 } else { 101 }),
+            spawn_error: None,
+        };
+        let mut r = Report::new("measuring");
+        decide_measuring_child(&mut r, &run, "measuring matrices", subject);
+        r.outcomes().map(|(o, l)| (o, l.to_string())).collect()
+    }
+
     #[test]
     fn a_measuring_child_requires_complete_decided_matrices() {
-        let result = |target: &str, planned, passed, failed, refused| {
-            format!(
-                "measure result: {target} planned={planned} passed={passed} \
-                 failed={failed} refused={refused}\n"
-            )
-        };
+        let result = measured_result;
         let paint = result("paint", 23, 23, 0, 0);
         let spin =
             result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &result("rewind", 2, 2, 0, 0);
         let decide = |ok: bool, output: String| {
-            let run = exec::Run {
-                ok,
-                output,
-                code: Some(if ok { 0 } else { 101 }),
-                spawn_error: None,
-            };
-            let mut r = Report::new("measuring");
-            decide_measuring_child(&mut r, &run, "measuring matrices");
-            let (outcome, label) = r.outcomes().next().expect("a decision");
-            (outcome, label.to_string())
+            decide_measured(ok, output, &measured_subject(true))
+                .into_iter()
+                .next()
+                .expect("a decision")
         };
         let could_not_run = Outcome::Fail(Severity::CouldNotRun);
         for output in [
@@ -3175,6 +3316,56 @@ mod tests {
             .0,
             Outcome::Fail(Severity::GateFailed)
         );
+    }
+
+    /// A row the subject has no answer to is a finding on HEAD's own build, and on another build
+    /// one skip line naming exactly that row, beside the verdict on the rows it answered.
+    #[test]
+    fn an_unanswered_row_fails_heads_build_and_is_named_on_another() {
+        let paint = measured_result("paint", 23, 23, 0, 0);
+        let spin = "measure row: spin::an_idle_open_rewind_view_arms_no_timer UNANSWERED\n\
+                    ctl rewind open: the subject does not know `rewind` (ERR unknown verb)\n\
+                    measure result: spin planned=3 passed=2 failed=0 refused=0 unanswered=1\n";
+        let aos = "measure row: aos::a_repair UNANSWERED\naos repair named no main_us=\n\
+                   measure result: aos planned=1 passed=0 failed=0 refused=0 unanswered=1\n";
+        let rewind = measured_result("rewind", 2, 2, 0, 0);
+        let output = paint.clone() + spin + aos + &rewind;
+        let named = "spin::an_idle_open_rewind_view_arms_no_timer (ctl rewind open: the subject \
+                     does not know `rewind` (ERR unknown verb)); aos::a_repair (aos repair named \
+                     no main_us=)";
+
+        let other = decide_measured(false, output.clone(), &measured_subject(false));
+        assert_eq!(other.len(), 2, "{other:?}");
+        assert_eq!(other[0].0, Outcome::Ok, "{other:?}");
+        assert_eq!(other[1].0, Outcome::Skip, "{other:?}");
+        assert!(other[1].1.contains("(215fb53331ab)"), "{other:?}");
+        assert!(
+            other[1].1.ends_with(&format!("no answer to {named}")),
+            "{other:?}"
+        );
+
+        let own = decide_measured(false, output.clone(), &measured_subject(true));
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert_eq!(own[0].0, Outcome::Fail(Severity::GateFailed), "{own:?}");
+        assert!(
+            own[0].1.ends_with(&format!("no answer to {named}")),
+            "{own:?}"
+        );
+
+        let failed =
+            paint.replace("passed=23 failed=0", "passed=22 failed=1") + spin + aos + &rewind;
+        let rows = decide_measured(false, failed, &measured_subject(false));
+        assert_eq!(rows[0].0, Outcome::Fail(Severity::GateFailed), "{rows:?}");
+        assert_eq!(rows[1].0, Outcome::Skip, "{rows:?}");
+        let refused = paint.replace(
+            "passed=23 failed=0 refused=0",
+            "passed=22 failed=0 refused=1",
+        ) + spin
+            + aos
+            + &rewind;
+        let rows = decide_measured(false, refused, &measured_subject(false));
+        assert_eq!(rows[0].0, Outcome::Fail(Severity::CouldNotRun), "{rows:?}");
+        assert_eq!(rows[1].0, Outcome::Skip, "{rows:?}");
     }
 
     #[test]

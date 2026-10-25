@@ -368,7 +368,6 @@ impl TurnFacts {
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => TurnFacts::default(),
         }
     }
@@ -485,8 +484,7 @@ const fn names_agent(program: aterm_phase::Program) -> bool {
         | aterm_phase::Program::Grok
         | aterm_phase::Program::Kimi
         | aterm_phase::Program::Agy
-        | aterm_phase::Program::Muse
-        | aterm_phase::Program::Gemini => true,
+        | aterm_phase::Program::Muse => true,
         aterm_phase::Program::Generic => false,
     }
 }
@@ -1151,49 +1149,6 @@ mod tests {
             session.detail().as_deref(),
             Some("3pm (America/Los_Angeles)")
         );
-    }
-
-    #[test]
-    fn gemini_cli_under_node_is_published_by_its_screen() {
-        use aterm_phase::gemini::fixtures as g;
-        use aterm_phase::prompt::fixtures::screen;
-        for (text, word, detail) in [
-            (g::IDLE, "idle", None),
-            (g::DRAFT, "idle", None),
-            (g::END_OF_TURN, "idle", None),
-            (g::INTERRUPTED, "idle", None),
-            (g::NARROW_IDLE, "idle", None),
-            (g::NARROW_END_OF_TURN, "idle", None),
-            (g::BUSY_THINKING, "busy", None),
-            (g::NARROW_BUSY, "busy", None),
-            (g::RETRY_503, "busy", None),
-            (g::BOX_SHELL, "prompt", Some("bash:not-read-only")),
-            (g::BOX_WRITE, "prompt", Some("write")),
-            (g::QUESTION, "prompt", Some("question")),
-            (g::LIMIT_DIALOG, "prompt", Some("usage-limit")),
-            (g::TRUST, "prompt", Some("trust")),
-            (g::ERROR_401, "wall:auth", None),
-            (g::ERROR_400_KEY, "wall:auth", None),
-            (g::LIMIT_STOPPED, "wall:api-error", None),
-            (g::SLASH_MENU, "unknown", None),
-        ] {
-            let what = text.lines().next().unwrap_or_default();
-            let rows = screen(text);
-            let v = agent_verdict(Some("node"), false, None, &rows, Cursor::Unknown, t0());
-            assert_eq!(v.program(), Some(aterm_phase::Program::Gemini), "{what}");
-            assert_eq!((v.word(), v.detail().as_deref()), (word, detail), "{what}");
-            let shell = agent_verdict(Some("zsh"), false, None, &rows, Cursor::Unknown, t0());
-            assert_eq!(shell.word(), "-", "{what}: a shell is never an agent");
-        }
-        let left = agent_verdict(
-            Some("node"),
-            false,
-            None,
-            &screen(g::EXIT),
-            Cursor::Unknown,
-            t0(),
-        );
-        assert_eq!(left.word(), "-", "the screen it left: {left:?}");
     }
 
     #[test]

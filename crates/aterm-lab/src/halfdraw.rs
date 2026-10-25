@@ -93,7 +93,7 @@ fn count(hay: &str, needle: &str) -> usize {
 pub fn cmd_halfdraw(args: &[String]) -> Res {
     let usage = || {
         Fail::usage(format!(
-            "usage: {LAB} halfdraw scan <cast> --program claude|agy|muse|gemini [--show N] [--event I]"
+            "usage: {LAB} halfdraw scan <cast> --program claude|agy|muse [--show N] [--event I]"
         ))
     };
     if args.first().map(String::as_str) != Some("scan") {

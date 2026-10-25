@@ -242,17 +242,15 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
         Some(notice::LOGIN_SIGN_IN.id),
         "{e:?}"
     );
+    // Over a roster row's login aterm backs out of the dialog of its own `/login` and signs the
+    // row in by itself: nobody is told to sign in there.
     let rostered = TurnEndReading {
         login_label: Some("work-2".to_string()),
         ..handoff.clone()
     };
-    let e = at(&mut typed_login(t), &rostered, t + MIN);
-    assert_eq!(
-        notice_id(e.as_ref()),
-        Some(notice::LOGIN_SIGN_IN_AS.id),
-        "{e:?}"
-    );
-    assert!(e.is_some_and(|e| e.action.contains("work-2")));
+    let (a, e) = point(&mut typed_login(t), &rostered, &cfg(), t + MIN);
+    assert_eq!(e, None, "{a:?}");
+    assert!(matches!(a, TurnEndAction::Cancel { .. }), "{a:?}");
     let picker = dialog(LOGIN_PICKER);
     assert_eq!(at(&mut typed_login(t), &picker, t + MIN), None);
     let unknown = TurnEndReading {
@@ -291,13 +289,12 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
         login_label: Some("work-2".to_string()),
         ..dialog(LOGIN_INTERRUPTED)
     };
-    let e = at(&mut typed_login(t), &rostered_left, t + MIN);
-    assert_eq!(
-        notice_id(e.as_ref()),
-        Some(notice::LOGIN_CANCELLED.id),
-        "{e:?}"
+    let (a, e) = point(&mut typed_login(t), &rostered_left, &cfg(), t + MIN);
+    assert_eq!(e, None, "the row's own sign-in waited on: {a:?}");
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("work-2")),
+        "{a:?}"
     );
-    assert!(e.is_some_and(|e| e.action.contains("work-2")));
     let again = TurnEndReading {
         worked: None,
         ..wall.clone()

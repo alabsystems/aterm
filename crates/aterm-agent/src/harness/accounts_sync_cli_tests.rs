@@ -106,7 +106,7 @@ fn read_named(_: &Env, source: &str) -> Result<String, String> {
 #[test]
 fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
-        for bad in ["state", "bindings", "lost"] {
+        for bad in ["state", "bindings", "lost", "lost-bindings"] {
             let bed = Bed::new("signin-read-refusal");
             let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
             store.ensure().unwrap();
@@ -125,6 +125,9 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
             }
             if bad == "bindings" {
                 fs::write(store.logins_file(), "{").unwrap();
+            }
+            if bad == "lost-bindings" {
+                fs::write(store.logins_witness_file(), "").unwrap();
             }
             let browser = bed.home.join(
                 ".cache/aterm/browser.noindex/chrome-headless-shell-fixture/chrome-headless-shell",
@@ -611,14 +614,16 @@ fn a_grok_rows_background_renewal_starts_on_macos() {
 fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_complete_and_idle() {
     let bed = Bed::new("vendor-recovery");
     bed.keep_roster(Cli::Kimi);
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
     fs::write(
         bed.roster(Cli::Kimi),
-        "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\n\
-         email = \"Kimi-One@Example.com\"\nregion = \"global\"\n",
+        format!(
+            "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\n\
+         email = \"Kimi-One@Example.com\"\nregion = \"global\"\ndir = {}\n",
+            toml_quote(store.login_dir("kimi-1").unwrap().to_str().unwrap())
+        ),
     )
     .unwrap();
-    let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
-    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
 
     // CONTROL 1: a checkpoint written for another CLI is never adopted by Kimi's pool.
@@ -633,6 +638,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
         None,
         Some(accounts::Proof::Page),
         NOW - 20,
+        &store.load_logins(NOW).unwrap().0,
     )
     .unwrap();
 
@@ -646,11 +652,18 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
         None,
         Some(accounts::Proof::Status),
         NOW - 15,
+        &store.load_logins(NOW).unwrap().0,
     )
     .unwrap();
 
     assert!(
-        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, (&roster, None), &guard, NOW),
+        !recover_interrupted_staging_renewals_for(
+            Cli::Kimi,
+            &store,
+            &bed.roster(Cli::Kimi),
+            &guard,
+            NOW
+        ),
         "CONTROLS: neither wrong-CLI checkpoint nor credential-less staging dir may recover"
     );
 
@@ -666,13 +679,20 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
         None,
         Some(accounts::Proof::Status),
         NOW - 5,
+        &store.load_logins(NOW).unwrap().0,
     )
     .unwrap();
 
     // CONTROL 3: while a live sign-in holds `signin.lock`, recovery yields instead of racing it.
     let live_lock = store.signin_now().unwrap().expect("signin lock free");
     assert!(
-        !recover_interrupted_staging_renewals_for(Cli::Kimi, &store, (&roster, None), &guard, NOW),
+        !recover_interrupted_staging_renewals_for(
+            Cli::Kimi,
+            &store,
+            &bed.roster(Cli::Kimi),
+            &guard,
+            NOW
+        ),
         "CONTROL: recovery yields while signin.lock is held"
     );
     drop(live_lock);
@@ -1513,6 +1533,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         None,
         Some(accounts::Proof::Status),
         now + 1,
+        &codex_store.load_logins(now + 1).unwrap().0,
     )
     .unwrap();
     let cooldown = Mutex::new(None);

@@ -452,24 +452,18 @@ fn the_reopened_row_asks_each_agents_admission() {
     let mut codex_off = on();
     codex_off.off.push(Program::Codex);
     let ([_, _, lanes @ ..], told) = of(codex_off);
-    assert_eq!(
-        lanes, [true; 3],
-        "PRECONDITION: agy, Muse Code, Gemini CLI admitted"
-    );
-    assert_eq!(told, [true, false, true, true, true]);
-    assert_eq!(of(on()).1, [true; 5]);
+    assert_eq!(lanes, [true; 2], "PRECONDITION: agy, Muse Code admitted");
+    assert_eq!(told, [true, false, true, true]);
+    assert_eq!(of(on()).1, [true; 4]);
     let mut muse_off = on();
     muse_off.off.push(Program::Muse);
-    assert_eq!(of(muse_off).1, [true, true, true, false, true]);
+    assert_eq!(of(muse_off).1, [true, true, true, false]);
     let mut agy_off = on();
     agy_off.off.push(Program::Agy);
-    assert_eq!(of(agy_off).1, [true, true, false, true, true]);
-    let mut gemini_off = on();
-    gemini_off.off.push(Program::Gemini);
-    assert_eq!(of(gemini_off).1, [true, true, true, true, false]);
+    assert_eq!(of(agy_off).1, [true, true, false, true]);
     let mut limited = on();
     limited.set("relaunch", "false").unwrap();
-    assert_eq!(of(limited).1, [false; 5]);
+    assert_eq!(of(limited).1, [false; 4]);
 }
 
 #[test]
@@ -604,14 +598,9 @@ fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
     let opted = Some(("s-opted", Program::Claude, Some(Autopilot::Cruise)));
     let table = |agent: Program| format!("[harness.{}]\nenabled = false\n", agent.name());
     let switch = |agent: Program| format!("[harness.{}] enabled = false", agent.name());
-    for agent in [
-        Program::Claude,
-        Program::Gemini,
-        Program::Agy,
-        Program::Muse,
-    ] {
+    for agent in [Program::Claude, Program::Agy, Program::Muse] {
         let other = if agent == Program::Claude {
-            Program::Gemini
+            Program::Muse
         } else {
             Program::Claude
         };

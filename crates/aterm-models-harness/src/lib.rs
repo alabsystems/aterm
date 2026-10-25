@@ -16,10 +16,22 @@
 //! tests drive these models dev-depend on this one, so editing a model here rebuilds this crate
 //! and those tests, never a library.
 
+mod models_account_adopt_identity;
+mod models_account_attempt_generation;
+mod models_account_binding_retention;
 mod models_account_identity;
+mod models_account_login_observation;
 mod models_account_pool_launch;
+mod models_account_pool_launch_policy;
+mod models_account_pool_move_policy;
+mod models_account_pool_usage_policy;
+mod models_account_recovery_policy;
+mod models_account_renewal_generation;
+mod models_account_renewal_policy;
+mod models_account_sample_context;
 mod models_account_signin;
 mod models_account_signin_lock;
+mod models_account_signin_policy;
 mod models_account_state_read;
 mod models_account_state_retention;
 mod models_agent_verdict;
@@ -39,10 +51,22 @@ mod models_supervise_accounts;
 mod models_supervise_tape;
 mod models_wakes;
 
+pub use models_account_adopt_identity::account_adopt_identity_model;
+pub use models_account_attempt_generation::account_attempt_generation_model;
+pub use models_account_binding_retention::account_binding_retention_model;
 pub use models_account_identity::account_identity_model;
+pub use models_account_login_observation::account_login_observation_model;
 pub use models_account_pool_launch::account_pool_launch_model;
+pub use models_account_pool_launch_policy::account_pool_launch_policy_model;
+pub use models_account_pool_move_policy::account_pool_move_policy_model;
+pub use models_account_pool_usage_policy::account_pool_usage_policy_model;
+pub use models_account_recovery_policy::account_recovery_policy_model;
+pub use models_account_renewal_generation::account_renewal_generation_model;
+pub use models_account_renewal_policy::account_renewal_policy_model;
+pub use models_account_sample_context::account_sample_context_model;
 pub use models_account_signin::account_signin_admission_model;
 pub use models_account_signin_lock::account_signin_lock_model;
+pub use models_account_signin_policy::account_signin_policy_model;
 pub use models_account_state_read::account_state_read_model;
 pub use models_account_state_retention::account_state_retention_model;
 pub use models_agent_verdict::claude_idle_at_composer_model;
@@ -53,8 +77,8 @@ pub use models_harness::*;
 pub use models_harness_account_key::harness_account_key_model;
 pub use models_harness_host::{
     harness_agy_exit_witness_model, harness_agy_quiet_upgrade_model, harness_commit_owed_model,
-    harness_exit_record_model, harness_gemini_exit_witness_model, harness_handoff_claim_model,
-    harness_leave_model, harness_muse_exit_witness_model, harness_muse_quiet_upgrade_model,
+    harness_exit_record_model, harness_handoff_claim_model, harness_leave_model,
+    harness_muse_exit_witness_model, harness_muse_quiet_upgrade_model,
     harness_relaunch_on_exit_model, harness_restart_stamp_liveness, harness_restart_stamp_model,
     harness_restored_carry_model, harness_restored_first_attempt_model, harness_upgrade_age_model,
     harness_upgrade_look_model, harness_worker_lifecycle_model,

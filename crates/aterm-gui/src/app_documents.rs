@@ -1533,7 +1533,14 @@ impl App {
             self.editor_workspace.can_redo(document),
         );
 
-        if !matches!(event, AppEvent::EditorConfigDiagnosticNavigate { .. }) {
+        // Neither a step through the diagnostics nor a change of how many rows the
+        // viewport shows touches the document: published as a document change, it would
+        // reset the view's diagnostic cycle and completion choice.
+        if !matches!(
+            event,
+            AppEvent::EditorConfigDiagnosticNavigate { .. }
+                | AppEvent::EditorViewportChanged { .. }
+        ) {
             self.publish_editor_commit(document, view);
         }
         for effect in effects {
@@ -2381,6 +2388,7 @@ impl App {
     }
 
     fn set_document_recovery_status(&mut self, document: DocumentId, message: Option<String>) {
+        let changed = self.native_documents.recovery_status.get(&document) != message.as_ref();
         if let Some(message) = &message {
             self.native_documents
                 .recovery_status
@@ -2390,8 +2398,8 @@ impl App {
         }
         self.native_runtime
             .set_document_recovery_status(document, message);
-        for (window, _, _) in self.document_native_views(document) {
-            self.request_native_redraw(window);
+        if changed {
+            self.repaint_document_views(document);
         }
     }
 
@@ -2400,6 +2408,7 @@ impl App {
         document: DocumentId,
         conflict: Option<DiskConflictCause>,
     ) {
+        let changed = self.native_documents.disk_conflicts.get(&document).copied() != conflict;
         if let Some(cause) = conflict {
             self.native_documents.disk_conflicts.insert(document, cause);
         } else {
@@ -2407,7 +2416,21 @@ impl App {
         }
         self.native_runtime
             .set_document_disk_conflict(document, conflict.is_some());
-        for (window, _, _) in self.document_native_views(document) {
+        if changed {
+            self.repaint_document_views(document);
+        }
+    }
+
+    /// Shared document status can change without changing the draft's text sequence.
+    fn repaint_document_views(&mut self, document: DocumentId) {
+        for (window, instance, view) in self.document_native_views(document) {
+            self.native_runtime.change_view_state(view, |state| {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                true
+            });
+            self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
+            self.refresh_native_presentation(window, instance, view);
             self.request_native_redraw(window);
         }
     }
@@ -2940,17 +2963,15 @@ impl App {
             .document_store
             .snapshot(document)
             .ok_or_else(|| "document disappeared during refresh".to_string())?;
+        // Only the spans that changed on disk: a caret, selection, mark or
+        // scroll anchor outside them stays on its text.
         let (seq, deltas) = if before.text.as_ref() == observed_text {
             (before.seq, Vec::new())
         } else {
-            match self.document_store.transact(
-                document,
-                before.seq,
-                vec![crate::document_store::TextEdit {
-                    range: 0..before.text.len(),
-                    insert: observed_text.to_string(),
-                }],
-            ) {
+            match self
+                .document_store
+                .replace_text(document, before.seq, observed_text)
+            {
                 crate::document_store::DocumentTxnOutcome::Committed { seq, deltas, .. } => {
                     (seq, deltas)
                 }
@@ -2970,6 +2991,7 @@ impl App {
             .checkpoint_ack(document, seq)
             .map_err(|error| format!("could not mark refreshed bytes durable: {error:?}"))?;
 
+        self.editor_workspace.observe_external(document, &deltas);
         let views = self.document_native_views(document);
         for (_, _, view) in &views {
             if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(*view)
@@ -3571,6 +3593,59 @@ impl App {
             if !unchanged {
                 continue;
             }
+            let mutations = if close.whole_tab {
+                [crate::DeferredHandoffMutation::CloseTab {
+                    window: close.window,
+                    tab: close.tab,
+                }]
+                .into_iter()
+                .collect()
+            } else {
+                close
+                    .views
+                    .iter()
+                    .map(|view| crate::DeferredHandoffMutation::CloseView {
+                        window: close.window,
+                        tab: close.tab,
+                        view: crate::tab_model::ViewId::from_stored(view.0),
+                    })
+                    .collect()
+            };
+            if self.defer_pending_update_handoff_teardown(
+                crate::DeferredHandoffTeardown::Mutations(mutations),
+            ) {
+                // The handoff now owns the stable close intent and its replay.
+                continue;
+            }
+            if !close.whole_tab {
+                let sole_leaf = self.windows.get(&close.window).and_then(|window| {
+                    window
+                        .tab_set
+                        .tabs()
+                        .iter()
+                        .position(|tab| tab.id == close.tab && tab.root.len() == 1)
+                        .map(|index| (index, window.tab_set.active_id()))
+                });
+                if let Some((index, active)) = sole_leaf {
+                    // A sibling may have closed while saving. Reuse whole-tab
+                    // recovery and last-window shutdown before detaching anything.
+                    self.close_tab_at(close.window, index);
+                    if self
+                        .windows
+                        .get(&close.window)
+                        .is_some_and(|window| window.tab_set.get(close.tab).is_some())
+                    {
+                        if let Some(active) = active
+                            && let Some(window) = self.windows.get_mut(&close.window)
+                        {
+                            window.tab_set.switch_to(active);
+                        }
+                        self.resync_active_or_window(close.window);
+                        deferred.push(close);
+                    }
+                    continue;
+                }
+            }
             self.document_store
                 .commit_detach(document, &close.views)
                 .map_err(|error| format!("could not finish document close: {error:?}"))?;
@@ -3587,6 +3662,7 @@ impl App {
             } else {
                 for document_view in close.views {
                     let view = crate::tab_model::ViewId::from_stored(document_view.0);
+                    let recovery = self.closed_view_record_for(close.window, close.tab, view);
                     let removed = self
                         .windows
                         .get_mut(&close.window)
@@ -3601,6 +3677,9 @@ impl App {
                         .map(|tab| tab.remove_view(view));
                     if removed == Some(crate::tab_model::RemoveLeaf::Removed) {
                         self.remove_view_link(view);
+                        if let Some(recovery) = recovery {
+                            self.retain_closed_view(recovery);
+                        }
                     }
                 }
                 self.refresh_aggregate_tab_presentation(close.window, close.tab);
@@ -4542,14 +4621,9 @@ impl App {
             if let Some(recovered) = recovered
                 && recovered.as_str() != disk_snapshot.text.as_ref()
             {
-                let outcome = self.document_store.transact(
-                    document,
-                    disk_snapshot.seq,
-                    vec![crate::document_store::TextEdit {
-                        range: 0..disk_snapshot.text.len(),
-                        insert: recovered,
-                    }],
-                );
+                let outcome =
+                    self.document_store
+                        .replace_text(document, disk_snapshot.seq, &recovered);
                 if !matches!(
                     outcome,
                     crate::document_store::DocumentTxnOutcome::Committed { .. }
@@ -5282,6 +5356,11 @@ mod tests {
         let draft = app.document_store.snapshot(document).unwrap();
         assert_save_available(&app, wid, true);
 
+        let prompt_commands = [
+            ("editor/goto-line-button", "editor/goto-line"),
+            ("editor/commands-button", "editor/commands"),
+        ];
+        let mut capability_failures = Vec::new();
         for command in [
             EditorCommand::GotoLine,
             EditorCommand::ExecuteCommand,
@@ -5304,6 +5383,53 @@ mod tests {
             ));
             assert_save_available(&app, wid, false);
             assert!(app.save_front_document().is_err());
+            for (key, action) in prompt_commands {
+                let commands = app.native_runtime.commands(instance, view).unwrap();
+                let enabled = commands
+                    .iter()
+                    .find(|candidate| candidate.id.as_str() == action)
+                    .unwrap()
+                    .enabled;
+                let compiled = app.compiled_native_ui(wid).unwrap();
+                let toolbar_enabled = compiled
+                    .semantic(&crate::native_ui::UiKey::new(key))
+                    .unwrap()
+                    .state
+                    .unwrap()
+                    .enabled;
+                if enabled || toolbar_enabled {
+                    capability_failures.push(format!(
+                        "{command:?}: {action} enabled in command={enabled}, toolbar={toolbar_enabled}"
+                    ));
+                }
+                let before = editor_buffer(&app, view).clone();
+                if app
+                    .act_app(crate::app_control::ActRequest {
+                        view,
+                        ui_key: key.to_string(),
+                        action: action.to_string(),
+                        value: None,
+                    })
+                    .is_ok()
+                {
+                    capability_failures.push(format!("{command:?}: {action} act did not refuse"));
+                }
+                assert_eq!(editor_buffer(&app, view), &before);
+                if app
+                    .activate_native_palette_target(&crate::palette::NativeCommandTarget {
+                        window: wid,
+                        instance,
+                        view,
+                        generation: app.native_runtime.view_generation(view).unwrap(),
+                        action: crate::native_ui::ActionId::new(action),
+                    })
+                    .is_ok()
+                {
+                    capability_failures
+                        .push(format!("{command:?}: {action} palette did not refuse"));
+                }
+                assert_eq!(editor_buffer(&app, view), &before);
+            }
             assert_eq!(editor_buffer(&app, view).minibuffer, prompt);
             let after_refusal = app.document_store.snapshot(document).unwrap();
             assert_eq!(after_refusal.seq, draft.seq);
@@ -5324,6 +5450,25 @@ mod tests {
                 Minibuffer::Inactive
             ));
             assert_save_available(&app, wid, true);
+            let commands = app.native_runtime.commands(instance, view).unwrap();
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            for (key, action) in prompt_commands {
+                assert!(
+                    commands
+                        .iter()
+                        .find(|candidate| candidate.id.as_str() == action)
+                        .unwrap()
+                        .enabled
+                );
+                assert!(
+                    compiled
+                        .semantic(&crate::native_ui::UiKey::new(key))
+                        .unwrap()
+                        .state
+                        .unwrap()
+                        .enabled
+                );
+            }
         }
 
         app.save_front_document().unwrap();
@@ -5333,6 +5478,7 @@ mod tests {
         let saved = app.document_store.snapshot(document).unwrap();
         assert_eq!(saved.seq, draft.seq);
         assert_eq!(saved.text, draft.text);
+        assert!(capability_failures.is_empty(), "{capability_failures:#?}");
     }
 
     #[test]
@@ -7365,12 +7511,20 @@ mod tests {
             let (text, added_as, _) = apply(key);
             assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{key}: {text}");
         }
+        // The font size's default is the platform's automatic size, which an
+        // explicit size draws exactly as.
+        let (text, added_as, _) = apply(crate::prefs::EDIT_FONT_PX);
+        assert_eq!(added_as, AbsentKeyAdded::AtDefault, "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line == format!("font_px = {}", crate::FONT_PX)),
+            "{text}"
+        );
         for key in [
             "shell",
             "shell_args",
             crate::prefs::EDIT_CURSOR_NYAN_SPRITE,
             crate::prefs::EDIT_FONT_FAMILY,
-            crate::prefs::EDIT_FONT_PX,
             "font_features",
             crate::prefs::EDIT_FALLBACK_FONTS,
             "font_variation",
@@ -7470,6 +7624,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A change of how many rows the editor shows (a resize, a footer that
+    /// wraps) is not a document change: the diagnostic cycle keeps its place,
+    /// so Previous Problem after it still steps back from the problem F8
+    /// reached. Published as a document change, it reset the cycle to the
+    /// first problem, and Previous wrapped to the last.
+    #[test]
+    fn a_viewport_change_keeps_the_diagnostic_cycle_in_place() {
+        let dir = fresh_dir("aterm-config-editor-cycle-viewport");
+        let path = dir.join("aterm.toml");
+        fs::write(
+            &path,
+            "future_first_setting = 1\nfuture_second_setting = 2\n",
+        )
+        .unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.ensure_and_open_config_editor_path_in_window(wid, &path)
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let analysis = app
+            .native_runtime
+            .config_editor_analysis(instance)
+            .unwrap()
+            .clone();
+        assert_eq!(analysis.diagnostic_count(), 2);
+        let first = analysis.diagnostic_at(0).unwrap().bytes.start;
+        let second = analysis.diagnostic_at(1).unwrap().bytes.start;
+        drive_native(&mut app, key(Key::Named(NamedKey::F8), Modifiers::empty()));
+        assert_eq!(editor_buffer(&app, view).primary_selection().head, second);
+        let rows = editor_buffer(&app, view).viewport_lines();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorViewportChanged {
+                visible_lines: rows.saturating_sub(2).max(1),
+            },
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("editor/config-problem-previous"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(editor_buffer(&app, view).primary_selection().head, first);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -9161,6 +9364,120 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Every reload path (the watch's clean reload, Discard, and an undo back
+    /// to the base under a conflict) keeps the caret, a mark and the scroll
+    /// on the text they were on, wherever the disk did not change it.
+    #[test]
+    fn a_reload_from_disk_keeps_the_caret_mark_and_scroll_on_their_text() {
+        let wid = WindowId(0);
+        let base = (1..=60)
+            .map(|line| format!("key_{line:02} = {line}\n"))
+            .collect::<String>();
+        // The external writer deletes line 2 and appends a key at the end.
+        let external = format!(
+            "{}{}extra = 1\n",
+            &base[..base.find("key_02").unwrap()],
+            &base[base.find("key_03").unwrap()..]
+        );
+        let line_start = |text: &str, key: &str| text.find(key).unwrap();
+        let place = |app: &mut App, view: crate::tab_model::ViewId| {
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+                panic!("expected editor view");
+            };
+            let buffer = state.buffer.as_mut().expect("attached editor buffer");
+            let caret = line_start(&base, "key_12") + 4;
+            buffer.selections = vec![crate::native_editor::Selection::caret(caret)];
+            buffer.primary = 0;
+            buffer.viewport_anchor = line_start(&base, "key_10");
+            caret
+        };
+        let check = |app: &App, view: crate::tab_model::ViewId, path: &str| {
+            let buffer = editor_buffer(app, view);
+            assert_eq!(
+                buffer.primary_selection().range(),
+                {
+                    let caret = line_start(&external, "key_12") + 4;
+                    caret..caret
+                },
+                "{path}: the caret stays on its text"
+            );
+            assert_eq!(
+                buffer.viewport_anchor,
+                line_start(&external, "key_10"),
+                "{path}: the scroll stays on its text"
+            );
+        };
+        let reload = |app: &mut App, path: &std::path::Path| {
+            fs::write(path, &external).unwrap();
+            let observation =
+                crate::native_config_service::VersionedConfigService::observe_path(path, false)
+                    .unwrap();
+            app.refresh_open_config_editor_observation(&observation)
+                .unwrap();
+        };
+
+        // The watch reloads a clean buffer.
+        let (dir, path, mut app, views) = open_config("aterm-reload-keeps-caret-clean", &base);
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        let caret = place(&mut app, views.1);
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorCommand(crate::native_editor::EditorCommand::SetMark),
+        )
+        .unwrap();
+        assert_eq!(
+            app.editor_workspace
+                .global_mark_ring
+                .front()
+                .map(|mark| mark.offset),
+            Some(caret)
+        );
+        reload(&mut app, &path);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            external
+        );
+        check(&app, views.1, "a clean reload");
+        assert_eq!(
+            app.editor_workspace
+                .global_mark_ring
+                .front()
+                .map(|mark| mark.offset),
+            Some(line_start(&external, "key_12") + 4),
+            "a clean reload: the mark stays on its text"
+        );
+        let _ = fs::remove_dir_all(dir);
+
+        // Discard Changes and Reload from Disk.
+        let (dir, path, mut app, views) = open_config("aterm-reload-keeps-caret-discard", &base);
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        place(&mut app, views.1);
+        commit(&mut app, wid, "x");
+        reload(&mut app, &path);
+        assert!(app.native_documents.disk_conflicts.contains_key(&document));
+        app.discard_document_changes(document, views.1).unwrap();
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            external
+        );
+        check(&app, views.1, "Discard");
+        let _ = fs::remove_dir_all(dir);
+
+        // An undo back to the base under a conflict adopts the disk text.
+        let (dir, path, mut app, views) = open_config("aterm-reload-keeps-caret-undo", &base);
+        let document = app.native_runtime.document_id(views.0).unwrap();
+        place(&mut app, views.1);
+        commit(&mut app, wid, "x");
+        reload(&mut app, &path);
+        undo(&mut app, wid);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            external
+        );
+        check(&app, views.1, "an undo to the base");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn undo_to_base_keeps_local_edits_saves_in_flight_and_binding_conflicts() {
         let wid = WindowId(0);
@@ -9234,6 +9551,8 @@ mod tests {
 
     #[test]
     fn file_refresh_reloads_clean_conflicts_dirty_and_explicit_discard_is_atomic() {
+        use amacs::input::EditorInput;
+
         let dir = fresh_dir("aterm-app-refresh-discard");
         let path = dir.join("watched.md");
         fs::write(&path, "disk one\n").unwrap();
@@ -9257,11 +9576,49 @@ mod tests {
 
         commit(&mut app, wid, "local ");
         let local = app.document_store.snapshot(document).unwrap();
+        let retained_state = |app: &mut App| {
+            assert!(app.prepare_native_input_scratch(wid));
+            let artifact = app
+                .retained_native_leaf_artifact(wid, view, false)
+                .expect("the retained Editor scene matches its current authority");
+            let save = artifact
+                .compiled
+                .semantic(&crate::native_ui::UiKey::new("editor/save-button"))
+                .expect("the retained toolbar has Save")
+                .state
+                .unwrap()
+                .enabled;
+            let revert = artifact
+                .compiled
+                .semantic(&crate::native_ui::UiKey::new("editor/revert-button"))
+                .map(|node| node.state.unwrap().enabled);
+            let conflict_recovery = artifact.compiled.paint.iter().any(|node| {
+                matches!(&node.content, crate::native_ui::UiContent::TextViewport(spec)
+                    if spec.semantic_status.as_deref().is_some_and(|status|
+                        status.contains(crate::native_app::DISK_CONFLICT_RECOVERY)))
+            });
+            let stamp = app.windows[&wid].leaf_render_cache[&view]
+                .native
+                .as_ref()
+                .unwrap()
+                .stamp;
+            (save, revert, conflict_recovery, stamp)
+        };
+        let warm = retained_state(&mut app);
+        assert_eq!(
+            (warm.0, warm.1, warm.2),
+            (true, None, false),
+            "a dirty Editor begins with retained Save and no conflict recovery"
+        );
+        let tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let tab_count = app.windows[&wid].tab_set.tabs().len();
         fs::write(&path, "disk three\n").unwrap();
-        assert!(matches!(
-            app.refresh_native_document(document).unwrap(),
-            crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
-        ));
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        assert_eq!(app.active_native_view(wid), Some((instance, view)));
+        assert_eq!(app.native_runtime.document_id(instance), Some(document));
+        assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab));
+        assert_eq!(app.windows[&wid].tab_set.tabs().len(), tab_count);
         let preserved = app.document_store.snapshot(document).unwrap();
         assert_eq!(preserved.seq, local.seq);
         assert_eq!(preserved.text, local.text);
@@ -9280,6 +9637,18 @@ mod tests {
             .expect("Save command")
             .enabled;
         assert!(!save_enabled, "Save UI is disabled during disk conflict");
+        let mut retained_failures = Vec::new();
+        let conflicted = retained_state(&mut app);
+        if (conflicted.0, conflicted.1, conflicted.2) != (false, Some(true), true) {
+            retained_failures.push(format!(
+                "reopening the dirty document retained stale Save/Revert/recovery: {:?}",
+                (conflicted.0, conflicted.1, conflicted.2)
+            ));
+        }
+        if conflicted.3 == warm.3 {
+            retained_failures
+                .push("conflict state did not retire the old compiled-scene authority".to_string());
+        }
         app.save_document_checkpoint(document, view).unwrap_err();
         assert_eq!(fs::read_to_string(&path).unwrap(), "disk three\n");
         let recovery = app
@@ -9288,6 +9657,136 @@ mod tests {
             .get(&document)
             .expect("conflict recovery guidance");
         assert_eq!(recovery, crate::native_app::DISK_CONFLICT_RECOVERY);
+
+        let revert_available = |app: &App| {
+            let command_enabled = app
+                .native_runtime
+                .commands(instance, view)
+                .unwrap()
+                .into_iter()
+                .find(|command| command.id.as_str() == "editor/revert")
+                .unwrap()
+                .enabled;
+            let toolbar_enabled = app
+                .compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&crate::native_ui::UiKey::new("editor/revert-button"))
+                .unwrap()
+                .state
+                .unwrap()
+                .enabled;
+            (command_enabled, toolbar_enabled)
+        };
+        let editor_save_state = |app: &App| {
+            let Some(NativeApp::Editor(editor)) = app.native_runtime.app(instance) else {
+                panic!("the conflicted editor remains installed");
+            };
+            (
+                editor.dirty,
+                editor.disk_conflict,
+                editor.checkpoint_pending,
+                editor.recovery_status.clone(),
+                editor.can_undo,
+                editor.can_redo,
+                app.native_documents.inflight.contains(&document),
+                app.native_documents.persistence.save_in_flight(document),
+                app.native_documents.persistence.observed(document),
+            )
+        };
+        assert_eq!(revert_available(&app), (true, true));
+        let mut capability_failures = Vec::new();
+        for command in [
+            EditorCommand::GotoLine,
+            EditorCommand::ExecuteCommand,
+            EditorCommand::SwitchBuffer,
+            EditorCommand::KillBuffer,
+            EditorCommand::IncrementalSearch,
+        ] {
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(command))
+                .unwrap();
+            app.dispatch_native_event(wid, AppEvent::EditorInput(EditorInput::Text("2".into())))
+                .unwrap();
+            let before_buffer = editor_buffer(&app, view).clone();
+            assert!(matches!(
+                (command, &before_buffer.minibuffer),
+                (EditorCommand::GotoLine, Minibuffer::GotoLine { .. })
+                    | (EditorCommand::ExecuteCommand, Minibuffer::Command { .. })
+                    | (EditorCommand::SwitchBuffer, Minibuffer::Buffer { .. })
+                    | (EditorCommand::KillBuffer, Minibuffer::Prompt { .. })
+                    | (EditorCommand::IncrementalSearch, Minibuffer::Search { .. })
+            ));
+            let query = match &before_buffer.minibuffer {
+                Minibuffer::GotoLine { query, .. }
+                | Minibuffer::Command { query, .. }
+                | Minibuffer::Buffer { query }
+                | Minibuffer::Prompt { query, .. }
+                | Minibuffer::Search { query, .. } => query,
+                Minibuffer::Inactive => unreachable!(),
+            };
+            assert_eq!(query, "2");
+            let available = revert_available(&app);
+            if available != (false, false) {
+                capability_failures.push(format!(
+                    "{command:?}: Revert enabled in command/toolbar {available:?}"
+                ));
+            }
+            let before_input = before_buffer.input_lifetime();
+            let before_save = editor_save_state(&app);
+            let before_conflicts = app.native_documents.disk_conflicts.clone();
+            let before_recovery = app.native_documents.recovery_status.clone();
+            for palette in [false, true] {
+                let result = if palette {
+                    app.activate_native_palette_target(&crate::palette::NativeCommandTarget {
+                        window: wid,
+                        instance,
+                        view,
+                        generation: app.native_runtime.view_generation(view).unwrap(),
+                        action: crate::native_ui::ActionId::new("editor/revert"),
+                    })
+                } else {
+                    app.act_app(crate::app_control::ActRequest {
+                        view,
+                        ui_key: "editor/revert-button".to_string(),
+                        action: "editor/revert".to_string(),
+                        value: None,
+                    })
+                    .map(|_| ())
+                };
+                if result.is_ok() {
+                    capability_failures.push(format!(
+                        "{command:?}: Revert did not refuse with palette={palette}"
+                    ));
+                }
+                assert_eq!(editor_buffer(&app, view), &before_buffer);
+                assert!(std::sync::Arc::ptr_eq(
+                    &before_input,
+                    &editor_buffer(&app, view).input_lifetime()
+                ));
+                let after = app.document_store.snapshot(document).unwrap();
+                assert_eq!(after.seq, local.seq);
+                assert_eq!(after.text, local.text);
+                assert_eq!(app.document_store.dirty(document), Some(true));
+                assert_eq!(fs::read_to_string(&path).unwrap(), "disk three\n");
+                assert_eq!(editor_save_state(&app), before_save);
+                assert_eq!(app.native_documents.disk_conflicts, before_conflicts);
+                assert_eq!(app.native_documents.recovery_status, before_recovery);
+            }
+            let exit = if command == EditorCommand::GotoLine {
+                AppEvent::EditorInput(EditorInput::Key {
+                    key: Key::Named(NamedKey::Enter),
+                    mods: Modifiers::empty(),
+                    text: None,
+                })
+            } else {
+                AppEvent::EditorCommand(EditorCommand::Abort)
+            };
+            app.dispatch_native_event(wid, exit).unwrap();
+            assert!(matches!(
+                editor_buffer(&app, view).minibuffer,
+                Minibuffer::Inactive
+            ));
+            assert_eq!(revert_available(&app), (true, true));
+        }
 
         app.dispatch_native_event(
             wid,
@@ -9312,9 +9811,22 @@ mod tests {
             .primary_selection()
             .range();
         assert!(selection.is_empty());
-        assert!(selection.end <= "disk three\n".len());
+        assert_eq!(selection.end, "disk three\n".len());
+        let discarded = retained_state(&mut app);
+        assert_eq!(
+            (discarded.0, discarded.1, discarded.2),
+            (false, None, false),
+            "the retained scene clears conflict controls and recovery after discard"
+        );
+        assert_ne!(discarded.3, conflicted.3);
 
         commit(&mut app, wid, "resolved ");
+        let resolved = retained_state(&mut app);
+        assert_eq!(
+            (resolved.0, resolved.1, resolved.2),
+            (true, None, false),
+            "fresh edits restore retained Save without a conflict action"
+        );
         let save_enabled = app
             .native_runtime
             .commands(instance, view)
@@ -9328,8 +9840,11 @@ mod tests {
             "fresh edits are saveable after explicit reload"
         );
         app.save_document_checkpoint(document, view).unwrap();
+        // The submitted Go to Line moved to line 2; Discard keeps that EOF caret.
         assert_eq!(fs::read_to_string(&path).unwrap(), "disk three\nresolved ");
         let _ = fs::remove_dir_all(dir);
+        assert!(capability_failures.is_empty(), "{capability_failures:#?}");
+        assert!(retained_failures.is_empty(), "{retained_failures:#?}");
     }
 
     #[test]
@@ -9587,48 +10102,282 @@ mod tests {
         fs::write(&path, "before\n").unwrap();
         let uri = file_uri(&path);
         let mut app = App::headless_for_test();
-        app.open_document_tab(AppKind::Editor, &uri).unwrap();
         let wid = WindowId(0);
+        let mut layout = app.capture_restore_manifest().windows.remove(0);
+        layout.tabs.clear();
+        layout.native_tabs.clear();
+        layout.tab_order.clear();
+        layout.active_item = Some(0);
+        layout.restored_tabs = vec![crate::restore::RestoredTab {
+            root: crate::restore::RestoredSplitTree::Split {
+                axis: crate::restore::SplitKind::Horizontal,
+                ratio: 0.63,
+                first: Box::new(crate::restore::RestoredSplitTree::leaf(
+                    crate::restore::RestoredView::Native(
+                        crate::restore::NativeLeafRestore::document("editor", uri.clone()),
+                    ),
+                )),
+                second: Box::new(crate::restore::RestoredSplitTree::leaf(
+                    crate::restore::RestoredView::Native(
+                        crate::restore::NativeLeafRestore::settings("/about".to_string()),
+                    ),
+                )),
+            },
+            focused_path: vec![crate::restore::RestoreBranch::First],
+            zoomed: false,
+        }];
+        let collapse_layout = layout.clone();
+        let mut failures = Vec::new();
+        app.restore_into_window(wid, layout);
         let (editor_instance, editor_view) = app.active_native_view(wid).unwrap();
         let document = app.native_runtime.document_id(editor_instance).unwrap();
-
-        let settings_instance = app
-            .native_runtime
-            .insert_instance(NativeApp::Settings(Box::new(
-                crate::native_settings::SettingsApp::new(
-                    crate::update_screen::UpdateState::from_status(1, "test", None, false),
-                ),
-            )))
-            .unwrap();
-        let settings_view = app
-            .split_active_with_native(
-                wid,
-                crate::tab_model::SplitAxis::Horizontal,
-                settings_instance,
-                AppViewState::Settings(Box::new(crate::native_settings::SettingsViewState::new(
-                    &app.config,
-                ))),
-            )
-            .unwrap();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .tab_set
-            .active_mut()
-            .unwrap()
-            .set_focus(editor_view);
-        app.sync_window(wid);
+        let original = app.windows[&wid].tab_set.active().unwrap();
+        let original_tab = original.id;
+        let original_root = original.root.clone();
+        assert_eq!(original_root.leaves().len(), 2);
+        let settings_view = original_root.leaves()[1];
+        let settings_generation = app.native_runtime.view_generation(settings_view);
+        let settings_state = |app: &App| {
+            let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(settings_view)
+            else {
+                panic!("the Settings sibling stays attached");
+            };
+            (state.route, state.search.clone(), state.page_scroll)
+        };
+        let settings_before = settings_state(&app);
+        assert_eq!(
+            settings_before.0,
+            crate::native_settings::SettingsRoute::About
+        );
+        assert!(app.closed_recovery.views.is_empty());
+        assert!(app.closed_recovery.tabs.is_empty());
         commit(&mut app, wid, "safe ");
+        let edited = app.document_store.snapshot(document).unwrap();
+        assert_eq!(edited.text.as_ref(), "safe before\n");
+        assert_eq!(app.document_store.dirty(document), Some(true));
 
         app.close_active_tab();
 
         let active = app.windows[&wid].tab_set.active().unwrap();
+        assert_eq!(active.id, original_tab);
         assert_eq!(active.root.leaves(), vec![settings_view]);
         assert_eq!(active.focus, settings_view);
         assert_eq!(app.document_store.view_count(document), Some(0));
+        assert_eq!(
+            app.document_store.checkpoint_seq(document),
+            Some(edited.seq)
+        );
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert!(app.view_store.get(editor_view).is_none());
+        assert!(app.native_runtime.view_state(editor_view).is_none());
+        assert!(app.native_documents.pending_closes.is_empty());
+        assert_eq!(settings_state(&app), settings_before);
+        assert_eq!(
+            app.native_runtime.view_generation(settings_view),
+            settings_generation
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "safe before\n");
         assert!(app.structural_invariants_ok());
+        let recovery_count = app.closed_recovery.views.len();
+        assert!(app.closed_recovery.tabs.is_empty());
+        if recovery_count == 1 {
+            app.reopen_last_closed_view().unwrap();
+            let (reopened_instance, reopened_view) = app.active_native_view(wid).unwrap();
+            assert_ne!(reopened_view, editor_view);
+            assert_ne!(reopened_instance, editor_instance);
+            assert_eq!(
+                app.native_runtime.document_id(reopened_instance),
+                Some(document)
+            );
+            let reopened = app.windows[&wid].tab_set.active().unwrap();
+            assert_eq!(reopened.id, original_tab);
+            assert_eq!(
+                reopened.root,
+                original_root.map(&mut |view| {
+                    if *view == editor_view {
+                        reopened_view
+                    } else {
+                        *view
+                    }
+                })
+            );
+            assert_eq!(reopened.focus, reopened_view);
+            assert_eq!(app.windows[&wid].tab_set.len(), 1);
+            assert_eq!(app.document_store.view_count(document), Some(1));
+            let snapshot = app.document_store.snapshot(document).unwrap();
+            assert_eq!((snapshot.seq, snapshot.text), (edited.seq, edited.text));
+            assert_eq!(app.document_store.dirty(document), Some(false));
+            assert_eq!(settings_state(&app), settings_before);
+            assert_eq!(
+                app.native_runtime.view_generation(settings_view),
+                settings_generation
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "safe before\n");
+            assert!(app.closed_recovery.views.is_empty());
+            assert!(app.closed_recovery.tabs.is_empty());
+            assert!(
+                app.reopen_last_closed_view().is_err(),
+                "the saved close is recorded once"
+            );
+            assert!(app.structural_invariants_ok());
+        }
+        if recovery_count != 1 {
+            failures.push("durable pane removal did not retain exactly one pane recovery record");
+        }
+        drop(app);
+
+        // A sibling can close while the document's real save is still in
+        // flight, leaving the pending pane close responsible for the whole tab.
+        for keep_foreground in [true, false] {
+            fs::write(&path, "before\n").unwrap();
+            let mut app = App::headless_for_test();
+            app.restore_into_window(wid, collapse_layout.clone());
+            let (editor_instance, editor_view) = app.active_native_view(wid).unwrap();
+            let document = app.native_runtime.document_id(editor_instance).unwrap();
+            let tab = app.windows[&wid].tab_set.active().unwrap();
+            let original_tab = tab.id;
+            let settings_view = tab.root.leaves()[1];
+            commit(&mut app, wid, "held ");
+            let edited = app.document_store.snapshot(document).unwrap();
+            let held = app.hold_document_save_for_test(document);
+            app.close_active_tab();
+            assert!(app.document_close_pending_for_test(document));
+            assert_eq!(app.document_store.view_count(document), Some(1));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+            assert!(app.closed_recovery.views.is_empty());
+            assert!(app.closed_recovery.tabs.is_empty());
+            assert!(
+                app.windows
+                    .get_mut(&wid)
+                    .unwrap()
+                    .tab_set
+                    .active_mut()
+                    .unwrap()
+                    .set_focus(settings_view)
+            );
+            app.resync_active_or_window(wid);
+            app.close_active_tab();
+            let remaining = app.windows[&wid].tab_set.get(original_tab).unwrap();
+            assert_eq!(remaining.root.leaves(), vec![editor_view]);
+            assert!(app.view_store.get(settings_view).is_none());
+            assert_eq!(
+                app.closed_recovery.views.len(),
+                1,
+                "the sibling's own close is recoverable"
+            );
+            assert!(app.closed_recovery.tabs.is_empty());
+            assert!(app.native_documents.inflight.contains(&document));
+
+            let terminal_text = |app: &App, session| {
+                let term = crate::term_lock(&app.pool.get(session).unwrap().term);
+                (0..usize::from(term.grid().rows()))
+                    .map(|row| term.row_text(row))
+                    .collect::<Vec<_>>()
+            };
+            let foreground = keep_foreground.then(|| {
+                let session = app.next_session_id;
+                app.push_stub_tab(wid, crate::stub_session(session));
+                let tab = app.windows[&wid].tab_set.active().unwrap().clone();
+                let layout = app.windows[&wid].layouts[0].clone();
+                let term = app.pool.get(session).unwrap().term.clone();
+                crate::term_lock(&term).process(b"FOREGROUND STAYS");
+                let text = terminal_text(&app, session);
+                (session, tab, layout, term, text)
+            });
+            app.land_held_document_save_for_test(document, editor_view, held)
+                .unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), "held before\n");
+            assert_eq!(
+                app.document_store.checkpoint_seq(document),
+                Some(edited.seq)
+            );
+            assert_eq!(app.document_store.dirty(document), Some(false));
+            assert_eq!(app.document_store.view_count(document), Some(0));
+            assert!(!app.document_close_pending_for_test(document));
+            assert_eq!(app.frontmost_window, Some(wid));
+            if let Some((session, tab, layout, term, text)) = &foreground {
+                assert_eq!(app.windows[&wid].tab_set.active_id(), Some(tab.id));
+                assert_eq!(app.windows[&wid].tab_set.get(tab.id), Some(tab));
+                assert_eq!(&app.windows[&wid].layouts[0], layout);
+                assert_eq!(app.clipboard_session_in(wid), Some(*session));
+                assert_eq!(
+                    app.active_handle.lock().unwrap().as_ref().unwrap().id,
+                    *session
+                );
+                assert!(std::sync::Arc::ptr_eq(
+                    term,
+                    &app.pool.get(*session).unwrap().term
+                ));
+                assert_eq!(&terminal_text(&app, *session), text);
+                assert!(!app.windows[&wid].pending_close);
+            } else {
+                assert_eq!(app.clipboard_session_in(wid), None);
+                assert!(app.active_handle.lock().unwrap().is_none());
+                if !app.windows[&wid].tab_set.is_empty() || !app.windows[&wid].pending_close {
+                    failures.push(
+                        "the final pending document close did not arm the empty window for closure",
+                    );
+                }
+            }
+            assert_eq!(
+                app.closed_recovery.views.len(),
+                1,
+                "finishing the whole tab adds no obsolete pane placement"
+            );
+            let closed = app.windows[&wid].tab_set.get(original_tab).is_none();
+            if !closed {
+                failures.push("the pending close left the saved document as a sole leaf");
+            }
+            if app.view_store.get(editor_view).is_some()
+                || app.native_runtime.view_state(editor_view).is_some()
+            {
+                failures.push("the pending close left the old document view attached");
+            }
+            let recovery_count = app.closed_recovery.tabs.len();
+            if recovery_count != 1 {
+                failures.push("the collapsed pending close did not retain exactly one whole-tab recovery record");
+            }
+            assert!(app.structural_invariants_ok());
+            if let Some((session, foreground_tab, foreground_layout, _, foreground_before)) =
+                foreground
+                && closed
+                && recovery_count == 1
+            {
+                app.reopen_last_closed_tab().unwrap();
+                let (reopened_instance, reopened_view) = app.active_native_view(wid).unwrap();
+                assert_ne!(reopened_instance, editor_instance);
+                assert_ne!(reopened_view, editor_view);
+                assert_eq!(
+                    app.native_runtime.document_id(reopened_instance),
+                    Some(document)
+                );
+                let reopened = app.windows[&wid].tab_set.active().unwrap();
+                assert_ne!(reopened.id, original_tab);
+                assert_eq!(reopened.root.leaves(), vec![reopened_view]);
+                assert_eq!(app.windows[&wid].tab_set.len(), 2);
+                let snapshot = app.document_store.snapshot(document).unwrap();
+                assert_eq!((snapshot.seq, snapshot.text), (edited.seq, edited.text));
+                assert_eq!(app.document_store.view_count(document), Some(1));
+                assert_eq!(app.document_store.dirty(document), Some(false));
+                assert_eq!(
+                    app.windows[&wid].tab_set.get(foreground_tab.id),
+                    Some(&foreground_tab)
+                );
+                assert_eq!(app.windows[&wid].layouts[0], foreground_layout);
+                assert_eq!(terminal_text(&app, session), foreground_before);
+                assert_eq!(fs::read_to_string(&path).unwrap(), "held before\n");
+                assert!(app.closed_recovery.tabs.is_empty());
+                assert_eq!(app.closed_recovery.views.len(), 1);
+                assert!(
+                    app.reopen_last_closed_tab().is_err(),
+                    "the saved tab close is recorded once"
+                );
+                assert!(app.structural_invariants_ok());
+            }
+        }
         let _ = fs::remove_dir_all(dir);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

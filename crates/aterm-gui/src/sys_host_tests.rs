@@ -938,6 +938,7 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
         exclusive_bytes: 4_000,
         shared_bytes: 5_000,
         walking: true,
+        undiscovered: false,
         warnings: Vec::new(),
         growth: None,
         unknown_tab: false,
@@ -983,6 +984,11 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
         (t.total, t.exclusive, t.shared, t.walking),
         (9_000, 4_000, 5_000, true)
     );
+    assert_eq!(
+        t.not_measured,
+        ["protected", "too_broad"],
+        "the outermost roots the balance leaves out"
+    );
     let unknown = DiskReport {
         scope: DiskScope::Tab(5),
         roots: Vec::new(),
@@ -1012,6 +1018,204 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
         }
     ));
     assert!(totals.is_some_and(|t| t.walking && t.total == 0));
+}
+
+/// A tab whose only root the walker does not walk (a scratch HOME is too broad) balances as
+/// unavailable(too_broad), never `0 B exclusive`; summed with a measured tab, a lower bound.
+#[test]
+fn a_report_whose_only_root_is_not_measured_balances_as_unavailable_never_zero() {
+    use crate::diskwalk_host::{
+        Claim, Complete, Detail, DiskReport, DiskScope, RootKind, RootRecord, RootRow, RootState,
+        WalkerState,
+    };
+    use aterm_vitals::sys::disk::{totals_clause, totals_json};
+    let now = Instant::now();
+    let row = |path: &str, state, complete| RootRow {
+        n: 1,
+        claim: Claim {
+            path: path.into(),
+            kinds: [RootKind::Cwd].into_iter().collect(),
+            linked_worktree: false,
+        },
+        inside: None,
+        shared_with: Vec::new(),
+        counted_in: None,
+        shared_alloc: 0,
+        record: RootRecord {
+            path: path.into(),
+            state,
+            id: None,
+            partial: None,
+            walked_entries: 0,
+            complete,
+            level: Vec::new(),
+            read_from: None,
+            asked: None,
+        },
+    };
+    let home = DiskReport {
+        scope: DiskScope::Tab(1),
+        label: Some("Tab 1".into()),
+        roots: vec![row("/Users//scratch", RootState::OneLevel, None)],
+        total_bytes: 0,
+        exclusive_bytes: 0,
+        shared_bytes: 0,
+        walking: false,
+        undiscovered: false,
+        warnings: Vec::new(),
+        growth: None,
+        unknown_tab: false,
+        walker: WalkerState::Running,
+    };
+    let bps = |b: f64| format!("{b} B/s");
+    let tab_of = |k: u64| Some(usize::try_from(k).unwrap_or(0));
+    let (roots, totals) = walker_roots(std::slice::from_ref(&home), &[], &tab_of, now);
+    assert_eq!(roots[0].size, RootSize::NotMeasured("too_broad"));
+    let t = totals.expect("a walker's balance");
+    assert_eq!((t.total, t.walking), (0, false));
+    assert_eq!(t.not_measured, ["too_broad"]);
+    assert_eq!(totals_clause(Some(&t), bps), "sizes unavailable(too_broad)");
+    let mut o = aterm_vitals::sys::json::Jv::obj::<&str>([]);
+    totals_json(Some(&t), &mut o);
+    assert!(contract_violations(&o).is_empty(), "{}", o.to_text());
+    assert_eq!(
+        o.get("exclusive_bytes"),
+        Some(&aterm_vitals::sys::json::Jv::why("too_broad"))
+    );
+
+    let measured = Complete {
+        sums: aterm_diskwalk::Sums {
+            alloc_fair: 9_000,
+            ..aterm_diskwalk::Sums::default()
+        },
+        detail: Detail::Sizes,
+        links: None,
+        at: now,
+        took: Duration::from_millis(5),
+        direct_entries_max: 1,
+        biggest: Vec::new(),
+        most_entries: Vec::new(),
+        huge: Vec::new(),
+        not_measured: Vec::new(),
+        growth: None,
+    };
+    let repo = DiskReport {
+        scope: DiskScope::Tab(2),
+        label: Some("Tab 2".into()),
+        roots: vec![row("/w/repo", RootState::Complete, Some(measured))],
+        total_bytes: 9_000,
+        exclusive_bytes: 9_000,
+        ..home.clone()
+    };
+    let (_, totals) = walker_roots(&[home, repo], &[], &tab_of, now);
+    let t = totals.expect("a walker's balance");
+    assert_eq!(
+        (t.total, t.not_measured.as_slice()),
+        (9_000, &["too_broad"][..])
+    );
+    assert_eq!(
+        totals_clause(Some(&t), bps),
+        "\u{2265}9 KB exclusive (1 not measured: too_broad)"
+    );
+}
+
+/// A scope the walker has not discovered yet (the first `sys disk` a tab makes) reads as its
+/// panes' cwds still walking, sizes unknown, beside whatever roots are derived: never "0 roots".
+#[test]
+fn an_undiscovered_scope_reads_as_its_cwds_walking_never_as_no_roots() {
+    use crate::diskwalk_host::{
+        Claim, DiskReport, DiskScope, RootKind, RootRecord, RootRow, RootState, WalkerState,
+    };
+    let now = Instant::now();
+    let first_ask = DiskReport {
+        scope: DiskScope::Tab(5),
+        label: Some("Tab 3".into()),
+        roots: Vec::new(),
+        total_bytes: 0,
+        exclusive_bytes: 0,
+        shared_bytes: 0,
+        walking: true,
+        undiscovered: true,
+        warnings: Vec::new(),
+        growth: None,
+        unknown_tab: false,
+        walker: WalkerState::Running,
+    };
+    let cwds = [
+        PaneCwd {
+            key: 5,
+            tab: Some(3),
+            path: "/w/new".into(),
+        },
+        PaneCwd {
+            key: 6,
+            tab: Some(4),
+            path: "/w/other".into(),
+        },
+    ];
+    let tab_of = |k: u64| Some(usize::try_from(k).unwrap_or(0));
+    let (roots, totals) = walker_roots(std::slice::from_ref(&first_ask), &cwds, &tab_of, now);
+    assert_eq!(roots.len(), 1, "the pane's own cwd only: {roots:?}");
+    assert_eq!(
+        (
+            roots[0].path.as_str(),
+            roots[0].keys.as_slice(),
+            roots[0].tab
+        ),
+        ("/w/new", &[5][..], Some(3))
+    );
+    assert_eq!(roots[0].size.state_word(), Some("walking"));
+    assert_eq!(roots[0].size.alloc_text(), "unavailable(walking)");
+    assert!(totals.is_some_and(|t| t.walking && t.total == 0));
+
+    let derived = RootRow {
+        n: 1,
+        claim: Claim {
+            path: "/w/new".into(),
+            kinds: [RootKind::Cwd].into_iter().collect(),
+            linked_worktree: false,
+        },
+        inside: None,
+        shared_with: Vec::new(),
+        counted_in: Some(5),
+        shared_alloc: 0,
+        record: RootRecord {
+            path: "/w/new".into(),
+            state: RootState::Walking,
+            id: None,
+            partial: None,
+            walked_entries: 3,
+            complete: None,
+            level: Vec::new(),
+            read_from: None,
+            asked: None,
+        },
+    };
+    let aterm = DiskReport {
+        scope: DiskScope::Aterm,
+        label: None,
+        roots: vec![derived],
+        ..first_ask
+    };
+    let (roots, totals) = walker_roots(&[aterm], &cwds, &tab_of, now);
+    let paths: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/w/new", "/w/other"],
+        "the derived root once, then the pane not derived yet"
+    );
+    assert!(matches!(
+        roots[0].size,
+        RootSize::Walking {
+            walked_entries: 3,
+            ..
+        }
+    ));
+    assert_eq!(
+        (roots[1].keys.as_slice(), roots[1].tab),
+        (&[6][..], Some(4))
+    );
+    assert!(totals.is_some_and(|t| t.walking));
 }
 
 #[test]

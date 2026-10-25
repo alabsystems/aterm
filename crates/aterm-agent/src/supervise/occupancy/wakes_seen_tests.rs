@@ -79,6 +79,7 @@ fn wake(ord: u16, prio: Prio, state: WakeState, await_only: bool) -> WakeSeen {
         kinds: vec![AtomKind::File],
         need: None,
         need_slots: false,
+        need_met: true,
         await_only,
     }
 }

@@ -55,6 +55,16 @@ impl RootSize {
         }
     }
 
+    /// Why no walk measured the root, or `None` when one measured it or is measuring it.
+    #[must_use]
+    pub fn not_measured_why(&self) -> Option<&'static str> {
+        match self {
+            Self::NotSampled => Some("not_sampled"),
+            Self::NotMeasured(why) => Some(why),
+            Self::Walking { .. } | Self::Complete(_) => None,
+        }
+    }
+
     /// The sizes that speak for the root.
     #[must_use]
     pub fn sizes(&self) -> Option<&RootSizes> {
@@ -220,10 +230,57 @@ pub struct DiskTotals {
     pub shared: u64,
     /// A walk is queued or running for one of them.
     pub walking: bool,
+    /// The why of each outermost root no walk measured ([`RootSize::not_measured_why`]), in
+    /// root order: the figures leave those roots out, so they are lower bounds.
+    pub not_measured: Vec<&'static str>,
     /// Σ growth of the complete outermost roots, bytes per second.
     pub growth_bps: Option<i64>,
     /// The §10.8 folders across its roots, most entries first.
     pub warnings: Vec<HugeDirFact>,
+}
+
+impl DiskTotals {
+    /// Whether the figures are lower bounds: a walk is owed, or a root they fold was not measured.
+    #[must_use]
+    pub fn at_least(&self) -> bool {
+        self.walking || !self.not_measured.is_empty()
+    }
+
+    /// Why the figures stand for no size at all: a root was not measured, no walk is owed and
+    /// nothing measured adds a byte, so `≥0` would say nothing. The first such root's why.
+    #[must_use]
+    pub fn unavailable_why(&self) -> Option<&'static str> {
+        if self.walking || self.total > 0 {
+            return None;
+        }
+        self.not_measured.first().copied()
+    }
+
+    /// The not-measured whys, each once, in root order.
+    fn whys(&self) -> String {
+        let mut seen: Vec<&str> = Vec::new();
+        for w in &self.not_measured {
+            if !seen.contains(w) {
+                seen.push(w);
+            }
+        }
+        seen.join(",")
+    }
+
+    /// One balance figure in the JSON's shapes: bare when exact; a lower bound whose cause is
+    /// `walking`, else the first not-measured root's why; or that why alone when
+    /// [`Self::unavailable_why`] names one.
+    #[must_use]
+    pub fn figure_json(&self, v: u64) -> Jv {
+        if let Some(why) = self.unavailable_why() {
+            return Jv::why(why);
+        }
+        match (self.walking, self.not_measured.first()) {
+            (true, _) => Jv::at_least(v, "walking"),
+            (false, Some(why)) => Jv::at_least(v, why),
+            (false, None) => Jv::u(v),
+        }
+    }
 }
 
 /// Bytes as people read them, in decimal units.
@@ -249,14 +306,22 @@ pub fn totals_clause(totals: Option<&DiskTotals>, bps_word: impl Fn(f64) -> Stri
     let Some(t) = totals else {
         return "sizes unavailable(not_sampled)".to_owned();
     };
-    let ge = if t.walking { "\u{2265}" } else { "" };
-    let mut out = format!("{ge}{} exclusive", bytes_word(t.exclusive));
-    if t.shared > 0 {
-        out.push_str(&format!(", {ge}{} shared", bytes_word(t.shared)));
-    }
-    if t.walking {
-        out.push_str(" (walking)");
-    }
+    let mut out = if t.unavailable_why().is_some() {
+        format!("sizes unavailable({})", t.whys())
+    } else {
+        let ge = if t.at_least() { "\u{2265}" } else { "" };
+        let mut out = format!("{ge}{} exclusive", bytes_word(t.exclusive));
+        if t.shared > 0 {
+            out.push_str(&format!(", {ge}{} shared", bytes_word(t.shared)));
+        }
+        match (t.walking, t.not_measured.len()) {
+            (false, 0) => {}
+            (true, 0) => out.push_str(" (walking)"),
+            (false, n) => out.push_str(&format!(" ({n} not measured: {})", t.whys())),
+            (true, n) => out.push_str(&format!(" (walking; {n} not measured: {})", t.whys())),
+        }
+        out
+    };
     match t.growth_bps {
         Some(g) if g > 0 => out.push_str(&format!(" · growing {}", bps_word(g as f64))),
         Some(g) if g < 0 => out.push_str(&format!(
@@ -277,22 +342,23 @@ pub fn totals_json(totals: Option<&DiskTotals>, o: &mut Jv) {
             o.set("shared_bytes", Jv::why("not_sampled"));
             o.set("total_bytes", Jv::why("not_sampled"));
             o.set("growth_bytes_per_s", Jv::why("not_sampled"));
+            o.set("not_measured", Jv::why("not_sampled"));
             o.set("warnings", Jv::why("not_sampled"));
         }
         Some(t) => {
-            let fig = |v: u64| {
-                if t.walking {
-                    Jv::at_least(v, "walking")
-                } else {
-                    Jv::u(v)
-                }
-            };
-            o.set("exclusive_bytes", fig(t.exclusive));
-            o.set("shared_bytes", fig(t.shared));
-            o.set("total_bytes", fig(t.total));
+            o.set("exclusive_bytes", t.figure_json(t.exclusive));
+            o.set("shared_bytes", t.figure_json(t.shared));
+            o.set("total_bytes", t.figure_json(t.total));
             o.set(
                 "growth_bytes_per_s",
-                t.growth_bps.map_or_else(|| Jv::why("warming"), Jv::Int),
+                t.growth_bps.map_or_else(
+                    || Jv::why(t.unavailable_why().unwrap_or("warming")),
+                    Jv::Int,
+                ),
+            );
+            o.set(
+                "not_measured",
+                Jv::Arr(t.not_measured.iter().map(|w| Jv::s(*w)).collect()),
             );
             o.set(
                 "warnings",
@@ -402,6 +468,7 @@ mod tests {
             exclusive: 15_300_000_000,
             shared: 0,
             walking: false,
+            not_measured: Vec::new(),
             growth_bps: Some(7_400_000),
             warnings: vec![HugeDirFact {
                 path: "/x/target/debug/deps".into(),
@@ -428,6 +495,93 @@ mod tests {
             totals_json(totals, &mut o);
             assert!(contract_violations(&o).is_empty(), "{}", o.to_text());
         }
+    }
+
+    /// `help sys`: the size of a folder no walk measures is `unavailable(<why>)`, never zero,
+    /// and a balance that leaves one out is a lower bound that says why.
+    #[test]
+    fn a_root_no_walk_measured_makes_the_balance_a_bound_never_a_bare_zero() {
+        let bps = |b: f64| format!("{:.1} MB/s", b / 1e6);
+        let json = |t: &DiskTotals| {
+            let mut o = Jv::obj::<&str>([]);
+            totals_json(Some(t), &mut o);
+            assert!(contract_violations(&o).is_empty(), "{}", o.to_text());
+            o
+        };
+        let only = DiskTotals {
+            not_measured: vec!["too_broad"],
+            ..DiskTotals::default()
+        };
+        assert_eq!(
+            totals_clause(Some(&only), bps),
+            "sizes unavailable(too_broad)"
+        );
+        let o = json(&only);
+        for key in [
+            "exclusive_bytes",
+            "shared_bytes",
+            "total_bytes",
+            "growth_bytes_per_s",
+        ] {
+            assert_eq!(o.get(key), Some(&Jv::why("too_broad")), "{key}");
+        }
+        assert_eq!(
+            o.get("not_measured"),
+            Some(&Jv::Arr(vec![Jv::s("too_broad")]))
+        );
+
+        let part = DiskTotals {
+            total: 9_150_000_000,
+            exclusive: 9_150_000_000,
+            growth_bps: Some(7_400_000),
+            ..only.clone()
+        };
+        assert_eq!(
+            totals_clause(Some(&part), bps),
+            "\u{2265}9.2 GB exclusive (1 not measured: too_broad) · growing 7.4 MB/s"
+        );
+        assert_eq!(
+            json(&part).get("exclusive_bytes"),
+            Some(&Jv::at_least(9_150_000_000, "too_broad"))
+        );
+
+        let both = DiskTotals {
+            walking: true,
+            not_measured: vec!["protected", "too_broad", "protected"],
+            ..part.clone()
+        };
+        assert_eq!(
+            totals_clause(Some(&both), bps),
+            "\u{2265}9.2 GB exclusive (walking; 3 not measured: protected,too_broad) · growing 7.4 MB/s"
+        );
+        assert_eq!(
+            json(&both).get("total_bytes"),
+            Some(&Jv::at_least(9_150_000_000, "walking"))
+        );
+        let owed = DiskTotals {
+            walking: true,
+            ..only
+        };
+        assert_eq!(
+            totals_clause(Some(&owed), bps),
+            "\u{2265}0 B exclusive (walking; 1 not measured: too_broad)",
+            "a walk still owed may add bytes: a bound, not unavailable"
+        );
+
+        let walking = DiskTotals {
+            walking: true,
+            not_measured: Vec::new(),
+            ..part
+        };
+        assert_eq!(
+            totals_clause(Some(&walking), bps),
+            "\u{2265}9.2 GB exclusive (walking) · growing 7.4 MB/s",
+            "nothing unmeasured: the walking form is unchanged"
+        );
+        assert_eq!(
+            json(&walking).get("not_measured"),
+            Some(&Jv::Arr(Vec::new()))
+        );
     }
 
     #[test]

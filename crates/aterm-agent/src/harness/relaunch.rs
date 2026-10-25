@@ -33,6 +33,9 @@ pub(super) struct Plan {
     pub(super) shell: u32,
     pub(super) dialect: Dialect,
     pub(super) line: String,
+    /// Why [`Self::line`] does not carry the usage tap its gate offered it ([`line_tap_kept`]):
+    /// recorded when the line is typed ([`note_tap_dropped`]).
+    pub(super) tap_dropped: Option<String>,
 }
 
 /// Why a session has no relaunch plan.
@@ -162,8 +165,7 @@ pub(super) fn plan(
     } else {
         launch.cwd.to_string()
     };
-    let cd =
-        (!want.is_empty() && cwd_of(shell).as_deref() != Some(want.as_str())).then(|| want.clone());
+    let cd = (!want.is_empty() && !same_dir(cwd_of(shell).as_deref(), &want)).then(|| want.clone());
     let model = line_model_of(opts, launch.session, launch.argv, launch.model);
     let required = required_env(launch.home, launch.homedir, launch.login);
     let exact = match launch.billing {
@@ -194,7 +196,7 @@ pub(super) fn plan(
             .map(|(name, value)| (*name, value.as_str()))
             .collect()
     });
-    let line = line_tapped_clear(
+    let (line, tap_dropped) = line_tap_kept(
         dialect,
         heal.as_deref(),
         cd.as_deref(),
@@ -215,7 +217,16 @@ pub(super) fn plan(
         shell,
         dialect,
         line,
+        tap_dropped,
     })
+}
+
+/// Whether the shell's directory `shell` (the kernel's spelling) is `want` (the agent's, often a
+/// session file's logical `$PWD`), by [`super::upgrade_drive::same_dir`]: one directory under two
+/// spellings (`/tmp` and `/private/tmp`, a symlinked home) is one directory, and a relaunch into
+/// it needs no `cd`. Every lane's relaunch plan asks this.
+pub(super) fn same_dir(shell: Option<&str>, want: &str) -> bool {
+    shell.is_some_and(|shell| super::upgrade_drive::same_dir(Path::new(shell), Path::new(want)))
 }
 
 fn tap_of(
@@ -310,6 +321,31 @@ fn line_tapped_clear(
     unset: Option<&[&str]>,
     tap: Option<&str>,
 ) -> Result<String, NoPlan> {
+    line_tap_kept(
+        dialect, heal, cd, exe, argv, session, model, mode, required, unset, tap,
+    )
+    .map(|(line, _)| line)
+}
+
+/// [`line_tapped_clear`]'s line, and why it does not carry the usage tap `tap` it was offered
+/// (`None`: it carries it, or none was offered): the tty's line cap had no room for it even
+/// without the launch's own environment ([`CLAUDE_LAUNCH_ENV`]), so the line falls back to no tap
+/// rather than to no relaunch. The plan reports it ([`Plan::tap_dropped`]), so the drop is
+/// recorded ([`note_tap_dropped`]), never silent.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn line_tap_kept(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    exe: &Path,
+    argv: &[String],
+    session: Option<&str>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    required: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    tap: Option<&str>,
+) -> Result<(String, Option<String>), NoPlan> {
     let mut flags =
         upgrade::rewrite_argv(argv, session.unwrap_or("-")).map_err(|e| NoPlan::Refused {
             why: format!("argv:{e}"),
@@ -326,21 +362,41 @@ fn line_tapped_clear(
         Some(unset) => upgrade::relaunch_line_env_clear(dialect, heal, cd, env, unset, exe, flags),
         None => upgrade::relaunch_line_env(dialect, heal, cd, env, exe, flags),
     };
-    tapped
-        .as_deref()
-        .map_or_else(|| Err(String::new()), |t| line(&both, t))
-        .or_else(|_| {
-            tapped
-                .as_deref()
-                .map_or_else(|| Err(String::new()), |t| line(required, t))
-        })
-        .or_else(|_| line(&both, &flags))
+    let dropped = match tapped.as_deref() {
+        None => None,
+        Some(t) => match line(&both, t).or_else(|_| line(required, t)) {
+            Ok(tapped) => return Ok((tapped, None)),
+            Err(why) => Some(why),
+        },
+    };
+    line(&both, &flags)
         .or_else(|_| line(required, &flags))
+        .map(|plain| {
+            let dropped = dropped.map(|why| {
+                format!(
+                    "the usage tap left this relaunch line: with it, {why}; without it, {} bytes",
+                    plain.len()
+                )
+            });
+            (plain, dropped)
+        })
         .map_err(|e| NoPlan::Refused {
             why: format!("line:{e}"),
             what: "line".to_string(),
             detail: e,
         })
+}
+
+/// The ledger's step for a relaunch typed without the usage tap its plan offered it, for want of
+/// room on the tty's line ([`line_tap_kept`]).
+pub(super) const TAP_DROPPED: &str = "tap-dropped";
+
+/// Record, beside the relaunch `r` whose line is about to be typed, that its line dropped the
+/// usage tap, where it did (`dropped`: [`Plan::tap_dropped`]).
+pub(super) fn note_tap_dropped(opts: &Opts, r: &Report, dropped: Option<&str>) {
+    if let Some(why) = dropped {
+        ledger(opts, &said(r.clone(), TAP_DROPPED), why);
+    }
 }
 
 /// `flags` with the usage tap's pair, `--settings <value>`, before the trailing `--resume` pair (at the end of a fresh start's flags).
@@ -2943,7 +2999,12 @@ pub(super) fn restart_as(
             };
             plan(opts, &launch, snap.shell, &t)
         });
-    let Plan { shell, line, .. } = match planned {
+    let Plan {
+        shell,
+        line,
+        tap_dropped,
+        ..
+    } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
@@ -3016,6 +3077,7 @@ pub(super) fn restart_as(
         &said(r.clone(), format!("restart:{}", why.word())),
         "SIGTERM",
     );
+    note_tap_dropped(opts, &r, tap_dropped.as_deref());
     let r = relaunch(opts, r, &mut st, &mut c, &session, k);
     save(opts, &session, &st);
     r
@@ -3084,7 +3146,7 @@ impl Snapshot {
     pub const fn codex(&self) -> Option<&CodexRun> {
         match &self.run {
             AgentRun::Codex(run) => Some(run),
-            AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
+            AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) => None,
         }
     }
 
@@ -3092,7 +3154,7 @@ impl Snapshot {
     pub const fn codex_mut(&mut self) -> Option<&mut CodexRun> {
         match &mut self.run {
             AgentRun::Codex(run) => Some(run),
-            AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
+            AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) => None,
         }
     }
 
@@ -3101,7 +3163,7 @@ impl Snapshot {
     pub const fn muse(&self) -> Option<&MuseRun> {
         match &self.run {
             AgentRun::Muse(run) => Some(run),
-            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
+            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) => None,
         }
     }
 
@@ -3110,16 +3172,7 @@ impl Snapshot {
     pub const fn agy(&self) -> Option<&AgyRun> {
         match &self.run {
             AgentRun::Agy(run) => Some(run),
-            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Gemini(_) => None,
-        }
-    }
-
-    /// A Gemini CLI's run, `None` for any other agent's.
-    #[must_use]
-    pub const fn gemini(&self) -> Option<&GeminiRun> {
-        match &self.run {
-            AgentRun::Gemini(run) => Some(run),
-            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => None,
+            AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) => None,
         }
     }
 }
@@ -3135,8 +3188,6 @@ pub enum AgentRun {
     Muse(MuseRun),
     /// An agy TUI ([`AgyRun`]).
     Agy(AgyRun),
-    /// A Gemini CLI TUI ([`GeminiRun`]).
-    Gemini(GeminiRun),
 }
 
 impl AgentRun {
@@ -3148,7 +3199,6 @@ impl AgentRun {
             AgentRun::Codex(_) => upgrade::Agent::Codex,
             AgentRun::Muse(_) => upgrade::Agent::Muse,
             AgentRun::Agy(_) => upgrade::Agent::Agy,
-            AgentRun::Gemini(_) => upgrade::Agent::Gemini,
         }
     }
 }
@@ -3192,28 +3242,6 @@ pub struct AgyRun {
     pub block: Option<u64>,
 }
 
-/// What a Gemini CLI TUI's relaunch on exit needs beside the [`Snapshot`]. The snapshot's `pid` is
-/// the parent node (the tab's foreground job, `node <gemini script>`), its `session` the one
-/// session header of its project begun since it started (the start-time rule; `None`: none, and
-/// no relaunch then resumes anything), and its `cwd` the project.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GeminiRun {
-    /// The gemini directory its sessions are under (canonical).
-    pub home: PathBuf,
-    /// Its project's chats directory (`<home>/tmp/<slug>/chats`, the slug whose `.project_root` names its project).
-    pub chats: Option<PathBuf>,
-    /// The homes its relaunch line carries (`GEMINI_CLI_HOME` where set, `HOME` where another than the user's; [`super::upgrade_gemini::relaunch_env`]).
-    pub env: Vec<(String, String)>,
-    /// When the parent started, unix milliseconds, never later than it did (`0`: unread).
-    pub started_ms: u64,
-    /// The child node it started (`0`: none found).
-    pub child: u32,
-    /// Why the start-time rule named no session, where it named none ([`super::upgrade_gemini::NoWitness`]).
-    pub unwitnessed: Option<super::upgrade_gemini::NoWitness>,
-    /// The shell-integration command block it runs in (its `id`, read while it runs), or `None` where none could be read.
-    pub block: Option<u64>,
-}
-
 /// What a codex-alab's relaunch needs beside the [`Snapshot`] (whose `session` is its thread, when nameable).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexRun {
@@ -3235,7 +3263,6 @@ pub fn carries_restart(user_home: &Path, snap: &Snapshot) -> bool {
         AgentRun::Agy(_) => {
             snap.shell != NO_SHELL && super::upgrade_drive::agy_carries_restart(user_home, snap)
         }
-        AgentRun::Gemini(_) => false,
     }
 }
 
@@ -3253,7 +3280,7 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
     }
     match &snap.run {
         AgentRun::Claude => {}
-        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => {
+        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => {
             return None;
         }
     }
@@ -3286,12 +3313,75 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
     .ok()
 }
 
+/// The longest model id [`tap_room`] keeps room for: a relaunch may name the conversation's model
+/// (`--model`), which only its records say.
+const TAP_ROOM_MODEL: usize = 64;
+
+/// The permission mode [`tap_room`] keeps room for: the longest one a relaunch names
+/// ([`with_permission_mode`] names none for `bypassPermissions`).
+const TAP_ROOM_MODE: &str = "acceptEdits";
+
+/// WHETHER THE RELAUNCH LINE aterm would type for `snap`'s Claude Code HAS ROOM FOR THE USAGE TAP
+/// `tap`, as far as a live read can tell: the one judgment the Claude Code footer's promise
+/// (`weekly ? · until relaunch`) makes beside its settings' ([`super::upgrade_drive::tap_settings_admit`]),
+/// so it never promises a tap the line would drop ([`line_tap_kept`]). The line is the one
+/// [`plan`] builds: the shell's dialect, atpkg's heal hook under `user_home`, a `cd` unless the
+/// shell is read standing in the agent's directory, its program, argv, conversation, home and
+/// login, and room besides for a `--model` of [`TAP_ROOM_MODEL`] bytes and a `--permission-mode`
+/// of [`TAP_ROOM_MODE`], which only the conversation's records say. `false` where no such line
+/// can be built at all.
+#[must_use]
+pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
+    let (Some(dialect), Some(session)) = (
+        snap.dialect,
+        snap.session
+            .as_deref()
+            .filter(|s| upgrade::is_session_id(s)),
+    ) else {
+        return false;
+    };
+    if !matches!(snap.run, AgentRun::Claude) {
+        return false;
+    }
+    let Ok(homedir) = home_carried(
+        user_home,
+        snap.home.as_deref(),
+        &snap.cwd,
+        &Records::of_snapshot(user_home, snap),
+    ) else {
+        return false;
+    };
+    let heal = atpkg::hooks::hook_file(user_home, dialect.hook_ext()).map(|(p, _)| p);
+    let cd = (!snap.cwd.is_empty()
+        && super::upgrade_drive::cwd_of(snap.shell).as_deref() != Some(snap.cwd.as_str()))
+    .then_some(snap.cwd.as_str());
+    let model = "m".repeat(TAP_ROOM_MODEL);
+    line_tap_kept(
+        dialect,
+        heal.as_deref(),
+        cd,
+        &snap.program,
+        &snap.argv,
+        Some(session),
+        Some(&model),
+        Some(TAP_ROOM_MODE),
+        &required_env(
+            snap.home.as_deref(),
+            homedir.as_deref(),
+            snap.login.as_deref(),
+        ),
+        None,
+        Some(tap),
+    )
+    .is_ok_and(|(_, dropped)| dropped.is_none())
+}
+
 /// The line a person is told to run to resume the agent `snap` describes by hand, for a user whose home is `user_home`.
 #[must_use]
 pub fn told_command(user_home: &Path, state: Option<&Path>, snap: &Snapshot) -> Option<String> {
     match &snap.run {
         AgentRun::Claude => {}
-        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => {
+        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => {
             return None;
         }
     }
@@ -3333,7 +3423,6 @@ pub fn launched(
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic,
         )
         | None => false,
@@ -3355,7 +3444,7 @@ pub fn launched(
     Some((image.to_path_buf(), out))
 }
 
-/// Read the [`Snapshot`] of the Claude Code (or codex-alab, Muse Code, agy or Gemini CLI) in tab `opts.only_sid` on `opts.sock`.
+/// Read the [`Snapshot`] of the Claude Code (or codex-alab, Muse Code or agy) in tab `opts.only_sid` on `opts.sock`.
 pub fn snapshot(opts: &Opts) -> Result<Snapshot, &'static str> {
     snapshot_with(opts, &Live)
 }
@@ -3383,34 +3472,26 @@ pub(super) enum SnapshotLane {
     Muse,
     /// The agy lane's.
     Agy,
-    /// The Gemini CLI lane's.
-    Gemini,
     /// No lane relaunches it.
     None,
 }
 
-/// The lane a foreground process is read by: a Gemini CLI by its `node` image and script, any
-/// other by the basename of its mapped image (`image`; `None`: unreadable), a Codex's lane only
-/// for an ALab build.
-pub(super) fn snapshot_lane(image: Option<&Path>, argv: &[String]) -> SnapshotLane {
-    if super::upgrade_gemini::is_gemini_process(image, argv) {
-        return SnapshotLane::Gemini;
+/// The lane a foreground process is read by: the basename of its mapped image (`image`; `None`:
+/// unreadable), a Codex's lane only for an ALab build, and none for a retired agent's
+/// ([`aterm_phase::retired_agent`]: Gemini CLI, which agy replaces).
+pub(super) fn snapshot_lane(image: Option<&Path>) -> SnapshotLane {
+    let name = image.and_then(Path::file_name).and_then(|n| n.to_str());
+    if name.is_some_and(aterm_phase::retired_agent) {
+        return SnapshotLane::None;
     }
-    match image
-        .and_then(Path::file_name)
-        .and_then(|n| n.to_str())
-        .and_then(aterm_phase::program_of)
-    {
+    match name.and_then(aterm_phase::program_of) {
         Some(aterm_phase::Program::Codex) if image.is_some_and(super::codex_alab::alab_bytes) => {
             SnapshotLane::CodexAlab
         }
         Some(aterm_phase::Program::Muse) => SnapshotLane::Muse,
         Some(aterm_phase::Program::Agy) => SnapshotLane::Agy,
         Some(
-            aterm_phase::Program::Codex
-            | aterm_phase::Program::Grok
-            | aterm_phase::Program::Kimi
-            | aterm_phase::Program::Gemini,
+            aterm_phase::Program::Codex | aterm_phase::Program::Grok | aterm_phase::Program::Kimi,
         ) => SnapshotLane::None,
         Some(aterm_phase::Program::Claude | aterm_phase::Program::Generic) | None => {
             SnapshotLane::Claude
@@ -3553,7 +3634,7 @@ fn snapshot_with_claimed(
     let start = kernel_start(pid).ok_or("start")?;
     let image = exe_of(pid);
     super::laps::lap("process");
-    match snapshot_lane(image.as_deref(), &args.argv) {
+    match snapshot_lane(image.as_deref()) {
         SnapshotLane::CodexAlab => {
             return super::upgrade_drive::codex_alab_snapshot_with_claim(
                 opts, tab, pid, start, shell, &args, claim,
@@ -3564,9 +3645,6 @@ fn snapshot_with_claimed(
         }
         SnapshotLane::Agy => {
             return super::upgrade_drive::agy_snapshot(opts, tab, pid, start, shell, &args);
-        }
-        SnapshotLane::Gemini => {
-            return super::upgrade_drive::gemini_snapshot(opts, tab, pid, start, shell, &args);
         }
         SnapshotLane::None => return Err(NO_LANE),
         SnapshotLane::Claude => {}
@@ -3645,7 +3723,7 @@ pub fn foreground(snap: &Snapshot, fg: i64) -> Foreground {
 pub fn follow(home: &Path, snap: &mut Snapshot) -> bool {
     match &snap.run {
         AgentRun::Claude => {}
-        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => {
+        AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => {
             return false;
         }
     }
@@ -3711,16 +3789,13 @@ pub enum ExitRecord {
     Crashed,
     /// The agent refused its own start, by its shell's exit status.
     Refused,
-    /// A Gemini CLI's own restart, refused for its own session ID, read at the exit from its
-    /// shell's word ([`ExitLook::restarted_itself`]).
-    Restarted,
 }
 
 impl ExitRecord {
     /// The exit was a crash, read at the exit.
     #[must_use]
     pub const fn crashed(&self) -> bool {
-        matches!(self, Self::Survived(_) | Self::Crashed | Self::Restarted)
+        matches!(self, Self::Survived(_) | Self::Crashed)
     }
 
     /// One word for the host's log.
@@ -3732,7 +3807,6 @@ impl ExitRecord {
             Self::Removed => "removed",
             Self::Crashed => "crashed",
             Self::Refused => "refused",
-            Self::Restarted => "restarted",
         }
     }
 }
@@ -3744,7 +3818,6 @@ pub fn launch_ended(snap: &Snapshot, left: &ExitRecord) -> Option<&'static str> 
         AgentRun::Claude | AgentRun::Codex(_) => upgrade::one_shot(&snap.argv),
         AgentRun::Muse(_) => !super::upgrade_muse::is_tui_argv(&snap.argv),
         AgentRun::Agy(_) => !super::upgrade_agy::is_tui_argv(&snap.argv),
-        AgentRun::Gemini(_) => !super::upgrade_gemini::is_tui_argv(&snap.argv),
     };
     if one_shot {
         Some("one-shot")
@@ -3770,9 +3843,6 @@ pub struct ExitLook {
     pub crashed: Option<bool>,
     /// A Muse Code's or an agy's shell says it refused its start ([`ExitRecord::Refused`]), with `crashed` `Some(false)`.
     pub refused: bool,
-    /// A Gemini CLI's shell says it restarted itself ([`ExitRecord::Restarted`]), with `crashed`
-    /// `Some(true)` (`upgrade_gemini::ExitKind::Restarted`).
-    pub restarted_itself: bool,
 }
 
 /// How long after the first look an exit may still be removing its own record.
@@ -3797,7 +3867,6 @@ pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
         agent: upgrade::Agent::Claude,
         crashed: None,
         refused: false,
-        restarted_itself: false,
     }
 }
 
@@ -3805,7 +3874,7 @@ pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
 pub fn follow_muse(snap: &mut Snapshot) -> bool {
     let muse = match &snap.run {
         AgentRun::Muse(_) => true,
-        AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => false,
+        AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) => false,
     };
     muse && super::upgrade_drive::muse_follow(snap)
 }
@@ -3820,34 +3889,6 @@ pub fn look_at_muse_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
 #[must_use]
 pub fn look_at_agy_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
     super::upgrade_drive::agy_look_at_exit(opts, snap)
-}
-
-/// [`ExitLook`] of a Gemini CLI `snap` ([`GeminiRun`]), live.
-#[must_use]
-pub fn look_at_gemini_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
-    super::upgrade_drive::gemini_look_at_exit(opts, snap)
-}
-
-/// Whether the exit is [`ExitRecord::Restarted`], read as the exit is seen, before deciding whose
-/// exit it is.
-pub fn restarted_itself(
-    mut look: impl FnMut() -> Option<ExitLook>,
-    mut wait: impl FnMut(Duration) -> bool,
-) -> bool {
-    let mut waited = Duration::ZERO;
-    loop {
-        match look() {
-            None => return false,
-            Some(now) if !now.running && now.crashed.is_some() => {
-                return now.crashed == Some(true) && now.restarted_itself;
-            }
-            Some(_) => {}
-        }
-        if waited >= EXIT_GONE || !wait(EXIT_LOOK) {
-            return false;
-        }
-        waited += EXIT_LOOK;
-    }
 }
 
 /// Read what the exit left, once, as it is seen, independent of the back-off.
@@ -3866,16 +3907,13 @@ pub fn exit_record(
             }
         } else {
             match now.agent {
-                upgrade::Agent::Muse | upgrade::Agent::Agy | upgrade::Agent::Gemini => {
-                    match now.crashed {
-                        Some(true) if now.restarted_itself => return ExitRecord::Restarted,
-                        Some(true) => return ExitRecord::Crashed,
-                        Some(false) if now.refused => return ExitRecord::Refused,
-                        Some(false) => return ExitRecord::Removed,
-                        None if waited >= EXIT_GONE => return ExitRecord::Unread,
-                        None => {}
-                    }
-                }
+                upgrade::Agent::Muse | upgrade::Agent::Agy => match now.crashed {
+                    Some(true) => return ExitRecord::Crashed,
+                    Some(false) if now.refused => return ExitRecord::Refused,
+                    Some(false) => return ExitRecord::Removed,
+                    None if waited >= EXIT_GONE => return ExitRecord::Unread,
+                    None => {}
+                },
                 upgrade::Agent::Claude => match now.record {
                     None => return ExitRecord::Removed,
                     Some(sf) if waited >= EXIT_SETTLE => {
@@ -3963,7 +4001,7 @@ pub fn after_host_ended_from(
 pub const fn self_claimed_line(snap: &Snapshot) -> Option<&super::self_claimed::Resume> {
     match &snap.run {
         AgentRun::Codex(run) => run.self_claimed.as_ref(),
-        AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
+        AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) => None,
     }
 }
 
@@ -4009,9 +4047,6 @@ fn after_exit_as(
         AgentRun::Agy(_) => {
             return super::upgrade_drive::agy_after_exit(opts, snap, left, upgrade, cause);
         }
-        AgentRun::Gemini(_) => {
-            return super::upgrade_drive::gemini_after_exit(opts, snap, left, upgrade, cause);
-        }
         AgentRun::Claude => {}
     }
     let mut r = Report {
@@ -4036,11 +4071,9 @@ fn after_exit_as(
     let survivor = match left {
         ExitRecord::Survived(sf) => Some(SessionFile::clone(sf)),
         ExitRecord::Removed => None,
-        ExitRecord::Unread | ExitRecord::Crashed | ExitRecord::Refused | ExitRecord::Restarted => {
-            records
-                .session_file(snap.pid)
-                .filter(|sf| squash(&sf.proc_start) == snap.start)
-        }
+        ExitRecord::Unread | ExitRecord::Crashed | ExitRecord::Refused => records
+            .session_file(snap.pid)
+            .filter(|sf| squash(&sf.proc_start) == snap.start),
     };
     let Some(session) = survivor
         .as_ref()
@@ -4248,7 +4281,12 @@ fn after_exit_as(
             };
             plan(opts, &launch, snap.shell, &table())
         });
-    let Plan { shell, line, .. } = match planned {
+    let Plan {
+        shell,
+        line,
+        tap_dropped,
+        ..
+    } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
@@ -4276,6 +4314,7 @@ fn after_exit_as(
     save(opts, &session, &st);
     consume_stamp(opts, snap, cause);
     ledger(opts, &said(r.clone(), "exited"), &st.line);
+    note_tap_dropped(opts, &r, tap_dropped.as_deref());
     let r = relaunch(opts, r, &mut st, &mut c, &session, &Live);
     save(opts, &session, &st);
     r
@@ -4333,7 +4372,6 @@ pub(super) fn ended_by_restart(
                             <= STOPPED_OWN_S)
             }
             upgrade::Agent::Codex => false,
-            upgrade::Agent::Gemini => false,
         }
 }
 
@@ -4437,7 +4475,6 @@ pub fn carry_restart(
             upgrade::Agent::Codex => None,
             upgrade::Agent::Claude => landed(opts, pid),
             upgrade::Agent::Muse | upgrade::Agent::Agy => quiet_landed(opts, agent, pid),
-            upgrade::Agent::Gemini => None,
         });
         let Some((session, st)) = found else {
             return said(r, "refused:no-restart-in-flight");
@@ -4536,9 +4573,6 @@ fn carry_own_step(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) 
         upgrade::Agent::Claude => carry_in_flight(opts, r, st, session, tab),
         upgrade::Agent::Muse => super::upgrade_drive::muse_carry_in_flight(opts, r, st, session),
         upgrade::Agent::Agy => super::upgrade_drive::agy_carry_in_flight(opts, r, st, session),
-        upgrade::Agent::Gemini => {
-            super::upgrade_drive::gemini_carry_in_flight(opts, r, st, session)
-        }
     };
     match r.step.strip_prefix("failed:").map(str::to_string) {
         Some(why) => refused(r, &why),
@@ -4669,10 +4703,7 @@ pub fn in_flight_here(opts: &Opts, tab: &str, session: &str) -> bool {
 const fn carried_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 
@@ -4768,9 +4799,6 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
         upgrade::Agent::Claude => carry_in_flight(&carry, r, st, &session, &tab),
         upgrade::Agent::Muse => super::upgrade_drive::muse_carry_in_flight(&carry, r, st, &session),
         upgrade::Agent::Agy => super::upgrade_drive::agy_carry_in_flight(&carry, r, st, &session),
-        upgrade::Agent::Gemini => {
-            super::upgrade_drive::gemini_carry_in_flight(&carry, r, st, &session)
-        }
     };
     if done_under_land && r.step == "adopted" {
         return carried_done(opts, r, &session);
@@ -4804,10 +4832,6 @@ fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
         ),
         upgrade::Agent::Agy => format!(
             "agy on {} · the same conversation resumed; {why}",
-            one_line(&st.to)
-        ),
-        upgrade::Agent::Gemini => format!(
-            "gemini on {} · the same session resumed; {why}",
             one_line(&st.to)
         ),
     };

@@ -922,6 +922,11 @@ pub trait Checks {
     /// Admits `job`'s memory claim ([`Job::need`]) at the launch gate: the claim, held until
     /// the check ends, or `None` while it waits for room ([`Admission::admit`]).
     fn admit(&mut self, job: &Job) -> Option<Admitted>;
+    /// What the check at the launch gate waits for, when one waits ([`Admission::waiting`]);
+    /// [`run_slots`] asks only when its last pass found the gate's head waiting.
+    fn waiting(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A check's admitted memory claim in the capacity ledger ([`aterm_capacity::Claim`]), held for
@@ -977,6 +982,8 @@ struct Head {
     looked: Option<Duration>,
     /// When it last said it waits.
     said: Option<Duration>,
+    /// What it waited for at its last look, its holders named.
+    short: Option<String>,
 }
 
 impl<'m> Admission<'m> {
@@ -1065,6 +1072,7 @@ impl<'m> Admission<'m> {
                     entered: now,
                     looked: None,
                     said: None,
+                    short: None,
                 },
                 Err(e) => {
                     say(&format!(
@@ -1095,6 +1103,12 @@ impl<'m> Admission<'m> {
                 // next pass, and say so only once it has lasted a minute.
                 let turn = matches!(short.shorts[..], [Short::Turn { .. }]);
                 head.looked = (!turn).then_some(now);
+                if !turn {
+                    head.short = Some(format!(
+                        "{what} waited {} at the launch gate: {short}",
+                        span(waited)
+                    ));
+                }
                 let due = head
                     .said
                     .is_none_or(|t| now.saturating_sub(t) >= self.pace.line_every);
@@ -1109,6 +1123,15 @@ impl<'m> Admission<'m> {
                 None
             }
         }
+    }
+}
+
+impl Admission<'_> {
+    /// What the check at the head of the queue waited for at its last look, its holders named:
+    /// what a run that must end while it waits says it ended on.
+    #[must_use]
+    pub fn waiting(&self) -> Option<String> {
+        self.head.as_ref().and_then(|h| h.short.clone())
     }
 }
 
@@ -1128,7 +1151,8 @@ pub struct Finished {
 /// Reason [`run_slots`] stopped before draining its queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stopped {
-    Interrupted,
+    /// Interrupted; while a check waited at the launch gate, what it waited for, its holders named.
+    Interrupted(Option<String>),
     /// A check process could not be spawned.
     Unstartable(String),
 }
@@ -1166,11 +1190,17 @@ pub fn run_slots(
         }
         running.clear();
     };
+    // Whether the last pass asked the launch gate and its head still waits: only then does what
+    // the gate says it waits for stand, not while the head waits for a slot or for trustd.
+    let mut gated = false;
     loop {
         if checks.interrupted() {
             stop_all(&mut running);
-            return Err(Stopped::Interrupted);
+            return Err(Stopped::Interrupted(
+                gated.then(|| checks.waiting()).flatten(),
+            ));
         }
+        gated = false;
         while running.len() < slots && (running.is_empty() || checks.trustd_held()) {
             let Some(slot) = (0..usize::MAX)
                 .find(|n| !running.iter().any(|r| r.job.slot == *n) && !checks.held(*n))
@@ -1178,6 +1208,7 @@ pub fn run_slots(
                 break;
             };
             let Some(claim) = queue.front().and_then(|job| checks.admit(job)) else {
+                gated = !queue.is_empty();
                 break;
             };
             let Some(mut job) = queue.pop_front() else {
@@ -1463,7 +1494,7 @@ impl Bench for Machine {
                 let _ = fs::remove_file(lock);
             }
         }
-        if ran == Err(Stopped::Interrupted) {
+        if matches!(ran, Err(Stopped::Interrupted(_))) {
             reap_stale_checks(&prep.root);
         }
         ran.map_err(stopped)
@@ -1485,7 +1516,10 @@ impl Bench for Machine {
 /// Why slots that stopped decided nothing.
 fn stopped(s: Stopped) -> String {
     match s {
-        Stopped::Interrupted => "interrupted; nothing was decided".into(),
+        Stopped::Interrupted(None) => "interrupted; nothing was decided".into(),
+        Stopped::Interrupted(Some(waiting)) => {
+            format!("interrupted while {waiting}; nothing was decided")
+        }
         Stopped::Unstartable(why) => why,
     }
 }
@@ -2274,7 +2308,8 @@ fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
 /// starts. A ledger that cannot be used is said, and the run goes on without a claim.
 ///
 /// # Errors
-/// The volume holding the root can never hold the need above its floor: COULD NOT RUN.
+/// The volume holding the root can never hold the need above its floor, or an interrupt ended
+/// the wait: COULD NOT RUN.
 fn claim_disk(
     cfg: &Config,
     root: &Path,
@@ -2286,6 +2321,9 @@ fn claim_disk(
         Err(atpkg::admit_disk::Error::Never(why)) => Err(Stop::CouldNotRun(format!(
             "{why}; it can never be admitted there. Fix: give it a --target-root on a larger \
              volume"
+        ))),
+        Err(e @ atpkg::admit_disk::Error::Stopped { .. }) => Err(Stop::CouldNotRun(format!(
+            "the run's disk claim was {e}; no check started, so nothing was decided"
         ))),
         Err(e) => {
             let _ = writeln!(
@@ -3500,8 +3538,12 @@ impl RunLock {
                 holder_name(holder.as_ref()),
                 path.display()
             )),
-            Err(named_lock::Refused::Stopped(holder)) => Err(format!(
-                "interrupted while waiting for {}, which holds {}",
+            Err(named_lock::Refused::Stopped { holder, signal }) => Err(format!(
+                "interrupted{} while waiting for {}, which holds {}",
+                signal.map_or_else(String::new, |sig| format!(
+                    " ({})",
+                    aterm_toolchain::interrupt::name(sig)
+                )),
                 holder_name(holder.as_ref()),
                 path.display()
             )),
@@ -3563,6 +3605,10 @@ impl Checks for RealChecks<'_> {
         self.admission.admit(job, now, &mut |line| {
             let _ = writeln!(out, "trust: {line}");
         })
+    }
+
+    fn waiting(&self) -> Option<String> {
+        self.admission.waiting()
     }
 
     fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>> {
@@ -5630,6 +5676,8 @@ mod tests {
         takes: BTreeMap<String, Duration>,
         /// trustd is held once this many checks have started.
         held_after: usize,
+        /// trustd lets go at this moment.
+        trustd_until: Option<Duration>,
         interrupt_at: Option<Duration>,
         unstartable: Option<String>,
         /// The host's load at a moment of the fake clock; `None` reads none.
@@ -5707,8 +5755,12 @@ mod tests {
                 w.borrow_mut().said.push((now, line.to_string()));
             })
         }
+        fn waiting(&self) -> Option<String> {
+            self.gate.as_ref().and_then(Admission::waiting)
+        }
         fn trustd_held(&self) -> bool {
-            self.w.borrow().starts.len() >= self.held_after
+            let w = self.w.borrow();
+            w.starts.len() >= self.held_after && self.trustd_until.is_none_or(|t| w.now < t)
         }
         fn probe_trustd(&mut self) -> String {
             "ours\tthis build's".into()
@@ -5844,6 +5896,7 @@ mod tests {
                 .map(|(n, s)| ((*n).to_string(), Duration::from_secs(*s)))
                 .collect(),
             held_after: 0,
+            trustd_until: None,
             interrupt_at: None,
             unstartable: None,
             load: None,
@@ -6069,12 +6122,53 @@ mod tests {
         );
         drop(w);
 
+        // Once the gate is no longer asked (the head waits for trustd, beside a check that runs),
+        // an interrupt names no shortfall its last look found long before.
+        let mut beside = fake(&[("aterm-render", 5)]);
+        beside.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        beside.holder = Some((Duration::MAX, hold(&l)));
+        beside.held_after = 1;
+        beside.trustd_until = Some(Duration::from_secs(100));
+        beside.interrupt_at = Some(Duration::from_secs(400));
+        let (r, _) = slots(&mut beside, vec![job("a"), check.clone()], 2, 1000);
+        assert_eq!(r, Err(Stopped::Interrupted(None)));
+        assert_eq!(beside.w.borrow().starts, ["a"]);
+        assert!(
+            beside
+                .w
+                .borrow()
+                .said
+                .iter()
+                .any(|(_, l)| l.contains("trust check aterm-render waits")),
+            "it waited at the gate before trustd let go"
+        );
+        drop(beside);
+
         let mut never = fake(&[("aterm-render", 5)]);
         never.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
         never.holder = Some((Duration::MAX, hold(&l)));
         never.interrupt_at = Some(Duration::from_secs(400));
         let (r, _) = slots(&mut never, vec![check], 1, 1000);
-        assert_eq!(r, Err(Stopped::Interrupted));
+        // The run ended while the check waited, so it says so, naming the holder.
+        let Err(Stopped::Interrupted(Some(waiting))) = r else {
+            panic!("an interrupt at the gate names the wait: {r:?}");
+        };
+        for named in [
+            "trust check aterm-render waited 6m",
+            "at the launch gate",
+            "memory short by",
+            me.as_str(),
+            "\"hold\"",
+        ] {
+            assert!(
+                waiting.contains(named),
+                "{waiting:?} does not name {named:?}"
+            );
+        }
+        assert!(
+            stopped(Stopped::Interrupted(Some(waiting)))
+                .starts_with("interrupted while trust check")
+        );
         let w = never.w.borrow();
         assert!(
             w.starts.is_empty(),
@@ -6084,6 +6178,18 @@ mod tests {
             w.said.iter().filter(|(_, l)| l.contains(" waits ")).count(),
             7,
             "one line a minute for 400 s"
+        );
+        drop(w);
+        // The interrupted head's place leaves the queue with the gate, so only the holder's
+        // claim is left.
+        never.gate = None;
+        assert_eq!(
+            l.list()
+                .unwrap()
+                .iter()
+                .map(|r| r.need.what.as_str())
+                .collect::<Vec<_>>(),
+            ["hold"]
         );
     }
 
@@ -6223,7 +6329,7 @@ mod tests {
         f.interrupt_at = Some(Duration::from_secs(3));
         let jobs = ["a", "b", "c"].map(job).to_vec();
         let (r, done) = slots(&mut f, jobs, 2, 100);
-        assert_eq!(r, Err(Stopped::Interrupted));
+        assert_eq!(r, Err(Stopped::Interrupted(None)));
         assert!(done.is_empty());
         let w = f.w.borrow();
         assert_eq!(w.ended_by_lane, ["a", "b"]);
@@ -6741,12 +6847,13 @@ mod tests {
         (outcome, String::from_utf8(out).unwrap(), filed)
     }
 
-    /// A [`Site`] whose disk claim answers as the capacity ledger would, refused (`never`) or
-    /// admitted with no claim, keeping each run it was asked to claim with how many checks had
-    /// started by then.
+    /// A [`Site`] whose disk claim answers as the capacity ledger would, refused (`never`),
+    /// ended by an interrupt (`interrupt`) or admitted with no claim, keeping each run it was
+    /// asked to claim with how many checks had started by then.
     struct Claims<'s> {
         site: &'s mut Site,
         never: Option<String>,
+        interrupt: Option<i32>,
         asked: Vec<(atpkg::admit_disk::Run, atpkg::admit_disk::Admit, usize)>,
     }
 
@@ -6790,6 +6897,12 @@ mod tests {
             _: &mut dyn Write,
         ) -> Result<Option<atpkg::admit_disk::Admitted>, atpkg::admit_disk::Error> {
             self.asked.push((run, mode, self.site.started.len()));
+            if let Some(sig) = self.interrupt {
+                return Err(atpkg::admit_disk::Error::Stopped {
+                    signal: Some(sig),
+                    short: None,
+                });
+            }
             match &self.never {
                 Some(why) => Err(atpkg::admit_disk::Error::Never(why.clone())),
                 None => Ok(None),
@@ -6799,7 +6912,8 @@ mod tests {
 
     /// A run claims its target root's disk once it holds the root and before any check starts:
     /// the cold budget on the root's volume, kept under its `logs`. Negative control: a need the
-    /// volume can never hold is COULD NOT RUN naming the fix, and no check starts.
+    /// volume can never hold is COULD NOT RUN naming the fix, and no check starts; so is a wait
+    /// an interrupt ended, naming the signal.
     #[test]
     fn a_run_claims_its_roots_disk_before_any_check() {
         let mut s = site(Scope::Packages(vec!["alpha".into()]));
@@ -6807,6 +6921,7 @@ mod tests {
         let mut claims = Claims {
             site: &mut s,
             never: None,
+            interrupt: None,
             asked: Vec::new(),
         };
         let mut out = Vec::new();
@@ -6845,6 +6960,7 @@ mod tests {
                  floor"
                     .into(),
             ),
+            interrupt: None,
             asked: Vec::new(),
         };
         let mut out = Vec::new();
@@ -6853,6 +6969,25 @@ mod tests {
         assert!(
             matches!(&outcome, Outcome::CouldNotRun(why)
                 if why.contains("needs 6 GiB on /Volumes/s") && why.contains("--target-root")),
+            "{outcome:?}: {said}"
+        );
+        assert!(claims.site.started.is_empty(), "{said}");
+
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        let cfg = s.cfg.clone();
+        let mut claims = Claims {
+            site: &mut s,
+            never: None,
+            interrupt: Some(15),
+            asked: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let outcome = run_on(&cfg, &mut claims, &mut out);
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains("disk claim was interrupted (SIGTERM)")
+                    && why.contains("nothing was decided")),
             "{outcome:?}: {said}"
         );
         assert!(claims.site.started.is_empty(), "{said}");

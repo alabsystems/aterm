@@ -187,7 +187,7 @@ fn under_an_agents_own_switch_the_menu_names_that_switch() {
     for (agent, why) in [
         (Program::Codex, "Watch codex-alab sessions is off"),
         (Program::Claude, "Supervise Claude Code sessions is off"),
-        (Program::Gemini, "Supervise Gemini CLI sessions is off"),
+        (Program::Muse, "Supervise Muse Code sessions is off"),
     ] {
         let view = AutopilotView::AgentOff(agent);
         let mut f = facts(view);
@@ -776,13 +776,13 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
             .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
             .unwrap();
         let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + i, rect.col + 3));
-        app.autopilot_menu_press(wid, true, x, y)
+        app.autopilot_menu_press(wid, true, x, y, Instant::now())
     };
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
     let rect = app.autopilot_menu.as_ref().unwrap().rect.unwrap();
     let (x, y) = app.frame_cell_centre(wid, (rect.row + 1, rect.col + 3));
-    assert!(app.autopilot_menu_press(wid, true, x, y));
+    assert!(app.autopilot_menu_press(wid, true, x, y, Instant::now()));
     assert!(app.autopilot_menu.is_some());
     assert!(press_row(&mut app, "autopilot-menu/mode/off"));
     assert!(app.autopilot_menu.is_none());
@@ -802,7 +802,7 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
     let (x, y) = app.frame_cell_centre(wid, (0, 0));
-    assert!(app.autopilot_menu_press(wid, true, x, y));
+    assert!(app.autopilot_menu_press(wid, true, x, y, Instant::now()));
     assert!(app.autopilot_menu.is_none());
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
@@ -858,7 +858,7 @@ fn the_land_at_row_names_the_day_it_would_arm_as_the_state_line_does() {
             .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
             .unwrap();
         let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + i, rect.col + 3));
-        app.autopilot_menu_press(wid, true, x, y)
+        app.autopilot_menu_press(wid, true, x, y, Instant::now())
     };
     for (land_at, words, other_day) in [
         ("18:36", format!("{tomorrow} 18:36"), true),
@@ -2319,7 +2319,7 @@ fn the_menus_harness_settings_lands_the_page_on_its_sessions_row() {
             .position(|r| matches!(r, MenuRow::Item { act, .. } if act.key() == key))
             .unwrap();
         let (x, y) = app.frame_cell_centre(wid, (rect.row + 1 + i, rect.col + 3));
-        app.autopilot_menu_press(wid, true, x, y)
+        app.autopilot_menu_press(wid, true, x, y, Instant::now())
     };
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
@@ -3121,10 +3121,11 @@ fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
         app.on_cursor_moved(wid, x, y);
         click(&mut app, wid, (x, y), Press::Bare);
         assert!(app.autopilot_menu.is_none(), "chosen and closed");
-        assert!(
-            app.autopilot_menu_spent.is_some(),
-            "the card a choice closed"
-        );
+        let chosen = app
+            .autopilot_menu_spent
+            .as_ref()
+            .expect("the card a choice closed")
+            .at;
         let doubled = app.font_size * 2.0;
         zoom(&mut app, doubled);
         assert!(
@@ -3135,8 +3136,12 @@ fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
         if !on_card {
             app.on_cursor_moved(wid, off.0, off.1);
         }
+        let second = chosen
+            + std::time::Duration::from_millis(
+                u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
+            );
         assert_eq!(
-            app.spends_menu_follow_up(wid),
+            app.spends_menu_follow_up(wid, second),
             on_card,
             "on_card={on_card}: spent only where it fell on the card as laid"
         );

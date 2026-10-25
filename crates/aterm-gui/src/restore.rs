@@ -176,7 +176,6 @@ pub(crate) enum RunRestore {
     Codex(CodexRestore),
     Muse(MuseRestore),
     Agy(AgyRestore),
-    Gemini(GeminiRestore),
 }
 
 mod leaf {
@@ -209,9 +208,17 @@ mod leaf {
         pub(super) muse: Option<super::MuseRestore>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) agy: Option<super::AgyRestore>,
+        /// The retired Gemini CLI's run table, which older builds wrote: read only to
+        /// refuse the leaf as no agent's ([`super::AgentRestore::retired`]); every write
+        /// leaves it out.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub(super) gemini: Option<super::GeminiRestore>,
+        pub(super) gemini: Option<RetiredRun>,
     }
+
+    /// A retired agent's run table, its fields ignored: that it was there is all a reader
+    /// keeps.
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct RetiredRun {}
 }
 
 impl From<leaf::AgentRestore> for AgentRestore {
@@ -226,14 +233,17 @@ impl From<leaf::AgentRestore> for AgentRestore {
             version: leaf.version,
             home: leaf.home,
             login: leaf.login,
-            run: match (leaf.codex, leaf.muse, leaf.agy, leaf.gemini) {
+            run: match (leaf.codex, leaf.muse, leaf.agy, &leaf.gemini) {
                 (Some(codex), None, None, None) => Some(RunRestore::Codex(codex)),
                 (None, Some(muse), None, None) => Some(RunRestore::Muse(muse)),
                 (None, None, Some(agy), None) => Some(RunRestore::Agy(agy)),
-                (None, None, None, Some(gemini)) => Some(RunRestore::Gemini(gemini)),
                 _ => None,
             },
-            word: leaf.word,
+            word: if leaf.gemini.is_some() {
+                RETIRED_GEMINI.to_string()
+            } else {
+                leaf.word
+            },
             cause: leaf.cause,
             tab: leaf.tab,
         }
@@ -242,12 +252,11 @@ impl From<leaf::AgentRestore> for AgentRestore {
 
 impl From<AgentRestore> for leaf::AgentRestore {
     fn from(agent: AgentRestore) -> Self {
-        let (codex, muse, agy, gemini) = match agent.run {
-            Some(RunRestore::Codex(run)) => (Some(run), None, None, None),
-            Some(RunRestore::Muse(run)) => (None, Some(run), None, None),
-            Some(RunRestore::Agy(run)) => (None, None, Some(run), None),
-            Some(RunRestore::Gemini(run)) => (None, None, None, Some(run)),
-            None => (None, None, None, None),
+        let (codex, muse, agy) = match agent.run {
+            Some(RunRestore::Codex(run)) => (Some(run), None, None),
+            Some(RunRestore::Muse(run)) => (None, Some(run), None),
+            Some(RunRestore::Agy(run)) => (None, None, Some(run)),
+            None => (None, None, None),
         };
         Self {
             pid: agent.pid,
@@ -265,7 +274,7 @@ impl From<AgentRestore> for leaf::AgentRestore {
             tab: agent.tab,
             muse,
             agy,
-            gemini,
+            gemini: None,
         }
     }
 }
@@ -301,7 +310,6 @@ impl RunRestore {
             RunRestore::Codex(_) => aterm_agent::harness::upgrade::Agent::Codex,
             RunRestore::Muse(_) => aterm_agent::harness::upgrade::Agent::Muse,
             RunRestore::Agy(_) => aterm_agent::harness::upgrade::Agent::Agy,
-            RunRestore::Gemini(_) => aterm_agent::harness::upgrade::Agent::Gemini,
         }
     }
 }
@@ -330,20 +338,11 @@ pub(crate) struct AgyRestore {
     pub env: Vec<String>,
 }
 
-/// A Gemini CLI TUI's run as its leaf's restore carries it (`aterm_agent::harness::relaunch::GeminiRun`), on disk the leaf's `gemini` table.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct GeminiRestore {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
-    #[serde(default)]
-    pub home: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chats: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<String>,
-    #[serde(default)]
-    pub started_ms: u64,
-}
+/// The agent word a leaf that carried the retired Gemini CLI's run table reads as:
+/// no lane's ([`aterm_phase::retired_agent`]), so the leaf is relaunched by nothing
+/// and never read as another agent's (an older leaf with no word would otherwise read
+/// as Claude Code's).
+const RETIRED_GEMINI: &str = "gemini";
 
 /// A Codex TUI's run as its leaf's restore carries it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -423,7 +422,7 @@ impl AgentRestore {
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
         let word = snap.agent().word().to_string();
         let (session, lane_session) = match &snap.run {
-            AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => (None, snap.session),
+            AgentRun::Muse(_) | AgentRun::Agy(_) => (None, snap.session),
             AgentRun::Claude | AgentRun::Codex(_) => (snap.session, None),
         };
         Self {
@@ -458,13 +457,6 @@ impl AgentRestore {
                     conversation: lane_session,
                     config: run.config.to_string_lossy().into_owned(),
                     env: aterm_agent::harness::upgrade_agy::env_words(&run.env),
-                })),
-                AgentRun::Gemini(run) => Some(RunRestore::Gemini(GeminiRestore {
-                    session: lane_session,
-                    home: run.home.to_string_lossy().into_owned(),
-                    chats: run.chats.map(|c| c.to_string_lossy().into_owned()),
-                    env: aterm_agent::harness::upgrade_gemini::env_words(&run.env),
-                    started_ms: run.started_ms,
                 })),
             },
             cause: None,
@@ -517,23 +509,7 @@ impl AgentRestore {
                 })
             }
             (Agent::Agy, _) => return None,
-            (Agent::Gemini, Some(RunRestore::Gemini(run))) => {
-                session = run.session;
-                AgentRun::Gemini(aterm_agent::harness::relaunch::GeminiRun {
-                    home: std::path::PathBuf::from(run.home),
-                    chats: run.chats.map(std::path::PathBuf::from),
-                    env: aterm_agent::harness::upgrade_gemini::env_of_words(&run.env),
-                    started_ms: run.started_ms,
-                    child: 0,
-                    unwitnessed: None,
-                    block: None,
-                })
-            }
-            (Agent::Gemini, _) => return None,
-            (
-                Agent::Codex,
-                Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)),
-            ) => return None,
+            (Agent::Codex, Some(RunRestore::Muse(_) | RunRestore::Agy(_))) => return None,
         };
         Some(aterm_agent::harness::relaunch::Snapshot {
             tab,
@@ -588,22 +564,22 @@ impl AgentRestore {
                         .is_some_and(aterm_agent::harness::upgrade_agy::is_conversation_uuid)
                         && aterm_agent::harness::upgrade_agy::is_tui_argv(&self.argv)
                 }
-                Some(RunRestore::Gemini(run)) => {
-                    run.session
-                        .as_deref()
-                        .is_some_and(aterm_agent::harness::upgrade_gemini::is_session_uuid)
-                        && aterm_agent::harness::upgrade_gemini::is_tui_argv(&self.argv)
-                }
                 Some(RunRestore::Codex(_)) | None => {
                     agent_resumes(self.session.as_deref(), &self.argv)
                 }
             }
     }
 
+    /// Whether it names an agent this build no longer supports ([`aterm_phase::retired_agent`]):
+    /// relaunched by nothing ([`Self::agent`] reads no agent), the restore saying why.
+    pub(crate) fn retired(&self) -> bool {
+        aterm_phase::retired_agent(&self.word)
+    }
+
     /// Whether any relaunch brings this agent back.
     pub(crate) const fn relaunched(&self) -> bool {
         match &self.run {
-            None | Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => true,
+            None | Some(RunRestore::Muse(_) | RunRestore::Agy(_)) => true,
             Some(RunRestore::Codex(run)) => run.alab.is_some(),
         }
     }
@@ -616,7 +592,6 @@ impl AgentRestore {
             Agent::Codex => "Codex",
             Agent::Muse => agent.product(),
             Agent::Agy => aterm_agent::harness::upgrade_agy::PROGRAM,
-            Agent::Gemini => agent.product(),
         })
     }
 
@@ -658,17 +633,6 @@ impl AgentRestore {
                     &self.argv,
                 );
             }
-            Agent::Gemini => {
-                let Some(RunRestore::Gemini(run)) = &self.run else {
-                    return None;
-                };
-                return aterm_agent::harness::upgrade_drive::gemini_told(
-                    run.session.as_deref()?,
-                    run.chats.as_deref().map(std::path::Path::new),
-                    &aterm_agent::harness::upgrade_gemini::env_of_words(&run.env),
-                    &self.cwd,
-                );
-            }
         };
         let conversation = self.session.as_deref().filter(|id| is_session_id(id))?;
         let (env, line) = match run {
@@ -700,7 +664,7 @@ impl AgentRestore {
                     .collect::<Option<Vec<_>>>()?
                     .join(" "),
             ),
-            Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => return None,
+            Some(RunRestore::Muse(_) | RunRestore::Agy(_)) => return None,
             Some(RunRestore::Codex(CodexRestore { alab: None, .. })) => return None,
         };
         let mut said = String::new();
@@ -725,7 +689,7 @@ impl AgentRestore {
         };
         let agrees = match agent {
             Agent::Claude => ran.is_none(),
-            Agent::Codex | Agent::Muse | Agent::Agy | Agent::Gemini => ran == Some(agent),
+            Agent::Codex | Agent::Muse | Agent::Agy => ran == Some(agent),
         };
         agrees.then_some(agent)
     }
@@ -6674,7 +6638,6 @@ metadata = "opaque=copy-me"
         const THREAD: &str = "01a0e4bd-2b37-75a0-9d52-7f1e2c3a4b5c";
         const MUSE: &str = "01a148f8-9301-7752-96db-fef456f88074";
         const AGY: &str = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
-        const GEMINI: &str = "11edd4f1-7048-4ff7-8ff2-83cce0095a7c";
 
         #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
         struct CodexRestore0104 {
@@ -7095,127 +7058,63 @@ metadata = "opaque=copy-me"
         let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
         assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
 
-        let chats = aterm_tempfile::tempdir().expect("scratch dir");
-        let chats_dir = chats.path().to_string_lossy().into_owned();
-        let gemini = Snapshot {
-            program: "/opt/homebrew/opt/node/bin/node".into(),
-            argv: vec![
-                "/opt/homebrew/opt/node/bin/node".into(),
-                "/opt/homebrew/bin/gemini".into(),
-                "--model".into(),
-                "gemini-3.5-flash".into(),
-            ],
-            session: Some(GEMINI.into()),
-            cwd: "/Users//me/proj".into(),
-            version: Some("0.46.0".into()),
-            run: AgentRun::Gemini(aterm_agent::harness::relaunch::GeminiRun {
-                home: "/Users//me/g/.gemini".into(),
-                chats: Some(chats.path().to_path_buf()),
-                env: vec![("GEMINI_CLI_HOME".into(), "/Users//me/g".into())],
-                started_ms: 1_792_261_698_000,
-                child: 4242,
-                unwitnessed: None,
-                block: Some(7),
-            }),
-            login: None,
-            home: None,
-            ..claude.clone()
-        };
-        let lane = wire(&gemini);
-        assert!(
-            lane.contains("word = \"gemini\"\n") && lane.contains("[gemini]\n"),
-            "{lane}"
-        );
-        let (top, table) = lane.split_once("[gemini]").expect("its table");
-        assert!(
-            table.contains(&format!("session = \"{GEMINI}\"")) && !top.contains("session = "),
-            "its session in its table alone: {lane}"
-        );
-        let old = aterm_toml::from_str::<AgentRestore0104>(&lane).expect("0.104.0 takes it");
-        assert_eq!(old.session, None, "{lane}");
-        assert_eq!(agent_0104(&old), "claude", "0.104.0 has no word");
-        assert!(
-            !resumes_0104(&old),
-            "0.104.0 finds no conversation to relaunch it on"
-        );
-        let older = aterm_toml::from_str::<AgentRestore0105>(&lane).expect("0.105.0 takes it");
-        assert_eq!(older.word, "gemini");
-        assert_eq!(agent_0105(&older), None, "0.105.0: no agent's");
-        let here: AgentRestore = aterm_toml::from_str(&lane).expect("this build takes it");
-        assert_eq!(here.agent(), Some(Agent::Gemini), "read as Gemini CLI's");
-        assert_eq!(here.name(), Some("Gemini CLI"));
-        assert!(here.resumes(), "its own table's session resumes");
-        assert_eq!(here.resume_line(), None, "no file: nothing vouched for");
-        std::fs::write(
-            chats.path().join(format!("session-2026-10-18T06-40-{}.jsonl", &GEMINI[..8])),
-            format!(
-                "{}\n{}\n{}\n",
-                format_args!(
-                    r#"{{"sessionId":"{GEMINI}","projectHash":"h","startTime":"2026-10-18T06:40:00.000Z","lastUpdated":"2026-10-18T06:40:00.000Z","kind":"main"}}"#
-                ),
-                r#"{"id":"u1","timestamp":"2026-10-18T06:41:00.000Z","type":"user","content":[{"text":"remember DELTA-FOUR"}]}"#,
-                r#"{"id":"g1","timestamp":"2026-10-18T06:41:01.000Z","type":"gemini","content":"ok"}"#,
-            ),
-        )
-        .expect("a session file");
-        assert_eq!(
-            here.resume_line().as_deref(),
-            Some(
-                format!(
-                    "cd /Users//me/proj && GEMINI_CLI_HOME=/Users//me/g gemini --resume {GEMINI}"
-                )
-                .as_str()
-            ),
-            "Gemini CLI's own resume, in its project, behind its home"
-        );
-        let back = here
-            .clone()
-            .snapshot("s-new".into(), 6161)
-            .expect("relaunched by its lane");
-        assert_eq!(back.agent(), Agent::Gemini);
-        assert_eq!(back.session.as_deref(), Some(GEMINI));
-        assert_eq!(back.cwd, "/Users//me/proj");
-        assert_eq!(
-            back.gemini().map(|run| (
-                run.home.clone(),
-                run.chats.clone(),
-                run.env.clone(),
-                run.started_ms,
-                run.child,
-                run.block
-            )),
-            Some((
-                PathBuf::from("/Users//me/g/.gemini"),
-                Some(PathBuf::from(&chats_dir)),
-                vec![("GEMINI_CLI_HOME".to_string(), "/Users//me/g".to_string())],
-                1_792_261_698_000,
-                0,
-                None
-            )),
-            "its run back, its start carried, its child and block never"
-        );
-        assert_eq!(
-            aterm_toml::to_string(&here).expect("written back"),
-            lane,
-            "read and written back as written"
-        );
-        let unproven = wire(&Snapshot {
-            session: None,
-            ..gemini.clone()
-        });
-        let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
-        assert_eq!(unproven.agent(), Some(Agent::Gemini));
-        assert!(!unproven.resumes() && unproven.resume_line().is_none());
-        for other in [
-            "[agy]\nconfig = \"/Users//me/.gemini/antigravity-cli\"\n",
-            "[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
-        ] {
-            let both = format!("{}\n{other}", lane.trim_end());
-            assert!(
-                aterm_toml::from_str::<AgentRestore>(&both).is_err(),
-                "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
+        // The retired Gemini CLI's leaf exactly as v0.134.0's producer wrote it
+        // (tests/fixtures/handoff/v0.134.0/carried-state): read, relaunched by
+        // nothing and never another agent's, its table dropped when written back.
+        let gemini_table = "\n[gemini]\nsession = \"c2d9e4f1-7a3b-4c5d-8e6f-0a1b2c3d4e5f\"\n\
+                            home = \"/home/dev/.gemini\"\n\
+                            chats = \"/home/dev/.gemini/tmp/7f3a9c/chats\"\n\
+                            env = [\"GEMINI_CLI_HOME=/home/dev\"]\n\
+                            started_ms = 1792871730000\n";
+        let top = "pid = 48503\nstart = \"Mon Oct 19 09:14:02 2026\"\n\
+                   program = \"/home/dev/.local/bin/gemini\"\nargv = [\"gemini\"]\n\
+                   cwd = \"/home/dev/src/aterm\"\nversion = \"1.4.0\"\n";
+        for (what, word) in [("its word", "word = \"gemini\"\n"), ("no word", "")] {
+            let lane = format!("{top}{word}{gemini_table}");
+            let here: AgentRestore = aterm_toml::from_str(&lane)
+                .unwrap_or_else(|e| panic!("{what}: this build reads the retired leaf: {e}"));
+            assert!(here.retired(), "{what}");
+            assert_eq!(
+                here.agent(),
+                None,
+                "{what}: no agent's, never Claude Code's"
             );
+            assert_eq!(here.name(), None, "{what}");
+            assert!(!here.resumes(), "{what}");
+            assert_eq!(here.resume_line(), None, "{what}");
+            assert!(
+                here.clone().snapshot("s-new".into(), 6161).is_none(),
+                "{what}: relaunched by nothing"
+            );
+            let back = aterm_toml::to_string(&here).expect("written back");
+            assert!(
+                back.contains("word = \"gemini\"\n") && !back.contains("[gemini]"),
+                "{what}: its word kept, its retired table dropped: {back}"
+            );
+            let again: AgentRestore = aterm_toml::from_str(&back).expect("read again");
+            assert!(again.retired() && again.agent().is_none(), "{what}: {back}");
+            for other in [
+                "[agy]\nconfig = \"/Users//me/.gemini/antigravity-cli\"\n",
+                "[codex]\nhome = \"/Users//me/.codex\"\nembedded = true\nstarted_ms = 1\n",
+            ] {
+                let both = format!("{}\n{other}", lane.trim_end());
+                assert!(
+                    aterm_toml::from_str::<AgentRestore>(&both).is_err(),
+                    "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
+                );
+            }
         }
+        let claude_word: AgentRestore =
+            aterm_toml::from_str(&format!("{}{gemini_table}", wire(&claude))).expect("read");
+        assert!(
+            claude_word.retired() && claude_word.agent().is_none(),
+            "a retired table beside Claude Code's word is no agent's"
+        );
+        let claude_leaf: AgentRestore = aterm_toml::from_str(&wire(&claude)).expect("read");
+        assert!(
+            !claude_leaf.retired() && claude_leaf.agent() == Some(Agent::Claude),
+            "NEGATIVE CONTROL: Claude Code's leaf is no retired agent's"
+        );
         let in_session = format!("{}word = \"gemini\"\n", wire(&claude));
         let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
         assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));

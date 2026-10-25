@@ -171,7 +171,7 @@ pub(crate) fn push_soft_disc(
         if rest <= 0.0 {
             continue;
         }
-        let span = rx * rest.sqrt();
+        let span = rx * crate::color_math::sqrt_f32(rest);
         let step = span * (1.0 / SEGMENTS as f32);
         let level = |x: f32| {
             let u = x * inv_rx;

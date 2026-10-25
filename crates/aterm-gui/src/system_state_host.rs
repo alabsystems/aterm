@@ -14,7 +14,7 @@ use crate::native_app::{AppKind, NativeApp};
 use crate::system_state::{
     Admission, PasswordAcceptance, SetupOperation, SetupStatus, SetupStatusRow, SystemStateAction,
 };
-use crate::workstation_setup::{Request, WorkstationSetupDecision};
+use crate::workstation_setup::{OfferKind, Request, WorkstationSetupDecision};
 use crate::{App, Wake};
 
 /// Provisioning callbacks installed by the shipped binary.
@@ -39,6 +39,12 @@ pub struct InitialSetupHandlers {
     /// a later `status()`. Never holds the setup slot.
     /// Returns whether the worker accepted the observation.
     pub observe: fn(Plan) -> bool,
+    /// While the GitHub repositories need a person, look on a worker whether a token renewed
+    /// in the vault reached this Mac: the vault's materialization mark, a local reading that
+    /// asks nothing of GitHub. Only when it moved since that row was last read is the GitHub
+    /// repositories row read again for `plan`, and that row alone (design §3.6). Returns
+    /// whether the look started.
+    pub look_for_token: fn(Plan) -> bool,
     /// Stop was pressed: the pass going now stops at its next stage boundary,
     /// and so does the run of every plan sent before the press that is still
     /// being admitted, once it registers (design §3.3). Asked once: the worker
@@ -69,6 +75,7 @@ impl InitialSetupHandlers {
             restore: || false,
             status: SetupStatus::default,
             observe: |_| false,
+            look_for_token: |_| false,
             stop: || {},
             settle: || {},
             sync_on: || false,
@@ -207,11 +214,13 @@ const CHANGING_REREAD: Duration = Duration::from_millis(100);
 /// named a plan all the same, since a read that met a write says nothing of one.
 const CHANGING_READS: u8 = 10;
 
-/// How long a shown page goes before it reads its rows again by itself while the GitHub
+/// How long a shown page goes between two looks for a renewed GitHub token while the GitHub
 /// repositories need a person ([`SetupStatus::github_needs_person`]): their remedy is the
-/// vault's (a token renewed there and synced here), which tells the page nothing, so it looks
-/// again on this slow clock, as it does whenever its window regains focus (§3.6).
-pub(crate) const PERSON_REREAD: Duration = Duration::from_secs(60);
+/// vault's (a token renewed there and synced here), which tells the page nothing. Each look
+/// checks the vault's local mark alone, and reads the GitHub repositories row again only when
+/// that mark moved ([`InitialSetupHandlers::look_for_token`]); the page reads every row again
+/// whenever its window regains focus (§3.6).
+pub(crate) const TOKEN_LOOK: Duration = Duration::from_secs(60);
 
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,14 +253,22 @@ pub(crate) struct Host {
     next_tick: Option<Instant>,
     generation: u64,
     offer_presented: bool,
+    /// A review was shown in this process: a later one (an offer no window could show the first
+    /// time, or the review of the groups the ALab signal adds) opens its tab behind the person's
+    /// and waits there, never taking the tab they are in (design §6).
+    review_shown: bool,
+    /// The launch review's last view closed before the worker's Closed answer/status caught up.
+    /// Its unadmitted rows stay calm until durable status says the review has given way.
+    closed_launch_review: bool,
     /// A System State view was visible at the last tick: showing it again
     /// asks for a fresh observation (§3.5).
     shown: bool,
     /// A refused observation start is tried again on the page's tick,
     /// no sooner than this deadline.
     observe_retry: Option<Instant>,
-    /// When the shown page's rows were last read ([`PERSON_REREAD`]).
-    observed_at: Option<Instant>,
+    /// When the shown page's rows were last read, or last looked at for a renewed GitHub
+    /// token ([`TOKEN_LOOK`]).
+    token_looked_at: Option<Instant>,
     /// The plan in force when the shown page's rows were last read: a status
     /// that names another (a Restore in a terminal) has them read again.
     observed_plan: Option<Plan>,
@@ -267,6 +284,9 @@ pub(crate) struct Host {
     fixture: Option<SetupStatus>,
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     fixture_read: bool,
+    /// The first launch's review the dev scenario shows, until the page takes it.
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    fixture_review: Option<crate::system_state::FixtureReview>,
 }
 
 impl Host {
@@ -292,14 +312,17 @@ impl Host {
     fn fixture(&mut self) -> Option<&SetupStatus> {
         if !self.fixture_read {
             self.fixture_read = true;
+            let mut review = None;
             self.fixture = aterm_types::dev_seam!(FIXTURE_SEAM).and_then(|name| {
                 let name = name.to_str()?.to_owned();
                 let status = crate::system_state::fixture_status(&name);
                 if status.is_none() {
                     aterm_log::warn!("{FIXTURE_SEAM}={name} names no System State scenario");
                 }
+                review = crate::system_state::fixture_review(&name);
                 status
             });
+            self.fixture_review = review;
         }
         self.fixture.as_ref()
     }
@@ -355,13 +378,23 @@ impl App {
         self.finish_system_state_shutdown_with(handlers);
     }
 
-    /// Queued setup has no durable successor yet; Restore also belongs to this worker
-    /// until a fresh status ends its reservation, even after its controller closes.
+    /// The first launch's review is up and unanswered: its headline is the page's one signal
+    /// meanwhile, so neither the menu line nor the tab's diamond says anything (§3.3, §3.6).
+    pub(crate) fn system_state_review_pending(&self) -> bool {
+        self.system_state_host
+            .pending
+            .as_ref()
+            .is_some_and(Request::pending)
+    }
+
+    /// Queued setup and Restore still belong to this worker; a live installer also
+    /// keeps its prompt guard here until exit or final detachment.
     pub(crate) fn system_state_handoff_pending(&self) -> bool {
         let host = &self.system_state_host;
         host.pending_apply.is_some()
             || host.operation == Some(SetupOperation::Restore)
             || host.latest_status.queued
+            || self.developer_tools_install_active()
     }
 
     /// An update's handoff is about to end this process: what a Stop still
@@ -416,6 +449,9 @@ impl App {
         // changing show as such. The next read comes once the write is over.
         let changing = status.changing;
         if changing && self.system_state_host.changing_reads < CHANGING_READS {
+            // Keep the displayed plan and access approvals, but an in-flight
+            // external mutation supplies no current run for a deferred command.
+            self.system_state_host.latest_status.run = None;
             self.system_state_host.changing_reads += 1;
             self.system_state_host.status_in_flight = false;
             self.system_state_host.next_status = Some(Instant::now() + CHANGING_REREAD);
@@ -435,10 +471,16 @@ impl App {
     }
 
     pub(crate) fn offer_system_state(&mut self, request: Request) {
+        let quiet = self.system_state_host.review_shown
+            || matches!(request.kind(), OfferKind::Widen { .. });
         if !request.pending()
             || self.headless
             || !self.can_offer_system_state()
-            || !self.open_system_state_tab()
+            || !(if quiet {
+                self.open_system_state_tab_quietly()
+            } else {
+                self.open_system_state_tab()
+            })
         {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
@@ -472,8 +514,14 @@ impl App {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
+        // The review of the groups the ALab signal adds holds none of aterm's own permissions:
+        // they are in the plan in force, whose run carries them (design §3.5).
+        let widen = matches!(request.kind(), OfferKind::Widen { .. });
         self.system_state_host.pending = Some(request);
-        self.hold_initial_setup_permissions();
+        self.system_state_host.review_shown = true;
+        if !widen {
+            self.hold_initial_setup_permissions();
+        }
         self.refresh_system_state_tab_indicators();
         self.system_state_host.offer_presented = false;
         self.system_state_host.action_refusal = None;
@@ -510,6 +558,9 @@ impl App {
         &self,
         mut status: SetupStatus,
     ) -> (SetupStatus, Option<Access>) {
+        if self.closed_launch_is_unanswered(&status) {
+            status.unanswered = true;
+        }
         if self.system_state_host.operation.is_some()
             || self.system_state_host.awaiting_run
             || self.system_state_host.pending_apply.is_some()
@@ -538,7 +589,13 @@ impl App {
         (status, step)
     }
 
-    pub(crate) fn publish_system_state(&mut self, status: SetupStatus) {
+    pub(crate) fn publish_system_state(&mut self, mut status: SetupStatus) {
+        if status.cancelled || status.finished || status.run.is_some_and(|run| run.allowed) {
+            self.system_state_host.closed_launch_review = false;
+        }
+        if self.closed_launch_is_unanswered(&status) {
+            status.unanswered = true;
+        }
         self.system_state_host.latest_status = status.clone();
         let (status, step) = self.project_system_state_status(status);
         // A stage running is a setup pass, whatever the window asked for last:
@@ -552,6 +609,8 @@ impl App {
         let changed = self.native_runtime.publish_system_state(status);
         self.system_state_host.status_in_flight = false;
         self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
+        // A Command Line Tools install a pass asked for opens its tab once it is due.
+        self.tick_developer_tools_install();
         // A tab indicator that changed redraws its own window (its tab chrome).
         self.refresh_system_state_tab_indicators();
         if changed {
@@ -615,6 +674,8 @@ impl App {
     }
 
     fn refresh_system_state_tab_indicators(&mut self) -> bool {
+        // The menu line says what the diamond says, the review's end or start included.
+        self.refresh_system_state_menu_line();
         let mut tabs = Vec::new();
         for (wid, window) in &self.windows {
             for tab in window.tab_set.tabs() {
@@ -641,12 +702,26 @@ impl App {
     /// person's or a control client's, before the page's reducer acts on it,
     /// so what it submits or opens carries who asked (design §6).
     pub(crate) fn interact_system_state(&mut self, wid: crate::WindowId) {
-        let ours = self.active_native_view(wid).is_some_and(|(instance, _)| {
-            matches!(
-                self.native_runtime.app(instance),
-                Some(NativeApp::SystemState(_))
-            )
-        });
+        if let Some((_, view)) = self.active_native_view(wid) {
+            self.interact_system_state_view(wid, view);
+        }
+    }
+
+    /// Pointer input can reach a visible split without moving keyboard focus.
+    /// Record only a System State leaf that this window currently shows.
+    pub(crate) fn interact_system_state_view(
+        &mut self,
+        wid: crate::WindowId,
+        view: crate::tab_model::ViewId,
+    ) {
+        let ours = self
+            .active_visible_leaf_plan(wid)
+            .is_some_and(|plan| plan.leaf(view).is_some())
+            && matches!(
+                self.view_store.get(view),
+                Some(crate::tab_model::View::Native(native))
+                    if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_)))
+            );
         if ours {
             let by_person = !self.person_gesture_refused();
             if self.native_runtime.system_state_gesture(by_person) {
@@ -705,8 +780,13 @@ impl App {
             .instance_by_kind(AppKind::SystemState)
             .filter(|instance| self.system_state_instance_has_view(*instance));
         let Some(instance) = instance else {
+            // The review's last view went: closed, not this launch.
             if let Some(request) = self.system_state_host.pending.take() {
-                request.finish(WorkstationSetupDecision::Unavailable);
+                let launch = matches!(request.kind(), OfferKind::Launch) && request.pending();
+                request.finish(WorkstationSetupDecision::Closed);
+                if launch {
+                    self.note_launch_review_closed();
+                }
             }
             self.system_state_host.next_tick = None;
             self.system_state_host.shown = false;
@@ -739,13 +819,18 @@ impl App {
         {
             host.shown = false;
         }
+        // While the GitHub repositories need a person, a page someone sees looks once a minute
+        // whether a renewed token reached this Mac; only that look's worker reads, and only
+        // that row, and only once the vault's mark moved (§3.6).
         if host.shown
+            && !shown.is_empty()
             && host
-                .observed_at
-                .is_some_and(|at| now.saturating_duration_since(at) >= PERSON_REREAD)
+                .token_looked_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= TOKEN_LOOK)
             && host.latest_status.github_needs_person()
         {
-            host.shown = false;
+            host.token_looked_at = Some(now);
+            self.look_for_github_token(instance);
         }
         if shown.is_empty() {
             self.system_state_host.shown = false;
@@ -764,7 +849,7 @@ impl App {
             host.observe_retry =
                 (observe == Observe::Refused).then_some(now + Duration::from_secs(1));
             if observe == Observe::Started {
-                host.observed_at = Some(now);
+                host.token_looked_at = Some(now);
                 host.observed_plan = host.latest_status.plan.clone();
                 if !host.latest_status.changing
                     && let Some(policy) = host.latest_status.permissions
@@ -794,6 +879,29 @@ impl App {
         }
     }
 
+    /// A dev scenario's first-launch review ([`crate::system_state::fixture_review`]): once a
+    /// System State page is open, it is offered the plan a fresh launch offers, as a first
+    /// launch's window offers it but in a headless instance too, so a lab capture sees it; a
+    /// click then stops its countdown where the scenario says so. Its answer goes nowhere.
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    fn offer_fixture_review(&mut self) {
+        let Some(review) = self.system_state_host.fixture_review else {
+            return;
+        };
+        if self
+            .native_runtime
+            .instance_by_kind(AppKind::SystemState)
+            .is_none()
+        {
+            return;
+        }
+        self.system_state_host.fixture_review = None;
+        self.attach_system_state_offer(Request::unanswered(Plan::default()));
+        if review == crate::system_state::FixtureReview::Stopped {
+            self.native_runtime.system_state_gesture(true);
+        }
+    }
+
     /// Where setup may not start (a headless instance), the page still runs
     /// while the dev seam shows it a scenario, so a lab capture sees it.
     pub(crate) fn tick_system_state_fixture(&mut self, now: Instant) {
@@ -819,6 +927,20 @@ impl App {
         self.system_state_host.next_tick = None;
     }
 
+    fn closed_launch_is_unanswered(&self, status: &SetupStatus) -> bool {
+        self.system_state_host.closed_launch_review
+            && !status.cancelled
+            && !status.finished
+            && status.run.is_none_or(|run| !run.allowed)
+    }
+
+    fn note_launch_review_closed(&mut self) {
+        self.system_state_host.closed_launch_review = true;
+        let unanswered = self.closed_launch_is_unanswered(&self.system_state_host.latest_status);
+        self.system_state_host.latest_status.unanswered |= unanswered;
+        self.refresh_system_state_tab_indicators();
+    }
+
     /// Publish visibility before another event or worker step can use it.
     /// Closing a passive copy keeps the visible page's authority; losing the
     /// last front page withdraws it even while a hidden controller survives.
@@ -836,18 +958,25 @@ impl App {
     /// screen (design §6). A focused window macOS reports occluded (the screen
     /// locked or asleep, a screen saver up) stays key but shows nothing.
     pub(crate) fn system_state_frontmost(&self) -> bool {
-        self.windows.iter().any(|(wid, window)| {
+        self.windows
+            .keys()
+            .any(|wid| self.system_state_frontmost_in(*wid))
+    }
+
+    /// Revalidate the particular window a deferred setup gesture was booked in.
+    pub(crate) fn system_state_frontmost_in(&self, wid: crate::WindowId) -> bool {
+        self.windows.get(&wid).is_some_and(|window| {
             crate::os_window_focused(window)
                 && !window.occluded
                 && window.overlay.is_none()
                 && self
-                    .active_native_view(*wid)
+                    .active_native_view(wid)
                     .is_some_and(|(instance, view)| {
                         matches!(
                             self.native_runtime.app(instance),
                             Some(crate::native_app::NativeApp::SystemState(_))
                         ) && self
-                            .active_visible_leaf_plan(*wid)
+                            .active_visible_leaf_plan(wid)
                             .is_some_and(|plan| plan.leaf(view).is_some())
                     })
         })
@@ -977,9 +1106,14 @@ impl App {
             return Observe::Started;
         };
         let plan = match self.native_runtime.app(instance) {
-            Some(NativeApp::SystemState(state)) if state.plan_known() => state.observation_plan(),
-            Some(NativeApp::SystemState(_)) => match &self.system_state_host.latest_status.plan {
-                Some(plan) => plan.clone(),
+            Some(NativeApp::SystemState(_)) => match self.system_state_observation_plan(instance) {
+                Some(plan) => plan,
+                // A newer aterm's setup names no plan this aterm reads, now or later; reading
+                // writes nothing, so its rows are read as they stand with nothing set up: no
+                // account and no network read but on Check again (§3.2, §3.5).
+                None if self.system_state_host.latest_status.newer() => {
+                    Plan::from(Selection::none())
+                }
                 None => return Observe::NoPlan,
             },
             _ => return Observe::Started,
@@ -992,6 +1126,37 @@ impl App {
         }
     }
 
+    /// The plan the shown page's rows are read for: the page's own, once it knows the plan in
+    /// force, else that plan from the last status. `None` while neither knows it.
+    fn system_state_observation_plan(
+        &self,
+        instance: crate::native_app::AppInstanceId,
+    ) -> Option<Plan> {
+        match self.native_runtime.app(instance) {
+            Some(NativeApp::SystemState(state)) if state.plan_known() => {
+                Some(state.observation_plan())
+            }
+            Some(NativeApp::SystemState(_)) => self.system_state_host.latest_status.plan.clone(),
+            _ => None,
+        }
+    }
+
+    /// One look for a renewed GitHub token while the GitHub repositories need a person
+    /// ([`TOKEN_LOOK`]): the worker reads that row again, alone, only if the vault's mark moved.
+    fn look_for_github_token(&mut self, instance: crate::native_app::AppInstanceId) {
+        if self.system_state_host.fixture().is_some() {
+            return;
+        }
+        let Some(handlers) = self.system_state_handlers() else {
+            return;
+        };
+        if let Some(plan) = self.system_state_observation_plan(instance)
+            && !(handlers.look_for_token)(plan)
+        {
+            aterm_log::info!("system state: the look for a renewed GitHub token did not start");
+        }
+    }
+
     fn poll_system_state_status(&mut self, now: Instant) {
         if !self.system_state_host.status_in_flight
             && self
@@ -1001,6 +1166,8 @@ impl App {
         {
             if let Some(status) = self.system_state_host.fixture().cloned() {
                 self.system_state_host.next_status = None;
+                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                self.offer_fixture_review();
                 self.publish_system_state(status);
                 return;
             }
@@ -1053,6 +1220,13 @@ impl App {
             self.native_runtime.app(instance),
             Some(NativeApp::SystemState(_))
         ) {
+            let launch = self
+                .system_state_host
+                .pending
+                .as_ref()
+                .is_some_and(|request| {
+                    matches!(request.kind(), OfferKind::Launch) && request.pending()
+                });
             self.system_state_host.shown = false;
             self.system_state_host.observe_retry = None;
             self.native_runtime
@@ -1060,6 +1234,9 @@ impl App {
             // Retire the ended offer before a reopened page can submit a new
             // intent; that intent belongs to its manual handler, not this request.
             self.resolve_withdrawn_system_state_offer(Instant::now());
+            if launch {
+                self.note_launch_review_closed();
+            }
         }
     }
 
@@ -1071,11 +1248,17 @@ impl App {
         match action {
             SystemStateAction::CancelReview => {
                 let _ = self.take_system_state_press();
+                let mut widen = false;
                 if let Some(request) = self.system_state_host.pending.take() {
+                    widen = matches!(request.kind(), OfferKind::Widen { .. });
                     request.finish(WorkstationSetupDecision::Cancelled);
                 }
                 self.begin_system_state_action(false, false);
-                self.recheck_initial_setup_permissions();
+                // The launch review's hold goes with it: a fresh read of the records, which
+                // keep the Cancel, decides. The widen's review held nothing.
+                if !widen {
+                    self.recheck_initial_setup_permissions();
+                }
                 self.finish_system_state_action(true, "Setup");
                 self.refresh_system_state_tab_indicators();
             }

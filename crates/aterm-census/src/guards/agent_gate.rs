@@ -356,13 +356,13 @@ mod tests {
     /// A newly declared `Program` variant is automatically fenced outside its own module.
     #[test]
     fn a_new_variant_is_fenced_from_its_declaration() {
-        let src = "fn f(a: Program) -> bool {\n    a == Program::Gemini\n}\n\
-                   fn g(a: Program) -> bool {\n    matches!(a, Program::Gemini)\n}\n";
+        let src = "fn f(a: Program) -> bool {\n    a == Program::Opencode\n}\n\
+                   fn g(a: Program) -> bool {\n    matches!(a, Program::Opencode)\n}\n";
         let found = gate(
-            "    Gemini,\n",
+            "    Opencode,\n",
             &[
                 ("crates/aterm-gui/src/harness_host.rs", src),
-                ("crates/aterm-phase/src/gemini.rs", src),
+                ("crates/aterm-phase/src/opencode.rs", src),
             ],
         );
         assert_eq!(

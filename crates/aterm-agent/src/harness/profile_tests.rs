@@ -160,6 +160,37 @@ fn subscription_display_follows_process_profile_selection_and_clears_on_missing(
 }
 
 #[test]
+fn subscription_display_checks_the_canonical_identity_of_a_login_alias() {
+    use super::super::accounts::{Roster, Row};
+
+    let root = tmp_dir("footer-alias-identity");
+    let records = root.path().join(".claude");
+    std::fs::create_dir(&records).unwrap();
+    let env = vec![format!("HOME={}", root.path().display())];
+    let roster = Roster {
+        rows: vec![Row {
+            label: "alias".into(),
+            email: Some("alias@example.test".into()),
+            identity_email: Some("canonical@example.test".into()),
+            ..Row::default()
+        }],
+    };
+    for email in ["canonical@example.test", "alias@example.test"] {
+        let value = with(composed(), &["oauthAccount", "emailAddress"], json!(email));
+        std::fs::write(
+            root.path().join(".claude.json"),
+            aterm_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        let displayed = subscription_for(&env, root.path(), &records, Some(&roster), 1_792_050_000);
+        assert_eq!(displayed.is_some(), email == "canonical@example.test");
+        if let Some(displayed) = displayed {
+            assert_eq!(displayed.email.as_deref(), Some(email));
+        }
+    }
+}
+
+#[test]
 fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     use super::super::accounts::{LOGIN_ENV, Roster, Row};
 
@@ -2623,6 +2654,7 @@ fn no_weekly_gap_tells_the_person_to_act() {
         WeeklyGap::Unoffered(Refusal::Line),
         WeeklyGap::Unoffered(Refusal::Argv),
         WeeklyGap::Unoffered(Refusal::Settings),
+        WeeklyGap::Unoffered(Refusal::Room),
         WeeklyGap::Untapped,
         WeeklyGap::Unrestarted,
         WeeklyGap::NoReply,

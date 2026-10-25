@@ -632,6 +632,7 @@ mod tests {
                 pid: 42,
                 start: "fixture birth".into(),
             }),
+            scoped: None,
         });
         meta.supervisor_revision = 1;
         drop(meta);

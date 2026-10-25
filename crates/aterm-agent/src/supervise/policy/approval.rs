@@ -69,11 +69,6 @@ pub const RULE_TALL_BOX: &str = "tall-box@v1";
 pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 /// The usage-limit dialog's rule ([`limit_wait`]).
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
-/// Gemini CLI's usage-limit dialog ([`limit_retry`]).
-pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
-/// Gemini CLI's usage-limit dialog of a model's own bucket ([`limit_retry`],
-/// [`LimitTry::StopThenResume`]).
-pub const RULE_LIMIT_STOP: &str = "limit-stop@v1";
 /// The usage-limit dialog's grant row ([`limit_reset`]).
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
 /// Claude Code's autocompact offer ([`autocompact_offer`]).
@@ -385,12 +380,18 @@ pub struct ApprovalCtx {
     pub model_fallback: bool,
     pub limit_wait: bool,
     pub limit_reset: bool,
-    pub limit_retry: bool,
     pub reset_kinds: Vec<aterm_phase::ResetKind>,
     pub usage_credits: bool,
     pub autocompact_offer: Option<u32>,
     pub login_carry: bool,
+    /// The picker is the `/login` aterm typed over a login that came back in another tab: the
+    /// loop backs out of it ([`super::login::PickerGate::Back`]).
     pub login_back: bool,
+    /// The picker is the `/login` aterm typed over a roster row's login, which aterm's sign-in
+    /// ladder signs in: the loop backs out of it ([`super::login::PickerGate::Roster`]).
+    pub login_roster: bool,
+    /// The picker is the `/login` aterm typed over a login a renewal the tab follows replaced:
+    /// the loop backs out of it ([`super::login::PickerGate::Renewed`]).
     pub login_renewed: bool,
     pub login_method: Option<aterm_phase::LoginMethod>,
     pub trust_roots: Vec<ScratchRoot>,
@@ -452,12 +453,12 @@ impl ApprovalCtx {
             model_fallback: defaults.model_fallback.is_some(),
             limit_wait: defaults.limit_wait,
             limit_reset: defaults.limit_reset,
-            limit_retry: false,
             reset_kinds: defaults.limit_reset_kinds,
             usage_credits: defaults.usage_credits,
             autocompact_offer: defaults.autocompact_offer,
             login_carry: false,
             login_back: false,
+            login_roster: false,
             login_renewed: false,
             login_method: None,
             trust_roots: Vec::new(),
@@ -740,40 +741,7 @@ const fn draws_claude_boxes(program: Program) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => false,
-    }
-}
-
-/// Whether `program`'s usage-limit dialog is kept trying past the reset it names
-/// ([`limit_retry`], [`RULE_LIMIT_RETRY`]).
-#[must_use]
-pub const fn keeps_trying_its_limit(program: Program) -> bool {
-    match program {
-        Program::Gemini => true,
-        Program::Claude
-        | Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Generic => false,
-    }
-}
-
-const fn foreign_limit(program: Program) -> &'static str {
-    match program {
-        Program::Gemini => {
-            "Gemini CLI's usage limit: neither Keep trying nor Stop is pressed; /stats model in \
-             this tab says which limit holds it"
-        }
-        Program::Claude
-        | Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Generic => "no usage-limit dialog the reader vouches for",
     }
 }
 
@@ -800,10 +768,8 @@ fn decide_box(
         && prompt.kind == PromptKind::UsageLimit
     {
         let read = reading.phase == Phase::Prompt && reading.phase_authoritative;
-        let decision = if read && keeps_trying_its_limit(reading.program) {
-            limit_retry(prompt, rows, ctx)
-        } else if !draws_claude_boxes(reading.program) || !read {
-            Decision::escalate(foreign_limit(reading.program))
+        let decision = if !draws_claude_boxes(reading.program) || !read {
+            Decision::escalate("no usage-limit dialog the reader vouches for")
         } else {
             limit_reset(prompt, rows, ctx).unwrap_or_else(|| limit_wait(prompt, rows, ctx))
         };
@@ -846,12 +812,11 @@ fn decide_box(
             aterm_phase::LoginScreen::Picker(picker) if ctx.login_carry => {
                 super::login::pick_method(prompt, &picker, ctx.login_method)
             }
-            aterm_phase::LoginScreen::Picker(_) if ctx.login_back => Decision::escalate(
-                "the login came back in another tab: press Esc in the tab to close this sign-in",
-            ),
-            aterm_phase::LoginScreen::Picker(_) if ctx.login_renewed => Decision::escalate(
-                "the login was renewed: press Esc in the tab to close this sign-in",
-            ),
+            aterm_phase::LoginScreen::Picker(picker)
+                if ctx.login_back || ctx.login_roster || ctx.login_renewed =>
+            {
+                super::login::back_out_of_picker(prompt, &picker)
+            }
             aterm_phase::LoginScreen::Picker(_) => {
                 Decision::escalate("a /login you opened: its sign-in method is yours to pick")
             }
@@ -2558,12 +2523,6 @@ fn spawned_trust(
     ctx: &ApprovalCtx,
 ) -> Decision {
     let product = program.product();
-    if relaunches_at_trust(program) {
-        return Decision::escalate(format!(
-            "{product}'s folder-trust dialog: it names no folder by its path, and its `Trust \
-             folder` relaunches it with its first prompt"
-        ));
-    }
     if !ctx.cwd_known {
         return Decision::escalate(format!(
             "{product}'s folder-trust dialog with the session's cwd unknown (meta cwd=-)"
@@ -2650,30 +2609,6 @@ fn spawned_trust(
         guard: row_guard(&rows[row]),
         subject: path.to_string(),
         unproven: None,
-    }
-}
-
-fn gemini_worker_trust(program: Program, p: &PromptV2, ctx: &ApprovalCtx) -> Option<String> {
-    (relaunches_at_trust(program)
-        && p.kind == PromptKind::Trust
-        && ctx.worker_agent.is_some_and(relaunches_at_trust))
-    .then(|| {
-        "Gemini CLI's folder-trust dialog on a worker: its `Trust folder` relaunches it with \
-         its task, which would be sent again"
-            .to_string()
-    })
-}
-
-const fn relaunches_at_trust(program: Program) -> bool {
-    match program {
-        Program::Gemini => true,
-        Program::Claude
-        | Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Generic => false,
     }
 }
 
@@ -2770,9 +2705,6 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
     if let Some(why) = unmeasured_box(reading.program, p) {
         return Decision::escalate(format!("{why} (the safe rules: {safe})"));
     }
-    if let Some(why) = gemini_worker_trust(reading.program, p, ctx) {
-        return Decision::escalate(format!("{why} (the safe rules: {safe})"));
-    }
     if p.kind == PromptKind::Other
         && let Some(decision) = credits_decline(reading.program, p, rows, ctx, &safe)
     {
@@ -2814,18 +2746,6 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
 
 fn unmeasured_box(program: Program, p: &PromptV2) -> Option<String> {
     match program {
-        Program::Gemini => {
-            let once = p.options.iter().filter(|o| o.role == Role::Once).count() == 1;
-            match p.kind {
-                PromptKind::Bash | PromptKind::Write | PromptKind::Edit if once => None,
-                PromptKind::Trust => None,
-                kind => Some(format!(
-                    "{} box of Gemini CLI's with no measured answer: its one-shot `Allow \
-                     once` on a shell, write or edit box, or its folder trust",
-                    a_or_an(kind.name())
-                )),
-            }
-        }
         Program::Muse => match p.kind {
             PromptKind::Tool => Some(format!(
                 "Muse Code's tool-action box for `{}`: an MCP tool's call reaches past the \
@@ -3353,177 +3273,6 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
         },
         guard: row_guard(title_row),
         subject: label,
-        unproven: None,
-    }
-}
-
-/// Format the escalation reason when Gemini CLI's usage-limit dialog names no reset time.
-#[must_use]
-pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>, how: LimitTry) -> String {
-    let tried = how.tried();
-    match unplaced {
-        None => format!(
-            "Gemini CLI's usage limit names no reset: {tried} on a back-off ladder; /stats \
-             model says which limit"
-        ),
-        Some(drawn) => format!(
-            "Gemini CLI's usage limit names a reset the loop cannot place ({}): {tried} on a \
-             back-off ladder",
-            crate::harness::one_line(drawn, 24)
-        ),
-    }
-}
-
-/// How Gemini CLI's usage-limit dialog is tried past its due ([`limit_retry`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LimitTry {
-    /// `1. Keep trying` over `2. Stop` (the account's quota, or a model with
-    /// no other to fall back to): `Keep trying` sends the turn again
-    /// ([`RULE_LIMIT_RETRY`]).
-    KeepTrying,
-    /// `Switch to <fallback>` over `Stop` (with `Upgrade for higher limits` between them under
-    /// the Google login), for a terminal quota of the model's own bucket (`Usage limit reached
-    /// for all Pro models.`). With no `Keep trying` on offer the try is `Stop` (the option at
-    /// `stop`, [`RULE_LIMIT_STOP`]), and the turn-end policy types the resume at the error it
-    /// leaves (`usage-resume@v1`) on the same due and ladder. The switch and the upgrade are
-    /// never pressed, so the bucket stays the session's model's.
-    StopThenResume { stop: usize },
-}
-
-impl LimitTry {
-    /// The try `labels` (the dialog's options, top down) offer.
-    #[must_use]
-    pub(crate) fn of(labels: &[&str]) -> Option<Self> {
-        let switch = |l: &str| {
-            l.strip_prefix(aterm_phase::anchor!("gemini.usage.switch"))
-                .is_some_and(|m| !m.trim().is_empty())
-        };
-        match labels {
-            [retry, "Stop"] if *retry == aterm_phase::anchor!("gemini.usage.retry") => {
-                Some(Self::KeepTrying)
-            }
-            [first, "Stop"] if switch(first) => Some(Self::StopThenResume { stop: 1 }),
-            [first, upgrade, "Stop"]
-                if switch(first) && *upgrade == aterm_phase::anchor!("gemini.usage.upgrade") =>
-            {
-                Some(Self::StopThenResume { stop: 2 })
-            }
-            _ => None,
-        }
-    }
-
-    /// The try as a WAITING line or a badge says it is made (`Keep trying is tried`).
-    #[must_use]
-    pub(crate) fn tried(self) -> String {
-        match self {
-            Self::KeepTrying => format!("{} is tried", aterm_phase::anchor!("gemini.usage.retry")),
-            Self::StopThenResume { .. } => "Stop and resume are tried".to_string(),
-        }
-    }
-
-    /// The try as a WAITING line says it is pressed (`Keep trying is pressed`).
-    #[must_use]
-    pub(crate) fn pressed(self) -> String {
-        match self {
-            Self::KeepTrying => {
-                format!("{} is pressed", aterm_phase::anchor!("gemini.usage.retry"))
-            }
-            Self::StopThenResume { .. } => "Stop is pressed and the turn resumed".to_string(),
-        }
-    }
-}
-
-/// Format the escalation reason for a Gemini CLI usage-limit dialog answered with `Stop`.
-#[must_use]
-pub(crate) fn limit_stopped_reason(unplaced: Option<&str>) -> String {
-    let what = match unplaced {
-        None => "names no reset".to_string(),
-        Some(drawn) => format!(
-            "names a reset the loop cannot place ({})",
-            crate::harness::one_line(drawn, 24)
-        ),
-    };
-    format!(
-        "Gemini CLI's usage limit {what}; after Stop, resumed on a back-off ladder; /stats model"
-    )
-}
-
-fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
-    if !ctx.limit_wait {
-        return Decision::escalate("a usage-limit dialog (limit_wait is off)");
-    }
-    let labels: Vec<&str> = prompt.options.iter().map(|o| o.label.as_str()).collect();
-    let retry = aterm_phase::anchor!("gemini.usage.retry");
-    let Some(how) = LimitTry::of(&labels) else {
-        return Decision::escalate(format!(
-            "Gemini CLI's usage limit offers {}: only `{retry}` over `Stop`, or a switch's `Stop`, \
-             is pressed",
-            labels.join(" | ")
-        ));
-    };
-    let reset = aterm_phase::gemini::limit_reset(rows);
-    if !ctx.limit_retry {
-        return Decision::escalate(match &reset {
-            Some(reset) if crate::supervise::limit::parse_reset(&reset.clock).is_some() => {
-                format!(
-                    "Gemini CLI's usage limit resets at {reset}: {} past it",
-                    how.pressed()
-                )
-            }
-            Some(reset) => limit_no_reset_reason(Some(&reset.to_string()), how),
-            None => limit_no_reset_reason(None, how),
-        });
-    }
-    let (rule_id, at, label) = match how {
-        LimitTry::KeepTrying => (RULE_LIMIT_RETRY, 0, retry),
-        LimitTry::StopThenResume { stop } => (RULE_LIMIT_STOP, stop, "Stop"),
-    };
-    let (head, from, missing) = match &reset {
-        Some(_) => (
-            aterm_phase::anchor!("gemini.usage.resets"),
-            prompt.span.0 + 1,
-            "the usage-limit dialog's reset row is not on the screen",
-        ),
-        None => (
-            aterm_phase::anchor!("gemini.usage.title"),
-            prompt.span.0,
-            "the usage-limit dialog's title row is not on the screen",
-        ),
-    };
-    let first_option = prompt.options[0].row;
-    let Some(reset_row) = rows
-        .iter()
-        .enumerate()
-        .take(first_option.min(rows.len()))
-        .skip(from)
-        .find(|(_, r)| r.contains(head))
-        .map(|(k, _)| k)
-    else {
-        return Decision::escalate(missing);
-    };
-    let choice = match (prompt.select, prompt.options[at].n) {
-        (Select::Digits, Some(n)) => Choice::Digit(n),
-        (Select::ArrowsEnter, _) => {
-            let Some(focused) = prompt.options.iter().position(|o| o.focused) else {
-                return Decision::escalate("a usage-limit dialog with no focused option");
-            };
-            Choice::Focus {
-                steps: focus_steps(focused, at),
-                label: label.to_string(),
-            }
-        }
-        (Select::Digits, None) => {
-            return Decision::escalate("a numbered dialog with an unnumbered option");
-        }
-    };
-    Decision::Approve {
-        rule_id,
-        choice,
-        guard: row_guard(&rows[reset_row]),
-        subject: match &reset {
-            Some(reset) => format!("{label} (reset {reset})"),
-            None => format!("{label} (no reset named)"),
-        },
         unproven: None,
     }
 }

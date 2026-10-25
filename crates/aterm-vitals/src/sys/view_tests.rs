@@ -955,6 +955,7 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
         exclusive: 9_150_000_000,
         shared: 0,
         walking: true,
+        not_measured: vec!["protected"],
         growth_bps: Some(7_400_000),
         warnings: vec![HugeDirFact {
             path: "/Users//a/my proj/target/debug/deps".into(),
@@ -965,7 +966,9 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     let c = ctx(&w, Some(&s), true, true);
     let text = all_text(&render_text(&query(View::Disk, false), &c));
     assert!(
-        text.contains("\u{2265}9.2 GB exclusive (walking) · growing 7.4 MB/s"),
+        text.contains(
+            "\u{2265}9.2 GB exclusive (walking; 1 not measured: protected) · growing 7.4 MB/s"
+        ),
         "{text}"
     );
     assert!(
@@ -1015,12 +1018,80 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     let tab = all_text(&render_text(&query(View::Tab, false), &c));
     assert!(
         tab.contains(
-            "disk   3 roots: cwd, repo, scratch, work · \u{2265}9.2 GB exclusive (walking)"
+            "disk   3 roots: cwd, repo, scratch, work · \u{2265}9.2 GB exclusive (walking; 1 not measured: protected)"
         ),
         "{tab}"
     );
     let tj = render_json(&query(View::Tab, true), &c);
     assert!(contract_violations(&tj).is_empty(), "{}", tj.to_text());
+}
+
+/// A tab whose only folder no walk measures (a scratch HOME is too broad) reads its size as
+/// unavailable in `sys disk` and `sys tab`, never `0 B`; beside a measured one, a lower bound.
+#[test]
+fn a_root_no_walk_measured_reads_unavailable_in_sys_disk_and_sys_tab_never_zero() {
+    use crate::sys::{DiskTotals, RootSize, RootSizes};
+    let s = snapshot();
+    let mut w = world();
+    w.roots[0].size = RootSize::NotMeasured("too_broad");
+    w.disk = Some(DiskTotals {
+        not_measured: vec!["too_broad"],
+        ..DiskTotals::default()
+    });
+    let c = ctx(&w, Some(&s), true, true);
+    let disk = all_text(&render_text(&query(View::Disk, false), &c));
+    assert!(
+        disk.contains(" · 1 root · sizes unavailable(too_broad) · writes "),
+        "{disk}"
+    );
+    assert!(!disk.contains("0 B exclusive"), "{disk}");
+    let tab = all_text(&render_text(&query(View::Tab, false), &c));
+    assert!(
+        tab.contains("disk   1 root: cwd · sizes unavailable(too_broad) · writes "),
+        "{tab}"
+    );
+    let j = render_json(&query(View::Disk, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let d = j.get("disk").expect("disk");
+    assert_eq!(d.get("exclusive_bytes"), Some(&Jv::why("too_broad")));
+    assert_eq!(d.get("total_bytes"), Some(&Jv::why("too_broad")));
+    let tj = render_json(&query(View::Tab, true), &c);
+    assert!(contract_violations(&tj).is_empty(), "{}", tj.to_text());
+    assert_eq!(
+        tj.get("tab").and_then(|t| t.get("root_bytes")),
+        Some(&Jv::why("too_broad"))
+    );
+
+    w.roots.push(Root {
+        kinds: vec!["work"],
+        path: "/w/repo".into(),
+        keys: vec![7],
+        tab: Some(1),
+        size: RootSize::Complete(RootSizes {
+            alloc: 7_050_000_000,
+            ..RootSizes::default()
+        }),
+        ..Root::default()
+    });
+    w.disk = Some(DiskTotals {
+        total: 7_050_000_000,
+        exclusive: 7_050_000_000,
+        not_measured: vec!["too_broad"],
+        ..DiskTotals::default()
+    });
+    let c = ctx(&w, Some(&s), true, true);
+    let disk = all_text(&render_text(&query(View::Disk, false), &c));
+    assert!(
+        disk.contains(
+            " · 2 roots · \u{2265}7.0 GB exclusive (1 not measured: too_broad) · writes "
+        ),
+        "{disk}"
+    );
+    let tj = render_json(&query(View::Tab, true), &c);
+    assert_eq!(
+        tj.get("tab").and_then(|t| t.get("root_bytes")),
+        Some(&Jv::at_least(7_050_000_000, "too_broad"))
+    );
 }
 
 #[test]

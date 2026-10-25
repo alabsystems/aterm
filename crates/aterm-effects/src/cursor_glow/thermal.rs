@@ -137,10 +137,10 @@ impl CursorGlow {
             ..
         } = mv;
         if typing {
-            let gap = self
-                .last_type
-                .map(|t| now.saturating_duration_since(t).as_secs_f32())
-                .unwrap_or(f32::MAX);
+            let gap = match self.last_type {
+                Some(t) => now.saturating_duration_since(t).as_secs_f32(),
+                None => f32::MAX,
+            };
             if (forward || echo_run || !fire) && !deletion && !navigation {
                 let cadence = Self::heat_cadence(gap);
                 let gain = Self::heat_gain(fire);
@@ -165,9 +165,10 @@ impl CursorGlow {
                     CursorCatMotionKind::Advance
                 };
                 let fold_held = kind == CursorCatMotionKind::Advance
-                    && self
-                        .momentum_pulse
-                        .is_some_and(|p| p.kind == CursorCatMotionKind::FoldForward);
+                    && matches!(
+                        self.momentum_pulse,
+                        Some(p) if p.kind == CursorCatMotionKind::FoldForward
+                    );
                 if !fold_held {
                     self.momentum_pulse = Some(CursorCatMotionPulse { at: now, kind });
                 }

@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use atpkg::{Channel, Program};
 use atpkg_publish::api::{Delta, Yank};
 use atpkg_publish::channel::Log;
-use atpkg_publish::channel::index::{Base, Plan, parse_delta, parse_yank, plan, render};
+use atpkg_publish::channel::index::{
+    Base, Plan, READERS, Readers, parse_delta, parse_yank, plan, plan_for, render,
+};
 use atpkg_publish::error::Error;
 use atpkg_publish::triple::{
     AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, Triple, X86_64_UNKNOWN_LINUX_GNU,
@@ -211,18 +213,78 @@ fn the_harness_rows_are_the_five_harnesses_each_shipping_its_one_binary() {
     );
 }
 
-/// A HARNESS IS PINNED LIKE ANY ROW AND INSTALLED ONLY BY NAME: `--pin` of each is admitted
-/// (it is a table row), its block names its own repo with no group, and the index it makes is
-/// one whose client installs it only when asked.
-#[test]
-fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
-    let b = base(21, &[("ay", 1)]);
+/// `--pin <harness>=7` for each of the five.
+fn harness_pins() -> Delta {
     let pins: Vec<String> = HARNESSES
         .iter()
         .flat_map(|(h, _)| ["--pin".to_string(), format!("{h}=7")])
         .collect();
     let pins: Vec<&str> = pins.iter().map(String::as_str).collect();
-    let (p, _) = ok(&b, &delta(&pins));
+    delta(&pins)
+}
+
+/// NO HARNESS IS PINNED WHILE SOME READER OF THE INDEX WOULD INSTALL IT UNASKED: every aterm
+/// through v0.135.0 installs every program the index lists, and one may still read it
+/// (`READERS`), so `--pin` of any harness is refused, and so is carrying a head's harness pin
+/// unless this publish retires it; a program that is not a harness pins as before.
+#[test]
+fn no_harness_is_pinned_while_a_reader_would_install_it_unasked() {
+    assert_eq!(READERS, Readers::SomeInstallEveryProgram);
+    let b = base(21, &[("ay", 1)]);
+    for (h, _) in HARNESSES {
+        let err = refused(&b, &delta(&["--pin", &format!("{h}=7")]));
+        assert!(err.contains(&format!("REFUSING --pin {h}=7")), "{err}");
+        assert!(err.contains("unasked"), "{err}");
+    }
+    let err = refused(&b, &harness_pins());
+    assert!(err.contains("is an ALab harness"), "{err}");
+
+    let stale = base(21, &[("ay", 1), ("muse-alab", 4), ("orca-alab", 2)]);
+    let err = refused(&stale, &delta(&["--pin", "ay=2"]));
+    assert!(
+        err.contains("REFUSING to carry the head's pin muse-alab=4")
+            && err.contains("--retire muse-alab"),
+        "{err}"
+    );
+    let err = refused(&stale, &delta(&["--retire", "muse-alab"]));
+    assert!(
+        err.contains("REFUSING to carry the head's pin orca-alab=2"),
+        "a head-only program named like a harness is one to every client: {err}"
+    );
+    let (p, _) = ok(
+        &stale,
+        &delta(&[
+            "--pin",
+            "ay=2",
+            "--retire",
+            "muse-alab",
+            "--retire",
+            "orca-alab",
+        ]),
+    );
+    assert_eq!(p.channel.pin.keys().collect::<Vec<_>>(), ["ay"]);
+    assert_eq!(p.retired, ["muse-alab", "orca-alab"]);
+    let (p, _) = ok(&b, &delta(&["--pin", "ty=3007"]));
+    assert_eq!(p.channel.pin.get("ty"), Some(&3007));
+}
+
+/// ONCE EVERY READER KEEPS A HARNESS OUT, A HARNESS PINS LIKE ANY ROW AND INSTALLS ONLY BY
+/// NAME: `--pin` of each is admitted (it is a table row), its block names its own repo with no
+/// group, and the index it makes is one whose client installs it only when asked.
+#[test]
+fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
+    let b = base(21, &[("ay", 1)]);
+    let mut log = Log::capture("test");
+    let p = plan_for(
+        Readers::AllKeepHarnessesOut,
+        &b,
+        &harness_pins(),
+        "m3",
+        3,
+        VU,
+        &mut log,
+    )
+    .unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
     for (h, _) in HARNESSES {
         assert_eq!(p.channel.pin.get(h), Some(&7), "{h}");
         let (_, block) = p
@@ -247,16 +309,13 @@ fn each_harness_pins_under_its_own_repo_and_stays_out_of_the_default_set() {
 
 #[test]
 fn a_head_program_the_table_lacks_keeps_the_heads_block() {
-    let mut b = base(21, &[("ay", 1), ("orca-alab", 4)]);
+    let mut b = base(21, &[("ay", 1), ("orca", 4)]);
     b.programs.insert("ay".into(), block("ay-old", None));
-    let (p, _) = ok(&b, &delta(&["--pin", "orca-alab=5"]));
+    let (p, _) = ok(&b, &delta(&["--pin", "orca=5"]));
     let names: Vec<&str> = p.programs.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["ay", "orca-alab"], "table order, then the rest");
+    assert_eq!(names, ["ay", "orca"], "table order, then the rest");
     assert_eq!(p.programs[0].1.repo, "ay", "the table's block is rendered");
-    assert_eq!(
-        p.programs[1].1.repo, "orca-alab",
-        "the head's block is carried"
-    );
+    assert_eq!(p.programs[1].1.repo, "orca", "the head's block is carried");
 }
 
 #[test]

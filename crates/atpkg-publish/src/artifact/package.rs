@@ -377,11 +377,23 @@ pub fn names_repo(url: &str, owner: &str, repo: &str) -> bool {
         || head.strip_prefix("file://").is_some_and(local)
 }
 
-/// The package's source commit is on `origin/main` of `repo_dir`, whose `origin` is `owner/repo`, and the version's `<count>` is that commit's `git rev-list --count`.
+/// `commit` (called `what` in a refusal) is on `origin/main` of `repo_dir`, whose `origin` names `owner/repo` ([`names_repo`]): what ALab ships, never a fork, another branch or an unpushed commit.
 /// # Errors
-/// A refusal naming what does not hold.
-pub fn check_source(repo_dir: &Path, owner: &str, repo: &str, pkg: &Package) -> Result<()> {
-    let url = crate::git::run(repo_dir, &["remote", "get-url", "origin"])?;
+/// A refusal naming what does not hold: no `origin`, an `origin` naming another repo, or `commit` not an ancestor of `refs/remotes/origin/main`.
+pub fn check_on_main(
+    repo_dir: &Path,
+    owner: &str,
+    repo: &str,
+    what: &str,
+    commit: &str,
+) -> Result<()> {
+    let url = crate::git::run(repo_dir, &["remote", "get-url", "origin"]).map_err(|e| {
+        Error::refused(format!(
+            "{} has no origin to read ({e}) — the source must be on ALab's main, \
+             {owner}/{repo}",
+            repo_dir.display()
+        ))
+    })?;
     if !names_repo(&url, owner, repo) {
         return Err(Error::refused(format!(
             "{}'s origin is {url}, not {owner}/{repo} — the source must be on ALab's main",
@@ -393,18 +405,25 @@ pub fn check_source(repo_dir: &Path, owner: &str, repo: &str, pkg: &Package) -> 
         &[
             "merge-base",
             "--is-ancestor",
-            &pkg.source,
+            commit,
             "refs/remotes/origin/main",
         ],
     );
     if let Err(e) = on_main {
         return Err(Error::refused(format!(
-            "the package's source {} is not on {owner}/{repo} origin/main in {} ({e}) — only \
-             what ALab ships is packed (fetch origin if it landed since)",
-            pkg.source,
+            "{what} {commit} is not on {owner}/{repo} origin/main in {} ({e}) — only what ALab \
+             ships is packed (fetch origin if it landed since)",
             repo_dir.display()
         )));
     }
+    Ok(())
+}
+
+/// The package's source commit is on `origin/main` of `repo_dir`, whose `origin` is `owner/repo` ([`check_on_main`]), and the version's `<count>` is that commit's `git rev-list --count`.
+/// # Errors
+/// A refusal naming what does not hold.
+pub fn check_source(repo_dir: &Path, owner: &str, repo: &str, pkg: &Package) -> Result<()> {
+    check_on_main(repo_dir, owner, repo, "the package's source", &pkg.source)?;
     let count = crate::git::rev_count(repo_dir, &pkg.source)?;
     if count != pkg.count {
         return Err(Error::refused(format!(

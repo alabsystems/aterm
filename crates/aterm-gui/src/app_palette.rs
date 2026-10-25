@@ -323,14 +323,14 @@ impl App {
         self.palette_live_for_window(self.frontmost_window)
     }
 
-    /// Selection geometry in the focused terminal or its visible terminal siblings.
+    /// Selection geometry on the screens the focused terminal and its visible siblings show.
     /// An unread lock stays unknown unless another pane proves a selection exists.
     fn terminal_selection_in(
         &self,
         wid: crate::WindowId,
         mut read: impl FnMut(&std::sync::Mutex<aterm_core::terminal::Terminal>) -> Option<bool>,
     ) -> Option<bool> {
-        let Some(focused) = self.front_terminal(wid) else {
+        let Some(focused) = self.shown_front(wid) else {
             return Some(false);
         };
         let mut selected = read(&focused.term);
@@ -354,10 +354,10 @@ impl App {
             if view.session == focused.session {
                 continue;
             }
-            let Some(session) = self.pool.get(view.session) else {
+            let Some(term) = self.pool.shown_term(view.session) else {
                 continue;
             };
-            match read(&session.term) {
+            match read(&term) {
                 Some(true) => return Some(true),
                 Some(false) => {}
                 None => selected = None,

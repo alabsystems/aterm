@@ -87,7 +87,8 @@ pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
 /// for. `Ok(None)`: nothing to claim, or no ledger to claim in (said, and the run goes on).
 ///
 /// # Errors
-/// The need is more than the target's volume holds above its floor: the run can never fit there.
+/// The need is more than the target's volume holds above its floor: the run can never fit there;
+/// or an interrupt ended the wait.
 pub fn admit(
     ctx: &Ctx,
     mode: atpkg::admit_disk::Admit,
@@ -99,6 +100,9 @@ pub fn admit(
         Ok(held) => Ok(Some(held)),
         Err(atpkg::admit_disk::Error::Never(why)) => Err(format!(
             "{why}; it can never be admitted there. Fix: point CARGO_TARGET_DIR at a larger volume"
+        )),
+        Err(e @ atpkg::admit_disk::Error::Stopped { .. }) => Err(format!(
+            "the run's disk claim was {e}; no check started, so nothing was decided"
         )),
         Err(e) => {
             eprintln!("verify: the run's disk is not claimed ({e}); it runs without a claim");

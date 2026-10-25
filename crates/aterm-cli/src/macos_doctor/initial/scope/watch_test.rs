@@ -44,6 +44,19 @@ impl<'a> ProvisionalSetupWatchTest<'a> {
         }
     }
 
+    /// The plan in force and the plan a look that hears the ALab signal offers to widen it to,
+    /// saving nothing ([`provisional_setup_widened`]).
+    pub fn widened(&self) -> Result<Option<(Plan, Plan)>, String> {
+        widened_at(self.root, || true, || Ok(None))
+    }
+
+    /// A person's Cancel of the review that offered the widen, through the real writer
+    /// ([`decline_provisional_setup_widen`]).
+    pub fn decline(&self) -> Result<bool, String> {
+        let _lock = HeldLock::take(self.root)?;
+        decline_widen_at(self.root)
+    }
+
     pub fn widens_from(&self) -> Option<u64> {
         self.upgrade.widens_from()
     }

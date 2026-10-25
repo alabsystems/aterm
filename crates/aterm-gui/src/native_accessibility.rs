@@ -14,7 +14,7 @@ use aterm_a11y::model::{
 
 use crate::native_ui::{
     ActionId, CompiledUi, ControlState, LogicalRect, SemanticNode, SemanticRole, SemanticValue,
-    TextViewportSpec, UiContent, UiKey, text_viewport_geometry,
+    TextViewportSpec, UiContent, UiKey,
 };
 use crate::tab_model::ViewId;
 
@@ -586,7 +586,7 @@ fn materialize_visible_text(
     id_for: &mut impl FnMut(&UiKey) -> NodeId,
     by_id: &mut FxHashMap<NodeId, UiKey>,
 ) -> Result<VisibleTextMaterialization, AccessibilityProjectionError> {
-    let geometry = text_viewport_geometry(rect);
+    let geometry = spec.geometry(rect);
     let mut pending = Vec::new();
     let mut lines = Vec::new();
     let mut selected_start = None::<u64>;
@@ -2237,6 +2237,7 @@ mod tests {
                     dirty: false,
                     saving: false,
                     focused: false,
+                    focus_visible: false,
                     action: None,
                 }),
             )]),
@@ -2259,7 +2260,7 @@ mod tests {
         assert_eq!(target.lines.len(), 1);
         let line = &target.lines[0];
         let cell_w =
-            crate::native_ui::text_viewport_geometry(LogicalRect::new(0.0, 0.0, 800.0, 600.0))
+            crate::native_ui::text_viewport_geometry(LogicalRect::new(0.0, 0.0, 800.0, 600.0), 1)
                 .cell_w;
         let expected_positions = [0.0, cell_w, 2.0 * cell_w, 4.0 * cell_w];
         let expected_widths = [cell_w, cell_w, 2.0 * cell_w, cell_w];
@@ -2431,6 +2432,7 @@ mod tests {
                     dirty: false,
                     saving: false,
                     focused: false,
+                    focus_visible: false,
                     action: None,
                 }),
             )]),

@@ -187,28 +187,33 @@ impl CursorGlow {
             let mut span: Option<(i32, i32)> = None;
             for (idx, pair) in row_pairs.iter().copied().enumerate() {
                 let col = ft.col0 + idx as i32;
-                let held = pair.is_some_and(|(ink, ground)| {
-                    if ink.is_some() {
-                        return true;
-                    }
-                    let g = ground & 0x00FF_FFFF;
-                    if g == page {
-                        return false;
-                    }
-                    match last_ground {
-                        Some((prev_g, prev_held)) if prev_g == g => prev_held,
-                        _ => {
-                            let h = !super::emit::reads_as_page(g, page);
-                            last_ground = Some((g, h));
-                            h
+                let held = match pair {
+                    Some((Some(_), _)) => true,
+                    Some((None, ground)) => {
+                        let g = ground & 0x00FF_FFFF;
+                        if g == page {
+                            false
+                        } else {
+                            match last_ground {
+                                Some((prev_g, prev_held)) if prev_g == g => prev_held,
+                                _ => {
+                                    let h = !super::emit::reads_as_page(g, page);
+                                    last_ground = Some((g, h));
+                                    h
+                                }
+                            }
                         }
                     }
-                });
+                    None => false,
+                };
                 match (held, run) {
                     (true, None) => run = Some(col),
                     (false, Some(c0)) => {
                         boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
-                        span = Some(span.map_or((c0, col), |(a, _)| (a, col)));
+                        span = Some(match span {
+                            Some((a, _)) => (a, col),
+                            None => (c0, col),
+                        });
                         run = None;
                     }
                     _ => {}
@@ -217,7 +222,10 @@ impl CursorGlow {
             if let Some(c0) = run {
                 let col = ft.col0 + row_pairs.len() as i32;
                 boxes.push((ox + c0 * cw, ox + col * cw, y0, y0 + ch));
-                span = Some(span.map_or((c0, col), |(a, _)| (a, col)));
+                span = Some(match span {
+                    Some((a, _)) => (a, col),
+                    None => (c0, col),
+                });
             }
             // For a dark train the span reaches a cell past the row's last
             // letter, where its caret stood when it was typed: a Return's

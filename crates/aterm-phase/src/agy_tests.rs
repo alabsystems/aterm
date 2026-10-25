@@ -2199,7 +2199,7 @@ fn the_launch_card_names_its_login() {
     );
     assert_ne!(launch_card_login(&idle), Some("Gemini 3.1 Pro (Low)"));
     assert_eq!(
-        launch_card_login(&screen(crate::gemini::fixtures::IDLE)),
+        launch_card_login(&screen(crate::muse::fixtures::IDLE)),
         None
     );
 }

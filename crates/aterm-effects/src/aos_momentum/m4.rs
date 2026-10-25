@@ -256,8 +256,12 @@ pub fn held_out_judged() -> u64 {
 }
 
 #[inline]
-fn wide(n: usize) -> u64 {
-    u64::try_from(n).unwrap_or(u64::MAX)
+const fn wide(n: usize) -> u64 {
+    if n > u64::MAX as usize {
+        u64::MAX
+    } else {
+        n as u64
+    }
 }
 
 /// Why a candidate is not admitted: the first step of the admission rule it failed.
@@ -493,15 +497,17 @@ impl Compared {
 
     /// `1 − ΣT_c / ΣT_B` in parts per million, truncated toward zero (0 when `ΣT_B` is 0).
     #[must_use]
-    pub fn gain_ppm(&self) -> i64 {
-        let (c, b) = (
-            i128::from(self.candidate.ticks),
-            i128::from(self.baseline.ticks),
-        );
+    pub const fn gain_ppm(&self) -> i64 {
+        let (c, b) = (self.candidate.ticks as i128, self.baseline.ticks as i128);
         if b == 0 {
             return 0;
         }
-        i64::try_from((b - c) * 1_000_000 / b).unwrap_or(i64::MIN)
+        let v = (b - c) * 1_000_000 / b;
+        if v < i64::MIN as i128 || v > i64::MAX as i128 {
+            i64::MIN
+        } else {
+            v as i64
+        }
     }
 }
 
@@ -518,14 +524,14 @@ impl Gain {
     /// The gain over the held-out split, in parts per million.
     #[inline]
     #[must_use]
-    pub fn ppm(&self) -> i64 {
+    pub const fn ppm(&self) -> i64 {
         self.held_out.gain_ppm()
     }
 
     /// The gain on `S0` alone, in parts per million.
     #[inline]
     #[must_use]
-    pub fn s0_ppm(&self) -> i64 {
+    pub const fn s0_ppm(&self) -> i64 {
         self.s0.gain_ppm()
     }
 }
@@ -543,36 +549,39 @@ pub(super) struct Sums {
 
 /// `rows`' sums against `policy`'s baseline.
 pub(super) fn sums(policy: &AcceptancePolicy, rows: &[Row]) -> Sums {
-    let sum = |split| {
-        rows.iter()
-            .filter(|r| r.split == split)
-            .fold(Totals::default(), |t, r| add(t, r.totals()))
-    };
-    let story = rows
-        .iter()
-        .find(|r| r.kind == ItemKind::M3Story)
-        .map(Row::totals)
-        .unwrap_or_default();
-    let pinned = policy
-        .items()
-        .iter()
-        .find(|p| p.kind() == ItemKind::M3Story)
-        .map(|p| {
+    let mut train_cand = Totals::default();
+    let mut held_out_cand = Totals::default();
+    let mut story = Totals::default();
+    let mut found_story = false;
+    for r in rows {
+        match r.split {
+            CorpusSplit::Train => train_cand = add(train_cand, r.totals()),
+            CorpusSplit::HeldOut => held_out_cand = add(held_out_cand, r.totals()),
+        }
+        if !found_story && r.kind == ItemKind::M3Story {
+            story = r.totals();
+            found_story = true;
+        }
+    }
+    let mut pinned = Totals::default();
+    for p in policy.items() {
+        if p.kind() == ItemKind::M3Story {
             let b = p.baseline();
-            Totals {
+            pinned = Totals {
                 ticks: b.ticks,
                 presented: b.presented,
                 wasted: b.wasted,
-            }
-        })
-        .unwrap_or_default();
+            };
+            break;
+        }
+    }
     Sums {
         train: Compared {
-            candidate: sum(CorpusSplit::Train),
+            candidate: train_cand,
             baseline: policy.totals(CorpusSplit::Train),
         },
         held_out: Compared {
-            candidate: sum(CorpusSplit::HeldOut),
+            candidate: held_out_cand,
             baseline: policy.totals(CorpusSplit::HeldOut),
         },
         s0: Compared {
@@ -595,10 +604,18 @@ struct TrainAdmitted {
 
 impl TrainAdmitted {
     /// `plan` admitted with `rows`, its totals summed here.
-    fn of(plan: SchedulePlan, rows: Vec<(usize, Row)>) -> TrainAdmitted {
-        let totals = rows
-            .iter()
-            .fold(Totals::default(), |t, (_, r)| add(t, r.totals()));
+    const fn of(plan: SchedulePlan, rows: Vec<(usize, Row)>) -> TrainAdmitted {
+        let mut totals = Totals {
+            ticks: 0,
+            presented: 0,
+            wasted: 0,
+        };
+        let slice = rows.as_slice();
+        let mut i = 0;
+        while i < slice.len() {
+            totals = add(totals, slice[i].1.totals());
+            i += 1;
+        }
         TrainAdmitted { plan, rows, totals }
     }
 }
@@ -656,7 +673,9 @@ pub struct Serial;
 
 impl Spread for Serial {
     fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
-        (0..n).for_each(job);
+        for i in 0..n {
+            job(i);
+        }
     }
 }
 
@@ -821,22 +840,25 @@ fn spread_map<I: Sync, T: Send + Sync>(
     items: &[I],
     f: &(dyn Fn(&I) -> T + Sync),
 ) -> Vec<T> {
-    let slots: Vec<OnceLock<T>> = items.iter().map(|_| OnceLock::new()).collect();
+    let mut slots = Vec::with_capacity(items.len());
+    for _ in 0..items.len() {
+        slots.push(OnceLock::new());
+    }
     spread.run(items.len(), &|i| {
         if let (Some(slot), Some(item)) = (slots.get(i), items.get(i)) {
             let _ = slot.get_or_init(|| f(item));
         }
     });
-    slots
-        .into_iter()
-        .zip(items)
-        .map(|(slot, item)| slot.into_inner().unwrap_or_else(|| f(item)))
-        .collect()
+    let mut out = Vec::with_capacity(items.len());
+    for (slot, item) in slots.into_iter().zip(items) {
+        out.push(slot.into_inner().unwrap_or_else(|| f(item)));
+    }
+    out
 }
 
 #[inline]
-fn index(slot: u32) -> usize {
-    usize::try_from(slot).unwrap_or(usize::MAX)
+const fn index(slot: u32) -> usize {
+    slot as usize
 }
 
 /// How far a distributed search judges the workers' claims again (design §11.3).
@@ -940,11 +962,12 @@ impl Contradiction {
 
 /// The item of training ordinal `t`, by id.
 fn claim_item(ev: &Evaluator, train: &[usize], t: usize) -> String {
-    train
-        .get(t)
-        .and_then(|&k| ev.corpus.items().get(k))
-        .map(|i| i.id().to_owned())
-        .unwrap_or_default()
+    if let Some(&k) = train.get(t)
+        && let Some(i) = ev.corpus.items().get(k)
+    {
+        return i.id().to_owned();
+    }
+    String::new()
 }
 
 /// One task of step 5.
@@ -980,10 +1003,15 @@ struct TaskOut {
 
 /// The contradiction of the lowest slot, then ordinal.
 fn first_contradiction(done: &[(Task, Result<Done, Contradiction>)]) -> Option<Contradiction> {
-    done.iter()
-        .filter_map(|(_, d)| d.as_ref().err())
-        .min_by_key(|c| (c.slot, c.ordinal))
-        .cloned()
+    let mut best: Option<&Contradiction> = None;
+    for (_, d) in done {
+        if let Err(c) = d
+            && best.is_none_or(|b| (c.slot, c.ordinal) < (b.slot, b.ordinal))
+        {
+            best = Some(c);
+        }
+    }
+    best.cloned()
 }
 
 /// A distributed search: its round-0 jobs and the claims workers returned for them.
@@ -1002,13 +1030,16 @@ pub struct Distributed<'a> {
 
 impl fmt::Debug for Distributed<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut claimed = 0usize;
+        for c in &self.claims {
+            if c.is_some() {
+                claimed += 1;
+            }
+        }
         f.debug_struct("Distributed")
             .field("check", &self.check)
             .field("jobs", &self.jobs.len())
-            .field(
-                "claimed",
-                &self.claims.iter().filter(|c| c.is_some()).count(),
-            )
+            .field("claimed", &claimed)
             .finish_non_exhaustive()
     }
 }
@@ -1081,7 +1112,13 @@ impl Distributed<'_> {
         }
         let (verdicts, judged) = ev.check_claims(&jobs, &taken, check, spread);
         let mut verdicts: Vec<Option<Judged>> = match verdicts {
-            Ok(v) => v.into_iter().map(Some).collect(),
+            Ok(v) => {
+                let mut opts = Vec::with_capacity(v.len());
+                for item in v {
+                    opts.push(Some(item));
+                }
+                opts
+            }
             Err(c) => {
                 let no = DistNoOutcome::Contradicted {
                     slot: c.slot,
@@ -1346,7 +1383,10 @@ impl Evaluator {
         let corpus = Corpus::generate().map_err(|_| PolicyRefusal::CorpusDrift {
             item: CORPUS_FOLD.to_owned(),
         })?;
-        let facts: Vec<ItemFacts<'_>> = corpus.items().iter().map(ItemFacts::of).collect();
+        let mut facts = Vec::with_capacity(corpus.items().len());
+        for item in corpus.items() {
+            facts.push(ItemFacts::of(item));
+        }
         policy.check_corpus(&facts)?;
         Ok(Evaluator {
             policy,
@@ -1496,13 +1536,13 @@ impl Evaluator {
     }
 
     fn indices(&self, split: CorpusSplit) -> Vec<usize> {
-        self.corpus
-            .items()
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.split() == split)
-            .map(|(k, _)| k)
-            .collect()
+        let mut out = Vec::with_capacity(self.corpus.items().len());
+        for (k, i) in self.corpus.items().iter().enumerate() {
+            if i.split() == split {
+                out.push(k);
+            }
+        }
+        out
     }
 
     /// Evaluate item `k`'s row under `sched` and return any refusal that stops a candidate there.
@@ -1765,7 +1805,7 @@ impl Evaluator {
         }
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<SchedulePlan, CandidateRefusal> {
+    const fn decode(&self, bytes: &[u8]) -> Result<SchedulePlan, CandidateRefusal> {
         let limit = self.policy.budgets().proposal_bytes;
         if bytes.len() > limit {
             return Err(CandidateRefusal::Budget {
@@ -1773,7 +1813,10 @@ impl Evaluator {
                 limit,
             });
         }
-        SchedulePlan::decode(bytes).map_err(CandidateRefusal::Decode)
+        match SchedulePlan::decode(bytes) {
+            Ok(p) => Ok(p),
+            Err(r) => Err(CandidateRefusal::Decode(r)),
+        }
     }
 
     /// Select the training winner among `proposer`'s proposals (lowest `ΣT`, `ΣZ`, then bytes).
@@ -1849,20 +1892,23 @@ impl Evaluator {
             Vec::new()
         };
         let mut jobs = Vec::new();
-        let distinct = fold
-            .distinct(&budgets, &proposed)
-            .into_iter()
-            .map(|d| {
-                let at = self.decode(d.bytes).map(|plan| {
+        let raw_distinct = fold.distinct(&budgets, &proposed);
+        let mut distinct = Vec::with_capacity(raw_distinct.len());
+        for d in raw_distinct {
+            let at = match self.decode(d.bytes) {
+                Ok(plan) => {
                     let slot = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
                     jobs.push(Job { slot, plan });
-                    slot
-                });
-                (d.index, d.cid, at)
-            })
-            .collect();
+                    Ok(slot)
+                }
+                Err(r) => Err(r),
+            };
+            distinct.push((d.index, d.cid, at));
+        }
+        let mut claims = Vec::with_capacity(jobs.len());
+        claims.resize_with(jobs.len(), || None);
         Distributed {
-            claims: jobs.iter().map(|_| None).collect(),
+            claims,
             ev: self,
             proposer,
             check,
@@ -1904,21 +1950,26 @@ impl Evaluator {
         spread: &dyn Spread,
     ) -> Checked {
         let train = self.indices(CorpusSplit::Train);
-        let best = jobs
-            .iter()
-            .zip(claims)
-            .filter(|(_, c)| c.kind() == ClaimKind::Admitted)
-            .min_by_key(|(j, c)| {
+        let mut best: Option<u32> = None;
+        let mut best_key: Option<(u64, u64, [u8; 12])> = None;
+        for (j, c) in jobs.iter().zip(claims) {
+            if c.kind() == ClaimKind::Admitted {
                 let t = c.totals();
-                (t.ticks, t.wasted, j.plan.encode())
-            })
-            .map(|(j, _)| j.slot);
+                let key = (t.ticks, t.wasted, j.plan.encode());
+                if best_key.is_none_or(|bk| key < bk) {
+                    best_key = Some(key);
+                    best = Some(j.slot);
+                }
+            }
+        }
         let mut tasks = Vec::new();
         for (j, c) in jobs.iter().zip(claims) {
             match c.kind() {
                 ClaimKind::Refused => tasks.push(Task::Prefix(j.slot)),
                 ClaimKind::Admitted if Some(j.slot) == best || check == CheckLevel::All => {
-                    tasks.extend((0..c.len()).map(|t| Task::Item(j.slot, t)));
+                    for t in 0..c.len() {
+                        tasks.push(Task::Item(j.slot, t));
+                    }
                 }
                 ClaimKind::Admitted => {}
             }
@@ -1926,16 +1977,19 @@ impl Evaluator {
         let first = spread_map(spread, &tasks, &|task| {
             self.run_task(*task, jobs, claims, &train, 0)
         });
-        let mut judged: Vec<(u32, usize)> = first.iter().flat_map(|o| o.judged.clone()).collect();
-        let mut done: Vec<(Task, Result<Done, Contradiction>)> = tasks
-            .into_iter()
-            .zip(first.into_iter().map(|o| o.done))
-            .collect();
+        let mut judged: Vec<(u32, usize)> = Vec::new();
+        let mut done: Vec<(Task, Result<Done, Contradiction>)> = Vec::with_capacity(tasks.len());
+        for (task, o) in tasks.into_iter().zip(first) {
+            judged.extend(o.judged);
+            done.push((task, o.done));
+        }
         if let Some(c) = first_contradiction(&done) {
             return (Err(c), judged);
         }
-        let mut rows: Vec<Vec<(usize, Row)>> = jobs.iter().map(|_| Vec::new()).collect();
-        let mut refused: Vec<Option<CandidateRefusal>> = jobs.iter().map(|_| None).collect();
+        let mut rows: Vec<Vec<(usize, Row)>> = Vec::with_capacity(jobs.len());
+        rows.resize_with(jobs.len(), Vec::new);
+        let mut refused: Vec<Option<CandidateRefusal>> = Vec::with_capacity(jobs.len());
+        refused.resize_with(jobs.len(), || None);
         for (task, out) in done.drain(..) {
             match (task, out) {
                 (Task::Prefix(slot), Ok(Done::Refused(r))) => {
@@ -1951,26 +2005,33 @@ impl Evaluator {
                 _ => {}
             }
         }
-        let winner_ticks = best.and_then(|slot| rows.get(index(slot))).map(|r| {
-            r.iter()
-                .fold(0u64, |t, (_, row)| t.saturating_add(row.ticks))
-        });
-        let mut dominated: Vec<bool> = jobs.iter().map(|_| false).collect();
+        let winner_ticks = if let Some(slot) = best
+            && let Some(r) = rows.get(index(slot))
+        {
+            let mut sum = 0u64;
+            for (_, row) in r {
+                sum = sum.saturating_add(row.ticks);
+            }
+            Some(sum)
+        } else {
+            None
+        };
+        let mut dominated: Vec<bool> = vec![false; jobs.len()];
         if let (CheckLevel::Dominance, Some(winner)) = (check, winner_ticks) {
-            let rest: Vec<Task> = jobs
-                .iter()
-                .zip(claims)
-                .filter(|(j, c)| c.kind() == ClaimKind::Admitted && Some(j.slot) != best)
-                .map(|(j, _)| Task::Dominate(j.slot))
-                .collect();
+            let mut rest = Vec::new();
+            for (j, c) in jobs.iter().zip(claims) {
+                if c.kind() == ClaimKind::Admitted && Some(j.slot) != best {
+                    rest.push(Task::Dominate(j.slot));
+                }
+            }
             let second = spread_map(spread, &rest, &|task| {
                 self.run_task(*task, jobs, claims, &train, winner)
             });
-            judged.extend(second.iter().flat_map(|o| o.judged.clone()));
-            let done: Vec<(Task, Result<Done, Contradiction>)> = rest
-                .into_iter()
-                .zip(second.into_iter().map(|o| o.done))
-                .collect();
+            let mut done: Vec<(Task, Result<Done, Contradiction>)> = Vec::with_capacity(rest.len());
+            for (task, o) in rest.into_iter().zip(second) {
+                judged.extend(o.judged);
+                done.push((task, o.done));
+            }
             if let Some(c) = first_contradiction(&done) {
                 return (Err(c), judged);
             }
@@ -1990,34 +2051,32 @@ impl Evaluator {
                 }
             }
         }
-        let verdicts = jobs
-            .iter()
-            .zip(claims)
-            .map(|(j, c)| {
-                let slot = index(j.slot);
-                match (c.kind(), refused.get_mut(slot).and_then(Option::take)) {
-                    (ClaimKind::Refused, Some(r)) => Ok(Judged::Refused(r)),
-                    (ClaimKind::Admitted, None) if dominated.get(slot) == Some(&true) => {
-                        Ok(Judged::Dominated {
-                            ticks: c.totals().ticks,
-                        })
-                    }
-                    (ClaimKind::Admitted, None) => {
-                        let mut r = rows.get_mut(slot).map(core::mem::take).unwrap_or_default();
-                        r.sort_by_key(|&(k, _)| k);
-                        if r.len() == c.len() {
-                            Ok(Judged::Admitted(TrainAdmitted::of(j.plan, r)))
-                        } else {
-                            Err(Contradiction::unjudged(j.slot))
-                        }
-                    }
-                    (ClaimKind::Refused, None) | (ClaimKind::Admitted, Some(_)) => {
-                        Err(Contradiction::unjudged(j.slot))
+        let mut verdicts = Vec::with_capacity(jobs.len());
+        for (j, c) in jobs.iter().zip(claims) {
+            let slot = index(j.slot);
+            let v = match (c.kind(), refused.get_mut(slot).and_then(Option::take)) {
+                (ClaimKind::Refused, Some(r)) => Judged::Refused(r),
+                (ClaimKind::Admitted, None) if dominated.get(slot) == Some(&true) => {
+                    Judged::Dominated {
+                        ticks: c.totals().ticks,
                     }
                 }
-            })
-            .collect::<Result<Vec<Judged>, Contradiction>>();
-        (verdicts, judged)
+                (ClaimKind::Admitted, None) => {
+                    let mut r = rows.get_mut(slot).map(core::mem::take).unwrap_or_default();
+                    r.sort_by_key(|&(k, _)| k);
+                    if r.len() == c.len() {
+                        Judged::Admitted(TrainAdmitted::of(j.plan, r))
+                    } else {
+                        return (Err(Contradiction::unjudged(j.slot)), judged);
+                    }
+                }
+                (ClaimKind::Refused, None) | (ClaimKind::Admitted, Some(_)) => {
+                    return (Err(Contradiction::unjudged(j.slot)), judged);
+                }
+            };
+            verdicts.push(v);
+        }
+        (Ok(verdicts), judged)
     }
 
     /// One task of step 5, `winner` being the winner's local `ΣT` for [`Task::Dominate`].
@@ -2168,13 +2227,25 @@ impl Evaluator {
             rows.push((k, row));
         }
         rows.sort_by_key(|&(k, _)| k);
-        let rows: Vec<Row> = rows.into_iter().map(|(_, r)| r).collect();
+        let mut sorted_rows = Vec::with_capacity(rows.len());
+        for (_, r) in rows {
+            sorted_rows.push(r);
+        }
+        let rows = sorted_rows;
         let s = sums(&self.policy, &rows);
         let useful = s.held_out.beats();
         let gain = Gain {
             held_out: s.held_out,
             s0: s.s0,
         };
+        let mut tested_assumptions = Vec::with_capacity(TESTED_ASSUMPTIONS.len());
+        for a in TESTED_ASSUMPTIONS {
+            tested_assumptions.push((*a).to_owned());
+        }
+        let mut plan_assumptions = Vec::with_capacity(PLAN_ASSUMPTIONS.len());
+        for a in PLAN_ASSUMPTIONS {
+            plan_assumptions.push((*a).to_owned());
+        }
         let parts = UncheckedBundle {
             policy: self.policy.id().clone(),
             base: MomentumCode::Shipped.artifact(&self.build),
@@ -2208,8 +2279,8 @@ impl Evaluator {
             publication: None,
             timings: Vec::new(),
             grade: BUNDLE_GRADE.to_owned(),
-            tested_assumptions: TESTED_ASSUMPTIONS.iter().map(|a| (*a).to_owned()).collect(),
-            plan_assumptions: PLAN_ASSUMPTIONS.iter().map(|a| (*a).to_owned()).collect(),
+            tested_assumptions,
+            plan_assumptions,
         };
         Ok(Admitted {
             policy: self.policy.id().clone(),
@@ -2341,7 +2412,10 @@ pub fn list_digest(list: &[[u8; PLAN_LEN]]) -> Digest {
     let mut list = list.to_vec();
     list.sort_unstable();
     list.dedup();
-    let parts: Vec<&[u8]> = list.iter().map(<[u8; PLAN_LEN]>::as_slice).collect();
+    let mut parts = Vec::with_capacity(list.len());
+    for item in &list {
+        parts.push(item.as_slice());
+    }
     Digest::of(LIST_DOMAIN, &parts)
 }
 
@@ -2423,10 +2497,12 @@ impl Bound {
                 cap,
             });
         }
-        if let Some(plan) = list.iter().find(|b| {
-            SchedulePlan::decode(b.as_slice()).map_or(true, |p| side(&p) != set.tag.side())
-        }) {
-            return Err(MintRefusal::Side { plan: *plan });
+        let want_side = set.tag.side();
+        for b in list {
+            match SchedulePlan::decode(b.as_slice()) {
+                Ok(p) if side(&p) == want_side => {}
+                _ => return Err(MintRefusal::Side { plan: *b }),
+            }
         }
         let mut list = list.to_vec();
         list.sort_unstable();
@@ -2452,25 +2528,35 @@ impl Bound {
     /// Whether `plans` is its list exactly (sorted and deduplicated, as the ledger line names
     /// it), each plan of its set's side and in one of its set's pools.
     fn admits(&self, plans: &[SchedulePlan]) -> Result<(), LabelRefusal> {
-        let given: Vec<[u8; PLAN_LEN]> = plans.iter().map(SchedulePlan::encode).collect();
+        let mut given = Vec::with_capacity(plans.len());
+        for p in plans {
+            given.push(p.encode());
+        }
         if given != self.list {
-            let stray = given.iter().find(|b| self.list.binary_search(b).is_err());
-            return Err(LabelRefusal::ScopeMismatch {
-                plan: stray.copied(),
-            });
+            let mut stray = None;
+            for b in &given {
+                if self.list.binary_search(b).is_err() {
+                    stray = Some(*b);
+                    break;
+                }
+            }
+            return Err(LabelRefusal::ScopeMismatch { plan: stray });
         }
         let pools = set_pools(self.set).map_err(LabelRefusal::Pool)?;
-        let drawn: BTreeSet<[u8; PLAN_LEN]> =
-            pools.iter().flatten().map(SchedulePlan::encode).collect();
-        match plans
-            .iter()
-            .find(|p| side(p) != self.set.tag.side() || !drawn.contains(&p.encode()))
-        {
-            Some(p) => Err(LabelRefusal::ScopeMismatch {
-                plan: Some(p.encode()),
-            }),
-            None => Ok(()),
+        let mut drawn = BTreeSet::new();
+        for pool in &pools {
+            for p in pool {
+                drawn.insert(p.encode());
+            }
         }
+        let want_side = self.set.tag.side();
+        for p in plans {
+            let enc = p.encode();
+            if side(p) != want_side || !drawn.contains(&enc) {
+                return Err(LabelRefusal::ScopeMismatch { plan: Some(enc) });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2786,26 +2872,34 @@ impl Evaluator {
         plans: &[[u8; PLAN_LEN]],
         spread: &dyn Spread,
     ) -> Result<Vec<TrainLabel>, LabelRefusal> {
-        let decoded = plans
-            .iter()
-            .map(|b| {
-                SchedulePlan::decode(b.as_slice())
-                    .map_err(|_| LabelRefusal::ScopeMismatch { plan: Some(*b) })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let only = |takes: &dyn Fn(&SchedulePlan) -> bool| match decoded.iter().find(|p| !takes(p))
-        {
-            Some(p) => Err(LabelRefusal::ScopeMismatch {
-                plan: Some(p.encode()),
-            }),
-            None => Ok(()),
+        let mut decoded = Vec::with_capacity(plans.len());
+        for b in plans {
+            let Ok(p) = SchedulePlan::decode(b.as_slice()) else {
+                return Err(LabelRefusal::ScopeMismatch { plan: Some(*b) });
+            };
+            decoded.push(p);
+        }
+        let only = |takes: &dyn Fn(&SchedulePlan) -> bool| {
+            for p in &decoded {
+                if !takes(p) {
+                    return Err(LabelRefusal::ScopeMismatch {
+                        plan: Some(p.encode()),
+                    });
+                }
+            }
+            Ok(())
         };
         match &scope {
             LabelScope::Train => only(&|p| {
-                side(p) == Side::Train
-                    || GRID_V1
-                        .iter()
-                        .any(|&(split, wake)| p.split() == split && p.wake() == wake)
+                if side(p) == Side::Train {
+                    return true;
+                }
+                for &(split, wake) in &GRID_V1 {
+                    if p.split() == split && p.wake() == wake {
+                        return true;
+                    }
+                }
+                false
             }),
             LabelScope::Practice(_) => only(&|p| side(p) == Side::Practice),
             LabelScope::HeldOut(t) => t.bound.admits(&decoded),
@@ -2816,11 +2910,13 @@ impl Evaluator {
         let new: Vec<SchedulePlan> = {
             let cached = cache();
             let mut seen = BTreeSet::new();
-            decoded
-                .iter()
-                .filter(|p| !cached.contains_key(&p.digest()) && seen.insert(p.encode()))
-                .copied()
-                .collect()
+            let mut new_plans = Vec::with_capacity(decoded.len());
+            for p in &decoded {
+                if !cached.contains_key(&p.digest()) && seen.insert(p.encode()) {
+                    new_plans.push(*p);
+                }
+            }
+            new_plans
         };
         let labelled = cache().len();
         if labelled.saturating_add(new.len()) > self.label_cap {
@@ -2837,10 +2933,13 @@ impl Evaluator {
         for label in judged {
             cached.entry(label.id).or_insert(label);
         }
-        Ok(decoded
-            .iter()
-            .filter_map(|p| cached.get(&p.digest()).cloned())
-            .collect())
+        let mut out = Vec::with_capacity(decoded.len());
+        for p in &decoded {
+            if let Some(lbl) = cached.get(&p.digest()) {
+                out.push(lbl.clone());
+            }
+        }
+        Ok(out)
     }
 
     /// The outcome of one pool's `K` ranked plans, folded by the selection rule.

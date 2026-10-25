@@ -1861,6 +1861,60 @@ mod tests {
         );
     }
 
+    /// THE AUTOMATIC FONT SIZE IS THE FONT SIZE'S DEFAULT: an explicit
+    /// `font_px` equal to the platform's size (12 px on macOS) resolves,
+    /// scales with each window and draws exactly as no `font_px` does, so a
+    /// write of it — `aterm ctl settings set font_px 12`, or a slider step
+    /// onto 12 — removes the key, and neither Modified nor the row's Changed
+    /// mark counts it. Before, the row's "12 (automatic)" placeholder was not
+    /// read as its unset value, so the set answered "saved: font_px = 12"
+    /// and left a Changed row whose Reset changed nothing. Negative control:
+    /// any other size stays written.
+    #[test]
+    fn the_automatic_font_size_is_written_as_a_removal() {
+        let automatic = crate::FONT_PX.to_string();
+        let mut service = VersionedConfigService::new(String::new()).unwrap();
+        let base = service.snapshot().revision;
+        let result = service.patch(edit(
+            base,
+            crate::prefs::EDIT_FONT_PX,
+            ExpectedValue::Any,
+            Some(&automatic),
+        ));
+        assert!(
+            matches!(result, ConfigPatchResult::Unchanged { .. }),
+            "font_px = {automatic} on an empty file: {result:?}"
+        );
+        assert_eq!(&*service.snapshot().text, "");
+
+        let mut service = VersionedConfigService::new("font_px = 14\n".into()).unwrap();
+        let base = service.snapshot().revision;
+        service.patch(edit(
+            base,
+            crate::prefs::EDIT_FONT_PX,
+            ExpectedValue::Any,
+            Some(&automatic),
+        ));
+        assert_eq!(service.value(crate::prefs::EDIT_FONT_PX).unwrap(), None);
+        assert_eq!(&*service.snapshot().text, "");
+
+        let other = (crate::FONT_PX + 1.0).to_string();
+        let base = service.snapshot().revision;
+        service.patch(edit(
+            base,
+            crate::prefs::EDIT_FONT_PX,
+            ExpectedValue::Any,
+            Some(&other),
+        ));
+        assert_eq!(
+            service
+                .value(crate::prefs::EDIT_FONT_PX)
+                .unwrap()
+                .as_deref(),
+            Some(other.as_str())
+        );
+    }
+
     #[test]
     fn an_alias_of_the_default_style_is_written_as_a_removal() {
         let default = crate::app_config::default_cursor_trail_style();

@@ -325,6 +325,9 @@ impl Listener {
             port,
             version: "0.95.0".to_owned(),
         });
+        // A fixed-key listener represents the key at construction, even when its
+        // worker starts after the caller rotates the key. Later rounds may reread it.
+        let mut first_secret = Some(read_key_file(state).expect("init wrote the key"));
         let state = state.to_path_buf();
         let serving = std::thread::spawn({
             let (running, round) = (Arc::clone(&running), Arc::clone(&round));
@@ -334,7 +337,9 @@ impl Listener {
                     break listener;
                 }
                 let listening = Listening {
-                    secret: read_key_file(&state).expect("init wrote the key"),
+                    secret: first_secret
+                        .take()
+                        .unwrap_or_else(|| read_key_file(&state).expect("init wrote the key")),
                     scope: FleetScope::Facts,
                     node: node.clone(),
                     serves,
@@ -718,7 +723,10 @@ fn a_machine_that_takes_a_members_node_id_is_refused() {
 
     let removed = ok(peers(&issuer.places, &args(&["rm", short(&node)])));
     assert!(
-        removed.contains("it still reads this fleet's surveys: only `aterm fleet init --rotate`"),
+        removed.contains(
+            "it may keep the fleet's secret (it does unless it left), and while it does it reads \
+             this fleet's surveys: only `aterm fleet init --rotate`"
+        ),
         "{removed}"
     );
     ok(join(&taker.places, &opts, &code));
@@ -2123,6 +2131,40 @@ fn a_configured_peer_stands_for_a_copy_at_its_place() {
 }
 
 #[test]
+fn an_issuer_whose_book_lists_no_peer_says_so_and_not_that_none_joined() {
+    let (issuer, code, _serving) = issuing("alone-issuer");
+    let fleet = aterm_ctl::FleetAsk {
+        host: None,
+        within: HANG,
+    };
+    let book = "this machine's book lists no peer: a member is recorded when it runs `aterm fleet \
+                join`, and `aterm fleet peers add <host>` names one by hand";
+    let alone = || {
+        let read = survey_fleet_in(&issuer.places, &fleet).unwrap();
+        assert!(read.peers.is_empty(), "{:?}", read.peers);
+        let (why, listed) = (
+            read.alone.unwrap_or_default(),
+            ok(list_peers(&issuer.places, HANG)),
+        );
+        assert!(
+            why == format!("survey --fleet read no other machine: {book}")
+                && listed.ends_with(&format!("  none: {book}\n")),
+            "{why}\n{listed}"
+        );
+    };
+    alone();
+    let member = World::new("alone-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let node = member::node_id(&member.places.state).unwrap();
+    ok(peers(&issuer.places, &args(&["rm", short(&node)])));
+    alone();
+}
+
+#[test]
 fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
     let (issuer, code, _serving) = issuing("rm-issuer-issuer");
     let member = World::new("rm-issuer-member");
@@ -2134,7 +2176,7 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
     let issuer_node = member::node_id(&issuer.places.state).unwrap();
     let removed = ok(peers(&member.places, &args(&["rm", short(&issuer_node)])));
     assert!(
-        !removed.contains("it keeps the fleet's secret")
+        !removed.contains("keep the fleet's secret")
             && removed.ends_with(
                 "  issuer     this machine names no issuer now, so it reads only the peers named \
                  here: `aterm fleet join` with the issuer's join code binds it again\n"
@@ -2147,8 +2189,29 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
             && !listed.contains("a member is recorded"),
         "{listed}"
     );
+    let fleet = aterm_ctl::FleetAsk {
+        host: None,
+        within: HANG,
+    };
+    let alone = survey_fleet_in(&member.places, &fleet).unwrap();
+    assert!(
+        alone.peers.is_empty()
+            && alone.alone.as_deref().is_some_and(|why| why.starts_with(
+                "survey --fleet read no other machine: this machine holds the fleet's key and \
+                 names no issuer, so it reads no member: `aterm fleet join` with the issuer's \
+                 join code binds it again"
+            )),
+        "{:?}",
+        alone.alone
+    );
     let named = format!("127.0.0.1:{}", closed_port());
     ok(peers(&member.places, &args(&["add", &named])));
+    let read = survey_fleet_in(&member.places, &fleet).unwrap();
+    assert_eq!(
+        (read.peers.len(), read.alone),
+        (1, None),
+        "a peer named by hand is read"
+    );
     let listed = ok(list_peers(&member.places, HANG));
     assert!(
         listed.ends_with(
@@ -2365,6 +2428,24 @@ fn peers_add_rm_and_leave() {
         peers(&world.places, &args(&["add", "lab mini"])),
         Err(Failure::Usage(_))
     ));
+    for (unheard, said) in [
+        ("[2001:4860::8888]:7100", "is no LAN address"),
+        ("[fd00::9]:7100", "is an IPv6 address"),
+        ("[fe80::1]:7100", "is an IPv6 address"),
+        ("[::ffff:10.0.0.8]:7100", "is an IPv6 address"),
+    ] {
+        let refused = match peers(&world.places, &args(&["add", unheard])) {
+            Err(Failure::Usage(why)) => why,
+            other => panic!("{unheard}: {other:?}"),
+        };
+        assert!(
+            refused.contains(said) && refused.ends_with("nothing was written"),
+            "{unheard}: {refused}"
+        );
+    }
+    assert_eq!(hosts(), ["lab-mini:7101"], "a refusal writes nothing");
+    ok(peers(&world.places, &args(&["add", "[::1]:7101"])));
+    ok(peers(&world.places, &args(&["rm", "[::1]:7101"])));
     let removed = ok(peers(&world.places, &args(&["rm", "lab-mini"])));
     assert!(!removed.contains("init --rotate"), "{removed}");
     assert_eq!(hosts(), Vec::<String>::new());
@@ -2864,14 +2945,15 @@ fn only_one_machines_two_listeners_at_a_place_are_told_the_port() {
     ] {
         let listed = [at(&gone, gone_host), at(&came, came_host)];
         assert_eq!(
-            unreached_words(&listed[0], &why, &listed, None),
+            unreached_words(&listed[0], &why, &listed, (None, None)),
             rejoin,
             "a readdressed member: {gone_host}"
         );
     }
     let listed = [at(&gone, "lab-mini.local"), at(&came, "LAB-MINI.local")];
     assert!(
-        unreached_words(&listed[0], &why, &listed, None).contains("`join --port <n>` on aaaaaaaa"),
+        unreached_words(&listed[0], &why, &listed, (None, None))
+            .contains("`join --port <n>` on aaaaaaaa"),
         "one name's two listeners"
     );
 }
@@ -2890,7 +2972,7 @@ fn a_place_this_machines_own_node_answers_at_is_named_as_this_machine() {
         said: own.clone(),
         want: gone.clone(),
     };
-    let named = |host: &str, ip, own| unreached_words(&copy(host), &at(ip), &[], own);
+    let named = |host: &str, ip, own| unreached_words(&copy(host), &at(ip), &[], (own, None));
     assert_eq!(
         named("127.0.0.1", [127, 0, 0, 1], Some(own.as_str())),
         "this machine holds this place: `join --port <n>` on aaaaaaaa, or the issuer's `peers rm \
@@ -2914,6 +2996,44 @@ fn a_place_this_machines_own_node_answers_at_is_named_as_this_machine() {
             "{ip:?}: no proof here of this machine"
         );
     }
+}
+
+#[test]
+fn another_secret_on_the_issuer_is_told_by_when_its_node_was_seen() {
+    let at = SocketAddr::from(([192, 168, 100, 200], 7100));
+    let why = Unreached::Handshake(at, FleetError::ListenerWrongSecret);
+    let seen = |seen_ms| Peer {
+        node: Some("aa".repeat(16)),
+        seen_ms,
+        via: Via::Joined,
+        ..manual_peer("192.168.100.200".to_owned(), 7100)
+    };
+    for (seen_ms, says) in [
+        (
+            Some(1_000),
+            "it joined before a rotate: it joins again with the new code",
+        ),
+        (
+            Some(3_000),
+            "it left or joined another fleet: it joins again with this code",
+        ),
+        (
+            None,
+            "it holds another fleet's: it joins this fleet with this code",
+        ),
+    ] {
+        let text = unreached_words(&seen(seen_ms), &why, &[], (None, Some(2_000)));
+        assert_eq!(text, format!("another secret at {at}: {says}"));
+        assert!(
+            text.chars().count() <= aterm_ctl::UNANSWERED_REASON_CHARS,
+            "{text}"
+        );
+    }
+    assert_eq!(
+        unreached_words(&seen(Some(3_000)), &why, &[], (None, None)),
+        why.to_string(),
+        "a member's"
+    );
 }
 
 #[test]
@@ -2953,7 +3073,7 @@ fn displaced_within_a_reason(
                 ..manual_peer(host.to_owned(), at.port())
             };
             let listed = [peer(gone, gone_host), peer(came, came_host)];
-            let text = unreached_words(&listed[0], &why(), &listed, None);
+            let text = unreached_words(&listed[0], &why(), &listed, (None, None));
             let label = shown_name(&listed[0]);
             // An address label stays whole, and the reason has the rest of the line.
             let room = if label.parse::<IpAddr>().is_ok() || label.parse::<SocketAddr>().is_ok() {
@@ -2970,7 +3090,7 @@ fn displaced_within_a_reason(
                 "{} > {room} beside {label}, or a part missing: {text}",
                 text.chars().count(),
             );
-            let row = peer_survey(&listed[0], Err(why()), (&listed, None));
+            let row = peer_survey(&listed[0], Err(why()), (&listed, None, None));
             assert_eq!(row.node.as_deref(), Some(gone));
         }
     }
@@ -3114,6 +3234,157 @@ fn a_survey_reads_its_issuers_book_again_within_its_own_deadline() {
 }
 
 #[test]
+fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not_answer() {
+    let (_issuer, code, serving) = issuing("silent-issuer");
+    let member = World::new("silent-issuer-member");
+    let opts = || Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts(), &code));
+    let own = member::node_id(&member.places.state).unwrap();
+    match allow(&member.places, &args(&["drive", "--from", &own[..8]])) {
+        Err(Failure::Failed(why)) => assert!(why.contains("is this machine itself"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let late = World::new("silent-issuer-late");
+    ok(join(&late.places, &opts(), &code));
+    let _silent = serving.take();
+    let within = Duration::from_millis(500);
+    let refused = drive_fleet_in(&member.places, "zz-unbooked", within)
+        .err()
+        .expect("no book names it");
+    assert!(
+        refused.again
+            && refused.why.starts_with(
+                "its issuer did not answer within 0.5s, so no book here says which Mac \
+                 `zz-unbooked` is"
+            ),
+        "{refused:?}"
+    );
+    match allow(&member.places, &args(&["drive", "--from", "zz-unbooked"])) {
+        Err(Failure::Failed(why)) => assert!(
+            why.starts_with(
+                "`zz-unbooked` names no peer this machine knows, and its issuer did not answer \
+                 within"
+            ) && why.contains("try again once it answers"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let survey = |word: &str, within| {
+        survey_fleet_in(
+            &member.places,
+            &aterm_ctl::FleetAsk {
+                host: Some(word),
+                within,
+            },
+        )
+        .unwrap_or_else(|why| panic!("{why}"))
+    };
+    let host = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let word = host.local_addr().unwrap().to_string();
+    let read = survey(&word, Duration::from_secs(1));
+    let said = read.peers[0]
+        .answer
+        .as_ref()
+        .expect_err("its issuer did not answer");
+    assert_eq!(
+        said,
+        "connected, but no fleet handshake within 1.0s: an aterm stopped or overloaded, or no aterm there",
+        "the host dial's whole reason, which leaves no room for a lead"
+    );
+    let note = read.note.as_deref().unwrap_or_default();
+    assert!(
+        note.starts_with(&format!(
+            "its issuer did not answer within 0.5s, so no book here names `{word}`, and it was \
+             read as a host: try again once the issuer answers"
+        )),
+        "{note}"
+    );
+    let closed = format!("127.0.0.1:{}", closed_port());
+    let read = survey(&closed, Duration::from_secs(1));
+    let said = read.peers[0].answer.as_ref().expect_err("nothing listens");
+    assert_eq!(
+        said,
+        &format!(
+            "issuer silent, as a host: nothing listens on {closed}: no aterm running there, \
+             or no [fleet] listen"
+        ),
+        "the issuer's silence first, then the dial's whole reason"
+    );
+    assert!(
+        said.chars().count() + read.peers[0].label.chars().count() <= aterm_ctl::UNANSWERED_ROOM,
+        "the row prints it uncut: {said}"
+    );
+    let answers = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let word = answers.local_addr().unwrap().to_string();
+    let _answers = Listener::serve(answers, &late.places.state);
+    let read = survey(&word, HANG);
+    assert!(
+        read.peers[0].answer.is_ok(),
+        "a host no book names is read in the rest of the deadline: {:?}",
+        read.peers
+    );
+}
+
+#[test]
+fn an_issuer_that_answers_with_no_book_is_told_once() {
+    let (issuer, code, serving) = issuing("bookless-issuer");
+    let member = World::new("bookless-issuer-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let _older = Listener::serving(
+        serving.take(),
+        &issuer.places.state,
+        &[FleetOp::Survey, FleetOp::Join],
+    );
+    let refused = drive_fleet_in(&member.places, "zz-unbooked", HANG)
+        .err()
+        .expect("no book names it");
+    assert!(
+        !refused.again
+            && refused
+                .why
+                .contains("runs an older aterm, which shares no book")
+            && !refused.why.contains("try again"),
+        "{refused:?}"
+    );
+    let elsewhere = format!("127.0.0.1:{}", closed_port());
+    let read = survey_fleet_in(
+        &member.places,
+        &aterm_ctl::FleetAsk {
+            host: Some(&elsewhere),
+            within: HANG,
+        },
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    let said = read.peers[0].answer.as_ref().expect_err("nothing listens");
+    assert!(
+        said.starts_with("no issuer's book, as a host: nothing listens on ")
+            && !said.contains("try again"),
+        "{said}"
+    );
+    let note = read.note.as_deref().unwrap_or_default();
+    assert!(
+        note.contains("runs an older aterm")
+            && note.contains("it was read as a host")
+            && !note.contains("try again"),
+        "{note}"
+    );
+    match allow(&member.places, &args(&["drive", "--from", "zz-unbooked"])) {
+        Err(Failure::Failed(why)) => assert!(
+            why.contains("runs an older aterm") && !why.contains("try again"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_join_that_would_take_the_issuers_own_address_writes_nothing() {
     let (_issuer, code, _serving) = issuing("same-place-issuer");
     let member = World::new("same-place-member");
@@ -3126,11 +3397,31 @@ fn a_join_that_would_take_the_issuers_own_address_writes_nothing() {
     ] {
         match join(&member.places, &opts, &code) {
             Err(Failure::Usage(why)) => assert!(
-                why.contains("the issuer's own address") && why.contains("`--port <n>`"),
+                why.contains("the issuer's own address")
+                    && why.contains("so name one with `--port <n>`")
+                    && !why.contains("own port"),
                 "{opts:?}: {why}"
             ),
             other => panic!("{opts:?}: {other:?}"),
         }
+    }
+    let issuers = JoinCode::parse(code.trim()).unwrap().port;
+    match join(
+        &member.places,
+        &Opts {
+            port: Some(issuers),
+            ..Opts::default()
+        },
+        &code,
+    ) {
+        Err(Failure::Usage(why)) => assert!(
+            why.contains(&format!(
+                "`--port {issuers}` is the issuer's own port there, so name another with \
+                 `--port <n>`"
+            )),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
     }
     assert!(
         !member.places.state.exists(),
@@ -3210,6 +3501,13 @@ fn a_place_no_read_takes_as_a_peer_is_refused_at_its_add_and_skipped_when_booked
         !ok(list_peers(&issuer.places, HANG)).contains("this machine itself"),
         "the edit it names takes it out"
     );
+    match peers(&issuer.places, &args(&["rm", &place])) {
+        Err(Failure::Failed(why)) => assert!(
+            why.starts_with(&format!("`{place}` is this machine itself (node ")),
+            "nothing listed there: {why}"
+        ),
+        other => panic!("{other:?}"),
+    }
     let whole = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
@@ -3635,10 +3933,10 @@ fn a_survey_answer_is_unproven_unless_its_node_key_is_bound() {
             lines: Vec::new(),
         })
     };
-    assert!(peer_survey(&peer, answered(false), (&[], None)).unproven);
-    assert!(!peer_survey(&peer, answered(true), (&[], None)).unproven);
+    assert!(peer_survey(&peer, answered(false), (&[], None, None)).unproven);
+    assert!(!peer_survey(&peer, answered(true), (&[], None, None)).unproven);
     let unreached = Unreached::Local("no".to_owned());
-    assert!(!peer_survey(&peer, Err(unreached), (&[], None)).unproven);
+    assert!(!peer_survey(&peer, Err(unreached), (&[], None, None)).unproven);
 }
 
 #[test]
@@ -3711,7 +4009,37 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         &world.places,
         &args(&["drive", "--from", "d2d2d2d2"]),
     ));
-    assert!(said.contains("names no peer"), "{said}");
+    assert!(
+        said.contains("names no peer this machine's book records") && !said.contains("issuer's"),
+        "{said}"
+    );
+    let own = member::node_id(&world.places.state).unwrap();
+    let listens = fleet_table(&world.config()).unwrap().listen.unwrap();
+    for word in [own.as_str(), &own[..8], listens.as_str(), "localhost:7100"] {
+        let said = refused(allow(&world.places, &args(&["drive", "--from", word])));
+        assert!(said.contains("is this machine itself"), "{word}: {said}");
+        let said = refused(peers(&world.places, &args(&["rm", word])));
+        assert!(
+            said.contains("is this machine itself") && said.contains("`aterm fleet leave`"),
+            "{word}: {said}"
+        );
+        let drives = drive_fleet_in(&world.places, word, HANG)
+            .err()
+            .expect("its own node");
+        assert!(
+            drives.why.contains("is this machine itself") && !drives.again,
+            "{drives:?}"
+        );
+        let read = survey_fleet_in(
+            &world.places,
+            &aterm_ctl::FleetAsk {
+                host: Some(word),
+                within: HANG,
+            },
+        )
+        .expect_err("its own node");
+        assert!(read.contains("is this machine itself"), "{read}");
+    }
     ok(peers(
         &world.places,
         &args(&["add", "lab-mini.invalid:7101"]),
@@ -3744,14 +4072,23 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         "the peer named once: {unanswered:?}"
     );
 
-    ok(allow(&world.places, &args(&["drive", "--from=b0b0b0b0"])));
+    let granted = ok(allow(&world.places, &args(&["drive", "--from=b0b0b0b0"])));
+    assert!(
+        granted.contains("every member of the fleet now reads this Mac at content, not facts")
+            && granted.contains("`aterm fleet allow facts` takes it back, ending every grant")
+            && !granted.contains("allow content"),
+        "{granted}"
+    );
     let table = fleet_table(&world.config()).unwrap();
     assert_eq!(table.level(), Some(aterm_net::fleet::DRIVE_LEVEL));
     let granted = format!("{bound}:{}", key.hex());
     assert_eq!(table.drive_from, vec![granted.clone()]);
     assert!(world.config().contains("theme = \"Nord\""));
     let again = ok(allow(&world.places, &args(&["DRIVE", "--from", &bound])));
-    assert!(again.contains("already"), "{again}");
+    assert!(
+        again.contains("already") && again.contains("`aterm fleet allow content` ends every grant"),
+        "{again}"
+    );
     let rekey = NodeIdentity::from_seed(&bound, &[4; 32]).unwrap().key();
     member::update_peers(&world.places.state, |book| {
         for entry in book.iter_mut() {
@@ -3773,7 +4110,13 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
     ));
     assert_eq!(fleet_table(&world.config()).unwrap().drive_from.len(), 1);
     let removed = ok(peers(&world.places, &args(&["rm", &bound])));
-    assert!(removed.contains("its grant"), "{removed}");
+    assert!(
+        removed.contains("its grant")
+            && removed.contains("allow is content")
+            && removed
+                .contains("still reads it at content, which `aterm fleet allow facts` lowers"),
+        "{removed}"
+    );
     let table = fleet_table(&world.config()).unwrap();
     assert_eq!(
         (table.level(), table.drive_from),
@@ -3792,6 +4135,28 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         (Some("content"), Vec::new())
     );
 
+    let from_content = ok(allow(&world.places, &args(&["drive", "--from", &bound])));
+    assert!(
+        from_content.contains("reads this Mac at content still")
+            && from_content.contains("`aterm fleet allow content` takes it back"),
+        "{from_content}"
+    );
+    ok(allow(&world.places, &args(&["facts"])));
+    let from_facts = ok(allow(&world.places, &args(&["drive", "--from", &bound])));
+    assert!(
+        from_facts.contains("`aterm fleet allow facts` takes it back"),
+        "{from_facts}"
+    );
+    let lowered = ok(allow(&world.places, &args(&["facts"])));
+    assert!(
+        lowered.contains("its grant of [fleet] drive_from removed"),
+        "{lowered}"
+    );
+    let table = fleet_table(&world.config()).unwrap();
+    assert_eq!(
+        (table.level(), table.drive_from),
+        (Some("facts"), Vec::new())
+    );
     ok(allow(&world.places, &args(&["drive", "--from", &bound])));
     ok(leave(&world.places, &[]));
     let table = fleet_table(&world.config()).unwrap();
@@ -3799,6 +4164,53 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         (table.listen, table.allow, table.drive_from),
         (None, None, Vec::new())
     );
+}
+
+#[test]
+fn a_drive_into_a_place_that_never_handshakes_is_unserved_within_its_deadline() {
+    let world = World::new("unserved");
+    ok(init(&world.places, &args(&["--host", "127.0.0.1"])));
+    // Bound and never accepted: the kernel takes the connection, and no handshake comes.
+    let silent = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let node = "e4".repeat(16);
+    let key = NodeIdentity::from_seed(&node, &[5; 32]).unwrap().key();
+    member::update_peers(&world.places.state, |book| {
+        book.push(Peer {
+            node: Some(node.clone()),
+            key: Some(key),
+            key_from: None,
+            host: "127.0.0.1".to_owned(),
+            addr: Some(IpAddr::from(Ipv4Addr::LOCALHOST)),
+            port: silent.local_addr().unwrap().port(),
+            version: None,
+            seen_ms: None,
+            via: Via::Joined,
+            fleet: None,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let refused = drive_fleet_in(&world.places, &node, Duration::from_secs(2))
+        .err()
+        .expect("never served");
+    assert!(
+        refused.unserved
+            && !refused.again
+            && refused.why.contains("no fleet handshake within 2.0s"),
+        "{refused:?}"
+    );
+    let closed = closed_port();
+    member::update_peers(&world.places.state, |book| {
+        for peer in book.iter_mut() {
+            peer.port = closed;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let refused = drive_fleet_in(&world.places, &node, Duration::from_secs(2))
+        .err()
+        .expect("nothing listens");
+    assert!(!refused.unserved, "{refused:?}");
 }
 
 #[test]
@@ -3841,7 +4253,11 @@ fn a_join_of_another_fleet_keeps_no_drive_grant() {
     );
 
     let moved = ok(join(&member.places, &opts, &other_code));
-    assert!(moved.contains("no Mac drives this one"), "{moved}");
+    assert!(
+        moved.contains("no Mac drives this one")
+            && moved.contains("still reads it at content, which `aterm fleet allow facts` lowers"),
+        "{moved}"
+    );
     let table = fleet_table(&member.config()).unwrap();
     assert_eq!(
         (table.level(), table.drive_from),
@@ -3920,6 +4336,11 @@ fn every_write_below_drive_takes_the_grants_out_and_says_so() {
             "content"
         };
         below(&world, &report, level);
+        assert_eq!(
+            report.contains("which `aterm fleet allow facts` lowers"),
+            level == "content",
+            "{words:?}: {report}"
+        );
         if words[0] == "init" {
             assert!(
                 report.contains("as the fleet's secret is new"),
@@ -3941,6 +4362,19 @@ fn every_write_below_drive_takes_the_grants_out_and_says_so() {
     assert_eq!(fleet_table(&world.config()).unwrap().drive_from.len(), 1);
     ok(allow(&world.places, &args(&["drive", "--from", &other])));
     assert_eq!(fleet_table(&world.config()).unwrap().drive_from, only_other);
+    // A hand's list at facts left the members reading at facts, so content raises them.
+    for (was, still) in [("facts", false), ("content", true)] {
+        let world = World::new("below-by-hand-level");
+        granting_issuer(&world.places);
+        world.write_config(&world.config().replace("\"drive\"", &format!("\"{was}\"")));
+        let report = ok(allow(&world.places, &args(&["content"])));
+        below(&world, &report, "content");
+        assert_eq!(
+            report.contains("every member of the fleet still reads it at content"),
+            still,
+            "{was}: {report}"
+        );
+    }
 
     let (issuer, code, serving) = issuing("below-issuer-live");
     let member = World::new("below-member");
@@ -5269,7 +5703,9 @@ fn a_members_drive_grant_follows_its_issuers_book() {
              its grant of [fleet] drive_from was removed from "
         ) && note.ends_with(
             ", with the 1 more it listed, as allow is content, below drive: no Mac drives this \
-             one until `aterm fleet allow drive --from <host|node>` grants again."
+             one until `aterm fleet allow drive --from <host|node>` grants again, and every \
+             member of the fleet still reads it at content, which `aterm fleet allow facts` \
+             lowers."
         ) && !note.contains("drive      "),
         "{note}"
     );

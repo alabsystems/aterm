@@ -9,15 +9,19 @@
 //! ([`crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE`]) and, inside aterm, the window's disk
 //! watch asked for the room (`await sys free>=`). Then the run waits, saying once a minute what
 //! it needs, what is free and what holds the most, instead of failing at `ENOSPC` hours in.
+//! SIGINT, SIGTERM or SIGHUP ends the claim, its measuring and its relief within a second
+//! ([`aterm_toolchain::interrupt`]), with [`Error::Stopped`] and nothing left in the ledger.
 //! While it runs, its own measure of its writes is its claim's progress
 //! ([`aterm_capacity::Meter`]), and what it took is kept for the next run.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use aterm_capacity::{
     Footprints, Ledger, Live, Machine, Meter, Need, Pace, Relief, Short, Shortfall, admit_relieved,
-    allocated,
+    allocated_until,
 };
 
 /// What a caller passes and reads back, so verify, the trust lane and the lab claim through
@@ -67,7 +71,8 @@ impl Admitted {
 ///
 /// # Errors
 /// [`Error::Never`]: the need is more than the volume holds above its floor; [`Error::Ledger`]:
-/// no home, or the ledger could not be written (the caller runs without a claim, and says so).
+/// no home, or the ledger could not be written (the caller runs without a claim, and says so);
+/// [`Error::Stopped`]: an interrupt ended the wait (the caller ends as NOT RUN).
 pub fn admit(run: Run, mode: Admit, say: &mut dyn FnMut(&str)) -> Result<Admitted, Error> {
     let ledger = Ledger::user().ok_or_else(|| {
         Error::Ledger(std::io::Error::new(
@@ -79,7 +84,9 @@ pub fn admit(run: Run, mode: Admit, say: &mut dyn FnMut(&str)) -> Result<Admitte
     admit_on(run, &ledger, &Live, mode, Pace::default(), &mut relief, say)
 }
 
-/// [`admit`] in `ledger` on `machine`, relieved by `relief`.
+/// [`admit`] in `ledger` on `machine`, relieved by `relief`. Under `--admit wait` the measuring
+/// of the run's directories is part of the wait: an interrupt then ends it as one during the
+/// wait does, before its first look, whether or not the run would claim anything.
 ///
 /// # Errors
 /// As [`admit`].
@@ -92,7 +99,19 @@ pub fn admit_on(
     relief: &mut dyn Relief,
     say: &mut dyn FnMut(&str),
 ) -> Result<Admitted, Error> {
-    let holds = allocated(&run.dirs);
+    let watch = (mode == Admit::Wait).then(aterm_toolchain::interrupt::Watch::enter);
+    let holds = allocated_until(&run.dirs, &|| {
+        watch.as_ref().is_some_and(|w| w.caught().is_some())
+    });
+    if let Some(signal) = watch
+        .as_ref()
+        .and_then(aterm_toolchain::interrupt::Watch::take)
+    {
+        return Err(Error::Stopped {
+            signal: Some(signal),
+            short: None,
+        });
+    }
     let estimate = Footprints::load(&run.record).need(holds, run.cold);
     let claim = if estimate.bytes == 0 {
         None
@@ -117,18 +136,25 @@ pub fn admit_on(
 /// directories it removed.
 pub type Passed = (u64, Vec<PathBuf>);
 
+/// Whether an interrupt ended the wait a relief works for ([`Relief`]): each part gives up what
+/// is left of its work once it says so.
+pub type Stopped<'a> = &'a dyn Fn() -> bool;
+
+/// The build cache's pass under pressure, given the short volume's mount.
+pub type Pass = Box<dyn FnMut(&Path, Stopped<'_>) -> Passed>;
+
 /// The window's disk watch asked for a number of bytes free on the volume mounted at a path:
 /// its answer, or `None` outside aterm.
-pub type Ask = Box<dyn FnMut(u64, &Path) -> Option<String>>;
+pub type Ask = Box<dyn FnMut(u64, &Path, Stopped<'_>) -> Option<String>>;
 
 /// The largest holders of the volume mounted at a path, with their sizes, largest first.
-pub type Largest = Box<dyn FnMut(&Path) -> Vec<(PathBuf, u64)>>;
+pub type Largest = Box<dyn FnMut(&Path, Stopped<'_>) -> Vec<(PathBuf, u64)>>;
 
 /// WHAT A SHORT VOLUME IS RELIEVED BY before a run waits on it, and who a wait line names as
 /// holding the rest.
 pub struct Reclaim {
     /// The build cache's pass under pressure, given the short volume's mount.
-    pass: Box<dyn FnMut(&Path) -> Passed>,
+    pass: Pass,
     /// The window's disk watch asked for `bytes` free on the volume mounted at `mount`: its
     /// answer, or `None` outside aterm.
     ask: Ask,
@@ -141,7 +167,7 @@ pub struct Reclaim {
 impl Reclaim {
     /// The relief made of these parts.
     #[must_use]
-    pub fn of(pass: Box<dyn FnMut(&Path) -> Passed>, ask: Ask, largest: Largest) -> Reclaim {
+    pub fn of(pass: Pass, ask: Ask, largest: Largest) -> Reclaim {
         Reclaim {
             pass,
             ask,
@@ -154,39 +180,51 @@ impl Reclaim {
     /// [`crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE`] where the build cache is on the short
     /// volume ([`cache_on`]), then inside aterm `aterm ctl @self
     /// await sys free>=<bytes> vol=<mount>` for up to [`ASK_FOR`]; the largest holders are the
-    /// build cache's directories on the volume and `own` (the run's directories).
+    /// build cache's directories on the volume and `own` (the run's directories). Once an
+    /// interrupt came, the pass is left behind removing nothing more ([`on_thread`]), the ask
+    /// is ended and the sizing stops.
     #[must_use]
     pub fn live(own: &[PathBuf]) -> Reclaim {
         let own = own.to_vec();
         Reclaim::of(
-            Box::new(|mount| {
+            Box::new(|mount, stopped| {
                 if !cache_on(mount) {
                     return (0, Vec::new());
                 }
                 let before = free_on(mount);
-                let mut removed = Vec::new();
-                crate::build_cache::reclaim_home_watched(
-                    crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
-                    None,
-                    &mut |path, _why| {
-                        removed.push(path.to_path_buf());
-                        true
-                    },
-                );
+                let removed = on_thread(stopped, |halt| {
+                    let mut removed = Vec::new();
+                    crate::build_cache::reclaim_home_watched(
+                        crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
+                        None,
+                        &mut |path, _why| {
+                            if halt.load(Ordering::SeqCst) {
+                                return false;
+                            }
+                            removed.push(path.to_path_buf());
+                            true
+                        },
+                    );
+                    removed
+                })
+                .unwrap_or_default();
                 (free_on(mount).saturating_sub(before), removed)
             }),
             Box::new(ask_watch),
-            Box::new(move |mount| largest_on(mount, &own)),
+            Box::new(move |mount, stopped| largest_on(mount, &own, stopped)),
         )
     }
 }
 
 impl Relief for Reclaim {
-    fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str)) {
+    fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) {
         let Some((need, mount, floor, reserved)) = disk_short(short) else {
             return;
         };
-        let (freed, removed) = (self.pass)(&mount);
+        let (freed, removed) = (self.pass)(&mount, stopped);
+        if stopped() {
+            return;
+        }
         say(&if removed.is_empty() {
             format!(
                 "disk: {} is short; the build cache had nothing unused to reclaim on it",
@@ -207,7 +245,7 @@ impl Relief for Reclaim {
             )
         });
         let want = floor.saturating_add(reserved).saturating_add(need);
-        if let Some(answer) = (self.ask)(want, &mount) {
+        if let Some(answer) = (self.ask)(want, &mount, stopped) {
             say(&format!(
                 "disk: asked the window's disk watch for {} free on {}: {answer}",
                 gib(want),
@@ -216,10 +254,10 @@ impl Relief for Reclaim {
         }
     }
 
-    fn holders(&mut self, short: &Shortfall) -> Option<String> {
+    fn holders(&mut self, short: &Shortfall, stopped: Stopped<'_>) -> Option<String> {
         let (_, mount, _, _) = disk_short(short)?;
         let named = self.named.get_or_insert_with(|| {
-            let found = (self.largest)(&mount);
+            let found = (self.largest)(&mount, stopped);
             if found.is_empty() {
                 return String::new();
             }
@@ -256,6 +294,37 @@ fn free_on(mount: &Path) -> u64 {
     Live.read(Some(mount)).volume.map_or(0, |v| v.free)
 }
 
+/// `work` (the build cache's pass) on a thread of its own, waited for until `stopped` says an
+/// interrupt came: `work`'s `halt` then says `true`, so it removes nothing more, and it is left
+/// to end the step it is in while this returns `None` at once. That step can be a whole build
+/// directory's removal; one the process's end cuts short leaves its stage, which the next pass
+/// finishes. `None` too when the thread cannot start or `work` panics: the relief is skipped.
+fn on_thread<T: Send + 'static>(
+    stopped: Stopped<'_>,
+    work: impl FnOnce(&AtomicBool) -> T + Send + 'static,
+) -> Option<T> {
+    let halt = Arc::new(AtomicBool::new(false));
+    let told = Arc::clone(&halt);
+    let (done, result) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("disk-relief".to_owned())
+        .spawn(move || {
+            let _ = done.send(work(&told));
+        })
+        .ok()?;
+    loop {
+        if stopped() {
+            halt.store(true, Ordering::SeqCst);
+            return None;
+        }
+        match result.recv_timeout(aterm_toolchain::interrupt::NAP) {
+            Ok(got) => return Some(got),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 /// Whether this user's build cache is on the volume mounted at `mount`: a pass over it frees
 /// nothing on any other volume, so a short scratch image or external disk is not reclaimed for.
 fn cache_on(mount: &Path) -> bool {
@@ -267,15 +336,16 @@ fn cache_on(mount: &Path) -> bool {
 
 /// Inside aterm (`ATERM_SESSION_ID` names this session), ask the window's disk watch for `bytes`
 /// free on the volume mounted at `mount` (`aterm ctl @self await sys free>=<bytes>B vol=<mount>`),
-/// waiting for it up to [`ASK_FOR`]: its answer, or `None` outside aterm or with no `aterm` on
-/// `PATH`.
-fn ask_watch(bytes: u64, mount: &Path) -> Option<String> {
+/// waiting for it up to [`ASK_FOR`], or until `stopped` says an interrupt came, which ends the
+/// ask (this process's own child) at once: its answer, or `None` outside aterm, with no `aterm`
+/// on `PATH`, or once stopped.
+fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
     std::env::var_os("ATERM_SESSION_ID").filter(|v| !v.is_empty())?;
     let path = std::env::var_os("PATH")?;
     let aterm = std::env::split_paths(&path)
         .map(|d| d.join("aterm"))
         .find(|p| p.is_file())?;
-    let out = aterm_uds::spawnfd::command(&aterm)
+    let mut child = aterm_uds::spawnfd::command(&aterm)
         .args([
             "ctl".to_owned(),
             "@self".to_owned(),
@@ -286,20 +356,55 @@ fn ask_watch(bytes: u64, mount: &Path) -> Option<String> {
             format!("timeout={}", ASK_FOR.as_millis()),
         ])
         .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
         .ok()?;
-    let said = String::from_utf8_lossy(if out.stdout.is_empty() {
-        &out.stderr
-    } else {
-        &out.stdout
-    })
-    .lines()
-    .next()
-    .unwrap_or_default()
-    .trim()
-    .to_owned();
+    // Each pipe is read on a thread of its own while the ask lasts, so no answer, however long,
+    // stalls it; an ask ended by an interrupt leaves them, which end with its pipes.
+    let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let out = reader(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let err = reader(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let status = loop {
+        if stopped() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(aterm_toolchain::interrupt::NAP),
+            Err(_) => return None,
+        }
+    };
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    let said = if out.is_empty() { err } else { out }
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
     Some(if said.is_empty() {
-        format!("no answer ({})", out.status)
+        format!("no answer ({status})")
     } else {
         said
     })
@@ -322,8 +427,9 @@ fn pct_encode(text: &str) -> String {
 /// size: the run's `own` directories and the build cache's directories there. Nothing else on
 /// the volume is walked: its other folders are the person's (Documents, Desktop, other apps'
 /// data), and a look into those can put a privacy dialog on their screen. A directory inside
-/// another named is left out, so no bytes are named twice.
-fn largest_on(mount: &Path, own: &[PathBuf]) -> Vec<(PathBuf, u64)> {
+/// another named is left out, so no bytes are named twice. The sizing stops once `stopped`
+/// says an interrupt came.
+fn largest_on(mount: &Path, own: &[PathBuf], stopped: Stopped<'_>) -> Vec<(PathBuf, u64)> {
     let on = |p: &Path| Live.read(Some(p)).volume.is_some_and(|v| v.mount == mount);
     let mut found: Vec<PathBuf> = own.iter().filter(|d| on(d)).cloned().collect();
     let cache = aterm_types::dirs::home_dir().map(|h| crate::build_cache::cache_root(&h));
@@ -341,7 +447,7 @@ fn largest_on(mount: &Path, own: &[PathBuf]) -> Vec<(PathBuf, u64)> {
     let mut sized: Vec<(PathBuf, u64)> = found
         .into_iter()
         .map(|p| {
-            let b = allocated(std::slice::from_ref(&p));
+            let b = allocated_until(std::slice::from_ref(&p), stopped);
             (p, b)
         })
         .filter(|(_, b)| *b > 0)

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_effects::cursor_fx::{CursorFx, CursorFxInput};
-use aterm_grapheme::GraphemeClusters;
 use aterm_render::{GlowQuad, RainHalo, RenderInput, Theme};
 
 use crate::cursor_glow::{Geom, GlowStyle};
@@ -593,6 +592,9 @@ pub(crate) const HDR_PREVIEW_CAVEAT: &str = "The preview can\u{2019}t show HDR b
 pub(crate) const HDR_PREVIEW_CAVEAT_TAG: &str = "Preview can\u{2019}t show HDR";
 /// [`HDR_PREVIEW_CAVEAT`] as the row speaks it.
 pub(crate) const HDR_PREVIEW_CAVEAT_SPOKEN: &str = "The preview can\u{2019}t show HDR brightness";
+/// What the cursor preview says while Heat shimmer is focused: the shimmer is the GPU's
+/// present-time refraction over the flames, and the preview is drawn on the CPU.
+pub(crate) const SHIMMER_PREVIEW_CAVEAT: &str = "Preview can\u{2019}t show shimmer";
 
 impl CursorPostFxSpec {
     /// Whether the preview draws HDR glow capped ([`hdr_glow_capped`]).
@@ -656,8 +658,15 @@ pub(crate) struct ThemeDemoSpec {
 /// The most rows and columns the demo terminal is laid out at.
 pub(crate) const DEMO_MAX_ROWS: usize = 40;
 pub(crate) const DEMO_MAX_COLS: usize = 100;
-/// The demo window's tab strip height.
-pub(crate) const DEMO_STRIP_HEIGHT: f32 = 28.0;
+/// The demo window's tab strip height at the 1x text size.
+const DEMO_STRIP_HEIGHT: f32 = 28.0;
+
+/// The demo window's tab strip height: [`DEMO_STRIP_HEIGHT`], or where a large text size sets
+/// the tab titles bigger, the tabs' 6pt inset over a title line like a header's (the caption
+/// with 4pt over and under it).
+pub(crate) fn demo_strip_height() -> f32 {
+    DEMO_STRIP_HEIGHT.max((header_caption().get() + 14.0).ceil())
+}
 /// The inset between the demo window's edge and its grid.
 pub(crate) const DEMO_GRID_INSET: f32 = 8.0;
 
@@ -718,7 +727,7 @@ const DEMO_TAB_RADIUS: f32 = 8.0;
 /// Where a demo window drawn in `rect` puts its strip's pieces ([`DemoStripLayout::of`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DemoStripLayout {
-    /// The strip's height: [`DEMO_STRIP_HEIGHT`], or the whole of a shorter rect.
+    /// The strip's height: [`demo_strip_height`], or the whole of a shorter rect.
     pub(crate) strip_h: f32,
     /// The tabs' top edge.
     pub(crate) tab_top: f32,
@@ -781,7 +790,7 @@ impl DemoStripLayout {
 
     pub(crate) fn of(rect: LogicalRect, frame: DemoFrame) -> Self {
         let top = rect.y;
-        let strip_h = DEMO_STRIP_HEIGHT.min(rect.height);
+        let strip_h = demo_strip_height().min(rect.height);
         let title_px = header_caption().get();
         match frame {
             DemoFrame::Dots => {
@@ -2065,49 +2074,35 @@ impl SettingsPreviewSpec {
                 )
             }
         };
-        let height = header_first_line(self.scene, px)
-            + lines.len().saturating_sub(1) as f32 * header_line_pitch(px);
+        let height = header_height_for(px, lines.len());
         PreviewHeader {
             scene,
             lines,
             says,
-            cut: false,
             available,
             px,
             height,
         }
     }
 
-    /// [`Self::header_layout`] in a card `rect`.
+    /// [`Self::header_layout`] in a card `rect`: the whole statement, or where the card is too
+    /// short for its lines, the band without words. A header never cuts a line ("Comet ·…").
     pub(crate) fn header_in(&self, rect: LogicalRect) -> PreviewHeader {
-        let mut header = self.header_layout(rect.width);
-        let (first, pitch) = (
-            header_first_line(self.scene, header.px),
-            header_line_pitch(header.px),
-        );
+        let header = self.header_layout(rect.width);
+        let holds = |height: f32, under: f32| height + under <= rect.height + 0.01;
         let body = self.least_body();
-        if header.height + body > rect.height + 0.01 && first + body <= rect.height + 0.01 {
-            header.lines.clear();
-            header.says.clear();
-            header.scene = false;
-            header.height = first;
-            return header;
+        // The specimen keeps its least row before the header keeps its words; a card too
+        // short for that row anyway gives the header its whole height.
+        let keeps = if holds(HEADER_BAND, body) {
+            holds(header.height, body)
+        } else {
+            holds(header.height, 4.0)
+        };
+        if keeps {
+            header
+        } else {
+            header.without_words()
         }
-        let room = ((rect.height - 4.0 - first).max(0.0) / pitch).floor() as usize + 1;
-        if header.lines.len() > room {
-            header.lines.truncate(room);
-            if let Some(last) = header.lines.pop() {
-                header.lines.push(bounded_badge_width(
-                    &format!("{last} …"),
-                    header.available,
-                    header.px,
-                    TextFace::UiBold,
-                ));
-            }
-            header.cut = true;
-            header.height = first + room.saturating_sub(1) as f32 * pitch;
-        }
-        header
     }
 
     fn least_body(&self) -> f32 {
@@ -2164,11 +2159,7 @@ impl SettingsPreviewSpec {
         let mut runs = Vec::new();
         if !header.lines.is_empty() {
             runs.push(PreviewTextRun {
-                painted: if header.cut {
-                    header.lines.join(" ")
-                } else {
-                    header.says.clone()
-                },
+                painted: header.says.clone(),
                 says: header.says.clone(),
                 required: if header.scene {
                     width(spec.scene.badge_label()) + 8.0 + widest
@@ -2261,25 +2252,33 @@ impl SettingsPreviewSpec {
 
     /// The least height this preview still demonstrates at.
     pub(crate) fn minimum_height(&self, floor: f32) -> f32 {
+        self.least_height(floor, &|spec: &Self| spec.header_height())
+    }
+
+    /// [`Self::minimum_height`] with a header of one line, whatever it says: the least height a
+    /// host that holds the preview still while its header changes (a style tried under the
+    /// pointer, "Trying: …") keeps, where the specimen always shows under the header's band.
+    pub(crate) fn steady_minimum_height(&self, floor: f32) -> f32 {
+        let one_line = header_height_for(header_caption().get(), 1);
+        self.least_height(floor, &|_: &Self| one_line)
+    }
+
+    fn least_height(&self, floor: f32, header_of: &dyn Fn(&Self) -> f32) -> f32 {
         let mut spec = self.normalized();
         floor.max(match self.scene {
             PreviewScene::Typography => self.typography_height(1),
             PreviewScene::CursorMotion => {
                 let row = spec.typography_row_height();
-                let header = spec.header_height();
+                let header = header_of(&spec);
                 spec.reduced_motion = !spec.reduced_motion;
-                (header.max(spec.header_height()) + 15.0 + row)
+                (header.max(header_of(&spec)) + 15.0 + row)
                     .max(crate::native_settings::scaled_control_height())
             }
             PreviewScene::Appearance => {
-                spec.header_height()
-                    + 15.0
-                    + appearance_terminal_floor(spec.typography_row_height())
+                header_of(&spec) + 15.0 + appearance_terminal_floor(spec.typography_row_height())
             }
             PreviewScene::ThemeDemo => spec.demo_height(6),
-            PreviewScene::Wallpaper => {
-                spec.header_height() + 15.0 + 2.0 * spec.typography_row_height()
-            }
+            PreviewScene::Wallpaper => header_of(&spec) + 15.0 + 2.0 * spec.typography_row_height(),
         })
     }
 
@@ -2302,14 +2301,14 @@ impl SettingsPreviewSpec {
     /// The demo window's height with `rows` whole rows.
     pub(crate) fn demo_height(&self, rows: usize) -> f32 {
         let (_, cell_h) = self.demo_cell_size();
-        (DEMO_STRIP_HEIGHT + DEMO_GRID_INSET * 2.0 + rows as f32 * cell_h).ceil()
+        (demo_strip_height() + DEMO_GRID_INSET * 2.0 + rows as f32 * cell_h).ceil()
     }
 
     /// The demo grid a `rect` holds.
     pub(crate) fn demo_grid(&self, rect: LogicalRect) -> (usize, usize) {
         let (cell_w, cell_h) = self.demo_cell_size();
         let width = (rect.width - DEMO_GRID_INSET * 2.0).max(0.0);
-        let height = (rect.height - DEMO_STRIP_HEIGHT - DEMO_GRID_INSET * 2.0).max(0.0);
+        let height = (rect.height - demo_strip_height() - DEMO_GRID_INSET * 2.0).max(0.0);
         let bound = match self.demo.max_rows {
             0 => DEMO_MAX_ROWS,
             rows => rows.min(DEMO_MAX_ROWS),
@@ -2596,8 +2595,9 @@ impl SettingsPreviewSpec {
     }
 
     fn demo_grid_rect(rect: LogicalRect) -> Option<LogicalRect> {
-        let strip_h = DEMO_STRIP_HEIGHT.min(rect.height);
-        (strip_h >= DEMO_STRIP_HEIGHT).then(|| {
+        let full = demo_strip_height();
+        let strip_h = full.min(rect.height);
+        (strip_h >= full).then(|| {
             LogicalRect::new(
                 rect.x + DEMO_GRID_INSET,
                 rect.y + strip_h + DEMO_GRID_INSET,
@@ -2765,7 +2765,7 @@ impl SettingsPreviewSpec {
         let inset = PREVIEW_INSET;
         let header = spec.header_in(rect);
         let caption_size = header_caption();
-        let first_line = header_first_line(spec.scene, header.px);
+        let first_line = header.first_line();
         let caption_y =
             crate::tray_raster::row_baseline(rect.y + 4.0, first_line, caption_size.get());
         let control_reserve = if spec.control_slot() {
@@ -2937,7 +2937,8 @@ impl SettingsPreviewSpec {
         }
     }
 
-    /// The facts the cursor scene draws its trail in, for the knob law (`GlowStyle::reads_knob`).
+    /// The facts the cursor scene draws its trail in, for the knob law (`GlowStyle::reads_knob`):
+    /// its ground, cursor shape, ring and classic face. Its jumps are [`scene_jumps`].
     pub(crate) fn scene_knob_context(&self) -> aterm_effects::cursor_glow::KnobContext {
         let dark = self
             .terminal_theme
@@ -2948,30 +2949,60 @@ impl SettingsPreviewSpec {
             ring: self.cursor.ring,
             classic_tinted: self.cursor.color.chosen()
                 || GlowStyle::style_names_classic_mono(self.cursor.effective_trail_style_raw()),
-            over_text: true,
+            over_text: false,
         }
+    }
+
+    /// The Trail length from which the scene draws alike at every longer length, the longest
+    /// [`GlowStyle::jump_reach`] of its jumps (`None`: Length shapes nothing it draws).
+    pub(crate) fn scene_length_reach(&self) -> Option<f32> {
+        let glow = self.cursor.resolved_trail_style().style?;
+        let ctx = self.scene_knob_context();
+        let (cell_w, cell_h) = self.demo_cell_size();
+        let aspect = cell_h / cell_w.max(1.0);
+        scene_jumps()
+            .into_iter()
+            .filter_map(|jump| {
+                glow.jump_reach(
+                    jump.rows,
+                    jump.cols,
+                    aspect,
+                    aterm_effects::cursor_glow::KnobContext {
+                        over_text: jump.over_letters,
+                        ..ctx
+                    },
+                )
+            })
+            .reduce(f32::max)
     }
 
     fn focused_idle(&self) -> Option<String> {
         if let Some(effect) = &self.focused_effect {
             return Some(effect.clone());
         }
+        if self.scene == PreviewScene::CursorMotion
+            && self.focused_key == crate::prefs::EDIT_CURSOR_FIRE_SHIMMER
+        {
+            return Some(SHIMMER_PREVIEW_CAVEAT.to_string());
+        }
         if self.scene != PreviewScene::CursorMotion
             || self.focused_key != crate::prefs::EDIT_CURSOR_TRAIL_LENGTH
             || self.animation() != PreviewAnimation::Continuous
+            || self.cursor.resolved_trail_style().style.is_none()
         {
             return None;
         }
-        let ctx = self.scene_knob_context();
-        let shows =
-            self.cursor.resolved_trail_style().style.is_none_or(|glow| {
-                glow.reads_knob(aterm_effects::cursor_glow::TrailKnob::Length, ctx)
-            });
-        if !shows {
-            return Some("Shown over blank cells only".to_string());
+        match self.scene_length_reach() {
+            None => Some("Not shown in this preview".to_string()),
+            Some(reach) if self.cursor.length as f32 >= reach => Some(format!(
+                "Preview shows up to {}",
+                crate::prefs::integer_reading(
+                    crate::prefs::EDIT_CURSOR_TRAIL_LENGTH,
+                    reach.ceil() as i64
+                )
+            )),
+            Some(_) => None,
         }
-        let jump = CURSOR_SCENE_TAB.1 - CURSOR_SCENE_TAB.0;
-        (self.cursor.length >= jump).then(|| format!("Covers this {jump}-cell jump"))
     }
 
     fn reads_live(&self) -> bool {
@@ -3129,11 +3160,22 @@ fn header_caption() -> crate::type_scale::StepPx {
         .scaled(crate::native_appearance::text_scale())
 }
 
-fn header_first_line(scene: PreviewScene, px: f32) -> f32 {
-    if scene == PreviewScene::Typography {
-        27.0_f32.max(px + 8.0)
-    } else {
-        27.0
+/// The band of a preview header that paints no words: the room its Pause/Play glyph takes, and
+/// the least every host's preview height counts on.
+const HEADER_BAND: f32 = 27.0;
+
+/// A header's first line: its caption with 4pt over and under it at every text size, never
+/// under [`HEADER_BAND`].
+fn header_first_line(px: f32) -> f32 {
+    HEADER_BAND.max(px + 8.0)
+}
+
+/// The height of a header with `lines` lines of its `px` caption: the band alone without words,
+/// else the first line and a pitch for each further line.
+fn header_height_for(px: f32, lines: usize) -> f32 {
+    match lines {
+        0 => HEADER_BAND,
+        lines => header_first_line(px) + (lines - 1) as f32 * header_line_pitch(px),
     }
 }
 
@@ -3150,14 +3192,31 @@ pub(crate) struct PreviewHeader {
     pub(crate) lines: Vec<String>,
     /// What the lines say together.
     pub(crate) says: String,
-    /// Its last line had to be cut.
-    pub(crate) cut: bool,
     /// The room each line has, left of the Pause/Play control's slot.
     pub(crate) available: f32,
     /// The caption's size.
     pub(crate) px: f32,
     /// The header band's height, down to the terminal body's gap.
     pub(crate) height: f32,
+}
+
+impl PreviewHeader {
+    /// The band alone: no scene label and no statement.
+    fn without_words(self) -> Self {
+        Self {
+            scene: false,
+            lines: Vec::new(),
+            says: String::new(),
+            height: HEADER_BAND,
+            ..self
+        }
+    }
+
+    /// The height of the first line, which the scene label, the state and the Pause/Play
+    /// glyph centre in.
+    fn first_line(&self) -> f32 {
+        header_height_for(self.px, self.lines.len().min(1))
+    }
 }
 
 fn font_candidate_pill_height(text_scale: f32) -> f32 {
@@ -3836,37 +3895,64 @@ const CURSOR_SPECIMEN_LINES_SH: [&str; 7] = [
     "\u{1b}[32m~/demo\u{1b}[0m $ git pull",
     "Already up to date.",
     "\u{1b}[32m~/demo\u{1b}[0m $ ls",
-    "\u{1b}[1;34msrc\u{1b}[0m  notes.md  \u{1b}[1;32mbuild.sh\u{1b}[0m",
-    "\u{1b}[32m~/demo\u{1b}[0m $ cat notes.md",
+    "\u{1b}[1;34msrc\u{1b}[0m  README.md  \u{1b}[1;32mbuild.sh\u{1b}[0m",
+    "\u{1b}[32m~/demo\u{1b}[0m $ cat README.md",
     "ship it \u{2713}",
-    "\u{1b}[32m~/demo\u{1b}[0m $ git add notes.md && git commit",
+    "\u{1b}[32m~/demo\u{1b}[0m $ git add README.md && git commit",
 ];
 
 const CURSOR_SPECIMEN_LINES_PWSH: [&str; 7] = [
     "PS C:\\> \u{1b}[93mgit\u{1b}[0m pull",
     "Already up to date.",
     "PS C:\\> \u{1b}[93mgit\u{1b}[0m status \u{1b}[90m-s\u{1b}[0m",
-    " \u{1b}[31mM\u{1b}[0m notes.md",
-    "PS C:\\> \u{1b}[93mcat\u{1b}[0m notes.md",
+    " \u{1b}[31mM\u{1b}[0m README.md",
+    "PS C:\\> \u{1b}[93mcat\u{1b}[0m README.md",
     "ship it \u{2713}",
-    "PS C:\\> \u{1b}[93mgit\u{1b}[0m add .\\notes.md; \u{1b}[93mgit\u{1b}[0m commit",
+    "PS C:\\> \u{1b}[93mgit\u{1b}[0m add .\\README.md; \u{1b}[93mgit\u{1b}[0m commit",
 ];
 
 const KEY_MS: u64 = 3 * MOTION_STEP_MS;
 
 const CURSOR_SCENE_COMMAND: &str = if cfg!(windows) {
-    "git add .\\notes.md; git commit"
+    "git add .\\README.md; git commit"
 } else {
-    "git add notes.md && git commit"
+    "git add README.md && git commit"
 };
 
-/// The typed cells and where the Tab lands: `no` completes `notes.md`, as `.\no` completes
-/// `.\notes.md` in PowerShell, so both scenes jump 6 cells and keep the same time. A longer
-/// jump lands later (a fire meteor rings on arrival), past the frame a pause holds.
-const CURSOR_SCENE_TAB: (usize, usize) = if cfg!(windows) { (12, 18) } else { (10, 16) };
+/// The typed cells and where the Tab lands: `R` completes `README.md`, as `.\R` completes
+/// `.\README.md` in PowerShell, so both scenes jump 8 cells and keep the same time: a leap, as
+/// ordinary a completion as there is, that Fire flies as a meteor Trail length cuts, over the
+/// letters a shorter hop's flame would leave dark.
+const CURSOR_SCENE_TAB: (usize, usize) = if cfg!(windows) { (11, 19) } else { (9, 17) };
 
 const CURSOR_SCENE_KEYS: u64 =
     (CURSOR_SCENE_TAB.0 + 1 + (CURSOR_SCENE_COMMAND.len() - CURSOR_SCENE_TAB.1)) as u64;
+
+/// One licensed jump the cursor scene makes: `rows` rows and `cols` columns, over typed letters
+/// only or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SceneJump {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) over_letters: bool,
+}
+
+/// The scene's jumps: the Tab's completion along the typed line, over the letters it completes,
+/// and the Return from the line's end down to the next prompt's first column.
+pub(crate) const fn scene_jumps() -> [SceneJump; 2] {
+    [
+        SceneJump {
+            rows: 0,
+            cols: (CURSOR_SCENE_TAB.1 - CURSOR_SCENE_TAB.0) as u16,
+            over_letters: true,
+        },
+        SceneJump {
+            rows: 1,
+            cols: CURSOR_SCENE_COMMAND.len() as u16,
+            over_letters: false,
+        },
+    ]
+}
 
 const CURSOR_SCENE_HOLD_MS: u64 = 15 * MOTION_STEP_MS;
 
@@ -5009,31 +5095,6 @@ const fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
-fn bounded_badge_width(value: &str, max_width: f32, px: f32, face: TextFace) -> String {
-    if max_width <= 0.0 {
-        return String::new();
-    }
-    if crate::tray_raster::ui_text_width_for(face, value, px) <= max_width {
-        return value.to_string();
-    }
-    let ellipsis = "…";
-    let ellipsis_width = crate::tray_raster::ui_text_width_for(face, ellipsis, px);
-    if ellipsis_width > max_width {
-        return String::new();
-    }
-    let mut end = 0;
-    for (offset, grapheme) in value.grapheme_indices() {
-        let next = offset + grapheme.len();
-        if crate::tray_raster::ui_text_width_for(face, &value[..next], px) + ellipsis_width
-            > max_width
-        {
-            break;
-        }
-        end = next;
-    }
-    format!("{}…", value[..end].trim_end())
-}
-
 fn family_words(family: &str) -> String {
     let Some(ids) = family.strip_prefix(aterm_render::DISPLAY_FACE_SCHEME) else {
         return family.to_string();
@@ -5633,7 +5694,10 @@ mod tests {
         let pathological = SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
             .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, long.as_str());
         let header = pathological.header_in(LogicalRect::new(0.0, 0.0, 122.0, 44.0));
-        assert!(header.cut, "{header:?}");
+        assert!(
+            header.lines.is_empty(),
+            "too short for its lines: {header:?}"
+        );
         let tree = UiTree::new(
             UiNode::new(
                 "root",
@@ -5651,13 +5715,7 @@ mod tests {
         )
         .compile(LogicalRect::new(0.0, 0.0, 160.0, 100.0))
         .expect("compiles");
-        assert!(
-            tree.fit_failures()
-                .iter()
-                .any(|line| line.contains("kind=settings-preview overflow=true")),
-            "{:?}",
-            tree.fit_failures()
-        );
+        assert!(tree.fit_failures().is_empty(), "{:?}", tree.fit_failures());
     }
 
     #[test]
@@ -5687,7 +5745,7 @@ mod tests {
                         .with_prepared_font(prepared.clone())
                         .with_measure_width(width);
                     let full = spec.normalized().header_layout(width);
-                    let band = header_first_line(spec.scene, full.px);
+                    let band = HEADER_BAND;
                     let body = spec.normalized().least_body();
                     let least = (band + body).ceil();
                     let most = spec.minimum_height(0.0).max(full.height + body).ceil();
@@ -5723,7 +5781,7 @@ mod tests {
                             words.iter().all(|word| !word.contains('…')),
                             "{context}: {words:?}"
                         );
-                        if full.lines.len() > 1 && full.height + body > height + 0.01 {
+                        if full.height + body > height + 0.01 {
                             assert!(words.is_empty(), "{context}: {words:?}");
                             squeezed += 1;
                         }
@@ -5743,44 +5801,121 @@ mod tests {
         assert!(squeezed > 0, "some card holds the lines but not the row");
     }
 
+    /// A card too short for its header's lines drops the words rather than cutting the last
+    /// line it has room for ("Comet ·…"): a header says a whole statement or nothing.
     #[test]
-    fn maximum_text_preview_badges_fit_by_ui_width_and_preserve_utf8() {
-        let available = 214.5;
-        let px = 27.5;
-        for source in [
-            "Theme: Catppuccin Mocha",
-            "Theme: Aurora 👩‍💻 Observatory — a deliberately very long personal color theme",
-            "Trail: hyper-dimensional rainbow kitties with an unusually long spelling",
-        ] {
-            let fitted = bounded_badge_width(source, available, px, TextFace::UiBold);
-            assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
-            assert!(fitted.ends_with('…'), "{source:?} => {fitted:?}");
-            assert!(
-                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &fitted, px)
-                    <= available + 0.01,
-                "{source:?} => {fitted:?}"
-            );
+    fn a_short_card_drops_its_header_words_and_never_cuts_them() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        let _ = compiled(SettingsPreviewSpec::default());
+        let roles = Roles::from_theme(Theme::default());
+        let comet = CursorPreviewSpec {
+            trail_style: PreviewTrailStyle::Comet,
+            trail_style_raw: Arc::from("comet"),
+            ..CursorPreviewSpec::default()
+        };
+        let long = "Pneumonoultramicroscopicsilicovolcanoconiosis".repeat(2);
+        let specs = [
+            SettingsPreviewSpec::cursor(comet.clone())
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "comet"),
+            SettingsPreviewSpec::cursor(comet)
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "comet")
+                .with_style_trial(Some(StyleTrial::Pointer)),
+            SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty pet"))
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "rainbow kitty pet"),
+            SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, long.as_str()),
+            SettingsPreviewSpec::typography(13.0)
+                .with_focus(crate::prefs::EDIT_FONT_FAMILY, "Automatic (SF Mono)"),
+        ];
+        let squash = |text: &str| text.replace('-', "").split_whitespace().collect::<String>();
+        let (mut dropped, mut kept) = (0, 0);
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for spec in &specs {
+                for width in [96.0_f32, 122.0, 150.0, 206.0] {
+                    let spec = spec.clone().with_measure_width(width);
+                    let rungs = spec.normalized().header_rungs();
+                    let most = spec.minimum_height(0.0).ceil() as i32 + 8;
+                    for height in (24..=most).step_by(2) {
+                        let rect = LogicalRect::new(10.0, 10.0, width, height as f32);
+                        let context = format!(
+                            "{} at {width}x{height}, {scale}x",
+                            spec.normalized().focused_value
+                        );
+                        let header = spec.normalized().header_in(rect);
+                        let said = header.lines.join(" ");
+                        assert!(!said.contains('\u{2026}'), "{context}: {header:?}");
+                        if header.lines.is_empty() {
+                            assert!(!header.scene && header.says.is_empty(), "{context}");
+                            dropped += 1;
+                            continue;
+                        }
+                        assert!(
+                            rungs.contains(&header.says) && squash(&said) == squash(&header.says),
+                            "{context}: the lines say one whole statement: {header:?}"
+                        );
+                        let mut prims = Vec::new();
+                        spec.paint(&mut prims, rect, Theme::default(), roles);
+                        for prim in &prims {
+                            if let DrawPrim::Text { s, .. } = prim {
+                                assert!(!s.contains('\u{2026}'), "{context}: paints {s:?}");
+                            }
+                        }
+                        kept += 1;
+                    }
+                }
+            }
         }
-        assert_eq!(
-            bounded_badge_width("Theme: Nord", available, px, TextFace::UiBold),
-            "Theme: Nord"
-        );
+        let _ = install_preferences(AppearancePreferences::default());
+        assert!(dropped > 0 && kept > 0, "{dropped} dropped, {kept} kept");
     }
 
+    /// A header's first line holds its caption at every text size: the band grows with the
+    /// type for every scene (not only the text specimen), and so does the Themes demo's strip.
     #[test]
-    fn preview_badge_limits_preserve_complete_grapheme_clusters() {
-        for (source, expected) in [("A👩‍💻WWWW", "A👩‍💻…"), ("AéWWWW", "Aé…"), ("A🇺🇳WWWW", "A🇺🇳…")]
-        {
-            let px = 27.5;
-            for face in [TextFace::UiBold, TextFace::Ui] {
-                let exact_width = crate::tray_raster::ui_text_width_for(face, expected, px) + 0.01;
-                assert_eq!(
-                    bounded_badge_width(source, exact_width, px, face),
-                    expected,
-                    "{source:?} in {face:?}"
+    fn a_preview_headers_first_line_follows_the_text_scale() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        let _ = compiled(SettingsPreviewSpec::default());
+        let specs = [
+            SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
+                .with_focus(crate::prefs::EDIT_CURSOR_STYLE, "block"),
+            SettingsPreviewSpec::appearance(13.0)
+                .with_focus(crate::prefs::EDIT_THEME, "Catppuccin Mocha"),
+            wallpaper_spec(None),
+            SettingsPreviewSpec::typography(13.0)
+                .with_focus(crate::prefs::EDIT_FONT_FAMILY, "Automatic (SF Mono)"),
+        ];
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            let px = header_caption().get();
+            for spec in &specs {
+                let header = spec.normalized().header_layout(720.0);
+                assert_eq!(header.lines.len(), 1, "{scale}x: {header:?}");
+                assert!(
+                    header.height + 0.01 >= px + 8.0,
+                    "{scale}x {:?}: a {px}px caption in a {}pt band",
+                    spec.scene,
+                    header.height
+                );
+            }
+            for frame in [DemoFrame::Dots, DemoFrame::Windows] {
+                let rect = LogicalRect::new(0.0, 0.0, 420.0, 260.0);
+                let strip = DemoStripLayout::of(rect, frame);
+                assert!(
+                    strip.tab_h(rect) + 0.01 >= strip.title_px + 8.0,
+                    "{scale}x {frame:?}: a {}px title in a {}pt tab",
+                    strip.title_px,
+                    strip.tab_h(rect)
                 );
             }
         }
+        let _ = install_preferences(AppearancePreferences::default());
     }
 
     #[test]
@@ -5794,7 +5929,6 @@ mod tests {
         let mut saw = (false, false);
         for width in (80..=720).step_by(8) {
             let header = spec.header_layout(width as f32);
-            assert!(!header.cut, "{width}: {header:?}");
             let said = header.lines.join(" ");
             assert!(!said.contains('…'), "{width}: {said}");
             assert!(
@@ -7902,11 +8036,23 @@ mod tests {
         // shorter than the Mac's, burns 183 there both ways).
         let keys = CURSOR_SCENE_KEYS as usize;
         let hottest = |heat: &[(u8, u16)]| heat[1..keys].iter().map(|(temp, _)| *temp).max();
-        let (warmest, coldest_peak) = (hottest(&warm).unwrap_or(0), hottest(&cold).unwrap_or(0));
-        assert!(warmest >= 120, "the blaze reaches orange metal: {warm:?}");
+        // Up to the Tab the loop types into a forge it has kept hot; the Tab's leap is a
+        // meteor whose strike heats even a cold forge for a moment, so the sustained blaze is
+        // read on the keys before it.
+        let typed = |heat: &[(u8, u16)]| {
+            heat[1..=CURSOR_SCENE_TAB.0]
+                .iter()
+                .map(|(temp, _)| *temp)
+                .max()
+        };
+        let (warmest, coldest_typing) = (typed(&warm).unwrap_or(0), typed(&cold).unwrap_or(0));
         assert!(
-            warmest > coldest_peak + 10,
-            "warmer than a cold start ever gets: {warm:?} against {cold:?}"
+            hottest(&warm).unwrap_or(0) >= 120,
+            "the blaze reaches orange metal: {warm:?}"
+        );
+        assert!(
+            warmest > coldest_typing + 10,
+            "the typed line burns warmer than a cold start's: {warm:?} against {cold:?}"
         );
         assert!(
             (1..keys).all(|key| warm[key].0 + 8 >= cold[key].0),
@@ -7941,20 +8087,36 @@ mod tests {
         raster_of(&tree.tray(Theme::default(), 13.0).prims)
     }
 
-    fn visibly_apart(left: &[u8], right: &[u8]) -> usize {
+    /// How many pixels of two rasters differ by more than `levels` in some channel.
+    fn apart_by(left: &[u8], right: &[u8], levels: u8) -> usize {
         left.chunks(4)
             .zip(right.chunks(4))
-            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 32))
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > levels))
             .count()
     }
 
+    /// THE SCENE'S JUMPS SHOW EVERY JUMP KNOB THE TERMINAL WOULD (audit r14 PV7, r14b PV2-1):
+    /// on a dark and a light ground, for every style, Trail length (2 against a length past the
+    /// scene's reach), Ring on jumps and Phaser's accent paint the card visibly apart on the
+    /// frames after the Return or the Tab exactly where the engine says the scene's jumps draw
+    /// them (`GlowStyle::jump_reach`, `GlowStyle::reads_knob`), alike while only typing, and a
+    /// knob that shows on the Tab shows on the frame a pause holds. Before, the scene's only
+    /// completion was a 6-cell hop over letters, which Fire's flame leaves dark (its Length never
+    /// showed) and the header's reach ignored the Return.
     #[test]
-    fn the_jump_knobs_show_visibly_after_the_scenes_tab() {
+    fn the_scenes_jumps_show_every_jump_knob() {
         use aterm_effects::cursor_glow::TrailKnob;
 
+        let light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
+        );
         let tab_ms = (CURSOR_SCENE_TAB.0 as u64 + 1) * KEY_MS;
-        let after: Vec<u64> = (0..4).map(|step| tab_ms + step * MOTION_STEP_MS).collect();
-        let before: Vec<u64> = vec![6 * KEY_MS, CURSOR_SCENE_TAB.0 as u64 * KEY_MS];
+        let after: Vec<u64> = [MOTION_STEP_MS, 2 * MOTION_STEP_MS, 4 * MOTION_STEP_MS]
+            .into_iter()
+            .chain((0..3).map(|step| tab_ms + step * MOTION_STEP_MS))
+            .chain([5 * MOTION_STEP_MS])
+            .collect();
+        let typing_only: Vec<u64> = vec![6 * KEY_MS, CURSOR_SCENE_TAB.0 as u64 * KEY_MS];
         let one_row = {
             let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec::default()).normalized();
             spec.header_layout(VIEWPORT.width - 20.0).height + 15.0 + spec.typography_row_height()
@@ -7965,119 +8127,145 @@ mod tests {
             let Some(glow) = crate::app_config::resolve_trail_style(raw).style else {
                 continue;
             };
-            let base = CursorPreviewSpec {
-                blink: false,
-                trail_style: style,
-                trail_style_raw: Arc::from(raw),
-                ..CursorPreviewSpec::default()
-            };
-            let ctx = SettingsPreviewSpec::cursor(base.clone()).scene_knob_context();
-            let knobs: Vec<(TrailKnob, CursorPreviewSpec, CursorPreviewSpec)> = vec![
-                (
-                    TrailKnob::Ring,
-                    CursorPreviewSpec {
-                        ring: true,
-                        ..base.clone()
-                    },
-                    CursorPreviewSpec {
-                        ring: false,
-                        ..base.clone()
-                    },
-                ),
-                (
-                    TrailKnob::Length,
-                    CursorPreviewSpec {
-                        length: 2,
-                        ..base.clone()
-                    },
-                    CursorPreviewSpec {
-                        length: 24,
-                        ..base.clone()
-                    },
-                ),
-                (
-                    TrailKnob::Accent,
-                    CursorPreviewSpec {
-                        accent: Some(0x00FF_0000),
-                        ..base.clone()
-                    },
-                    CursorPreviewSpec {
-                        accent: Some(0x0000_FFFF),
-                        ..base.clone()
-                    },
-                ),
-            ];
-            for (knob, a, b) in knobs {
-                let law = glow.reads_knob(knob, ctx);
-                if knob == TrailKnob::Accent && glow != GlowStyle::Phaser {
-                    continue;
-                }
-                if !law && !(knob == TrailKnob::Length && glow == GlowStyle::Fire) {
-                    continue;
-                }
-                for height in [190.0_f32, one_row] {
-                    let frame = |cursor: &CursorPreviewSpec, phase: u64| {
-                        card_pixels(
-                            SettingsPreviewSpec::cursor(cursor.clone()).with_phase(phase),
-                            height,
-                        )
-                    };
-                    let apart = after
-                        .iter()
-                        .map(|&phase| visibly_apart(&frame(&a, phase), &frame(&b, phase)))
-                        .max()
-                        .unwrap_or(0);
-                    let apart16 = after
-                        .iter()
-                        .map(|&phase| {
-                            let (x, y) = (frame(&a, phase), frame(&b, phase));
-                            x.chunks(4)
-                                .zip(y.chunks(4))
-                                .filter(|(p, q)| {
-                                    p.iter().zip(q.iter()).any(|(m, n)| m.abs_diff(*n) > 16)
-                                })
-                                .count()
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    let held = |cursor: &CursorPreviewSpec| {
-                        card_pixels(
-                            SettingsPreviewSpec::cursor(cursor.clone())
-                                .with_phase(300)
-                                .with_paused(true),
-                            height,
-                        )
-                    };
-                    let held_apart = visibly_apart(&held(&a), &held(&b));
-                    if law {
-                        assert!(
-                            apart >= 12 && apart16 >= 40,
-                            "{raw}: {knob:?} shows after the Tab in a {height}pt card: {apart} px \
-                             more than 32 levels apart, {apart16} more than 16"
-                        );
-                        assert!(
-                            held_apart >= 12,
-                            "{raw}: {knob:?} shows on the paused frame in a {height}pt card: \
-                             {held_apart} px"
-                        );
-                        for &phase in &before {
-                            assert_eq!(
-                                visibly_apart(&frame(&a, phase), &frame(&b, phase)),
-                                0,
-                                "{raw}: {knob:?} is invisible while only typing ({phase} ms)"
+            for (ground, heights) in [(None, vec![190.0_f32, one_row]), (Some(light), vec![190.0])]
+            {
+                let base = CursorPreviewSpec {
+                    blink: false,
+                    trail_style: style,
+                    trail_style_raw: Arc::from(raw),
+                    ..CursorPreviewSpec::default()
+                };
+                let on_ground = |cursor: CursorPreviewSpec| {
+                    let spec = SettingsPreviewSpec::cursor(cursor);
+                    match ground {
+                        Some(theme) => spec.with_terminal_theme(theme),
+                        None => spec,
+                    }
+                };
+                let scene = on_ground(base.clone());
+                let ctx = scene.scene_knob_context();
+                let reach = scene.scene_length_reach();
+                let long = reach.map_or(512, |reach| reach.ceil() as usize + 8);
+                let knobs = [
+                    (
+                        TrailKnob::Length,
+                        reach.is_some(),
+                        CursorPreviewSpec {
+                            length: 2,
+                            ..base.clone()
+                        },
+                        CursorPreviewSpec {
+                            length: long,
+                            ..base.clone()
+                        },
+                    ),
+                    (
+                        TrailKnob::Ring,
+                        glow.reads_knob(TrailKnob::Ring, ctx),
+                        CursorPreviewSpec {
+                            ring: true,
+                            ..base.clone()
+                        },
+                        CursorPreviewSpec {
+                            ring: false,
+                            ..base.clone()
+                        },
+                    ),
+                    (
+                        TrailKnob::Accent,
+                        glow.reads_knob(TrailKnob::Accent, ctx),
+                        CursorPreviewSpec {
+                            accent: Some(0x00FF_0000),
+                            ..base.clone()
+                        },
+                        CursorPreviewSpec {
+                            accent: Some(0x0000_FFFF),
+                            ..base.clone()
+                        },
+                    ),
+                ];
+                for (knob, law, a, b) in knobs {
+                    if knob == TrailKnob::Accent && glow != GlowStyle::Phaser {
+                        continue;
+                    }
+                    for &height in &heights {
+                        let frame = |cursor: &CursorPreviewSpec, phase: u64| {
+                            card_pixels(on_ground(cursor.clone()).with_phase(phase), height)
+                        };
+                        let pairs: Vec<(Vec<u8>, Vec<u8>)> = after
+                            .iter()
+                            .map(|&phase| (frame(&a, phase), frame(&b, phase)))
+                            .collect();
+                        let apart = pairs
+                            .iter()
+                            .map(|(x, y)| apart_by(x, y, 32))
+                            .max()
+                            .unwrap_or(0);
+                        let apart16 = pairs
+                            .iter()
+                            .map(|(x, y)| apart_by(x, y, 16))
+                            .max()
+                            .unwrap_or(0);
+                        let side = if ground.is_some() { "light" } else { "dark" };
+                        if law {
+                            assert!(
+                                apart >= 12 && apart16 >= 40,
+                                "{raw} {side}: {knob:?} shows after a jump in a {height}pt card: \
+                                 {apart} px more than 32 levels apart, {apart16} more than 16"
+                            );
+                            for &phase in &typing_only {
+                                assert_eq!(
+                                    apart_by(&frame(&a, phase), &frame(&b, phase), 32),
+                                    0,
+                                    "{raw} {side}: {knob:?} is invisible while only typing \
+                                     ({phase} ms)"
+                                );
+                            }
+                        } else {
+                            assert!(
+                                apart < 12,
+                                "{raw} {side}: {knob:?} the engine says the scene cannot show \
+                                 paints {apart} px apart"
                             );
                         }
-                    } else {
-                        assert!(
-                            apart < 12,
-                            "{raw}: {knob:?} the law says the scene cannot show paints {apart} px apart"
-                        );
+                        checked += 1;
                     }
-                    checked += 1;
+                }
+                // What the Tab shows, the frame a pause holds shows.
+                let held = |cursor: CursorPreviewSpec| {
+                    card_pixels(on_ground(cursor).with_phase(300).with_paused(true), 190.0)
+                };
+                let tab = scene_jumps()[0];
+                let (cell_w, cell_h) = scene.demo_cell_size();
+                let tab_reach = glow.jump_reach(
+                    tab.rows,
+                    tab.cols,
+                    cell_h / cell_w.max(1.0),
+                    aterm_effects::cursor_glow::KnobContext {
+                        over_text: tab.over_letters,
+                        ..ctx
+                    },
+                );
+                if tab_reach.is_some_and(|reach| reach > 2.0) {
+                    let apart = apart_by(
+                        &held(CursorPreviewSpec {
+                            length: 2,
+                            ..base.clone()
+                        }),
+                        &held(CursorPreviewSpec {
+                            length: long,
+                            ..base.clone()
+                        }),
+                        32,
+                    );
+                    assert!(
+                        apart >= 12,
+                        "{raw}: Trail length shows on the paused frame: {apart} px"
+                    );
                 }
             }
         }
-        assert!(checked >= 20, "{checked} knobs checked");
+        assert!(checked >= 40, "{checked} knobs checked");
     }
 
     #[test]
@@ -8257,11 +8445,11 @@ mod tests {
     }
 
     #[test]
-    fn a_trail_length_the_scenes_jump_cannot_show_says_so() {
-        let focused = |length: usize| {
+    fn a_trail_length_the_scenes_jumps_cannot_show_says_so() {
+        let focused = |raw: &'static str, length: usize| {
             SettingsPreviewSpec::cursor(CursorPreviewSpec {
-                trail_style: PreviewTrailStyle::Comet,
-                trail_style_raw: Arc::from("comet"),
+                trail_style: PreviewTrailStyle::parse(raw),
+                trail_style_raw: Arc::from(raw),
                 length,
                 ..CursorPreviewSpec::default()
             })
@@ -8269,61 +8457,77 @@ mod tests {
             .with_phase(900)
             .normalized()
         };
-        let long = focused(24);
-        assert_eq!(long.live_state(), "Covers this 6-cell jump");
-        let spoken = long
-            .clone()
-            .with_focus_label("Trail length")
-            .semantic_value();
-        assert!(
-            spoken.contains(&format!("Trail length · {}.", long.live_state())),
-            "{spoken}"
-        );
-        assert!(
-            long.header_rungs()
-                .iter()
-                .all(|rung| !rung.contains("Live"))
-        );
-        assert!(!long.reads_live());
-        let cut = focused(3);
-        assert!(cut.reads_live(), "{}", cut.live_state());
-        assert!(!cut.live_state().contains("jump"));
-        let spoken = cut
-            .clone()
-            .with_focus_label("Trail length")
-            .semantic_value();
-        assert!(
-            !spoken.contains("jump") && !spoken.contains("blank cells"),
-            "{spoken}"
-        );
-        let one = focused(1).with_focus_label("Trail length");
+        // Comet's Return lays the whole line it leaves, a cell a column; Fire flies the Tab's
+        // leap as a meteor, and the Return's, steep, shorter; Phaser lays nothing off its row,
+        // so only the Tab shows its length, short of the cell it leaves.
+        let line = CURSOR_SCENE_COMMAND.len();
+        let tab = CURSOR_SCENE_TAB.1 - CURSOR_SCENE_TAB.0;
+        for (raw, reach) in [("comet", line), ("fire", tab), ("phaser", tab - 1)] {
+            let long = focused(raw, reach);
+            let says = format!("Preview shows up to {reach} cells");
+            assert_eq!(long.live_state(), says, "{raw}");
+            let spoken = long
+                .clone()
+                .with_focus_label("Trail length")
+                .semantic_value();
+            assert!(
+                spoken.contains(&format!("Trail length · {says}.")),
+                "{raw}: {spoken}"
+            );
+            assert!(
+                long.header_rungs()
+                    .iter()
+                    .all(|rung| !rung.contains("Live")),
+                "{raw}"
+            );
+            assert!(!long.reads_live(), "{raw}");
+            let cut = focused(raw, reach - 1);
+            assert!(cut.reads_live(), "{raw}: {}", cut.live_state());
+            let spoken = cut
+                .clone()
+                .with_focus_label("Trail length")
+                .semantic_value();
+            assert!(!spoken.contains("Preview shows up to"), "{raw}: {spoken}");
+        }
+        let one = focused("comet", 1).with_focus_label("Trail length");
         assert!(
             one.header_rungs()[0].starts_with("Trail length: 1 cell ·"),
             "{:?}",
             one.header_rungs()
         );
-        let fire = |length: usize| {
-            SettingsPreviewSpec::cursor(CursorPreviewSpec {
-                trail_style: PreviewTrailStyle::Fire,
-                trail_style_raw: Arc::from("fire"),
-                length,
-                ..CursorPreviewSpec::default()
-            })
-            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_LENGTH, length.to_string())
-            .with_phase(900)
-            .normalized()
-        };
-        for length in [2, 24] {
-            assert_eq!(fire(length).live_state(), "Shown over blank cells only");
-            assert!(!fire(length).reads_live());
-            let spoken = fire(length)
-                .with_focus_label("Trail length")
-                .semantic_value();
-            assert!(
-                spoken.contains(&format!("Trail length · {}.", fire(length).live_state())),
-                "{spoken}"
-            );
-        }
+    }
+
+    /// The heat shimmer is the GPU's refraction over the flames, which the CPU-drawn preview
+    /// cannot draw: focused, the header says so instead of calling the trail live (it said
+    /// "Live trail" while turning the shimmer on or off changed nothing it drew).
+    #[test]
+    fn a_focused_heat_shimmer_says_the_preview_cannot_show_it() {
+        let focused = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            trail_style: PreviewTrailStyle::Fire,
+            trail_style_raw: Arc::from("fire"),
+            ..CursorPreviewSpec::default()
+        })
+        .with_focus(crate::prefs::EDIT_CURSOR_FIRE_SHIMMER, "true")
+        .with_focus_label("Heat shimmer")
+        .with_phase(900)
+        .normalized();
+        assert_eq!(focused.live_state(), SHIMMER_PREVIEW_CAVEAT);
+        assert!(!focused.reads_live());
+        assert!(
+            focused
+                .header_rungs()
+                .iter()
+                .all(|rung| !rung.contains("Live")),
+            "{:?}",
+            focused.header_rungs()
+        );
+        assert!(
+            focused
+                .semantic_value()
+                .contains(&format!("Heat shimmer · {SHIMMER_PREVIEW_CAVEAT}.")),
+            "{}",
+            focused.semantic_value()
+        );
     }
 
     #[test]
@@ -9061,8 +9265,8 @@ mod tests {
         for (rows, line) in [
             (&color, "PS C:\\src> git status --short"),
             (&color, "PS C:\\src> cargo test"),
-            (&cursor, "PS C:\\> cat notes.md"),
-            (&cursor, "PS C:\\> git add .\\notes.md; git commit"),
+            (&cursor, "PS C:\\> cat README.md"),
+            (&cursor, "PS C:\\> git add .\\README.md; git commit"),
         ] {
             assert!(rows.iter().any(|row| row == line), "{line}: {rows:#?}");
         }
@@ -9075,7 +9279,7 @@ mod tests {
         assert!(sh.iter().any(|row| row == "$ git status --short"));
         assert_eq!(
             sample_rows(&CURSOR_SPECIMEN_LINES_SH.join("\r\n"))[4],
-            "~/demo $ cat notes.md"
+            "~/demo $ cat README.md"
         );
         for row in color.iter().chain(&sh) {
             assert!(row.chars().count() <= SPECIMEN_COLS, "{row}");
@@ -9101,7 +9305,7 @@ mod tests {
             let line = TypedLine::of(&input.cells[0]);
             assert_eq!(
                 (line.start, line.end),
-                (prompt.len(), prompt.len() + 30),
+                (prompt.len(), prompt.len() + 31),
                 "{prompt}"
             );
             let typed: String = input.cells[0][line.start..line.end]
@@ -9109,9 +9313,9 @@ mod tests {
                 .map(|cell| cell.ch)
                 .collect();
             let command = if prompt.starts_with("PS") {
-                "git add .\\notes.md; git commit"
+                "git add .\\README.md; git commit"
             } else {
-                "git add notes.md && git commit"
+                "git add README.md && git commit"
             };
             assert_eq!(typed, command, "{prompt}");
         }

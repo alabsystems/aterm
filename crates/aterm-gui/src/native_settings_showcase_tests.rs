@@ -5696,7 +5696,7 @@ fn a_theme_file_published_again_repaints_its_rows_slab() {
             .iter()
             .find(|node| node.key.as_str() == slab)
             .and_then(|node| match &node.content {
-                crate::native_ui::UiContent::Custom(custom) => custom.value.clone(),
+                crate::native_ui::UiContent::Custom(custom) => custom.paint.clone(),
                 _ => None,
             })
             .expect("Mine's row paints its slab")

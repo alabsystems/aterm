@@ -418,18 +418,20 @@ fn hit_under(app: &App, (x, y): (f64, f64)) -> Option<String> {
         .map(|hit| hit.key.as_str().to_string())
 }
 
-fn click_still(app: &mut App, (x, y): (f64, f64)) {
+/// A click at a still pointer `(x, y)` whose button went down and up at `when`.
+fn click_still(app: &mut App, (x, y): (f64, f64), when: std::time::Instant) {
     use aterm_window::event::{ElementState, MouseButton};
     for state in [ElementState::Pressed, ElementState::Released] {
         app.on_cursor_moved(WindowId(0), x, y);
-        app.on_mouse_input(WindowId(0), state, MouseButton::Left);
+        app.on_mouse_input_at(WindowId(0), state, MouseButton::Left, when);
     }
 }
 
 /// A DOUBLE-CLICK IS ONE CLICK'S WORTH ON WHAT IT PRESSED: the second press of a double-click on
 /// Keep, which lands once Keep's save has put Customize under the still pointer, opens nothing
 /// and only lights Customize, as a triple-click's third does; a press after a double click's
-/// interval opens it. (The second press opened the Customize sheet.)
+/// interval opens it. (The second press opened the Customize sheet.) Each press states when it
+/// happened, so how long the work between presses takes never moves one across the interval.
 #[test]
 fn a_double_click_on_keep_never_opens_what_takes_its_place() {
     let mut app = app();
@@ -442,7 +444,11 @@ fn a_double_click_on_keep_never_opens_what_takes_its_place() {
     let view = present_themes(&mut app);
     let at = pointer_at(&app, view, "settings/showcase/keep");
     app.native_config_inflight = true;
-    click_still(&mut app, at);
+    let interval = std::time::Duration::from_millis(
+        u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
+    );
+    let first = std::time::Instant::now();
+    click_still(&mut app, at, first);
     complete_settings_save(&mut app, false);
     app.sync_settings_theme_trial(std::time::Instant::now());
     assert_eq!(
@@ -460,10 +466,10 @@ fn a_double_click_on_keep_never_opens_what_takes_its_place() {
         let (_, _, _, state) = app.native_settings_view_target().unwrap();
         state.showcase.sheet_open
     };
-    click_still(&mut app, at);
+    click_still(&mut app, at, first + interval);
     assert!(
         !sheet_open(&app),
-        "the double-click's second press opened nothing"
+        "the double-click's second press, at the interval's last instant, opened nothing"
     );
     let lit = app
         .native_runtime
@@ -472,17 +478,16 @@ fn a_double_click_on_keep_never_opens_what_takes_its_place() {
         .map(|key| key.as_str().to_string());
     assert_eq!(lit.as_deref(), Some("settings/showcase/customize"));
     present_themes(&mut app);
-    click_still(&mut app, at);
+    click_still(&mut app, at, first + interval * 2);
     assert!(!sheet_open(&app), "nor did a triple-click's third");
     present_themes(&mut app);
-    app.windows
-        .get_mut(&WindowId(0))
-        .and_then(|ws| ws.native_rest.as_mut())
-        .expect("the pointer rests")
-        .age_press();
-    click_still(&mut app, at);
+    click_still(
+        &mut app,
+        at,
+        first + interval * 3 + std::time::Duration::from_millis(1),
+    );
     assert!(
         sheet_open(&app),
-        "a press after the interval opens Customize"
+        "a press a millisecond after the interval opens Customize"
     );
 }

@@ -7,6 +7,8 @@ use aterm_spec::derive::Model;
 
 mod dispatch;
 pub use dispatch::resource_dispatch_model;
+mod discovery;
+pub use discovery::discovery_replacement_model;
 mod enrollment_gate;
 pub use enrollment_gate::enrollment_gate_model;
 

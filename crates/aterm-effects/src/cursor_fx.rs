@@ -165,12 +165,15 @@ pub fn forge_cursor_fill(
     glow_cfg: &GlowConfig,
     fill: impl FnOnce() -> Option<u32>,
 ) -> Option<u32> {
-    (cursor_body_allowed
+    if cursor_body_allowed
         && glow_cfg.enabled
         && glow_cfg.intensity > 0.0
-        && matches!(glow_cfg.style, GlowStyle::Fire))
-    .then(fill)
-    .flatten()
+        && matches!(glow_cfg.style, GlowStyle::Fire)
+    {
+        fill()
+    } else {
+        None
+    }
 }
 
 /// The cursor-body fills one tick can produce (plus the momentum tint), in precedence order.
@@ -1171,12 +1174,18 @@ impl CursorFx {
         // Sparkle's caret on paper is its paper gold deepened in its hue, not its dark-theme
         // peach, which deepens to a mustard brown beside the gold its puff wears. A colour the
         // user chose is its own.
-        let sparkle_paper_rod = (warm
+        let sparkle_paper_rod = if warm
             && !dark
             && !tinted
             && !f.cursor_color_pinned
-            && matches!(glow_cfg.style, GlowStyle::Sparkle))
-        .then(|| crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0));
+            && matches!(glow_cfg.style, GlowStyle::Sparkle)
+        {
+            Some(crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(
+                glow_cfg, 1.0,
+            ))
+        } else {
+            None
+        };
         let (rod_color, rod_haze) = match glow_cfg.style {
             GlowStyle::Beam => (glow_cfg.color, aterm_render::BEAM_SPACE_HAZE),
             GlowStyle::Sparkle if let Some(gold) = sparkle_paper_rod => {
@@ -1206,7 +1215,11 @@ impl CursorFx {
         // charge are the paper gold its body wears, not the peach of its
         // dark-theme colour, which deepens to brown (looks6 N7). A pinned
         // cursor colour or the user's own trail colour is never recoloured.
-        let sparkle_paper_gold = sparkle_paper_rod.filter(|_| glow_cfg.enabled);
+        let sparkle_paper_gold = if glow_cfg.enabled {
+            sparkle_paper_rod
+        } else {
+            None
+        };
         self.momentum.set_light_vivid(sparkle_paper_gold.is_some());
         let momentum_frame = self.momentum.tick(
             cur,
@@ -1222,9 +1235,12 @@ impl CursorFx {
                 hue: if !glow_cfg.enabled {
                     f.live_cursor & 0x00FF_FFFF
                 } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
-                    sparkle_paper_rod.unwrap_or_else(|| {
-                        crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0)
-                    })
+                    match sparkle_paper_rod {
+                        Some(rod) => rod,
+                        None => {
+                            crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0)
+                        }
+                    }
                 } else {
                     rod_color
                 },
@@ -1232,7 +1248,10 @@ impl CursorFx {
                 theme_bg: glow_cfg.theme_bg,
                 block: is_block(f.cursor_style),
                 glyph_span: if momentum_enabled && !dark {
-                    cur.and_then(|cell| self.glow.caret_row_glyphs(cell))
+                    match cur {
+                        Some(cell) => self.glow.caret_row_glyphs(cell),
+                        None => None,
+                    }
                 } else {
                     None
                 },
@@ -1265,15 +1284,16 @@ impl CursorFx {
         } else {
             0
         };
-        let momentum_steady = momentum_frame
-            .hot
-            .then_some(match f.cursor_style {
-                CursorStyle::BlinkingBlock => CursorStyle::SteadyBlock,
-                CursorStyle::BlinkingUnderline => CursorStyle::SteadyUnderline,
-                CursorStyle::BlinkingBar => CursorStyle::SteadyBar,
-                other => other,
-            })
-            .filter(|s| *s != f.cursor_style);
+        let momentum_steady = if momentum_frame.hot {
+            match f.cursor_style {
+                CursorStyle::BlinkingBlock => Some(CursorStyle::SteadyBlock),
+                CursorStyle::BlinkingUnderline => Some(CursorStyle::SteadyUnderline),
+                CursorStyle::BlinkingBar => Some(CursorStyle::SteadyBar),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53) ^ held_print.rotate_left(31);
         let body_from = self.glow_scratch.len();
         let comet_frame = self.comet.tick(
@@ -1289,7 +1309,7 @@ impl CursorFx {
                 dark_theme: dark,
                 theme_fg: glow_cfg.theme_fg,
                 theme_bg: glow_cfg.theme_bg,
-                pinned: pinned_base.map(|c| c & 0x00FF_FFFF) == Some(glow_cfg.color & 0x00FF_FFFF),
+                pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (glow_cfg.color & 0x00FF_FFFF)),
             },
             &mut self.glow_scratch,
             self.glow.under_sink(),
@@ -1345,7 +1365,7 @@ impl CursorFx {
                 dark_theme: dark,
                 theme_fg: glow_cfg.theme_fg,
                 theme_bg: glow_cfg.theme_bg,
-                pinned: pinned_base.map(|c| c & 0x00FF_FFFF) == Some(rod_color & 0x00FF_FFFF),
+                pinned: matches!(pinned_base, Some(c) if (c & 0x00FF_FFFF) == (rod_color & 0x00FF_FFFF)),
             },
             &mut self.glow_scratch,
             self.glow.under_sink(),
@@ -1450,11 +1470,12 @@ impl CursorFx {
             }
         });
         let block_fill = project_block_fill(candidate, f.live_cursor, f.shed_envelope);
-        let glow_fp = block_fill.map_or(glow_fp, |owned| {
-            glow_fp
+        let glow_fp = match block_fill {
+            Some(owned) => glow_fp
                 .wrapping_mul(1_000_003)
-                .wrapping_add(u64::from(owned.fill) | (1 << 32))
-        });
+                .wrapping_add(u64::from(owned.fill) | (1 << 32)),
+            None => glow_fp,
+        };
         CursorFxFrame {
             glow_fp,
             trail_fp,

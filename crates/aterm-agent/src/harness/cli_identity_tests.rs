@@ -185,13 +185,178 @@ fn terminal_codex_refuses_wrong_or_missing_identity_without_replacing_a_binding(
 }
 
 #[test]
+fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() {
+    for change in ["email", "removed", "malformed", "missing", "binding"] {
+        for outcome in ["signed-in", "signed-out", "failed", "during-status"] {
+            let tmp = tmp_dir("plain-login-policy");
+            let env = env_at(&tmp);
+            assert_eq!(acc_quiet(add("work", Class::Dedicated), &env).0, exit(0));
+            let store = env.accounts_store();
+            let path = env.accounts_roster().unwrap();
+            let original = std::fs::read_to_string(&path).unwrap();
+            let original_dir = store.login_dir("work").unwrap();
+            let after = std::cell::RefCell::new(None);
+            let snapshot = || {
+                [
+                    store.state_file(),
+                    store.logins_file(),
+                    store.ledger_path(),
+                    store.wake_path(),
+                ]
+                .map(|path| std::fs::read(path).ok())
+            };
+            let mutate = || {
+                match change {
+                    "email" => std::fs::write(
+                        &path,
+                        format!("{original}\nemail = 'changed@example.test'\n"),
+                    )
+                    .unwrap(),
+                    "removed" => std::fs::write(&path, "").unwrap(),
+                    "malformed" => std::fs::write(&path, "[[broken").unwrap(),
+                    "missing" => std::fs::rename(&path, path.with_extension("kept")).unwrap(),
+                    "binding" => {
+                        store
+                            .transact_logins(env.now, &mut None, |state, logins| {
+                                Ok(accounts::note_renewed(
+                                    state,
+                                    logins,
+                                    "work",
+                                    original_dir.to_str(),
+                                    "/concurrent-login",
+                                    None,
+                                    env.now,
+                                ))
+                            })
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                *after.borrow_mut() = Some(snapshot());
+            };
+            let status = |_: &str| {
+                assert_ne!(outcome, "failed", "failed login must not query status");
+                if outcome == "during-status" {
+                    mutate();
+                }
+                said(outcome != "signed-out")
+            };
+            let mut host = FakeHost::new(&status);
+            host.tty = true;
+            host.writes_home = true;
+            host.login = Ok(if outcome == "failed" { 1 } else { 0 });
+            host.after_login = (outcome != "during-status").then_some(&mutate);
+            let (code, out, err) = acc(
+                AccountsCmd::Login {
+                    label: "work".into(),
+                },
+                &env,
+                &host,
+            );
+            assert_eq!(code, exit(1), "{change}/{outcome}: {err}");
+            assert_eq!(
+                snapshot(),
+                after.borrow().clone().unwrap(),
+                "{change}/{outcome}"
+            );
+            assert!(!out.contains("work: signed in"));
+            assert!(!original_dir.join(".claude.json").is_file());
+            let staging = PathBuf::from(host.logins.borrow()[0].as_ref().unwrap());
+            assert!(staging.join(".claude.json").is_file());
+            assert!(!staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists());
+        }
+    }
+}
+
+#[test]
+fn plain_claude_login_preserves_the_bound_directory_and_adopts_only_staging() {
+    let tmp = tmp_dir("plain-login-bound-directory");
+    let env = env_at(&tmp);
+    let (old, _) = three_accounts(&tmp, &env);
+    let fresh = tmp.path().join("fresh-login");
+    login_made_in(&fresh);
+    let previous = every_file(&fresh);
+    let store = env.accounts_store();
+    store
+        .transact_logins(env.now, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                "work-2",
+                Some(&old),
+                fresh.to_str().unwrap(),
+                None,
+                env.now,
+            ))
+        })
+        .unwrap();
+    let status = |_: &str| said(true);
+    let mut host = FakeHost::new(&status);
+    host.tty = true;
+    host.writes_home = true;
+    let (code, _, err) = acc(
+        AccountsCmd::Login {
+            label: "work-2".into(),
+        },
+        &env,
+        &host,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    let staging = host.logins.borrow()[0].as_ref().unwrap().clone();
+    assert_ne!(staging, fresh.to_str().unwrap());
+    assert_eq!(*host.asked.borrow(), vec![staging.clone()]);
+    assert_eq!(every_file(&fresh), previous);
+    assert_eq!(
+        store
+            .load_logins(env.now)
+            .unwrap()
+            .0
+            .get("work-2")
+            .unwrap()
+            .dir
+            .as_deref(),
+        Some(staging.as_str())
+    );
+}
+
+#[test]
+fn a_claude_identity_expectation_cannot_use_unchecked_plain_login() {
+    let tmp = tmp_dir("claude-identity-plain-login");
+    let env = env_at(&tmp);
+    std::fs::write(
+        env.accounts_roster().unwrap(),
+        "[[account]]\nlabel='account'\nclass='dedicated'\nidentity_email='owner@example.test'\n",
+    )
+    .unwrap();
+    let mut host = FakeHost::new(&never_asked);
+    host.tty = true;
+    let (code, _, err) = acc(
+        AccountsCmd::Login {
+            label: "account".into(),
+        },
+        &env,
+        &host,
+    );
+    assert_eq!(code, exit(1));
+    assert!(err.contains("requires a checked identity"), "{err}");
+    assert!(host.logins.borrow().is_empty());
+    assert!(!env.accounts_store().state_file().exists());
+}
+
+#[test]
 fn duplicate_canonical_identities_and_unsupported_alias_options_refuse() {
     let text = "[[account]]\nlabel='one'\nclass='dedicated'\ndir='/one'\nemail='alias@example.test'\nidentity_email='owner@example.test'\n\n[[account]]\nlabel='two'\nclass='dedicated'\ndir='/two'\nemail='OWNER@example.test'\n";
     assert!(Roster::parse_for(Cli::Codex, text).is_err());
     assert!(Roster::parse_for(Cli::Claude, text).is_err());
     assert!(
         parsed(
-            "accounts add account --email alias@example.test --identity-email owner@example.test"
+            "accounts add account --cli grok --email alias@example.test --identity-email owner@example.test"
+        )
+        .is_err()
+    );
+    assert!(
+        parsed(
+            "accounts adopt-default account --cli kimi --email alias@example.test --identity-email owner@example.test --region global"
         )
         .is_err()
     );
@@ -297,6 +462,7 @@ fn codex_recovery_requires_scoped_identity_and_a_status_check() {
             None,
             proof,
             env.now - 1,
+            &store.load_logins(env.now).unwrap().0,
         )
         .unwrap();
         let path = tmp.path().join("accounts-codex.toml");
@@ -310,7 +476,7 @@ fn codex_recovery_requires_scoped_identity_and_a_status_check() {
         let recovered = crate::harness::accounts_sync::recover_staging_renewals_for(
             Cli::Codex,
             &store,
-            (&roster, &path),
+            &path,
             env.now,
         );
         assert_eq!(

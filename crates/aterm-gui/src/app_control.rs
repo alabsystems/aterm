@@ -11,7 +11,7 @@ use aterm_types::app_inspection::{
     InspectionProjection, InspectionSubject, OpenAppRequest as WireOpenAppRequest, WireViewId,
 };
 
-use crate::native_app::{ActionInvocation, AppEvent, EventResult, SemanticInput, ViewCx};
+use crate::native_app::{ActionInvocation, EventResult, SemanticInput, ViewCx};
 use crate::native_ui::{ActionId, CompiledUi, SemanticRole, SemanticValue, UiKey};
 use crate::tab_model::{LogicalRect, SplitAxis, SplitTree, Tab, View, ViewId};
 use crate::{App, WindowId};
@@ -267,13 +267,15 @@ impl App {
         }
         let value = semantic_input(&node.role, &node.value, request.value.as_deref())?;
         let result = self.with_gesture_source(true, |app| {
-            app.dispatch_native_view_event(
+            app.dispatch_native_control_action(
                 wid,
                 request.view,
-                AppEvent::Action(ActionInvocation {
+                key,
+                ActionInvocation {
                     id: ActionId::new(request.action.clone()),
                     value,
-                }),
+                },
+                true,
             )
         })?;
         if result != EventResult::Handled {
@@ -810,7 +812,7 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
         lines.push(format!(
             "editor-painted-status key={:?} value={painted_status:?} truncated={}",
             paint.key.as_str(),
-            semantic_status != painted_status,
+            !crate::native_ui::footer_shows_whole(semantic_status, painted_status),
         ));
         lines.push(format!(
             "editor-minibuffer key={:?} active={} value={:?}",
@@ -1170,6 +1172,7 @@ fn inspection_revision(fingerprint: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_app::AppEvent;
 
     /// `act` reaches a control a Settings list holds off screen: it scrolls
     /// the row into view and presses it. A key no list holds stays refused.
@@ -1342,6 +1345,7 @@ mod tests {
                     dirty: true,
                     saving: false,
                     focused: true,
+                    focus_visible: true,
                     action: Some(ActionId::new("editor/focus-buffer")),
                 }),
             )
@@ -1643,6 +1647,232 @@ mod tests {
             "{audit:#?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn advertised_editor_buffer_action_focuses_only_its_live_view() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-control-editor-buffer-focus-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        let other_path = dir.join("other.txt");
+        std::fs::write(&path, "aéz\n").unwrap();
+        std::fs::write(&other_path, "other window\n").unwrap();
+        let mut app = App::headless_for_test();
+        let target_window = WindowId(0);
+        app.open_document_tab_in_window(
+            target_window,
+            crate::native_app::AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+        )
+        .unwrap();
+        let (instance, view) = app.active_native_view(target_window).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        app.dispatch_native_view_event(
+            target_window,
+            view,
+            AppEvent::EditorSetSelection { anchor: 1, head: 3 },
+        )
+        .unwrap();
+        app.reconcile_active_editor_viewport(target_window).unwrap();
+        let target_tab = app.windows[&target_window]
+            .tab_set
+            .active()
+            .unwrap()
+            .clone();
+
+        let session = app.next_session_id;
+        let front_window = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        app.open_document_tab_in_window(
+            front_window,
+            crate::native_app::AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&other_path).unwrap(),
+        )
+        .unwrap();
+        let (other_instance, other_view) = app.active_native_view(front_window).unwrap();
+        let other_document = app.native_runtime.document_id(other_instance).unwrap();
+        app.reconcile_active_editor_viewport(front_window).unwrap();
+        let front_tab = app.windows[&front_window].tab_set.active().unwrap().clone();
+        let editor_state = |app: &App, view| {
+            let Some(crate::native_app::AppViewState::Editor(state)) =
+                app.native_runtime.view_state(view)
+            else {
+                panic!("editor view remains attached")
+            };
+            state.as_ref().clone()
+        };
+        let document_state = |app: &App, document| {
+            let snapshot = app.document_store.snapshot(document).unwrap();
+            (
+                snapshot.seq,
+                snapshot.text,
+                app.document_store.dirty(document),
+                app.document_store.checkpoint_seq(document),
+            )
+        };
+        let before = editor_state(&app, view);
+        let other_before = editor_state(&app, other_view);
+        let document_before = document_state(&app, document);
+        let other_document_before = document_state(&app, other_document);
+        let initial_lifetime = before.common.input_lifetime();
+        let other_lifetime = other_before.common.input_lifetime();
+        assert_eq!(app.frontmost_window, Some(front_window));
+        assert!(before.common.last_focus.is_none());
+
+        let key = UiKey::new("editor/buffer");
+        let inspected = app.compile_view(view).unwrap();
+        let node = inspected.compiled.semantic(&key).unwrap();
+        assert_eq!(node.role, SemanticRole::TextViewport);
+        assert_eq!(
+            node.action.as_ref().unwrap().as_str(),
+            "editor/focus-buffer"
+        );
+        assert!(node.state.is_none_or(|state| state.enabled));
+        assert!(!node.offscreen);
+        assert!(inspected.compiled.focus_order.contains(&key));
+        let request = parse_act(&format!(
+            "app/v1 view {} editor/buffer editor/focus-buffer",
+            view.get()
+        ))
+        .unwrap();
+        let mut wrong_action = request.clone();
+        wrong_action.action = "editor/find".to_string();
+        assert!(app.act_app(wrong_action).is_err());
+        let mut supplied_value = request.clone();
+        supplied_value.value = Some("must not replace this document".to_string());
+        assert!(app.act_app(supplied_value).is_err());
+        assert_eq!(editor_state(&app, view), before);
+        assert!(std::sync::Arc::ptr_eq(
+            &initial_lifetime,
+            &editor_state(&app, view).common.input_lifetime()
+        ));
+
+        let mut failures = Vec::new();
+        if let Err(error) = app.act_app(request.clone()) {
+            failures.push(format!("advertised buffer action refused: {error}"));
+        }
+        let focused = editor_state(&app, view);
+        if focused.common.last_focus.as_ref() != Some(&key) || !focused.common.focus_visible {
+            failures.push("buffer action did not install visible field focus".to_string());
+        }
+        let focused_lifetime = focused.common.input_lifetime();
+        if std::sync::Arc::ptr_eq(&initial_lifetime, &focused_lifetime) {
+            failures.push("buffer focus did not retire the previous input lifetime".to_string());
+        }
+        let painted = app.compile_view(view).unwrap();
+        let viewport = painted
+            .compiled
+            .paint
+            .iter()
+            .find_map(|paint| {
+                if paint.key != key {
+                    return None;
+                }
+                let crate::native_ui::UiContent::TextViewport(spec) = &paint.content else {
+                    return None;
+                };
+                Some(spec)
+            })
+            .unwrap();
+        if !viewport.focused {
+            failures.push("buffer action did not reach the focused viewport paint".to_string());
+        }
+        if let Err(error) = app.act_app(request.clone()) {
+            failures.push(format!("repeated buffer action refused: {error}"));
+        }
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &focused_lifetime,
+                &editor_state(&app, view).common.input_lifetime()
+            ),
+            "reaffirming the same field preserves its input lifetime"
+        );
+        assert_eq!(editor_state(&app, view).buffer, before.buffer);
+        assert_eq!(
+            app.windows[&target_window].tab_set.active(),
+            Some(&target_tab)
+        );
+        assert_eq!(
+            app.windows[&front_window].tab_set.active(),
+            Some(&front_tab)
+        );
+        assert_eq!(app.frontmost_window, Some(front_window));
+        assert_eq!(editor_state(&app, other_view), other_before);
+        assert!(std::sync::Arc::ptr_eq(
+            &other_lifetime,
+            &editor_state(&app, other_view).common.input_lifetime()
+        ));
+
+        assert!(app.open_settings_tab_in_window(
+            target_window,
+            crate::native_settings::SettingsRoute::About
+        ));
+        let (_, settings_view) = app.active_native_view(target_window).unwrap();
+        let settings_before = app
+            .native_runtime
+            .view_state(settings_view)
+            .unwrap()
+            .common()
+            .clone();
+        let inactive_before = editor_state(&app, view);
+        assert!(
+            app.act_app(request.clone()).is_err(),
+            "an inactive view cannot borrow the current native target"
+        );
+        assert_eq!(editor_state(&app, view), inactive_before);
+        assert_eq!(
+            app.native_runtime
+                .view_state(settings_view)
+                .unwrap()
+                .common(),
+            &settings_before
+        );
+        let index = app.windows[&target_window]
+            .tab_set
+            .tabs()
+            .iter()
+            .position(|tab| tab.id == target_tab.id)
+            .unwrap();
+        assert!(!app.close_tab_at(target_window, index));
+        assert!(app.native_runtime.view_state(view).is_none());
+        assert!(
+            app.act_app(request).is_err(),
+            "a retired view cannot redirect its action to a replacement"
+        );
+        assert_eq!(
+            app.active_native_view(target_window).unwrap().1,
+            settings_view
+        );
+        assert_eq!(
+            app.native_runtime
+                .view_state(settings_view)
+                .unwrap()
+                .common(),
+            &settings_before
+        );
+        assert_eq!(app.frontmost_window, Some(front_window));
+        assert_eq!(
+            app.windows[&front_window].tab_set.active(),
+            Some(&front_tab)
+        );
+        assert_eq!(editor_state(&app, other_view), other_before);
+        assert!(std::sync::Arc::ptr_eq(
+            &other_lifetime,
+            &editor_state(&app, other_view).common.input_lifetime()
+        ));
+        assert_eq!(document_state(&app, document), document_before);
+        assert_eq!(document_state(&app, other_document), other_document_before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aéz\n");
+        assert_eq!(
+            std::fs::read_to_string(&other_path).unwrap(),
+            "other window\n"
+        );
+        assert!(app.structural_invariants_ok());
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

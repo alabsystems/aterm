@@ -457,8 +457,8 @@ fn forged_row(field: BundleField, item: &str) -> BundleRefusal {
 }
 
 #[inline]
-fn wide(n: usize) -> u64 {
-    u64::try_from(n).unwrap_or(u64::MAX)
+const fn wide(n: usize) -> u64 {
+    n as u64
 }
 
 fn encode_verdict(e: &mut Enc, v: &RowVerdict) {
@@ -527,10 +527,12 @@ fn decode_kind(d: &mut Dec<'_>) -> Result<ItemKind, WireFault> {
     let seed = d.u64(FIELD)?;
     let stratum = d.opt(FIELD, |d| {
         let name = d.str(FIELD)?;
-        Stratum::ALL
-            .into_iter()
-            .find(|s| s.name() == name)
-            .ok_or(WireFault::NonCanonical { field: FIELD })
+        for s in Stratum::ALL {
+            if s.name() == name {
+                return Ok(s);
+            }
+        }
+        Err(WireFault::NonCanonical { field: FIELD })
     })?;
     match (tag, stratum) {
         (0, None) if seed == 0 => Ok(ItemKind::GoldenTrace),
@@ -692,7 +694,11 @@ fn decode_publication(d: &mut Dec<'_>) -> Result<Publication, WireFault> {
 
 fn decode_strs(d: &mut Dec<'_>, field: &'static str) -> Result<Vec<String>, WireFault> {
     let n = d.count(field, MAX_ASSUMPTIONS)?;
-    (0..n).map(|_| Ok(d.str(field)?.to_owned())).collect()
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(d.str(field)?.to_owned());
+    }
+    Ok(out)
 }
 
 impl UncheckedBundle {
@@ -757,15 +763,14 @@ impl UncheckedBundle {
         if magic[8] != BUNDLE_MAGIC[8] {
             return Err(BundleRefusal::Format { found: magic[8] });
         }
-        let body_len = bytes
-            .len()
-            .checked_sub(SEAL_LEN)
-            .filter(|&n| n >= BUNDLE_MAGIC.len())
-            .ok_or(BundleRefusal::Wire(WireFault::Truncated {
+        if bytes.len() < BUNDLE_MAGIC.len() + SEAL_LEN {
+            return Err(BundleRefusal::Wire(WireFault::Truncated {
                 field: "bundle.seal",
                 need: SEAL_LEN,
                 have: bytes.len() - BUNDLE_MAGIC.len(),
-            }))?;
+            }));
+        }
+        let body_len = bytes.len() - SEAL_LEN;
         let (body, closing) = bytes.split_at(body_len);
         let mut sealed = [0u8; SEAL_LEN];
         sealed.copy_from_slice(closing);
@@ -802,20 +807,20 @@ impl UncheckedBundle {
         let build = d.str("bundle.build")?.to_owned();
         let toolchain = d.str("bundle.toolchain")?.to_owned();
         let n = d.count("bundle.rows", MAX_ROWS)?;
-        let rows = (0..n)
-            .map(|_| decode_row(d))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            rows.push(decode_row(d)?);
+        }
         let selection = decode_selection(d)?;
         let publication = d.opt("bundle.publication", decode_publication)?;
         let n = d.count("bundle.timings", MAX_TIMINGS)?;
-        let timings = (0..n)
-            .map(|_| {
-                Ok(Timing {
-                    label: d.str("bundle.timing")?.to_owned(),
-                    measured_ns: d.u64("bundle.timing")?,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut timings = Vec::with_capacity(n);
+        for _ in 0..n {
+            timings.push(Timing {
+                label: d.str("bundle.timing")?.to_owned(),
+                measured_ns: d.u64("bundle.timing")?,
+            });
+        }
         let grade = d.str("bundle.grade")?.to_owned();
         let tested_assumptions = decode_strs(d, "bundle.tested_assumptions")?;
         let plan_assumptions = decode_strs(d, "bundle.plan_assumptions")?;
@@ -901,8 +906,10 @@ impl CandidateBundle {
         check_rows(&b, evaluator, plan)?;
         check_selection(&b, evaluator)?;
         check_grid(&b, evaluator, plan)?;
-        if b.timings.iter().any(|t| t.label.is_empty()) {
-            return Err(forged(BundleField::Timings));
+        for t in &b.timings {
+            if t.label.is_empty() {
+                return Err(forged(BundleField::Timings));
+            }
         }
         if let Some(p) = &b.publication {
             check_publication(&b, p, evaluator)?;
@@ -974,10 +981,12 @@ fn check_identities(b: &UncheckedBundle, ev: &Evaluator) -> Result<(), BundleRef
             BundleField::Assumptions,
         ),
     ];
-    match checks.into_iter().find(|&(ok, _)| !ok) {
-        Some((_, field)) => Err(forged(field)),
-        None => Ok(()),
+    for (ok, field) in checks {
+        if !ok {
+            return Err(forged(field));
+        }
     }
+    Ok(())
 }
 
 fn check_proposer(b: &UncheckedBundle) -> Result<(), BundleRefusal> {
@@ -987,10 +996,13 @@ fn check_proposer(b: &UncheckedBundle) -> Result<(), BundleRefusal> {
         Mode::Distributed => {
             b.round == 0
                 && (b.proposer != GridProposer::new().id()
-                    || usize::try_from(b.index)
-                        .ok()
-                        .and_then(|i| GridProposer::plans().get(i).cloned())
-                        .is_some_and(|p| p == b.plan))
+                    || match usize::try_from(b.index) {
+                        Ok(i) => match GridProposer::plans().get(i) {
+                            Some(p) => *p == b.plan,
+                            None => false,
+                        },
+                        Err(_) => false,
+                    })
         }
     };
     if ok {
@@ -1095,7 +1107,7 @@ pub(super) fn row_difference(r: &Row, again: &Row) -> Option<BundleField> {
 
 /// Whether `r` is a passing row, as [`check_rows`] reads one: its run and `NoStrandedLight`
 /// passed, and lane fidelity did not fail.
-pub(super) fn row_passes(r: &Row) -> bool {
+pub(super) const fn row_passes(r: &Row) -> bool {
     r.run.passed()
         && r.stranded_light.passed()
         && !matches!(r.lane_fidelity, RowVerdict::Fail { .. })
@@ -1170,10 +1182,13 @@ fn check_publication(
     p: &Publication,
     ev: &Evaluator,
 ) -> Result<(), BundleRefusal> {
-    let how = MomentumCode::ALL
-        .iter()
-        .find(|c| p.live_code == c.artifact(&b.build))
-        .and_then(|&c| ev.policy().base(Sched::Prebuilt(c)));
+    let mut how = None;
+    for c in MomentumCode::ALL {
+        if p.live_code == c.artifact(&b.build) {
+            how = ev.policy().base(Sched::Prebuilt(*c));
+            break;
+        }
+    }
     let by_rule = match how {
         Some(Replace::Optimization) => b.selection.useful,
         Some(Replace::Repair) => true,

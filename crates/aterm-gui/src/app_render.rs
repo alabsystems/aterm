@@ -1048,6 +1048,116 @@ pub(crate) fn retire_kitty_cursor_without_owner(
     }
 }
 
+/// What one frame's step of the cursor companions' clocks asks the host to sound.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CompanionStep {
+    /// The celebration's drive this frame (0 once it has wound down).
+    pub(crate) sing_drive: f32,
+    /// A new riff bar to sound: the bar, its gain and the celebration's signature.
+    pub(crate) riff: Option<(u64, f32, u32)>,
+    /// The celebration's outro to sound: its gain and signature.
+    pub(crate) outro: Option<(f32, u32)>,
+}
+
+/// The sound settings a [`step_cursor_companions`] call reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompanionSound {
+    pub(crate) on: bool,
+    pub(crate) riff: bool,
+    pub(crate) volume: f32,
+}
+
+/// Step the cursor companions' clocks for a frame at `now`, drawn or not: the celebration's drive
+/// with its bar fan and outro on the glow (settled once it has wound down), the cat's singing
+/// sync, and the grounding of an ordinary flight no trail owns (`cat_owned` is false where the
+/// route draws no cat). Every route that runs the cursor family steps it, so a companion it does
+/// not draw buys no frame cadence.
+pub(crate) fn step_cursor_companions(
+    ws: &mut WindowState,
+    now: Instant,
+    allowed: bool,
+    glow_cfg: &crate::cursor_glow::GlowConfig,
+    cat_owned: bool,
+    pet_mode: bool,
+    sound: CompanionSound,
+) -> CompanionStep {
+    if !allowed {
+        ws.fx.companions_mut().kitty_sing = aterm_effects::kitty_sing::KittySing::default();
+        ws.fx.companions_mut().music_notes.clear();
+        ws.fx.companions_mut().sing_riff_bar = None;
+    }
+    let sing_drive =
+        if allowed && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty) {
+            ws.fx.companions_mut().kitty_sing.drive(now)
+        } else {
+            0.0
+        };
+    let mut step = CompanionStep {
+        sing_drive,
+        ..CompanionStep::default()
+    };
+    if sing_drive > 0.0 {
+        ws.fx.cursor_mut().glow.celebrate(now, sing_drive);
+        if let Some(bar) = ws.fx.companions_mut().kitty_sing.bar(now)
+            && ws.fx.companions_mut().sing_riff_bar != Some(bar)
+        {
+            ws.fx.companions_mut().sing_riff_bar = Some(bar);
+            step.riff = sing_riff_gain(ws.focused, sound.on, sound.riff, sound.volume)
+                .map(|gain| (bar, gain, ws.fx.companions_mut().kitty_sing.signature()));
+        }
+        if let Some(fan) = ws.fx.companions_mut().kitty_sing.take_bar_fan(now) {
+            ws.fx.cursor_mut().glow.party(now, fan.n, fan.ring);
+        }
+        if let Some(outro) = ws.fx.companions_mut().kitty_sing.take_outro(now) {
+            ws.fx.cursor_mut().glow.party(now, outro.drop, false);
+            step.outro = sing_riff_gain(ws.focused, sound.on, sound.riff, sound.volume)
+                .map(|gain| (gain, outro.sig));
+        }
+    } else {
+        ws.fx.companions_mut().kitty_sing.settle(now);
+        ws.fx.companions_mut().sing_riff_bar = None;
+    }
+    let c = ws.fx.companions_mut();
+    c.cursor_cat.set_singing(
+        now,
+        crate::kitty_cursor::SingSync {
+            drive: sing_drive,
+            beat: c.kitty_sing.beat(now).unwrap_or(0.0),
+        },
+    );
+    retire_kitty_cursor_without_owner(
+        cat_owned && glow_cfg.enabled && allowed,
+        pet_mode,
+        glow_cfg.style,
+        sing_drive,
+        &mut ws.fx.companions_mut().cursor_cat,
+    );
+    step
+}
+
+impl CompanionStep {
+    /// Sound what the step asked for.
+    pub(crate) fn sound(self, audio: &mut crate::trail_audio::TrailAudio) {
+        if let Some((bar, gain, sig)) = self.riff {
+            audio.push(sing_riff_event(bar, gain, sig));
+        }
+        if let Some((gain, sig)) = self.outro {
+            audio.push(sing_outro_event(gain, sig));
+        }
+    }
+}
+
+impl App {
+    /// The sound settings the cursor companions read.
+    pub(crate) fn companion_sound(&self) -> CompanionSound {
+        CompanionSound {
+            on: self.config.trail_sounds_or_default(),
+            riff: self.config.trail_sound_riff_or_default(),
+            volume: self.config.trail_sound_volume(),
+        }
+    }
+}
+
 /// Exact host presentation gate shared by glass and styled captures.
 #[inline]
 pub(crate) fn cursor_cat_presentation_enabled(
@@ -9218,6 +9328,36 @@ impl App {
         self.prepare_native_input_scratch_from_plan(id, plan)
     }
 
+    /// Prepare a glassless window's mixed frame and mark its native leaves presented, as a
+    /// mixed present does (`finalize_successful_present`), so pointer input can aim at them.
+    pub(crate) fn commit_glassless_heterogeneous_frame(&mut self, id: WindowId) -> bool {
+        let Some((plan, route @ crate::VisibleContentRoute::Heterogeneous)) =
+            self.active_visible_frame_layout(id)
+        else {
+            return false;
+        };
+        self.prepare_layout_coordinate_space_from_plan(id, route, &plan);
+        if self
+            .prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(id, None, &plan)
+            .is_none()
+        {
+            return false;
+        }
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        for leaf in &plan.leaves {
+            if let Some(raster) = ws
+                .leaf_render_cache
+                .get_mut(&leaf.view)
+                .and_then(|cache| cache.native.as_mut())
+            {
+                raster.presented = true;
+            }
+        }
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare_heterogeneous_input_scratch(&mut self, id: WindowId) -> Option<String> {
         self.prepare_heterogeneous_input_scratch_with_cursor_fx(id, None)
@@ -9628,7 +9768,6 @@ impl App {
                             terminal.modes().ambiguous_width_double,
                         )
                     };
-                    drop(terminal);
                     if cursor_fx_sample.is_some() {
                         focused_cursor_fx_sample = cursor_fx_sample;
                     }
@@ -9687,9 +9826,21 @@ impl App {
                             sub_cols,
                             leaf.focused,
                         );
+                        cache.hover_key = (
+                            cache.staged_input.terminal_id,
+                            cache.staged_input.engine_fill_seq,
+                            cache.staged_input.display_offset,
+                        );
                         window.leaf_render_cache.insert(leaf.view, cache);
                     }
-                    if leaf.focused && !terminal_title.is_empty() {
+                    if leaf.focused {
+                        // Under the hold that filled the frame, as a terminal tab does.
+                        self.refresh_hover_for_frame_locked(id, &terminal);
+                    }
+                    drop(terminal);
+                    if leaf.focused {
+                        // Empty as well: the window title then falls back to the cwd, as a
+                        // terminal tab's does (`App::window_title_identity`).
                         title = terminal_title.to_string();
                     }
                 }
@@ -10447,7 +10598,7 @@ impl App {
     }
 
     #[cfg(test)]
-    fn prepare_layout_coordinate_space(
+    pub(crate) fn prepare_layout_coordinate_space(
         &mut self,
         id: WindowId,
         route: crate::VisibleContentRoute,
@@ -10518,9 +10669,15 @@ impl App {
             state.fx.regrid_rain();
             state.rain_hidden_band.clear();
         }
-        if composed {
+        // Only a single terminal pane draws the window's scroll pill; any other front would keep
+        // a latch nothing lowers, and the timer tick would redraw it for nothing.
+        if !matches!(
+            route,
+            crate::VisibleContentRoute::Terminal { composed: false }
+        ) {
             state.pill_shown = false;
-        } else {
+        }
+        if !composed {
             state.composed_cursor_effect_valid = false;
             state.composed_cursor_effect_session = None;
         }
@@ -10575,6 +10732,34 @@ impl App {
         }
     }
 
+    /// Step the cursor companions for a mixed frame of window `id` ([`step_cursor_companions`]):
+    /// while its terminal leaf has focus the route draws the glow a celebration lights, so the
+    /// celebration runs and settles, and it draws no cat, so an ordinary flight it fed is grounded.
+    /// A focused native leaf draws no glow and the scheduler plans no celebration deadline for it,
+    /// so its frames leave the song for the terminal leaf's return, as the Native route does.
+    fn step_heterogeneous_companions(&mut self, id: WindowId, now: Instant) {
+        let allowed = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::CursorCat);
+        let trail_presentation = self.trail_presentation();
+        let glow_cfg = self.glow_config_for(trail_presentation);
+        let pet_mode = trail_presentation.pet_species.is_some();
+        let sound = self.companion_sound();
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return;
+        };
+        // The route draws no cat, so a collection hello waits for a frame that does.
+        ws.fx
+            .companions_mut()
+            .cursor_cat
+            .set_collection_presentable(now, false);
+        if ws.front_terminal().is_none() {
+            return;
+        }
+        step_cursor_companions(ws, now, allowed, &glow_cfg, false, pet_mode, sound)
+            .sound(&mut self.trail_audio);
+    }
+
     fn redraw_heterogeneous_window(
         &mut self,
         id: WindowId,
@@ -10589,6 +10774,7 @@ impl App {
         ) else {
             return;
         };
+        self.step_heterogeneous_companions(id, frame_started);
         let Some(composed) =
             self.compose_route_chrome(id, crate::VisibleContentRoute::Heterogeneous, plan)
         else {
@@ -10614,7 +10800,9 @@ impl App {
                 return;
             }
         };
-        let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns);
+        // The route draws the cursor effects, so a GPU that cannot keep up sheds them here too.
+        let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns)
+            .saturating_add(self.gpu_backpressure_ns(id));
         self.finalize_successful_present(
             id,
             startup_timing,
@@ -11241,6 +11429,7 @@ impl App {
             self.install_window_config_assets(id);
             let front_session = self.focused_session_id(id).unwrap_or(0);
             let companion_verdict = self.companion_verdict_for_resolved_claim(id, frame_started);
+            let companion_sound = self.companion_sound();
             let trail_presentation = self.trail_presentation();
             let pet_mode = trail_presentation.pet_species.is_some();
             let pet_species = trail_presentation
@@ -11284,81 +11473,17 @@ impl App {
             ws.fx
                 .decos_mut()
                 .set_presentable(frame_started, words_presentable);
-            if !cursor_companions_allowed {
-                ws.fx.companions_mut().kitty_sing = aterm_effects::kitty_sing::KittySing::default();
-                ws.fx.companions_mut().music_notes.clear();
-                ws.fx.companions_mut().sing_riff_bar = None;
-            }
-            let sing_drive = if cursor_companions_allowed
-                && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty)
-            {
-                ws.fx.companions_mut().kitty_sing.drive(frame_started)
-            } else {
-                0.0
-            };
-            if sing_drive > 0.0 {
-                ws.fx.cursor_mut().glow.celebrate(frame_started, sing_drive);
-                if let Some(bar) = ws.fx.companions_mut().kitty_sing.bar(frame_started)
-                    && ws.fx.companions_mut().sing_riff_bar != Some(bar)
-                {
-                    ws.fx.companions_mut().sing_riff_bar = Some(bar);
-                    if let Some(gain) = sing_riff_gain(
-                        ws.focused,
-                        self.config.trail_sounds_or_default(),
-                        self.config.trail_sound_riff_or_default(),
-                        self.config.trail_sound_volume(),
-                    ) {
-                        self.trail_audio.push(sing_riff_event(
-                            bar,
-                            gain,
-                            ws.fx.companions_mut().kitty_sing.signature(),
-                        ));
-                    }
-                }
-                if let Some(fan) = ws
-                    .fx
-                    .companions_mut()
-                    .kitty_sing
-                    .take_bar_fan(frame_started)
-                {
-                    ws.fx
-                        .cursor_mut()
-                        .glow
-                        .party(frame_started, fan.n, fan.ring);
-                }
-                if let Some(outro) = ws.fx.companions_mut().kitty_sing.take_outro(frame_started) {
-                    ws.fx
-                        .cursor_mut()
-                        .glow
-                        .party(frame_started, outro.drop, false);
-                    if let Some(gain) = sing_riff_gain(
-                        ws.focused,
-                        self.config.trail_sounds_or_default(),
-                        self.config.trail_sound_riff_or_default(),
-                        self.config.trail_sound_volume(),
-                    ) {
-                        self.trail_audio.push(sing_outro_event(gain, outro.sig));
-                    }
-                }
-            } else {
-                ws.fx.companions_mut().kitty_sing.settle(frame_started);
-                ws.fx.companions_mut().sing_riff_bar = None;
-            }
-            let c = ws.fx.companions_mut();
-            c.cursor_cat.set_singing(
+            let companion_step = step_cursor_companions(
+                ws,
                 frame_started,
-                crate::kitty_cursor::SingSync {
-                    drive: sing_drive,
-                    beat: c.kitty_sing.beat(frame_started).unwrap_or(0.0),
-                },
-            );
-            retire_kitty_cursor_without_owner(
-                glow_cfg.enabled && cursor_companions_allowed,
+                cursor_companions_allowed,
+                &glow_cfg,
+                true,
                 pet_mode,
-                glow_cfg.style,
-                sing_drive,
-                &mut ws.fx.companions_mut().cursor_cat,
+                companion_sound,
             );
+            companion_step.sound(&mut self.trail_audio);
+            let sing_drive = companion_step.sing_drive;
             let animate_cat = cursor_motion.animate(crate::motion::MotionEffect::CursorGlow)
                 && shed_envelope > 0.0;
             let mut cat_frame = if animate_cat {
@@ -14470,10 +14595,31 @@ impl App {
             .copied()?
             .terminal_session()?;
         let ws = self.windows.get(&wid)?;
-        let tree = &ws.layouts[ws.tabs.active];
         let blink_phase = ws.blink_phase;
         let last_present = ws.last_present;
-        let rects = tree.compute_layout(ws.rows, ws.cols);
+        // A zoomed mixed tab composes its one terminal leaf here but has no terminal pane tree
+        // (`ws.layouts` holds only all-terminal tabs), so its rects come from the plan.
+        let rects = match crate::active_terminal_projection(ws, &self.view_store) {
+            Some(tree) => tree.compute_layout(ws.rows, ws.cols),
+            None => plan
+                .leaves
+                .iter()
+                .map(|leaf| {
+                    let cells = |v: f32| u16::try_from(v.round().max(0.0) as u64).ok();
+                    Some(pane::PaneRect {
+                        session: self
+                            .view_store
+                            .get(leaf.view)
+                            .copied()
+                            .and_then(crate::tab_model::View::terminal_session)?,
+                        row_off: cells(leaf.rect.origin.y)?,
+                        col_off: cells(leaf.rect.origin.x)?,
+                        rows: cells(leaf.rect.size.height)?.max(1),
+                        cols: cells(leaf.rect.size.width)?.max(1),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
         if rects.len() != plan.leaves.len()
             || rects.iter().zip(&plan.leaves).any(|(rect, leaf)| {
                 self.view_store
@@ -14959,11 +15105,7 @@ impl App {
             !focus_scrolled,
         );
         let companion_verdict = self.companion_verdict_for_resolved_claim(wid, now);
-        let sing_style = cursor_companions_allowed
-            && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
-        let sound_on = self.config.trail_sounds_or_default();
-        let sound_volume = self.config.trail_sound_volume();
-        let riff_key = self.config.trail_sound_riff_or_default();
+        let companion_sound = self.companion_sound();
         let pet_species = trail_presentation
             .pet_species
             .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
@@ -14997,7 +15139,7 @@ impl App {
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
-        let (cat_frame, kitty_alpha, riff, outro, pet, escort) = {
+        let (cat_frame, kitty_alpha, companion_step, pet, escort) = {
             let ws = self.windows.get_mut(&wid)?;
             ws.fx
                 .companions_mut()
@@ -15010,54 +15152,16 @@ impl App {
             if shed_envelope_transitioning(load_shed, shed_envelope) && ws.os_window.is_some() {
                 ws.note_deco_animating(now);
             }
-            if !cursor_companions_allowed {
-                ws.fx.companions_mut().kitty_sing = aterm_effects::kitty_sing::KittySing::default();
-                ws.fx.companions_mut().music_notes.clear();
-                ws.fx.companions_mut().sing_riff_bar = None;
-            }
-            let sing_drive = if sing_style {
-                ws.fx.companions_mut().kitty_sing.drive(now)
-            } else {
-                0.0
-            };
-            let mut riff: Option<(u64, f32, u32)> = None;
-            let mut outro: Option<(f32, u32)> = None;
-            if sing_drive > 0.0 {
-                ws.fx.cursor_mut().glow.celebrate(now, sing_drive);
-                if let Some(bar) = ws.fx.companions_mut().kitty_sing.bar(now)
-                    && ws.fx.companions_mut().sing_riff_bar != Some(bar)
-                {
-                    ws.fx.companions_mut().sing_riff_bar = Some(bar);
-                    riff = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
-                        .map(|gain| (bar, gain, ws.fx.companions_mut().kitty_sing.signature()));
-                }
-                if let Some(fan) = ws.fx.companions_mut().kitty_sing.take_bar_fan(now) {
-                    ws.fx.cursor_mut().glow.party(now, fan.n, fan.ring);
-                }
-                if let Some(o) = ws.fx.companions_mut().kitty_sing.take_outro(now) {
-                    ws.fx.cursor_mut().glow.party(now, o.drop, false);
-                    outro = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
-                        .map(|gain| (gain, o.sig));
-                }
-            } else {
-                ws.fx.companions_mut().kitty_sing.settle(now);
-                ws.fx.companions_mut().sing_riff_bar = None;
-            }
-            let c = ws.fx.companions_mut();
-            c.cursor_cat.set_singing(
+            let companion_step = step_cursor_companions(
+                ws,
                 now,
-                crate::kitty_cursor::SingSync {
-                    drive: sing_drive,
-                    beat: c.kitty_sing.beat(now).unwrap_or(0.0),
-                },
-            );
-            retire_kitty_cursor_without_owner(
-                glow_cfg.enabled && cursor_companions_allowed,
+                cursor_companions_allowed,
+                &glow_cfg,
+                true,
                 pet_mode,
-                glow_cfg.style,
-                sing_drive,
-                &mut ws.fx.companions_mut().cursor_cat,
+                companion_sound,
             );
+            let sing_drive = companion_step.sing_drive;
             let mut cat_frame = if animate_cat {
                 ws.fx.companions_mut().cursor_cat.frame(now)
             } else {
@@ -15194,14 +15298,9 @@ impl App {
             let escort = pet_tick.escort_caret();
             let pet = ws.fx.companion_mut().tick(pet_tick);
             ws.fx.offer_pet_v2(&pet.pet, pane_geom, focus_off, now);
-            (cat_frame, alpha, riff, outro, pet, escort)
+            (cat_frame, alpha, companion_step, pet, escort)
         };
-        if let Some((bar, gain, sig)) = riff {
-            self.trail_audio.push(sing_riff_event(bar, gain, sig));
-        }
-        if let Some((gain, sig)) = outro {
-            self.trail_audio.push(sing_outro_event(gain, sig));
-        }
+        companion_step.sound(&mut self.trail_audio);
         let word_focus =
             self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
         let deco_fp = self.compose_words(

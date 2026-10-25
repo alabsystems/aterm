@@ -14,6 +14,7 @@ mod measuring {
     use super::support::{self, Outcome};
 
     use aterm_conformance::measure::Rig;
+    use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::paint::{
         Capture, Companion, Expect, PaintRow, Scene, Split, Style,
     };
@@ -283,6 +284,7 @@ mod measuring {
         let scene = row.scene.name();
         let report = match measure(rig, row) {
             Ok(report) => report,
+            Err(CouldNotRun::Unanswered(why)) => return Outcome::Unanswered(why),
             Err(why) => {
                 return Outcome::CouldNotRun(format!(
                     "PAINT COULD NOT RUN [{scene}]: the take decided nothing: {why}"

@@ -7,7 +7,7 @@
 use crate::control::Repair;
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -76,6 +76,28 @@ impl Hints {
                     }
         });
     }
+    fn replacement(&self, source: Option<IpAddr>) -> Option<SocketAddr> {
+        self.peers
+            .iter()
+            .filter(|(address, peer)| {
+                source.is_none_or(|source| address.ip() == source)
+                    && peer.failed
+                    && !peer.busy
+                    && (source.is_some() || !peer.verified)
+            })
+            // A new port on the same IP can replace a failed old listener.
+            // Unrelated IPs cannot evict an authenticated peer with beacons.
+            .min_by_key(|(_, peer)| (peer.verified, peer.seen))
+            .map(|(address, _)| *address)
+    }
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDiscoveryReplacement",
+            action = "Observe",
+            project = "aterm_db::runtime::discovery::admission_tests::replacement_transition"
+        )
+    )]
     pub(super) fn observe(&mut self, wire: &[u8], source: SocketAddr, now: Instant) {
         if wire.len() != WIRE_LEN
             || &wire[..4] != b"ACH2"
@@ -104,25 +126,13 @@ impl Hints {
             return;
         }
         if self.peers.keys().filter(|p| p.ip() == address.ip()).count() >= PER_IP {
-            let replace = self
-                .peers
-                .iter()
-                .filter(|(a, p)| a.ip() == address.ip() && p.failed && !p.verified && !p.busy)
-                .min_by_key(|(_, p)| p.seen)
-                .map(|(a, _)| *a);
-            let Some(replace) = replace else {
+            let Some(replace) = self.replacement(Some(address.ip())) else {
                 return;
             };
             self.peers.remove(&replace);
         }
         if self.peers.len() == MAX_PEERS {
-            let oldest = self
-                .peers
-                .iter()
-                .filter(|(_, p)| p.failed && !p.verified && !p.busy)
-                .min_by_key(|(_, p)| p.seen)
-                .map(|(a, _)| *a);
-            let Some(oldest) = oldest else {
+            let Some(oldest) = self.replacement(None) else {
                 return;
             };
             self.peers.remove(&oldest);
@@ -193,6 +203,52 @@ impl Hints {
         }
     }
 }
+
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbDiscoveryReplacement",
+        action = "AnotherLeft",
+        reason = "Model bookkeeping: choose the first endpoint's completed or active state"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbDiscoveryReplacement",
+        action = "AnotherRight",
+        reason = "Model bookkeeping: choose the second endpoint's completed or active state"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbDiscoveryReplacement",
+        action = "GlobalLimit",
+        reason = "Model bookkeeping: choose separate or simultaneous per-IP and total capacity limits"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbDiscoveryReplacement",
+        action = "RightOlder",
+        reason = "Model bookkeeping: choose which endpoint was last confirmed earlier"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbDiscoveryReplacement",
+        action = "Choose",
+        reason = "Model bookkeeping: freeze the native endpoint fixture before Observe"
+    )
+)]
+fn replacement_environment() {}
+
+#[cfg(test)]
+mod admission_tests;
 
 #[cfg(test)]
 mod tests {

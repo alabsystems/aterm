@@ -467,6 +467,46 @@ impl InitialSetupAuthorization {
         self.persist_as(plan, Admission::Automatic)
     }
 
+    /// A person's Cancel of the review this ticket bound (System State design §3.3), recorded
+    /// for good while the records are still the ones the review bound: the first-run decision,
+    /// cancelled, naming `reviewed`, the plan the review showed ([`save_cancelled_decision`]),
+    /// or, where a Restore's record stands (the review offered what a Restore brought forward),
+    /// that record held ([`Restored::held`]), which keeps what the Restore put back. Either is
+    /// one write, so a process that ends anywhere leaves whole records. `Ok(false)` when the
+    /// records changed since the review bound (a choice made meanwhile answers for it) or the
+    /// setup ended: nothing is written.
+    pub fn cancel_observed(&mut self, reviewed: &Plan) -> InitialSetupObserved<bool> {
+        observe_person_choice(|root| self.cancel_at(root, reviewed))
+    }
+
+    pub(super) fn cancel_at(&mut self, root: &Path, reviewed: &Plan) -> Result<bool, String> {
+        let AuthorizationState::Bound(baseline) = &self.state else {
+            return Ok(false);
+        };
+        if !owns_publications(root, &baseline.publications())? {
+            self.state = AuthorizationState::Ended;
+            return Ok(false);
+        }
+        let current = observation_at(root).map_err(|error| error.to_string())?;
+        if current != *baseline || records_finished(&current.records) {
+            self.state = AuthorizationState::Ended;
+            return Ok(false);
+        }
+        match current.records.restored {
+            Some(restored) => save_restored_decision(
+                root,
+                RestoredState::Restored,
+                Restored {
+                    held: true,
+                    ..restored
+                },
+            )?,
+            None => save_cancelled_decision(root, reviewed)?,
+        }
+        self.state = AuthorizationState::Ended;
+        Ok(true)
+    }
+
     /// Widen the provisional plan this ticket observed to `plan`, even after its
     /// run finished. The caller checked the observed records allow it.
     pub(super) fn upgrade_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {

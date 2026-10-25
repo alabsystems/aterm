@@ -512,10 +512,6 @@ impl Env for Rig {
         self.said.lock().unwrap().get(sid).copied()
     }
 
-    fn hosted(&self, _sid: &str) -> bool {
-        false
-    }
-
     fn fs(&self) -> &dyn WakeFs {
         &self.fs
     }
@@ -1921,6 +1917,159 @@ fn a_seat_names_its_shell_before_any_machine_snapshot_names_the_tab() {
     assert_eq!(seat.pty_child, None);
     let seat = seat_of(&store, 0x5ea9).expect("a registered session's seat");
     assert_eq!(seat.pty_child, None, "a bare pid pins nothing");
+}
+
+/// Tab A's job wake (`pid:500 exited`, needing a free slot) read by a loop where `hosted`, its job
+/// ended and its await answered with one slot free: the rig and the host.
+fn answered_job(hosted: bool) -> (Rig, WakeHost) {
+    let rig = Rig::new(Occupancy::Observe);
+    let host = WakeHost::default();
+    let a = seat_a();
+    assert_eq!(
+        host.wake(
+            &rig,
+            &a,
+            Some(400),
+            "label=job when=pid:500 exited need=slots>=1"
+        ),
+        "OK wake #1\n"
+    );
+    if hosted {
+        let seen = host.seen_for(&rig, A);
+        assert_eq!(
+            seen.wakes
+                .iter()
+                .map(|w| (w.ord, w.state, w.need_met))
+                .collect::<Vec<_>>(),
+            [(1, WakeState::Pending, false)]
+        );
+    }
+    rig.tree.kill(500);
+    rig.slots(3, 1);
+    host.tick(&rig, false);
+    assert_eq!(answered_once(&host, &rig, &a, 1), Some(1));
+    host.answered(&rig, A, 1, true);
+    (rig, host)
+}
+
+/// A loop that reads the book hosts the session (the plan's S2): an answer written stays
+/// `Answered` until the loop tells it heard through `await` (another episode's tell changes
+/// nothing), and the loop's leaving tells every answer left. Under `off` the read is empty and
+/// hosts nothing. NEGATIVE CONTROL: read by no loop, the answer is told at its write.
+#[test]
+fn a_hosted_answer_stays_answered_until_its_loop_tells_it_heard() {
+    let (rig, host) = answered_job(false);
+    assert_eq!(
+        state(&host, A, 1),
+        Some(WakeState::Told {
+            door: WakeDoor::Await,
+            at_ms: rig.now_ms()
+        }),
+        "CONTROL: no loop reads the book, so no door is left to tell it heard"
+    );
+
+    let (rig, host) = answered_job(true);
+    let at_ms = rig.now_ms();
+    assert_eq!(state(&host, A, 1), Some(WakeState::Answered { at_ms }));
+    let seen = host.seen_for(&rig, A);
+    assert_eq!(seen.pending(), 1, "an answer unheard is still the loop's");
+    let episode = seen.wakes[0].episode();
+    rig.advance(1_000);
+    host.told_for(&rig, A, 1, episode ^ 1, WakeDoor::Await);
+    assert_eq!(state(&host, A, 1), Some(WakeState::Answered { at_ms }));
+    host.told_for(&rig, A, 1, episode, WakeDoor::Await);
+    assert_eq!(
+        state(&host, A, 1),
+        Some(WakeState::Told {
+            door: WakeDoor::Await,
+            at_ms: at_ms + 1_000
+        })
+    );
+    assert_eq!(host.seen_for(&rig, A).pending(), 0);
+
+    let (rig, host) = answered_job(true);
+    rig.advance(1_000);
+    host.left(&rig, A);
+    assert_eq!(
+        state(&host, A, 1),
+        Some(WakeState::Told {
+            door: WakeDoor::Await,
+            at_ms: rig.now_ms()
+        }),
+        "its loop gone, the answer is told"
+    );
+    assert!(!host.lock().hosted.contains(A));
+
+    let rig = Rig::new(Occupancy::Observe);
+    let host = WakeHost::default();
+    host.wake(&rig, &seat_a(), Some(400), "label=job when=pid:500 exited");
+    rig.set_mode(Occupancy::Off);
+    assert_eq!(host.seen_for(&rig, A), WakesSeen::default());
+    assert!(!host.lock().hosted.contains(A), "off hosts nothing");
+}
+
+/// A closed session (`forget`) is hosted no more: an answer its next shelf writes is told at the
+/// write, as an unhosted session's is. NEGATIVE CONTROL: not closed, the loop's read hosts it and
+/// the same answer stays `Answered` for its loop to hear.
+#[test]
+fn a_closed_session_is_hosted_no_more() {
+    let answered = |close: bool| {
+        let rig = Rig::new(Occupancy::Observe);
+        let host = WakeHost::default();
+        let a = seat_a();
+        host.seen_for(&rig, A);
+        if close {
+            host.forget(A);
+        }
+        host.wake(&rig, &a, Some(400), "label=t when=in:1m");
+        rig.advance(60_000);
+        assert_eq!(answered_once(&host, &rig, &a, 1), Some(1));
+        host.answered(&rig, A, 1, true);
+        (state(&host, A, 1), rig.now_ms())
+    };
+    let (closed, at_ms) = answered(true);
+    assert_eq!(
+        closed,
+        Some(WakeState::Told {
+            door: WakeDoor::Await,
+            at_ms
+        })
+    );
+    let (hosted, at_ms) = answered(false);
+    assert_eq!(
+        hosted,
+        Some(WakeState::Answered { at_ms }),
+        "CONTROL: hosted, the answer waits for its loop"
+    );
+}
+
+/// A ready wake whose need holds reads the session ready for the ring (the plan's F14); its need
+/// unmet, or the wake still pending, it does not. The loop's read carries the same latch.
+#[test]
+fn a_ready_wake_with_its_need_met_reads_the_session_ready() {
+    let rig = Rig::new(Occupancy::Observe);
+    let host = WakeHost::default();
+    let a = seat_a();
+    host.wake(
+        &rig,
+        &a,
+        Some(400),
+        "label=job when=pid:500 exited need=slots>=1",
+    );
+    rig.slots(3, 1);
+    host.tick(&rig, false);
+    assert!(!host.met(A), "pending");
+    rig.tree.kill(500);
+    rig.slots(3, 0);
+    host.tick(&rig, false);
+    assert_eq!(state(&host, A, 1), Some(WakeState::Ready));
+    assert!(!host.met(A), "its need unmet");
+    assert!(!host.seen_for(&rig, A).wakes[0].need_met);
+    rig.slots(3, 1);
+    host.tick(&rig, false);
+    assert!(host.met(A));
+    assert!(host.seen_for(&rig, A).wakes[0].need_met);
+    assert!(!host.met(B), "another session's book is its own");
 }
 
 #[cfg(target_os = "macos")]

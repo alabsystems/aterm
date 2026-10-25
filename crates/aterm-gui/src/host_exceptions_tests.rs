@@ -2777,7 +2777,7 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
 
 /// A limit's line names the agent its tabs run, or none: a generic screen and tabs running
 /// different agents name none, and one agent's tabs are named where the glass's six words hold the
-/// name and the place (`Codex`), never where they do not (`Gemini CLI`). Negative controls: Claude
+/// name and the place (`Codex`), never where they do not (`Muse Code`). Negative controls: Claude
 /// Code's tabs keep `Claude`, and `/goal`'s line keeps its words on any agent.
 #[test]
 fn a_limits_line_names_the_agent_its_tabs_run() {
@@ -2810,9 +2810,9 @@ fn a_limits_line_names_the_agent_its_tabs_run() {
         "Limit still holds Codex in tab 2"
     );
     assert_eq!(
-        title(&[("s-2", 2, futile, Program::Gemini)]),
+        title(&[("s-2", 2, futile, Program::Muse)]),
         "Limit still holds in tab 2",
-        "`… Gemini CLI in tab 2` is seven words"
+        "`… Muse Code in tab 2` is seven words"
     );
     assert_eq!(
         title(&[("s-2", 2, ExceptionKind::Spend, Program::Codex)]),
@@ -3788,7 +3788,7 @@ fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
     use aterm_agent::supervise::occupancy::{
         OccupancyReading, OccupancySaid, RuleId, SaidHold, SaidRule, SaidVerdict,
     };
-    let word = |mode: Occupancy, verdicts: [SaidVerdict; RuleId::COUNT]| OccupancySaid {
+    let word = |mode: Occupancy, verdicts: [SaidVerdict; 2]| OccupancySaid {
         mode,
         hold: Some(SaidHold {
             since_ms: 1_792_600_000_000,
@@ -3811,6 +3811,7 @@ fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
         at_ms: 1_792_600_000_000,
         reading: OccupancyReading::default(),
         ready_idle: None,
+        wake: None,
     };
     let mut app = App::headless_for_test();
     let stable = occupancy_sid(&app);
@@ -3893,6 +3894,7 @@ fn occupancy_word(
         at_ms: 1_792_601_800_000,
         reading: OccupancyReading::default(),
         ready_idle,
+        wake: None,
     }
 }
 

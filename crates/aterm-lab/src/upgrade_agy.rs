@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::door::Door;
-use crate::gemini::Agent;
 use crate::pyjson::J;
 use crate::relaunch_agy::{lock_conversation, resumed, shell_exports, twin_script};
 use crate::relaunch_check::{host_said, newest_dump, open_files, request_with, said, wait_for};
@@ -182,10 +181,7 @@ fn children(pid: i32) -> usize {
 }
 
 fn config(run: &Run) -> PathBuf {
-    let c = run
-        .w
-        .join(Agent::Agy.home())
-        .join(".gemini/antigravity-cli");
+    let c = run.w.join(crate::agy::HOME).join(".gemini/antigravity-cli");
     std::fs::canonicalize(&c).unwrap_or(c)
 }
 
@@ -278,7 +274,7 @@ fn kept(m: Option<&Moved>) -> bool {
 #[allow(clippy::too_many_lines)]
 fn run_check(tag: &str) -> Result<bool, Fail> {
     let mut run = Run::load(tag)?;
-    crate::gemini::need(&run, Agent::Agy).map_err(|f| could_not(&f.msg.unwrap_or_default()))?;
+    crate::agy::need(&run).map_err(|f| could_not(&f.msg.unwrap_or_default()))?;
     let source = exec_target(Path::new(&run.agy_bin));
     println!(
         "agy-upgrade: lab '{tag}', agy {} ({}, built {}), {}",
@@ -336,12 +332,11 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
 
     let mut through = run.clone();
     through.agy_bin = store.twin().to_string_lossy().into_owned();
-    crate::gemini::launch(
+    crate::agy::launch(
         &through,
-        Agent::Agy,
-        &crate::gemini::Launch {
+        &crate::agy::Launch {
             no_wait: true,
-            ..crate::gemini::Launch::default()
+            ..crate::agy::Launch::default()
         },
     )?;
     run = Run::load(tag)?;

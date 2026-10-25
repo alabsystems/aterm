@@ -97,7 +97,7 @@ const TYPE_LOGIN_AS: &str = "Sign in to {label}: type /login in the tab.";
 /// login swallowed again by itself, and aterm presses the success Enter.
 const CONTINUES: &str = "The session continues by itself once you are signed in.";
 
-/// What closes a sign-in aterm opened that nobody needs any more: Esc IN THE
+/// What closes a sign-in a person is in that nobody needs any more: Esc IN THE
 /// TAB the band's title names — never `this tab`, which on the window's band
 /// reads as whichever tab is in front.
 const ESC_SIGN_IN: &str = "Press Esc in the tab to close its sign-in.";
@@ -130,7 +130,7 @@ pub const WHYS: &[&str] = &[
     WHY_TURN_YOURS,
 ];
 
-/// The `/login` aterm typed opened its browser sign-in (the hand-off read on the screen), the method picker answered with the method the session already uses: the sign-in in the browser is the one step left, and only the owner can take it.
+/// The `/login` aterm typed opened its browser sign-in (the hand-off read on the screen), the method picker answered with the method the session already uses: the sign-in in the browser is the one step left, and only the owner can take it. Only over a login no roster row names (`login_label`: none lists the login, its row has no email, or `logins` is off) and no move put the session on: aterm's sign-in ladder has no row to sign in there, and the host's discovery, asked once before `/login` is typed (`IdleHost::login_discover`: the upkeep's sync, which adopts the default login's address), named none, or named it only after the hand-off was decided (and then aterm backs out of it, `super::login::backs_out`).
 pub const LOGIN_SIGN_IN: NoticeText = NoticeText {
     id: "login-sign-in",
     code: "si",
@@ -147,7 +147,7 @@ pub const LOGIN_SIGN_IN: NoticeText = NoticeText {
     back: BACK,
 };
 
-/// [`LOGIN_SIGN_IN`] for a session whose login is a roster row (`{label}`: the renewable login it runs on, or the account a move put it on): the browser sign-in must be that row's own account, or two rows of the roster become one account. aterm types no `/login` over the lost login of a row the roster lists for the session (`super::turn_end`'s `login_wall_waits`: its sign-in ladder signs the row in), so this is the `/login` it typed before the roster named the row, or over a moved session's account the roster gives no row of.
+/// [`LOGIN_SIGN_IN`] for a session whose login is a roster row (`{label}`: the renewable login it runs on, or the account a move put it on): the browser sign-in must be that row's own account, or two rows of the roster become one account. aterm types no `/login` over the lost login of a row the roster lists for the session (`super::turn_end`'s `login_wall_waits`: its sign-in ladder signs the row in), and backs out of the dialog of one it typed before the roster named the row (`super::login::backs_out`; a dialog still drawn after its Esc gets the Esc again, and nobody is told there), so this is the `/login` over a moved session's account the roster gives no row of.
 pub const LOGIN_SIGN_IN_AS: NoticeText = NoticeText {
     id: "login-sign-in-as",
     code: "sa",
@@ -164,7 +164,7 @@ pub const LOGIN_SIGN_IN_AS: NoticeText = NoticeText {
     back: BACK,
 };
 
-/// The method picker of the `/login` aterm typed, which aterm does not answer: nothing says the session signs in with a subscription (the only method chosen for the owner), or the picker is not drawn as the one measured — or Console's own menu behind it (`How do you want to sign in?`, one of whose options mints an API key).
+/// The method picker of the `/login` aterm typed, which aterm does not answer: nothing says the session signs in with a subscription (the only method chosen for the owner), or the picker is not drawn as the one measured — or Console's own menu behind it (`How do you want to sign in?`, one of whose options mints an API key). Not over a login whose sign-in nobody needs (a roster row's, `login_label`; one back in another tab; one a renewal the tab follows replaced: `super::login::nobody_signs_in`), whose picker aterm backs out of (`super::login::backs_out`) and whose Console menu it tells nothing at but where the login is back in another tab ([`LOGIN_BACK_DIALOG`]).
 pub const LOGIN_CHOOSE: NoticeText = NoticeText {
     id: "login-choose",
     code: "ch",
@@ -198,7 +198,7 @@ pub const LOGIN_CANCELLED: NoticeText = NoticeText {
     back: BACK,
 };
 
-/// THE LOGIN CAME BACK IN ANOTHER TAB while the dialog of the `/login` aterm typed here still stands (its picker, its browser hand-off, Console's menu or a message of its own): nothing is left to sign in, and nobody is asked to — a second sign-in is what one sign-in per login exists to prevent.
+/// THE LOGIN CAME BACK IN ANOTHER TAB while a `/login` dialog a person is in still stands here, which aterm presses nothing in: Console's menu, which only a person's pick at the picker of aterm's `/login` opens, or the message a person's own `/login` stopped on. Nothing is left to sign in, and nobody is asked to — a second sign-in is what one sign-in per login exists to prevent. The picker, browser hand-off or message of the `/login` aterm typed is no such dialog: aterm closes it with its own Esc and tells no one (`super::login::backs_out`).
 pub const LOGIN_BACK_DIALOG: NoticeText = NoticeText {
     id: "login-back-dialog",
     code: "bd",
@@ -209,23 +209,6 @@ pub const LOGIN_BACK_DIALOG: NoticeText = NoticeText {
     todo: ESC_SIGN_IN,
     todo_as: None,
     expect: "The session continues by itself once the sign-in is closed.",
-    expect_reset: None,
-    undo: None,
-    whys: &[],
-    back: BACK,
-};
-
-/// A RENEWAL MADE WHILE THE `/login` aterm TYPED HERE STILL STANDS (its picker, its browser hand-off, or a message of its own), the tab's relaunch onto the renewed login in reach: nothing is left to sign in, and nobody is asked to — a browser sign-in there would bring back the login the renewal replaced, and the tab moves onto the renewed one anyway.
-pub const LOGIN_RENEWED_DIALOG: NoticeText = NoticeText {
-    id: "login-renewed-dialog",
-    code: "re",
-    title: "Claude sign-in still open",
-    short_title: "Sign-in still open",
-    happened: "This tab's login was renewed, but the sign-in aterm opened here is still open.",
-    did: "aterm does not ask you to sign in again, and leaves the open sign-in to you.",
-    todo: ESC_SIGN_IN,
-    todo_as: None,
-    expect: MOVES,
     expect_reset: None,
     undo: None,
     whys: &[],
@@ -595,7 +578,6 @@ pub const ALL: &[NoticeText] = &[
     LOGIN_CHOOSE,
     LOGIN_CANCELLED,
     LOGIN_BACK_DIALOG,
-    LOGIN_RENEWED_DIALOG,
     LOGIN_LEFT,
     LOGIN_STOPPED,
     LOGIN_NOT_RUN,

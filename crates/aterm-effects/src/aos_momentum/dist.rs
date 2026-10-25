@@ -32,7 +32,7 @@ use super::bundle::{
     BUNDLE_GRADE, BundleField, PLAN_ASSUMPTIONS, Row, add, decode_row, encode_row, row_difference,
     row_passes,
 };
-use super::corpus::{CorpusSplit, ItemKind};
+use super::corpus::CorpusSplit;
 use super::fidelity::{LaneFidelity, ORACLE};
 use super::lane::LANE_MODEL;
 use super::lease::{
@@ -146,21 +146,20 @@ pub struct Claim {
     rows: Vec<Row>,
 }
 
-/// The pins of the training items, in corpus order.
-fn training_pins(pins: &[ItemPin]) -> impl Iterator<Item = &ItemPin> {
-    pins.iter().filter(|p| p.split() == CorpusSplit::Train)
-}
-
 impl Claim {
     /// `rows` claimed `kind`, shaped against `pins`, the policy's items in corpus order.
     /// # Errors
     /// The first [`ShapeFault`].
     pub fn shaped(kind: ClaimKind, rows: Vec<Row>, pins: &[ItemPin]) -> Result<Claim, ShapeFault> {
-        let train: Vec<(&'static str, ItemKind)> =
-            training_pins(pins).map(|p| (p.id(), p.kind())).collect();
+        let mut train_len = 0usize;
+        for p in pins {
+            if p.split() == CorpusSplit::Train {
+                train_len += 1;
+            }
+        }
         let fits = match kind {
-            ClaimKind::Admitted => rows.len() == train.len(),
-            ClaimKind::Refused => (1..=train.len()).contains(&rows.len()),
+            ClaimKind::Admitted => rows.len() == train_len,
+            ClaimKind::Refused => !rows.is_empty() && rows.len() <= train_len,
         };
         if !fits {
             return Err(ShapeFault::Count {
@@ -169,8 +168,14 @@ impl Claim {
             });
         }
         let last = rows.len().saturating_sub(1);
-        for (row, (r, &(id, item_kind))) in rows.iter().zip(&train).enumerate() {
-            if r.item != id || r.split != CorpusSplit::Train || r.kind != item_kind {
+        let mut pin_idx = 0usize;
+        for (row, r) in rows.iter().enumerate() {
+            while pin_idx < pins.len() && pins[pin_idx].split() != CorpusSplit::Train {
+                pin_idx += 1;
+            }
+            let pin = &pins[pin_idx];
+            pin_idx += 1;
+            if r.item != pin.id() || r.split != CorpusSplit::Train || r.kind != pin.kind() {
                 return Err(ShapeFault::Item { row });
             }
             let refuses_here = kind == ClaimKind::Refused && row == last;
@@ -196,30 +201,44 @@ impl Claim {
     /// Its rows' count.
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.rows.len()
     }
 
     /// Whether it has no rows (never, once shaped).
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// Its rows' `ΣT`, `ΣP`, `ΣZ`, summed as the evaluator sums a candidate's.
     #[must_use]
-    pub fn totals(&self) -> Totals {
-        self.rows
-            .iter()
-            .fold(Totals::default(), |t, r| add(t, r.totals()))
+    pub const fn totals(&self) -> Totals {
+        let rows = self.rows.as_slice();
+        let mut t = Totals {
+            ticks: 0,
+            presented: 0,
+            wasted: 0,
+        };
+        let mut i = 0;
+        while i < rows.len() {
+            t = add(t, rows[i].totals());
+            i += 1;
+        }
+        t
     }
 
     /// Row `k`'s claimed `T`.
     #[inline]
     #[must_use]
-    pub fn ticks(&self, k: usize) -> Option<u64> {
-        self.rows.get(k).map(|r| r.ticks)
+    pub const fn ticks(&self, k: usize) -> Option<u64> {
+        let rows = self.rows.as_slice();
+        if k < rows.len() {
+            Some(rows[k].ticks)
+        } else {
+            None
+        }
     }
 
     /// Whether row `k` is `judged`, a row judged here.
@@ -229,7 +248,10 @@ impl Claim {
         let Some(r) = self.rows.get(k) else {
             return Err(BundleField::Row);
         };
-        row_difference(r, judged).map_or(Ok(()), Err)
+        match row_difference(r, judged) {
+            Some(field) => Err(field),
+            None => Ok(()),
+        }
     }
 
     /// Its encoding: the kind's tag, the row count, then each row as a bundle row.
@@ -406,13 +428,21 @@ impl ExecIdentity {
     #[must_use]
     pub fn of(ev: &Evaluator, binary: Binary) -> ExecIdentity {
         let build = ev.build().to_owned();
+        let mut tested_assumptions = Vec::with_capacity(TESTED_ASSUMPTIONS.len());
+        for a in TESTED_ASSUMPTIONS {
+            tested_assumptions.push(a.to_owned());
+        }
+        let mut plan_assumptions = Vec::with_capacity(PLAN_ASSUMPTIONS.len());
+        for a in PLAN_ASSUMPTIONS {
+            plan_assumptions.push(a.to_owned());
+        }
         ExecIdentity {
             policy: ev.policy().id().clone(),
             stranded_light: NoStrandedLight::artifact(),
             lane_fidelity: LaneFidelity::artifact(),
             grade: BUNDLE_GRADE.to_owned(),
-            tested_assumptions: TESTED_ASSUMPTIONS.iter().map(|a| (*a).to_owned()).collect(),
-            plan_assumptions: PLAN_ASSUMPTIONS.iter().map(|a| (*a).to_owned()).collect(),
+            tested_assumptions,
+            plan_assumptions,
             corpus: ev.corpus_digest(),
             base: MomentumCode::Shipped.artifact(&build),
             build,
@@ -460,7 +490,12 @@ impl ExecIdentity {
             ("executable", self.executable == other.executable),
             ("faults", self.faults == other.faults),
         ];
-        fields.into_iter().find(|&(_, same)| !same).map(|(f, _)| f)
+        for (f, same) in fields {
+            if !same {
+                return Some(f);
+            }
+        }
+        None
     }
 
     /// Its encoding.
@@ -529,7 +564,11 @@ fn encode_strs(e: &mut Enc, v: &[String]) {
 
 fn decode_strs(d: &mut Dec<'_>, field: &'static str, limit: u64) -> Result<Vec<String>, WireFault> {
     let n = d.count(field, limit)?;
-    (0..n).map(|_| Ok(d.str(field)?.to_owned())).collect()
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(d.str(field)?.to_owned());
+    }
+    Ok(out)
 }
 
 /// The id of the job that judges `plan` under the identity whose digest is `exec`.
@@ -872,13 +911,16 @@ pub fn run_job(
 ) -> Result<JobEnd, ShapeFault> {
     let TrainingRows { rows, end } = ev.training_rows(plan, keep);
     let at = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-    let rows: Vec<Row> = rows.into_iter().map(|(_, r)| r).collect();
     let kind = match end {
         TrainingEnd::Admitted => ClaimKind::Admitted,
         TrainingEnd::Refused(_) => ClaimKind::Refused,
         TrainingEnd::Stopped(()) => return Ok(JobEnd::Stopped { at }),
     };
-    Claim::shaped(kind, rows, ev.policy().items()).map(JobEnd::Claimed)
+    let mut plain_rows = Vec::with_capacity(rows.len());
+    for (_, r) in rows {
+        plain_rows.push(r);
+    }
+    Claim::shaped(kind, plain_rows, ev.policy().items()).map(JobEnd::Claimed)
 }
 
 /// Why the coordinator voided the command's distributed work.
@@ -1117,11 +1159,12 @@ impl Coordinator {
         let n = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
         let mut effects = self.ledger.begin(search, n, now)?;
         if self.ledger.search() == search {
-            self.jobs = jobs
-                .iter()
-                .map(|&j| (j, job_id(&self.exec, KIND_TRAIN, j.plan)))
-                .collect();
-            self.claims = jobs.iter().map(|_| None).collect();
+            let mut pairs = Vec::with_capacity(jobs.len());
+            for &j in jobs {
+                pairs.push((j, job_id(&self.exec, KIND_TRAIN, j.plan)));
+            }
+            self.jobs = pairs;
+            self.claims = vec![None; jobs.len()];
         }
         effects.extend(self.ledger.assign(now)?);
         self.ledger.finish(now)?;
@@ -1134,11 +1177,14 @@ impl Coordinator {
         if self.ledger.outcome() != Outcome::Complete {
             return Vec::new();
         }
-        core::mem::take(&mut self.claims)
-            .into_iter()
-            .zip(&self.jobs)
-            .filter_map(|(c, (j, _))| c.map(|c| (j.slot, c)))
-            .collect()
+        let taken = core::mem::take(&mut self.claims);
+        let mut out = Vec::with_capacity(taken.len());
+        for (c, (j, _)) in taken.into_iter().zip(&self.jobs) {
+            if let Some(c) = c {
+                out.push((j.slot, c));
+            }
+        }
+        out
     }
 
     /// `w`'s event.
@@ -1336,28 +1382,33 @@ impl Coordinator {
     /// The ledger's effects as the shell's actions.
     fn actions(&mut self, effects: Vec<Effect>, now: Nanos) -> Vec<Action> {
         self.note_ledger_void();
-        effects
-            .into_iter()
-            .filter_map(|e| match e {
-                Effect::Lease(w, token) => self.jobs.get(index(token.slot)).map(|&(j, id)| {
-                    self.leased.insert(token, now);
-                    let msg = Msg::Lease {
-                        token,
-                        job: id,
-                        kind: KIND_TRAIN,
-                        plan: j.plan.encode(),
-                    };
-                    Action::Send(w, msg.encode())
-                }),
-                Effect::Cancel(w, token) => Some(Action::Send(w, Msg::Cancel { token }.encode())),
-                Effect::Kill(w) => Some(Action::Kill(w)),
-                Effect::Accepted(..) => None,
-            })
-            .collect()
+        let mut out = Vec::with_capacity(effects.len());
+        for e in effects {
+            match e {
+                Effect::Lease(w, token) => {
+                    if let Some(&(j, id)) = self.jobs.get(index(token.slot)) {
+                        self.leased.insert(token, now);
+                        let msg = Msg::Lease {
+                            token,
+                            job: id,
+                            kind: KIND_TRAIN,
+                            plan: j.plan.encode(),
+                        };
+                        out.push(Action::Send(w, msg.encode()));
+                    }
+                }
+                Effect::Cancel(w, token) => {
+                    out.push(Action::Send(w, Msg::Cancel { token }.encode()));
+                }
+                Effect::Kill(w) => out.push(Action::Kill(w)),
+                Effect::Accepted(..) => {}
+            }
+        }
+        out
     }
 }
 
 #[inline]
-fn index(n: u32) -> usize {
-    usize::try_from(n).unwrap_or(usize::MAX)
+const fn index(n: u32) -> usize {
+    n as usize
 }

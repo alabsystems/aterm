@@ -1345,9 +1345,9 @@ fn each_image_goes_to_its_own_lanes_reader() {
         ("/usr/local/bin/codex", SnapshotLane::None),
         ("/Users//u/.local/bin/claude", SnapshotLane::Claude),
     ] {
-        assert_eq!(snapshot_lane(Some(Path::new(image)), &[]), lane, "{image}");
+        assert_eq!(snapshot_lane(Some(Path::new(image))), lane, "{image}");
     }
-    assert_eq!(snapshot_lane(None, &[]), SnapshotLane::Claude);
+    assert_eq!(snapshot_lane(None), SnapshotLane::Claude);
 }
 
 /// Conformance test of `look_at_exit`, `exit_record`, and `after_exit` against `HarnessMuseExitWitness`.

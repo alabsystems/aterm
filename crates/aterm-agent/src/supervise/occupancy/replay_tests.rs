@@ -143,7 +143,7 @@ fn the_f1_night_replays_the_slice_one_times() {
         lines[0].contains(&format!("looks={}", rows.len())),
         "{lines:#?}"
     );
-    let tail = &lines[lines.len() - 2..];
+    let tail = &lines[lines.len() - 3..];
     assert!(
         tail[0].starts_with("wait-nudge@v1 first would 19:2"),
         "{lines:#?}"
@@ -151,6 +151,14 @@ fn the_f1_night_replays_the_slice_one_times() {
     assert!(
         tail[1].starts_with("hold-room@v1 first would 11:0"),
         "{lines:#?}"
+    );
+    assert!(
+        tail[2].starts_with("wake@v1 ") && !tail[2].contains("would"),
+        "the wake's line names no would: {lines:#?}"
+    );
+    assert!(
+        !replayed.iter().any(|r| r.rule == RuleId::Wake),
+        "{replayed:#?}"
     );
 }
 
@@ -173,7 +181,7 @@ fn a_ring_with_no_free_window_gives_no_hold_room() {
         0,
     );
     assert_eq!(
-        lines.last().map(String::as_str),
+        lines.get(lines.len() - 2).map(String::as_str),
         Some("hold-room@v1 first would never")
     );
 }

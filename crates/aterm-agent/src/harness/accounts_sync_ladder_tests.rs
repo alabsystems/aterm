@@ -140,6 +140,68 @@ fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
         .and_then(|b| b.sign_in_attempt.clone())
 }
 
+#[test]
+fn a_replaced_login_stops_the_automatic_retry_and_failure_summary() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, true);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let after = Arc::new(Mutex::new(None));
+    let mut fx = bench.fx();
+    let changed_store = store.clone();
+    let count = Arc::clone(&called);
+    let changed_after = Arc::clone(&after);
+    fx.run_attempt = Some(Arc::new(move |_, _| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = changed_store.login_dir("w3").unwrap();
+        changed_store
+            .transact_logins(NOW, &mut None, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state,
+                    logins,
+                    "w3",
+                    dir.to_str(),
+                    dir.to_str().unwrap(),
+                    None,
+                    NOW,
+                ))
+            })
+            .unwrap();
+        *changed_after.lock().unwrap() = Some(
+            [
+                changed_store.state_file(),
+                changed_store.logins_file(),
+                changed_store.ledger_path(),
+            ]
+            .map(|path| fs::read(path).ok()),
+        );
+        Renewal::AuthFailed
+    }));
+    assert!(auto_renew_next_account(
+        &desk.home,
+        &desk.state,
+        &desk.roster(),
+        NOW,
+        &fx
+    ));
+    assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        [store.state_file(), store.logins_file(), store.ledger_path(),]
+            .map(|path| fs::read(path).ok()),
+        after.lock().unwrap().clone().unwrap()
+    );
+    assert!(attempt_of(&desk, "w3").is_none());
+}
+
 /// A row with a stored headless profile and a desk browser profile: the ladder drives the
 /// profile headless, and when that run makes no login, nothing that opens a window (the desk
 /// profile, the default browser) is tried in its place. The run that failed is on record with

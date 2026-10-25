@@ -140,19 +140,7 @@ pub(crate) const fn hypot_f32(x: f32, y: f32) -> f32 {
 }
 
 #[inline]
-pub(crate) const fn powf_pos_f32(x: f32, exp: f32) -> f32 {
-    if x.is_nan() || exp.is_nan() {
-        return f32::NAN;
-    }
-    if exp == 0.0 || x == 1.0 {
-        return 1.0;
-    }
-    if x <= 0.0 {
-        return if exp > 0.0 { 0.0 } else { f32::INFINITY };
-    }
-    if x.is_infinite() {
-        return if exp > 0.0 { f32::INFINITY } else { 0.0 };
-    }
+pub(crate) const fn ln_pos_f64(x: f32) -> f64 {
     let xf = x as f64;
     let bits = xf.to_bits();
     let exp_bits = ((bits >> 52) & 0x7ff) as i32;
@@ -172,8 +160,41 @@ pub(crate) const fn powf_pos_f32(x: f32, exp: f32) -> f32 {
         sum += term / (j as f64);
         j += 2;
     }
-    let ln_x = 2.0 * sum + (k as f64) * std::f64::consts::LN_2;
-    exp_f64_to_f32((exp as f64) * ln_x)
+    2.0 * sum + (k as f64) * std::f64::consts::LN_2
+}
+
+#[inline]
+pub(crate) const fn ln_pos_f32(x: f32) -> f32 {
+    if x.is_nan() || x < 0.0 {
+        return f32::NAN;
+    }
+    if x == 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    if x.is_infinite() {
+        return f32::INFINITY;
+    }
+    if x == 1.0 {
+        return 0.0;
+    }
+    ln_pos_f64(x) as f32
+}
+
+#[inline]
+pub(crate) const fn powf_pos_f32(x: f32, exp: f32) -> f32 {
+    if x.is_nan() || exp.is_nan() {
+        return f32::NAN;
+    }
+    if exp == 0.0 || x == 1.0 {
+        return 1.0;
+    }
+    if x <= 0.0 {
+        return if exp > 0.0 { 0.0 } else { f32::INFINITY };
+    }
+    if x.is_infinite() {
+        return if exp > 0.0 { f32::INFINITY } else { 0.0 };
+    }
+    exp_f64_to_f32((exp as f64) * ln_pos_f64(x))
 }
 
 #[inline]

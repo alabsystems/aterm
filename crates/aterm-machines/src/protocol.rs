@@ -351,7 +351,7 @@ pub struct HostedSession {
     /// Whether its window is focused.
     #[serde(default)]
     pub focused: bool,
-    /// Foreground program (`claude`, `codex`, `agy`, `muse`, `gemini`, `zsh`, …).
+    /// Foreground program (`claude`, `codex`, `agy`, `muse`, `zsh`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
     /// Live AI CLI status word (`working`, `waiting`, `idle`, `confirm`, `error`, `done`, …).

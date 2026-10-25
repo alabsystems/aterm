@@ -378,7 +378,7 @@ impl Cadence {
     /// An exact instant.
     #[inline]
     pub(crate) fn edge(&mut self, at: Instant) {
-        if at > self.now && self.best.is_none_or(|b| at < b) {
+        if at > self.now && !matches!(self.best, Some(b) if at >= b) {
             self.best = Some(at);
         }
     }
@@ -406,7 +406,7 @@ impl Cadence {
     #[inline]
     #[must_use]
     pub(crate) fn at_tail_floor(&self) -> bool {
-        self.best.is_some_and(|b| b <= self.now + TAIL_FLOOR)
+        matches!(self.best, Some(b) if b <= self.now + TAIL_FLOOR)
     }
 
     /// The fold: the next frame when brisk, else the earliest offer.
@@ -528,11 +528,11 @@ impl EchoLedger {
         };
         let mut any = false;
         for slot in &mut self.slots {
-            let Some((at, _)) = *slot else { break };
+            let Some((at, _c)) = *slot else { break };
             if stale(at) {
                 #[cfg(test)]
                 {
-                    self.tally.expired += slot.map_or(0, |(_, c)| u32::from(c));
+                    self.tally.expired += u32::from(_c);
                 }
                 *slot = None;
                 any = true;
@@ -972,41 +972,54 @@ impl Engine {
             return;
         }
         let tail_start = self.unechoed_tail_start();
-        let soft = self.soft_wrap.take().and_then(|(sw, key_at)| {
-            let at_move = self.events.iter().position(|(e, _)| {
+        let soft = if let Some((sw, key_at)) = self.soft_wrap.take()
+            && let Some(at_move) = self.events.iter().position(|(e, _)| {
                 matches!(*e, Event::Move { from, to, .. } if from == sw.origin && to == sw.landing)
-            })?;
-            let at_key = key_at.and_then(|key| {
-                self.events[..at_move]
+            })
+        {
+            let at_key = match key_at {
+                Some(key) => self.events[..at_move]
                     .iter()
-                    .position(|&(e, at)| matches!(e, Event::Typed { .. }) && at == key)
-            });
+                    .position(|&(e, at)| matches!(e, Event::Typed { .. }) && at == key),
+                None => None,
+            };
             Some((sw, at_move, at_key))
-        });
-        let lift = self.lift.take().and_then(|(lift, key_at)| {
-            let at_move = self.events.iter().position(|(e, _)| {
+        } else {
+            None
+        };
+        let lift = if let Some((lift, key_at)) = self.lift.take()
+            && let Some(at_move) = self.events.iter().position(|(e, _)| {
                 matches!(*e, Event::Move { from, to, .. } if from == lift.origin && to == lift.landing)
-            })?;
-            let at_key = key_at.and_then(|key| {
-                self.events[..at_move]
+            })
+        {
+            let at_key = match key_at {
+                Some(key) => self.events[..at_move]
                     .iter()
-                    .rposition(|&(e, at)| matches!(e, Event::Typed { .. }) && at == key)
-            });
+                    .rposition(|&(e, at)| matches!(e, Event::Typed { .. }) && at == key),
+                None => None,
+            };
             Some((lift, at_move, at_key))
-        });
-        let reflow = self.reflow.take().and_then(|(sw, to)| {
-            let at_move = self.events.iter().position(|(e, _)| {
+        } else {
+            None
+        };
+        let reflow = if let Some((sw, to)) = self.reflow.take()
+            && let Some(at_move) = self.events.iter().position(|(e, _)| {
                 matches!(*e, Event::Move { from, to: t, .. } if from == sw.landing && t == to)
-            })?;
+            })
+        {
             Some((sw, at_move))
-        });
-        let revive = self.revive.take().and_then(|rv| {
-            let at_sweep = self.events.iter().position(|(e, _)| {
+        } else {
+            None
+        };
+        let revive = if let Some(rv) = self.revive.take()
+            && let Some(at_sweep) = self.events.iter().position(|(e, _)| {
                 matches!(*e, Event::Sweep { row, col0, col1 }
                     if row == rv.row && col0 == rv.col0 && col1 == rv.col1)
-            })?;
+            }) {
             Some((rv, at_sweep))
-        });
+        } else {
+            None
+        };
         if let Some((rv, at_sweep)) = revive {
             let (ev, at) = self.events[at_sweep];
             self.ribbon.revive_sweep(&ev, at, ctx, rv);
@@ -1036,9 +1049,11 @@ impl Engine {
                 continue;
             };
             if index >= tail_start {
-                let cell = self
-                    .caret_known
-                    .then(|| (self.caret.0, self.caret.1.saturating_add(held_cells)));
+                let cell = if self.caret_known {
+                    Some((self.caret.0, self.caret.1.saturating_add(held_cells)))
+                } else {
+                    None
+                };
                 self.ribbon.hold_typed(&ev, at, ctx, cell);
                 held_cells = held_cells.saturating_add(cells);
             } else if let Some((first_move, caret)) = pre_move
@@ -1331,11 +1346,28 @@ impl Engine {
             .max_by_key(|coh| (self.caret_known && coh.row == self.caret.0, coh.alive_at))
             .map(|coh| coh.row);
         let carry = self.witness.scroll_carry();
-        let back = |row: u16| row.checked_add(carry).filter(|_| carry > 0);
-        let lead = caret_move
-            .map(|(from, to)| i32::from(to) - i32::from(from))
-            .filter(|&d| d.unsigned_abs() > 2 && d != i32::from(carry));
-        let ahead = |row: u16| lead.and_then(|d| u16::try_from(i32::from(row) + d).ok());
+        let back = |row: u16| {
+            if carry > 0 {
+                row.checked_add(carry)
+            } else {
+                None
+            }
+        };
+        let lead = match caret_move {
+            Some((from, to)) => {
+                let d = i32::from(to) - i32::from(from);
+                if d.unsigned_abs() > 2 && d != i32::from(carry) {
+                    Some(d)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let ahead = |row: u16| match lead {
+            Some(d) => u16::try_from(i32::from(row) + d).ok(),
+            None => None,
+        };
         if let Some(focus) = focus {
             add(out, &mut n, focus);
             if let Some(row) = focus.checked_sub(1) {
@@ -1421,9 +1453,7 @@ impl Engine {
         }
         for &r in asked {
             let readable = r < self.grid_rows
-                && self
-                    .pane_rows
-                    .is_none_or(|(first, n)| r >= first && r - first < n);
+                && !matches!(self.pane_rows, Some((first, n)) if r < first || r - first >= n);
             if readable
                 && !rows.iter().any(|s| s.row == r)
                 && !self.withheld[..self.withheld_n].contains(&r)
@@ -1435,7 +1465,7 @@ impl Engine {
         }
         self.note_rewrap_starts(rows, park);
         let caret = self.caret_known.then_some(self.caret);
-        let same_caret_row = self.caret_seen.is_none_or(|(r, _)| r == self.caret.0);
+        let same_caret_row = !matches!(self.caret_seen, Some((r, _)) if r != self.caret.0);
         if self.witness.scroll_carry() == 0
             && self.witness.caret_carry() == 0
             && lifted.is_none()
@@ -1473,9 +1503,10 @@ impl Engine {
             self.follow_missed += u64::from(score.missed);
             self.status.follow_missed = self.follow_missed;
         }
-        let hand = self
-            .hand_rides(rows, hand_withheld, lifted)
-            .or_else(|| self.hand_returns(rows));
+        let hand = match self.hand_rides(rows, hand_withheld, lifted) {
+            Some(h) => Some(h),
+            None => self.hand_returns(rows),
+        };
         self.witness.end_scroll_carry();
         if let Some(h) = hand
             && !self
@@ -1494,26 +1525,30 @@ impl Engine {
             }
             return (n, false);
         }
-        let park_owner = park.and_then(|(from, to)| {
-            if from.0 != to.0 || !(1..=2).contains(&from.1.saturating_sub(to.1)) {
-                return None;
-            }
-            let last_col = from.1.checked_sub(1)?;
+        let park_owner = if let Some((from, to)) = park
+            && from.0 == to.0
+            && (1..=2).contains(&from.1.saturating_sub(to.1))
+            && let Some(last_col) = from.1.checked_sub(1)
+        {
             self.ribbon
                 .cells()
                 .iter()
                 .find(|cell| !cell.leaving() && cell.row == from.0 && cell.col == last_col)
                 .map(|cell| (from.0, cell.cohort))
-        });
-        let hand_row = hand.map_or(self.caret.0, |h| h.row);
+        } else {
+            None
+        };
+        let hand_row = match hand {
+            Some(h) => h.row,
+            None => self.caret.0,
+        };
         for k in 0..self.follow_scratch.len() {
             let run = self.follow_scratch[k];
             let Some(target) = run.row.checked_add_signed(run.dr) else {
                 continue;
             };
             let away = !self.caret_known || target != self.caret.0;
-            let park_owns_run =
-                park_owner.is_some_and(|(row, cohort)| row == run.row && cohort == run.cohort);
+            let park_owns_run = park_owner == Some((run.row, run.cohort));
             self.moved_scratch.clear();
             let moved = self
                 .ribbon
@@ -1577,20 +1612,25 @@ impl Engine {
             return None;
         }
         let seen_row = self.caret_seen.map(|(r, _)| r);
-        let run = self
-            .follow_scratch
-            .iter()
-            .copied()
-            .find(|r| {
-                r.row == self.caret.0
-                    && (r.dr.unsigned_abs() > 2
-                        || (seen_row.is_some() && r.row.checked_add_signed(r.dr) == seen_row))
-            })
-            .or_else(|| {
-                let sr = seen_row.filter(|&sr| sr != self.caret.0)?;
-                self.hand_line_follow(rows, Some(sr))
-                    .filter(|r| r.row == self.caret.0 && r.row.checked_add_signed(r.dr) == Some(sr))
-            })?;
+        let found = self.follow_scratch.iter().copied().find(|r| {
+            r.row == self.caret.0
+                && (r.dr.unsigned_abs() > 2
+                    || (seen_row.is_some() && r.row.checked_add_signed(r.dr) == seen_row))
+        });
+        let run = match found {
+            Some(run) => run,
+            None => {
+                let sr = seen_row?;
+                if sr == self.caret.0 {
+                    return None;
+                }
+                let r = self.hand_line_follow(rows, Some(sr))?;
+                if r.row != self.caret.0 || r.row.checked_add_signed(r.dr) != Some(sr) {
+                    return None;
+                }
+                r
+            }
+        };
         let to = run.row.checked_add_signed(run.dr)?;
         self.lift_hand_anchors(run.row, to);
         self.hand_lift = Some((run.row, to));
@@ -1640,7 +1680,9 @@ impl Engine {
         if self.caret_known {
             self.caret.0 = map(self.caret.0);
         }
-        self.caret_seen = self.caret_seen.map(|(r, c)| (map(r), c));
+        if let Some((r, _)) = &mut self.caret_seen {
+            *r = map(*r);
+        }
         self.erased.0 = map(self.erased.0);
         for (cell, _) in &mut self.earned {
             cell.0 = map(cell.0);
@@ -1698,20 +1740,23 @@ impl Engine {
         if self.events.is_empty() && park.is_none() {
             return;
         }
-        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
-        let found = self
-            .events
-            .iter()
-            .rev()
-            .find_map(|(ev, _)| match *ev {
-                Event::Move {
-                    from, to, licence, ..
-                } if licence == Licence::Typed && from.0 == to.0 && to.1 < from.1 => {
-                    Some((from, to))
-                }
-                _ => None,
-            })
-            .or_else(|| park.filter(|&(from, to)| from.0 == to.0 && to.1 < from.1));
+        let pane_col0 = match self.pane {
+            Some((c0, _)) => c0,
+            None => 0,
+        };
+        let mut found = self.events.iter().rev().find_map(|(ev, _)| match *ev {
+            Event::Move {
+                from, to, licence, ..
+            } if licence == Licence::Typed && from.0 == to.0 && to.1 < from.1 => Some((from, to)),
+            _ => None,
+        });
+        if found.is_none()
+            && let Some((from, to)) = park
+            && from.0 == to.0
+            && to.1 < from.1
+        {
+            found = Some((from, to));
+        }
         let Some((from, to)) = found else {
             return;
         };
@@ -1719,19 +1764,19 @@ impl Engine {
             return;
         };
         let tail_vacated = (to.1..from.1).all(|c| {
-            sample
-                .cols
-                .get(usize::from(c))
-                .is_none_or(|&ch| ch == ' ' || ch == '\0')
+            !matches!(
+                sample.cols.get(usize::from(c)),
+                Some(&ch) if ch != ' ' && ch != '\0'
+            )
         });
         if !tail_vacated {
             return;
         }
         let start = (pane_col0..to.1).find(|&c| {
-            sample
-                .cols
-                .get(usize::from(c))
-                .is_some_and(|&ch| ch != ' ' && ch != '\0')
+            matches!(
+                sample.cols.get(usize::from(c)),
+                Some(&ch) if ch != ' ' && ch != '\0'
+            )
         });
         if let Some(start) = start {
             self.ribbon.note_rewrap_start(from, to, start, None, None);
@@ -1842,14 +1887,13 @@ impl Engine {
 
         self.spine.update(now);
         self.stardust.budget.refill(now);
-        if self.caret_seam.flare_at.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() >= SPRING_SNAP_RESPONSE_S
-        }) {
+        if let Some(t) = self.caret_seam.flare_at
+            && now.saturating_duration_since(t).as_secs_f32() >= SPRING_SNAP_RESPONSE_S
+        {
             self.caret_seam.flare_at = None;
         }
-        if self
-            .paint_at
-            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() >= RELIGHT_LIFE_S)
+        if let Some(t) = self.paint_at
+            && now.saturating_duration_since(t).as_secs_f32() >= RELIGHT_LIFE_S
         {
             self.paint_at = None;
         }
@@ -2178,14 +2222,17 @@ impl Engine {
     #[inline]
     #[must_use]
     pub fn caret_paint(&self, now: Instant) -> f32 {
-        let relight = self.paint_at.map_or(0.0, |at| {
-            let age = now.saturating_duration_since(at).as_secs_f32();
-            if age >= RELIGHT_LIFE_S {
-                0.0
-            } else {
-                half_life(age, SPRING_SNAP_RESPONSE_S, SPRING_SNAP_RESPONSE_S)
+        let relight = match self.paint_at {
+            Some(at) => {
+                let age = now.saturating_duration_since(at).as_secs_f32();
+                if age >= RELIGHT_LIFE_S {
+                    0.0
+                } else {
+                    half_life(age, SPRING_SNAP_RESPONSE_S, SPRING_SNAP_RESPONSE_S)
+                }
             }
-        });
+            None => 0.0,
+        };
         self.spine.disp().max(relight)
     }
 
@@ -2209,7 +2256,7 @@ impl Engine {
         if let Some(d) = self.ribbon.next_change_deadline(now) {
             cad.edge(d);
         }
-        if !cad.best.is_some_and(|b| b <= now + FRAME_CADENCE)
+        if !matches!(cad.best, Some(b) if b <= now + FRAME_CADENCE)
             && let Some(d) = self.stardust.next_change_deadline(now)
         {
             cad.edge(d);
@@ -2219,7 +2266,8 @@ impl Engine {
         {
             cad.tail(step);
         }
-        cad.take().map(|at| at.max(now + ARM_MIN))
+        let at = cad.take()?;
+        Some(at.max(now + ARM_MIN))
     }
 
     /// The last frame's liveness, which `is_active` follows when engaged (§17.2).
@@ -2247,12 +2295,14 @@ impl Engine {
     /// ```
     #[must_use]
     pub fn pet_offer(&self, geom: Geom, pet: Option<companion::PetOnGlass>) -> companion::PetOffer {
-        let perk_at = self.companion.and_then(|imp| {
-            match companion::impulse_for(companion::Body::Pet, imp) {
-                companion::BodyImpulse::Perk { at } => Some(at),
-                _ => None,
-            }
-        });
+        let perk_at = if let Some(imp) = self.companion
+            && let companion::BodyImpulse::Perk { at } =
+                companion::impulse_for(companion::Body::Pet, imp)
+        {
+            Some(at)
+        } else {
+            None
+        };
         let Some(pet) = pet else {
             return companion::PetOffer {
                 perk_at,
@@ -2261,36 +2311,36 @@ impl Engine {
         };
         let (lo, hi) = pet.span();
         let mote_cell = ((lo + hi) * 0.5).floor().max(0.0) as u32;
-        let mote_t = u16::try_from(mote_cell)
-            .ok()
-            .and_then(|col| self.ribbon.field_at(pet.row, col));
-        let catch = pet
-            .contented()
-            .then(|| {
-                self.stardust
-                    .live_iter()
-                    .filter_map(|s| {
-                        if !(s.gold
-                            && s.class == stardust::StarClass::M1
-                            && s.lane.is_sky()
-                            && s.finish.is_none()
-                            && s.in_sky_of(pet.row, geom))
-                        {
-                            return None;
-                        }
-                        let col = s.grid_col(geom);
-                        (pet.columns_to(col) <= companion::CATCH_REACH_CELLS).then_some(
-                            companion::StarCatch {
-                                x: s.x,
-                                y: s.y,
-                                born: s.born,
-                                col,
-                            },
-                        )
-                    })
-                    .max_by_key(|c| c.born)
-            })
-            .flatten();
+        let mote_t = match u16::try_from(mote_cell) {
+            Ok(col) => self.ribbon.field_at(pet.row, col),
+            Err(_) => None,
+        };
+        let catch = if pet.contented() {
+            self.stardust
+                .live_iter()
+                .filter_map(|s| {
+                    if !(s.gold
+                        && s.class == stardust::StarClass::M1
+                        && s.lane.is_sky()
+                        && s.finish.is_none()
+                        && s.in_sky_of(pet.row, geom))
+                    {
+                        return None;
+                    }
+                    let col = s.grid_col(geom);
+                    (pet.columns_to(col) <= companion::CATCH_REACH_CELLS).then_some(
+                        companion::StarCatch {
+                            x: s.x,
+                            y: s.y,
+                            born: s.born,
+                            col,
+                        },
+                    )
+                })
+                .max_by_key(|c| c.born)
+        } else {
+            None
+        };
         companion::PetOffer {
             perk_at,
             catch,
@@ -2455,9 +2505,10 @@ impl Engine {
             return;
         }
         self.ribbon.translate_scroll(rows);
-        let bottom = self
-            .pane_rows
-            .map_or(self.grid_rows, |(first, n)| first.saturating_add(n));
+        let bottom = match self.pane_rows {
+            Some((first, n)) => first.saturating_add(n),
+            None => self.grid_rows,
+        };
         self.witness.translate(rows, bottom);
         self.meteor.translate_scroll(rows, cell_h);
         self.stardust.translate_scroll(rows, cell_h);
@@ -2497,29 +2548,33 @@ impl Engine {
             }
             _ => true,
         });
-        self.lift = self.lift.and_then(|(lift, key_at)| {
-            mark(lift.dst.0).map(|dst_row| {
-                (
-                    ribbon::Lift {
-                        origin: (pos(lift.origin.0), lift.origin.1),
-                        landing: (pos(lift.landing.0), lift.landing.1),
-                        dst: (dst_row, lift.dst.1),
-                    },
-                    key_at,
-                )
-            })
-        });
-        self.revive = self
-            .revive
-            .and_then(|rv| mark(rv.row).map(|row| ribbon::Revive { row, ..rv }));
+        if let Some((lift, _)) = &mut self.lift {
+            match mark(lift.dst.0) {
+                Some(dst_row) => {
+                    lift.origin.0 = pos(lift.origin.0);
+                    lift.landing.0 = pos(lift.landing.0);
+                    lift.dst.0 = dst_row;
+                }
+                None => self.lift = None,
+            }
+        }
+        if let Some(rv) = &mut self.revive {
+            match mark(rv.row) {
+                Some(row) => rv.row = row,
+                None => self.revive = None,
+            }
+        }
     }
 
     #[inline]
     fn translate_pre_move(&mut self, mark: impl Fn(u16) -> Option<u16>) {
         if let Some((_, caret)) = &mut self.pre_move
-            && let Some((row, col)) = *caret
+            && let Some((row, _)) = caret
         {
-            *caret = mark(row).map(|row| (row, col));
+            match mark(*row) {
+                Some(r) => *row = r,
+                None => *caret = None,
+            }
         }
     }
 

@@ -88,9 +88,9 @@ const SAID_LINE: &str = "window=2 program=claude face=land drawn=\"⤓ land\" sp
      again at your turn or once the agent works · not landed yet: 1 untracked file · landing \
      since 11:42, 1 nudge · click: off · right-click: more\"";
 
-/// Gemini CLI's line in front: no footer, so no chip and no title.
+/// A footerless program's line in front (Kimi Code draws no footer): no chip and no title.
 const FOOTLESS: &str =
-    "window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-";
+    "window=2 program=kimi face=- drawn=- why=no-footer spoken=- description=- title=-";
 
 /// The hover past the hold, as `b42ae72fc3` drew it and as §14.3 words it.
 const MAIN_HOVER: &str = "driven by aterm (land: not landed yet, 1 untracked file)";
@@ -161,27 +161,27 @@ fn a_held_chip_in_front_must_say_stopped_typing() {
     );
 }
 
-/// Where no chip is drawn (Gemini CLI's composer has no footer) the hover says it, every read of
-/// it past the settle.
+/// Where no chip is drawn (a composer with no footer, as Kimi Code's) the hover says it, every
+/// read of it past the settle.
 #[test]
 fn where_no_chip_is_drawn_the_hover_says_it() {
     let main = held(Chain::LandC, FOOTLESS, MAIN_HOVER);
-    let v = said(&main, &cx(Chain::LandC, "gemini"), stall(&main));
+    let v = said(&main, &cx(Chain::LandC, "kimi"), stall(&main));
     assert!(matches!(v, Verdict::Fail(_)), "{v:?}");
     assert!(
         v.why().contains("the hover \"driven by aterm (land: not"),
         "{v:?}"
     );
     let ok = held(Chain::LandC, FOOTLESS, SAID_HOVER);
-    let v = said(&ok, &cx(Chain::LandC, "gemini"), stall(&ok));
+    let v = said(&ok, &cx(Chain::LandC, "kimi"), stall(&ok));
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
     let mut stale = held(Chain::LandC, FOOTLESS, SAID_HOVER);
     stale.window.hover.push(j(HELD_AT + 30_000, MAIN_HOVER));
-    let v = said(&stale, &cx(Chain::LandC, "gemini"), stall(&stale));
+    let v = said(&stale, &cx(Chain::LandC, "kimi"), stall(&stale));
     assert!(matches!(v, Verdict::Fail(_)), "the words went stale: {v:?}");
     let mut early = held(Chain::LandC, FOOTLESS, MAIN_HOVER);
     early.window.hover.push(j(HELD_AT + 5_000, SAID_HOVER));
-    let v = said(&early, &cx(Chain::LandC, "gemini"), stall(&early));
+    let v = said(&early, &cx(Chain::LandC, "kimi"), stall(&early));
     assert!(
         matches!(v, Verdict::Pass(_)),
         "the read before the settle is not judged: {v:?}"
@@ -189,7 +189,7 @@ fn where_no_chip_is_drawn_the_hover_says_it() {
     let mut unhovered = held(Chain::LandC, FOOTLESS, SAID_HOVER);
     unhovered.window.hover_reads.clear();
     unhovered.window.hover.truncate(1);
-    let v = said(&unhovered, &cx(Chain::LandC, "gemini"), stall(&unhovered));
+    let v = said(&unhovered, &cx(Chain::LandC, "kimi"), stall(&unhovered));
     assert!(matches!(v, Verdict::Unobserved(_)), "{v:?}");
 }
 
@@ -388,9 +388,10 @@ fn hl_passes_on_the_hold_at_the_second_answer() {
     ));
 }
 
-/// The lift as Gemini CLI's land-d journaled it on `b42ae72fc3` (the review's `--mode both` run,
-/// `s-c71e2740fe2fa36ac9d1`): its tab brought in front 11.6 s past the hold, Gemini CLI redrew
-/// the tall reply, and aterm read its last row as a different reply 4 s later. The stub read no
+/// The lift as land-d journaled it on `b42ae72fc3` (the review's `--mode both` run,
+/// `s-c71e2740fe2fa36ac9d1`, on Gemini CLI before agy replaced it): its tab brought in front
+/// 11.6 s past the hold, the agent redrew the tall reply, and aterm read its last row as a
+/// different reply 4 s later. The stub read no
 /// request of that conversation from the nudge (+370.3 s, `req-00082.json`) to the next one
 /// (+856.6 s, `req-00102.json`).
 const LIFT: &str = "CLEARED seq=388136 exception=stalled after=15s a different reply, someone's \
@@ -417,8 +418,8 @@ fn lifted_held(line: &str, requests: Option<usize>) -> Seen {
 /// skip; no lift, or the loop's own end, passes.
 #[test]
 fn a_lift_with_no_new_reply_fails_the_hold() {
-    let gemini = lifted_held(FOOTLESS, Some(0));
-    let v = stands(&gemini, &cx(Chain::LandC, "gemini"), stall(&gemini));
+    let footless = lifted_held(FOOTLESS, Some(0));
+    let v = stands(&footless, &cx(Chain::LandC, "kimi"), stall(&footless));
     assert!(matches!(v, Verdict::Fail(_)), "{v:?}");
     assert!(
         v.why()
@@ -471,7 +472,7 @@ fn a_lift_with_no_new_reply_fails_the_hold() {
 }
 
 /// The lift's witness counts the conversation's requests after the hold and by the lift: on the
-/// review's Gemini CLI run, the nudge's before the hold and the next nudge's after the lift, so
+/// review's run ([`LIFT`]), the nudge's before the hold and the next nudge's after the lift, so
 /// none.
 #[test]
 fn the_lifts_witness_counts_the_requests_between_the_hold_and_the_lift() {
@@ -506,7 +507,7 @@ fn an_undrawn_chip_is_unread_never_judged_on_the_hover() {
         );
     }
     let s = held(Chain::LandC, FOOTLESS, SAID_HOVER);
-    let v = said(&s, &cx(Chain::LandC, "gemini"), stall(&s));
+    let v = said(&s, &cx(Chain::LandC, "kimi"), stall(&s));
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
 }
 

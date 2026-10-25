@@ -7,7 +7,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::door::Door;
-use crate::gemini::Agent;
 use crate::relaunch_check::{
     cwd_of, exit_of, host_said, newest_dump, open_files, relaunch_rows, request_with, running,
     said, send_when_free, shown, unobserved, wait_for,
@@ -68,7 +67,7 @@ fn agys(run: &Run) -> Vec<(i32, Vec<String>)> {
 
 /// agy's config under its scratch home (`agy-home/.gemini/<app>`).
 fn config(run: &Run, app: &str) -> std::path::PathBuf {
-    run.w.join(Agent::Agy.home()).join(".gemini").join(app)
+    run.w.join(crate::agy::HOME).join(".gemini").join(app)
 }
 
 /// The conversation of the presence lock a path names under `config` (`<config>/presence/<uuid>.lock`).
@@ -104,7 +103,7 @@ fn resuming(run: &Run, conv: &str, not: &[i32]) -> Option<(i32, Vec<String>)> {
         .find(|(pid, w)| !not.contains(pid) && resumed(w) == Some(conv))
 }
 
-/// The shell environment a relaunched agy reaches the stub with, as the lab's launcher gives it agy ([`crate::gemini::launcher`]) but its `HOME`, which the relaunch line carries from the process.
+/// The shell environment a relaunched agy reaches the stub with, as the lab's launcher gives it agy ([`crate::agy::launcher`]) but its `HOME`, which the relaunch line carries from the process.
 #[must_use]
 pub fn shell_exports(run: &Run) -> String {
     use crate::util::shell_quote as q;
@@ -128,7 +127,7 @@ pub fn shell_exports(run: &Run) -> String {
     s.push_str("export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost\n");
     s.push_str(&format!(
         "export GEMINI_API_KEY={} GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{}\n",
-        crate::gemini::LAB_GEMINI_KEY,
+        crate::agy::LAB_GEMINI_KEY,
         run.port
     ));
     s.push_str(&format!(
@@ -171,7 +170,7 @@ fn open_tab(run: &Run, proj: &str, known: &[i32], args: &[&str]) -> Result<(Stri
     crate::sys::put(
         &script,
         0o755,
-        &crate::sys::PutSrc::Bytes(crate::gemini::launcher(run, Agent::Agy, &[], &args).as_bytes()),
+        &crate::sys::PutSrc::Bytes(crate::agy::launcher(run, &[], &args).as_bytes()),
     )
     .map_err(|e| could_not(&format!("a tab's launcher: {e}")))?;
     let spawned = door.ctl(&["spawn", &format!("cwd={proj}"), "raise=false"])?;
@@ -354,7 +353,7 @@ fn put_build(run: &Run, name: &str, flag: &str) -> Result<String, Fail> {
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Launch agy by the seeded verb (`crate::gemini::launch`), the lab
+/// Launch agy by the seeded verb (`crate::agy::launch`), the lab
 /// reloaded, and wait for ITS screen: a new agy process under the instance,
 /// then its logo (the launcher's `clear` wipes the last agy's frame, whose
 /// rows a composer pattern alone would match at once) and its composer, the
@@ -362,13 +361,12 @@ fn put_build(run: &Run, name: &str, flag: &str) -> Result<String, Fail> {
 fn launch_agy(tag: &str, args: &[String]) -> Result<Run, Fail> {
     let run = Run::load(tag)?;
     let before: Vec<i32> = agys(&run).into_iter().map(|(p, _)| p).collect();
-    crate::gemini::launch(
+    crate::agy::launch(
         &run,
-        Agent::Agy,
-        &crate::gemini::Launch {
+        &crate::agy::Launch {
             no_wait: true,
             args: args.to_vec(),
-            ..crate::gemini::Launch::default()
+            ..crate::agy::Launch::default()
         },
     )?;
     let run = Run::load(tag)?;
@@ -413,7 +411,7 @@ fn holder(run: &Run, not: &[i32]) -> Result<Option<(i32, String)>, Fail> {
 fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let mut run = Run::load(tag)?;
     let aterm = restore::seam_checked(&run)?;
-    crate::gemini::need(&run, Agent::Agy).map_err(|f| could_not(&f.msg.unwrap_or_default()))?;
+    crate::agy::need(&run).map_err(|f| could_not(&f.msg.unwrap_or_default()))?;
     println!(
         "agy-relaunch: lab '{tag}', agy {} ({}), {aterm}",
         run.agy_ver, run.agy_bin
@@ -707,14 +705,13 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let Some(proj) = workspace.clone() else {
         return Ok(Verdict::Failed);
     };
-    crate::gemini::seed(&run, Agent::Agy, &crate::gemini::Launch::default())?;
+    crate::agy::seed(&run, &crate::agy::Launch::default())?;
     let script = run.run.join("agy-resume.sh");
     crate::sys::put(
         &script,
         0o755,
         &crate::sys::PutSrc::Bytes(
-            crate::gemini::launcher(&run, Agent::Agy, &[], &[format!("--conversation={conv}")])
-                .as_bytes(),
+            crate::agy::launcher(&run, &[], &[format!("--conversation={conv}")]).as_bytes(),
         ),
     )
     .map_err(|e| could_not(&format!("the resume launcher: {e}")))?;
@@ -863,9 +860,9 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     for (file, text) in [
         (
             "settings.json",
-            crate::gemini::agy_settings(&[canonical_proj, run.proj.clone(), proj.clone()]),
+            crate::agy::agy_settings(&[canonical_proj, run.proj.clone(), proj.clone()]),
         ),
-        ("cache/onboarding.json", crate::gemini::agy_onboarded()),
+        ("cache/onboarding.json", crate::agy::agy_onboarded()),
     ] {
         crate::sys::put(
             &fresh_config.join(file),

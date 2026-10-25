@@ -218,11 +218,13 @@ pub(crate) struct HoverMemo {
     named: Option<(i32, Option<String>)>,
 }
 
-/// The engine fill a window's frame stands on.
+/// The engine fill a window's frame stands on: the single pane's, the composed focus pane's, and
+/// a mixed tab's focused terminal leaf's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HoverFrame {
     single: (u64, u64, i32),
     composed: (u64, u64, i32),
+    mixed: (u64, u64, i32),
 }
 
 impl HoverMemo {
@@ -231,9 +233,17 @@ impl HoverMemo {
         let of = |s: &aterm_core::render::RenderInput| {
             (s.terminal_id, s.engine_fill_seq, s.display_offset)
         };
+        let mixed = match ws.front_content {
+            Some(crate::front_content::FrontContent::Terminal { view, .. }) => ws
+                .leaf_render_cache
+                .get(&view)
+                .map_or((0, 0, 0), |cache| cache.hover_key),
+            _ => (0, 0, 0),
+        };
         HoverFrame {
             single: of(&ws.input_scratch),
             composed: of(&ws.composed_focus_scratch),
+            mixed,
         }
     }
 
@@ -703,20 +713,6 @@ impl NativePointerRest {
             streak,
         }
     }
-
-    /// Let a double click's interval pass since the last press at this rest, as a person's next,
-    /// separate click would: the press is stamped that long ago.
-    #[cfg(test)]
-    pub(crate) fn age_press(&mut self) {
-        let interval = std::time::Duration::from_millis(
-            u64::try_from(crate::multi_click_ms()).expect("a double click's interval") + 1,
-        );
-        if let Some(streak) = self.streak.as_mut()
-            && let Some(at) = streak.at.checked_sub(interval)
-        {
-            streak.at = at;
-        }
-    }
 }
 
 /// Every input of the pixel → pane-local cell mapping other than the pixel, plus the session the cell is reported to.
@@ -1140,11 +1136,16 @@ impl App {
         wid: WindowId,
         focused: Option<(u16, u16, u16, u16)>,
     ) -> PointerRoute {
-        let Some(ws) = self.windows.get(&wid) else {
-            return PointerRoute::Front;
-        };
+        self.pointer_capture_route(wid)
+            .unwrap_or_else(|| self.pane_under_pointer(wid, focused))
+    }
+
+    /// A held gesture keeps its owner even when the pointer crosses a pane.
+    /// With no capture, pointer routing can resolve the leaf under it.
+    fn pointer_capture_route(&self, wid: WindowId) -> Option<PointerRoute> {
+        let ws = self.windows.get(&wid)?;
         if ws.overlay_open() || ws.tab_menu.is_some() || ws.selecting || ws.divider_drag.is_some() {
-            return PointerRoute::Front;
+            return Some(PointerRoute::Front);
         }
         let page_buttons = if self.active_native_view(wid).is_some() {
             ws.page_buttons
@@ -1154,15 +1155,15 @@ impl App {
         if held_button(ws.reported_buttons | page_buttons)
             .is_some_and(|lowest| page_buttons & (1 << lowest.slot()) != 0)
         {
-            return PointerRoute::Front;
+            return Some(PointerRoute::Front);
         }
         if ws.reported_buttons != 0 {
             let owner = ws
                 .held_mouse_button
                 .and_then(|button| ws.button_owners[usize::from(button.slot())]);
-            return self.owner_route(wid, owner);
+            return Some(self.owner_route(wid, owner));
         }
-        self.pane_under_pointer(wid, focused)
+        None
     }
 
     fn pane_under_pointer(
@@ -1830,9 +1831,8 @@ impl App {
     ) {
         let pressed = state == ElementState::Pressed;
         let seen = pressed.then(|| self.focused_session_id(wid)).flatten();
-        self.on_mouse_input(wid, state, button);
-        if pressed {
-            self.interact_system_state(wid);
+        if let Some(view) = self.mouse_input_target(wid, state, button, Instant::now()) {
+            self.interact_system_state_view(wid, view);
         }
         if let Some(session) = seen {
             self.note_human_acted_on(wid, session);
@@ -2047,6 +2047,17 @@ impl App {
         let Some((_, view)) = self.active_native_view(wid) else {
             return false;
         };
+        // A mixed tab's focused native leaf is committed with the mixed frame it sits in.
+        if self
+            .active_visible_frame_layout(wid)
+            .is_some_and(|(_, route)| route == crate::VisibleContentRoute::Heterogeneous)
+        {
+            if !self.commit_glassless_heterogeneous_frame(wid) {
+                return false;
+            }
+            self.refresh_native_hover_for_frame(wid);
+            return true;
+        }
         if !self.prepare_native_input_scratch(wid) {
             return false;
         }
@@ -3178,7 +3189,7 @@ impl App {
         let crate::native_ui::UiContent::TextViewport(spec) = &node.content else {
             return None;
         };
-        let geometry = crate::native_ui::text_viewport_geometry(node.rect);
+        let geometry = spec.geometry(node.rect);
         if x < geometry.text_x
             || x >= node.rect.right()
             || y < geometry.body_y
@@ -3717,8 +3728,8 @@ impl App {
         }
     }
 
-    /// Shift-click.
-    pub(crate) fn shift_extend_press(&mut self, wid: WindowId) {
+    /// A shift-click pressed at `at`, which starts the grid's click streak there.
+    pub(crate) fn shift_extend_press(&mut self, wid: WindowId, at: Instant) {
         let Some((row, col)) = self.windows.get(&wid).map(|ws| ws.last_mouse_cell) else {
             return;
         };
@@ -3734,7 +3745,6 @@ impl App {
             let (col, doubled_side) = pointer_char(&term, row, col);
             (sel_row, col, doubled_side)
         };
-        let now = Instant::now();
         let side = doubled_side.unwrap_or_else(|| {
             self.windows
                 .get(&wid)
@@ -3742,7 +3752,7 @@ impl App {
         });
         self.extend_selection_to(wid, sel_row, col, side);
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.last_press = Some((now, (sel_row, col)));
+            ws.last_press = Some((at, (sel_row, col)));
             ws.click_count = 1;
             if let Some(w) = &ws.os_window {
                 w.request_redraw();
@@ -3750,8 +3760,8 @@ impl App {
         }
     }
 
-    /// Advance the `multi_click_ms` streak and return the resulting click count (1, 2, 3; a fourth rapid click wraps to 1).
-    pub(crate) fn advance_click_streak(&mut self, wid: WindowId) -> u8 {
+    /// Advance the `multi_click_ms` streak by a press at `at` and return the resulting click count (1, 2, 3; a fourth rapid click wraps to 1).
+    pub(crate) fn advance_click_streak(&mut self, wid: WindowId, at: Instant) -> u8 {
         let Some(term) = self
             .front_terminal(wid)
             .map(|terminal| terminal.term.clone())
@@ -3767,17 +3777,16 @@ impl App {
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
             (sel_row, pointer_char(&term, row, col).0)
         };
-        let now = Instant::now();
         ws.click_count = match ws.last_press {
             Some((t, cell))
                 if cell == (sel_row, col)
-                    && now.duration_since(t).as_millis() <= multi_click_ms() =>
+                    && at.saturating_duration_since(t).as_millis() <= multi_click_ms() =>
             {
                 ws.click_count % 3 + 1
             }
             _ => 1,
         };
-        ws.last_press = Some((now, (sel_row, col)));
+        ws.last_press = Some((at, (sel_row, col)));
         ws.click_count
     }
 
@@ -4216,13 +4225,43 @@ impl App {
     }
 
     /// `MouseInput` -> when no app is tracking the mouse.
+    #[cfg(test)]
     pub(crate) fn on_mouse_input(
         &mut self,
         wid: WindowId,
         state: ElementState,
         button: WinitMouseButton,
     ) {
-        self.route_mouse_input(wid, state, button);
+        self.on_mouse_input_at(wid, state, button, Instant::now());
+    }
+
+    /// [`Self::on_mouse_input`] with the button gone down or up at `at`.
+    #[cfg(test)]
+    pub(crate) fn on_mouse_input_at(
+        &mut self,
+        wid: WindowId,
+        state: ElementState,
+        button: WinitMouseButton,
+        at: Instant,
+    ) {
+        let _ = self.mouse_input_target(wid, state, button, at);
+    }
+
+    /// Route first, then report the native body a press reached. Chrome and
+    /// focus-only navigation do not become page input when they change focus.
+    ///
+    /// The button went down or up at `at`. Every run of presses (a still pointer's
+    /// [`NativePointerRest`], the grid's click streak, a tab chip or the bare band, a menu's
+    /// spent card, the harness switch and chip, a banner's link) measures a double click's
+    /// interval between its presses by `at`, never by how long the work between them took.
+    fn mouse_input_target(
+        &mut self,
+        wid: WindowId,
+        state: ElementState,
+        button: WinitMouseButton,
+        at: Instant,
+    ) -> Option<crate::tab_model::ViewId> {
+        let target = self.route_mouse_input(wid, state, button, at);
         if state == ElementState::Released
             && let Some(button) = winit_mouse_button(button)
         {
@@ -4231,6 +4270,7 @@ impl App {
                 ws.page_buttons &= !(1 << button.slot());
             }
         }
+        target
     }
 
     fn end_unpaired_release(&mut self, wid: WindowId, button: aterm_types::mouse::MouseButton) {
@@ -4271,13 +4311,63 @@ impl App {
         );
     }
 
-    fn native_scroll_target(&self, wid: WindowId) -> Option<crate::native_ui::UiKey> {
+    /// Resolve a native pointer without moving keyboard focus. Captured gestures
+    /// keep their owner; free gestures use the current visible layout, even
+    /// when an earlier gesture has invalidated its retained paint.
+    fn native_pointer_view(&self, wid: WindowId) -> Option<crate::tab_model::ViewId> {
+        let focused = || self.active_native_view(wid).map(|(_, view)| view);
+        if let Some(route) = self.pointer_capture_route(wid) {
+            return match route {
+                PointerRoute::Front => focused(),
+                PointerRoute::Pane { .. } | PointerRoute::Nowhere => None,
+            };
+        }
+        self.native_view_under_pointer(wid)
+    }
+
+    /// The free body hit, used when a new press overrides an older hold.
+    fn native_view_under_pointer(&self, wid: WindowId) -> Option<crate::tab_model::ViewId> {
+        let window = self.windows.get(&wid)?;
+        let (x, y) = window.last_cursor_px;
+        if !window.pointer_position_known || !x.is_finite() || !y.is_finite() {
+            return self.active_native_view(wid).map(|(_, view)| view);
+        }
+        let plan = self.active_visible_leaf_plan(wid)?;
+        let geom = self.pointer_geometry(wid);
+        let (cw, ch) = geom.cell;
+        if cw == 0 || ch == 0 {
+            return None;
+        }
+        let (ox, oy) = self.frame_origin_with(wid, geom);
+        // Keep outside pixels signed: clamping a title row or padding into
+        // the first grid cell would turn a focus-only press into page input.
+        let point = crate::tab_model::LogicalPoint {
+            x: ((x - ox as f64 - geom.pad as f64) / cw as f64) as f32,
+            y: ((y - oy as f64 - (geom.pad_top + geom.head) as f64) / ch as f64
+                - f64::from(self.chrome_rows(wid))) as f32,
+        };
+        let leaf = plan.leaf_at(point)?;
+        matches!(
+            self.view_store.get(leaf.view),
+            Some(crate::tab_model::View::Native(_))
+        )
+        .then_some(leaf.view)
+    }
+
+    fn native_scroll_target(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> Option<crate::native_ui::UiKey> {
         let ws = self
             .windows
             .get(&wid)
             .filter(|ws| ws.pointer_position_known)?;
         let (x, y) = ws.last_cursor_px;
         let (artifact, local_x, local_y) = self.retained_native_leaf_at_pointer(wid, x, y)?;
+        if artifact.view != view {
+            return None;
+        }
         artifact
             .compiled
             .semantics
@@ -4306,7 +4396,13 @@ impl App {
         )
     }
 
-    fn route_mouse_input(&mut self, wid: WindowId, state: ElementState, button: WinitMouseButton) {
+    fn route_mouse_input(
+        &mut self,
+        wid: WindowId,
+        state: ElementState,
+        button: WinitMouseButton,
+        at: Instant,
+    ) -> Option<crate::tab_model::ViewId> {
         self.clear_move_license(wid);
         let pressed = state == ElementState::Pressed;
         if button == WinitMouseButton::Left
@@ -4317,7 +4413,7 @@ impl App {
                 if let Some(w) = &ws.os_window {
                     let _ = w.drag_resize_window(edge.direction());
                 }
-                return;
+                return None;
             }
             if !pressed {
                 ws.caption_move = None;
@@ -4336,7 +4432,7 @@ impl App {
             ws.strip_drag = None;
         }
         if !pressed && button == WinitMouseButton::Left && self.scrollbar_release(wid) {
-            return;
+            return None;
         }
         if self.palette_claims_pointer(wid) {
             let (x, y) = self
@@ -4353,7 +4449,7 @@ impl App {
             if !pressed {
                 self.settle_pointer_drags(wid);
             }
-            return;
+            return None;
         }
         if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
             if pressed {
@@ -4361,14 +4457,14 @@ impl App {
                     .windows
                     .get(&wid)
                     .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-                self.autopilot_menu_press(wid, button == WinitMouseButton::Left, px, py);
+                self.autopilot_menu_press(wid, button == WinitMouseButton::Left, px, py, at);
             } else {
                 self.settle_pointer_drags(wid);
             }
-            return;
+            return None;
         }
-        if pressed && self.spends_menu_follow_up(wid) {
-            return;
+        if pressed && self.spends_menu_follow_up(wid, at) {
+            return None;
         }
         if self
             .windows
@@ -4390,7 +4486,7 @@ impl App {
             } else {
                 self.settle_pointer_drags(wid);
             }
-            return;
+            return None;
         }
         if self.overview_claims_pointer(wid) {
             let (x, y) = self
@@ -4407,11 +4503,9 @@ impl App {
             if !pressed {
                 self.settle_pointer_drags(wid);
             }
-            return;
+            return None;
         }
-        let Some(mods_state) = self.windows.get(&wid).map(|ws| ws.mods) else {
-            return;
-        };
+        let mods_state = self.windows.get(&wid).map(|ws| ws.mods)?;
         if self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open())
             && self.pointer_is_over_pane_header(wid)
         {
@@ -4434,7 +4528,7 @@ impl App {
                     self.refresh_mouse_cell(wid, self.pointer_geometry(wid), x, y);
                     self.focus_pane_under_pointer(wid);
                 }
-                return;
+                return None;
             }
         }
         if self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open()) {
@@ -4445,7 +4539,7 @@ impl App {
                     self.stats_owns_pointer(wid)
                 };
                 if taken {
-                    return;
+                    return None;
                 }
             } else if self
                 .windows
@@ -4453,9 +4547,18 @@ impl App {
                 .is_some_and(|ws| !ws.selecting && ws.held_mouse_button.is_none())
                 && self.stats_owns_pointer(wid)
             {
-                return;
+                return None;
             }
         }
+        let page_press = pressed
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|window| !window.selecting && window.divider_drag.is_none());
+        let mut native_press = page_press.then(|| self.native_pointer_view(wid)).flatten();
+        let native_body_press = page_press
+            .then(|| self.native_view_under_pointer(wid))
+            .flatten();
         let mut canonical_press_routed = false;
         if pressed
             && button == WinitMouseButton::Left
@@ -4470,14 +4573,14 @@ impl App {
             let on_band = self.band_banner_at(wid, px, py).is_some()
                 || self.band_hit_at(wid, px, py).is_some();
             let in_content = !on_band && self.strip_col_at(wid, px, py).is_none();
-            if in_content && self.press_claude_light(wid) {
-                return;
+            if in_content && self.press_claude_light(wid, at) {
+                return None;
             }
-            if in_content
-                && (self.begin_divider_drag_with_plan(wid, Some(&plan))
-                    || self.focus_pane_under_pointer_from_plan(wid, &plan))
-            {
-                return;
+            if in_content && self.begin_divider_drag_with_plan(wid, Some(&plan)) {
+                return None;
+            }
+            if in_content && self.focus_pane_under_pointer_from_plan(wid, &plan) {
+                return native_body_press;
             }
         }
         let terminal_beside = if pressed {
@@ -4494,9 +4597,16 @@ impl App {
             })
         };
         if self.active_native_view(wid).is_some() && !terminal_beside {
-            // Every press this boundary takes is the page's until its release, a miss
-            // included: its drag and wheel stay the page's (`pointer_route`).
+            // The native handler takes this body press directly, including a
+            // new left press while an older terminal button remains held.
+            native_press = native_body_press;
+            // A press on this page, including a body miss, owns its drag and
+            // wheel until release. An ignored press on a native sibling must
+            // not grant capture to the focused page.
             if pressed
+                && self
+                    .active_native_view(wid)
+                    .is_some_and(|(_, view)| native_press == Some(view))
                 && let Some(button) = winit_mouse_button(button)
                 && let Some(ws) = self.windows.get_mut(&wid)
             {
@@ -4508,7 +4618,7 @@ impl App {
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if !pressed && button == WinitMouseButton::Left {
                 let Some((_, view)) = self.active_native_view(wid) else {
-                    return;
+                    return native_press;
                 };
                 let armed = self
                     .native_runtime
@@ -4531,9 +4641,10 @@ impl App {
                                 extend: true,
                             })
                             .or_else(|| {
-                                artifact
-                                    .compiled
-                                    .slider_value_at(&hit.key, x)
+                                // A click on a slider's number opens it for an exact value.
+                                (!artifact.compiled.slider_readout_at(&hit.key, x, y))
+                                    .then(|| artifact.compiled.slider_value_at(&hit.key, x))
+                                    .flatten()
                                     .map(crate::native_app::SemanticInput::Number)
                             })
                             .or_else(|| {
@@ -4568,23 +4679,26 @@ impl App {
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.native_rehover = true;
                     }
-                    let _ = self.dispatch_native_event(
+                    let _ = self.dispatch_native_control_action(
                         wid,
-                        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                        release_view,
+                        release.key,
+                        crate::native_app::ActionInvocation {
                             id: release.action,
                             value,
-                        }),
+                        },
+                        false,
                     );
                 }
-                return;
+                return native_press;
             }
             if pressed && button == WinitMouseButton::Left {
                 if let Some(col) = self.strip_col_at(wid, px, py) {
-                    self.handle_tab_strip_click(wid, col);
-                    return;
+                    self.handle_tab_strip_click(wid, col, at);
+                    return None;
                 }
                 if self.press_band_at(wid, px, py) {
-                    return;
+                    return None;
                 }
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
@@ -4632,7 +4746,7 @@ impl App {
                             &mut ws.native_rest,
                             (px, py),
                             (*target_view, key),
-                            std::time::Instant::now(),
+                            at,
                         )
                     })
                 });
@@ -4667,7 +4781,7 @@ impl App {
                         crate::native_app::DamageRegion::All,
                     );
                     self.request_redraw_all_windows();
-                    return;
+                    return native_press;
                 }
                 if let Some((target_view, generation, key, action, text_position, _)) = press {
                     if self.native_runtime.view_generation(target_view) == Some(generation)
@@ -4730,7 +4844,7 @@ impl App {
                     }
                 }
             }
-            return;
+            return native_press;
         }
         if pressed && button == WinitMouseButton::Left {
             let (px, py) = self
@@ -4738,10 +4852,10 @@ impl App {
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if self.press_band_at(wid, px, py) {
-                return;
+                return None;
             }
-            if self.press_claude_light(wid) {
-                return;
+            if self.press_claude_light(wid, at) {
+                return None;
             }
         }
         if pressed && button != WinitMouseButton::Left {
@@ -4762,19 +4876,19 @@ impl App {
                 if button == WinitMouseButton::Right && !self.open_autopilot_menu_at(wid, px, py) {
                     self.open_fact_menu_at(wid, px, py);
                 }
-                return;
+                return None;
             }
             if button != WinitMouseButton::Right {
                 if let Some(col) = self.strip_col_at(wid, px, py) {
                     if button == WinitMouseButton::Middle {
                         self.handle_tab_strip_middle_press(wid, col);
                     }
-                    return;
+                    return None;
                 }
                 if self.band_banner_at(wid, px, py).is_some()
                     || self.band_hit_at(wid, px, py).is_some()
                 {
-                    return;
+                    return None;
                 }
             }
         }
@@ -4792,7 +4906,7 @@ impl App {
                 if self.front_pane_for_local_press(wid, press_route) {
                     self.paste_primary_into(wid);
                 }
-                return;
+                return native_press;
             }
         }
         #[cfg(windows)]
@@ -4809,7 +4923,7 @@ impl App {
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                     let _ = crate::platform_win::popup_system_menu(w);
                 }
-                return;
+                return native_press;
             }
         }
         if pressed && button == WinitMouseButton::Right {
@@ -4863,11 +4977,11 @@ impl App {
                             }
                         }
                     }
-                    return;
+                    return None;
                 }
                 RightPressPlan::Copy => {
                     if !self.front_pane_for_local_press(wid, press_route) {
-                        return;
+                        return native_press;
                     }
                     if let (Some(text), Some(t)) = (selection, term.as_ref()) {
                         let _ = control::pbcopy(&text);
@@ -4877,13 +4991,13 @@ impl App {
                             w.request_redraw();
                         }
                     }
-                    return;
+                    return native_press;
                 }
                 RightPressPlan::Paste => {
                     if self.front_pane_for_local_press(wid, press_route) {
                         self.paste_clipboard_into(wid);
                     }
-                    return;
+                    return native_press;
                 }
                 RightPressPlan::Seam => {}
             }
@@ -4894,8 +5008,8 @@ impl App {
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if let Some(col) = self.strip_col_at(wid, px, py) {
-                self.handle_tab_strip_click(wid, col);
-                return;
+                self.handle_tab_strip_click(wid, col, at);
+                return None;
             }
             if self.inline_rename_edit(wid).is_some() {
                 self.clear_strip_press(wid);
@@ -4910,25 +5024,25 @@ impl App {
             if let Some((row, col)) = self.find_bar_cell_at(wid, px, py)
                 && self.find_bar_click_at(wid, row, col, Some(px))
             {
-                return;
+                return None;
             }
         }
         if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid) {
-            return;
+            return None;
         }
         if pressed && button == WinitMouseButton::Left && self.scrollbar_press(wid) {
-            return;
+            return None;
         }
         if button == WinitMouseButton::Left {
             if pressed {
                 if !canonical_press_routed && self.begin_divider_drag(wid) {
-                    return;
+                    return None;
                 }
             } else if self.finish_divider_drag(wid) {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.held_mouse_button = held_button(ws.reported_buttons);
                 }
-                return;
+                return native_press;
             }
         }
         if pressed
@@ -4936,7 +5050,7 @@ impl App {
             && !canonical_press_routed
             && self.focus_pane_under_pointer(wid)
         {
-            return;
+            return native_press;
         }
         if let Some(session) = self.rewound_front(wid) {
             if button == WinitMouseButton::Left {
@@ -4944,7 +5058,7 @@ impl App {
             } else if pressed {
                 self.note_rewind_withheld(session);
             }
-            return;
+            return native_press;
         }
         let mut click_count: u8 = 1;
         if button == WinitMouseButton::Left {
@@ -4952,7 +5066,7 @@ impl App {
                 .front_terminal(wid)
                 .map(|terminal| terminal.term.clone())
             else {
-                return;
+                return native_press;
             };
             let tracking = term_lock(&term).mouse_tracking_enabled();
             let option_held = mods_state.alt_key();
@@ -4960,13 +5074,13 @@ impl App {
                 // Cmd-click (macOS) / Ctrl-click (elsewhere) on a link opens it (safe
                 // schemes only) instead of starting a selection; GUI-only, never the seam.
                 if link_modifier_held(mods_state) && self.open_link_under_pointer(wid) {
-                    return;
+                    return native_press;
                 }
                 if mods_state.shift_key() && !(tracking && !option_held) {
-                    self.shift_extend_press(wid);
-                    return;
+                    self.shift_extend_press(wid, at);
+                    return native_press;
                 }
-                click_count = self.advance_click_streak(wid);
+                click_count = self.advance_click_streak(wid, at);
                 if tracking {
                     let (row, col) = self
                         .windows
@@ -4974,7 +5088,7 @@ impl App {
                         .map_or((0, 0), |ws| ws.last_mouse_cell);
                     let block = press_selection_kind(option_held, tracking) == SelectionType::Block;
                     self.seam_left_press(wid, row, col, click_count, block);
-                    return;
+                    return native_press;
                 }
             }
             if !pressed && self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
@@ -4982,11 +5096,11 @@ impl App {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
                 }
-                return;
+                return native_press;
             }
         }
         let Some(button) = winit_mouse_button(button) else {
-            return;
+            return native_press;
         };
         let slot = usize::from(button.slot());
         let bit = 1u8 << (button.slot() & 7);
@@ -4999,7 +5113,7 @@ impl App {
             self.owner_route(wid, owner)
         };
         if pressed && route == PointerRoute::Nowhere {
-            return;
+            return native_press;
         }
         let (row, col) = match route {
             PointerRoute::Pane { cell, .. } => cell,
@@ -5037,7 +5151,7 @@ impl App {
             }
         }
         if !pressed && !was_reported {
-            return;
+            return native_press;
         }
         let block = mods_state.alt_key();
         self.send_pointer(
@@ -5056,6 +5170,7 @@ impl App {
                 px_off,
             },
         );
+        native_press
     }
 
     fn front_pane_for_local_press(&mut self, wid: WindowId, route: PointerRoute) -> bool {
@@ -5151,8 +5266,6 @@ impl App {
         self.clear_move_license(wid);
         let palette = self.palette_claims_pointer(wid);
         let overview = self.overview_claims_pointer(wid);
-        let native_page =
-            self.active_native_view(wid).is_some() && !self.pointer_routes_to_a_terminal_pane(wid);
         if !(palette || overview) && self.pointer_is_over_pane_header(wid) {
             return;
         }
@@ -5163,6 +5276,10 @@ impl App {
             .windows
             .get(&wid)
             .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
+        let native_view = (!seam_owned)
+            .then(|| self.native_pointer_view(wid))
+            .flatten();
+        let native_page = native_view.is_some();
         if !(seam_owned || palette || overview || native_page)
             && let Some(session) = self.rewound_under_pointer(wid)
         {
@@ -5178,13 +5295,13 @@ impl App {
             MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
             MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
         };
-        if native_page
+        if let Some(view) = native_view
             && !(seam_owned || palette || overview)
             && dx.is_finite()
             && dy.is_finite()
             && (dx != 0.0 || dy != 0.0)
         {
-            self.interact_system_state(wid);
+            self.interact_system_state_view(wid, view);
         }
         let track_px = match delta {
             MouseScrollDelta::PixelDelta(p)
@@ -5227,16 +5344,13 @@ impl App {
                 self.overview_pointer_wheel(wid, signed);
                 return;
             }
-            if native_page {
+            if let Some(view) = native_view {
                 let signed = if up { -lines } else { lines };
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.native_rehover = true;
                 }
-                let event = match self.native_scroll_target(wid) {
-                    Some(key) => crate::native_app::AppEvent::ScrollAt { lines: signed, key },
-                    None => crate::native_app::AppEvent::ScrollLines(signed),
-                };
-                let _ = self.dispatch_native_event(wid, event);
+                let key = self.native_scroll_target(wid, view);
+                let _ = self.scroll_native_view(wid, view, signed, key);
                 return;
             }
         }
@@ -5848,6 +5962,61 @@ mod tests {
             (12.0, 20.0),
             (view, &row, false)
         ));
+    }
+
+    #[test]
+    fn a_glassless_mixed_tab_s_native_leaf_takes_the_pointer() {
+        use super::NativePointerTarget;
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorStyles));
+        let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let native_view = app
+            .active_visible_leaf_plan(wid)
+            .expect("a mixed plan")
+            .leaves
+            .iter()
+            .find(|leaf| !leaf.focused)
+            .expect("the settings leaf")
+            .view;
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.tab_set.active_mut())
+                .is_some_and(|tab| tab.set_focus(native_view)),
+            "the native leaf is live"
+        );
+        app.sync_window(wid);
+        assert_eq!(
+            app.active_visible_frame_layout(wid).map(|(_, route)| route),
+            Some(crate::VisibleContentRoute::Heterogeneous),
+            "PRECONDITION: a mixed tab"
+        );
+        let (_, view) = app
+            .active_native_view(wid)
+            .expect("PRECONDITION: the native leaf has focus");
+        assert!(
+            app.commit_glassless_native_frame(wid),
+            "the glassless mixed frame commits"
+        );
+        let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+        let row = compiled
+            .focus_order
+            .iter()
+            .find(|key| key.as_str().starts_with("settings/cursor-style/"))
+            .cloned()
+            .expect("a style row");
+        app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+            row.as_str().to_string(),
+        )))
+        .expect("the move aims at the native leaf's row");
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone()),
+            Some(row),
+            "the row is hovered"
+        );
     }
 
     #[test]
@@ -7615,7 +7784,9 @@ mod tests {
         std::fs::write(&path, "alpha βeta\nsecond\n").unwrap();
         let uri = file_uri(&path);
         app.open_document_tab(AppKind::Editor, &uri).unwrap();
-        let (_, editor_view) = app.active_native_view(wid).expect("Editor active");
+        let (editor_instance, editor_view) = app.active_native_view(wid).expect("Editor active");
+        let document = app.native_runtime.document_id(editor_instance).unwrap();
+        let before = app.document_store.snapshot(document).unwrap();
         let compiled = presented_native_ui(&mut app, wid);
         let editor_key = UiKey::new("editor/buffer");
         let editor = compiled
@@ -7626,7 +7797,7 @@ mod tests {
         let UiContent::TextViewport(spec) = &editor.content else {
             panic!("editor body remains a text viewport");
         };
-        let geometry = crate::native_ui::text_viewport_geometry(editor.rect);
+        let geometry = spec.geometry(editor.rect);
         let content_x = geometry.text_x + 36.0;
         let content_y = geometry.body_y + geometry.line_h * 0.5;
         let expected =
@@ -7644,7 +7815,268 @@ mod tests {
             editor.buffer.as_ref().unwrap().primary_selection().head,
             expected
         );
+        assert_eq!(editor.common.last_focus.as_ref(), Some(&editor_key));
+        assert!(
+            !editor.common.focus_visible,
+            "pointer focus keeps its quiet style"
+        );
+        let selected = editor.buffer.as_ref().unwrap().primary_selection().clone();
+        let mut failures = Vec::new();
+        let clicked = presented_native_ui(&mut app, wid);
+        let viewport = clicked
+            .paint
+            .iter()
+            .find(|node| node.key == editor_key)
+            .unwrap();
+        let UiContent::TextViewport(spec) = &viewport.content else {
+            panic!("editor viewport")
+        };
+        if !spec.focused {
+            failures.push("pointer-focused buffer did not retain actual input focus");
+        }
+        if clicked.ime_caret_rect().is_none() {
+            failures.push("pointer-focused buffer supplied no IME caret anchor");
+        }
+        let prims = clicked.tray(aterm_render::Theme::default(), 13.0).prims;
+        assert!(
+            !prims.iter().any(|prim| matches!(prim,
+                crate::widget::DrawPrim::Stroke { x, y, w, h, radius, .. }
+                    if (*x, *y, *w, *h, *radius) == (
+                        viewport.rect.x + 0.5, viewport.rect.y + 0.5,
+                        viewport.rect.width - 1.0, viewport.rect.height - 1.0, 10.0
+                    )
+            )),
+            "a pointer focus does not acquire the keyboard focus ring"
+        );
+        app.on_ime_preedit(wid, "日".to_string(), Some((0, 0)));
+        let composing = presented_native_ui(&mut app, wid);
+        if composing.ime_caret_rect().is_none() {
+            failures.push("pointer-owned composition supplied no IME caret anchor");
+        }
+        let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view) else {
+            panic!("Editor state")
+        };
+        assert_eq!(editor.preedit, "日");
+        assert_eq!(
+            editor.buffer.as_ref().unwrap().primary_selection(),
+            &selected
+        );
+        app.on_ime_preedit(wid, String::new(), None);
+        let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view) else {
+            panic!("Editor state")
+        };
+        assert!(editor.preedit.is_empty());
+        assert_eq!(
+            editor.buffer.as_ref().unwrap().primary_selection(),
+            &selected
+        );
+        assert!(!editor.common.focus_visible);
+        let mut toolbar_failures = Vec::new();
+        let inspect_anchor = |compiled: &crate::native_ui::CompiledUi,
+                              prompt: bool,
+                              label: &str,
+                              failures: &mut Vec<String>| {
+            let viewport = compiled
+                .paint
+                .iter()
+                .find(|node| node.key == editor_key)
+                .unwrap();
+            let UiContent::TextViewport(spec) = &viewport.content else {
+                panic!("editor viewport")
+            };
+            assert!(!spec.focused, "the toolbar retains control focus: {label}");
+            let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+            assert!(
+                !prims.iter().any(|prim| matches!(prim,
+                    crate::widget::DrawPrim::Stroke { x, y, w, h, radius, .. }
+                        if (*x, *y, *w, *h, *radius) == (
+                            viewport.rect.x + 0.5, viewport.rect.y + 0.5,
+                            viewport.rect.width - 1.0, viewport.rect.height - 1.0, 10.0
+                        )
+                )),
+                "toolbar focus does not give the viewport an outer ring: {label}"
+            );
+            if let Some(caret) = compiled.ime_caret_rect() {
+                let geometry = spec.geometry(viewport.rect);
+                assert_eq!(
+                    caret.y >= geometry.body_y + geometry.body_h,
+                    prompt,
+                    "{label}"
+                );
+                if !prims.iter().any(|prim| {
+                    matches!(prim,
+                        crate::widget::DrawPrim::Stroke { x, y, w, h, .. }
+                            if (*x, *y, *w, *h) == (caret.x, caret.y, caret.width, caret.height)
+                    )
+                }) {
+                    failures.push(format!("{label}: the text target's caret is not painted"));
+                }
+            } else {
+                failures.push(format!("{label}: the text target has no IME anchor"));
+            }
+        };
+        let key = |key, mods| crate::input::InputEvent::Key {
+            key,
+            mods,
+            base_layout: None,
+            layout_text: None,
+            event_type: aterm_types::keyboard::KeyEventType::Press,
+        };
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+        let abort = key(Key::Character('g'), Modifiers::CTRL);
+        for button in [
+            "editor/find-button",
+            "editor/goto-line-button",
+            "editor/commands-button",
+        ] {
+            let compiled = presented_native_ui(&mut app, wid);
+            let hit = compiled
+                .hits
+                .iter()
+                .find(|hit| hit.key.as_str() == button)
+                .expect("enabled toolbar button");
+            let (x, y) = native_content_to_window(
+                &mut app,
+                wid,
+                hit.rect.x + hit.rect.width * 0.5,
+                hit.rect.y + hit.rect.height * 0.5,
+            );
+            app.on_cursor_moved(wid, x, y);
+            for state in [ElementState::Pressed, ElementState::Released] {
+                app.mouse_input_then_fold(wid, state, MouseButton::Left);
+            }
+            let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view)
+            else {
+                panic!("Editor state")
+            };
+            assert_eq!(
+                editor.common.last_focus.as_ref().map(UiKey::as_str),
+                Some(button)
+            );
+            assert!(
+                !editor.common.focus_visible,
+                "pointer toolbar focus stays quiet"
+            );
+            use crate::native_editor::Minibuffer;
+            assert!(
+                matches!(
+                    (button, &editor.buffer.as_ref().unwrap().minibuffer),
+                    ("editor/find-button", Minibuffer::Search { .. })
+                        | ("editor/goto-line-button", Minibuffer::GotoLine { .. })
+                        | ("editor/commands-button", Minibuffer::Command { .. })
+                ),
+                "the actual toolbar click opens its prompt: {button}"
+            );
+            let compiled = presented_native_ui(&mut app, wid);
+            inspect_anchor(&compiled, true, button, &mut toolbar_failures);
+            assert!(app.native_input_event(wid, &crate::input::InputEvent::Text("λ".to_string())));
+            let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view)
+            else {
+                panic!("Editor state")
+            };
+            let query = match &editor.buffer.as_ref().unwrap().minibuffer {
+                Minibuffer::Search { query, .. }
+                | Minibuffer::GotoLine { query, .. }
+                | Minibuffer::Command { query, .. } => query,
+                _ => panic!("toolbar prompt remains open"),
+            };
+            assert_eq!(query, "λ", "text still belongs to this prompt: {button}");
+            app.on_ime_preedit(wid, "日".to_string(), Some((0, 0)));
+            let compiled = presented_native_ui(&mut app, wid);
+            inspect_anchor(&compiled, true, button, &mut toolbar_failures);
+            let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view)
+            else {
+                panic!("Editor state")
+            };
+            assert_eq!(editor.preedit, "日");
+            assert_eq!(
+                editor.buffer.as_ref().unwrap().primary_selection(),
+                &selected
+            );
+            app.on_ime_preedit(wid, String::new(), None);
+            app.on_ime_commit(wid, String::new());
+            assert!(app.native_input_event(wid, &abort));
+            let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view)
+            else {
+                panic!("Editor state")
+            };
+            assert!(editor.preedit.is_empty());
+            assert!(!editor.buffer.as_ref().unwrap().minibuffer_active());
+            assert_eq!(
+                editor.buffer.as_ref().unwrap().primary_selection(),
+                &selected
+            );
+        }
+        for prompt in [false, true] {
+            app.focus_native_control(wid, editor_view, editor_key.clone(), false)
+                .unwrap();
+            if prompt {
+                app.dispatch_native_event(
+                    wid,
+                    crate::native_app::AppEvent::EditorCommand(
+                        crate::native_editor::EditorCommand::IncrementalSearch,
+                    ),
+                )
+                .unwrap();
+            }
+            let navigation = if prompt {
+                key(Key::Named(NamedKey::Tab), Modifiers::SHIFT)
+            } else {
+                key(Key::Named(NamedKey::F6), Modifiers::empty())
+            };
+            assert!(app.native_input_event(wid, &navigation));
+            let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view)
+            else {
+                panic!("Editor state")
+            };
+            assert_eq!(
+                editor.common.last_focus.as_ref().map(UiKey::as_str),
+                Some("editor/find-button")
+            );
+            assert!(
+                editor.common.focus_visible,
+                "keyboard navigation retains its toolbar ring"
+            );
+            let label = if prompt {
+                "search then Shift+Tab"
+            } else {
+                "document then F6"
+            };
+            let compiled = presented_native_ui(&mut app, wid);
+            inspect_anchor(&compiled, prompt, label, &mut toolbar_failures);
+            app.on_ime_preedit(wid, "日".to_string(), Some((0, 0)));
+            let compiled = presented_native_ui(&mut app, wid);
+            inspect_anchor(&compiled, prompt, label, &mut toolbar_failures);
+            let Some(AppViewState::Editor(editor)) = app.native_runtime.view_state(editor_view)
+            else {
+                panic!("Editor state")
+            };
+            assert_eq!(editor.preedit, "日");
+            assert_eq!(
+                editor.buffer.as_ref().unwrap().primary_selection(),
+                &selected
+            );
+            app.on_ime_preedit(wid, String::new(), None);
+            app.on_ime_commit(wid, String::new());
+            if prompt {
+                assert!(app.native_input_event(wid, &abort));
+            }
+        }
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!((after.seq, after.text), (before.seq, before.text));
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha βeta\nsecond\n"
+        );
+        assert!(app.structural_invariants_ok());
         let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            toolbar_failures.is_empty(),
+            "{}",
+            toolbar_failures.join("\n")
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
@@ -9944,7 +10376,7 @@ mod tests {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.last_mouse_cell = (0, 9);
         ws.last_mouse_side = SelectionSide::Left;
-        app.shift_extend_press(wid);
+        app.shift_extend_press(wid, std::time::Instant::now());
         assert_eq!(
             term_lock(&term).selection_to_string().as_deref(),
             Some("HELLO"),
@@ -9957,6 +10389,73 @@ mod tests {
         assert_eq!(
             term_lock(&term).selection_to_string().as_deref(),
             Some("plain")
+        );
+    }
+
+    /// THE GRID COUNTS A RUN OF PRESSES BY WHEN EACH HAPPENED: a press at the last instant of a
+    /// double click's interval after the first continues the run and selects the word under
+    /// it, and a press a millisecond after the interval starts a new run where a triple click's
+    /// third would select the line; a shift-click starts a run the same way. Each press states
+    /// its time, so how long the work between presses takes never moves one across the interval.
+    #[test]
+    fn the_grids_click_streak_counts_each_press_by_when_it_happened() {
+        use crate::{App, WindowId, term_lock};
+        use aterm_window::event::{ElementState, MouseButton};
+        use aterm_window::keyboard::ModifiersState;
+        use std::time::{Duration, Instant};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(b"hello world");
+        let (x, y) = app
+            .cell_centre_px(wid, 0, 1)
+            .expect("cell (0, 1) is on the grid");
+        app.on_cursor_moved(wid, x, y);
+        let interval = Duration::from_millis(
+            u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
+        );
+        // A minute ago, so a press or a stamp that read the clock instead of its stated time
+        // lands on the wrong side of the interval.
+        let first = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("a minute of uptime");
+        let past = interval + Duration::from_millis(1);
+        let shifted = first + interval * 4;
+        let mut counts = Vec::new();
+        for (k, (at, mods)) in [
+            (first, ModifiersState::empty()),
+            (first + interval, ModifiersState::empty()),
+            (first + interval + past, ModifiersState::empty()),
+            (shifted, ModifiersState::SHIFT),
+            (shifted + interval, ModifiersState::empty()),
+            (shifted + interval * 3, ModifiersState::SHIFT),
+            (shifted + interval * 3 + past, ModifiersState::empty()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.windows.get_mut(&wid).expect("window").mods = mods;
+            app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
+            counts.push(app.windows[&wid].click_count);
+            if k == 1 {
+                assert_eq!(
+                    term_lock(&term).selection_to_string().as_deref(),
+                    Some("hello"),
+                    "the second press, at the interval's last instant, selects the word"
+                );
+            }
+            app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
+        }
+        assert_eq!(
+            counts,
+            [1, 2, 1, 1, 2, 1, 1],
+            "a press a millisecond after the interval starts a new run, after a press or a \
+             shift-click"
         );
     }
 
@@ -11084,3 +11583,7 @@ mod client_frame_tests;
 #[cfg(test)]
 #[path = "app_mouse_menu_regrid_tests.rs"]
 mod menu_regrid_tests;
+
+#[cfg(test)]
+#[path = "app_mouse_startup_review_tests.rs"]
+mod startup_review_tests;

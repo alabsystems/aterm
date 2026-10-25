@@ -9733,7 +9733,7 @@ fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
             .find(|key| key.as_str().starts_with("settings/nav/"))
             .expect("the sidebar has a visible row")
             .clone();
-        app.focus_native_control(wid, rail).unwrap();
+        app.focus_native_control(wid, view, rail, true).unwrap();
         app.dispatch_native_view_event(
             wid,
             view,
@@ -9758,7 +9758,8 @@ fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
             .find(|key| key.as_str().starts_with("settings/nav/"))
             .expect("End shows a sidebar row")
             .clone();
-        app.focus_native_control(wid, rail.clone()).unwrap();
+        app.focus_native_control(wid, view, rail.clone(), true)
+            .unwrap();
         let seated = app.compiled_native_ui(wid).unwrap();
         let at = seated
             .focus_order

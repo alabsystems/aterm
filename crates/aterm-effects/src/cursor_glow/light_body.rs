@@ -326,8 +326,12 @@ pub(crate) fn push_ink_ring(
             continue;
         }
         let dy2 = dy * dy;
-        let outer = (r2 - dy2).sqrt();
-        let inner = if dy < ri { (ri2 - dy2).sqrt() } else { 0.0 };
+        let outer = crate::color_math::sqrt_f32(r2 - dy2);
+        let inner = if dy < ri {
+            crate::color_math::sqrt_f32(ri2 - dy2)
+        } else {
+            0.0
+        };
         span(under, y, cx - outer, cx - inner, rim);
         span(under, y, cx - inner, cx + inner, fill);
         span(under, y, cx + inner, cx + outer, rim);

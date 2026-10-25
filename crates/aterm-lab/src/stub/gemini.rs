@@ -11,11 +11,11 @@ use super::{est_tokens, limit_params, rand_hex, script_calls, spec_headers, spli
 use crate::pyjson::{COMPACT, J};
 use crate::util::one_line;
 
-/// The fixed fake key the lab gives Gemini CLI and agy: never a credential anywhere.
+/// The fixed fake key the lab gives agy: never a credential anywhere.
 pub const LAB_GEMINI_KEY: &str = "lab-gemini-not-a-key";
 
 /// The `thoughtSignature` of a call the stub makes (base64 of a fixed text):
-/// agy echoes it back with the call's result, Gemini CLI stores it.
+/// agy echoes it back with the call's result.
 const SIGNATURE: &str = "bGFiLXN0dWItdGhvdWdodC1zaWduYXR1cmU=";
 
 /// What a Gemini API request asks.
@@ -408,94 +408,6 @@ pub fn quota_error_for(model: &str, quota_id: &str, limit: u32, retry_delay: &st
 /// The `RetryInfo` of the `rate-limit` mode's spent day quota, in seconds.
 pub const DAY_QUOTA_RETRY: i64 = 3600;
 
-/// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google
-/// ACCOUNT's spent usage limit ([`exhausted_error`]) rather than an API key's
-/// spent per-day quota ([`quota_error`], every other claim).
-pub const ACCOUNT_CLAIM: &str = "code_assist";
-
-/// The claim of `limit:CLAIM:RESET` that walls a Google ACCOUNT's PRO
-/// bucket under Gemini CLI's Auto model: the turn answered as
-/// [`ACCOUNT_CLAIM`]'s ([`exhausted_error`]), and while it stands each
-/// structured side request routed to the Pro model ([`route_pro`]), so the
-/// turn meets the wall on a Pro model with a flash model to fall back to and
-/// Gemini CLI 0.46.0 draws the per-model bucket's dialog (`Switch to
-/// <fallback>` over `Stop`). On a model a `--model` named, or on the flash
-/// model, the failed model is its own fallback and the CLI draws the
-/// account's `Keep trying` instead.
-pub const BUCKET_CLAIM: &str = "code_assist_pro";
-
-/// A structured side request's answer `filled` ([`schema_fill`]) routed to
-/// the Pro model: Gemini CLI's numerical router reads `complexity_score`
-/// against its threshold (at most 100), its classifier `model_choice`
-/// (`pro`, the bundle's `PRO_MODEL`); any other answer is left as it is.
-#[must_use]
-pub fn route_pro(filled: J) -> J {
-    match filled {
-        J::Obj(props) => J::Obj(
-            props
-                .into_iter()
-                .map(|(k, v)| match k.as_str() {
-                    "complexity_score" => (k, J::Int(100)),
-                    "model_choice" => (k, J::s("pro")),
-                    _ => (k, v),
-                })
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-/// Whether stub mode `mode` routes the side requests to the Pro model now
-/// (`now_s`): a [`BUCKET_CLAIM`] wall not yet reset.
-#[must_use]
-pub fn routes_pro(mode: &str, now_s: i64) -> bool {
-    limit_params(mode).is_some_and(|(claim, reset, _)| claim == BUCKET_CLAIM && now_s < reset)
-}
-
-/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server
-/// (`cloudcode-pa.googleapis.com`, the API a Google sign-in's Gemini CLI
-/// speaks) answers once the ACCOUNT's usage limit on `model` is spent: the
-/// message `You have exhausted your capacity on this model. Your quota will
-/// reset after <span>.`, an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in
-/// the Code Assist domain with the reset in its metadata (`quotaResetDelay`,
-/// `quotaResetTimeStamp`), and a `RetryInfo` of the same delay.
-#[must_use]
-pub fn exhausted_error(model: &str, retry_secs: i64, reset_s: i64) -> J {
-    let secs = retry_secs.max(0);
-    let span = format!("{}h{}m{}s", secs / 3600, secs % 3600 / 60, secs % 60);
-    let span = span.strip_prefix("0h").unwrap_or(&span).to_string();
-    google_error(
-        429,
-        "RESOURCE_EXHAUSTED",
-        &format!(
-            "You have exhausted your capacity on this model. Your quota will reset after {span}."
-        ),
-        vec![
-            J::obj([
-                ("@type", J::s("type.googleapis.com/google.rpc.ErrorInfo")),
-                ("reason", J::s("QUOTA_EXHAUSTED")),
-                ("domain", J::s("cloudcode-pa.googleapis.com")),
-                (
-                    "metadata",
-                    J::obj([
-                        ("uiMessage", J::s("true")),
-                        ("model", J::s(model)),
-                        ("quotaResetDelay", J::s(span.as_str())),
-                        (
-                            "quotaResetTimeStamp",
-                            J::s(format!("{}Z", crate::util::utc_civil(reset_s))),
-                        ),
-                    ]),
-                ),
-            ]),
-            J::obj([
-                ("@type", J::s("type.googleapis.com/google.rpc.RetryInfo")),
-                ("retryDelay", J::s(format!("{secs}s"))),
-            ]),
-        ],
-    )
-}
-
 /// The wall a fixed mode puts on a turn, in Google's shape.
 #[must_use]
 pub fn mode_error(mode: &str, model: &str) -> Option<(u16, J)> {
@@ -574,7 +486,7 @@ pub fn mode_error(mode: &str, model: &str) -> Option<(u16, J)> {
     })
 }
 
-/// The Gemini API's other refusals the lab measured Gemini CLI and agy under.
+/// The Gemini API's other refusals the lab measured agy under.
 #[must_use]
 pub fn measured_refusals() -> Vec<(&'static str, &'static str, J)> {
     let model = "gemini-3.1-pro-preview";
@@ -797,13 +709,7 @@ impl Stub {
         let t = (method, path, blen, mode, model, verb, in_tok);
         if kind != "gemini" {
             let answer = if kind == "gemini-json" {
-                let filled = schema_fill(info.schema.as_ref().unwrap_or(&J::Obj(Vec::new())), None);
-                if routes_pro(mode, crate::util::now_secs()) {
-                    summary.push_str(" routed:pro");
-                    route_pro(filled).dump(COMPACT)
-                } else {
-                    filled.dump(COMPACT)
-                }
+                schema_fill(info.schema.as_ref().unwrap_or(&J::Obj(Vec::new())), None).dump(COMPACT)
             } else {
                 "Lab stub session".to_string()
             };
@@ -907,11 +813,7 @@ impl Stub {
             };
             let now_s = crate::util::now_secs();
             if now_s < reset {
-                let body = if claim == ACCOUNT_CLAIM || claim == BUCKET_CLAIM {
-                    exhausted_error(model, reset - now_s, reset)
-                } else {
-                    quota_error(model, reset - now_s)
-                };
+                let body = quota_error(model, reset - now_s);
                 let st = out.json(429, &body, &[])?;
                 let s = format!("{summary} limit:{claim} resets in {}s", reset - now_s);
                 self.record(method, path, st, blen, &mode, &s);

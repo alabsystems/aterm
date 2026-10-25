@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Worker launch (`spawn agent=<claude|codex|gemini|agy|muse>`) across harnesses.
+//! Worker launch (`spawn agent=<claude|codex|agy|muse>`) across harnesses.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,17 @@ pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
 
 fn too_large(len: &str, agent: &str) -> String {
     format!("ERR spawn agent={agent}: the task is {len} bytes (max {TASK_MAX})\n")
+}
+
+/// The reply to a spawn line whose `agent=` names a retired agent
+/// ([`aterm_phase::RETIRED_AGENTS`], Gemini CLI): refused with the agent that
+/// replaces it named, never read as another worker.
+pub(crate) fn retired_worker(agent: Option<&str>) -> Option<String> {
+    let agent = agent?;
+    aterm_phase::RETIRED_AGENTS
+        .iter()
+        .any(|retired| agent.eq_ignore_ascii_case(retired))
+        .then(|| format!("ERR spawn agent={agent}: {}\n", aterm_phase::RETIRED_AGENT))
 }
 
 /// The worker word a spawn line's `agent=` names.
@@ -216,7 +227,6 @@ fn draws_nothing(c: char) -> bool {
 #[derive(Clone)]
 pub(crate) struct TaskSeed {
     text: Arc<[u8]>,
-    trust_text: Option<Arc<[u8]>>,
     /// The write and explicit discard share one decision across clones.
     written: Arc<Mutex<TaskFileState>>,
 }
@@ -225,7 +235,6 @@ pub(crate) struct TaskSeed {
 struct TaskFileState {
     discarded: bool,
     path: Option<PathBuf>,
-    trust_path: Option<PathBuf>,
 }
 
 impl TaskSeed {
@@ -233,42 +242,22 @@ impl TaskSeed {
     pub(crate) fn new(text: Vec<u8>) -> Self {
         Self {
             text: text.into(),
-            trust_text: None,
             written: Arc::default(),
         }
     }
 
-    /// Prepare the worker's optional private trust sidecar alongside its task file.
-    pub(crate) fn with_trust_file(mut self, folder: &str) -> Self {
-        self.trust_text = Some(
-            aterm_agent::harness::worker::trusted_folders_text(folder)
-                .into_bytes()
-                .into(),
-        );
-        self
-    }
-
-    pub(crate) fn trust_file(&self) -> Option<PathBuf> {
-        self.written
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .trust_path
-            .clone()
-    }
-
-    /// Remove the task and optional trust file this seed wrote: its worker did not start.
+    /// Remove the task file this seed wrote: its worker did not start.
     pub(crate) fn discard(&self) {
         let written = {
             let mut state = self.written.lock().unwrap_or_else(|p| p.into_inner());
             state.discarded = true;
-            [state.path.take(), state.trust_path.take()]
+            state.path.take()
         };
-        for path in written.into_iter().flatten() {
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                aterm_log::warn!("task file {}: not removed: {e}", path.display());
-            }
+        if let Some(path) = written
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            aterm_log::warn!("task file {}: not removed: {e}", path.display());
         }
     }
 
@@ -320,29 +309,13 @@ impl TaskSeed {
         let pinned = crate::pinned_dir::PinnedDir::open_resolved(dir)?;
         let file = write(&pinned, name, &self.text)?;
         let path = dir.join(name);
-        let trust_name = trust_file_name(sid);
-        let trust = self.trust_text.as_ref().and_then(|text| {
-            pinned
-                .write_new_private(std::ffi::OsStr::new(&trust_name), text)
-                .inspect_err(|e| {
-                    aterm_log::warn!(
-                        "worker {sid}: its trusted-folders file was not written ({e}): its \
-                         folder-trust dialog is the person's"
-                    );
-                })
-                .ok()
-        });
         let mut state = self.written.lock().unwrap_or_else(|p| p.into_inner());
         if state.discarded {
             drop(state);
-            let task_removed = file.remove_exact();
-            let trust_removed = trust.map(|file| file.remove_exact()).transpose();
-            task_removed?;
-            trust_removed?;
+            file.remove_exact()?;
             return Err(cancelled());
         }
         state.path = Some(path.clone());
-        state.trust_path = trust.map(|_| dir.join(trust_name));
         Ok(path)
     }
 }
@@ -351,6 +324,8 @@ fn task_file_name(sid: &SessionId) -> String {
     format!("{}-1.txt", sid.as_str())
 }
 
+/// The trusted-folders sidecar an older aterm wrote beside a Gemini CLI worker's task file; a
+/// session handed across the upgrade can still have one, removed with its task file.
 fn trust_file_name(sid: &SessionId) -> String {
     format!("{}-1.trust.json", sid.as_str())
 }
@@ -476,8 +451,6 @@ pub(crate) struct Launch {
     pub(crate) model: Option<String>,
     /// The one folder the worker's starter trusted for it (the spawn's canonical `cwd=`).
     pub(crate) trusted_cwd: Option<String>,
-    /// The optional sidecar already written with the task before the session was registered.
-    pub(crate) trust_file: Option<PathBuf>,
     /// The starter's session, whose agent of the worker's kind the line follows.
     pub(crate) caller: Option<Arc<SessionCtx>>,
 }
@@ -525,16 +498,6 @@ fn run_worker_launch(work: &Launch) {
         work.trusted_cwd.as_deref(),
         || shell_cwd(&work.store, &work.ctx),
     );
-    let session = cli.session_flag.and_then(|_| {
-        aterm_agent::harness::worker::fresh_session_id()
-            .inspect_err(|e| {
-                aterm_log::warn!(
-                    "worker session {}: no session id of its own ({e})",
-                    work.local
-                );
-            })
-            .ok()
-    });
     let rotated = agy_rotation(work, &caller);
     if let Some(pick) = &rotated {
         note_launch(&work.ctx, format!("agy quota: {}", pick.describe()));
@@ -550,8 +513,6 @@ fn run_worker_launch(work: &Launch) {
     let fresh = aterm_agent::harness::worker::Fresh {
         model,
         trusted_here: here,
-        trust_file: work.trust_file.as_deref(),
-        session: session.as_deref(),
     };
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &caller, &fresh);
     match line {
@@ -583,7 +544,7 @@ fn run_worker_launch(work: &Launch) {
                 }
             };
             let note = format!(
-                "typed ({} B, {written}): {} ({}{}{}{})",
+                "typed ({} B, {written}): {} ({}{}{})",
                 line.len() + 1,
                 caller.exe.display(),
                 found.words(cli.agent),
@@ -595,10 +556,6 @@ fn run_worker_launch(work: &Launch) {
                 cli.trust_flag
                     .filter(|_| here)
                     .map(|flag| format!(", trusting its folder for this run ({flag})"))
-                    .unwrap_or_default(),
-                work.trust_file
-                    .as_deref()
-                    .map(|f| format!(", trusting its folder alone by {}", f.display()))
                     .unwrap_or_default(),
             );
             aterm_log::info!("worker session {}: launch line {note}", work.local);
@@ -732,7 +689,6 @@ fn agy_rotation(
         | Program::Codex
         | Program::Grok
         | Program::Kimi
-        | Program::Gemini
         | Program::Muse
         | Program::Generic => {
             return None;

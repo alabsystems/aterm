@@ -30,6 +30,19 @@ fn every_line_is_the_mark_a_closed_fact_and_its_rule() {
             }
         }
     }
+    for class in Declarer::ALL {
+        for kinds in [
+            &[][..],
+            &AtomKind::ALL[..],
+            &[AtomKind::File, AtomKind::File][..],
+        ] {
+            for since in [None, Some((0, 0)), Some((23, 59))] {
+                for slots in [None, Some((1, 3)), Some((u16::MAX, u16::MAX))] {
+                    lines.push(wake(u16::MAX, class, kinds, since, slots));
+                }
+            }
+        }
+    }
     for line in &lines {
         let text = line.text();
         assert!(text.starts_with("[aterm harness] aterm: "), "{text}");
@@ -60,6 +73,35 @@ fn each_rule_says_its_own_numbers() {
         assert!(room.fact().contains(said), "{said} in {}", room.text());
     }
     assert!(!room.text().contains("WAITING:"), "{}", room.text());
+
+    let woke = wake(
+        1,
+        Declarer::Agent,
+        &[AtomKind::File],
+        Some((23, 40)),
+        Some((1, 3)),
+    );
+    assert_eq!(woke.rule(), RuleId::Wake);
+    assert_eq!(
+        woke.text(),
+        "[aterm harness] aterm: wake #1 (yours): its file condition holds since 23:40; 1 of 3 \
+         build slots free. Re-read the base of any cut, mint or publish before you start it. \
+         (rule wake@v1)"
+    );
+    let plain = wake(
+        2,
+        Declarer::Owner,
+        &[AtomKind::File, AtomKind::Pid, AtomKind::File, AtomKind::At],
+        None,
+        None,
+    );
+    assert!(
+        plain
+            .fact()
+            .starts_with("wake #2 (owner's): its file, pid and at conditions hold."),
+        "each kind once, in order: {}",
+        plain.text()
+    );
 }
 
 #[test]

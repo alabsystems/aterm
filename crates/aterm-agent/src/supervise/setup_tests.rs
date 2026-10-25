@@ -288,3 +288,41 @@ fn the_ladder_seam_scales_the_short_back_off_ladder_and_nothing_else() {
     let back = Header::decode(&text).expect("decodes");
     assert_eq!(back.setup.turn_end_timing, scaled);
 }
+
+/// THE RESET SEAM SCALES THE WAIT PAST A WALL'S RESET AND NOTHING ELSE, beside the ladder's: a
+/// world test's carry-on comes at the wall's own reset (`ATERM_DEV_RESET_SCALE`).
+#[test]
+fn the_reset_seam_scales_the_wait_past_a_walls_reset_and_nothing_else() {
+    use crate::supervise::policy::turn_end::{LADDER_SCALE_SEAM, RESET_SCALE_SEAM};
+    use std::ffi::OsStr;
+    let shipped = TurnEndTiming::default();
+    let scaled = TurnEndTiming::for_seams(None, Some(OsStr::new("0.5")));
+    assert_eq!(
+        (scaled.reset_grace, scaled.reset_jitter),
+        (Duration::from_secs(75), Duration::from_secs(30))
+    );
+    assert_eq!(
+        TurnEndTiming {
+            reset_grace: shipped.reset_grace,
+            reset_jitter: shipped.reset_jitter,
+            ..scaled.clone()
+        },
+        shipped,
+        "only the reset's wait moves"
+    );
+    let both = TurnEndTiming::for_seams(Some(OsStr::new("0.125")), Some(OsStr::new("0.5")));
+    assert_eq!(
+        both,
+        scaled.clone().ladder_scaled(0.125),
+        "each seam its own"
+    );
+    assert_eq!(TurnEndTiming::for_seams(None, None), shipped);
+    for bad in ["0", "1.5", "nan", "soon"] {
+        assert_eq!(
+            TurnEndTiming::for_seams(None, Some(OsStr::new(bad))),
+            shipped,
+            "{bad:?}"
+        );
+    }
+    assert_ne!(LADDER_SCALE_SEAM, RESET_SCALE_SEAM);
+}

@@ -509,17 +509,18 @@ impl CursorRainbow {
         let emitted_from = out.len();
         let was_active = self.energy > SETTLED_ENERGY;
         self.energy = e;
-        let paint = cfg.paint.map_or(e, |p| {
-            (p.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).max(e)
-        });
+        let paint = match cfg.paint {
+            Some(p) => (p.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).max(e),
+            None => e,
+        };
         let was_painted = self.paint > SETTLED_ENERGY;
         self.paint = paint;
 
         let active = e > SETTLED_ENERGY;
-        let since_last = self
-            .last
-            .map(|t| now.saturating_duration_since(t).as_secs_f32())
-            .unwrap_or(0.0);
+        let since_last = match self.last {
+            Some(t) => now.saturating_duration_since(t).as_secs_f32(),
+            None => 0.0,
+        };
         let dt = if was_active && active {
             since_last.min(MAX_DT)
         } else {
@@ -541,19 +542,23 @@ impl CursorRainbow {
             self.spin = if (0.0..2.0).contains(&next_spin) {
                 next_spin
             } else {
-                next_spin.rem_euclid(2.0)
+                next_spin - (next_spin * 0.5).floor() * 2.0
             };
         }
-        let spectrum_phase = family
-            .map(|(phase, _)| phase)
-            .unwrap_or_else(|| rainbow_phase_from_unit_turn(self.phase));
-        let spectrum_field = family.map(|(_, field)| field);
+        let (spectrum_phase, spectrum_field) = match family {
+            Some((phase, field)) => (phase, Some(field)),
+            None => (rainbow_phase_from_unit_turn(self.phase), None),
+        };
 
         if cfg.blinking {
-            let rung_reached = MOMENTUM_FLARE_STEPS
-                .iter()
-                .take_while(|&&step| paint >= step)
-                .count() as u8;
+            let mut rung_reached = 0u8;
+            for &step in &MOMENTUM_FLARE_STEPS {
+                if paint >= step {
+                    rung_reached += 1;
+                } else {
+                    break;
+                }
+            }
             if rung_reached > self.flare_rung {
                 self.flare_rung = rung_reached;
                 self.twinkle_at = Some(now);
@@ -581,7 +586,10 @@ impl CursorRainbow {
                 } else {
                     let scint = (u * TWINKLE_SCINT + self.twinkle_seq as f32 * 0.37)
                         * std::f32::consts::TAU;
-                    ((u * std::f32::consts::PI).sin(), 0.72 + 0.28 * scint.sin())
+                    (
+                        crate::supernova::sin_cos_f32(u * std::f32::consts::PI).0,
+                        0.72 + 0.28 * crate::supernova::sin_cos_f32(scint).0,
+                    )
                 }
             }
             None => (0.0, 0.0),
@@ -594,9 +602,18 @@ impl CursorRainbow {
             lerp(SAT_IDLE_LIGHT, SAT_MAX, paint)
         };
         let val = lerp(VAL_IDLE, VAL_MAX, paint);
-        let col = cur.map_or(0, |(_, cc)| cc);
-        let sweep = spectrum_field.unwrap_or_else(|| rainbow_sweep_at(col, spectrum_phase));
-        let head_rgb = cfg.head_rgb.unwrap_or_else(|| spectrum_at(sweep, 0.0));
+        let col = match cur {
+            Some((_, cc)) => cc,
+            None => 0,
+        };
+        let sweep = match spectrum_field {
+            Some(s) => s,
+            None => rainbow_sweep_at(col, spectrum_phase),
+        };
+        let head_rgb = match cfg.head_rgb {
+            Some(rgb) => rgb,
+            None => spectrum_at(sweep, 0.0),
+        };
         let rainbow = shade(head_rgb, sat, val);
 
         let base = cfg.base.unwrap_or(if dark_theme {
@@ -635,8 +652,10 @@ impl CursorRainbow {
         let flare_age = cfg
             .flare_at
             .map(|t| now.saturating_duration_since(t).as_secs_f32());
-        self.flaring =
-            flare_age.is_some_and(|age| age < crate::rainbow_kitty::timing::SPRING_SNAP_RESPONSE_S);
+        self.flaring = matches!(
+            flare_age,
+            Some(age) if age < crate::rainbow_kitty::timing::SPRING_SNAP_RESPONSE_S
+        );
         let mut fill = match flare_age {
             None => fill,
             Some(age) => {
@@ -656,7 +675,7 @@ impl CursorRainbow {
         let breath = if self.pulse == 0.0 {
             0.5
         } else {
-            0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin()
+            0.5 + 0.5 * crate::supernova::sin_cos_f32(self.pulse * std::f32::consts::TAU).0
         };
         let halo_energy = HALO_IDLE_FLOOR * (0.35 + PULSE_DEPTH * breath) + paint;
         let mut flare_pop = 1.0f32;
@@ -670,14 +689,13 @@ impl CursorRainbow {
             let ch = geom.ch as i32;
             let cx = geom.origin_x as i32 + cc as i32 * cw;
             let cy = geom.origin_y as i32 + cr as i32 * ch;
-            flare_pop = flare_age.map_or(1.0, |age| {
-                const INV_FLARE_RING_TAU_S: f32 = 1.0 / FLARE_RING_TAU_S;
-                if age >= 20.0 * FLARE_RING_TAU_S {
-                    1.0
-                } else {
-                    1.0 + FLARE_RING_POP * (-age * INV_FLARE_RING_TAU_S).exp()
+            flare_pop = match flare_age {
+                Some(age) if age < 20.0 * FLARE_RING_TAU_S => {
+                    const INV_FLARE_RING_TAU_S: f32 = 1.0 / FLARE_RING_TAU_S;
+                    1.0 + FLARE_RING_POP * crate::color_math::exp_f32(-age * INV_FLARE_RING_TAU_S)
                 }
-            });
+                _ => 1.0,
+            };
             let halo_r = lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, paint);
             let radius_x = (halo_r * cw as f32 * flare_pop).max(1.0);
             let radius_y = (halo_r * ch as f32 * flare_pop).max(1.0);
@@ -692,12 +710,13 @@ impl CursorRainbow {
             let mut rings = [(0usize, 0u8, 0u32, 0u32); HALO_LAYERS as usize];
             let mut gxy = [(0i32, 0i32); HALO_LAYERS as usize];
             let mut n_rings = 0usize;
-            let prev_rings = self.rim_memo.filter(|m| m.key.page == page).map(|m| {
-                (
+            let prev_rings = match self.rim_memo {
+                Some(m) if m.key.page == page => Some((
                     usize::from(m.key.n_rings).min(HALO_LAYERS as usize),
                     m.key.rings,
-                )
-            });
+                )),
+                _ => None,
+            };
             const INV_HALO_SPAN: f32 = 1.0 / (HALO_LAYERS - 1) as f32;
             for layer in 0..HALO_LAYERS {
                 let t = layer as f32 * INV_HALO_SPAN;
@@ -713,14 +732,24 @@ impl CursorRainbow {
                 } else {
                     shade(spectrum_at(ring_sweep, t * hue_spread), sat, val)
                 };
-                let ring_light = prev_rings
-                    .and_then(|(prev_n, prev)| {
-                        prev[..prev_n]
-                            .iter()
-                            .find(|&&(_, pcov, parc, _)| pcov == cov && parc == ring_arc)
-                            .map(|&(_, _, _, plight)| plight)
-                    })
-                    .unwrap_or_else(|| ring_light_on_page(ring_arc, cov, page, 1.0));
+                let ring_light = if let Some((prev_n, prev)) = prev_rings {
+                    let mut found = None;
+                    let mut pi = 0;
+                    while pi < prev_n {
+                        let (_, pcov, parc, plight) = prev[pi];
+                        if pcov == cov && parc == ring_arc {
+                            found = Some(plight);
+                            break;
+                        }
+                        pi += 1;
+                    }
+                    match found {
+                        Some(plight) => plight,
+                        None => ring_light_on_page(ring_arc, cov, page, 1.0),
+                    }
+                } else {
+                    ring_light_on_page(ring_arc, cov, page, 1.0)
+                };
                 rings[n_rings] = (out.len() - rings_from, cov, ring_arc, ring_light);
                 gxy[n_rings] = (gx, gy);
                 n_rings += 1;
@@ -749,7 +778,9 @@ impl CursorRainbow {
                 rings,
             };
             rim_key = Some(key);
-            if let Some(memo) = self.rim_memo.filter(|m| m.key == key) {
+            if let Some(memo) = self.rim_memo
+                && memo.key == key
+            {
                 if let Some(best) = memo.best {
                     Self::apply_equalised_rings(&mut out[rings_from..], &rings[..n_rings], &best);
                 }
@@ -828,9 +859,10 @@ impl CursorRainbow {
         if dark_theme && caret_floor > 0.0 {
             let rim_peak = if pop == 0.0
                 && let Some(key) = rim_key
-                && self.rim_memo.is_some_and(|m| m.key == key)
+                && let Some(m) = self.rim_memo
+                && m.key == key
             {
-                if let Some(peak) = self.rim_memo.and_then(|m| m.peak_dark_no_twinkle) {
+                if let Some(peak) = m.peak_dark_no_twinkle {
                     peak
                 } else {
                     let peak = self.rim_light_peak(&out[emitted_from..], dark_theme);
@@ -882,13 +914,19 @@ impl CursorRainbow {
         self.settle_probe = Some(SettleProbe {
             cur,
             energy,
-            energy_prev: previous.map_or(energy, |p| p.energy),
+            energy_prev: match previous {
+                Some(p) => p.energy,
+                None => energy,
+            },
             family,
             blink_phase,
             dark_theme,
             geom,
             cfg: *cfg,
-            paint_prev: previous.and_then(|p| p.cfg.paint),
+            paint_prev: match previous {
+                Some(p) => p.cfg.paint,
+                None => None,
+            },
             sample_dt: since_last,
         });
         self.settle_memo = None;
@@ -954,9 +992,11 @@ impl CursorRainbow {
         scratch.resize(w * h, 0);
         let mut ring_pixels = [0u32; HALO_LAYERS as usize];
         for (i, &(start, _, _, _)) in rings.iter().enumerate() {
-            let end = rings
-                .get(i + 1)
-                .map_or(quads.len(), |&(next, _, _, _)| next);
+            let end = if i + 1 < rings.len() {
+                rings[i + 1].0
+            } else {
+                quads.len()
+            };
             let bit = 1u32 << (i * 8);
             for q in &quads[start..end] {
                 if q.alpha != 0 {
@@ -986,19 +1026,25 @@ impl CursorRainbow {
                 buckets[last_bucket.1].1 += 1;
                 continue;
             }
-            if let Some((idx, (_, count))) = buckets[..n_buckets]
-                .iter_mut()
-                .enumerate()
-                .find(|(_, (m, _))| *m == mask)
-            {
-                *count += 1;
-                last_bucket = (mask, idx);
-            } else if n_buckets < buckets.len() {
-                buckets[n_buckets] = (mask, 1);
-                last_bucket = (mask, n_buckets);
-                n_buckets += 1;
-            } else {
-                buckets_complete = false;
+            let mut found = false;
+            let mut idx = 0;
+            while idx < n_buckets {
+                if buckets[idx].0 == mask {
+                    buckets[idx].1 += 1;
+                    last_bucket = (mask, idx);
+                    found = true;
+                    break;
+                }
+                idx += 1;
+            }
+            if !found {
+                if n_buckets < buckets.len() {
+                    buckets[n_buckets] = (mask, 1);
+                    last_bucket = (mask, n_buckets);
+                    n_buckets += 1;
+                } else {
+                    buckets_complete = false;
+                }
             }
         }
         let rings_len = rings.len();
@@ -1088,11 +1134,11 @@ impl CursorRainbow {
         for _ in 1..8 {
             let mid = 0.5 * (lo + hi);
             let c = solve(mid);
-            if lo_solved.is_some_and(|(lc, _)| lc == c) {
+            if matches!(lo_solved, Some((lc, _)) if lc == c) {
                 lo = mid;
                 continue;
             }
-            if hi_solved.is_some_and(|(hc, _)| hc == c) {
+            if matches!(hi_solved, Some((hc, _)) if hc == c) {
                 hi = mid;
                 continue;
             }
@@ -1110,16 +1156,22 @@ impl CursorRainbow {
                 break;
             }
         }
-        let (a, la) = lo_solved.unwrap_or_else(|| {
-            let a = solve(lo);
-            let la = pile_light(&a);
-            (a, la)
-        });
-        let (b, lb) = hi_solved.unwrap_or_else(|| {
-            let b = solve(hi);
-            let lb = pile_light(&b);
-            (b, lb)
-        });
+        let (a, la) = match lo_solved {
+            Some(pair) => pair,
+            None => {
+                let a = solve(lo);
+                let la = pile_light(&a);
+                (a, la)
+            }
+        };
+        let (b, lb) = match hi_solved {
+            Some(pair) => pair,
+            None => {
+                let b = solve(hi);
+                let lb = pile_light(&b);
+                (b, lb)
+            }
+        };
         let best = if (la - target).abs() <= (lb - target).abs() {
             a
         } else {
@@ -1173,14 +1225,13 @@ impl CursorRainbow {
             }
         }
         let mut last_px = FIELD;
-        let peak = scratch.iter().copied().fold(FIELD_PEAK, |peak, px| {
-            if px == FIELD || px == last_px {
-                peak
-            } else {
+        let mut peak = FIELD_PEAK;
+        for &px in &scratch {
+            if px != FIELD && px != last_px {
                 last_px = px;
-                peak.max(crate::color_math::relative_luminance(px) * 255.0)
+                peak = peak.max(crate::color_math::relative_luminance(px) * 255.0);
             }
-        });
+        }
         self.rim_scratch = scratch;
         peak
     }

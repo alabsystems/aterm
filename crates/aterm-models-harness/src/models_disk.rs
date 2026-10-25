@@ -237,7 +237,10 @@ pub fn disk_await_liveness() -> aterm_spec::derive::Liveness {
 ///   volume short opens a new one in its place (`Expire`, then the opening);
 /// - `pX`: X was elected this episode; `lX`: the lines X took this episode; `asks`: the lines
 ///   the lease counted; `cool`: a line went within the cooldown; `rose`: free space rose a GiB
-///   since a line; `raised`: the owner's disk line says the asks ran out;
+///   since a line; `raised`: the owner's disk line says the asks ran out. A's `pA` says more: 1,
+///   elected; 2, gone back to the episode as its host held it while owed (`ReturnA`), so it may
+///   be elected once more; 3, elected that once more and owed. A 3 is kept only while A is owed,
+///   and a 2 is dropped as the episode parks, as nothing there reads them;
 /// - `uA`: A's line went but its host could not write its record (a full disk), so the lease
 ///   still owes it, or has handed it off, run out, or elected another, until that host's next
 ///   look records it: the record counts it as one of the episode's lines, and the episode waits
@@ -245,17 +248,28 @@ pub fn disk_await_liveness() -> aterm_spec::derive::Liveness {
 ///   still take the episode's second line (`RecordOverA`); one elected since whose line would be
 ///   past the two is withdrawn untyped (`RecordWithdrawA`). The record lands before another
 ///   session's line goes (`TypeB` and `TypeC` wait on it): a host looks a minute apart
-///   (`LOOK_EVERY_MS`), and design §7 names a record lost for longer.
+///   (`LOOK_EVERY_MS`), and design §7 names a record lost for longer;
+/// - `wA`: the lease's record says A's host holds A where it cannot take a line now (an unspent
+///   usage-limit wall, a box only its owner can answer), as that host's last look read it
+///   (`Wall`, `Past`): the seat rule then nominates it no more; its host, the first time it holds
+///   A owed, returns it to the episode (`ReturnA`), and the second time releases it (`ReleaseA`),
+///   so it stays elected; and a round with nobody else to elect waits for it to be past, while it
+///   is not elected or has gone back, rather than running out (`ElectNone`). Only a round or an
+///   owed line reads it, so it is kept there alone (phases 1 and 2) and dropped as the episode
+///   leaves them; the next look there reads it again. B's and C's holds are not modeled: either
+///   may go back to the episode at any owed step of theirs (`ReturnB`, `ReturnC`).
 ///
 /// The rest record what a step saw, for the laws to judge: `sowed`, what the last line was
 /// typed on; `scool` and `sdone`, what the last opening saw; `slate`, whether the last line went
 /// after space was freed; `past`, whether the last episode closed past the margin of the floor
 /// it was held to, or gave way a cooldown after it parked; `sflap`, whether an episode opened
 /// after one that closed short of that; `skept`, whether A's host kept A owed with its task
-/// done; `sfit`, whether the last line to A went while the seat rule admitted it. `End`,
-/// `Expire`, `KeepA` and `TypeA` record from their own state what their guards are meant to
-/// hold, and each of their mutants is the same step under a weaker guard, so a guard weakened
-/// in the step itself breaks the law too.
+/// done; `sfit`, whether the last line to A went while the seat rule admitted it; `swall`,
+/// whether A's host kept A owed while it held it at a wall or a box; `swait`, whether a round ran
+/// out while A, not yet elected, was held so; `sret`, whether one ran out while A, gone back to
+/// the episode, was held so. `End`, `Expire`, `KeepA`, `TypeA` and `ElectNone`
+/// record from their own state what their guards are meant to hold, and each of their mutants is
+/// the same step under a weaker guard, so a guard weakened in the step itself breaks the law too.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn disk_free_ask_model() -> Model {
@@ -288,6 +302,10 @@ pub fn disk_free_ask_model() -> Model {
             var sfit = 1;
             var skept = 0;
             var uA = 0;
+            var wA = 0;
+            var swall = 0;
+            var swait = 0;
+            var sret = 0;
 
             action Drop when (free > 0) { free = free - 1; }
             action Climb when (4 > free) { free = free + 1; }
@@ -295,6 +313,8 @@ pub fn disk_free_ask_model() -> Model {
             action Unspend when (done == 1) { done = 0; }
             action Finish when (dA == 0) { dA = 1; }
             action Unfinish when (dA == 1) { dA = 0; }
+            action Wall when ((phase == 1 || phase == 2) && wA == 0) { wA = 1; }
+            action Past when ((phase == 1 || phase == 2) && wA == 1) { wA = 0; }
             action Cools when (cool == 1) { cool = 0; }
             action Ages when (phase > 3 && aged == 0) { aged = 1; }
             action OpenH when (free <= 2 && phase == 0 && done == 1 && cool == 0) {
@@ -312,10 +332,10 @@ pub fn disk_free_ask_model() -> Model {
                 sflap = if (past == 0) { 1 } else { sflap };
             }
             action RaiseH when (free <= 3 && phase > 0 && bar == 1) { bar = 2; }
-            action ElectA when (free <= 3 && phase == 1 && pA == 0) {
+            action ElectA when (free <= 3 && phase == 1 && (pA == 0 || pA == 2)) {
                 phase = 2;
                 owner = 1;
-                pA = 1;
+                pA = if (pA == 2) { 3 } else { 1 };
             }
             action ElectB when (free <= 3 && phase == 1 && pB == 0) {
                 phase = 2;
@@ -327,12 +347,35 @@ pub fn disk_free_ask_model() -> Model {
                 owner = 3;
                 pC = 1;
             }
-            action ElectNone when (free <= 3 && phase == 1) { phase = 5; raised = 1; }
-            action KeepA when (phase == 2 && owner == 1 && dA == 0) {
+            action ElectNone when (free <= 3 && phase == 1 && (wA == 0 || pA == 1)) {
+                phase = 5;
+                raised = 1;
+                swait = if (wA == 1 && pA == 0) { 1 } else { 0 };
+                sret = if (wA == 1 && pA == 2) { 1 } else { 0 };
+                wA = 0;
+                pA = if (pA == 2) { 0 } else { pA };
+            }
+            action KeepA when (phase == 2 && owner == 1 && dA == 0 && wA == 0) {
                 owner = 1;
                 skept = dA;
+                swall = wA;
             }
-            action ReleaseA when (phase == 2 && owner == 1 && dA == 1) { phase = 1; owner = 0; }
+            action ReleaseA when (
+                phase == 2 && owner == 1 && (dA == 1 || (wA == 1 && pA == 3))
+            ) {
+                phase = 1;
+                owner = 0;
+                pA = 1;
+            }
+            action ReturnA when (
+                phase == 2 && owner == 1 && dA == 0 && wA == 1 && pA == 1 && uA == 0
+            ) {
+                phase = 1;
+                owner = 0;
+                pA = 2;
+            }
+            action ReturnB when (phase == 2 && owner == 2) { phase = 1; owner = 0; pB = 0; }
+            action ReturnC when (phase == 2 && owner == 3) { phase = 1; owner = 0; pC = 0; }
             action TypeA when (phase == 2 && owner == 1 && dA == 0 && uA == 0) {
                 lA = lA + 1;
                 asks = asks + 1;
@@ -341,6 +384,8 @@ pub fn disk_free_ask_model() -> Model {
                 sowed = 1;
                 slate = rose;
                 sfit = if (dA == 0) { 1 } else { 0 };
+                wA = 0;
+                pA = 1;
             }
             action TypeALost when (phase == 2 && owner == 1 && dA == 0 && uA == 0) {
                 lA = lA + 1;
@@ -354,6 +399,8 @@ pub fn disk_free_ask_model() -> Model {
                 asks = asks + 1;
                 phase = 3;
                 uA = 0;
+                wA = 0;
+                pA = 1;
             }
             action RecordBackA when (uA == 1 && (phase == 1 || phase == 5)) {
                 asks = asks + 1;
@@ -361,6 +408,7 @@ pub fn disk_free_ask_model() -> Model {
                 owner = 1;
                 aged = 0;
                 uA = 0;
+                wA = 0;
             }
             action RecordOverA when (uA == 1 && phase == 2 && owner > 1 && asks == 0) {
                 asks = asks + 1;
@@ -371,6 +419,7 @@ pub fn disk_free_ask_model() -> Model {
                 phase = 3;
                 owner = 1;
                 uA = 0;
+                wA = 0;
             }
             action TypeB when (phase == 2 && owner == 2 && uA == 0) {
                 lB = lB + 1;
@@ -379,6 +428,7 @@ pub fn disk_free_ask_model() -> Model {
                 cool = 1;
                 sowed = 1;
                 slate = rose;
+                wA = 0;
             }
             action TypeC when (phase == 2 && owner == 3 && uA == 0) {
                 lC = lC + 1;
@@ -387,10 +437,19 @@ pub fn disk_free_ask_model() -> Model {
                 cool = 1;
                 sowed = 1;
                 slate = rose;
+                wA = 0;
             }
             action Frees when (phase == 3 && rose == 0) { rose = 1; }
-            action Freed when (free <= 3 && phase == 3 && rose == 1) { phase = 4; owner = 0; }
-            action HandOffOwed when (phase == 2) { phase = 1; owner = 0; }
+            action Freed when (free <= 3 && phase == 3 && rose == 1) {
+                phase = 4;
+                owner = 0;
+                pA = if (pA == 2) { 0 } else { pA };
+            }
+            action HandOffOwed when (phase == 2) {
+                phase = 1;
+                owner = 0;
+                pA = if (pA == 3) { 1 } else { pA };
+            }
             action HandOffAsked when (free <= 3 && phase == 3 && rose == 0 && 2 > asks) {
                 phase = 1;
                 owner = 0;
@@ -399,6 +458,7 @@ pub fn disk_free_ask_model() -> Model {
                 phase = 5;
                 owner = 0;
                 raised = 1;
+                pA = if (pA == 2) { 0 } else { pA };
             }
             action End when (phase > 0 && (free == 4 || (bar == 1 && free > 1))) {
                 phase = 0;
@@ -416,6 +476,7 @@ pub fn disk_free_ask_model() -> Model {
                 raised = 0;
                 uA = 0;
                 past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+                wA = 0;
             }
             action Expire when (phase > 3 && aged == 1 && cool == 0 && done == 1 && free <= 2) {
                 phase = 0;
@@ -498,6 +559,7 @@ pub fn disk_free_ask_model() -> Model {
                 raised = 0;
                 uA = 0;
                 past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+                wA = 0;
             }
             action EndAtHeldFloor when (
                 Buggy == 9 && phase > 0 && (free > 2 || (bar == 1 && free > 0))
@@ -517,6 +579,7 @@ pub fn disk_free_ask_model() -> Model {
                 raised = 0;
                 uA = 0;
                 past = if (free == 4 || (bar == 1 && free > 1)) { 1 } else { 0 };
+                wA = 0;
             }
             action KeepDoneA when (Buggy == 10 && phase == 2 && owner == 1) {
                 owner = 1;
@@ -530,6 +593,8 @@ pub fn disk_free_ask_model() -> Model {
                 sowed = 1;
                 slate = rose;
                 sfit = if (dA == 0) { 1 } else { 0 };
+                wA = 0;
+                pA = 1;
             }
             action RecordLostA when (
                 Buggy == 13 && uA > 0 && (phase <= 1 || phase > 2 || owner <= 0 || owner > 1)
@@ -541,6 +606,27 @@ pub fn disk_free_ask_model() -> Model {
             ) {
                 asks = asks + 1;
                 uA = 0;
+            }
+            action KeepHeldA when (Buggy == 15 && phase == 2 && owner == 1 && dA == 0) {
+                owner = 1;
+                skept = dA;
+                swall = wA;
+            }
+            action OutWhileHeldA when (Buggy == 16 && free <= 3 && phase == 1) {
+                phase = 5;
+                raised = 1;
+                swait = if (wA == 1 && pA == 0) { 1 } else { 0 };
+                sret = if (wA == 1 && pA == 2) { 1 } else { 0 };
+                wA = 0;
+            }
+            action OutWhileReturnedA when (
+                Buggy == 17 && free <= 3 && phase == 1 && (wA == 0 || pA > 0)
+            ) {
+                phase = 5;
+                raised = 1;
+                swait = if (wA == 1 && pA == 0) { 1 } else { 0 };
+                sret = if (wA == 1 && pA == 2) { 1 } else { 0 };
+                wA = 0;
             }
             action ExpireEarly when (
                 Buggy == 12 && phase > 3 && cool == 0 && done == 1 && free <= 2
@@ -573,6 +659,9 @@ pub fn disk_free_ask_model() -> Model {
             invariant DoneIsReleased: skept == 0;
             invariant TypedOnlyFit: sfit == 1;
             invariant LinesCounted: uA > 0 || asks == lA + lB + lC;
+            invariant HeldIsReleased: swall == 0;
+            invariant HeldIsWaitedFor: swait == 0;
+            invariant ReturnedIsWaitedFor: sret == 0;
             bound PhaseBox: phase <= 5;
             bound AsksBox: asks <= 3;
             bound FreeBox: free <= 4;

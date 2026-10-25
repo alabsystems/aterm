@@ -8,13 +8,13 @@ use super::*;
 /// Whether a one-shot hint stamped at `hint` is still inside its `window` (seconds) at `now`.
 #[inline]
 pub(crate) fn hint_fresh(hint: Option<Instant>, now: Instant, window: f32) -> bool {
-    hint.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
+    matches!(hint, Some(t) if now.saturating_duration_since(t).as_secs_f32() <= window)
 }
 
 /// Whether a one-shot hint stamped at `hint` is still inside its `window` at `now`.
 #[inline]
 pub(crate) fn hint_fresh_dur(hint: Option<Instant>, now: Instant, window: Duration) -> bool {
-    hint.is_some_and(|t| now.saturating_duration_since(t) <= window)
+    matches!(hint, Some(t) if now.saturating_duration_since(t) <= window)
 }
 
 /// Spend a one-shot hint: take it only while fresh ([`hint_fresh`]).
@@ -397,7 +397,7 @@ impl PressCredits {
     /// Whether the press banked at `at` is held ([`Self::held_through`]).
     #[inline]
     pub(super) fn held(&self, at: Instant) -> bool {
-        self.held_through.is_some_and(|through| at <= through)
+        matches!(self.held_through, Some(through) if at <= through)
     }
 
     /// Whether the press banked at `at` with `credits` unpaid cells may pay for the move.
@@ -462,7 +462,10 @@ impl PressCredits {
         let (mut free, mut held) = (None::<Instant>, None::<Instant>);
         for (t, _, _) in self.within(now) {
             let slot = if self.held(t) { &mut held } else { &mut free };
-            *slot = Some(slot.map_or(t, |prev| prev.min(t)));
+            *slot = Some(match *slot {
+                Some(prev) => prev.min(t),
+                None => t,
+            });
         }
         free.or(held)
     }
@@ -558,11 +561,16 @@ impl PressCredits {
         }
         for start in 0..n {
             if start + glyphs.len() <= n {
-                let exact = glyphs.iter().enumerate().all(|(offset, &expected)| {
-                    live[start + offset].is_some_and(|(_, _, credits, glyph)| {
-                        credits == 1 && glyph == Some(expected)
-                    })
-                });
+                let mut exact = true;
+                for (offset, &expected) in glyphs.iter().enumerate() {
+                    if !matches!(
+                        live[start + offset],
+                        Some((_, _, 1, Some(g))) if g == expected
+                    ) {
+                        exact = false;
+                        break;
+                    }
+                }
                 if exact {
                     let (_, last_at, _, _) = live[start + glyphs.len() - 1]?;
                     if now.saturating_duration_since(last_at) <= tail_window {
@@ -671,7 +679,9 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if self.slots[i].is_some_and(|(t, _, _)| pred(t)) {
+            if let Some((t, _, _)) = self.slots[i]
+                && pred(t)
+            {
                 self.slots[i] = None;
                 self.occupied &= !(1u128 << i);
             }
@@ -747,7 +757,9 @@ impl PressCredits {
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            if self.slots[i].is_some_and(|(t, _, _)| t > at) {
+            if let Some((t, _, _)) = self.slots[i]
+                && t > at
+            {
                 later.slots[i] = self.slots[i].take();
                 let bit = 1u128 << i;
                 self.occupied &= !bit;
@@ -794,7 +806,7 @@ impl PressCredits {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             if let Some((t, _, _)) = self.slots[i]
-                && best.is_none_or(|(_, bt)| t >= bt)
+                && !matches!(best, Some((_, bt)) if t < bt)
             {
                 best = Some((i, t));
             }
@@ -1178,7 +1190,7 @@ impl InsertSeam {
 
     /// Revoke the arm stamped at exactly `at` (a queued or failed dispatch).
     pub(super) fn revoke_arm_at(&mut self, at: Instant) {
-        if self.armed.is_some_and(|i| i.at == at) {
+        if matches!(self.armed, Some(i) if i.at == at) {
             self.armed = self.undo.licence.take();
             self.tally.delivered = self.tally.delivered.saturating_sub(1);
             self.tally.last_cells = self.undo.last_cells;
@@ -1188,14 +1200,13 @@ impl InsertSeam {
     /// The armed licence while fresh.
     #[inline]
     pub(super) fn fresh(&self, now: Instant) -> Option<InsertLicence> {
-        self.armed.filter(|i| {
-            let window = if i.known {
-                INSERT_HINT_FRESH_DUR
-            } else {
-                INSERT_GESTURE_HINT_FRESH_DUR
-            };
-            now.saturating_duration_since(i.at) <= window
-        })
+        let i = self.armed?;
+        let window = if i.known {
+            INSERT_HINT_FRESH_DUR
+        } else {
+            INSERT_GESTURE_HINT_FRESH_DUR
+        };
+        (now.saturating_duration_since(i.at) <= window).then_some(i)
     }
 
     /// Drop the licence and the credit it accumulated.
@@ -1223,11 +1234,15 @@ impl InsertSeam {
             orphans.site = None;
         }
         self.orphan_exact = None;
-        if let Some(ins) = self.armed.as_mut() {
-            ins.row = ins.row.and_then(&map);
+        if let Some(ins) = self.armed.as_mut()
+            && let Some(row) = ins.row
+        {
+            ins.row = map(row);
         }
-        if let Some(ins) = self.undo.licence.as_mut() {
-            ins.row = ins.row.and_then(&map);
+        if let Some(ins) = self.undo.licence.as_mut()
+            && let Some(row) = ins.row
+        {
+            ins.row = map(row);
         }
     }
 
@@ -1240,7 +1255,7 @@ impl InsertSeam {
     ) -> Option<PendingHop> {
         let hop = self.pending_hop.take()?;
         (at.saturating_duration_since(hop.at) <= INSERT_RETRO_FRESH_DUR
-            && dispatched_at.is_none_or(|dispatched| hop.at >= dispatched)
+            && !matches!(dispatched_at, Some(dispatched) if hop.at < dispatched)
             && Self::retro_hop_is_the_inserts(hop, armed.cells, armed.known, armed.row))
         .then_some(hop)
     }
@@ -1266,12 +1281,14 @@ impl InsertSeam {
     /// Whether a retreat to `col` on `row` lands inside the span a delivered insert laid.
     #[inline]
     pub(super) fn span_admits_retreat(&self, row: u16, col: u16, now: Instant) -> bool {
-        self.span.is_some_and(|span| {
-            span.row == row
-                && col >= span.col0
-                && col <= span.col1
-                && now.saturating_duration_since(span.laid_at) <= INSERT_REWRITE_FRESH_DUR
-        })
+        matches!(
+            self.span,
+            Some(span)
+                if span.row == row
+                    && col >= span.col0
+                    && col <= span.col1
+                    && now.saturating_duration_since(span.laid_at) <= INSERT_REWRITE_FRESH_DUR
+        )
     }
 
     /// The licence was laid as `span`.
@@ -1300,10 +1317,12 @@ impl InsertSeam {
     /// Once an unknown insert's hop is old enough for any next-frame echo to have spent its own.
     pub(super) fn retire_orphans(&mut self, now: Instant) -> Option<UnknownInsertOrphans> {
         let orphans = self.orphans?;
-        (now.saturating_duration_since(orphans.laid_at) > INSERT_REWRITE_FRESH_DUR).then(|| {
+        if now.saturating_duration_since(orphans.laid_at) > INSERT_REWRITE_FRESH_DUR {
             self.orphans = None;
-            orphans
-        })
+            Some(orphans)
+        } else {
+            None
+        }
     }
 }
 
@@ -1346,23 +1365,24 @@ impl CursorGlow {
     pub fn note_backspace_erasing(&mut self, now: Instant, cells: Option<u16>) {
         self.clear_typed_keeping_hand(now);
         let newest = self.type_press_ring.newest();
-        let newest_press = newest.and_then(|i| self.type_press_ring.slots[i]);
+        let newest_press = match newest {
+            Some(i) => self.type_press_ring.slots[i],
+            None => None,
+        };
         match cells {
             Some(cells) => self
                 .type_press_ring
                 .retire_newest_cells(u8::try_from(cells).unwrap_or(u8::MAX)),
             None => self.type_press_ring.retire_newest(),
         }
-        let retired = newest
-            .filter(|&i| self.type_press_ring.slots[i].is_none())
-            .and(newest_press)
-            .and_then(|(_, _, glyph)| glyph);
-        let mut owed = self
-            .last_erase
-            .filter(|erase| erase.owed_at(now))
-            .map_or(([' '; ERASE_RETIRED_MAX], 0, 0), |erase| {
-                (erase.retired, erase.retired_n, erase.owed)
-            });
+        let retired = match (newest, newest_press) {
+            (Some(i), Some((_, _, glyph))) if self.type_press_ring.slots[i].is_none() => glyph,
+            _ => None,
+        };
+        let mut owed = match self.last_erase {
+            Some(erase) if erase.owed_at(now) => (erase.retired, erase.retired_n, erase.owed),
+            _ => ([' '; ERASE_RETIRED_MAX], 0, 0),
+        };
         if let Some(glyph) = retired
             && usize::from(owed.1) < ERASE_RETIRED_MAX
         {
@@ -1628,14 +1648,18 @@ impl CursorGlow {
     pub(super) fn insert_row(&self, now: Instant) -> Option<u16> {
         let established = self.last_anchor_sweep.map(|(row, _)| row);
         if let Some((row, _)) = self.last
-            && established.is_none_or(|er| er == row)
+            && !matches!(established, Some(er) if er != row)
         {
             return Some(row);
         }
-        self.last_licensed_row
-            .filter(|(_, at)| now.saturating_duration_since(*at) <= rk::ribbon::CHAIN_GAP_MAX_DUR)
-            .map(|(row, _)| row)
-            .or(established)
+        match self.last_licensed_row {
+            Some((row, at))
+                if now.saturating_duration_since(at) <= rk::ribbon::CHAIN_GAP_MAX_DUR =>
+            {
+                Some(row)
+            }
+            _ => established,
+        }
     }
 
     /// Remember a refused same-row forward hop `col0 → col1` on `row` for one in-flight delivery.
@@ -1831,14 +1855,18 @@ impl CursorGlow {
             }
         }
         if !ins.known && self.type_press_ring.cells_where(now, |t| t <= ins.at) > 0 {
-            let site = self
-                .row_cur_meta
-                .filter(|m| m.row == cr && m.caret == cc && m.at == now)
-                .and_then(|_| {
-                    self.print_anchor
-                        .filter(|&(row, col, _)| row == cr && col == cc)
-                        .map(|(_, _, seq)| (cr, cc, seq))
-                });
+            let site = if let Some(m) = self.row_cur_meta
+                && m.row == cr
+                && m.caret == cc
+                && m.at == now
+                && let Some((row, col, seq)) = self.print_anchor
+                && row == cr
+                && col == cc
+            {
+                Some((cr, cc, seq))
+            } else {
+                None
+            };
             self.insert.orphans = Some(UnknownInsertOrphans {
                 dispatched_at: ins.dispatched_at,
                 delivered_at: ins.at,
@@ -1910,7 +1938,10 @@ impl CursorGlow {
     #[must_use]
     pub fn in_flight_tally(&self) -> InFlightTally {
         InFlightTally {
-            credits: self.heat_at.map_or(0, |now| self.typed_credits_within(now)),
+            credits: match self.heat_at {
+                Some(now) => self.typed_credits_within(now),
+                None => 0,
+            },
             ..self.in_flight_tally
         }
     }
@@ -2015,10 +2046,16 @@ impl CursorGlow {
         if lo >= hi {
             return 0;
         }
-        self.row_cur[lo..hi]
-            .iter()
-            .filter(|&&ch| ch == '\0')
-            .count()
+        let mut count = 0usize;
+        let slice = &self.row_cur[lo..hi];
+        let mut i = 0;
+        while i < slice.len() {
+            if slice[i] == '\0' {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
     }
 
     /// Host key hint withheld.
@@ -2069,15 +2106,19 @@ impl CursorGlow {
         if let Some(cells) = self.fold_shape(pr, pc, cr, cc, geom) {
             return cells >= 1 && credits >= cells;
         }
-        self.coalesced_fold_shape(pr, pc, cr, cc, now, geom)
-            .is_some_and(|cells| credits == cells)
+        matches!(
+            self.coalesced_fold_shape(pr, pc, cr, cc, now, geom),
+            Some(cells) if credits == cells
+        )
     }
 
     /// The alt-screen blink discriminator.
     #[inline]
     pub(super) fn blink_fresh(&self, now: Instant) -> bool {
-        self.blink_hint
-            .is_some_and(|t| now.saturating_duration_since(t) <= BLINK_HINT_FRESH_DUR)
+        matches!(
+            self.blink_hint,
+            Some(t) if now.saturating_duration_since(t) <= BLINK_HINT_FRESH_DUR
+        )
     }
 
     /// The focused pane's `(first column, width)` under the host's pane columns.
@@ -2135,7 +2176,7 @@ impl CursorGlow {
         {
             return None;
         }
-        let blank = |row: &[char], col: usize| row.get(col).is_none_or(|&g| g == ' ');
+        let blank = |row: &[char], col: usize| !matches!(row.get(col), Some(&g) if g != ' ');
         let origin = usize::from(pc);
         if !(pane_col0..usize::from(cc)).all(|col| blank(&self.row_cur, col))
             || blank(&self.row_above_cur, origin)
@@ -2391,9 +2432,8 @@ impl CursorGlow {
         self.return_hint = None;
         self.reflow_hint = None;
         self.newline_hint = None;
-        if self
-            .quench_hint
-            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > 0.03)
+        if let Some(t) = self.quench_hint
+            && now.saturating_duration_since(t).as_secs_f32() > 0.03
         {
             self.quench_hint = None;
         }
@@ -2444,7 +2484,7 @@ impl CursorGlow {
         // A held park is spared while fresh, like the typed bank: Ink brackets
         // its park and rewrite in DECTCEM hides, so a boundary can complete
         // mid-park. A park past its window is judged now, as the tick would.
-        if self.held_park.is_some_and(|p| !p.fresh(now)) {
+        if matches!(self.held_park, Some(p) if !p.fresh(now)) {
             self.flush_held_park();
         }
         self.type_hint.retire_stale(now, TYPE_HINT_FRESH_DUR);
@@ -2460,10 +2500,10 @@ impl CursorGlow {
         self.newline_hint = None;
         self.reflow_hint = None;
         self.type_press_ring.retire_stale(now);
-        if self
-            .last_committed_type
-            .is_some_and(|t| now.saturating_duration_since(t) > TYPE_HINT_FRESH_DUR)
-        {
+        if matches!(
+            self.last_committed_type,
+            Some(t) if now.saturating_duration_since(t) > TYPE_HINT_FRESH_DUR
+        ) {
             self.last_committed_type = None;
         }
     }

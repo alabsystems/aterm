@@ -1097,7 +1097,12 @@ impl InkLedger {
                 }
                 let weights: [Option<f32>; Self::BANDS] = std::array::from_fn(|band| {
                     let d2 = dx2 + dy2[band];
-                    (d2 < 1.0).then_some((1.0 - d2) * (1.0 - d2))
+                    if d2 < 1.0 {
+                        let u = 1.0 - d2;
+                        Some(u * u)
+                    } else {
+                        None
+                    }
                 });
                 if weights == [None; Self::BANDS] {
                     continue;
@@ -1202,12 +1207,16 @@ impl CursorGlow {
         for (slot, line) in lines.iter_mut().zip(spans.lines()) {
             *slot = Some(line);
         }
-        if let Some((row, col)) = cur.map(|(r, c)| (i32::from(r), i32::from(c))) {
+        let caret_i32 = cur.map(|(r, c)| (i32::from(r), i32::from(c)));
+        if let Some((row, col)) = caret_i32 {
             let mut typed: Option<(i32, i32)> = None;
             for s in &self.sparks {
                 if s.typing && i32::from(s.row) == row {
                     let c = i32::from(s.col);
-                    typed = Some(typed.map_or((c, c), |(lo, hi)| (lo.min(c), hi.max(c))));
+                    typed = Some(match typed {
+                        Some((lo, hi)) => (lo.min(c), hi.max(c)),
+                        None => (c, c),
+                    });
                 }
             }
             let mut add = |line: (i32, i32, i32)| {
@@ -1234,12 +1243,11 @@ impl CursorGlow {
                 (first - reach).max(0),
                 (last + 1 + reach).min(geom.cols as i32),
             );
-            let meta = self
-                .row_prev_meta
-                .as_ref()
-                .filter(|m| i32::from(m.row) == row);
-            let captured =
-                |nbr: fn(&RowProbe) -> NbrProbe| meta.is_some_and(|m| nbr(m) == NbrProbe::Probed);
+            let meta = match &self.row_prev_meta {
+                Some(m) if i32::from(m.row) == row => Some(m),
+                _ => None,
+            };
+            let captured = |nbr: fn(&RowProbe) -> NbrProbe| matches!(meta, Some(m) if nbr(m) == NbrProbe::Probed);
             let text = self.text_view();
             let mut neighbour = |nbr: i32| match text.frame_line(nbr) {
                 Some(Some((first, end))) => add((nbr, first, end)),
@@ -1269,7 +1277,7 @@ impl CursorGlow {
             geom.cw as f32,
             geom.ch as f32,
         );
-        ledger.caret = cur.map(|(r, c)| (i32::from(r), i32::from(c)));
+        ledger.caret = caret_i32;
         ledger.stride = geom.cols;
         ledger.laid.clear();
         ledger
@@ -1393,9 +1401,10 @@ impl CursorGlow {
         let caret_row = caret.map(|(r, _)| i32::from(r));
         let filled = |row: i32, col: i32| {
             Some(row) != caret_row
-                && frame_text
-                    .pair(row, col)
-                    .is_some_and(|(_, ground)| !super::emit::reads_as_page(ground, page))
+                && matches!(
+                    frame_text.pair(row, col),
+                    Some((_, ground)) if !super::emit::reads_as_page(ground, page)
+                )
         };
         let span = |h: &RainHalo| {
             let row = (i32::from(h.y) - oy).div_euclid(ch);
@@ -1504,9 +1513,10 @@ impl CursorGlow {
         };
         let inked = |row: i32, col: i32| {
             view.covers_cell(row, col)
-                || self.frame_text.pair(row, col).is_some_and(|(ink, ground)| {
-                    ink.is_some() || !super::emit::reads_as_page(ground, page)
-                })
+                || matches!(
+                    self.frame_text.pair(row, col),
+                    Some((ink, ground)) if ink.is_some() || !super::emit::reads_as_page(ground, page)
+                )
         };
         let cr = i32::from(cr);
         let mid_y = 0.5 * (top + bot);

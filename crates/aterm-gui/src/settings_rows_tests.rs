@@ -1143,6 +1143,62 @@ fn a_status_bars_stacked_buttons_keep_their_words() {
     });
 }
 
+/// A stacked bar button says the fullest whole form one line holds before it wraps: in a
+/// short 164pt window at 2x, a two-line "Discard Draft" ran its button off the window's foot.
+#[test]
+fn a_stacked_bar_button_takes_one_line_before_it_wraps() {
+    at_each_text_scale(&[2.0], "stacked one line", |_| {
+        let mut stacked = 0;
+        for (drafts, confirm) in [(1, true), (2, true), (2, false)] {
+            for width in [164.0, 178.0] {
+                for height in [300.0, 348.0] {
+                    let mut lab = Lab::new("");
+                    lab.state_mut().navigate(SettingsRoute::Terminal);
+                    let _ = lab.compile(width, height);
+                    let _ = lab.invoke(
+                        &format!("settings/set/{}", prefs::EDIT_SCROLLBACK),
+                        Some(SemanticInput::Text("abc".to_string())),
+                    );
+                    if drafts == 2 {
+                        let _ = lab.invoke(
+                            &format!("settings/set/{}", prefs::EDIT_SEARCH_HISTORY_LINES),
+                            Some(SemanticInput::Text("lots".to_string())),
+                        );
+                    }
+                    if confirm {
+                        let _ = lab.invoke("settings/drafts/discard-all", None);
+                    }
+                    let compiled = lab.compile(width, height);
+                    let context = format!("{drafts} drafts, confirm {confirm}, {width}x{height}");
+                    let discard = rect_of(&compiled, "settings/drafts/discard-all");
+                    assert!(
+                        discard.bottom() <= height + 0.5,
+                        "{context}: the button stands in the window: {discard:?}"
+                    );
+                    let audit = compiled
+                        .text_fit_audit_line(&UiKey::new("settings/drafts/discard-all"))
+                        .unwrap_or_else(|| panic!("{context}: Discard is drawn"));
+                    assert!(
+                        audit.contains(" overflow=false clip-truncated=false ")
+                            && !audit.contains('\u{2026}'),
+                        "{context}: {audit}"
+                    );
+                    let above = if confirm {
+                        "settings/drafts/discard-cancel"
+                    } else {
+                        "settings/drafts/review"
+                    };
+                    if discard.y >= rect_of(&compiled, above).bottom() - 0.5 {
+                        assert!(!audit.contains("\\n"), "{context}: one line: {audit}");
+                        stacked += 1;
+                    }
+                }
+            }
+        }
+        assert!(stacked > 0, "a narrow window stacks the buttons");
+    });
+}
+
 #[test]
 fn a_docked_statuss_actions_stand_across_the_toolbar() {
     at_each_text_scale(&[2.0], "docked actions", |_| {
@@ -2505,53 +2561,88 @@ fn a_refused_value_is_painted_under_its_row_on_every_page() {
     }
 }
 
+/// TOP SETTINGS SAYS WHERE A VALUE COMES FROM, AS EVERY PAGE DOES. A key aterm.toml
+/// sets paints and speaks "Changed" on Top as on its own page, and offers its Reset
+/// there, so Font size goes back to Automatic from Top; every Top row keeps Reset's
+/// place, so its control does not move when Reset comes; and the automatic font size
+/// says so where an explicit 12 px does not. Before, Top's rows dropped their tags,
+/// timing and Reset ("Modified owns provenance"): a changed size looked like the
+/// default, and the only way back to Automatic was another page.
 #[test]
-fn top_rows_speak_and_paint_their_bare_name_at_every_size() {
-    at_each_text_scale(&[1.0, 1.25, 2.0], "top direct rows", |scale| {
-        for source in [
-            "window_theme = \"dark\"\ntrail_sounds = false\ntheme = \"Dracula\"\n\
-             [sparkle_words.profanity]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n",
-            "theme = \"dark:Dracula,light:Default Light\"\n",
-        ] {
-            for (width, height) in [(1_074.0, 900.0), (390.0, 760.0), (738.0, 418.0)] {
-                let mut lab = Lab::new(source);
-                lab.state_mut().navigate(SettingsRoute::Home);
+fn top_rows_say_changed_and_offer_reset_as_every_page_does() {
+    let source =
+        "window_theme = \"dark\"\ntrail_sounds = false\ntheme = \"Dracula\"\nfont_px = 14\n";
+    let keys = [
+        prefs::EDIT_THEME,
+        prefs::EDIT_WINDOW_THEME,
+        prefs::EDIT_FONT_PX,
+        prefs::EDIT_TRAIL_SOUNDS,
+    ];
+    at_each_text_scale(&[1.0, 1.25, 2.0], "top rows", |scale| {
+        for (width, height) in [(1_074.0, 900.0), (390.0, 760.0), (738.0, 418.0)] {
+            let context = format!("{width}×{height} at {scale}×");
+            let mut lab = Lab::new(source);
+            lab.state_mut().navigate(SettingsRoute::Home);
+            for key in keys {
+                lab.state_mut()
+                    .reveal_control(UiKey::new(format!("settings/control/{key}")));
                 let compiled = lab.compile(width, height);
-                let context = format!("{width}×{height} at {scale}×: {source}");
-                for node in &compiled.semantics {
-                    assert!(
-                        !node.key.as_str().starts_with("settings/label/"),
-                        "{context}: {} is a second stop for its row's name",
-                        node.key.as_str()
-                    );
-                }
-                for key in [prefs::EDIT_WINDOW_THEME, KEYWORD_KITTIES_KEY] {
-                    if let Some(painted) = painted_row_label(&compiled, key) {
-                        assert!(
-                            !painted.contains(CHANGED_WORD),
-                            "{context}: {key} {painted:?}"
-                        );
-                    }
-                }
+                let label = compiled
+                    .semantic(&UiKey::new(format!("settings/label/{key}")))
+                    .unwrap_or_else(|| panic!("{context}: {key}'s label"))
+                    .label
+                    .clone();
+                assert!(label.contains(CHANGED_WORD), "{context}: {key} {label:?}");
+                let painted = painted_row_words(&compiled, key);
+                assert!(
+                    painted.contains(CHANGED_WORD),
+                    "{context}: {key} paints Changed: {painted:?}"
+                );
+                assert!(
+                    compiled
+                        .semantic(&UiKey::new(format!("settings/reset/{key}")))
+                        .is_some(),
+                    "{context}: {key} offers Reset"
+                );
+            }
+            let mut unset = Lab::new("");
+            unset.state_mut().navigate(SettingsRoute::Home);
+            for key in keys {
+                unset
+                    .state_mut()
+                    .reveal_control(UiKey::new(format!("settings/control/{key}")));
+                let compiled = unset.compile(width, height);
+                assert!(
+                    compiled
+                        .paint
+                        .iter()
+                        .any(|node| node.key.as_str() == format!("settings/reset-slot/{key}")),
+                    "{context}: {key} keeps Reset's place"
+                );
             }
         }
     });
-    let mut lab = Lab::new("trail_sounds = false\n");
-    lab.state_mut().navigate(SettingsRoute::Sound);
-    let compiled = lab.compile(1_074.0, 900.0);
-    let label = compiled
-        .semantic(&UiKey::new(format!(
-            "settings/label/{}",
-            prefs::EDIT_TRAIL_SOUNDS
-        )))
-        .expect("the Sound page's Music effects label")
-        .label
-        .clone();
-    assert!(label.contains(CHANGED_WORD), "{label}");
-    assert!(
-        painted_row_label(&compiled, prefs::EDIT_TRAIL_SOUNDS)
-            .is_some_and(|painted| painted.contains(CHANGED_WORD))
-    );
+    let painted = |source: &str| {
+        let mut lab = Lab::new(source);
+        lab.state_mut().navigate(SettingsRoute::Home);
+        lab.state_mut().reveal_control(UiKey::new(format!(
+            "settings/control/{}",
+            prefs::EDIT_FONT_PX
+        )));
+        painted_row_words(&lab.compile(1_074.0, 900.0), prefs::EDIT_FONT_PX)
+    };
+    let automatic = painted("");
+    assert!(automatic.contains("Automatic"), "{automatic}");
+    assert!(!painted("font_px = 13\n").contains("Automatic"));
+}
+
+/// What `key`'s row paints beside and under its name: its label and detail lines.
+fn painted_row_words(compiled: &crate::native_ui::CompiledUi, key: &str) -> String {
+    [
+        painted_text(compiled, &format!("settings/label/{key}/")),
+        painted_text(compiled, &format!("settings/detail/{key}/")),
+    ]
+    .join(" ")
 }
 
 #[test]
@@ -5278,8 +5369,8 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
     at_each_text_scale(&[2.0], "a control the wheel left cut", |_| {
         // Windows' narrower UI face draws the switch whole after the wheel at
         // 444pt; at 424pt it leaves it cut over the heights 444pt does on the
-        // Mac (284-296pt).
-        let (width, height) = (if cfg!(windows) { 424.0 } else { 444.0 }, 292.0);
+        // Mac (330-342pt).
+        let (width, height) = (if cfg!(windows) { 424.0 } else { 444.0 }, 336.0);
         let switch = UiKey::new(THEME_MODE_ACTION);
         let drawn = |compiled: &crate::native_ui::CompiledUi| {
             compiled
@@ -5348,7 +5439,7 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
 #[test]
 fn a_status_that_comes_over_a_control_the_wheel_left_cut_keeps_it_in_view() {
     at_each_text_scale(&[2.0], "a status over a cut control", |_| {
-        let (width, height) = (300.0, 292.0);
+        let (width, height) = (300.0, 344.0);
         let switch = UiKey::new(THEME_MODE_ACTION);
         let painted = |compiled: &crate::native_ui::CompiledUi| {
             compiled
@@ -6165,4 +6256,158 @@ fn a_status_never_moves_a_switch_pressed_whole_on_a_compact_page() {
         faults.join("\n")
     );
     assert!(pressed > 0, "some page presses a switch");
+}
+
+/// The role and painted kind of `key`'s control.
+fn control_kind(compiled: &crate::native_ui::CompiledUi, key: &str) -> (SemanticRole, bool) {
+    let control = UiKey::new(format!("settings/control/{key}"));
+    let role = compiled.semantic(&control).expect("the control").role;
+    let slider = compiled
+        .paint
+        .iter()
+        .any(|node| node.key == control && matches!(node.content, UiContent::Slider(_)));
+    (role, slider)
+}
+
+/// The value the first config edit `outcome` emits writes, if it emits one.
+fn written(outcome: &crate::native_app::DispatchOutcome) -> Option<Option<String>> {
+    outcome.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first().map(|edit| edit.value.clone()),
+        _ => None,
+    })
+}
+
+/// A SLIDER TAKES AN EXACT VALUE. The Font size row is a slider whose arrows step whole
+/// pixels; a number typed on it, Return on it, or a click on its number opens a field
+/// in its place that writes any size the runtime takes: 13.5 is written as typed, 500
+/// is refused under the row with nothing written, Escape brings the slider back, and
+/// from 13.5 the arrows go to the next whole pixel each way (14 and 13). A value set
+/// outright (VoiceOver, `aterm ctl act`) is written as set. Before, the row was only a
+/// slider: a typed number did nothing, and every write was pulled onto the whole-pixel
+/// grid (15.5 written as 16, Right from 13.5 written as 15).
+#[test]
+fn a_slider_row_takes_an_exact_value_typed_into_it() {
+    let (width, height) = (1_074.0, 900.0);
+    let key = prefs::EDIT_FONT_PX;
+    let control = UiKey::new(format!("settings/control/{key}"));
+    let mut lab = Lab::new("font_px = 14\n");
+    lab.state_mut().navigate(SettingsRoute::TextFonts);
+    lab.state_mut().common.last_focus = Some(control.clone());
+    assert_eq!(
+        control_kind(&lab.compile(width, height), key),
+        (SemanticRole::Slider, true)
+    );
+
+    lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit("1".into())));
+    lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit("3.5".into())));
+    assert_eq!(
+        control_kind(&lab.compile(width, height), key),
+        (SemanticRole::TextField, false),
+        "a number typed on the slider opens its field"
+    );
+    let patch = lab.commit_event(AppEvent::TextInput(TextInputEvent::Submit));
+    assert_eq!(patch.edits[0].value.as_deref(), Some("13.5"));
+    assert!(lab.text().contains("font_px = 13.5"), "{}", lab.text());
+    assert_eq!(
+        control_kind(&lab.compile(width, height), key),
+        (SemanticRole::Slider, true),
+        "saved, the slider is back"
+    );
+
+    for (step, want) in [
+        (TextInputEvent::Right { extend: false }, "14"),
+        (TextInputEvent::Left { extend: false }, "13"),
+    ] {
+        let mut stepped = Lab::new("font_px = 13.5\n");
+        stepped.state_mut().navigate(SettingsRoute::TextFonts);
+        stepped.state_mut().common.last_focus = Some(control.clone());
+        let _ = stepped.compile(width, height);
+        let outcome = stepped.dispatch_outcome(AppEvent::TextInput(step));
+        assert_eq!(written(&outcome), Some(Some(want.to_string())), "from 13.5");
+    }
+
+    lab.invoke(&format!("settings/set/{key}"), None);
+    let compiled = lab.compile(width, height);
+    assert_eq!(
+        control_kind(&compiled, key),
+        (SemanticRole::TextField, false),
+        "Return or a click on the number opens the field"
+    );
+    assert_eq!(
+        compiled.semantic(&control).unwrap().value,
+        SemanticValue::Text("13.5".to_string()),
+        "holding the saved size"
+    );
+    lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit("500".into())));
+    let outcome = lab.dispatch_outcome(AppEvent::TextInput(TextInputEvent::Submit));
+    assert_eq!(written(&outcome), None, "500 px is refused");
+    let refusal = painted_text(
+        &lab.compile(width, height),
+        &format!("settings/error/{key}/"),
+    );
+    assert!(refusal.contains("between 6 px and 200 px"), "{refusal}");
+    assert!(lab.text().contains("font_px = 13.5"), "{}", lab.text());
+    let outcome = lab.dispatch_outcome(AppEvent::TextInput(TextInputEvent::Cancel));
+    assert_eq!(written(&outcome), None);
+    assert_eq!(
+        control_kind(&lab.compile(width, height), key),
+        (SemanticRole::Slider, true),
+        "Escape brings the slider back"
+    );
+
+    let outcome = lab.dispatch_outcome(AppEvent::Action(ActionInvocation {
+        id: ActionId::new(format!("settings/set/{key}")),
+        value: Some(SemanticInput::Number(15.5)),
+    }));
+    assert_eq!(written(&outcome), Some(Some("15.5".to_string())));
+}
+
+/// The exact field is every slider's, not the font size's alone: Line spacing takes
+/// 1.37 though its arrows step 0.05.
+#[test]
+fn every_slider_row_takes_an_exact_value() {
+    let key = prefs::EDIT_LINE_HEIGHT;
+    let mut lab = Lab::new("");
+    lab.state_mut().navigate(SettingsRoute::TextFonts);
+    lab.state_mut().common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
+    let _ = lab.compile(1_074.0, 900.0);
+    lab.invoke(&format!("settings/set/{key}"), None);
+    lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit("1.37".into())));
+    let patch = lab.commit_event(AppEvent::TextInput(TextInputEvent::Submit));
+    assert_eq!(patch.edits[0].value.as_deref(), Some("1.37"));
+}
+
+/// A TYPED NUMBER THE ROW REFUSES IS NOT WHAT THE PREVIEW NAMES. While 500 sits refused
+/// in the Font size field, the Text preview keeps drawing the saved 13.5 px, so its
+/// "Size:" badge says 13.5, as it says a size it accepts (20.5) while typed. Before, the
+/// badge read the draft ("Size: 500 px") over text drawn at the saved size.
+#[test]
+fn a_refused_typed_number_is_not_what_the_preview_names() {
+    let (width, height) = (1_074.0, 900.0);
+    let key = prefs::EDIT_FONT_PX;
+    let named = |lab: &mut Lab| {
+        lab.compile(width, height)
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::SettingsPreview(spec)
+                    if node.key.as_str() == "settings/preview/text-fonts" =>
+                {
+                    Some(spec.focused_value.clone())
+                }
+                _ => None,
+            })
+            .expect("the Text preview")
+    };
+    for (typed, want) in [("20.5", "20.5"), ("500", "13.5"), ("big", "13.5")] {
+        let mut lab = Lab::new("font_px = 13.5\n");
+        lab.state_mut().navigate(SettingsRoute::TextFonts);
+        lab.state_mut().common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
+        let _ = lab.compile(width, height);
+        lab.invoke(&format!("settings/set/{key}"), None);
+        lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit(typed.into())));
+        assert_eq!(named(&mut lab), want, "typed {typed}");
+        let _ = lab.dispatch_outcome(AppEvent::TextInput(TextInputEvent::Submit));
+        assert_eq!(named(&mut lab), want, "typed {typed}, then Return");
+    }
 }

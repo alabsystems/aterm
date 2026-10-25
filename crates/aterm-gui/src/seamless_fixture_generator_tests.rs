@@ -3483,8 +3483,8 @@ fn fx_agent(
 
 fn fx_carried_state_desk() -> FxDesk {
     use crate::restore::{
-        AgentRestore, AgyRestore, AlabRestore, CodexRestore, GeminiRestore, LostRestore,
-        MuseRestore, RestoreManifest, RunRestore,
+        AgentRestore, AgyRestore, AlabRestore, CodexRestore, LostRestore, MuseRestore,
+        RestoreManifest, RunRestore,
     };
     use crate::session_timeline::{
         AutopilotSetBy, SessionMeta, parse_carried_attention, parse_carried_supervisor,
@@ -3840,21 +3840,9 @@ fn fx_carried_state_desk() -> FxDesk {
             "agy",
         )));
     });
-    let gemini = leaf_of(5, "zsh", &|leaf| {
-        leaf.agent = Some(Box::new(fx_agent(
-            48_503,
-            "gemini",
-            None,
-            Some(RunRestore::Gemini(GeminiRestore {
-                session: Some("c2d9e4f1-7a3b-4c5d-8e6f-0a1b2c3d4e5f".to_string()),
-                home: "/home/dev/.gemini".to_string(),
-                chats: Some("/home/dev/.gemini/tmp/7f3a9c/chats".to_string()),
-                env: vec!["GEMINI_CLI_HOME=/home/dev".to_string()],
-                started_ms: u64::try_from(release_ms).unwrap() + 1_800_000,
-            })),
-            "gemini",
-        )));
-    });
+    // Session 5 carried a Gemini CLI relaunch through v0.138.0; Gemini CLI is retired (agy
+    // replaces it), so its leaf is a plain shell's and the older desks hold the reading.
+    let plain = leaf_of(5, "zsh", &|_| {});
     let asked = leaf_of(6, "zsh", &|leaf| {
         let mut agent = fx_agent(
             48_604,
@@ -3901,7 +3889,7 @@ fn fx_carried_state_desk() -> FxDesk {
         rows,
         cols,
         band_rows,
-        vec![pair(first, owed), pair(muse, agy), pair(gemini, asked)],
+        vec![pair(first, owed), pair(muse, agy), pair(plain, asked)],
     );
     front.inner_px = inner_px;
     let co_view = leaf_of(0, "zsh", &|leaf| leaf.theme = Some("Nord".to_string()));
@@ -4452,6 +4440,15 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("layout", "TerminalLeafRestore.holds"),
     ("layout", "TerminalLeafRestore.profile"),
     ("layout", "CodexRestore.carried"),
+    // Gemini CLI is retired (agy replaces it): a leaf's `gemini` table is read only to refuse
+    // the leaf as no agent's, and no write sets it; its run's fields until a release records
+    // their omission (tests/fixtures/handoff/README.md).
+    ("layout", "AgentRestore.gemini"),
+    ("layout", "GeminiRestore.chats"),
+    ("layout", "GeminiRestore.env"),
+    ("layout", "GeminiRestore.home"),
+    ("layout", "GeminiRestore.session"),
+    ("layout", "GeminiRestore.started_ms"),
     ("layout", "NativeLeafRestore.metadata"),
     ("meta", "ColorRepr.stack"),
     ("meta", "CursorStyle::Hidden"),

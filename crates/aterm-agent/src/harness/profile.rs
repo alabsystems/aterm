@@ -891,9 +891,10 @@ pub enum WeeklyGap {
     /// The tap is on, and no relaunch line could carry it for this process (why: the
     /// [`super::tap::Refusal`]): the harness reads no figure for it.
     Unoffered(super::tap::Refusal),
-    /// The tap is on, and a relaunch line would carry it, but this process was not started
-    /// with it, and aterm's restart in place is offered for it now: the next relaunch aterm
-    /// makes of it (a live upgrade, a restart in place) adds it.
+    /// The tap is on, and a relaunch line would carry it (its settings admit it, and the line
+    /// aterm would type now has room for it: `relaunch::tap_room`), but this process was not
+    /// started with it, and aterm's restart in place is offered for it now: the next relaunch
+    /// aterm makes of it (a live upgrade, a restart in place) adds it.
     Untapped,
     /// As [`Self::Untapped`], but no restart in place is offered for it now (the host
     /// supervises no such process in its tab, as with its Autopilot off, or its relaunch would
@@ -2061,7 +2062,7 @@ fn selected_profile(
             })
         })
         .flatten();
-    if let Some(expected) = selected.and_then(|row| row.email.as_deref()) {
+    if let Some(expected) = selected.and_then(super::accounts::Row::expected_identity_email) {
         if !read
             .email
             .as_deref()

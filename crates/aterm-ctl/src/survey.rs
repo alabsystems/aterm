@@ -109,6 +109,8 @@ pub struct FleetRead {
     pub peers: Vec<PeerSurvey>,
     /// The line the read ends with (on stderr under `--json` and `--sid`).
     pub note: Option<String>,
+    /// Why the read asked no other machine, with what binds one (on stderr).
+    pub alone: Option<String>,
 }
 
 /// Fleet survey callback linked by the `aterm` binary.
@@ -1475,10 +1477,12 @@ pub(crate) fn read_survey(
         }],
     };
     let mut notes: Vec<String> = Vec::new();
+    let mut alone = None;
     if let Some(peers) = peers {
         let peers = match peers {
             Ok(read) => {
                 notes.extend(read.note);
+                alone = read.alone;
                 read.peers
             }
             Err(why) if args.host.is_some() => {
@@ -1524,7 +1528,7 @@ pub(crate) fn read_survey(
     } else {
         render_read(&replies, args.budget, &notes, own)
     };
-    let err = if args.json || args.sid.is_some() {
+    let mut err = if args.json || args.sid.is_some() {
         notes
     } else {
         if args.host.is_some() {
@@ -1535,6 +1539,7 @@ pub(crate) fn read_survey(
         }
         Vec::new()
     };
+    err.extend(alone);
     Printed {
         err,
         out: Some(text),

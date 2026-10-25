@@ -26,8 +26,8 @@ use atpkg_publish::triple::{
 
 use super::fixture::{
     Answer, CPU_ARM64, CPU_X86_64, DORMANT_LEDGER, EM_AARCH64, EM_X86_64, FakeTools, MINTED_LEDGER,
-    checkout as fixture_checkout, client_verifies, elf, macho, push_from_elsewhere, put, put_exe,
-    ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo,
+    bare_origin, checkout as fixture_checkout, client_verifies, elf, macho, push_from_elsewhere,
+    put, put_exe, ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo,
 };
 
 /// A machine with a rostered key, a channel head, a dormant trust checkout at `$HOME/trust`,
@@ -777,10 +777,10 @@ fn an_upload_without_the_staging_token_is_refused_before_anything_is_built() {
     upload::token_preflight(&ctx).expect("a token file");
 }
 
-/// A harness checkout at `w.root/<name>`: one commit, `/target/` ignored, as the five
-/// harness repos are.
-fn harness_checkout(w: &World, name: &str) -> PathBuf {
-    let dir = w.root.join(name);
+/// A harness checkout at `w.root/<dir>` with no origin: one commit, `/target/` ignored, as
+/// the five harness repos are.
+fn harness_tree(w: &World, dir: &str) -> PathBuf {
+    let dir = w.root.join(dir);
     fixture_checkout(
         &dir,
         &[
@@ -788,6 +788,29 @@ fn harness_checkout(w: &World, name: &str) -> PathBuf {
             ("Cargo.toml", b"[package]\nname = \"harness\"\n"),
         ],
     );
+    dir
+}
+
+/// Give `checkout` the origin `w.root/remotes/<owner>/<repo>.git`, a bare it pushes its
+/// `HEAD` to as `branch` and then fetches.
+fn harness_origin(w: &World, checkout: &Path, owner: &str, repo: &str, branch: &str) {
+    let bare = w.root.join(format!("remotes/{owner}/{repo}.git"));
+    if !bare.exists() {
+        bare_origin(&bare);
+    }
+    let git = |args: &[&str]| super::fixture::git(checkout, args);
+    if git(&["remote"]).is_empty() {
+        git(&["remote", "add", "origin", &bare.to_string_lossy()]);
+    }
+    git(&["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    git(&["fetch", "-q", "origin"]);
+}
+
+/// A harness checkout at `w.root/<name>` as a roster machine clones it: one commit, on the
+/// `main` of its origin `alabsystems/<name>` (the staging owner's repo).
+fn harness_checkout(w: &World, name: &str) -> PathBuf {
+    let dir = harness_tree(w, name);
+    harness_origin(w, &dir, "alabsystems", name, "main");
     dir
 }
 
@@ -983,6 +1006,57 @@ fn a_harness_pack_refuses_every_departure_from_its_rule_before_the_build() {
         req(),
         "has changes or untracked files",
     );
+}
+
+/// A HARNESS IS PACKED ONLY FROM ITS REPO'S MAIN, as codex's package is
+/// (`package::check_on_main`): a clean checkout at its own commit count is still refused,
+/// before anything is built or written, when it has no origin, when its origin is a fork or
+/// another harness's repo, or when its `HEAD` is a commit main does not hold (unpushed, or
+/// pushed to a branch only). Each would mint a signed `0.1.0+g<sha>` at a build number main
+/// never gives that commit. The same checkout packs once main holds its `HEAD`.
+#[test]
+fn a_harness_pack_is_minted_only_from_its_repos_main() {
+    let w = world("pack-harness-source");
+    let meta = |co: &Path| harness_metadata_json(co, "muse-alab", "0.1.0", &["muse-alab"], &[]);
+    let refuses = |co: &Path, build: u64, says: &str| {
+        let t = harness_tools(co, meta(co), arm_bins(&["muse-alab"]));
+        let mut req = harness_request(&w, "muse-alab", co);
+        req.build = Some(build);
+        let err = pack::pack_with(&w.ctx, &req, &t).expect_err(says);
+        assert!(err.to_string().contains(says), "{says}: {err}");
+        assert!(
+            t.runs_of("build").is_empty(),
+            "{says}: refused before the build"
+        );
+        assert!(w.written(".toml").is_empty() && w.written(".tar.zst").is_empty());
+    };
+
+    let orphan = harness_tree(&w, "orphan/muse-alab");
+    refuses(&orphan, 1, "has no origin to read");
+
+    let fork = harness_tree(&w, "fork/muse-alab");
+    harness_origin(&w, &fork, "someone", "muse-alab", "main");
+    refuses(&fork, 1, "not alabsystems/muse-alab");
+
+    let other = harness_tree(&w, "other/muse-alab");
+    harness_origin(&w, &other, "alabsystems", "agy-alab", "main");
+    refuses(&other, 1, "not alabsystems/muse-alab");
+
+    let ahead = harness_checkout(&w, "muse-alab");
+    put(&ahead.join("README"), b"a commit main does not hold\n");
+    super::fixture::git(&ahead, &["add", "-A"]);
+    super::fixture::git(&ahead, &["commit", "-q", "-m", "local"]);
+    refuses(&ahead, 2, "is not on alabsystems/muse-alab origin/main");
+    harness_origin(&w, &ahead, "alabsystems", "muse-alab", "feature");
+    refuses(&ahead, 2, "is not on alabsystems/muse-alab origin/main");
+
+    harness_origin(&w, &ahead, "alabsystems", "muse-alab", "main");
+    let t = harness_tools(&ahead, meta(&ahead), arm_bins(&["muse-alab"]));
+    let mut req = harness_request(&w, "muse-alab", &ahead);
+    req.build = Some(2);
+    let out = pack::pack_with(&w.ctx, &req, &t).expect("main holds HEAD: it packs");
+    let sha = super::fixture::git(&ahead, &["rev-parse", "--short=9", "HEAD"]);
+    assert_eq!((out.build, out.version), (2, format!("0.1.0+g{sha}")));
 }
 
 #[test]

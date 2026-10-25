@@ -1227,7 +1227,6 @@ fn typed_relaunch_why(agent: aterm_agent::harness::upgrade::Agent) -> String {
         Agent::Codex => "the relaunched Codex did not come up in the tab".to_string(),
         Agent::Muse => "the relaunched Muse Code did not come up in the tab".to_string(),
         Agent::Agy => "the relaunched agy did not come up in the tab".to_string(),
-        Agent::Gemini => "the relaunched Gemini CLI did not come up in the tab".to_string(),
     }
 }
 
@@ -1237,7 +1236,6 @@ const fn resume_words(agent: aterm_agent::harness::upgrade::Agent) -> (&'static 
         aterm_agent::harness::upgrade::Agent::Codex => ("codex resume", "thread"),
         aterm_agent::harness::upgrade::Agent::Muse => ("muse resume", "session"),
         aterm_agent::harness::upgrade::Agent::Agy => ("agy then /resume", "conversation"),
-        aterm_agent::harness::upgrade::Agent::Gemini => ("gemini then /resume", "session"),
     }
 }
 
@@ -1293,8 +1291,7 @@ pub(crate) fn restored_agents_not_resumed(
                 aterm_agent::harness::upgrade::Agent::Claude => true,
                 aterm_agent::harness::upgrade::Agent::Codex
                 | aterm_agent::harness::upgrade::Agent::Muse
-                | aterm_agent::harness::upgrade::Agent::Agy
-                | aterm_agent::harness::upgrade::Agent::Gemini => false,
+                | aterm_agent::harness::upgrade::Agent::Agy => false,
             };
             let first = if started_without_conversation(outcome) && started {
                 format!(
@@ -3042,8 +3039,7 @@ pub(crate) fn agent_upgrade_stalled(
                 }
                 aterm_agent::harness::upgrade::Agent::Claude => Some("claude --resume".to_string()),
                 aterm_agent::harness::upgrade::Agent::Muse
-                | aterm_agent::harness::upgrade::Agent::Agy
-                | aterm_agent::harness::upgrade::Agent::Gemini => None,
+                | aterm_agent::harness::upgrade::Agent::Agy => None,
             } {
                 Some(command) => format!(
                     "it no longer runs in the tab and aterm will not bring it back: `{command}` \
@@ -5334,8 +5330,7 @@ const fn resume_agent_word(agent: aterm_phase::Program) -> &'static str {
         | aterm_phase::Program::Grok
         | aterm_phase::Program::Kimi
         | aterm_phase::Program::Agy
-        | aterm_phase::Program::Muse
-        | aterm_phase::Program::Gemini => agent.product(),
+        | aterm_phase::Program::Muse => agent.product(),
     }
 }
 
@@ -5746,9 +5741,9 @@ const fn agent_word(agent: aterm_agent::harness::upgrade::Agent) -> &'static str
     match agent {
         aterm_agent::harness::upgrade::Agent::Claude => "Claude",
         aterm_agent::harness::upgrade::Agent::Codex => "Codex",
-        aterm_agent::harness::upgrade::Agent::Muse
-        | aterm_agent::harness::upgrade::Agent::Agy
-        | aterm_agent::harness::upgrade::Agent::Gemini => agent.product(),
+        aterm_agent::harness::upgrade::Agent::Muse | aterm_agent::harness::upgrade::Agent::Agy => {
+            agent.product()
+        }
     }
 }
 

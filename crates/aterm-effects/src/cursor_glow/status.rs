@@ -476,16 +476,24 @@ impl TrailStatus<'_> {
             self.glow_active,
             self.pet_active,
             self.cat_active,
-            self.block_fill.map_or("none", |b| b.owner.label()),
+            match self.block_fill {
+                Some(b) => b.owner.label(),
+                None => "none",
+            },
             std::fmt::from_fn(|f| match self.block_fill {
                 Some(b) => write!(f, "{:06x}", b.fill),
                 None => f.write_str("none"),
             }),
-            std::fmt::from_fn(|f| match self.block_fill.and_then(|b| b.base) {
-                Some(base) => write!(f, "{base:06x}"),
-                None => f.write_str("none"),
+            std::fmt::from_fn(|f| match self.block_fill {
+                Some(BlockFill {
+                    base: Some(base), ..
+                }) => write!(f, "{base:06x}"),
+                _ => f.write_str("none"),
             }),
-            self.block_fill.map_or("none", |b| b.base_from().label()),
+            match self.block_fill {
+                Some(b) => b.base_from().label(),
+                None => "none",
+            },
             self.pet_action,
             self.pet_content,
             self.pet_pending,
@@ -843,7 +851,10 @@ impl CursorGlow {
     #[must_use]
     pub fn rainbow_field(&self) -> f32 {
         if self.v2.engaged() {
-            return self.v2_stop.map_or_else(|| self.v2.field(), |(t, _)| t);
+            return match self.v2_stop {
+                Some((t, _)) => t,
+                None => self.v2.field(),
+            };
         }
         0.0
     }
@@ -965,11 +976,15 @@ impl TextSpans {
 
     /// A test's probe of up to three lines `(row, first, end)`, each row read.
     #[cfg(test)]
-    pub(crate) fn of_lines(lines: &[(i32, i32, i32)]) -> Self {
-        let mut s = Self::default();
-        for (i, &line) in lines.iter().take(3).enumerate() {
+    pub(crate) const fn of_lines(lines: &[(i32, i32, i32)]) -> Self {
+        let mut s = Self::EMPTY;
+        let limit = if lines.len() < 3 { lines.len() } else { 3 };
+        let mut i = 0;
+        while i < limit {
+            let line = lines[i];
             s.rows[i] = Some(line);
             s.read[i] = Some(line.0);
+            i += 1;
         }
         s
     }

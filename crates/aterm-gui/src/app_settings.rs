@@ -1337,14 +1337,17 @@ impl App {
         }
         let strip_rows = usize::from(self.tab_strip_rows);
         let strip_y = self.win_pad_top(wid).saturating_add(self.win_head(wid));
+        // The frame sits centred in the surface (`frame_origin`), as native leaves are placed.
+        let (frame_x, frame_y) = self.frame_origin(wid);
+        let (frame_x, frame_y) = (frame_x as f64, frame_y as f64);
         Some(crate::a11y_tree::GridGeometry {
-            origin_x: self.win_pad(wid) as f64,
-            origin_y: self.native_content_origin_y(wid) as f64,
+            origin_x: frame_x + self.win_pad(wid) as f64,
+            origin_y: frame_y + self.native_content_origin_y(wid) as f64,
             cell_w: cw as f64,
             cell_h: ch as f64,
-            strip_y: strip_y as f64,
+            strip_y: frame_y + strip_y as f64,
             strip_h: (strip_rows * ch) as f64,
-            bars_y: (strip_y + strip_rows * ch) as f64,
+            bars_y: frame_y + (strip_y + strip_rows * ch) as f64,
             bar_h: if self.message_band_rows == 0 {
                 0.0
             } else {
@@ -1406,61 +1409,137 @@ impl App {
         if plan.leaves.len() < 2 || plan.zoomed {
             return Vec::new();
         }
-        let Some(ws) = self.windows.get(&wid) else {
-            return Vec::new();
-        };
-        let strip = usize::from(self.chrome_rows(wid));
-        let total = plan.leaves.len();
         plan.leaves
             .iter()
             .enumerate()
-            .map(|(slot, leaf)| {
-                self.view_store
-                    .get(leaf.view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)?;
-                let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
-                let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
-                let rows = (leaf.rect.size.height.round() as usize).max(1);
-                let cols = (leaf.rect.size.width.round() as usize).max(1);
-                let cursor = (ws.input_scratch.cursor_visible && leaf.focused)
-                    .then(|| {
-                        let crow = ws.input_scratch.cursor_row.saturating_sub(strip);
-                        let ccol = ws.input_scratch.cursor_col;
-                        (crow >= row_off
-                            && crow < row_off + rows
-                            && ccol >= col_off
-                            && ccol < col_off + cols)
-                            .then_some((crow - row_off, ccol - col_off))
-                    })
-                    .flatten();
-                let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
-                    &crate::claude_footer::ProgramCells::of(
-                        &ws.input_scratch,
-                        &ws.claude_footer_undo,
-                    ),
-                    strip + row_off..strip + row_off + rows,
-                    col_off..col_off + cols,
-                    cursor,
-                );
-                let selection =
-                    self.grid_a11y_selection(wid, &snap, row_off, col_off..col_off + cols);
-                Some(crate::a11y_tree::GridPane {
-                    slot,
-                    label: format!(
-                        "{} — pane {} of {total}",
-                        crate::accessibility::LABEL,
-                        slot + 1
-                    ),
-                    snap,
-                    row_off,
-                    col_off,
-                    focused: leaf.focused,
-                    selection,
-                })
-            })
+            .map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
+    }
+
+    /// Window `wid`'s mixed-tab tree `update` with the terminal leaves of `plan` beside its
+    /// native leaves, each one terminal document sliced from the composed cells.
+    #[cfg(a11y_tree)]
+    pub(crate) fn with_mixed_terminal_panes(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        mut update: aterm_a11y::model::TreeUpdate,
+    ) -> Result<aterm_a11y::model::TreeUpdate, String> {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.input_scratch.cells.is_empty())
+        {
+            return Ok(update);
+        }
+        let panes: Vec<_> = plan
+            .leaves
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, leaf)| self.grid_a11y_pane(wid, plan, slot, leaf))
+            .collect();
+        if panes.is_empty() {
+            return Ok(update);
+        }
+        crate::a11y_tree::splice_terminal_panes(
+            &mut update,
+            &panes,
+            self.grid_a11y_geometry(wid),
+            plan.leaves.len(),
+        )
+        .map_err(|id| format!("native accessibility terminal pane id {id:?} collides"))?;
+        Ok(update)
+    }
+
+    /// Window `wid`'s native-tab tree `update` with the window chrome the frame painted around
+    /// its leaves: the tab list, stats, messages, find field, Rewind view, harness chips and menu.
+    #[cfg(a11y_tree)]
+    pub(crate) fn with_window_chrome(
+        &self,
+        wid: crate::WindowId,
+        mut update: aterm_a11y::model::TreeUpdate,
+    ) -> Result<aterm_a11y::model::TreeUpdate, String> {
+        let Some(cols) = self.windows.get(&wid).map(|ws| usize::from(ws.cols)) else {
+            return Ok(update);
+        };
+        let tabs = self.grid_a11y_tabs(wid);
+        let find = self.grid_a11y_find(wid);
+        let messages = self.grid_a11y_messages(wid);
+        let chips = self.claude_chips_a11y(wid);
+        let menu = self.autopilot_grid_menu(wid);
+        let stats = self.stats_a11y(wid);
+        let rewind = self.rewind_a11y(wid);
+        crate::a11y_tree::splice_chrome(
+            &mut update,
+            self.grid_a11y_geometry(wid),
+            &crate::a11y_tree::GridFrame {
+                tabs: &tabs,
+                find: find.as_ref(),
+                messages: &messages,
+                chips: &chips,
+                menu: menu.as_ref(),
+                stats: stats.as_ref(),
+                rewind: rewind.as_ref(),
+                ..crate::a11y_tree::GridFrame::default()
+            },
+            cols,
+        )
+        .map_err(|id| format!("native accessibility chrome id {id:?} collides"))?;
+        Ok(update)
+    }
+
+    /// The terminal document of `plan`'s leaf `leaf` at `slot`, or `None` for a non-terminal leaf.
+    #[cfg(a11y_tree)]
+    fn grid_a11y_pane(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        slot: usize,
+        leaf: &crate::tab_model::VisibleLeaf,
+    ) -> Option<crate::a11y_tree::GridPane> {
+        self.view_store
+            .get(leaf.view)
+            .copied()
+            .and_then(crate::tab_model::View::terminal_session)?;
+        let ws = self.windows.get(&wid)?;
+        let strip = usize::from(self.chrome_rows(wid));
+        let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
+        let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
+        let rows = (leaf.rect.size.height.round() as usize).max(1);
+        let cols = (leaf.rect.size.width.round() as usize).max(1);
+        let cursor = (ws.input_scratch.cursor_visible && leaf.focused)
+            .then(|| {
+                let crow = ws.input_scratch.cursor_row.saturating_sub(strip);
+                let ccol = ws.input_scratch.cursor_col;
+                (crow >= row_off
+                    && crow < row_off + rows
+                    && ccol >= col_off
+                    && ccol < col_off + cols)
+                    .then_some((crow - row_off, ccol - col_off))
+            })
+            .flatten();
+        let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
+            &crate::claude_footer::ProgramCells::of(&ws.input_scratch, &ws.claude_footer_undo),
+            strip + row_off..strip + row_off + rows,
+            col_off..col_off + cols,
+            cursor,
+        );
+        let selection = self.grid_a11y_selection(wid, &snap, row_off, col_off..col_off + cols);
+        Some(crate::a11y_tree::GridPane {
+            slot,
+            label: format!(
+                "{} — pane {} of {}",
+                crate::accessibility::LABEL,
+                slot + 1,
+                plan.leaves.len()
+            ),
+            snap,
+            row_off,
+            col_off,
+            focused: leaf.focused,
+            selection,
+        })
     }
 
     /// The painted selection covering one published document: the whole visible grid
@@ -3046,8 +3125,8 @@ mod tests {
         );
         assert_eq!(
             app.devtools_helper.queued(),
-            None,
-            "the press ends the wait"
+            Some(Origin::Automatic),
+            "no revision stands, so the press's page is not its own: the window's own waits on"
         );
         assert!(
             app.devtools_watch.wants_read(now),
@@ -3345,9 +3424,14 @@ mod tests {
 
         // An `spctl` run's answer waits with it, so the run is not made again.
         let mut listed = app_with(granted);
+        let at = Instant::now();
         assert_eq!(
-            listed.devtools_hand_over_after_listing(Origin::Automatic, Ok(()), Instant::now()),
+            listed.devtools_hand_over_after_listing(Origin::Automatic, Ok(()), at),
             HandOver::Queued
+        );
+        assert!(
+            listed.devtools_helper.hand_over_due(at + PANEL_TICK),
+            "a panel tick later too, its run's answer or not"
         );
         assert_eq!(
             listed.devtools_helper.take_queued(Instant::now(), true),

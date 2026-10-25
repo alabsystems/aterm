@@ -238,6 +238,19 @@ impl HoldClock {
         })
     }
 
+    /// A wake the agent declared stands in its session's book at a settled read of the open
+    /// hold: it said what it waits for, as a `WAITING:` line does ([`HoldEvent::AnswerTail`]).
+    /// The hold is declared once; `None` with none open or one declared already.
+    pub fn declare(&mut self) -> Option<HoldChange> {
+        let since = self.since_ms?;
+        if std::mem::replace(&mut self.declared, true) {
+            return None;
+        }
+        Some(HoldChange::Declared {
+            held_ms: self.seen_ms - since,
+        })
+    }
+
     /// How long the open hold has held at `now_ms`; `None` with none open.
     #[must_use]
     pub fn held_ms(&self, now_ms: i64) -> Option<i64> {

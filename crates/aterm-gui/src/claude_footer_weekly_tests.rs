@@ -137,6 +137,7 @@ fn asks(args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>, seat: fn() -> Ta
             seat,
             settings: |_, _| true,
             restart: |_, _| true,
+            room: |_, _| true,
         },
     }
 }
@@ -861,6 +862,7 @@ fn a_footer_with_no_weekly_figure_says_why() {
             seat: armed,
             settings: |_, _| false,
             restart: |_, _| true,
+            room: |_, _| true,
         },
         ..seat(armed)
     };
@@ -881,6 +883,7 @@ fn a_footer_with_no_weekly_figure_says_why() {
                 );
                 false
             },
+            room: |_, _| panic!("no room is asked where no restart is offered"),
         },
         ..seat(armed)
     };
@@ -888,6 +891,27 @@ fn a_footer_with_no_weekly_figure_says_why() {
         weekly(unrestarted),
         none(WeeklyGap::Unrestarted),
         "a line would tap it, and no restart in place is offered for it (its Autopilot off)"
+    );
+    let roomless = Asks {
+        tap: TapAsks {
+            seat: armed,
+            settings: |_, _| true,
+            restart: |_, _| true,
+            room: |tab, pid| {
+                assert_eq!(
+                    (tab, pid),
+                    (TAB, PID as u32),
+                    "asked of its own tab and process"
+                );
+                false
+            },
+        },
+        ..seat(armed)
+    };
+    assert_eq!(
+        weekly(roomless),
+        none(WeeklyGap::Unoffered(Refusal::Room)),
+        "a restart is offered, and its line has no room for the tap: no promise the line breaks"
     );
     let dir = own_config_dir();
     assert_eq!(

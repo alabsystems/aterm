@@ -28,6 +28,13 @@ impl EditorWorkspace {
         }
     }
 
+    /// Carry `document`'s marks through a commit made outside this workspace
+    /// (a reload from disk), as [`EditorBufferView::observe_external`] carries
+    /// a view's carets.
+    pub fn observe_external(&mut self, document: DocumentId, deltas: &[EditDelta]) {
+        self.rebase_marks(document, deltas);
+    }
+
     fn last_mark(&self, document: DocumentId, text: &str) -> Option<usize> {
         self.global_mark_ring
             .iter()

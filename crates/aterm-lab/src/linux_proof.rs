@@ -2190,9 +2190,11 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         let built = out.ok();
         // The GUI rows that follow are timed: they run on the quiet machine, from here to the
         // end of this arch ([`crate::admission`]).
-        let _quiet = built
-            .then(|| crate::admission::quiet(&format!("{tag} GUI rows")))
-            .flatten();
+        let quiet = if built {
+            crate::admission::quiet(&format!("{tag} GUI rows"))
+        } else {
+            Ok(None)
+        };
         rows.push(Row {
             name: format!("{tag} build aterm-gui{oracle}"),
             verdict: if built { Verdict::Pass } else { Verdict::Fail },
@@ -2203,6 +2205,18 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 tally(&out.text).error.unwrap_or_else(|| out.tail(5))
             },
         });
+        // An interrupt that ended its wait is the run's ([`crate::stop::note`]): no GUI row
+        // starts, and the run ends NOT RUN.
+        let _quiet = match quiet {
+            Ok(quiet) => quiet,
+            Err(f) => {
+                if let Some(m) = f.msg {
+                    eprintln!("aterm-lab: {m}");
+                }
+                stopped = f.stopped.map(crate::stop::Stopped);
+                break 'arches;
+            }
+        };
         let sessions: Vec<Option<Display>> =
             if ask.gone_only || ask.a11y_only || ask.deck_only || ask.edges_only {
                 Vec::new()
@@ -2522,6 +2536,11 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         println!("report and frames: {}", results.display());
     }
     if let Some(s) = stopped {
+        // A failure found before an interrupt ended a wait stays the run's verdict
+        // ([`crate::stop::status`]).
+        if crate::stop::ended_a_wait() && exit_code(&rows) == 1 {
+            return Ok(1);
+        }
         return Err(s.into());
     }
     let code = exit_code(&rows);

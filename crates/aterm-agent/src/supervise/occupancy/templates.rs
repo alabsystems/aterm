@@ -10,11 +10,15 @@
 //! A [`FactLine`] is made here and nowhere else (its constructor is private), to judge and book
 //! what `prompt` would type (`fact-would@v1`).
 //!
+//! `wake@v1`'s line (the slice-2 plan's 2.8 types it) is made here for the decider's verdict
+//! already: under `observe` it is booked, never typed.
+//!
 //! `wait-nudge` leaves out §3.2's `(2 workflows, 3 shells)`: no reader counts a
 //! session's workflows yet, and a count the harness cannot measure is not typed.
 
 use super::super::facts::FACT_CAP;
 use super::rules::RuleId;
+use super::wakes_seen::{AtomKind, Declarer};
 use crate::harness::harness_mark;
 
 /// The longest a whole line may be, in characters: the facts seam's budget for a typed line, so
@@ -29,6 +33,9 @@ const HEAD: &str = concat!(harness_mark!(), " aterm: ");
 const ADVICE: &str = "If a step of your plan has its inputs ready, start it now rather than at the \
                       end of the whole workflow; re-read the base of any cut, mint or publish \
                       before you start it.";
+
+/// `wake@v1`'s advice: F2's base re-read alone (the wake says what the agent waited for).
+const REREAD: &str = "Re-read the base of any cut, mint or publish before you start it.";
 
 /// `wait-nudge`'s ask for the declaration, a constant like the advice.
 const DECLARE: &str = "Put one line starting WAITING: that names what you wait for and the step \
@@ -129,6 +136,44 @@ pub fn hold_room(held_ms: i64, usable: u16, slots: u16, free_ms: u64, avail_mib:
         avail_mib / 1024,
     );
     FactLine::new(RuleId::HoldRoom, fact, &[ADVICE])
+}
+
+/// `wake@v1`: wake `ord` of `class`'s, whose condition (its atoms' `kinds`, each named once in
+/// their order) holds, since `since_local` (`HH:MM` on the local clock) where the caller read it,
+/// with `slots` (`usable` of `n` build slots free) where its need names them:
+/// `wake #1 (yours): its file condition holds since 23:40; 1 of 3 build slots free.` Closed words
+/// and numbers only: no label, path or pattern of the wake's is filled in.
+#[must_use]
+pub fn wake(
+    ord: u16,
+    class: Declarer,
+    kinds: &[AtomKind],
+    since_local: Option<(u8, u8)>,
+    slots: Option<(u16, u16)>,
+) -> FactLine {
+    let mut named: Vec<&str> = Vec::new();
+    for kind in kinds {
+        if !named.contains(&kind.word()) {
+            named.push(kind.word());
+        }
+    }
+    let (kinds, holds) = match named.as_slice() {
+        [] => (String::new(), "condition holds"),
+        [one] => (format!("{one} "), "condition holds"),
+        [rest @ .., last] => (
+            format!("{} and {last} ", rest.join(", ")),
+            "conditions hold",
+        ),
+    };
+    let since = since_local.map_or_else(String::new, |(h, m)| format!(" since {h:02}:{m:02}"));
+    let slots = slots.map_or_else(String::new, |(usable, n)| {
+        format!("; {usable} of {n} build slots free")
+    });
+    let fact = format!(
+        "wake #{ord} ({}): its {kinds}{holds}{since}{slots}.",
+        class.word()
+    );
+    FactLine::new(RuleId::Wake, fact, &[REREAD])
 }
 
 #[cfg(test)]

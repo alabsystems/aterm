@@ -285,6 +285,7 @@ mod devtools_helper_drive;
 mod overview;
 mod overview_fabric;
 pub(crate) use amacs_files::save_words;
+mod clt_install;
 mod secrets_join;
 mod system_state;
 mod system_state_access;
@@ -295,10 +296,10 @@ pub use devtools_helper_drive::run_devtools_helper_drive;
 pub use quit_reopen::{REOPEN_VERB, run_reopen_after};
 pub use system_state::{
     Admission as InitialSetupAdmission, CHECK_FAILED_NOTE, InitialSetupPermissionPolicy,
-    NEWER_SETUP_NOTE, RESTORE_BACKUP_UNREAD_NOTE, RESTORE_FAILED_NOTE, SETUP_ROW,
-    STARTUP_RETRY_NOTE, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus, SetupStatusRow,
-    VAULT_NOT_JOINED_NOTE, VAULT_UNREAD_NOTE, calm_setup_row, journal_refused_entry, pass_rows,
-    restore_rows, setup_not_started_entry, setup_set_aside_entry,
+    InitialSetupRunPolicy, NEWER_SETUP_NOTE, RESTORE_BACKUP_UNREAD_NOTE, RESTORE_FAILED_NOTE,
+    SETUP_ROW, STARTUP_RETRY_NOTE, STATE_UNREAD_NOTE, SetupCheck, SetupOperation, SetupStatus,
+    SetupStatusRow, VAULT_NOT_JOINED_NOTE, VAULT_UNREAD_NOTE, calm_setup_row,
+    journal_refused_entry, pass_rows, restore_rows, setup_not_started_entry, setup_set_aside_entry,
 };
 #[cfg(unix)]
 pub use system_state::{
@@ -348,13 +349,14 @@ fn mend_secrets_subscriber_once(headless: bool) {
     }
 }
 
+pub use clt_install::offer_developer_tools_install;
 pub use system_state_host::{
     CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
     set_initial_setup_handlers,
 };
 pub use workstation_setup::{
-    SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
-    on_window_focus_gained, window_focus_gains,
+    OfferKind, SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
+    await_widen_answer_while, on_window_focus_gained, window_focus_gains,
 };
 #[cfg(any(test, debug_assertions))]
 pub use workstation_setup::{drive_initial_setup_answer_for_test, gain_window_focus_for_test};
@@ -652,6 +654,7 @@ pub(crate) use aterm_predict as predict;
 mod aos_host;
 mod aos_verb;
 mod card_verb;
+mod harness_claim;
 mod harness_policy_verb;
 mod kitty_animation;
 mod login_notice_verb;
@@ -2935,6 +2938,9 @@ pub(crate) struct PausePlan {
 #[derive(Debug)]
 enum Wake {
     WorkstationSetup(workstation_setup::Request),
+    /// Whether a setup pass's Repositories stage, at its end, waits on Apple's Command Line
+    /// Tools: a tab installs them ([`clt_install`]).
+    DeveloperToolsInstall(u64, bool),
     InitialSetupStatus {
         generation: Option<u64>,
         status: system_state::SetupStatus,
@@ -6382,6 +6388,10 @@ struct LeafRenderCache {
     staged_input: RenderInput,
     native: Option<NativeLeafRaster>,
     native_damage: Option<native_app::DamageRegion>,
+    /// The terminal id, engine fill and display offset of the fill this leaf's last frame
+    /// showed, which the hover memo keys on (`HoverMemo::frame_of`). The swap of `input` and
+    /// `staged_input` after the frame leaves it alone.
+    hover_key: (u64, u64, i32),
 }
 
 impl Default for LeafRenderCache {
@@ -6391,6 +6401,7 @@ impl Default for LeafRenderCache {
             staged_input: RenderInput::empty(),
             native: None,
             native_damage: None,
+            hover_key: (0, 0, 0),
         }
     }
 }
@@ -6717,6 +6728,9 @@ struct WindowState {
     os_window: Option<Arc<Window>>,
     #[cfg(test)]
     os_window_for_test: bool,
+    /// How many times [`WindowState::request_redraw`] asked for a frame.
+    #[cfg(test)]
+    redraw_requests_for_test: std::cell::Cell<u32>,
     present: Option<PresentTarget>,
     scale: f64,
     front_content: Option<front_content::FrontContent>,
@@ -7203,11 +7217,72 @@ impl WindowState {
         if self.front_terminal().is_none() {
             return false;
         }
+        let companions_drawn = animate_cursor_cat && self.front_draws_cursor_companions();
         self.fx.cursor().trail.is_active()
-            || (animate_cursor_cat && self.fx.companions().cursor_cat.is_active())
-            || (animate_cursor_cat && self.fx.companion().needs_frames())
-            || self.fx.decos().is_active(now)
+            || (companions_drawn && self.fx.companions().cursor_cat.is_active())
+            || (companions_drawn && self.fx.companion().needs_frames())
+            || (!self.last_frame_was_mixed() && self.fx.decos().is_active(now))
             || self.fx.cursor().bodies_active()
+    }
+
+    /// Whether the window's last frame was a mixed tab's: a terminal leaf beside a native one.
+    fn last_frame_was_mixed(&self) -> bool {
+        matches!(
+            self.last_layout_coordinate_space.map(|space| space.route),
+            Some(VisibleContentRoute::Heterogeneous)
+        )
+    }
+
+    /// Whether the front's frame draws a scroll glide's or bounce's sub-row offset and the scroll
+    /// pill they touch: not a native or mixed frame, which shows a terminal's whole rows at most
+    /// (`App::set_scroll_band` runs for a single terminal pane). A window with no frame yet is
+    /// taken to.
+    pub(crate) fn front_draws_sub_row_scroll(&self) -> bool {
+        !matches!(
+            self.last_layout_coordinate_space.map(|space| space.route),
+            Some(VisibleContentRoute::Heterogeneous | VisibleContentRoute::Native { .. })
+        )
+    }
+
+    /// Ask the OS window for a frame; a headless window has none to ask.
+    pub(crate) fn request_redraw(&self) {
+        #[cfg(test)]
+        self.redraw_requests_for_test
+            .set(self.redraw_requests_for_test.get().saturating_add(1));
+        if let Some(window) = self.os_window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Whether the front draws the cursor cat and the resident pet: a terminal front, unless its last
+    /// frame was a mixed tab's, which draws neither (`App::step_heterogeneous_companions`).
+    fn front_draws_cursor_companions(&self) -> bool {
+        self.front_terminal().is_some() && !self.last_frame_was_mixed()
+    }
+
+    /// Whether the front shows a terminal leaf whose output effects (the streak's comets) the
+    /// frame draws: a terminal front, or a mixed tab's frame, which draws them in its terminal
+    /// leaves whichever leaf has focus.
+    fn front_shows_terminal_leaf(&self) -> bool {
+        self.front_terminal().is_some() || self.last_frame_was_mixed()
+    }
+
+    /// What the scroll pill asks of the scheduler at `now`: whether it dirties the window, and
+    /// its next deadline. Only a terminal frame (the single pane's pill, a split's pane bars)
+    /// draws it, so a native or mixed front's pill clock asks for nothing.
+    pub(crate) fn scroll_pill_wake(
+        &self,
+        now: Instant,
+        animated: bool,
+        interval: Duration,
+    ) -> (bool, Option<Instant>) {
+        if self.front_terminal().is_none() || self.last_frame_was_mixed() {
+            return (false, None);
+        }
+        (
+            self.scroll_pill.is_active(now, animated),
+            self.scroll_pill.next_deadline(now, animated, interval),
+        )
     }
 
     /// The cursor-effect typed wake.
@@ -7303,11 +7378,13 @@ impl WindowState {
     }
 
     fn deco_anim_frame_active(&self, now: Instant) -> bool {
-        self.deco_anim_until.is_some_and(|until| now < until) && self.front_terminal().is_some()
+        self.deco_anim_until.is_some_and(|until| now < until) && self.front_shows_terminal_leaf()
     }
 
     fn output_streak_next_change_deadline(&self, now: Instant, idle_secs: f32) -> Option<Instant> {
-        self.front_terminal()?;
+        if !self.front_shows_terminal_leaf() {
+            return None;
+        }
         if !self.is_split() {
             return self
                 .fx
@@ -7355,7 +7432,7 @@ impl WindowState {
         let deco_wake = self.deco_anim_frame_active(now);
         let pet_deadline = (has_glass
             && pet_motion
-            && self.front_terminal().is_some()
+            && self.front_draws_cursor_companions()
             && (self.focused || self.cursor_fx_typed_wake(now) || recording_watcher))
             .then(|| self.fx.companion_mut().next_change_deadline(now))
             .flatten();
@@ -7700,6 +7777,8 @@ impl WindowState {
             os_window: None,
             #[cfg(test)]
             os_window_for_test: false,
+            #[cfg(test)]
+            redraw_requests_for_test: std::cell::Cell::new(0),
             present: None,
             scale: 1.0,
             front_content,
@@ -10288,8 +10367,7 @@ impl App {
             return;
         }
         self.note_devtools_reading(&row);
-        let key = self.access_marks().devtools;
-        let opened = (self.devtools_helper.reach().last_opened)().is_some_and(|(v, _)| v == key);
+        let opened = self.devtools_shown_this_revision();
         let step = self.devtools_watch.observe(row.grant(), opened);
         let list_read = row.list().label == aterm_containment::DevToolListLabel::Read;
         if self
@@ -10369,6 +10447,8 @@ impl App {
                     && (self.devtools_helper.now_answered_within_its_minute(now)
                         || self.devtools_helper.fda_first())),
             fda_on: fda.fda == aterm_containment::consent::FdaState::Granted,
+            shown_this_revision: origin == devtools_helper::Origin::Automatic
+                && self.devtools_shown_this_revision(),
         };
         (
             reading,
@@ -10448,7 +10528,13 @@ impl App {
             Admit::PanelOnly => {
                 let shown = self.show_devtools_helper(origin, reading, None, now);
                 self.devtools_watch.note_handed_over();
-                self.devtools_helper.drop_queued();
+                // The verb's asker brings the page up itself after this answer (`aterm-cli`'s
+                // devtools_open_here, behind its `spctl` run) and writes the marker then: a step
+                // kept waiting looks in ten minutes, and that marker, if younger, holds it on
+                // (`Self::devtools_page_holds_the_step`).
+                let revision = self.access_revision().is_some();
+                self.devtools_helper
+                    .page_came_up(revision, devtools_helper::past_its_ten_minutes());
                 self.devtools_helper.noted_now_answered(now);
                 if shown {
                     HandOver::Shown
@@ -10569,7 +10655,9 @@ impl App {
         );
         self.devtools_helper.noted_opened(aterm_time::unix_secs());
         self.devtools_watch.note_handed_over();
-        self.devtools_helper.drop_queued();
+        let revision = self.access_revision().is_some();
+        self.devtools_helper
+            .page_came_up(revision, devtools_helper::past_its_ten_minutes());
         if panel {
             let reading = self.devtools_reading();
             let _ = self.show_devtools_helper(origin, reading, shown_listed, now);
@@ -10645,6 +10733,7 @@ impl App {
         }
         if let Some((listing, listed, waiting)) = self.devtools_helper.take_listed() {
             let unlisted = listed.as_ref().err().cloned();
+            let run = listed.clone();
             let outcome = match listing {
                 devtools_helper::Listing::HandOver(origin) if !origin.owner_press() => {
                     self.devtools_hand_over_after_listing(origin, listed, now)
@@ -10676,6 +10765,19 @@ impl App {
                 }
             };
             self.settle_devtools_waiting(waiting, outcome, unlisted.as_deref());
+            // The ask that waited for the step's run takes its answer, so it makes no run of its
+            // own. Refused, it is judged as a run that ended now: at its own moment, else held
+            // for it.
+            if let Some(mut rider) = self.devtools_helper.take_listing_rider(now) {
+                let listed = rider.listed.get_or_insert(run).clone();
+                match outcome {
+                    devtools_helper::HandOver::Refused(_) => {
+                        let _ = self.devtools_hand_over_after_listing(rider.origin, listed, now);
+                    }
+                    devtools_helper::HandOver::Queued => self.devtools_helper.ride(rider),
+                    _ => {}
+                }
+            }
         }
         if self.devtools_helper.panel().is_some() {
             let read =
@@ -10718,25 +10820,84 @@ impl App {
         }
         self.tick_fda_hand_over(now);
         if self.devtools_helper.hand_over_due(now) {
-            let quiet = if self
+            let step = self
                 .devtools_helper
                 .queued()
-                .is_some_and(devtools_helper::Origin::system_state_step)
-            {
+                .is_some_and(devtools_helper::Origin::system_state_step);
+            let quiet = if step {
                 self.access_step_moment(now)
             } else {
                 self.devtools_moment_is_quiet(now)
-            };
-            if let Some((origin, listed)) = self.devtools_helper.take_queued(now, quiet) {
+            } && !self.devtools_page_holds_the_step(now);
+            // The control verb's ask the waiting step carries keeps its own quiet moment.
+            if step
+                && !quiet
+                && self.devtools_moment_is_quiet(now)
+                && let Some(rider) = self.devtools_helper.take_quiet_rider(now)
+            {
                 let _ = self.devtools_hand_over_carrying(
+                    rider.origin,
+                    devtools_helper::Moment::Quiet,
+                    rider.listed,
+                );
+            }
+            if let Some((origin, listed)) = self.devtools_helper.take_queued(now, quiet) {
+                let answer = self.devtools_hand_over_carrying(
                     origin,
                     devtools_helper::Moment::Quiet,
                     listed,
                 );
+                if let Some(rider) = self.devtools_helper.take_rider(now) {
+                    self.settle_devtools_rider(answer, rider);
+                }
             }
         }
         // After both launch pages: System State's debugger step.
         self.look_for_debugger_moment(now, Self::debugger_step_moment);
+    }
+
+    /// Whether the page the window's own Developer Tools step waits out is still within its ten
+    /// minutes at the step's look (its marker younger than the wait allowed for: a control
+    /// verb's `now` whose asker wrote it late, or a page brought up since). The step then waits
+    /// out the rest, a wait and never a refusal as [`devtools_helper::Refusal::Recent`], unless
+    /// this revision brought the page up already, which refuses it as shown at once.
+    fn devtools_page_holds_the_step(&mut self, now: Instant) -> bool {
+        if !self.devtools_helper.waits_out_a_page() || self.devtools_shown_this_revision() {
+            return false;
+        }
+        let window = atpkg::devtools::REOPEN_AFTER_S;
+        let Some(ago) = (self.devtools_helper.reach().opened_within)(window) else {
+            return false;
+        };
+        self.devtools_helper
+            .wait_out_page(now + Duration::from_secs(window.saturating_sub(ago).max(1)));
+        true
+    }
+
+    /// An ask the window's own Developer Tools step carried (`devtools_helper::Rider`), once the
+    /// step was answered `answer`. It is judged by its own rules, with what its own `spctl` run
+    /// answered, when the step is refused, since a refusal of the step (a page this revision
+    /// already brought up) need not be the ask's. It waits with the step when the step waits
+    /// again, or for the step's `spctl` run while that is out. A page the step brought up is the
+    /// ask's too.
+    fn settle_devtools_rider(
+        &mut self,
+        answer: devtools_helper::HandOver,
+        rider: devtools_helper::Rider,
+    ) {
+        use devtools_helper::HandOver;
+        match answer {
+            HandOver::Refused(_) => {
+                let _ = self.devtools_hand_over_carrying(
+                    rider.origin,
+                    devtools_helper::Moment::Quiet,
+                    rider.listed,
+                );
+            }
+            HandOver::Queued => self.devtools_helper.ride(rider),
+            HandOver::Listing => self.devtools_helper.ride_listing(rider),
+            _ => {}
+        }
     }
 
     /// System State's once-per-Mac debugger step (`docs/DESIGN-system-state-2026-10-21.md`
@@ -11613,7 +11774,7 @@ impl App {
                 )]
                 self.devtools_helper.queue_fda(origin, now);
                 if let Some(left) = gap_left {
-                    self.devtools_helper.defer_fda(now + left);
+                    self.devtools_helper.fda_wait_out_page(now + left);
                 }
                 HandOver::Queued
             }
@@ -11665,9 +11826,7 @@ impl App {
             grant_stable: (reach.grant_stable)(),
             recent: !press && (fda.opened_within)(window).is_some(),
             devtools_recent: devtools_ago.is_some(),
-            shown_this_revision: !press
-                && (fda.last_opened)()
-                    .is_some_and(|(word, _)| atpkg::devtools::same_step(&word, &shown_key)),
+            shown_this_revision: !press && self.fda_shown_this_revision(),
             own: press || self.consent.window_reads_own_grant(),
         };
         let gap_left =
@@ -11722,12 +11881,20 @@ impl App {
     }
 
     fn fda_page_brought_up(&mut self, origin: devtools_helper::Origin, panel: bool, now: Instant) {
-        (self.devtools_helper.fda_reach().note_opened)(&self.access_marks().fda);
+        let fda = self.devtools_helper.fda_reach();
+        let word = devtools_helper::fda_opened_word(
+            self.access_revision().is_some(),
+            (fda.last_opened)().map(|(word, _)| word).as_deref(),
+            &self.access_marks().fda,
+        );
+        (fda.note_opened)(&word);
         self.record_access_step(
             aterm_types::macos_setup::Access::FullDiskAccess,
             aterm_types::macos_setup::AccessOutcome::Handed,
         );
-        self.devtools_helper.drop_queued_fda();
+        let revision = self.access_revision().is_some();
+        self.devtools_helper
+            .fda_page_came_up(revision, devtools_helper::past_its_ten_minutes());
         if origin == devtools_helper::Origin::Automatic {
             self.record_macos_access_marker(consent_card::Marker::Opened);
             self.persist_macos_access_record(consent_card::AccessRecord {
@@ -11899,6 +12066,24 @@ impl App {
             } else if answer.brings_owner() {
                 // A client's act: its refusal decides nothing for the launch warm-up.
                 self.fda_page_up_for_launch();
+            }
+            // An ask the window's own step carried, as the Developer Tools step's
+            // (`Self::tick_devtools_hand_over`).
+            if let Some(rider) = self.devtools_helper.take_fda_rider(now) {
+                match answer {
+                    devtools_helper::HandOver::Refused(_) => {
+                        let carried = self.fda_hand_over(
+                            rider.origin,
+                            devtools_helper::Moment::Quiet,
+                            read.fda,
+                        );
+                        if carried.brings_owner() {
+                            self.fda_page_up_for_launch();
+                        }
+                    }
+                    devtools_helper::HandOver::Queued => self.devtools_helper.ride_fda(rider),
+                    _ => {}
+                }
             }
         }
     }
@@ -16938,7 +17123,11 @@ impl ApplicationHandler<Wake> for App {
                 if ws.fx.look_mut().tenure_mut().poll(now) {
                     dirty = true;
                 }
-                if ws.pill_shown || ws.scroll_pill.is_active(now, pill_fade_full && ws.focused) {
+                if ws.pill_shown
+                    || ws
+                        .scroll_pill_wake(now, pill_fade_full && ws.focused, app_frame_interval)
+                        .0
+                {
                     dirty = true;
                 }
                 if dirty {
@@ -17487,10 +17676,7 @@ impl ApplicationHandler<Wake> for App {
                     .frame_interval
                     .unwrap_or(frame_interval)
                     .max(AURORA_TICK_INTERVAL);
-                if let Some(d) = ws
-                    .scroll_pill
-                    .next_deadline(native_preview_now, animated, iv)
-                {
+                if let Some(d) = ws.scroll_pill_wake(native_preview_now, animated, iv).1 {
                     fold_owned_deadline(
                         &mut deadline,
                         &mut deadline_owner,
@@ -18449,6 +18635,9 @@ impl App {
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
             Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
+            Wake::DeveloperToolsInstall(revision, wanted) => {
+                self.want_developer_tools_install(revision, wanted)
+            }
             Wake::InitialSetupStatus { generation, status } => {
                 self.receive_system_state_status(generation, status)
             }
@@ -18812,6 +19001,7 @@ impl App {
                     }
                 }
                 self.escalate_document_shutdown(el);
+                self.escalate_pending_close(el);
             }
             Wake::NativeDocumentQueueSlotAvailable => {
                 self.native_document_queue_slot_available();

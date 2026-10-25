@@ -40,10 +40,6 @@ pub(super) use muse::carry_in_flight as muse_carry_in_flight;
 mod agy;
 pub(super) use agy::carry_in_flight as agy_carry_in_flight;
 
-#[path = "upgrade_gemini_drive.rs"]
-mod gemini;
-pub(super) use gemini::carry_in_flight as gemini_carry_in_flight;
-
 #[path = "upgrade_watch.rs"]
 mod watch;
 
@@ -1132,11 +1128,6 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held], quiet
         (upgrade::Agent::Agy, _) => {
             "agy's live upgrade asks nothing (its quiet flow alone): it is restarted onto the new \
              build at its next genuinely idle point, and nothing is typed into it"
-                .to_string()
-        }
-        (upgrade::Agent::Gemini, _) => {
-            "no upgrade lane moves Gemini CLI (it is only relaunched on exit): nothing is asked \
-             of it or typed into it for an upgrade"
                 .to_string()
         }
     };
@@ -2672,8 +2663,11 @@ pub fn tap_user_settings(home: &Path) -> String {
         .to_string()
 }
 
-/// [`tap_settings`] under the user home `home`.
-fn tap_settings_under(
+/// [`tap_settings`] under the user home `home`: every settings document a Claude Code line of
+/// `argv` in `cwd` reads, for the tap's gate at a relaunch and at a launch
+/// ([`super::tap::launch_value`]).
+#[must_use]
+pub fn tap_settings_under(
     home: &Path,
     argv: &[String],
     cwd: &str,
@@ -2728,8 +2722,15 @@ fn tap_settings_under(
 }
 
 pub(super) fn tap_profile_store(opts: &Opts) -> bool {
+    tap_profile_store_at(&opts.home)
+}
+
+/// Whether the vendor's profile store under the user home `home` (or the host's
+/// `XDG_CONFIG_HOME`) holds a config, which keeps the tap off ([`super::tap::GateFacts::profile_store`]).
+#[must_use]
+pub fn tap_profile_store_at(home: &Path) -> bool {
     use super::accounts::{profile_configs_dir, profile_configured};
-    let home = opts.home.display().to_string();
+    let home = home.display().to_string();
     let by_home = profile_configs_dir([("HOME", home.as_str())]);
     let by_xdg = host_xdg_config_home()
         .and_then(|xdg| profile_configs_dir([("XDG_CONFIG_HOME", xdg.as_str())]));
@@ -3351,9 +3352,6 @@ pub(super) struct St {
     pub(super) muse_env: Vec<String>,
     pub(super) agy_config: String,
     pub(super) agy_env: Vec<String>,
-    pub(super) gemini_chats: String,
-    pub(super) gemini_env: Vec<String>,
-    pub(super) gemini_child: u32,
     pub(super) resume_argv: Vec<String>,
     pub(super) resume_home: String,
     pub(super) resume_start: String,
@@ -3639,10 +3637,7 @@ impl St {
     pub(super) fn failed_start(&self) -> Option<FailedStart> {
         match self.agent {
             upgrade::Agent::Claude => {}
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => return None,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => return None,
         }
         match &self.phase {
             Phase::Failed(why) if why == "no-resume" && self.source != SAME_PROGRAM => {
@@ -3667,10 +3662,7 @@ impl St {
     pub(super) fn roll_back(&mut self, now: u64) -> bool {
         let claude = match self.agent {
             upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Gemini => false,
+            upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
         };
         if !claude || self.back_line.is_empty() || self.source == SAME_PROGRAM {
             return false;
@@ -3934,10 +3926,9 @@ impl St {
     fn stop_kept_onto(&self) -> String {
         match self.agent {
             upgrade::Agent::Codex => {}
-            upgrade::Agent::Claude
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => return String::new(),
+            upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => {
+                return String::new();
+            }
         }
         match &self.phase {
             Phase::Failed(why) if why == upgrade::GAVE_UP => why.clone(),
@@ -4241,18 +4232,6 @@ impl St {
         if !self.agy_config.is_empty() {
             o.insert("agy_config".into(), Value::from(self.agy_config.as_str()));
         }
-        if !self.gemini_chats.is_empty() {
-            o.insert(
-                "gemini_chats".into(),
-                Value::from(self.gemini_chats.as_str()),
-            );
-        }
-        if self.gemini_child != 0 {
-            o.insert(
-                "gemini_child".into(),
-                Value::from(u64::from(self.gemini_child)),
-            );
-        }
         if let Some(profile) = &self.home_profile {
             o.insert("home_profile".into(), Value::from(profile.as_str()));
         }
@@ -4355,7 +4334,6 @@ impl St {
             ("argv", &self.argv),
             ("muse_env", &self.muse_env),
             ("agy_env", &self.agy_env),
-            ("gemini_env", &self.gemini_env),
             ("tabs", &self.tabs),
             ("tabs_until", &tabs_until),
             ("resume_argv", &self.resume_argv),
@@ -4525,9 +4503,6 @@ impl St {
             muse_env: list("muse_env"),
             agy_config: s("agy_config"),
             agy_env: list("agy_env"),
-            gemini_chats: s("gemini_chats"),
-            gemini_env: list("gemini_env"),
-            gemini_child: small("gemini_child"),
             resume_argv: list("resume_argv"),
             resume_home: s("resume_home"),
             resume_start: s("resume_start"),
@@ -4610,10 +4585,7 @@ impl St {
     pub(super) fn landed_after_stop(&self, sf: &SessionFile, k: &dyn Kernel) -> bool {
         match self.agent {
             upgrade::Agent::Claude => {}
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => return false,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => return false,
         }
         matches!(&self.phase, Phase::Failed(why) if why == "no-resume")
             && self.exited_at != 0
@@ -4670,10 +4642,7 @@ impl St {
     pub(super) fn carried_through_hand(&mut self, now: u64) -> bool {
         let claude = match self.agent {
             upgrade::Agent::Claude => true,
-            upgrade::Agent::Codex
-            | upgrade::Agent::Muse
-            | upgrade::Agent::Agy
-            | upgrade::Agent::Gemini => false,
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
         };
         if !claude
             || !matches!(self.phase, Phase::Exiting { .. })
@@ -4984,10 +4953,7 @@ pub(super) fn settled(st: &St) -> bool {
 const fn driven_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex
-        | upgrade::Agent::Muse
-        | upgrade::Agent::Agy
-        | upgrade::Agent::Gemini => false,
+        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
     }
 }
 
@@ -6989,8 +6955,7 @@ fn snapshot_transcript_end(
         super::relaunch::AgentRun::Claude => {}
         super::relaunch::AgentRun::Codex(_)
         | super::relaunch::AgentRun::Muse(_)
-        | super::relaunch::AgentRun::Agy(_)
-        | super::relaunch::AgentRun::Gemini(_) => return None,
+        | super::relaunch::AgentRun::Agy(_) => return None,
     }
     let args = atpkg::caller_shell::process_args(snap.pid);
     let home = aterm_types::dirs::home_dir();
@@ -7152,7 +7117,6 @@ fn lane_due(opts: &Opts, tabs: &[LiveTab], agent: upgrade::Agent) -> Option<Due>
         upgrade::Agent::Claude => None,
         upgrade::Agent::Muse => muse::live::upgrade_due(opts, tabs),
         upgrade::Agent::Agy => agy::live::upgrade_due(opts, tabs),
-        upgrade::Agent::Gemini => None,
     }
 }
 
@@ -7508,7 +7472,6 @@ fn lane_noted(opts: &Opts, tabs: &[LiveTab], agent: upgrade::Agent, _since: u64)
         upgrade::Agent::Claude => None,
         upgrade::Agent::Muse => muse::live::leads(opts, tabs).then_some(Behind::Nothing),
         upgrade::Agent::Agy => agy::live::leads(opts, tabs).then_some(Behind::Nothing),
-        upgrade::Agent::Gemini => None,
     }
 }
 
@@ -8072,13 +8035,11 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
     };
     muse::sweep_prune(opts, live_tabs);
     agy::sweep_prune(opts, live_tabs);
-    gemini::sweep_prune(opts, live_tabs);
     reports.extend(lanes(opts, live_tabs, &|agent| match agent {
         upgrade::Agent::Codex => codex_alab_drive::sweep(opts, live_tabs),
         upgrade::Agent::Claude => claude_pass(opts, live_tabs),
         upgrade::Agent::Muse => muse::live::upgrade_pass(opts, live_tabs),
         upgrade::Agent::Agy => agy::live::upgrade_pass(opts, live_tabs),
-        upgrade::Agent::Gemini => Vec::new(),
     }));
     reports
 }
@@ -8239,51 +8200,6 @@ pub(super) fn agy_after_exit(
     cause: super::relaunch::ExitCause,
 ) -> Report {
     agy::after_exit(opts, snap, left, upgrade, cause, &Live)
-}
-
-pub(super) fn gemini_snapshot(
-    opts: &Opts,
-    tab: &str,
-    pid: u32,
-    start: String,
-    shell: u32,
-    args: &atpkg::caller_shell::ProcArgs,
-) -> Result<super::relaunch::Snapshot, &'static str> {
-    gemini::snapshot(opts, tab, pid, start, shell, args, &Live)
-}
-
-pub(super) fn gemini_look_at_exit(
-    opts: &Opts,
-    snap: &super::relaunch::Snapshot,
-) -> super::relaunch::ExitLook {
-    gemini::look_at_exit(opts, snap, &Live)
-}
-
-pub(super) fn gemini_after_exit(
-    opts: &Opts,
-    snap: &super::relaunch::Snapshot,
-    left: &super::relaunch::ExitRecord,
-    upgrade: bool,
-    cause: super::relaunch::ExitCause,
-) -> Report {
-    gemini::after_exit(opts, snap, left, upgrade, cause, &Live)
-}
-
-/// The resume line a person is told for `snap`'s Gemini CLI ([`gemini::told`]).
-#[must_use]
-pub fn gemini_told_line(snap: &super::relaunch::Snapshot) -> Option<String> {
-    gemini::told(snap)
-}
-
-/// [`gemini_told_line`] of `session` in the project `root` whose chats directory is `chats`, behind the homes `env`.
-#[must_use]
-pub fn gemini_told(
-    session: &str,
-    chats: Option<&Path>,
-    env: &[(String, String)],
-    root: &str,
-) -> Option<String> {
-    gemini::told_at(session, chats, env, root)
 }
 
 pub(super) fn agy_carries_restart(user_home: &Path, snap: &super::relaunch::Snapshot) -> bool {
@@ -10492,7 +10408,12 @@ fn restart(
         };
         plan(opts, &launch, proven, t)
     });
-    let Plan { shell, line, .. } = match planned {
+    let Plan {
+        shell,
+        line,
+        tap_dropped,
+        ..
+    } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, st, no),
     };
@@ -10611,6 +10532,7 @@ fn restart(
             "SIGTERM"
         },
     );
+    super::relaunch::note_tap_dropped(opts, &r, tap_dropped.as_deref());
     relaunch(opts, r, st, c, &sf.session_id, k)
 }
 

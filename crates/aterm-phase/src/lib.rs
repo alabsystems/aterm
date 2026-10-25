@@ -11,7 +11,6 @@ pub mod autocompact;
 pub mod codex;
 pub mod credits;
 pub mod disk_full;
-pub mod gemini;
 pub mod grok;
 pub mod harness_version;
 pub mod kimi;
@@ -64,9 +63,10 @@ pub use question::{
     Recommended,
 };
 pub use reader::{
-    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GeminiReader, GenericReader, GrokReader,
-    KimiReader, MuseReader, Program, Reading, ScreenReader, identify, live_zone_reaches_above,
-    live_zone_start, may_host_agent, program_of, read, read_at, shell_alone,
+    AgyReader, BLANK_GAP, ClaudeReader, CodexReader, GenericReader, GrokReader, KimiReader,
+    MuseReader, Program, RETIRED_AGENT, RETIRED_AGENTS, Reading, ScreenReader, identify,
+    live_zone_reaches_above, live_zone_start, may_host_agent, program_of, read, read_at,
+    retired_agent, shell_alone,
 };
 pub use reset::{
     ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, reset_confirm,

@@ -614,18 +614,6 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
 }
 
 #[test]
-fn a_walled_gemini_cli_runs_in_a_zone_not_the_machines() {
-    let now = crate::util::now_ms() / 1000;
-    let zone = foreign_tz(now);
-    let ist = 19_800;
-    if crate::sys::local_offset_s(now) == ist {
-        assert_eq!(zone, "America/St_Johns");
-    } else {
-        assert_eq!(zone, "Asia/Kolkata");
-    }
-}
-
-#[test]
 fn the_remembered_walls_reset_leaves_room_for_the_hide() {
     assert_eq!(Chain::Wall.wall_ahead_ms(), WALL_AHEAD_MS);
     for now in [1_792_500_010_000_i64, 1_792_500_059_999, 1_792_500_060_000] {
@@ -694,7 +682,7 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 44);
+    assert_eq!(Chain::every().len(), 39);
     assert!(
         Chain::every()
             .iter()
@@ -713,21 +701,17 @@ fn the_coverage_modes_pick_their_chains() {
         assert_eq!(wall_out_of_reach(h, Mode::WallHid), None, "{h:?}");
     }
     assert_eq!(
-        Harness::ALL.map(|h| hide_of(h).map(|x| (x.by, x.cancel))),
+        Harness::ALL.map(|h| hide_of(h).map(|x| (x.command, x.cancel))),
         [
-            Ok((HideBy::Command(CLAUDE_HIDE_COMMAND), Some(CLAUDE_CANCEL))),
-            Ok((HideBy::Option(GEMINI_HIDE_OPTION), None)),
-            Ok((HideBy::Command(AGY_HIDE_COMMAND), None)),
-            Ok((HideBy::Command(HIDE_COMMAND), None))
+            Ok((CLAUDE_HIDE_COMMAND, Some(CLAUDE_CANCEL))),
+            Ok((AGY_HIDE_COMMAND, None)),
+            Ok((HIDE_COMMAND, None))
         ]
     );
-    assert_eq!(
-        Harness::ALL.map(wall_claim),
-        ["five_hour", "code_assist", "five_hour", "five_hour"]
-    );
+    assert_eq!(WALL_CLAIM, "five_hour");
     assert_eq!(
         Harness::ALL.map(|h| wall_grace_ms(h.name())),
-        [150_000, 60_000, 60_000, 60_000]
+        [150_000, 60_000, 60_000]
     );
     for m in [Mode::Land, Mode::Cruise, Mode::Both, Mode::Cover, Mode::Cap] {
         assert!(
@@ -738,53 +722,10 @@ fn the_coverage_modes_pick_their_chains() {
     }
     assert!(WallHid.lands() && !WallHid.managed() && WallHid.autopilot() == "land");
     assert_eq!(WallHid.scenarios(), [Scenario::W2]);
-    assert_eq!(Chain::of_mode(Mode::WallDay), [WallDay]);
-    assert_eq!(Chain::of_mode_on(Mode::WallDay, Harness::Gemini), [WallDay]);
-    assert_eq!(wall_out_of_reach(Harness::Gemini, Mode::WallDay), None);
-    for h in [Harness::Claude, Harness::Agy, Harness::Muse] {
-        assert!(Chain::of_mode_on(Mode::WallDay, h).is_empty(), "{h:?}");
-        assert!(wall_out_of_reach(h, Mode::WallDay).is_some(), "{h:?}");
-    }
-    assert!(WallDay.lands() && !WallDay.managed() && WallDay.autopilot() == "land");
-    assert_eq!(WallDay.scenarios(), [Scenario::W1]);
-    assert_eq!(Chain::of_mode(Mode::WallClimb), [WallClimb]);
+    assert!(Wall.walled() && WallHid.walled() && !LandA.walled() && !Off.walled());
     assert_eq!(
-        Chain::of_mode_on(Mode::WallClimb, Harness::Gemini),
-        [WallClimb]
-    );
-    for h in [Harness::Claude, Harness::Agy, Harness::Muse] {
-        assert!(Chain::of_mode_on(Mode::WallClimb, h).is_empty(), "{h:?}");
-    }
-    assert!(WallClimb.lands() && WallClimb.walled() && WallClimb.autopilot() == "land");
-    assert_eq!(WallClimb.scenarios(), [Scenario::W1]);
-    assert_eq!(WallClimb.wall_claim_on(Harness::Gemini), "five_hour");
-    assert!(WallClimb.wall_ahead_ms() > 32 * 60_000 && WallClimb.wall_ahead_ms() < 2 * 60 * 60_000);
-    assert!(WallClimb.limit_ms() > (30 + 120 + 5) * 60_000);
-    assert_eq!(WallDay.wall_claim_on(Harness::Gemini), "five_hour");
-    assert_eq!(Wall.wall_claim_on(Harness::Gemini), "code_assist");
-    assert!(WallDay.wall_ahead_ms() < 30 * 60_000 && WallDay.wall_ahead_ms() > WALL_AHEAD_MS);
-    assert_eq!(WallDay.limit_ms(), WALL_DAY_LIMIT_MS);
-    assert!(
-        Wall.walled() && WallHid.walled() && WallDay.walled() && !LandA.walled() && !Off.walled()
-    );
-    assert_eq!(
-        [
-            Mode::Wall,
-            Mode::WallHid,
-            Mode::WallDay,
-            Mode::WallClimb,
-            Mode::Cap,
-            Mode::Both
-        ]
-        .map(Mode::walled),
-        [
-            Some(Scenario::W1),
-            Some(Scenario::W2),
-            Some(Scenario::W1),
-            Some(Scenario::W1),
-            None,
-            None
-        ]
+        [Mode::Wall, Mode::WallHid, Mode::Cap, Mode::Both].map(Mode::walled),
+        [Some(Scenario::W1), Some(Scenario::W2), None, None]
     );
     for m in [Mode::Land, Mode::Cruise, Mode::Both, Mode::Cover, Mode::Cap] {
         assert!(Chain::of_mode(m).iter().all(|c| !c.walled()), "{m:?}");
@@ -795,13 +736,20 @@ fn the_coverage_modes_pick_their_chains() {
         ("cap", Mode::Cap),
         ("wall", Mode::Wall),
         ("wall-hid", Mode::WallHid),
-        ("wall-day", Mode::WallDay),
-        ("wall-climb", Mode::WallClimb),
     ] {
         let a = parse_args(&v(&["--harness", "claude", "--mode", w]))
             .unwrap()
             .unwrap();
         assert_eq!(a.mode, m);
+    }
+    for w in [
+        "wall-day",
+        "wall-climb",
+        "wall-shift",
+        "wall-day-stop",
+        "wall-bucket",
+    ] {
+        assert_eq!(Mode::of(w), None, "{w}: a retired Gemini CLI mode");
     }
 }
 
@@ -1098,7 +1046,7 @@ fn the_words_are_read() {
         d.chains(Harness::Claude),
         [Chain::LandQ, Chain::Mgr, Chain::Worker, Chain::Off]
     );
-    for h in [Harness::Gemini, Harness::Agy, Harness::Muse] {
+    for h in [Harness::Agy, Harness::Muse] {
         assert_eq!(
             d.chains(h),
             [Chain::LandQ, Chain::Mgr, Chain::Worker, Chain::Off],
@@ -1353,11 +1301,7 @@ fn landed_a() -> Seen {
             status_of(131_000, "open", "ask", "land", "aterm-harness@1"),
             status(376_000, "landed", "land"),
         ],
-        meta: vec![
-            no_meta(1_000),
-            needs_meta(131_000, "gemini"),
-            no_meta(376_000),
-        ],
+        meta: vec![no_meta(1_000), needs_meta(131_000, "agy"), no_meta(376_000)],
         task: vec![j(1_000, "OK task -")],
         reply_ms: None,
         asked_ms: None,
@@ -1375,7 +1319,7 @@ fn landed_a() -> Seen {
 #[test]
 fn land_a_passes_on_a_landing_with_its_need_raised_then_cleared() {
     assert_eq!(
-        verdicts(Chain::LandA, &landed_a(), "gemini"),
+        verdicts(Chain::LandA, &landed_a(), "agy"),
         [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")]
     );
 }
@@ -1398,17 +1342,17 @@ fn a_landing_is_watched_past_the_ladders_next_step() {
 #[test]
 fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     let l3 = |s: &Seen, p: &str| verdicts(Chain::LandA, s, p)[1];
-    let l5 = |s: &Seen| verdicts(Chain::LandA, s, "gemini")[2];
-    assert_eq!(l3(&landed_a(), "agy"), ("L3", "FAIL"));
+    let l5 = |s: &Seen| verdicts(Chain::LandA, s, "agy")[2];
+    assert_eq!(l3(&landed_a(), "muse"), ("L3", "FAIL"));
     let mut s = landed_a();
     s.meta[1].1 = s.meta[1].1.replace("— carrying on", "— waiting for you");
-    assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
+    assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
     let mut s = landed_a();
     s.status.remove(1);
-    assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
+    assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
     let mut s = landed_a();
     s.ledger[3].command = LAND_NUDGE.to_string();
-    assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
+    assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
     let mut s = landed_a();
     s.journal.push(j(
         430_000,
@@ -1465,7 +1409,7 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
     s.end_ms = T0 + 470_000;
-    let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L5);
+    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L5);
     assert_eq!(w, "UNOBSERVED", "{why}");
     let s = Seen {
         journal: vec![j(5_000, "EVENT idle seq=1 x")],
@@ -1473,17 +1417,17 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
         ..Seen::default()
     };
     assert_eq!(
-        verdicts(Chain::LandA, &s, "gemini"),
+        verdicts(Chain::LandA, &s, "agy"),
         [("L1", "FAIL"), ("L3", "UNOBSERVED"), ("L5", "UNOBSERVED")]
     );
     let mut s = landed_a();
     s.ledger.retain(|r| r.rule != "land@v1");
-    assert_eq!(verdicts(Chain::LandA, &s, "gemini")[0], ("L1", "FAIL"));
+    assert_eq!(verdicts(Chain::LandA, &s, "agy")[0], ("L1", "FAIL"));
     let mut s = landed_a();
     s.journal.retain(|(_, l)| !l.contains("land-nudge"));
     s.journal.push(j(131_000, "DONE seq=2 rule=land@v1 x"));
     s.journal.sort();
-    assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
+    assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
 }
 
 fn repo_suffix(repo: Repo) -> String {
@@ -1708,7 +1652,7 @@ fn tasked() -> Seen {
             ),
             j(
                 10_000,
-                "OK task rev=2 state=done from=ctl since_ms=0 result_bytes=120 why=landed result_path=x agent=gemini attention=-",
+                "OK task rev=2 state=done from=ctl since_ms=0 result_bytes=120 why=landed result_path=x agent=agy attention=-",
             ),
         ],
         reply_ms: None,
@@ -1726,30 +1670,30 @@ fn tasked() -> Seen {
 
 #[test]
 fn land_e_passes_on_a_workers_task_marked_done_why_landed() {
-    let (w, why) = one(Chain::LandE, &tasked(), "gemini", Scenario::L7);
+    let (w, why) = one(Chain::LandE, &tasked(), "agy", Scenario::L7);
     assert_eq!(w, "PASS", "{why}");
     let mut s = tasked();
     s.task[1].1 = s.task[1].1.replace("why=landed", "why=marker");
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "FAIL")]);
     let mut s = tasked();
     s.task.pop();
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "FAIL")]);
     let mut s = tasked();
     s.journal.pop();
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "FAIL")]);
     let mut s = tasked();
     s.journal
         .push(j(9_100, "WAITING seq=2 until=x 2 short turn(s) in a row"));
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "FAIL")]);
     let mut s = tasked();
     s.journal.truncate(3);
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "FAIL")]);
     let mut s = tasked();
     s.end_ms = T0 + 50_000;
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "UNOBSERVED")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "UNOBSERVED")]);
     let mut s = tasked();
     s.task = vec![j(-2_000, "OK task -")];
-    assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "UNOBSERVED")]);
+    assert_eq!(verdicts(Chain::LandE, &s, "agy"), [("L7", "UNOBSERVED")]);
     let mut s = tasked();
     s.task.insert(
         1,
@@ -1763,7 +1707,7 @@ fn land_e_passes_on_a_workers_task_marked_done_why_landed() {
     assert!(why.contains("state=stalled"), "{why}");
     let mut s = tasked();
     s.task[1].1 = s.task[1].1.replace("rev=2", "rev=3");
-    let (w, why) = one(Chain::LandE, &s, "gemini", Scenario::L7);
+    let (w, why) = one(Chain::LandE, &s, "agy", Scenario::L7);
     assert_eq!(w, "FAIL", "{why}");
     assert!(
         why.contains("changed between looks unread: rev 1 then 3"),
@@ -1996,7 +1940,7 @@ fn instant_landed() -> Seen {
 
 #[test]
 fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
-    let p4l = |s: &Seen| one(Chain::InstantLand, s, "gemini", Scenario::P4L);
+    let p4l = |s: &Seen| one(Chain::InstantLand, s, "agy", Scenario::P4L);
     let (w, why) = p4l(&instant_landed());
     assert_eq!(w, "PASS", "{why}");
     let mut unread = instant_landed();
@@ -2173,15 +2117,10 @@ fn instant_asked() -> Seen {
 
 #[test]
 fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
-    let p4p = |s: &Seen| one(Chain::InstantCruise, s, "gemini", Scenario::P4P);
+    let p4p = |s: &Seen| one(Chain::InstantCruise, s, "agy", Scenario::P4P);
     let (w, why) = p4p(&instant_asked());
     assert_eq!(w, "PASS", "{why}");
-    let (w, why) = one(
-        Chain::InstantCruise,
-        &instant_asked(),
-        "gemini",
-        Scenario::P4C,
-    );
+    let (w, why) = one(Chain::InstantCruise, &instant_asked(), "agy", Scenario::P4C);
     assert_eq!(w, "PASS", "{why}");
     let mut untyped = instant_asked();
     untyped.asked_ms = None;
@@ -2908,7 +2847,7 @@ fn started() -> Seen {
 
 #[test]
 fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
-    let p5 = |s: &Seen| one(Chain::LandT, s, "gemini", Scenario::P5);
+    let p5 = |s: &Seen| one(Chain::LandT, s, "agy", Scenario::P5);
     let (w, why) = p5(&started());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("then done why=landed"), "{why}");
@@ -2998,16 +2937,16 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
     let mut s = spawned();
     s.status[0] = status(1_000, "open", "cruise");
     assert_eq!(l15(&s).0, "FAIL");
-    let mut s = spawned_on("gemini");
+    let mut s = spawned_on("agy");
     s.status.insert(0, status(-1_000, "-", "-"));
-    let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
+    let (w, why) = one(Chain::Worker, &s, "agy", Scenario::L15);
     assert_eq!(w, "PASS", "{why}");
     s.status[1] = status(1_000, "open", "cruise");
-    let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
+    let (w, why) = one(Chain::Worker, &s, "agy", Scenario::L15);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("is not autopilot=land"), "{why}");
     s.status = vec![status(-1_000, "-", "-"), status(1_000, "open", "-")];
-    let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
+    let (w, why) = one(Chain::Worker, &s, "agy", Scenario::L15);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("none named one"), "{why}");
     let mut s = spawned();
@@ -3053,16 +2992,12 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
 
 #[test]
 fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
-    for program in ["claude", "gemini", "agy", "muse"] {
+    for program in ["claude", "agy", "muse"] {
         let l15 = |s: &Seen| one(Chain::Worker, s, program, Scenario::L15);
         let (w, why) = l15(&spawned_on(program));
         assert_eq!(w, "PASS", "{program}: {why}");
         assert!(why.contains(&format!("spawned agent={program} ")), "{why}");
-        let other = if program == "claude" {
-            "gemini"
-        } else {
-            "claude"
-        };
+        let other = if program == "claude" { "agy" } else { "claude" };
         let mut s = spawned_on(program);
         s.cover.agent = Some(other.into());
         let (w, why) = l15(&s);
@@ -3093,33 +3028,6 @@ fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
     let mut s = spawned_on("agy");
     s.cover.result_head = Some(result_head("muse"));
     assert_eq!(one(Chain::Worker, &s, "agy", Scenario::L15).0, "FAIL");
-}
-
-#[test]
-fn a_worker_shells_gemini_runs_the_labs_build_and_its_project_is_trusted() {
-    let w = gemini_wrapper("/opt/homebrew/bin/gemini");
-    assert!(w.starts_with("#!/bin/sh\n"), "{w}");
-    assert!(w.ends_with("exec /opt/homebrew/bin/gemini \"$@\"\n"), "{w}");
-    assert!(
-        gemini_wrapper("/a b/gemini").ends_with("exec '/a b/gemini' \"$@\"\n"),
-        "{w}"
-    );
-    let j = crate::pyjson::J::parse(&gemini_trusted_project("/tmp")).unwrap();
-    let crate::pyjson::J::Obj(rows) = &j else {
-        panic!("{j:?}")
-    };
-    let mut keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
-    keys.sort_unstable();
-    assert_eq!(keys, ["/private/tmp", "/tmp"]);
-    assert!(
-        rows.iter()
-            .all(|(_, v)| *v == crate::pyjson::J::s("TRUST_FOLDER"))
-    );
-    let j = crate::pyjson::J::parse(&gemini_trusted_project("/nonexistent/proj")).unwrap();
-    assert_eq!(
-        j,
-        crate::pyjson::J::obj([("/nonexistent/proj", crate::pyjson::J::s("TRUST_FOLDER"))])
-    );
 }
 
 fn capped() -> Seen {
@@ -3582,40 +3490,40 @@ fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() 
         s
     };
     assert_eq!(
-        verdicts(Chain::LandA, &moved(123_100), "gemini"),
+        verdicts(Chain::LandA, &moved(123_100), "agy"),
         [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")]
     );
     let early = moved(122_900);
     assert_eq!(
-        verdicts(Chain::LandA, &early, "gemini"),
+        verdicts(Chain::LandA, &early, "agy"),
         [("L1", "FAIL"), ("L3", "FAIL"), ("L5", "FAIL")]
     );
-    let (_, why) = one(Chain::LandA, &early, "gemini", Scenario::L1);
+    let (_, why) = one(Chain::LandA, &early, "agy", Scenario::L1);
     assert!(
         why.contains("+122.9 s land@v1 typed 2.1 s BEFORE the due"),
         "{why}"
     );
     assert!(why.contains("its own judge: PASS"), "{why}");
     assert_eq!(
-        verdicts(Chain::LandA, &moved(60_000), "gemini")[0],
+        verdicts(Chain::LandA, &moved(60_000), "agy")[0],
         ("L1", "FAIL")
     );
     let mut s = landed_a();
     s.journal[6].0 = T0 + 190_000;
     s.ledger[3].ts = T0 + 190_000;
-    let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L3);
+    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L3);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("land-nudge@v1 typed"), "{why}");
     let mut s = moved(60_000);
     s.journal
         .insert(2, j(59_000, "EVENT idle seq=9 another turn ended"));
-    assert_eq!(verdicts(Chain::LandA, &s, "gemini")[0], ("L1", "PASS"));
+    assert_eq!(verdicts(Chain::LandA, &s, "agy")[0], ("L1", "PASS"));
     let mut s = moved(60_000);
     s.journal[1].1 = "WAITING seq=1 until=x the worker to take the land@v1 act".into();
-    assert_eq!(verdicts(Chain::LandA, &s, "gemini")[0], ("L1", "PASS"));
+    assert_eq!(verdicts(Chain::LandA, &s, "agy")[0], ("L1", "PASS"));
     let mut s = landed_a();
     s.journal[1].1 = "WAITING seq=1 until=soon 1 short turn(s) in a row: 2 min back-off".into();
-    let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L1);
+    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("names no due that reads"), "{why}");
     let mut s = walled();
@@ -3662,17 +3570,17 @@ fn a_point_before_the_first_prompt_or_a_late_ladder_fails_the_chain() {
     let mut s = landed_a();
     s.ledger.insert(0, point(-3_000, 1));
     assert_eq!(
-        verdicts(Chain::LandA, &s, "gemini"),
+        verdicts(Chain::LandA, &s, "agy"),
         [("L1", "FAIL"), ("L3", "FAIL"), ("L5", "FAIL")]
     );
-    let (_, why) = one(Chain::LandA, &s, "gemini", Scenario::L1);
+    let (_, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
     assert!(
         why.contains("a point judged 3.0 s before the first prompt (P3)"),
         "{why}"
     );
     let mut s = landed_a();
     s.ledger[0] = point(5_000, 2);
-    let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L5);
+    let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L5);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("closed 2 short turn(s), not 1"), "{why}");
     assert!(chain_faults(&landed_a(), T0).is_empty());
@@ -3735,7 +3643,7 @@ fn the_walls_deadline_is_the_programs_own_grace() {
         why.contains("TYPED ON TOP of the program's own continuation"),
         "{why}"
     );
-    for program in ["gemini", "agy", "muse"] {
+    for program in ["agy", "muse"] {
         let (w, why) = one(Chain::Wall, &late, program, Scenario::W1);
         assert_eq!(w, "FAIL", "{program}: {why}");
         assert!(
@@ -3817,10 +3725,9 @@ fn the_programs_own_continuation_is_the_first_request_holding_its_words() {
     assert_eq!(first_continuation(&dumps[1..2], &tok, 0), None);
 }
 
-const GEMINI_LIMIT_HELD: &str = "Gemini CLI's usage limit: neither Keep trying nor Stop is \
-     pressed; /stats model in this tab says which limit holds it";
+const LIMIT_HELD: &str = "the usage limit's menu offers no wait: a person chooses how to go on";
 
-fn gemini_walled() -> Seen {
+fn walled_escalated() -> Seen {
     let mut s = walled();
     s.journal.truncate(3);
     s.journal.push(j(130_000, "ESCALATED seq=2 attention=OK"));
@@ -3830,21 +3737,21 @@ fn gemini_walled() -> Seen {
     ));
     s.ledger.truncate(2);
     s.ledger
-        .push(row(130_000, "-", "escalated", "", GEMINI_LIMIT_HELD));
+        .push(row(130_000, "-", "escalated", "", LIMIT_HELD));
     s.status.truncate(1);
     s.status
         .push(status_of(130_500, "open", "ask", "land", "aterm-harness@1"));
-    s.end_ms = T0 + 300_000 + wall_grace_ms("gemini") + WALL_LOST_MS + 1_000;
+    s.end_ms = T0 + 300_000 + wall_grace_ms("muse") + WALL_LOST_MS + 1_000;
     s
 }
 
 #[test]
 fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
-    let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
-    let (w, why) = w1(&gemini_walled());
+    let w1 = |s: &Seen| one(Chain::Wall, s, "muse", Scenario::W1);
+    let (w, why) = w1(&walled_escalated());
     assert_eq!(w, "FAIL", "{why}");
     assert!(
-        why.contains("ESCALATED the wall to a person at +130.0 s: Gemini CLI's usage limit"),
+        why.contains("ESCALATED the wall to a person at +130.0 s: the usage limit's menu"),
         "{why}"
     );
     assert!(
@@ -3867,342 +3774,9 @@ fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
     assert!(why.contains("never drawn as a limit point"), "{why}");
     let mut s = walled();
     s.ledger
-        .insert(4, row(300_500, "-", "escalated", "", GEMINI_LIMIT_HELD));
+        .insert(4, row(300_500, "-", "escalated", "", LIMIT_HELD));
     let (w, why) = w1(&s);
     assert!(!why.contains("ESCALATED the wall"), "{w}: {why}");
-}
-
-fn gemini_kept_trying() -> Seen {
-    let mut s = walled();
-    s.journal.truncate(3);
-    s.journal.extend([
-        j(
-            140_000,
-            "EVENT prompt seq=2 kind=usage-limit classify=- command=-",
-        ),
-        j(
-            140_100,
-            &format!(
-                "WAITING seq=2 until={} rule=limit-retry@v1 Gemini CLI's usage limit resets at \
-                 1:05 PM GMT+5:30: Keep trying is pressed past it",
-                stamp(420_000)
-            ),
-        ),
-        j(
-            421_000,
-            "APPROVED seq=2 Keep trying (reset 1:05 PM GMT+5:30)",
-        ),
-        j(425_000, "EVENT idle seq=3 Nothing left: the parser"),
-        j(425_000, "DONE seq=3 rule=land@v1 x"),
-    ]);
-    s.ledger = vec![
-        point(5_000, 1),
-        typed(125_000, "land@v1", LAND),
-        point(140_000, 2),
-        row(
-            140_100,
-            "limit-retry@v1",
-            "waiting",
-            "Keep trying (reset 1:05 PM GMT+5:30)",
-            "until …: Gemini CLI's usage limit resets at 1:05 PM GMT+5:30: Keep trying is \
-             pressed past it",
-        ),
-        row(
-            421_000,
-            "limit-retry@v1",
-            "approved",
-            "Keep trying (reset 1:05 PM GMT+5:30)",
-            "",
-        ),
-        point(425_000, 3),
-        task_done(425_000),
-    ];
-    s.status = vec![
-        status(1_000, "open", "land"),
-        status(426_000, "landed", "land"),
-    ];
-    s.end_ms = T0 + 425_000 + 545_000;
-    s
-}
-
-#[test]
-fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
-    let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
-    let (w, why) = w1(&gemini_kept_trying());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains(
-            "gone on: limit-retry@v1 pressed at +421.0 s (121.0 s past the reset), ledgered"
-        ),
-        "{why}"
-    );
-    assert!(
-        why.contains("1.0 s after the until= its wait named"),
-        "at its due: {why}"
-    );
-    let mut s = gemini_kept_trying();
-    s.ledger[4].ts = T0 + 200_000;
-    s.journal[4].0 = T0 + 200_000;
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("TYPED into the wall: 0 journal act(s), 1 ledger act(s) (the first limit-retry@v1 approved at +200.0 s)"),
-        "{why}"
-    );
-    let mut s = gemini_kept_trying();
-    s.ledger[4].ts = T0 + 360_000;
-    s.journal[5].0 = T0 + 360_000;
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("PRESSED BEFORE ITS DUE: limit-retry@v1 at +360.0 s, 60.0 s before"),
-        "{why}"
-    );
-    let mut s = gemini_kept_trying();
-    s.ledger.remove(4);
-    let (w, why) = w1(&s);
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(why.contains("the program's own retry landed it"), "{why}");
-    let mut s = gemini_kept_trying();
-    s.ledger[4].ts = T0 + 700_000;
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("PERSISTENCE LOST: the first press after the reset"),
-        "{why}"
-    );
-}
-
-const GEMINI_NO_RESET: &str = "Gemini CLI's usage limit names no reset: Keep trying is tried on a \
-     back-off ladder; /stats model says which limit";
-
-fn gemini_day_kept_trying() -> Seen {
-    let mut s = walled();
-    let due = 140_000 + 1_800_000;
-    let waits = "Gemini CLI's usage limit names no reset: Keep trying is pressed on the back-off \
-         ladder";
-    s.journal.truncate(3);
-    s.journal.extend([
-        j(
-            140_000,
-            "EVENT prompt seq=2 kind=usage-limit classify=- command=-",
-        ),
-        j(140_100, "ESCALATED seq=2 attention=OK"),
-        j(
-            140_200,
-            &format!(
-                "WAITING seq=2 until={} rule=limit-retry@v1 {waits}",
-                stamp(due)
-            ),
-        ),
-        j(due + 1_000, "APPROVED seq=2 Keep trying (no reset named)"),
-        j(due + 4_000, "CLEARED seq=3 box attention=OK"),
-        j(due + 5_000, "EVENT idle seq=3 Nothing left: the parser"),
-        j(due + 5_000, "DONE seq=3 rule=land@v1 x"),
-    ]);
-    s.ledger = vec![
-        point(5_000, 1),
-        typed(125_000, "land@v1", LAND),
-        point(140_000, 2),
-        row(
-            140_100,
-            "-",
-            "escalated",
-            "Keep trying (no reset named)",
-            GEMINI_NO_RESET,
-        ),
-        row(
-            140_200,
-            "limit-retry@v1",
-            "waiting",
-            "Keep trying (no reset named)",
-            &format!("until …: {waits}"),
-        ),
-        row(
-            due + 1_000,
-            "limit-retry@v1",
-            "approved",
-            "Keep trying (no reset named)",
-            "",
-        ),
-        point(due + 5_000, 3),
-        task_done(due + 5_000),
-    ];
-    s.status = vec![
-        status(1_000, "open", "land"),
-        status_of(141_000, "open", "ask", "land", "aterm-harness@1"),
-        status(due + 6_000, "landed", "land"),
-    ];
-    s.cover.wall = Some((T0 + 6_000, (T0 + 1_500_000) / 1000));
-    s.cover.lifted_ms = Some(T0 + 1_497_000);
-    s.end_ms = T0 + due + 5_000 + 545_000;
-    s
-}
-
-#[test]
-fn a_per_day_dialogs_badge_is_no_stall_and_its_ladder_goes_on() {
-    let w1 = |s: &Seen| one(Chain::WallDay, s, "gemini", Scenario::W1);
-    let (w, why) = w1(&gemini_day_kept_trying());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains("gone on: limit-retry@v1 pressed at +1941.0 s"),
-        "{why}"
-    );
-    let mut s = gemini_day_kept_trying();
-    s.ledger.remove(4);
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("ESCALATED the wall to a person at +140.1 s"),
-        "{why}"
-    );
-    let mut s = gemini_day_kept_trying();
-    s.ledger[5].ts = T0 + 140_000 + 1_800_000 + 301_000;
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("PERSISTENCE LOST: the first press after the reset"),
-        "{why}"
-    );
-    let mut s = gemini_day_kept_trying();
-    s.journal.remove(5);
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("PERSISTENCE LOST: the first press after the reset"),
-        "{why}"
-    );
-    let mut s = gemini_day_kept_trying();
-    s.journal.push(j(150_000, "NEEDS seq=2 count=1 x"));
-    let (w, why) = w1(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("a need was raised"), "{why}");
-}
-
-fn gemini_day_climbed() -> Seen {
-    let mut s = gemini_day_kept_trying();
-    let due = 140_000 + 1_800_000;
-    let try1 = due + 1_000;
-    let due2 = try1 + 7_200_000;
-    let waits = "Gemini CLI's usage limit names no reset: Keep trying is pressed on the back-off \
-         ladder";
-    let again = format!("{waits} (drawn again after its Keep trying, try 1)");
-    s.journal.truncate(7);
-    s.journal.extend([
-        j(
-            try1 + 2_500,
-            "EVENT prompt seq=4 kind=usage-limit classify=- command=-",
-        ),
-        j(
-            try1 + 3_000,
-            &format!(
-                "WAITING seq=4 until={} rule=limit-retry@v1 {again}",
-                stamp(due2)
-            ),
-        ),
-        j(due2 + 1_000, "APPROVED seq=4 Keep trying (no reset named)"),
-        j(due2 + 4_000, "CLEARED seq=5 box attention=OK"),
-        j(due2 + 5_000, "EVENT idle seq=5 Nothing left: the parser"),
-        j(due2 + 5_000, "DONE seq=5 rule=land@v1 x"),
-    ]);
-    s.ledger.truncate(6);
-    s.ledger.extend([
-        row(
-            try1 + 3_000,
-            "limit-retry@v1",
-            "waiting",
-            "Keep trying (no reset named)",
-            &format!("until …: {again}"),
-        ),
-        row(
-            due2 + 1_000,
-            "limit-retry@v1",
-            "approved",
-            "Keep trying (no reset named)",
-            "",
-        ),
-        point(due2 + 5_000, 5),
-        task_done(due2 + 5_000),
-    ]);
-    s.status = vec![
-        status(1_000, "open", "land"),
-        status_of(141_000, "open", "ask", "land", "aterm-harness@1"),
-        status(due2 + 6_000, "landed", "land"),
-    ];
-    s.status_reads = [1_000, 141_000, try1 + 6_000, try1 + 3_600_000, due2 + 6_000]
-        .map(|t| T0 + t)
-        .to_vec();
-    s.cover.wall = Some((T0 + 6_000, (T0 + 2_706_000) / 1000));
-    s.cover.lifted_ms = Some(T0 + 2_703_000);
-    s.end_ms = T0 + due2 + 5_000 + 2_100_000;
-    s
-}
-
-#[test]
-fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
-    let w1 = |s: &Seen| one(Chain::WallClimb, s, "gemini", Scenario::W1);
-    let (w, why) = w1(&gemini_day_climbed());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains("gone on: limit-retry@v1 pressed at +9142.0 s")
-            && why.contains(
-                "the ladder climbed in the wall: try 1 drawn again, next due 7200.0 s on"
-            )
-            && why.contains("needs=ask at 2 status read(s)")
-            && why.contains("NEEDS YOU down at +9145.0 s"),
-        "{why}"
-    );
-    let (w, why) = w1(&gemini_day_kept_trying());
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(why.contains("the climb unobserved"), "{why}");
-    let fail = |s: &Seen, needle: &str| {
-        let (w, why) = w1(s);
-        assert_eq!(w, "FAIL", "{needle}: {why}");
-        assert!(why.contains(needle), "{needle}: {why}");
-    };
-    let try1 = 140_000 + 1_800_000 + 1_000;
-    let mut s = gemini_day_climbed();
-    for (_, l) in &mut s.journal {
-        *l = l.replace(" (drawn again after its Keep trying, try 1)", "");
-    }
-    fail(&s, "was not answered by the dialog drawn again");
-    let mut s = gemini_day_climbed();
-    s.journal.retain(|(_, l)| !l.contains("drawn again"));
-    fail(&s, "PERSISTENCE LOST: the first press after the reset");
-    let mut s = gemini_day_climbed();
-    let early = try1 + 1_200_000;
-    for (t, l) in &mut s.journal {
-        if l.contains("drawn again") {
-            *l = l.replacen(&stamp(try1 + 7_200_000), &stamp(early), 1);
-        } else if l.starts_with("APPROVED seq=4") {
-            *t = T0 + early + 1_000;
-        }
-    }
-    let at = s.ledger.len() - 3;
-    s.ledger[at].ts = T0 + early + 1_000;
-    fail(&s, "the ladder did not climb at the try at +1941.0 s");
-    let mut s = gemini_day_climbed();
-    s.journal
-        .push(j(try1 + 4_000, "CLEARED seq=4 box attention=OK"));
-    s.journal.sort_by_key(|(t, _)| *t);
-    fail(&s, "NEEDS YOU came down at +1945.0 s while the quota stood");
-    let mut s = gemini_day_climbed();
-    s.status.insert(2, status(try1 + 3_600_000, "open", "land"));
-    fail(
-        &s,
-        "NEEDS YOU not standing at the status read at +5541.0 s while the quota stood",
-    );
-    let mut s = gemini_day_climbed();
-    s.status_reads
-        .retain(|t| *t <= T0 + try1 || *t > T0 + try1 + 7_200_000);
-    fail(&s, "no status read between the last try in the wall");
-    let mut s = gemini_day_climbed();
-    s.journal.retain(|(_, l)| !l.starts_with("CLEARED seq=5"));
-    s.status[2] = status_of(try1 + 7_205_000, "landed", "ask", "land", "aterm-harness@1");
-    fail(&s, "NEEDS YOU STOOD after the try that got through");
-    let mut s = gemini_day_climbed();
-    s.ledger[5].ts = T0 + try1 - 61_000;
-    fail(&s, "TYPED into the wall: 0 journal act(s), 1 ledger act(s)");
 }
 
 const RULES_ROWS: &str =
@@ -4316,7 +3890,7 @@ fn agys_notice_is_gone_only_when_no_row_of_its_block_draws() {
     let tail = format!("{id_row}\n\n{titles}{frame}");
     assert!(!notice_gone(Harness::Agy, &tail), "{tail}");
     assert!(!notice_gone(Harness::Agy, &titles));
-    for h in [Harness::Muse, Harness::Claude, Harness::Gemini] {
+    for h in [Harness::Muse, Harness::Claude] {
         assert!(!notice_gone(h, &scrolled), "{h:?}");
     }
 }
@@ -4358,7 +3932,7 @@ fn agys_hide_enters_only_the_command_its_menu_offers_first() {
     ));
     assert!(!menu_offers(Harness::Agy, TITLE_ROWS, AGY_HIDE_COMMAND));
     assert!(!menu_offers(Harness::Muse, &offered, AGY_HIDE_COMMAND));
-    assert!(!menu_offers(Harness::Gemini, &offered, AGY_HIDE_COMMAND));
+    assert!(!menu_offers(Harness::Claude, &offered, AGY_HIDE_COMMAND));
 }
 
 fn walled_hidden() -> Seen {
@@ -4448,7 +4022,6 @@ fn walled_hidden() -> Seen {
                 seq: Some(40),
                 commands: 10,
                 command: HIDE_COMMAND,
-                stopped: false,
                 words: &[WALL_WORDS],
             }),
             ..Cover::default()
@@ -4577,36 +4150,27 @@ fn hold(line: (i64, String), held: &str, nudges: &str, since: &str) -> (i64, Str
 const LAND_SINCE: &str = "1125";
 
 /// Its opening sweep's read (5d): its chip drawn in front before its first prompt, the title its
-/// mode's sentence from MODE_WORDS (Gemini CLI, no footer: no title).
+/// mode's sentence from MODE_WORDS.
 fn opened(program: &str, mode: &str) -> Option<(i64, String)> {
     use aterm_agent::supervise::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
-    let line = if program == "gemini" {
-        "window=2 program=gemini face=- drawn=- why=no-footer spoken=- description=- title=-"
-            .to_string()
-    } else {
-        let m = Autopilot::ALL
-            .into_iter()
-            .find(|m| m.word() == mode)
-            .expect("a mode");
-        let title = format!(
-            "autopilot: {mode} \u{2014} {} \u{b7} click: x \u{b7} right-click: more",
-            mode_words(m).chip
-        );
-        format!(
-            "window=2 program={program} face={mode} drawn={:?} spoken=\"x\" description=- title={title:?}",
-            surfaces::face_cells(mode).expect("a face")
-        )
-    };
+    let m = Autopilot::ALL
+        .into_iter()
+        .find(|m| m.word() == mode)
+        .expect("a mode");
+    let title = format!(
+        "autopilot: {mode} \u{2014} {} \u{b7} click: x \u{b7} right-click: more",
+        mode_words(m).chip
+    );
+    let line = format!(
+        "window=2 program={program} face={mode} drawn={:?} spoken=\"x\" description=- title={title:?}",
+        surfaces::face_cells(mode).expect("a face")
+    );
     Some((T0 - 30_000, line))
 }
 
 fn behind(program: &str, face: &str) -> String {
-    if program == "gemini" {
-        "window=2 program=gemini face=- drawn=- why=no-footer spoken=-".to_string()
-    } else {
-        format!("window=2 program={program} face={face} drawn=- why=not-drawn spoken=-")
-    }
+    format!("window=2 program={program} face={face} drawn=- why=not-drawn spoken=-")
 }
 
 fn seen_land_a(program: &str) -> Seen {
@@ -4678,7 +4242,7 @@ fn seen_land_a(program: &str) -> Seen {
 
 #[test]
 fn land_a_passes_on_the_window_a_person_would_see() {
-    for program in ["claude", "gemini"] {
+    for program in ["claude", "agy"] {
         assert_eq!(
             verdicts(Chain::LandA, &seen_land_a(program), program),
             [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")],
@@ -4779,9 +4343,6 @@ fn land_a_fails_a_wrong_window_read() {
     let (w, why) = l(&s, "claude", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("face=land (wanted [\"landed\"])"), "{why}");
-    let mut s = seen_land_a("gemini");
-    s.window.chip[0].1 = behind("claude", "land");
-    assert_eq!(l(&s, "gemini", Scenario::L1).0, "FAIL");
 }
 
 #[test]
@@ -5342,14 +4903,14 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
             st(10_000, "landed", "-", "-", "-", "-"),
         ];
         s.window = surfaces::Window {
-            chip: vec![j(1_000, &behind("gemini", ""))],
+            chip: vec![j(1_000, &behind("agy", "land"))],
             strip: vec![j(10_000, "index=5 selected=0 states=done")],
             menu: vec![j(
                 10_000,
                 "done-head|Done for you (1) rows=1\ndone|✓ land-e — landed #",
             )],
             rest: rest.map(str::to_string),
-            opening: opened("gemini", "land"),
+            opening: opened("agy", "land"),
             ..window("land-e")
         };
         s
@@ -5361,7 +4922,7 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     };
     const TODAY: &str = "3 landed today · 2 kept going · 7 land prompts";
     const EVERY: &str = "Every session, 12 sessions: 2 cruising, 6 landing, 3 landed, 1 off";
-    let l7 = |s: &Seen| one(Chain::LandE, s, "gemini", Scenario::L7);
+    let l7 = |s: &Seen| one(Chain::LandE, s, "agy", Scenario::L7);
     let good = seen(Some(&rest(
         "This Mac — 6 landing · 3 landed · 2 shells",
         3,
@@ -5371,7 +4932,7 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     let (w, why) = l7(&good);
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("today 3 landed today"), "{why}");
-    assert_eq!(one(Chain::LandE, &good, "gemini", Scenario::L7).0, "PASS");
+    assert_eq!(one(Chain::LandE, &good, "agy", Scenario::L7).0, "PASS");
     for (here, landed) in [
         ("This Mac — 2 shells", 3),
         ("This Mac — 2 landed · 2 shells", 3),
@@ -5559,14 +5120,11 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         end(&rest_desk(REST, "0"), &[(Chain::LandA, &never)]),
         "FAIL"
     );
-    let g = front("window=2 program=gemini face=- drawn=- why=no-footer spoken=-");
+    let g = front("window=2 program=agy face=- drawn=- why=no-footer spoken=-");
     assert_eq!(
-        surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &g)], "gemini").word(),
-        "PASS"
-    );
-    assert_eq!(
-        surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &n)], "gemini").word(),
-        "FAIL"
+        surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &g)], "agy").word(),
+        "FAIL",
+        "every harness the lab runs draws its chip: a no-footer line at rest is no face"
     );
     assert_eq!(end(&surfaces::Desk::default(), &tabs), "UNOBSERVED");
     let mut d = rest_desk(REST, "0");
@@ -5844,7 +5402,7 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
         Chain::of_mode_on(Mode::Resid, Harness::Agy),
         [InstantCruise, InstantPerson, SameWords, TallScroll, Off]
     );
-    for h in [Harness::Claude, Harness::Gemini, Harness::Muse] {
+    for h in [Harness::Claude, Harness::Muse] {
         assert_eq!(
             Chain::of_mode_on(Mode::Resid, h),
             Chain::of_mode(Mode::Resid),
@@ -5855,7 +5413,7 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
     assert!(tool_end_out_of_reach(Harness::Agy).is_some());
     let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     for (w, m) in [("resid", Mode::Resid), ("ladder", Mode::Ladder)] {
-        let a = parse_args(&v(&["--harness", "gemini", "--mode", w]))
+        let a = parse_args(&v(&["--harness", "agy", "--mode", w]))
             .unwrap()
             .unwrap();
         assert_eq!(a.mode, m);
@@ -5915,7 +5473,6 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
         .collect();
     for (h, name) in [
         (Harness::Claude, "Read"),
-        (Harness::Gemini, "read_file"),
         (Harness::Agy, "view_file"),
         (Harness::Muse, "read_file"),
     ] {
@@ -6534,7 +6091,6 @@ fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
         w: base.join("w"),
         port: "5".into(),
         proxy: "http://127.0.0.1:6".into(),
-        gemini_bin: "/g/gemini.js".into(),
         agy_bin: "/a/agy".into(),
         ..Run::default()
     };
@@ -6550,32 +6106,6 @@ fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
     );
     assert!(
         !crate::lab::launcher(&run, &crate::lab::Launch::default()).contains(SCROLL_CLAUDE_ENV),
-        "the run's own"
-    );
-    let gemini = text(
-        &scroll_launcher(&run, Harness::Gemini, &dirs, false)
-            .unwrap()
-            .unwrap(),
-    );
-    let settings = run.w.join(SCROLL_GEMINI_FILE);
-    assert!(!run.run.join(SCROLL_GEMINI_FILE).exists(), "the run's dir");
-    assert!(
-        gemini.contains(&format!(
-            "GEMINI_CLI_SYSTEM_SETTINGS_PATH={}",
-            settings.display()
-        )),
-        "{gemini}"
-    );
-    assert_eq!(
-        J::parse(&text(&settings))
-            .unwrap()
-            .get("ui")
-            .and_then(|u| u.get("useAlternateBuffer")),
-        Some(&J::Bool(true))
-    );
-    assert!(
-        !crate::gemini::launcher(&run, crate::gemini::Agent::Gemini, &[], &[])
-            .contains("GEMINI_CLI_SYSTEM_SETTINGS_PATH"),
         "the run's own"
     );
     let agy = text(
@@ -6606,8 +6136,7 @@ fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
             .is_file()
     );
     assert!(
-        !crate::gemini::launcher(&run, crate::gemini::Agent::Agy, &[], &[])
-            .contains(SCROLL_AGY_HOME),
+        !crate::agy::launcher(&run, &[], &[]).contains(SCROLL_AGY_HOME),
         "the run's own"
     );
     assert_eq!(
@@ -6778,7 +6307,7 @@ fn laddered_late(scale: f64, late: u32, extra: i64) -> Seen {
 
 #[test]
 fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due() {
-    let lad = |s: &Seen| one(Chain::Ladder, s, "gemini", Scenario::Ladder);
+    let lad = |s: &Seen| one(Chain::Ladder, s, "agy", Scenario::Ladder);
     let good = laddered(LADDER_SCALE);
     let (w, why) = lad(&good);
     assert_eq!(w, "PASS", "{why}");
@@ -6962,43 +6491,6 @@ fn the_backoff_helpers_read_a_points_own_decision() {
     );
 }
 
-fn gemini_dialog_and_stopped() -> (String, String) {
-    let strip = |f: &str| {
-        f.lines()
-            .skip_while(|l| l.starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    (
-        strip(aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT),
-        strip(aterm_phase::gemini::fixtures::LIMIT_STOPPED),
-    )
-}
-
-#[test]
-fn gemini_clis_notice_is_gone_once_its_dialog_is_answered_stop() {
-    let (dialog, stopped) = gemini_dialog_and_stopped();
-    assert!(notice_gone(Harness::Gemini, &stopped), "{stopped}");
-    assert!(
-        aterm_phase::gemini::wall(&stopped.lines().map(str::to_string).collect::<Vec<_>>())
-            .is_some(),
-        "PRECONDITION: the Stop's error is a wall its reader reads"
-    );
-    assert!(!notice_gone(Harness::Gemini, &dialog));
-    assert_eq!(dialog_focus(&dialog).as_deref(), Some("1. Keep trying"));
-    let moved = dialog
-        .replace("│ ● 1. Keep trying", "│   1. Keep trying")
-        .replace("│   2. Stop", "│ ● 2. Stop");
-    assert_eq!(dialog_focus(&moved).as_deref(), Some(GEMINI_HIDE_OPTION));
-    assert!(!notice_gone(Harness::Gemini, &moved));
-    assert_eq!(dialog_focus(&stopped), None);
-    let titled = stopped.replace(
-        "✕ [API Error: An unknown error occurred.]",
-        "Usage limit reached for gemini-3.5-flash.",
-    );
-    assert!(!notice_gone(Harness::Gemini, &titled), "{titled}");
-}
-
 fn claude_limit_screens() -> (String, String, String) {
     let rule = "─".repeat(144);
     let named = format!("{} w2probe ─", "─".repeat(134));
@@ -7044,79 +6536,12 @@ fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
     assert!(!menu_offers(Harness::Claude, &other, CLAUDE_HIDE_COMMAND));
 }
 
-fn gemini_stopped() -> Seen {
-    let mut s = walled_hidden();
-    s.journal[3].1 = "EVENT prompt seq=2 kind=usage-limit classify=- command=-".into();
-    s.journal[4].1 = format!(
-        "WAITING seq=2 until={} rule=limit-retry@v1 Gemini CLI's usage limit resets at 1:06 PM GMT+5:30",
-        stamp(540_000)
-    );
-    s.journal[6].1 =
-        "EVENT limited seq=30 message=[API Error: An unknown error occurred.] reset=-".into();
-    let h = s.cover.hidden.as_mut().expect("hidden");
-    h.first_ms = T0 + 160_000;
-    h.enter_ms = T0 + 160_000;
-    h.seen_ms = T0 + 163_000;
-    h.seq = Some(30);
-    h.commands = 1;
-    h.command = GEMINI_HIDE_OPTION;
-    h.stopped = true;
-    h.words = &GEMINI_WALL_WORDS;
-    s
-}
-
-#[test]
-fn the_remembered_wall_on_gemini_cli_reads_the_stops_error_as_a_screen_without_the_notice() {
-    let w2 = |s: &Seen| one(Chain::WallHid, s, "gemini", Scenario::W2);
-    let (w, why) = w2(&gemini_stopped());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(why.contains("1 2. Stop from +160.0 s"), "{why}");
-    assert!(why.contains("read +168.4 s EVENT limited seq=30"), "{why}");
-    let unobserved = |edit: &dyn Fn(&mut Seen)| {
-        let mut s = gemini_stopped();
-        edit(&mut s);
-        let (w, why) = w2(&s);
-        assert_eq!(w, "UNOBSERVED", "{why}");
-        assert!(
-            why.contains("no point was read on a screen without the wall"),
-            "{why}"
-        );
-    };
-    unobserved(&|s| {
-        s.journal[6].1 =
-            "EVENT limited seq=30 message=Usage limit reached for gemini-3.5-flash. reset=-".into();
-    });
-    unobserved(&|s| {
-        s.journal[6].1 = "EVENT prompt seq=30 kind=usage-limit classify=- command=-".into();
-    });
-    unobserved(&|s| {
-        s.journal[6].1 =
-            "EVENT limited seq=20 message=[API Error: An unknown error occurred.] reset=-".into();
-    });
-    unobserved(&|s| s.cover.hidden.as_mut().expect("hidden").stopped = false);
-    let mut s = gemini_stopped();
-    s.journal.truncate(8);
-    s.ledger.truncate(5);
-    s.ledger.push(row(
-        168_450,
-        "-",
-        "escalated",
-        "",
-        "api-error not retried (Gemini CLI retries what time answers; after its usage limit's Stop, see /stats model): [API Error: An unknown error occurred.]",
-    ));
-    s.status.truncate(1);
-    let (w, why) = w2(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("ESCALATED"), "{why}");
-}
-
 #[path = "forever_walls_tests.rs"]
 mod walls;
 
 #[test]
 fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
-    let ladder = "WAITING seq=38891 until=2026-10-22T11:47:18Z rule=limit-retry@v1 Gemini CLI's \
-                  usage limit names no reset: Keep trying is pressed on the back-off ladder";
+    let wait = "WAITING seq=38891 until=2026-10-22T11:47:18Z usage-session resets";
     let event = "EVENT prompt seq=38891 kind=usage-limit classify=- command=-";
     let land = "CONTINUED seq=36822 rule=land@v1 [aterm harness] Autopilot is Land:";
     let seen = |lines: &[(i64, &str)]| Seen {
@@ -7125,16 +6550,16 @@ fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
     };
     assert!(waits_on_the_wall(&seen(&[
         (124_300, land),
-        (125_100, ladder),
+        (125_100, wait),
         (125_200, "ESCALATED seq=38891 attention=OK"),
         (125_200, event),
     ])));
     assert!(waits_on_the_wall(&seen(&[
         (124_300, land),
         (125_000, event),
-        (125_100, ladder),
+        (125_100, wait),
     ])));
-    let other = ladder.replace("seq=38891", "seq=36822");
+    let other = wait.replace("seq=38891", "seq=36822");
     assert!(!waits_on_the_wall(&seen(&[
         (124_300, land),
         (125_100, &other),
@@ -7147,12 +6572,12 @@ fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
         (125_200, event),
     ])));
     assert!(!waits_on_the_wall(&seen(&[
-        (124_000, ladder),
+        (124_000, wait),
         (124_300, land),
         (125_200, event),
     ])));
     assert!(!waits_on_the_wall(&seen(&[
-        (125_100, ladder),
+        (125_100, wait),
         (125_200, event)
     ])));
     let error = "EVENT limited seq=2483 message=model failed: API error 429: The usage limit has \
@@ -7560,10 +6985,10 @@ fn a_hold_fails_every_scenario_of_a_chain_that_scripts_no_same_reply() {
         ),
     );
     assert_eq!(
-        verdicts(Chain::LandA, &s, "gemini"),
+        verdicts(Chain::LandA, &s, "muse"),
         [("L1", "FAIL"), ("L3", "FAIL"), ("L5", "FAIL")]
     );
-    let (_, why) = one(Chain::LandA, &s, "gemini", Scenario::L5);
+    let (_, why) = one(Chain::LandA, &s, "muse", Scenario::L5);
     assert!(
         why.starts_with("THE CHAIN'S RECORDS: aterm stopped typing into it at +131.0 s"),
         "{why}"

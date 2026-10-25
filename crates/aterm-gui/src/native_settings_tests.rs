@@ -9,6 +9,9 @@ use crate::native_config_service::{
     VersionedConfigService,
 };
 use crate::native_ui::LogicalRect;
+use crate::security_fixtures::{
+    ANSWERED_AT_MS as DEVTOOLS_ANSWERED_AT_MS, debugger as debugger_facts, devtools_list,
+};
 use crate::tab_model::ViewStore;
 use std::collections::BTreeSet;
 
@@ -583,16 +586,18 @@ fn fallback_raw_projection_covers_dotted_keys() {
     }
 }
 
+/// A carried draft comes back to a row that takes text, a slider's exact field among
+/// them (Font size), and never to one that takes none (a choice).
 #[test]
 fn a_carried_draft_is_taken_only_by_a_row_that_takes_text() {
     let service = VersionedConfigService::new("font_px = 14\n".into()).unwrap();
     let mut state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-    let slider = state
-        .field_by_key(prefs::EDIT_FONT_PX)
-        .expect("the font size row");
+    let choice = state
+        .field_by_key(prefs::EDIT_WINDOW_THEME)
+        .expect("the window appearance row");
     assert!(
-        numeric_slider_value(slider).is_some() && !field_accepts_text_input(slider),
-        "PRECONDITION: the row is a slider, which takes no text"
+        !field_accepts_text_input(choice),
+        "PRECONDITION: a choice takes no text"
     );
     state.take_carried_field_drafts(vec![
         crate::restore::SettingsDraftRestore {
@@ -603,19 +608,34 @@ fn a_carried_draft_is_taken_only_by_a_row_that_takes_text() {
             key: prefs::EDIT_FONT_PX.to_string(),
             text: "17 px, maybe".to_string(),
         },
+        crate::restore::SettingsDraftRestore {
+            key: prefs::EDIT_WINDOW_THEME.to_string(),
+            text: "dark-ish".to_string(),
+        },
     ]);
     assert!(
-        !state.field_inputs.contains_key(prefs::EDIT_FONT_PX),
-        "the slider row takes no carried text: the host says it lost"
+        !state.field_inputs.contains_key(prefs::EDIT_WINDOW_THEME),
+        "a choice takes no carried text: the host says it lost"
     );
-    assert_eq!(
+    let draft = |key: &str| {
         state
             .field_inputs
-            .get(prefs::EDIT_FONT_FAMILY)
-            .map(crate::native_text_input::TextInputState::value),
+            .get(key)
+            .map(crate::native_text_input::TextInputState::value)
+            .map(str::to_string)
+    };
+    assert_eq!(
+        draft(prefs::EDIT_FONT_FAMILY).as_deref(),
         Some("Carried Mono"),
         "a text row takes its draft"
     );
+    assert_eq!(
+        draft(prefs::EDIT_FONT_PX).as_deref(),
+        Some("17 px, maybe"),
+        "a slider's exact field takes its draft"
+    );
+    let font_px = state.field_by_key(prefs::EDIT_FONT_PX).unwrap();
+    assert!(state.row_takes_text(font_px), "and shows it");
 }
 
 #[test]
@@ -1336,7 +1356,7 @@ fn serious_mode_style_candidate_previews_the_atomic_post_commit_state() {
 }
 
 #[test]
-fn top_settings_paints_direct_labels_but_keeps_complete_label_semantics() {
+fn top_settings_paints_bare_labels_while_unset_and_keeps_complete_label_semantics() {
     let (runtime, _instance, view) = setup();
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         unreachable!();
@@ -1348,7 +1368,7 @@ fn top_settings_paints_direct_labels_but_keeps_complete_label_semantics() {
         .find(|field| field.key == prefs::EDIT_THEME)
         .unwrap();
     let expected_visual = field.label.to_string();
-    let row = top_setting_row(state, prefs::EDIT_THEME, None, SettingsWidth::Wide, true)
+    let row = top_setting_row(state, prefs::EDIT_THEME, None, SettingsWidth::Wide)
         .unwrap()
         .row;
     let compiled = UiTree::new(row)
@@ -2631,33 +2651,6 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
             2,
             "{action}: settled, a new press asks"
         );
-    }
-}
-
-fn debugger_facts(
-    mode: aterm_containment::consent::DebuggerMode,
-    member: aterm_containment::consent::DebuggerMember,
-    hardening: aterm_containment::consent::SelfHardening,
-) -> crate::debugger_access::DebuggerFacts {
-    use aterm_containment::consent::{DebuggerMode, DebuggerProbe, DebuggerProbeLabel};
-    crate::debugger_access::DebuggerFacts {
-        enabled: true,
-        probe: DebuggerProbe {
-            mode,
-            member,
-            label: if mode == DebuggerMode::Unknown {
-                DebuggerProbeLabel::StatusUnrecognized
-            } else {
-                DebuggerProbeLabel::StatusOk
-            },
-        },
-        self_hardened: hardening,
-        in_flight: None,
-        busy: false,
-        recorded: None,
-        drift_since: None,
-        last_outcome: None,
-        refusal: None,
     }
 }
 
@@ -4199,22 +4192,6 @@ fn devtools_access(facts: DevToolsFacts, evidence: SpikeEvidence) -> MacosAccess
             DrClass::Identity,
             aterm_containment::FdaScope::Unknown,
         )
-    }
-}
-
-const DEVTOOLS_ANSWERED_AT_MS: i64 = 1_791_381_501_820;
-
-fn devtools_list(
-    listing: aterm_containment::consent::DevToolListing,
-    label: aterm_containment::consent::DevToolListLabel,
-    modified_at_s: Option<i64>,
-    rows: Option<u32>,
-) -> aterm_containment::consent::DevToolList {
-    aterm_containment::consent::DevToolList {
-        listing,
-        label,
-        modified_at_s,
-        rows,
     }
 }
 
@@ -7469,6 +7446,73 @@ fn escape_returns_the_cursor_style_preview_to_the_saved_style() {
     );
 }
 
+/// At 2x text and a 2x line height, the page floored the pinned preview at a flat 64pt: room
+/// for neither its band over a prompt row nor a tried style's two-line header ("Trying:
+/// Rainbow underline"), so the card painted its saved style's name and no row, and under the
+/// pointer only its Pause glyph. The floor holds the header's first line over a prompt row
+/// (a starved page lists the preview instead), so wherever the card is drawn it shows the
+/// style it is trying.
+#[test]
+fn a_drawn_cursor_preview_shows_its_style_at_a_large_text_size() {
+    at_each_text_scale(&[2.0], "tried style preview", |_| {
+        let mut drawn = 0;
+        for (width, height) in [
+            (178.0, 686.0),
+            (178.0, 760.0),
+            (178.0, 900.0),
+            (238.0, 686.0),
+        ] {
+            let mut cx = view_cx_at(width, height);
+            cx.semantic_font = Some(
+                crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                    &crate::widget::SemanticFontCandidate::default(),
+                ),
+            );
+            for tried in [None, Some("rainbow kitty underline"), Some("comet")] {
+                let (mut runtime, instance, view) =
+                    cursor_styles_runtime(&trail_drawn("line_height = 2\n"));
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.common.hovered =
+                        tried.map(|style| UiKey::new(cursor_style_row_key(style)));
+                }
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let context = format!("{width}x{height} trying {tried:?}");
+                let Some(paint) = compiled
+                    .paint
+                    .iter()
+                    .find(|paint| paint.key.as_str() == "settings/preview/cursor-styles")
+                else {
+                    continue;
+                };
+                let UiContent::SettingsPreview(spec) = &paint.content else {
+                    unreachable!()
+                };
+                let mut prims = Vec::new();
+                spec.paint(
+                    &mut prims,
+                    paint.rect,
+                    aterm_render::Theme::default(),
+                    crate::settings::Roles::from_theme(aterm_render::Theme::default()),
+                );
+                let rows = prims.iter().find_map(|prim| match prim {
+                    crate::widget::DrawPrim::TerminalSpecimen { spec, .. } => Some(spec.input.rows),
+                    _ => None,
+                });
+                assert!(
+                    rows.is_some_and(|rows| rows >= 1),
+                    "{context}: the card shows its prompt row ({:?}, {rows:?})",
+                    paint.rect
+                );
+                drawn += 1;
+            }
+        }
+        assert!(drawn > 0, "some window pins the preview");
+    });
+}
+
 #[test]
 fn cursor_styles_land_with_a_list_in_view_at_common_sizes() {
     for (width, height, landed) in [
@@ -8469,6 +8513,9 @@ fn tuning_a_style_does_not_read_says_so() {
     }
 }
 
+/// Music effects says Changed and offers Reset on Sound and on Top alike; its note
+/// ("Off silences every aterm sound but the bell") is Sound's, as Top's card says what
+/// its rows do.
 #[test]
 fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
     let painted_label = |compiled: &crate::native_ui::CompiledUi| {
@@ -8483,7 +8530,7 @@ fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
             })
             .expect("the Music effects label is painted")
     };
-    for (route, offers) in [(SettingsRoute::Sound, true), (SettingsRoute::Home, false)] {
+    for (route, noted) in [(SettingsRoute::Sound, true), (SettingsRoute::Home, false)] {
         let service = VersionedConfigService::new("trail_sounds = false\n".to_string()).unwrap();
         let (mut runtime, instance, view) = setup();
         {
@@ -8509,10 +8556,9 @@ fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
                 prefs::EDIT_TRAIL_SOUNDS
             )))
             .is_some();
-        assert_eq!(reset, offers, "{route:?}: Reset");
-        assert_eq!(
+        assert!(reset, "{route:?}: Reset");
+        assert!(
             painted_label(&compiled).contains("Changed"),
-            offers,
             "{route:?}: {}",
             painted_label(&compiled)
         );
@@ -8533,7 +8579,7 @@ fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
             .join(" ");
         assert_eq!(
             note.contains(prefs::TRAIL_SOUNDS_NOTE),
-            offers,
+            noted,
             "{route:?}: the row's note {note:?}"
         );
     }
@@ -10286,6 +10332,46 @@ fn software_update_links_to_its_messages() {
             "Software Update at {width}×{height} links to its messages"
         );
     }
+}
+
+/// A display face's name is the row's label, drawn in its own face from the face's id: a screen
+/// reader hears the name a sighted person reads ("Chunky"), never the id the painter draws it
+/// from ("chunky"), as AppKit reads a label's words from its value.
+#[test]
+fn a_display_face_row_speaks_its_name_not_its_face_id() {
+    let (mut runtime, instance, view) = setup();
+    let cx = view_cx_at(1_074.0, 684.0);
+    let key = UiKey::new("settings/display-face/label/chunky");
+    for page in 0..24 {
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::TextFonts);
+            state.scroll_page_to(page);
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        if compiled.semantic(&key).is_none() {
+            continue;
+        }
+        let projection = crate::native_accessibility::project_native_accessibility(&compiled, None)
+            .expect("the page projects");
+        let id = projection.id_for_key(&key).expect("the name is published");
+        let (_, node) = projection
+            .update()
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id)
+            .expect("its node");
+        assert_eq!(node.label(), Some("Chunky"));
+        assert_eq!(
+            node.value(),
+            Some("Chunky"),
+            "the words a screen reader reads"
+        );
+        return;
+    }
+    panic!("the Chunky face row never published its name");
 }
 
 #[test]
@@ -14683,6 +14769,9 @@ fn local_settings_eliders_keep_combining_zwj_and_flag_graphemes_atomic() {
 
 #[test]
 fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
+    // Two sizes above the platform's automatic one (14 px on macOS), so the
+    // step below lands on neither.
+    let seed = crate::FONT_PX + 2.0;
     let (mut runtime, instance, view) = setup();
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         panic!("Settings view");
@@ -14694,8 +14783,8 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
         .iter_mut()
         .find(|field| field.key == prefs::EDIT_FONT_PX)
         .expect("font size field");
-    field.seed = Some("14".to_string());
-    field.placeholder = "14 px".to_string();
+    field.seed = Some(seed.to_string());
+    field.placeholder = format!("{seed} px");
     state.common.last_focus = Some(UiKey::new(format!(
         "settings/control/{}",
         prefs::EDIT_FONT_PX
@@ -14711,7 +14800,7 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
     assert_eq!(
         compiled.semantic(&key).unwrap().value,
         SemanticValue::Number {
-            value: 14.0,
+            value: f64::from(seed),
             minimum: 6.0,
             maximum: 200.0,
         }
@@ -14731,7 +14820,7 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
         })
         .expect("numeric field paints as slider");
     assert_eq!(slider.spec.step, 1.0);
-    assert_eq!(slider.spec.display_value, "14 px");
+    assert_eq!(slider.spec.display_value, format!("{seed} px"));
     assert_eq!(slider.spec.track, Some((8.0, 36.0)));
     let rect = compiled
         .paint
@@ -14761,7 +14850,10 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
         edit.map(|edit| edit.key.as_str()),
         Some(prefs::EDIT_FONT_PX)
     );
-    assert_eq!(edit.and_then(|edit| edit.value.as_deref()), Some("15"));
+    assert_eq!(
+        edit.and_then(|edit| edit.value.clone()),
+        Some((seed + 1.0).to_string())
+    );
 
     let range = prefs::range_of(prefs::EDIT_FONT_PX).unwrap();
     assert_eq!(normalize_slider_value(13.49, range).as_deref(), Some("13"));
@@ -14775,6 +14867,48 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
             Some(text)
         );
     }
+}
+
+/// A STEP ONTO THE AUTOMATIC FONT SIZE PUTS THE SIZE BACK TO AUTOMATIC:
+/// from one pixel above the platform's size (13 px on macOS), Left sends a
+/// removal of `font_px`, not `font_px = 12`, because an explicit 12 draws
+/// exactly what Automatic does. Before, the step wrote the number and the
+/// row read "Font size · Changed" with a Reset that changed nothing.
+#[test]
+fn a_step_onto_the_automatic_font_size_removes_the_key() {
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(
+        &mut runtime,
+        view,
+        format!("font_px = {}\n", crate::FONT_PX + 1.0),
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        panic!("Settings view");
+    };
+    state.route = SettingsRoute::TextFonts;
+    state.common.last_focus = Some(UiKey::new(format!(
+        "settings/control/{}",
+        prefs::EDIT_FONT_PX
+    )));
+    let cx = view_cx_at(900.0, 820.0);
+    runtime.render(instance, view, &cx).unwrap();
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Left { extend: false }),
+        )
+        .unwrap();
+    let edit = outcome.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first(),
+        _ => None,
+    });
+    assert_eq!(
+        edit.map(|edit| (edit.key.as_str(), edit.value.as_deref())),
+        Some((prefs::EDIT_FONT_PX, None)),
+        "a step onto {} px is a removal",
+        crate::FONT_PX
+    );
 }
 
 #[test]
@@ -19832,6 +19966,62 @@ fn a_search_takes_loose_hits_only_where_nothing_starts_a_word() {
     assert_eq!(SearchQuery::of(&state, "top").reach, MatchReach::Words);
 }
 
+/// A loose search's reach is decided once a frame: the list, its count, the preview's focus and
+/// the host's font and animation passes all ask it of one query, and before, each asked scanned
+/// every row, page and aterm.toml key again (six scans a frame, about a millisecond each in a
+/// debug build).
+#[test]
+fn a_frame_decides_a_loose_searchs_reach_once() {
+    let cx = view_cx_at(1_200.0, 900.0);
+    for query in ["board", "zqzqzq"] {
+        let (runtime, instance, view, _) = compile_search(query, &cx);
+        let state = settings_state(&runtime, view);
+        let scans = || REACH_SCANS.with(Cell::get);
+        let before = scans();
+        let _ = state.preview_font_candidate(720, cx.motion, cx.terminal_font_px);
+        let _ = state.preview_animation(
+            720,
+            cx.motion,
+            cx.terminal_font_px,
+            cx.terminal_scale,
+            cx.viewport,
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            scans() - before <= 1,
+            "{query:?}: {} scans for one frame",
+            scans() - before
+        );
+        assert_eq!(SearchQuery::of(state, query).reach, MatchReach::Loose);
+    }
+}
+
+/// The once-a-frame reach is never stale: a key aterm.toml now sets, or a theme now installed,
+/// whose name starts with the query turns a loose search into a word search at once.
+#[test]
+fn a_searchs_reach_follows_what_it_reads() {
+    let mut state = SettingsViewState::new(&Config::default());
+    assert_eq!(SearchQuery::of(&state, "zqzq").reach, MatchReach::Loose);
+    state
+        .raw_values
+        .insert("zqzq_widget".to_string(), "1".to_string());
+    assert_eq!(
+        SearchQuery::of(&state, "zqzq").reach,
+        MatchReach::Words,
+        "an authored key starts with it"
+    );
+    state.raw_values.remove("zqzq_widget");
+    assert_eq!(SearchQuery::of(&state, "zqzq").reach, MatchReach::Loose);
+    let mut assets = (*state.assets).clone();
+    assets.themes = theme_catalog_with("reach", &[("zqzq-dusk.conf", MY_THEME)]);
+    state.assets = Arc::new(assets);
+    assert_eq!(
+        SearchQuery::of(&state, "zqzq").reach,
+        MatchReach::Words,
+        "an installed theme's name starts with it"
+    );
+}
+
 #[test]
 fn a_theme_filter_takes_loose_hits_only_where_no_row_starts_a_word() {
     let themes = crate::app_config::ThemeCatalog::default();
@@ -21151,10 +21341,12 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                         && key != prefs::EDIT_CURSOR_TRAIL_STYLE
                         && !row_name_scrolled_out(compiled, key)
                     {
+                        // A Top row's label says its name and provenance, as every
+                        // page's does.
                         let label_key = UiKey::new(format!("settings/label/{key}"));
                         assert!(
-                            compiled.semantic(&label_key).is_none(),
-                            "{context}: Top visual label duplicated semantics"
+                            compiled.semantic(&label_key).is_some(),
+                            "{context}: Top row label speaks"
                         );
                         assert!(
                             compiled.paint.iter().any(|node| node.key == label_key),
@@ -21794,7 +21986,9 @@ fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
         assert!(compiled.semantic(&UiKey::new(key)).is_some(), "{key}");
     }
 
-    let medium_cx = view_cx_at(900.0, roomy);
+    // Every Top row keeps Reset's place, so the two columns take 120pt more height than
+    // they would without it.
+    let medium_cx = view_cx_at(900.0, roomy + 120.0);
     let medium = runtime
         .render(instance, view, &medium_cx)
         .unwrap()

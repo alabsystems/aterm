@@ -326,8 +326,8 @@ fn tapes_under(path: &Path, out: &mut Vec<PathBuf>) {
 pub fn cmd_idle_points(args: &[String]) -> Res {
     let usage = || {
         Fail::usage(format!(
-            "usage: {LAB} idle-points scan <tape|dir>... --program claude|agy|muse|gemini|auto [--show N]\n\
-             \x20      {LAB} idle-points cast <cast>... --program claude|agy|muse|gemini [--show N]\n\
+            "usage: {LAB} idle-points scan <tape|dir>... --program claude|agy|muse|auto [--show N]\n\
+             \x20      {LAB} idle-points cast <cast>... --program claude|agy|muse [--show N]\n\
              \x20      {LAB} idle-points gate <lab logs dir>..."
         ))
     };

@@ -9,14 +9,16 @@ use super::*;
 use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::fault::{self, Fault};
 use crate::supervise::occupancy::templates;
+use crate::supervise::occupancy::wakes_seen::{AtomKind, Declarer, Prio, WakeState};
 use crate::supervise::occupancy::{
     FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, PaceRefusal, RuleId,
-    SaidReadyIdle, SlotsSeen,
+    SaidReadyIdle, SaidVerdict, SaidWake, SlotsSeen, WakeClaim, WakeDoor, WakeSeen, WakesSeen,
 };
 use crate::supervise::policy::turn_end::{HostTurn, RULE_LAND};
 
 const NUDGE: &str = "wait-nudge@v1";
 const ROOM: &str = "hold-room@v1";
+const WAKE: &str = "wake@v1";
 const PLANT: &str = "ignore.previous.instructions";
 
 /// The window's host as the door asks it: each answer the test sets, and every call the door
@@ -48,6 +50,12 @@ struct DoorHost {
     clear_note: Mutex<Option<NoteOutcome>>,
     /// The host's persistent task slot across loop instances: edits alone move its revision.
     record: Mutex<(Option<FactWord>, u64)>,
+    /// The session's book of wakes as the loop reads it ([`IdleHost::wakes`]).
+    wakes: Mutex<WakesSeen>,
+    /// How many times the loop read the book.
+    wake_reads: Mutex<usize>,
+    /// The book keeps a wake the loop told, as a window that took the tell not does.
+    keeps_told: AtomicBool,
 }
 
 impl DoorHost {
@@ -117,6 +125,26 @@ impl IdleHost for DoorHost {
     }
     fn occupancy_said(&self, said: &OccupancySaid) {
         self.said.lock().expect("said").push(said.clone());
+    }
+    fn wakes(&self) -> WakesSeen {
+        *self.wake_reads.lock().expect("wake_reads") += 1;
+        self.wakes.lock().expect("wakes").clone()
+    }
+    fn wake_claim(&self, ord: u16, _: u64, door: WakeDoor) -> WakeClaim {
+        self.called(format!("wake_claim #{ord} {}", door.word()));
+        WakeClaim::Gone
+    }
+    fn wake_told(&self, ord: u16, _: u64, door: WakeDoor) {
+        self.called(format!("wake_told #{ord} {}", door.word()));
+        if self.keeps_told.load(Ordering::SeqCst) {
+            return;
+        }
+        // As the window's book does: told, the wake leaves the live wakes a read names.
+        self.wakes
+            .lock()
+            .expect("wakes")
+            .wakes
+            .retain(|w| w.ord != ord);
     }
     fn task_fact(&self, word: Option<FactWord>) -> NoteOutcome {
         self.called(format!(
@@ -2247,7 +2275,7 @@ fn of_two_lines_raised_the_word_names_the_one_due_longest() {
         .said
         .iter()
         .find(|s| {
-            s.rules.iter().all(|r| {
+            s.rules.iter().filter(|r| r.rule != RuleId::Wake).all(|r| {
                 r.verdict == crate::supervise::occupancy::SaidVerdict::Held(Guard::Exchange)
             })
         })
@@ -3056,6 +3084,805 @@ fn a_managed_workers_line_before_its_first_fold_is_held_by_the_record_read_at_th
         "CONTROL: a session with no task record is typed its line: {:?}",
         unmanaged.writes()
     );
+}
+
+/// Wake `ord` of a job's (`pid:` exited), declared at [`T0`], in `state`, its need met.
+fn job_wake(ord: u16, state: WakeState) -> WakeSeen {
+    WakeSeen {
+        ord,
+        class: Declarer::Agent,
+        prio: Prio::Normal,
+        state,
+        declared_ms: T0,
+        ready_since_ms: (state != WakeState::Pending).then_some(T0 + MIN),
+        kinds: vec![AtomKind::Pid],
+        need: None,
+        need_slots: false,
+        need_met: true,
+        await_only: false,
+    }
+}
+
+fn book(wakes: &[WakeSeen]) -> WakesSeen {
+    WakesSeen {
+        wakes: wakes.to_vec(),
+    }
+}
+
+/// The run's `OCCUPANCY` changes of the rule named `rule`, in order.
+fn rule_said(ran: &Ran, rule: &str) -> Vec<String> {
+    wrote(&ran.noted)
+        .into_iter()
+        .filter(|(r, _)| r == rule)
+        .map(|(_, words)| words)
+        .collect()
+}
+
+/// A session's hold from [`T0`] with a book of one pending wake: its book's first read declares
+/// the hold, as a `WAITING:` line does, so no nudge is due at 31 minutes. NEGATIVE CONTROL: with
+/// the book empty the hold stays undeclared and the nudge is due at 31 minutes.
+#[test]
+fn a_pending_wake_declares_the_hold_and_no_nudge_is_due() {
+    let run = |wakes: WakesSeen| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = wakes;
+        Script {
+            host,
+            ..Script::new("write-wake-declares", Occupancy::Observe, &[0, 31 * 60])
+        }
+        .run(&mut nothing)
+    };
+    let pending = run(book(&[job_wake(1, WakeState::Pending)]));
+    assert!(
+        pending
+            .noted
+            .iter()
+            .any(|l| l.starts_with("OCCUPANCY ") && l.contains(" hold declared")),
+        "{:#?}",
+        pending.noted
+    );
+    assert_eq!(rule_said(&pending, NUDGE), Vec::<String>::new());
+    assert!(pending.rows.is_empty(), "{:?}", pending.rows);
+    let empty = run(WakesSeen::default());
+    assert!(
+        !empty.noted.iter().any(|l| l.contains(" hold declared")),
+        "{:#?}",
+        empty.noted
+    );
+    assert_eq!(
+        rule_said(&empty, NUDGE),
+        ["would"],
+        "CONTROL: no wake pending, the nudge is due at 31 minutes"
+    );
+}
+
+/// D6 at a break of the loop (§2.1): with the nudge and the room line due at one break, a
+/// recording with slice 2's doors ranks them, the nudge first and the room line `Outranked` (due,
+/// unbooked); a replay of a tape without them keeps slice 1's pick, the room line paced a
+/// session's pace on. Each is the other's control.
+#[test]
+fn the_break_ranks_on_slice_twos_doors_and_keeps_slice_ones_pick_without_them() {
+    use crate::supervise::occupancy::rules::{Guards, HoldSeen, SESSION_PACE_MS, Verdict};
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::TAPE_ID;
+    const SLICE2: [&str; 5] = [
+        "host.wakes",
+        "host.wake_claim",
+        "host.wake_release",
+        "host.wake_told",
+        "host.task_fact",
+    ];
+    let now_ms = 2 * 60 * MIN;
+    let hold = HoldSeen {
+        since_ms: 0,
+        declared: false,
+    };
+    let verdicts = |slice2: bool| {
+        let mut m = Mock::new(Vec::new());
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        if !slice2 {
+            let doors: Vec<String> = crate::supervise::run::host_door::HOST_DOORS
+                .iter()
+                .filter(|door| !SLICE2.contains(door))
+                .map(ToString::to_string)
+                .collect();
+            let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+            core.recorded_doors(doors);
+            s.set_fx(Fx::replay(core));
+        }
+        assert_eq!(s.fx.slice2_recorded(), slice2);
+        let (verdicts, wake) = s.break_verdicts(
+            &room_at(now_ms),
+            hold,
+            &Guards::clear(Autopilot::Cruise),
+            now_ms,
+        );
+        assert_eq!(wake, None);
+        verdicts.map(|(rule, verdict)| (rule, matches!(verdict, Verdict::Due(_)), verdict))
+    };
+    let ranked = verdicts(true);
+    assert!(ranked[RuleId::WaitNudge.index()].1, "{ranked:?}");
+    assert_eq!(ranked[RuleId::HoldRoom.index()].2, Verdict::Outranked);
+    let slice_one = verdicts(false);
+    assert!(slice_one[RuleId::WaitNudge.index()].1, "{slice_one:?}");
+    assert_eq!(
+        slice_one[RuleId::HoldRoom.index()].2,
+        Verdict::Paced {
+            next_ms: now_ms + SESSION_PACE_MS
+        },
+        "CONTROL: a slice-1 tape keeps its pick"
+    );
+}
+
+/// The nudge held off to two hours meets the room line at one break: under `observe` the nudge's
+/// would row goes and the room line is said `outranked`, its row not booked; at the next break it
+/// is still due, and the session's pace holds it.
+#[test]
+fn wait_nudge_outranks_hold_room_at_one_break() {
+    let host = Arc::new(DoorHost::default());
+    *host.board.lock().expect("board") = room_at(T0);
+    let ran = Script {
+        host,
+        ..Script::new(
+            "write-rank-nudge-room",
+            Occupancy::Observe,
+            &[0, 60 * 60, 120 * 60, 121 * 60],
+        )
+    }
+    .run(&mut |s, i| {
+        if i == 0 {
+            s.setup.occupancy_nudge_after = Duration::from_secs(2 * 3600);
+        }
+    });
+    assert_eq!(rule_said(&ran, NUDGE), ["would"]);
+    assert_eq!(
+        rule_said(&ran, ROOM),
+        ["outranked", &format!("paced next_s={}", 19 * 60)]
+    );
+    let would: Vec<String> = ran
+        .rows
+        .iter()
+        .filter(|(rule, _, _, _)| rule == crate::supervise::occupancy::rules::WOULD_RULE)
+        .map(|(_, _, _, reason)| reason.split(' ').next().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        would,
+        [format!("rule={NUDGE}")],
+        "the outranked line books no row"
+    );
+}
+
+/// The book's wake and the room line due at one break of a declared hold: the wake's line is
+/// picked and its would row booked (`wake@v1`, under its own episode), the room line said
+/// `outranked`, and the told word names the wake; at the next break the wake is booked and the
+/// room line, still due, waits the session's pace. Nothing is typed. (A nudge cannot be due beside
+/// a wake: the book's pending wake declares the hold.)
+#[test]
+fn a_wake_and_the_room_line_due_at_one_break_pick_the_wake() {
+    let host = Arc::new(DoorHost::default());
+    *host.board.lock().expect("board") = room_at(T0);
+    *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Pending)]);
+    let book_of = Arc::clone(&host);
+    let ran = Script {
+        host,
+        ..Script::new(
+            "write-rank-wake-room",
+            Occupancy::Observe,
+            &[0, 60 * 60, 120 * 60, 121 * 60],
+        )
+    }
+    .run(&mut |_, i| {
+        if i == 2 {
+            *book_of.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
+        }
+    });
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    assert_eq!(rule_said(&ran, WAKE), ["would"]);
+    assert_eq!(rule_said(&ran, NUDGE), Vec::<String>::new());
+    assert_eq!(
+        rule_said(&ran, ROOM),
+        ["outranked", &format!("paced next_s={}", 19 * 60)]
+    );
+    let episode = job_wake(1, WakeState::Ready).episode();
+    let would: Vec<String> = ran
+        .rows
+        .iter()
+        .filter(|(rule, _, _, _)| rule == crate::supervise::occupancy::rules::WOULD_RULE)
+        .map(|(_, _, _, reason)| reason.clone())
+        .collect();
+    assert_eq!(would.len(), 1, "{would:?}");
+    assert!(
+        would[0].starts_with(&format!("rule={WAKE} episode={episode:016x} ")),
+        "{would:?}"
+    );
+    let at_wake = ran
+        .said
+        .iter()
+        .find(|said| said.wake.is_some())
+        .expect("a told word names the wake");
+    assert_eq!(
+        at_wake.wake,
+        Some(SaidWake {
+            ord: 1,
+            since_ms: T0 + MIN
+        })
+    );
+    let verdict_of = |rule: RuleId| {
+        at_wake
+            .rules
+            .iter()
+            .find(|r| r.rule == rule)
+            .map(|r| r.verdict)
+    };
+    assert_eq!(verdict_of(RuleId::Wake), Some(SaidVerdict::Would));
+    assert_eq!(verdict_of(RuleId::HoldRoom), Some(SaidVerdict::Outranked));
+}
+
+/// THE OBSERVE HALF OF T-OBS2 (the slice-2 plan's §2): a ready wake under `observe` is a would row
+/// and nothing more: no write and no `status` read, no act asked of the host (no `wake_claim`,
+/// `task_fact`, `break_taken` or `occupancy_pace`), and nothing told but the word; under `off`
+/// the book is not read at all. NEGATIVE CONTROL: the same run under `observe` with an empty book
+/// books no wake row.
+#[test]
+fn t_obs2_a_ready_wake_under_observe_is_a_would_row_and_nothing_more() {
+    let run = |occupancy: Occupancy, wakes: WakesSeen| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = wakes;
+        let read = Arc::clone(&host);
+        let ran = Script {
+            host,
+            ..Script::new("write-t-obs2", occupancy, &[0, 5 * 60])
+        }
+        .run(&mut nothing);
+        (ran, *read.wake_reads.lock().expect("wake_reads"))
+    };
+    let ready = || book(&[job_wake(1, WakeState::Ready)]);
+    observe_types_nothing(&|occupancy| run(occupancy, ready()).0);
+    let (observed, reads) = run(Occupancy::Observe, ready());
+    assert!(reads > 0, "observe reads the book");
+    assert_eq!(rule_said(&observed, WAKE), ["would"]);
+    assert_eq!(
+        observed
+            .rows
+            .iter()
+            .map(|(rule, decision, command, _)| (
+                rule.as_str(),
+                decision.as_str(),
+                command.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            crate::supervise::occupancy::rules::WOULD_RULE,
+            "waiting",
+            ""
+        )]
+    );
+    assert!(
+        !observed.calls.iter().any(|c| c.starts_with("wake_claim")
+            || c.starts_with("wake_told")
+            || c.starts_with("inform")),
+        "{:?}",
+        observed.calls
+    );
+    assert!(
+        !observed.ledger.contains("fact-wake@v1"),
+        "{}",
+        observed.ledger
+    );
+    let (_, reads) = run(Occupancy::Off, ready());
+    assert_eq!(reads, 0, "off reads no book");
+    let (empty, _) = run(Occupancy::Observe, WakesSeen::default());
+    assert_eq!(
+        rule_said(&empty, WAKE),
+        Vec::<String>::new(),
+        "CONTROL: an empty book books no wake row"
+    );
+}
+
+/// An answer the agent's own `await wake` got at [`T0`] + 30 s is heard at the first live turn
+/// read after it (the plan's S2): the host is told `wake_told(#1, await)` once, and the episode's
+/// `fact-wake@v1` row says it told by the await; nothing is typed. A live read before the answer
+/// tells nothing. NEGATIVE CONTROL: with no live turn read after it, the answer stays unheard.
+#[test]
+fn an_answer_a_turn_ran_after_is_told_heard() {
+    let run = |turns: &[usize]| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") =
+            book(&[job_wake(1, WakeState::Answered { at_ms: T0 + 30_000 })]);
+        let turns = turns.to_vec();
+        Script {
+            host,
+            ..Script::new("write-wake-heard", Occupancy::Observe, &[0, 60, 120])
+        }
+        .run(&mut |s, i| {
+            if turns.contains(&i) {
+                s.took(7, Some(&policy(Occupancy::Observe)), &mut Heard::default());
+            }
+        })
+    };
+    let told = |ran: &Ran| -> Vec<String> {
+        ran.calls
+            .iter()
+            .filter(|c| c.starts_with("wake_told"))
+            .cloned()
+            .collect()
+    };
+    let heard = run(&[1, 2]);
+    assert_eq!(told(&heard), ["wake_told #1 await"]);
+    assert!(heard.writes().is_empty(), "{:?}", heard.writes());
+    let episode = job_wake(1, WakeState::Ready).episode();
+    let rows: Vec<(String, String)> = heard
+        .ledger
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| v.get("rule_id").and_then(aterm_json::Value::as_str) == Some("fact-wake@v1"))
+        .map(|v| {
+            let text = |k: &str| {
+                v.get(k)
+                    .and_then(aterm_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            (text("decision"), text("reason"))
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [(
+            "waiting".to_string(),
+            format!("rule={WAKE} episode={episode:016x} ord=1 told door=await")
+        )]
+    );
+    let early = run(&[1]);
+    assert_eq!(
+        told(&early),
+        Vec::<String>::new(),
+        "a live read before the answer hears nothing"
+    );
+    let unheard = run(&[]);
+    assert_eq!(
+        told(&unheard),
+        Vec::<String>::new(),
+        "CONTROL: no turn ran after the answer"
+    );
+}
+
+/// The run's tells of an answer heard, in order.
+fn wakes_told(ran: &Ran) -> Vec<String> {
+    ran.calls
+        .iter()
+        .filter(|c| c.starts_with("wake_told"))
+        .cloned()
+        .collect()
+}
+
+/// The run's `fact-wake@v1` rows' reasons, in order.
+fn wake_rows(ran: &Ran) -> Vec<String> {
+    ran.ledger
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| v.get("rule_id").and_then(aterm_json::Value::as_str) == Some("fact-wake@v1"))
+        .map(|v| {
+            v.get("reason")
+                .and_then(aterm_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
+/// An answer written mid-turn, after the live read that read the book last (its wake pending
+/// then), is heard at a later live read of the turn: the host is told `wake_told(#1, await)`
+/// once. NEGATIVE CONTROL: with no live read after the answer, it stays unheard.
+#[test]
+fn an_answer_written_mid_turn_is_heard_at_a_later_live_read() {
+    let run = |later_read: bool| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Pending)]);
+        let book_of = Arc::clone(&host);
+        Script {
+            host,
+            drawn: &|i| if i == 0 { break_screen() } else { live_turn() },
+            ..Script::new(
+                "write-heard-mid-turn",
+                Occupancy::Observe,
+                &[0, 60, 120, 180],
+            )
+        }
+        .run(&mut |s, i| {
+            let cfg = policy(Occupancy::Observe);
+            if i == 1 {
+                s.took(7, Some(&cfg), &mut Heard::default());
+                *book_of.wakes.lock().expect("wakes") =
+                    book(&[job_wake(1, WakeState::Answered { at_ms: T0 + 70_000 })]);
+            }
+            if i == 3 && later_read {
+                s.took(8, Some(&cfg), &mut Heard::default());
+            }
+        })
+    };
+    let heard = run(true);
+    assert_eq!(wakes_told(&heard), ["wake_told #1 await"]);
+    assert!(heard.writes().is_empty(), "{:?}", heard.writes());
+    assert_eq!(
+        wakes_told(&run(false)),
+        Vec::<String>::new(),
+        "CONTROL: no live read after the answer"
+    );
+}
+
+/// An answer a live read ran after, the book's pace holding that read's look at the book, is
+/// heard at the turn's decided point: the live read 20 s after the book's last read reads
+/// nothing, the point reads the book and tells the answer heard, and a second point reads
+/// nothing more. NEGATIVE CONTROL: with no point after it, the answer stays unheard.
+#[test]
+fn an_answer_a_paced_live_read_ran_after_is_heard_at_the_turns_point() {
+    let run = |point: bool| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Pending)]);
+        let book_of = Arc::clone(&host);
+        let mut reads = Vec::new();
+        let ran = Script {
+            host,
+            drawn: &|i| if i == 0 { break_screen() } else { live_turn() },
+            ..Script::new("write-heard-point", Occupancy::Observe, &[0, 20, 40, 60])
+        }
+        .run(&mut |s, i| {
+            let cfg = policy(Occupancy::Observe);
+            match i {
+                1 => {
+                    s.took(7, Some(&cfg), &mut Heard::default());
+                    *book_of.wakes.lock().expect("wakes") =
+                        book(&[job_wake(1, WakeState::Answered { at_ms: T0 + 10_000 })]);
+                }
+                2 => s.took(8, Some(&cfg), &mut Heard::default()),
+                3 if point => {
+                    let screen = screen_at(9, break_screen());
+                    s.hold_point(&screen, false, Some(&cfg), &mut Heard::default());
+                    s.hold_point(&screen, false, Some(&cfg), &mut Heard::default());
+                }
+                _ => {}
+            }
+            reads.push(*book_of.wake_reads.lock().expect("wake_reads"));
+        });
+        (ran, reads)
+    };
+    let (heard, reads) = run(true);
+    assert_eq!(wakes_told(&heard), ["wake_told #1 await"]);
+    assert_eq!(
+        reads,
+        [0, 2, 2, 3],
+        "the hold's read, the live read's, none at the paced live read, one at the points"
+    );
+    let (unheard, reads) = run(false);
+    assert_eq!(
+        wakes_told(&unheard),
+        Vec::<String>::new(),
+        "CONTROL: no point"
+    );
+    assert_eq!(reads, [0, 2, 2, 2]);
+}
+
+/// A live read hears an answer by its own screen read's wall (`Session::read_wall`), never by the
+/// mark a later call left: an answer written between the screen read and a later call is heard
+/// only at the live read after it. NEGATIVE CONTROL: that later live read hears it.
+#[test]
+fn a_live_read_hears_by_its_screen_reads_wall() {
+    let host = Arc::new(DoorHost::default());
+    *host.wakes.lock().expect("wakes") =
+        book(&[job_wake(1, WakeState::Answered { at_ms: T0 + 90_000 })]);
+    let calls_of = Arc::clone(&host);
+    let mut told_by = Vec::new();
+    let ran = Script {
+        host,
+        ..Script::new(
+            "write-heard-read-wall",
+            Occupancy::Observe,
+            &[0, 60, 120, 180],
+        )
+    }
+    .run(&mut |s, i| {
+        let cfg = policy(Occupancy::Observe);
+        if i == 2 {
+            s.clock_marks = Some((s.fx.mono(), T0 + 100_000));
+        }
+        if i >= 2 {
+            s.took(7, Some(&cfg), &mut Heard::default());
+            told_by.push(calls_of.calls().iter().any(|c| c.starts_with("wake_told")));
+        }
+    });
+    assert_eq!(
+        told_by,
+        [false, true],
+        "unheard by the screen read at T0+60 s, though a later call marked T0+100 s; heard by \
+         the one at T0+120 s"
+    );
+    assert_eq!(wakes_told(&ran), ["wake_told #1 await"]);
+}
+
+/// The break's decider judges the book as the loop last read it, at a live read or a point as at
+/// a hold's: an answer heard at a live read of the harness's own turn (the hold stays open), the
+/// book read again at the turn's point and the told answer forgotten there, is not reopened by
+/// the hold's next break, past the unheard gap. NEGATIVE CONTROL: with no live read the answer
+/// stays unheard, and that break opens it.
+#[test]
+fn an_answer_heard_between_breaks_is_not_reopened_by_the_hold() {
+    let run = |live: bool| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(
+            1,
+            WakeState::Answered {
+                at_ms: T0 - 270_000,
+            },
+        )]);
+        Script {
+            host,
+            ..Script::new("write-heard-reopen", Occupancy::Observe, &[0, 10, 20, 40])
+        }
+        .run(&mut |s, i| {
+            let cfg = policy(Occupancy::Observe);
+            if live && (i == 1 || i == 2) {
+                s.turn_end.fact_typed();
+                s.took(7, Some(&cfg), &mut Heard::default());
+            }
+            if live && i == 2 {
+                let screen = screen_at(9, break_screen());
+                s.hold_point(&screen, false, Some(&cfg), &mut Heard::default());
+            }
+        })
+    };
+    let heard = run(true);
+    assert_eq!(wakes_told(&heard), ["wake_told #1 await"]);
+    assert_eq!(rule_said(&heard, WAKE), Vec::<String>::new());
+    assert_eq!(
+        rule_said(&run(false), WAKE),
+        ["would"],
+        "CONTROL: unheard past the gap, the break opens it"
+    );
+}
+
+/// A told wake the book no longer names is forgotten at the book's next read (told, taken or
+/// expired, a wake never opens again), so the loop's told wakes stay the book's. NEGATIVE
+/// CONTROL: `WakeToldKept` keeps it.
+#[test]
+fn a_told_wake_the_book_no_longer_names_is_forgotten() {
+    use crate::supervise::facts::{EpisodeKey, FactKind};
+    let key = EpisodeKey {
+        kind: FactKind::Wake,
+        id: job_wake(1, WakeState::Ready).episode(),
+    };
+    let run = || {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") =
+            book(&[job_wake(1, WakeState::Answered { at_ms: T0 + 30_000 })]);
+        let mut told = Vec::new();
+        Script {
+            host,
+            ..Script::new(
+                "write-heard-forgotten",
+                Occupancy::Observe,
+                &[0, 60, 120, 180],
+            )
+        }
+        .run(&mut |s, i| {
+            if i == 1 || i == 2 {
+                s.took(7, Some(&policy(Occupancy::Observe)), &mut Heard::default());
+            }
+            told.push(s.facts.state.is_told(key));
+        });
+        told
+    };
+    assert_eq!(
+        run(),
+        [false, false, true, false],
+        "told at the live read at T0+60 s, forgotten at the hold's read after it"
+    );
+    assert_eq!(
+        fault::with(Fault::WakeToldKept, run),
+        [false, false, true, true],
+        "CONTROL"
+    );
+}
+
+/// An answer the window keeps `Answered` past the loop's tell (it took the tell not) is told
+/// again at each read of the book, and its episode's `fact-wake@v1` row is booked once. The
+/// tells again are the control: each later read found the answer still to be heard.
+#[test]
+fn an_answer_told_again_is_booked_once() {
+    let host = Arc::new(DoorHost::default());
+    host.keeps_told.store(true, Ordering::SeqCst);
+    *host.wakes.lock().expect("wakes") =
+        book(&[job_wake(1, WakeState::Answered { at_ms: T0 + 30_000 })]);
+    let ran = Script {
+        host,
+        ..Script::new("write-heard-once", Occupancy::Observe, &[0, 60, 120, 180])
+    }
+    .run(&mut |s, i| {
+        if i > 0 {
+            s.took(7, Some(&policy(Occupancy::Observe)), &mut Heard::default());
+        }
+    });
+    assert!(wakes_told(&ran).len() >= 2, "{:?}", ran.calls);
+    let episode = job_wake(1, WakeState::Ready).episode();
+    assert_eq!(
+        wake_rows(&ran),
+        [format!(
+            "rule={WAKE} episode={episode:016x} ord=1 told door=await"
+        )]
+    );
+}
+
+/// THE BOOK'S READS ARE PACED: at the hold's breaks once an [`ASK_EVERY_MS`] (breaks every 20 s
+/// for two minutes read it three times, as breaks a minute apart do, the control), and at the
+/// live reads of a session the loop hosts once an [`ASK_EVERY_MS`] of live walls (live reads
+/// every 20 s for three minutes, three reads after the hold's). A session the loop has not read
+/// the book of is not hosted, and its live reads read nothing (the window tells its answers at
+/// their write).
+#[test]
+fn the_books_reads_are_paced_at_breaks_and_live_reads() {
+    let reads = |at_s: &[i64], live: bool, first_break: bool| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Pending)]);
+        let read = Arc::clone(&host);
+        let drawn = |i: usize| {
+            if live && (i > 0 || !first_break) {
+                live_turn()
+            } else {
+                break_screen()
+            }
+        };
+        Script {
+            host,
+            drawn: &drawn,
+            ..Script::new("write-book-paced", Occupancy::Observe, at_s)
+        }
+        .run(&mut |s, i| {
+            if live && i > 0 {
+                s.took(7, Some(&policy(Occupancy::Observe)), &mut Heard::default());
+            }
+        });
+        *read.wake_reads.lock().expect("wake_reads")
+    };
+    let every_20s: Vec<i64> = (0..=6).map(|n| n * 20).collect();
+    assert_eq!(
+        reads(&[0, 60, 120], false, true),
+        3,
+        "CONTROL: a read a minute"
+    );
+    assert_eq!(reads(&every_20s, false, true), 3);
+    let live_20s: Vec<i64> = (0..=9).map(|n| n * 20).collect();
+    assert_eq!(
+        reads(&live_20s, true, true),
+        4,
+        "the hold's, then the live reads' at T0, T0+60 s and T0+120 s"
+    );
+    assert_eq!(reads(&live_20s, true, false), 0, "no hold read: not hosted");
+}
+
+/// THE PROMPT HALF OF T-OBS2 AS 2.7 LEAVES IT: under `prompt` a ready wake's line is a would row
+/// and nothing more (its write is the slice-2 plan's 2.8): nothing typed, no `status` read, and
+/// no pace, break or claim asked of the host. NEGATIVE CONTROL: `WakeTypedEarly` types it.
+#[test]
+fn under_prompt_a_due_wake_is_booked_and_typed_nowhere_yet() {
+    let run = || {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
+        Script {
+            host,
+            ..Script::new("write-wake-prompt", Occupancy::Prompt, &[0, 5 * 60, 6 * 60])
+        }
+        .run(&mut |s, i| {
+            if i == 2 {
+                s.took(7, Some(&policy(Occupancy::Prompt)), &mut Heard::default());
+            }
+        })
+    };
+    let ran = run();
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    assert!(
+        !ran.requests().iter().any(|r| r == "status"),
+        "{:?}",
+        ran.requests()
+    );
+    assert!(
+        !ran.calls.iter().any(|c| c.starts_with("occupancy_pace")
+            || c == "break_taken"
+            || c.starts_with("wake_claim")),
+        "{:?}",
+        ran.calls
+    );
+    assert_eq!(rule_said(&ran, WAKE), ["would"]);
+    let early = fault::with(Fault::WakeTypedEarly, run);
+    assert!(
+        early.writes().iter().any(|w| w.contains("wake #1")),
+        "CONTROL: {:?}",
+        early.writes()
+    );
+}
+
+/// A managed worker's ready wake under `prompt` is held by the manager and noted nowhere yet (a
+/// managed wake's note comes with its write, the slice-2 plan's 2.8): no task-record fact, and
+/// nothing typed. NEGATIVE CONTROL: `WakeNotedEarly` notes it.
+#[test]
+fn a_managed_workers_due_wake_is_noted_nowhere_yet() {
+    let run = || {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
+        Script {
+            host,
+            ..Script::new(
+                "write-wake-managed",
+                Occupancy::Prompt,
+                &[0, 5 * 60, 6 * 60],
+            )
+        }
+        .run(&mut |s, _| s.turn_end.set_managed(true))
+    };
+    let ran = run();
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    assert_eq!(task_facts(&ran), Vec::<String>::new());
+    assert_eq!(rule_said(&ran, WAKE), ["held:managed"]);
+    let early = fault::with(Fault::WakeNotedEarly, run);
+    assert!(
+        task_facts(&early).iter().any(|f| f.contains("wake@v1")),
+        "CONTROL: {:?}",
+        early.calls
+    );
+}
+
+/// A wake's line feeds no K clock of the loop's (the window's wake K clock is its own): a
+/// managed worker's ready wake held K looks and more raises no ready-idle line in the told word.
+/// NEGATIVE CONTROL: `WakeFeedsK` raises it, naming the wake.
+#[test]
+fn a_held_wake_feeds_no_k_clock_of_the_loops() {
+    let run = || {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
+        Script {
+            host,
+            ..Script::new("write-wake-k", Occupancy::Observe, &minutely(1, 13))
+        }
+        .run(&mut |s, _| s.turn_end.set_managed(true))
+    };
+    let ran = run();
+    assert_eq!(rule_said(&ran, WAKE), ["held:managed"]);
+    assert!(first_ready_idle(&ran).is_none(), "{:#?}", ready_idles(&ran));
+    let fed = fault::with(Fault::WakeFeedsK, run);
+    assert_eq!(
+        first_ready_idle(&fed)
+            .and_then(|s| s.ready_idle)
+            .map(|r| r.rule),
+        Some(RuleId::Wake),
+        "CONTROL: {:#?}",
+        ready_idles(&fed)
+    );
+}
+
+/// A successor seeded from its predecessor's ledger books no second would row for the wake the
+/// predecessor's row booked (its episode carried as booked). NEGATIVE CONTROL: unseeded, the
+/// successor books it.
+#[test]
+fn a_successor_books_no_second_would_row_for_a_carried_wake() {
+    let loop_of = |tag: &'static str, seed: Option<(String, i64)>| {
+        let host = Arc::new(DoorHost::default());
+        *host.wakes.lock().expect("wakes") = book(&[job_wake(1, WakeState::Ready)]);
+        Script {
+            host,
+            seed,
+            ..Script::new(tag, Occupancy::Observe, &[0, 60]).virtualized()
+        }
+        .run(&mut nothing)
+    };
+    let first = loop_of("write-wake-carry-first", None);
+    assert_eq!(rule_said(&first, WAKE), ["would"]);
+    let carried = loop_of(
+        "write-wake-carry-successor",
+        Some((first.ledger.clone(), T0 + 2 * MIN)),
+    );
+    assert_eq!(rule_said(&carried, WAKE), Vec::<String>::new());
+    let unseeded = loop_of("write-wake-carry-unseeded", None);
+    assert_eq!(rule_said(&unseeded, WAKE), ["would"], "CONTROL");
 }
 
 #[path = "facts_loop_tests.rs"]

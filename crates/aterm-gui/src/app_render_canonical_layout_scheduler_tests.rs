@@ -1006,3 +1006,149 @@ fn modal_transform_tracks_visible_route_across_mixed_focus_and_zoom() {
     );
     assert_ne!(native_view, terminal_view);
 }
+
+#[test]
+fn a_native_front_clears_the_single_pane_pill_latch() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let route = app.active_visible_content_route(wid).unwrap();
+    assert!(
+        matches!(route, crate::VisibleContentRoute::Native { .. }),
+        "precondition: the front is a native view"
+    );
+    app.windows.get_mut(&wid).unwrap().pill_shown = true;
+    let _ = app.prepare_layout_coordinate_space(wid, route);
+    assert!(
+        !app.windows[&wid].pill_shown,
+        "a native front draws no scroll pill, so nothing would lower its latch"
+    );
+}
+
+/// A zoomed mixed tab (a terminal leaf zoomed over a native sibling, as Cmd-Shift-Enter or a
+/// restored zoom leaves it) shows its one terminal leaf through the composed terminal route. That
+/// tab has no terminal pane tree, so the frame is laid out from the plan and draws the leaf, beside
+/// another terminal tab (whose tree it once borrowed and refused) and alone in its window (where
+/// it once indexed past the trees and panicked).
+#[test]
+fn a_zoomed_mixed_tab_draws_its_terminal_leaf() {
+    for alone in [false, true] {
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        if alone {
+            let bootstrap = app.windows[&wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .position(|tab| tab.root.len() == 1)
+                .expect("PRECONDITION: the bootstrap terminal tab");
+            assert!(
+                app.apply_tab_cmd(crate::TabAction::Close(Some(bootstrap)))
+                    .is_ok(),
+                "the bootstrap tab closes"
+            );
+            assert!(
+                app.windows[&wid].layouts.is_empty(),
+                "PRECONDITION: no terminal tab is left"
+            );
+        }
+        {
+            let ws = app.windows.get_mut(&wid).expect("the window");
+            ws.focused = true;
+            assert!(
+                ws.tab_set.active_mut().is_some_and(|tab| tab.toggle_zoom()),
+                "PRECONDITION: the mixed tab zooms its terminal leaf"
+            );
+        }
+        app.resize_panes(wid);
+        assert_eq!(
+            app.active_visible_content_route(wid),
+            Some(crate::VisibleContentRoute::Terminal { composed: true }),
+            "PRECONDITION: the zoomed leaf takes the composed terminal route (alone={alone})"
+        );
+        assert!(
+            app.active_tree(wid).is_none(),
+            "PRECONDITION: the mixed tab has no terminal pane tree"
+        );
+        let term = app
+            .pool
+            .get(session)
+            .expect("the stub session")
+            .term
+            .clone();
+        crate::term_lock(&term).process(b"zoomed-leaf-text");
+        let before = crate::scripted_redraw_fixture::surface(&mut app).commits();
+        app.redraw_window(wid);
+        assert!(
+            crate::scripted_redraw_fixture::surface(&mut app).commits() > before,
+            "the zoomed leaf's frame presents (alone={alone})"
+        );
+        let rows: Vec<String> = app.windows[&wid]
+            .input_scratch
+            .cells
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect())
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("zoomed-leaf-text")),
+            "and shows the leaf's text (alone={alone}): {rows:?}"
+        );
+    }
+}
+
+/// A mixed tab draws no scroll pill (nor a split's pane bars), so once a mixed frame was drawn a
+/// wheel's pill clock neither dirties the window nor owns a deadline through its fade; under a
+/// terminal frame it does both.
+#[test]
+fn a_mixed_frame_s_scroll_pill_owes_no_wakes() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    let route = app
+        .active_visible_content_route(wid)
+        .expect("a visible route");
+    assert_eq!(
+        route,
+        crate::VisibleContentRoute::Heterogeneous,
+        "PRECONDITION: a mixed tab"
+    );
+    let _ = app.prepare_layout_coordinate_space(wid, route);
+    let t0 = Instant::now();
+    let interval = Duration::from_millis(16);
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.focused = true;
+    assert!(
+        ws.front_terminal().is_some(),
+        "PRECONDITION: the terminal leaf has focus"
+    );
+    ws.scroll_pill.touch(t0);
+    for at in [
+        t0 + Duration::from_millis(100),
+        t0 + Duration::from_millis(950),
+    ] {
+        assert_eq!(
+            ws.scroll_pill_wake(at, true, interval),
+            (false, None),
+            "the mixed frame's pill owes nothing at {:?}",
+            at - t0
+        );
+        ws.last_layout_coordinate_space
+            .as_mut()
+            .expect("PRECONDITION: the mixed frame's coordinate space")
+            .route = crate::VisibleContentRoute::Terminal { composed: false };
+        let (dirty, deadline) = ws.scroll_pill_wake(at, true, interval);
+        assert!(
+            dirty && deadline.is_some(),
+            "control: under a terminal frame the pill dirties and owns a deadline at {:?}",
+            at - t0
+        );
+        ws.last_layout_coordinate_space
+            .as_mut()
+            .expect("the coordinate space")
+            .route = crate::VisibleContentRoute::Heterogeneous;
+    }
+}

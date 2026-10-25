@@ -213,6 +213,23 @@ pub fn ordered(file: &File) -> io::Result<()> {
     primitive::barrier(file)
 }
 
+/// [`ordered`], or a plain `fsync(2)` where the volume refuses its full flush too (a network
+/// home whose server takes no `F_FULLFSYNC`), as SQLite does there. That `fsync` sends the bytes
+/// to the volume but orders nothing beyond what it promises, so this finishes a write whose loss
+/// costs a repeat (a page marker), never one a Strict acknowledgement rests on.
+/// # Errors
+/// The flush's own error: [`ordered`]'s when it failed rather than was refused, else `fsync`'s.
+pub fn ordered_or_fsync(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        primitive::refused_or(ordered(file), || primitive::fsync(file))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        ordered(file)
+    }
+}
+
 /// [`durable`] for the directory `dir`.
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
@@ -296,12 +313,32 @@ pub mod primitive {
         }
     }
 
+    /// `flushed`, answered by `fallback` only when the volume refused the flush.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn refused_or(
+        flushed: io::Result<()>,
+        fallback: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        match flushed {
+            Err(refused) if astream_sys::barrier_refused(&refused) => fallback(),
+            other => other,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    thread_local! {
+        /// The plain `fsync(2)`s [`fsync`] issued on this test thread.
+        pub(crate) static FSYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
     /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`.
     /// # Errors
     /// The flush's own error.
     #[cfg(unix)]
     pub fn fsync(file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
+        #[cfg(test)]
+        FSYNCS.with(|fsyncs| fsyncs.set(fsyncs.get() + 1));
         // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer; for a
         // descriptor that is not open it fails with `EBADF`.
         unsafe extern "C" {
@@ -618,6 +655,77 @@ mod tests {
             full,
             "a refused barrier answers with the real full flush's own result"
         );
+    }
+
+    /// [`ordered_or_fsync`] falls back only on a refusal: a failed flush is returned untouched,
+    /// and a flush that succeeded owes nothing more.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn only_a_refused_flush_is_answered_by_the_fallback() {
+        for errno in [19, 22, 25, 45] {
+            let mut fallbacks = 0;
+            let answer =
+                primitive::refused_or(Err(std::io::Error::from_raw_os_error(errno)), || {
+                    fallbacks += 1;
+                    Err(std::io::Error::from_raw_os_error(5))
+                });
+            assert_eq!(
+                (answer.map_err(|e| e.raw_os_error()), fallbacks),
+                (Err(Some(5)), 1),
+                "errno {errno}: the fallback's own answer"
+            );
+        }
+        for errno in [5, 28, 9, 1] {
+            let mut fallbacks = 0;
+            let answer =
+                primitive::refused_or(Err(std::io::Error::from_raw_os_error(errno)), || {
+                    fallbacks += 1;
+                    Ok(())
+                });
+            assert_eq!(
+                (answer.map_err(|e| e.raw_os_error()), fallbacks),
+                (Err(Some(errno)), 0),
+                "errno {errno} is a failed flush"
+            );
+        }
+        let mut fallbacks = 0;
+        primitive::refused_or(Ok(()), || {
+            fallbacks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fallbacks, 0);
+    }
+
+    /// The shipped [`super::ordered_or_fsync`] on a descriptor that refuses both of [`ordered`]'s
+    /// flushes issues one plain `fsync(2)` and no other flush of this crate (a [`durable`] would
+    /// be a full flush outside a test binary), and one that takes the barrier issues none.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_shipped_fallback_takes_fsync_where_both_flushes_are_refused() {
+        let fsyncs = || primitive::FSYNCS.with(std::cell::Cell::get);
+        let null = std::fs::File::open("/dev/null").expect("/dev/null opens");
+        let refused = ordered(&null);
+        assert!(
+            refused.as_ref().is_err_and(astream_sys::barrier_refused),
+            "devfs no longer refuses both flushes on /dev/null ({refused:?}): this test needs \
+             another descriptor that does"
+        );
+        let before = fsyncs();
+        let recording = seam::Recording::start();
+        super::ordered_or_fsync(&null).expect("the refused flushes answered by fsync");
+        assert_eq!(fsyncs(), before + 1, "one fsync(2) answered the refusals");
+        assert_eq!(
+            recording.take(),
+            [Flush::Ordered],
+            "the fallback is a plain fsync(2)"
+        );
+        drop(recording);
+        let dir = scratch();
+        let file = std::fs::File::create(dir.path().join("f")).unwrap();
+        let before = fsyncs();
+        super::ordered_or_fsync(&file).expect("this volume takes an ordered flush");
+        assert_eq!(fsyncs(), before, "a flush that succeeded owes no fsync(2)");
     }
 
     #[test]

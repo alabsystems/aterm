@@ -1292,7 +1292,9 @@ fn the_restart_predicate_asks_the_relaunch_line_at_worst() {
             for len in 0..=bound {
                 let mut snap = rig.snap(Some(C1));
                 snap.dialect = Some(dialect);
-                snap.cwd = format!("/w/{}", "d".repeat(len));
+                // A directory beside the shell's (`/w`), never `/w/` itself: one directory under
+                // two spellings needs no cd.
+                snap.cwd = format!("/x/{}", "d".repeat(len));
                 let ask = carries_restart_onto(&snap, &rig.opts.home, Some(rig.twin.clone()));
                 n += usize::from(ask);
                 let st = St {
@@ -1753,7 +1755,7 @@ fn each_image_goes_to_its_own_lanes_reader() {
         ("/usr/local/bin/codex", SnapshotLane::None),
         ("/Users//u/.local/bin/claude", SnapshotLane::Claude),
     ] {
-        assert_eq!(snapshot_lane(Some(Path::new(image)), &[]), lane, "{image}");
+        assert_eq!(snapshot_lane(Some(Path::new(image))), lane, "{image}");
     }
 }
 

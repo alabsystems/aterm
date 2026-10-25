@@ -43,11 +43,6 @@ pub const fn lanes(program: Program) -> Lanes {
             upgrade: true,
             restart_in_place: false,
         },
-        Program::Gemini => Lanes {
-            relaunch: true,
-            upgrade: false,
-            restart_in_place: false,
-        },
         Program::Grok | Program::Kimi | Program::Generic => Lanes::NONE,
     }
 }
@@ -57,12 +52,7 @@ pub const fn lanes(program: Program) -> Lanes {
 pub const fn sweep_carries_relaunch(program: Program) -> bool {
     match program {
         Program::Claude | Program::Codex => true,
-        Program::Muse
-        | Program::Agy
-        | Program::Gemini
-        | Program::Grok
-        | Program::Kimi
-        | Program::Generic => false,
+        Program::Muse | Program::Agy | Program::Grok | Program::Kimi | Program::Generic => false,
     }
 }
 
@@ -73,10 +63,10 @@ mod tests {
 
     const NONE: Lanes = Lanes::NONE;
 
-    /// Gemini CLI is relaunched on exit (and restored), never upgraded live
-    /// nor restarted in place: it has no atpkg row to land a build.
+    /// Muse Code and agy are relaunched on exit and upgraded live, never
+    /// restarted in place; their hosts carry the relaunch.
     #[test]
-    fn muse_code_agy_and_gemini_cli_are_relaunched_on_exit_and_only_muse_and_agy_upgraded() {
+    fn muse_code_and_agy_are_relaunched_on_exit_and_upgraded() {
         for p in [Program::Muse, Program::Agy] {
             assert_eq!(
                 lanes(p),
@@ -90,19 +80,6 @@ mod tests {
             assert_ne!(lanes(p), lanes(Program::Claude), "{p:?}");
             assert!(!sweep_carries_relaunch(p), "{p:?}: its host carries it");
         }
-        let p = Program::Gemini;
-        assert!(p.supervisable(), "{p:?}");
-        assert_eq!(
-            lanes(p),
-            Lanes {
-                relaunch: true,
-                upgrade: false,
-                restart_in_place: false,
-            },
-            "{p:?}"
-        );
-        assert_ne!(lanes(p), lanes(Program::Claude), "{p:?}");
-        assert!(!sweep_carries_relaunch(p), "{p:?}: its host carries it");
         assert!(sweep_carries_relaunch(Program::Codex));
     }
 

@@ -1688,7 +1688,7 @@ fn a_theme_demo_tick_repaints_only_its_grid() {
         .expect("the demo is drawn");
     let grid = spec.tick_rect(node);
     assert!(
-        grid.y >= node.y + crate::settings_preview::DEMO_STRIP_HEIGHT
+        grid.y >= node.y + crate::settings_preview::demo_strip_height()
             && grid.x > node.x
             && grid.right() < node.right()
             && grid.bottom() < node.bottom(),

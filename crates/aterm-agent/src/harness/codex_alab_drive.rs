@@ -225,7 +225,9 @@ pub(super) fn self_claimed_plan(
     };
     let heal = atpkg::hooks::hook_file(&opts.home, dialect.hook_ext()).map(|(p, _)| p);
     let want = st.cwd.clone();
-    let cd = (!want.is_empty() && k.cwd(shell).as_deref() != Some(want.as_str())).then_some(want);
+    let cd = (!want.is_empty()
+        && !super::super::relaunch::same_dir(k.cwd(shell).as_deref(), &want))
+    .then_some(want);
     let home = st.codex_home_env.as_deref().or_else(|| {
         // Older self-claimed records stored only a nonempty home string.
         (!st.resume_home.is_empty()).then_some(st.resume_home.as_str())
@@ -251,6 +253,7 @@ pub(super) fn self_claimed_plan(
         shell,
         dialect,
         line,
+        tap_dropped: None,
     })
 }
 

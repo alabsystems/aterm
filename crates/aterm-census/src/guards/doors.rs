@@ -439,8 +439,16 @@ const FENCES: &[Fence] = &[
         gate: None,
         callers: &[
             (KEY_EVENTS, "on_key_native_mode"),
-            (NATIVE_EVENTS, "dispatch_native_event"),
             (NATIVE_EVENTS, "native_input_event"),
+        ],
+    },
+    Fence {
+        name: "interact_system_state_view",
+        home: HOST,
+        gate: None,
+        callers: &[
+            (HOST, "interact_system_state"),
+            (NATIVE_EVENTS, "dispatch_native_target_event"),
             (MOUSE_EVENTS, "mouse_input_then_fold"),
             (MOUSE_EVENTS, "on_mouse_wheel_inner"),
         ],
@@ -466,7 +474,7 @@ const FENCES: &[Fence] = &[
         home: HOST,
         gate: None,
         callers: &[
-            (NATIVE_EVENTS, "dispatch_native_event"),
+            (NATIVE_EVENTS, "dispatch_native_target_event"),
             (HOST, "tick_system_state"),
         ],
     },
@@ -500,7 +508,7 @@ const FENCES: &[Fence] = &[
         name: "note_system_state_touch",
         home: SETUP,
         gate: None,
-        callers: &[(HOST, "interact_system_state")],
+        callers: &[(HOST, "interact_system_state_view")],
     },
     Fence {
         name: "take_system_state_press",
@@ -3034,6 +3042,9 @@ impl Default for PagePress {}
         self.observe_initial_setup_permissions(s.permissions);
     }
     pub(crate) fn interact_system_state(&mut self) {
+        self.interact_system_state_view();
+    }
+    pub(crate) fn interact_system_state_view(&mut self) {
         self.note_system_state_touch();
     }
     pub(crate) fn tick_system_state(&mut self) {
@@ -3106,7 +3117,10 @@ impl Default for PagePress {}
 ";
     const NATIVE_TWIN: &str = "impl App {
     pub(crate) fn dispatch_native_event(&mut self) {
-        self.interact_system_state();
+        self.dispatch_native_target_event();
+    }
+    fn dispatch_native_target_event(&mut self) {
+        self.interact_system_state_view();
         self.drain_system_state_actions();
     }
 }
@@ -3168,6 +3182,24 @@ impl Default for PagePress {}
     fn the_yes_inputs_are_taken_by_their_callers_alone() {
         assert_eq!(fenced(SETUP_TWIN, &[]), Vec::<String>::new());
         let cases: &[(&str, &str, &[usize])] = &[
+            (
+                MOUSE_EVENTS,
+                "impl App {\n    fn mouse_input_then_fold(&mut self) {\n        \
+                 self.interact_system_state_view(wid, view);\n    }\n}\n",
+                &[],
+            ),
+            (
+                MOUSE_EVENTS,
+                "impl App {\n    fn mouse_input_then_fold(&mut self) {\n        \
+                 self.interact_system_state(wid);\n    }\n}\n",
+                &[3],
+            ),
+            (
+                MOUSE_EVENTS,
+                "impl App {\n    fn route_mouse_input(&mut self) {\n        \
+                 self.interact_system_state_view(wid, view);\n    }\n}\n",
+                &[3],
+            ),
             (
                 STRANGER,
                 "fn sneaky(app: &mut App) -> bool {\n    app.admitted_by_press(true).is_some()\n}\n",
@@ -3352,7 +3384,7 @@ impl Default for PagePress {}
                 "the dispatcher cannot skip the drain to supply its own action",
                 &[(
                     NATIVE_EVENTS,
-                    "impl App {\n    fn dispatch_native_event(&mut self) {\n        \
+                    "impl App {\n    fn dispatch_native_target_event(&mut self) {\n        \
                      self.run_system_state_action(made_up);\n    }\n}\n",
                 )],
                 &[(NATIVE_EVENTS, 2), (NATIVE_EVENTS, 3)],

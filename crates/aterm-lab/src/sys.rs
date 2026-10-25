@@ -181,12 +181,6 @@ struct Tm {
     tm_zone: *const libc::c_char,
 }
 
-/// Local UTC offset in seconds east (`tm_gmtoff`) at Unix timestamp `secs`.
-#[must_use]
-pub fn local_offset_s(secs: i64) -> i64 {
-    local_tm(secs).tm_gmtoff
-}
-
 /// Local calendar fields `(year, month, day, hour, minute, second)` at `secs`.
 #[must_use]
 pub fn local_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {

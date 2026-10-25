@@ -847,9 +847,9 @@ fn the_front_door_routes_doctor_here_and_its_help_to_the_diagnostics() {
     assert!(!crate::routes_to_doctor("show-config", &[]));
 }
 
-/// `base.clt` reads a C toolchain verdict as the install's to fix only where the tools are
-/// missing: a refusing compiler is installed already, and one that did not answer is
-/// unknown.
+/// `base.clt` reads a C toolchain verdict, beside Command Line Tools git, as the install's to
+/// fix only where the tools are missing: a refusing compiler is installed already, and one
+/// that did not answer is unknown.
 #[cfg(target_os = "macos")]
 #[test]
 fn base_clt_reads_a_missing_toolchain_as_the_install_s_and_nothing_else() {
@@ -857,30 +857,33 @@ fn base_clt_reads_a_missing_toolchain_as_the_install_s_and_nothing_else() {
     use atpkg::prereq::CcVerdict;
     let cc = PathBuf::from("/usr/bin/cc");
     assert!(matches!(
-        super::clt_found(&CcVerdict::NoDeveloperDir),
+        super::clt_found(&CcVerdict::NoDeveloperDir, true),
         Found::Missing(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::NoDriver),
+        super::clt_found(&CcVerdict::NoDriver, true),
         Found::Missing(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::Ready { driver: cc.clone() }),
+        super::clt_found(&CcVerdict::Ready { driver: cc.clone() }, true),
         Found::Present(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::Broken {
-            driver: cc.clone(),
-            why: "license".into()
-        }),
+        super::clt_found(
+            &CcVerdict::Broken {
+                driver: cc.clone(),
+                why: "license".into()
+            },
+            true
+        ),
         Found::Refuses(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::Unanswered { driver: cc }),
+        super::clt_found(&CcVerdict::Unanswered { driver: cc }, true),
         Found::Unknown(_)
     ));
     assert!(matches!(
-        super::clt_found(&CcVerdict::NotProbed),
+        super::clt_found(&CcVerdict::NotProbed, true),
         Found::NotHere(_)
     ));
 }
@@ -1380,4 +1383,35 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         ),
         "the other pools stand alone where Claude Code has no source"
     );
+}
+
+/// `base.clt` plans the install wherever Command Line Tools git is missing, beside an
+/// Xcode.app compiler that builds or refuses too: the GitHub setup's clones run the tools' own
+/// git, and System State opens the install's tab for exactly that wait. A compiler that did
+/// not answer stays unknown.
+#[cfg(target_os = "macos")]
+#[test]
+fn base_clt_wants_the_tools_git_beside_an_xcode_compiler() {
+    use aterm_machines::init_clt::Found;
+    use atpkg::prereq::CcVerdict;
+
+    let driver = PathBuf::from("/Applications/Xcode.app/Contents/Developer/usr/bin/clang");
+    let ready = CcVerdict::Ready {
+        driver: driver.clone(),
+    };
+    let broken = CcVerdict::Broken {
+        driver: driver.clone(),
+        why: "You have not agreed to the Xcode license agreements.".into(),
+    };
+    assert!(matches!(super::clt_found(&ready, true), Found::Present(_)));
+    assert!(matches!(super::clt_found(&ready, false), Found::Missing(_)));
+    assert!(matches!(super::clt_found(&broken, true), Found::Refuses(_)));
+    assert!(matches!(
+        super::clt_found(&broken, false),
+        Found::Missing(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&CcVerdict::Unanswered { driver }, false),
+        Found::Unknown(_)
+    ));
 }

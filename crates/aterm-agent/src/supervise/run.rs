@@ -763,7 +763,6 @@ fn indicator_gone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => false,
     }
 }
@@ -1004,12 +1003,7 @@ fn live_rows(reader: &dyn ScreenReader, screen: &Screen) -> (usize, Option<(usiz
 pub(crate) const fn places_resets_on_print(p: Program) -> bool {
     match p {
         Program::Claude | Program::Generic => true,
-        Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Gemini => false,
+        Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Muse => false,
     }
 }
 
@@ -1993,6 +1987,10 @@ pub struct Session<'a, C: Ctl> {
     turn_end: TurnEndState,
     turn_end_due: Option<Due>,
     clock_marks: Option<(Instant, i64)>,
+    /// The wall (unix ms) [`Self::clock_marks`] held as the loop's last screen read returned
+    /// ([`Self::screen`]): a live turn's read hears an answer by it (`Session::wakes_heard`), never
+    /// by the mark a later call left.
+    read_wall: Option<i64>,
     sleeps: SleepBook,
     sleep_count: Option<SleepStamp>,
     sleep_look: Option<FirstLook>,
@@ -2002,6 +2000,9 @@ pub struct Session<'a, C: Ctl> {
     /// The last sleep the loop measured while the worker's turn ran, until that turn's point
     /// ([`woken_turn`]).
     woken: Option<woken_turn::WokenTurn>,
+    /// Claude Code's no-response retry row the busy reads show, as drawn, until a busy read shows
+    /// another row or none, or the point ([`woken_turn`]).
+    retry_seen: Option<String>,
     wake_settle: Option<(Due, bool)>,
     restart_waits: u32,
     restart_run: Option<(&'static str, i64)>,
@@ -2058,20 +2059,15 @@ pub struct Session<'a, C: Ctl> {
     box_reason: Option<(String, String)>,
     changed_streak: u32,
     press_retry: Option<approval_loop::PressRetry>,
-    limit_retry: Option<approval_loop::LimitRetry>,
-    /// Gemini CLI's usage-limit dialog as the last read that drew it showed it, kept until a point
-    /// that is neither the dialog nor its `Stop`'s error, or a read of another box
-    /// ([`approval_loop::LimitDialogRead`]).
-    limit_dialog_read: Option<approval_loop::LimitDialogRead>,
-    /// The key of the point the limit episode's badge was carried to, when that point is neither
-    /// its dialog nor its `Stop`'s error ([`Self::limit_badge_carry`]); cleared once a point's
-    /// fold ends the episode.
-    limit_badge_away: Option<String>,
     driver: bool,
     question: approval_loop::QuestionMemory,
     decline: approval_loop::DeclineMemory,
     question_held: bool,
     question_handed_back: bool,
+    /// The accounts' news came while the box of the `/login` this loop typed stood handed over
+    /// (its method picker): the box is decided again, as one the roster may now name the row of
+    /// ([`super::policy::login::PickerGate::Roster`]).
+    login_box_news: bool,
     tell_own: bool,
     read_back: Option<(Screen, Duration)>,
     refusal_pause: Duration,
@@ -2168,6 +2164,9 @@ pub struct Session<'a, C: Ctl> {
     account_stamp: Option<u64>,
     account_news_at: Option<Instant>,
     login_seen: Option<u64>,
+    /// The host was asked to discover the lost login's row before any `/login` was typed into it
+    /// ([`IdleHost::login_discover`]): once per lost login.
+    login_discovered: bool,
     probe: UsageProbe,
     probe_fold: Option<(Option<u16>, Option<usize>)>,
     probe_off: bool,
@@ -2284,6 +2283,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             zone_offset: limit::zone_offset_at,
             turn_end_due: None,
             clock_marks: None,
+            read_wall: None,
             sleeps: SleepBook::default(),
             sleep_count: None,
             sleep_look: None,
@@ -2291,6 +2291,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             sleep_unsaid: None,
             slept_at: None,
             woken: None,
+            retry_seen: None,
             wake_settle: None,
             restart_waits: 0,
             restart_run: None,
@@ -2342,14 +2343,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             box_reason: None,
             changed_streak: 0,
             press_retry: None,
-            limit_retry: None,
-            limit_dialog_read: None,
-            limit_badge_away: None,
             driver: false,
             question: approval_loop::QuestionMemory::default(),
             decline: approval_loop::DeclineMemory::default(),
             question_held: false,
             question_handed_back: false,
+            login_box_news: false,
             tell_own: false,
             read_back: None,
             refusal_pause: REFUSAL_PAUSE,
@@ -2430,6 +2429,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             account_stamp: None,
             account_news_at: None,
             login_seen: None,
+            login_discovered: false,
             probe: UsageProbe::Idle,
             probe_fold: None,
             probe_off: false,
@@ -2941,8 +2941,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             | Program::Grok
             | Program::Kimi
             | Program::Agy
-            | Program::Muse
-            | Program::Gemini => false,
+            | Program::Muse => false,
         };
         if self.program.is_none()
             && no_grammar
@@ -2957,8 +2956,8 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// the loop began showed anything the agent drew, the screen could be the shell's alone
     /// ([`aterm_phase::shell_alone`]), and the agent's reader finds nothing of its own on it
     /// ([`aterm_phase::ScreenReader::program_drawn`]). The agent is the one `status` last named,
-    /// else the task's `worker=`, else the one the screen names; when nothing names one (Gemini
-    /// CLI's process is `node`), every reader that knows its program's frame is asked. Once a
+    /// else the task's `worker=`, else the one the screen names; when nothing names one (an
+    /// agent run by `node`), every reader that knows its program's frame is asked. Once a
     /// read shows the agent's frame it stays drawn. A loop with no host owes none.
     fn first_frame_owed(&mut self, screen: &Screen, hosted: bool) -> bool {
         if matches!(self.first_frame, FirstFrame::Drawn { .. }) {
@@ -2975,7 +2974,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             || match named.unwrap_or_else(|| aterm_phase::identify(None, rows).program()) {
                 Program::Generic => Program::ALL.iter().any(|p| {
                     let knows_its_frame = match p {
-                        Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
+                        Program::Claude | Program::Agy | Program::Muse => true,
                         Program::Codex | Program::Grok | Program::Kimi | Program::Generic => false,
                     };
                     knows_its_frame && p.reader().program_drawn(rows)
@@ -3083,6 +3082,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
         let asked = self.fx.mono();
         let (screen, read_by) = self.read_once()?;
+        self.read_wall = self.clock_marks.map(|(_, wall_ms)| wall_ms);
         self.fx.screen_read(&screen);
         #[cfg(test)]
         let asked = self.read_clock_now().unwrap_or(asked);
@@ -3103,8 +3103,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         } else if self.footer.is_none() && !self.busy_read {
             self.busy_read = reader.phase(&screen.rows) == Phase::Busy;
         }
-        let busy = self.limit_dialog_read.is_some() && reader.phase(&screen.rows) == Phase::Busy;
-        self.note_limit_dialog(reader.program(), &screen.rows, busy);
         let credits = reader.credits(&screen.rows);
         self.note_credits(reader, credits.as_ref(), &screen.rows);
         self.note_usage(reader, credits, &screen.rows);
@@ -3326,7 +3324,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         let Some(words) = claude
@@ -3837,7 +3834,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             if !(writing && unsettled) {
                 saw.busy = true;
                 saw.live |= !writing && !signing_in;
-                let try_in_flight = !writing && self.limit_retry_busy();
+                self.note_retry_row(&screen);
                 if !signing_in {
                     if let Some(opts) = opts {
                         self.end_told_wait(opts);
@@ -3859,7 +3856,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     if self.wall_memory.is_none() && !self.turn_end.compacting() && !signing_in {
                         self.exception_ended(screen.seq, Some("the agent working"), review);
                     }
-                    if self.box_ask.is_some() && !writing && !try_in_flight {
+                    if self.box_ask.is_some() && !writing {
                         self.close_box(screen.seq, review)?;
                     }
                     if !writing && !self.question.answered.is_empty() {
@@ -4652,12 +4649,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             .as_ref()
             .is_some_and(|b| b.key != *turn_key.get_or_insert_with(|| self.review_key(&turn)))
         {
-            let key = turn_key
-                .get_or_insert_with(|| self.review_key(&turn))
-                .clone();
-            if !self.limit_badge_carry(&turn, &key) {
-                self.close_box(turn.screen.seq, review)?;
-            }
+            self.close_box(turn.screen.seq, review)?;
         }
         if turn.timed_out || self.fx.mono() >= *deadline {
             return Ok(Some(End::Timeout(turn)));
@@ -4686,7 +4678,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             state.gone_first = false;
             return Ok(None);
         }
-        let handed_back = std::mem::take(&mut self.question_handed_back);
+        let handed_back = std::mem::take(&mut self.question_handed_back)
+            | std::mem::take(&mut self.login_box_news);
         let seen = if !handed_back
             && state.handed.as_deref().is_some_and(|h| {
                 h == turn_key
@@ -4728,6 +4721,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             let busy_for = self.running.point(self.fx.mono());
             self.woken = None;
+            self.retry_seen = None;
             let turn_end = if review.unattended() {
                 let action = self.turn_end_at_point(&point, busy_for, opts)?;
                 let folded = self.task_edge_at_fold(&point.screen, opts, review);
@@ -4736,9 +4730,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 TurnEndAction::Nothing
             };
-            if self.limit_badge_off_ended() {
-                self.close_box(point.screen.seq, review)?;
-            }
             if review.unattended()
                 && self.limit.is_some()
                 && self.turn_end.limit_ended()
@@ -4771,14 +4762,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                         }
                     }
                     _ => {}
-                }
-                if !point_escalated && self.limit_retry.is_some() {
-                    let key = self.review_key(&point);
-                    if let Some(reason) = self.limit_stopped_badge(&point, &key) {
-                        let raised = self.escalate_point(&point, Some(&reason), review);
-                        self.said_before_fail(&point, raised, review)?;
-                        self.limit_badge_raised(&key);
-                    }
                 }
             }
             if !self.say_point(&point, review)? {
@@ -5387,6 +5370,19 @@ impl<C: Ctl> Session<'_, C> {
             ep.reset_unix = Some(at);
             ep.reset_text = text.to_string();
             ep.extended = false;
+            self.tell_wall(Some(at));
+        }
+    }
+
+    /// Tell the host the reset the open limit episode now holds its wall to
+    /// ([`IdleHost::limit_wall`]), so what it publishes of the wall is spent where
+    /// [`Self::limit_spent`] takes it so. A replay of a tape whose recording build had no such door
+    /// tells nothing, as it recorded.
+    fn tell_wall(&self, reset_unix: Option<i64>) {
+        if let Some(host) = &self.stall_host
+            && !self.fx.replay_lacks_host_door("host.limit_wall")
+        {
+            host.limit_wall(reset_unix);
         }
     }
 
@@ -5459,6 +5455,7 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(host) = &self.stall_host {
             host.limited(true);
         }
+        self.tell_wall(reset_unix);
         Ok(())
     }
 
@@ -5576,6 +5573,10 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(None);
             }
             if self.account_edge(opts) {
+                if seen.phase == Phase::Prompt && self.turn_end.login_typed_at().is_some() {
+                    self.login_box_news = true;
+                    return Ok(None);
+                }
                 self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
             }
@@ -5749,10 +5750,11 @@ impl<C: Ctl> Session<'_, C> {
         let woke_at = wall_now.div_euclid(1000);
         self.settle_wake(woke_at, mono_now);
         self.slept_at = Some(woke_at);
+        let carried = self.retry_seen.clone();
         self.woken = self
             .running
             .runs()
-            .then(|| woken_turn::WokenTurn::measured(wall_then, wall_now, mono_now));
+            .then(|| woken_turn::WokenTurn::measured(wall_then, wall_now, mono_now, carried));
     }
 
     fn recount_sleep(&mut self) -> Option<Duration> {
@@ -5879,9 +5881,16 @@ impl<C: Ctl> Session<'_, C> {
             return true;
         }
         let latched = self.turn_end.account_refused();
-        let stands =
-            self.turn_end_due.is_some() || (self.nothing_decided && self.roster_seen.is_some());
-        if (self.account_seen.is_none() && self.roster_seen.is_none() && !latched) || !stands {
+        // The `/login` this loop typed still stands (its dialog, or its opening): the roster may
+        // name the login's row while the dialog sits unchanged, and the dialog is then backed out
+        // of ([`super::policy::login::backs_out`]), so the accounts' news decides it again.
+        let own_login = opts.policy.logins && self.turn_end.login_typed_at().is_some();
+        let stands = self.turn_end_due.is_some()
+            || (self.nothing_decided && self.roster_seen.is_some())
+            || own_login;
+        if (self.account_seen.is_none() && self.roster_seen.is_none() && !latched && !own_login)
+            || !stands
+        {
             return false;
         }
         let Some(host) = opts.idle_host.as_ref() else {
@@ -6024,8 +6033,7 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Grok
             | Program::Kimi
             | Program::Agy
-            | Program::Muse
-            | Program::Gemini) => p.product(),
+            | Program::Muse) => p.product(),
             Program::Generic => "The agent",
         };
         let resume = host.resume_command();
@@ -6087,12 +6095,9 @@ impl<C: Ctl> Session<'_, C> {
             && !self.busy_read
             && match self.reader(&seen.screen.rows).program() {
                 Program::Claude | Program::Generic => true,
-                Program::Codex
-                | Program::Grok
-                | Program::Kimi
-                | Program::Agy
-                | Program::Muse
-                | Program::Gemini => false,
+                Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Muse => {
+                    false
+                }
             }
         {
             return None;
@@ -6191,7 +6196,6 @@ impl<C: Ctl> Session<'_, C> {
             Some(Guard::Settle)
         } else if self.limit.is_some() && !self.limit_spent(Some(host.as_ref()), notice)
             || self.policy_limit_holds()
-            || self.limit_retry_is_away()
         {
             Some(Guard::LimitEpisode)
         } else if self.stalled.is_some() {
@@ -6292,7 +6296,7 @@ impl<C: Ctl> Session<'_, C> {
             Some(Guard::Prompt)
         } else if self.limit.is_some() && !spent {
             Some(Guard::LimitEpisode)
-        } else if self.policy_limit_holds() || self.limit_retry_is_away() {
+        } else if self.policy_limit_holds() {
             // Turn-end policy or dialog limit still active.
             Some(Guard::LimitEpisode)
         } else if self.turn_end.act_in_flight() {
@@ -6643,7 +6647,6 @@ fn phase_prompt(
         | Program::Kimi
         | Program::Agy
         | Program::Muse
-        | Program::Gemini
         | Program::Generic => reader.prompt(rows).map(|p| {
             let esc = esc_line(reader.esc(&p));
             let prompt = Prompt {
@@ -6673,12 +6676,7 @@ fn esc_line(effect: Option<CancelEffect>) -> Option<&'static str> {
 fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
     match reader.program() {
         Program::Claude | Program::Generic => busy_signal(rows).map(|b| b.to_string()),
-        Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Gemini => {
+        Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Muse => {
             let status_row = reader.busy_guard().is_some_and(|guard| {
                 aterm_observe::row_matcher(&guard).is_ok_and(|m| rows.iter().any(|r| m.matches(r)))
             });
@@ -6746,12 +6744,9 @@ fn said_summary(reader: &dyn ScreenReader, turn: &Turn) -> String {
             reset.as_deref().map_or_else(|| "-".to_string(), clip)
         ),
         Phase::Busy | Phase::Idle | Phase::Question => match reader.program() {
-            Program::Codex
-            | Program::Grok
-            | Program::Kimi
-            | Program::Agy
-            | Program::Muse
-            | Program::Gemini => or_dash(&clip_tail(&said_line(reader, rows, width))),
+            Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Muse => {
+                or_dash(&clip_tail(&said_line(reader, rows, width)))
+            }
             Program::Claude => {
                 let line = last_said_index(rows).map_or_else(String::new, |last| {
                     let first = width.map_or(last, |w| aterm_phase::line_start(rows, last, w));
@@ -7114,9 +7109,9 @@ pub(super) use wall_confirm::words_kind;
 mod wall_memory;
 #[path = "woken_turn.rs"]
 mod woken_turn;
-pub use turn_end_loop::standing_rules;
 /// Re-exports composer cursor-row guard constructors.
-pub(crate) use turn_end_loop::{composer_guard, composer_guard_at};
+pub(crate) use turn_end_loop::composer_guard;
+pub use turn_end_loop::standing_rules;
 /// Re-exports turn-text folding and standing-rules helpers.
 #[cfg(test)]
 pub(crate) use turn_end_loop::{one_turn, standing_rules_in};

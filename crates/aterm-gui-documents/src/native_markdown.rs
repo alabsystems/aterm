@@ -773,61 +773,362 @@ pub fn source_window_from_anchor(
     }
 }
 
-/// Lay out only the viewport plus a bounded lookahead.
+/// The type steps the reader paints with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderStep {
+    Display,
+    Title,
+    Body,
+    Caption,
+}
+
+/// The reader's type at the current text size: the pixel size the window paints each
+/// [`ReaderStep`] at, and the text scale the reader's insets grow with. The window builds it
+/// from its own type scale, so the layout, the row navigation, the painter and the paint audit
+/// all measure a block with one set of numbers ([`block_frame`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReaderType {
+    /// The text scale, 1.0 at the default size.
+    pub scale: f32,
+    pub display: f32,
+    pub title: f32,
+    pub body: f32,
+    pub caption: f32,
+}
+
+impl ReaderType {
+    /// The pixel size of `step`.
+    #[must_use]
+    pub const fn px(&self, step: ReaderStep) -> f32 {
+        match step {
+            ReaderStep::Display => self.display,
+            ReaderStep::Title => self.title,
+            ReaderStep::Body => self.body,
+            ReaderStep::Caption => self.caption,
+        }
+    }
+
+    /// The text scale, or 1.0 where it is not a usable size.
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        if self.scale.is_finite() && self.scale > 0.0 {
+            self.scale
+        } else {
+            1.0
+        }
+    }
+}
+
+/// What decides a block's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockShape {
+    Heading(u8),
+    Paragraph,
+    ListItem {
+        depth: usize,
+    },
+    Quote,
+    /// A fenced block: `labelled` when it names a language, which paints above its text;
+    /// `dense` in the narrow source pane.
+    Code {
+        labelled: bool,
+        dense: bool,
+    },
+    Table,
+    Rule,
+}
+
+impl BlockShape {
+    /// The shape the reader's preview gives `block`.
+    #[must_use]
+    pub fn of(block: &MarkdownBlock) -> Self {
+        match block {
+            MarkdownBlock::Heading { level, .. } => Self::Heading(*level),
+            MarkdownBlock::Paragraph { .. } => Self::Paragraph,
+            MarkdownBlock::ListItem { depth, .. } => Self::ListItem { depth: *depth },
+            MarkdownBlock::Quote { .. } => Self::Quote,
+            MarkdownBlock::CodeBlock { language, .. } => Self::Code {
+                labelled: language
+                    .as_deref()
+                    .is_some_and(|language| !language.is_empty()),
+                dense: false,
+            },
+            MarkdownBlock::Table { .. } => Self::Table,
+            MarkdownBlock::ThematicBreak { .. } => Self::Rule,
+        }
+    }
+}
+
+/// Where one block's text sits in its rectangle and how it wraps: the one geometry the
+/// reader's layout, its row navigation, the painter and the paint audit all read, so the rows
+/// a block is laid out with are the rows it paints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockFrame {
+    pub step: ReaderStep,
+    pub px: f32,
+    pub line_h: f32,
+    pub mono: bool,
+    pub bold: bool,
+    /// Source lines stay rows (code, tables); prose re-flows.
+    pub preserve_lines: bool,
+    pub inset_left: f32,
+    pub inset_right: f32,
+    pub inset_top: f32,
+    pub inset_bottom: f32,
+    /// The height of the language caption a labelled code block paints above its text.
+    pub label_h: f32,
+}
+
+impl BlockFrame {
+    /// The width the text wraps in, in a block `width` wide.
+    #[must_use]
+    pub fn text_width(&self, width: f32) -> f32 {
+        (width - self.inset_left - self.inset_right).max(20.0)
+    }
+
+    /// The average advance a column is budgeted at.
+    #[must_use]
+    pub fn advance(&self) -> f32 {
+        self.px * if self.mono { 0.62 } else { 0.55 }
+    }
+
+    /// The columns a row holds in a block `width` wide; a wide char takes two
+    /// ([`reader_columns`]).
+    #[must_use]
+    pub fn columns(&self, width: f32) -> usize {
+        (self.text_width(width) / self.advance().max(1.0))
+            .floor()
+            .max(4.0) as usize
+    }
+
+    /// The height of the block's rectangle with `rows` rows of text.
+    #[must_use]
+    pub fn height(&self, rows: usize) -> f32 {
+        self.inset_top + rows as f32 * self.line_h + self.inset_bottom
+    }
+
+    /// The whole rows of text a rectangle `height` tall holds (at least one): the rows the
+    /// painter draws in it, none cut by its edge.
+    #[must_use]
+    pub fn rows_in(&self, height: f32) -> usize {
+        ((height - self.inset_top + 0.01) / self.line_h)
+            .floor()
+            .max(1.0) as usize
+    }
+}
+
+/// The frame of a block of `shape` at `ty`; `None` for a rule, which has no text.
+#[must_use]
+pub fn block_frame(shape: BlockShape, ty: ReaderType) -> Option<BlockFrame> {
+    let scale = ty.scale();
+    let frame = |step: ReaderStep, mono: bool, bold: bool, preserve_lines: bool, leading: f32| {
+        let px = ty.px(step);
+        BlockFrame {
+            step,
+            px,
+            line_h: (px * leading).max(16.0),
+            mono,
+            bold,
+            preserve_lines,
+            inset_left: 0.0,
+            inset_right: 0.0,
+            inset_top: 0.0,
+            inset_bottom: 0.0,
+            label_h: 0.0,
+        }
+    };
+    Some(match shape {
+        BlockShape::Heading(1) => BlockFrame {
+            inset_bottom: 16.0 * scale,
+            ..frame(ReaderStep::Display, false, true, false, 1.32)
+        },
+        BlockShape::Heading(2) => BlockFrame {
+            inset_bottom: 14.0 * scale,
+            ..frame(ReaderStep::Title, false, true, false, 1.35)
+        },
+        BlockShape::Heading(_) => BlockFrame {
+            inset_bottom: 14.0 * scale,
+            ..frame(ReaderStep::Body, false, true, false, 1.45)
+        },
+        BlockShape::Paragraph => frame(ReaderStep::Body, false, false, false, 1.72),
+        BlockShape::ListItem { depth } => BlockFrame {
+            inset_left: (28.0 + (depth as f32 * 16.0).min(64.0)) * scale,
+            ..frame(ReaderStep::Body, false, false, false, 1.66)
+        },
+        BlockShape::Quote => BlockFrame {
+            inset_left: 18.0 * scale,
+            inset_right: 12.0 * scale,
+            inset_top: 8.0 * scale,
+            inset_bottom: 8.0 * scale,
+            ..frame(ReaderStep::Body, false, false, false, 1.66)
+        },
+        BlockShape::Code { labelled, dense } => {
+            let label_h = if labelled {
+                (ty.caption * 1.45).max(16.0)
+            } else {
+                0.0
+            };
+            let step = if dense {
+                ReaderStep::Caption
+            } else {
+                ReaderStep::Body
+            };
+            BlockFrame {
+                inset_left: 12.0 * scale,
+                inset_right: 12.0 * scale,
+                inset_top: if labelled {
+                    5.0 * scale + label_h + 3.0 * scale
+                } else {
+                    10.0 * scale
+                },
+                inset_bottom: 10.0 * scale,
+                label_h,
+                ..frame(step, true, false, true, 1.55)
+            }
+        }
+        BlockShape::Table => BlockFrame {
+            inset_left: 12.0 * scale,
+            inset_right: 12.0 * scale,
+            inset_top: 8.0 * scale,
+            inset_bottom: 8.0 * scale,
+            ..frame(ReaderStep::Body, true, false, true, 1.65)
+        },
+        BlockShape::Rule => return None,
+    })
+}
+
+/// The height a rule's rectangle takes.
+#[must_use]
+pub fn rule_height(ty: ReaderType) -> f32 {
+    24.0 * ty.scale()
+}
+
+/// One block's measure at a width: its rows of text, the height of one, and the height it
+/// takes in the reader's column (its rectangle and the gap after it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockMeasure {
+    pub rows: usize,
+    pub row_h: f32,
+    pub height: f32,
+}
+
+/// `block`'s measure in a column `width` wide at `ty`. Its rows are the painter's own wrap of
+/// the text the block paints ([`block_paint_text`], [`wrap_reader_text`]), so every row it
+/// lays out is a row the painter draws and every row the painter draws can be scrolled to.
+#[must_use]
+pub fn measure_block(block: &MarkdownBlock, width: f32, ty: ReaderType) -> BlockMeasure {
+    let Some(frame) = block_frame(BlockShape::of(block), ty) else {
+        let row_h = rule_height(ty);
+        return BlockMeasure {
+            rows: 1,
+            row_h,
+            height: row_h + VISUAL_BLOCK_GAP,
+        };
+    };
+    let rows = reader_rows(
+        &block_paint_text(block),
+        frame.columns(width),
+        frame.preserve_lines,
+    )
+    .max(1);
+    BlockMeasure {
+        rows,
+        row_h: frame.line_h,
+        height: frame.height(rows) + VISUAL_BLOCK_GAP,
+    }
+}
+
+/// The most bytes of a block the reader lays out and paints.
+pub const BLOCK_PAINT_LIMIT: usize = 128 * 1024;
+
+/// The text a block paints: its own text, a table's rows joined by `│`, at most
+/// [`BLOCK_PAINT_LIMIT`] bytes with a closing `…` where it was cut.
+#[must_use]
+pub fn block_paint_text(block: &MarkdownBlock) -> Cow<'_, str> {
+    match block {
+        MarkdownBlock::Heading { text, .. }
+        | MarkdownBlock::Paragraph { text, .. }
+        | MarkdownBlock::ListItem { text, .. }
+        | MarkdownBlock::Quote { text, .. }
+        | MarkdownBlock::CodeBlock { code: text, .. } => bounded_text(text, BLOCK_PAINT_LIMIT),
+        MarkdownBlock::ThematicBreak { .. } => Cow::Borrowed(""),
+        MarkdownBlock::Table { header, rows, .. } => {
+            let mut output = String::new();
+            for row in std::iter::once(header).chain(rows) {
+                for (index, cell) in row.iter().enumerate() {
+                    if index > 0 {
+                        output.push_str("  │  ");
+                    }
+                    let remaining = BLOCK_PAINT_LIMIT.saturating_sub(output.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    output.push_str(&bounded_text(cell, remaining));
+                }
+                if output.len() >= BLOCK_PAINT_LIMIT {
+                    break;
+                }
+                output.push('\n');
+            }
+            Cow::Owned(output)
+        }
+    }
+}
+
+/// `text`, cut to at most `limit` bytes at a char boundary with a closing `…` where it was.
+#[must_use]
+pub fn bounded_text(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
+        return Cow::Borrowed(text);
+    }
+    let end = text.floor_char_boundary(limit.saturating_sub('…'.len_utf8()));
+    let mut output = text[..end].to_string();
+    output.push('…');
+    Cow::Owned(output)
+}
+
+/// Lay out only the viewport plus a bounded lookahead, each block at its measure
+/// ([`measure_block`]) in a column `viewport_width` wide at `ty`.
 pub fn layout_visible_blocks(
     document: &MarkdownDocument,
     source_anchor: usize,
     visual_row: usize,
     viewport_width: f32,
     viewport_height: f32,
+    ty: ReaderType,
 ) -> VirtualBlockLayout {
     if document.blocks.is_empty() || viewport_width <= 0.0 || viewport_height <= 0.0 {
         return VirtualBlockLayout::default();
     }
     let anchor_index = block_at_source(document, source_anchor).unwrap_or(0);
-    let sample_start = anchor_index.saturating_sub(32);
-    let sample_end = sample_start.saturating_add(64).min(document.blocks.len());
-    let sample = &document.blocks[sample_start..sample_end];
-    let sample_heights = sample
-        .iter()
-        .map(|block| estimated_block_height(block, viewport_width))
-        .collect::<Vec<_>>();
-    let mean_height = sample_heights.iter().sum::<f32>() / sample.len().max(1) as f32;
-    let total_height = mean_height * document.blocks.len() as f32;
-    let start = anchor_index;
-    let measured_height = |index: usize, block: &MarkdownBlock| {
-        index
-            .checked_sub(sample_start)
-            .and_then(|offset| sample_heights.get(offset).copied())
-            .unwrap_or_else(|| estimated_block_height(block, viewport_width))
-    };
-    let total_anchor_rows = block_visual_rows_for_height(
-        &document.blocks[anchor_index],
-        measured_height(anchor_index, &document.blocks[anchor_index]),
-    );
-    let visual_row = visual_row.min(total_anchor_rows.saturating_sub(1));
+    let anchor = measure_block(&document.blocks[anchor_index], viewport_width, ty);
+    let visual_row = visual_row.min(anchor.rows.saturating_sub(1));
     let mut y = 0.0;
-    let limit = viewport_height + 320.0;
+    let limit = viewport_height + 320.0 * ty.scale();
     let mut blocks = Vec::new();
-    for (index, block) in document.blocks.iter().enumerate().skip(start) {
-        let row = if index == anchor_index { visual_row } else { 0 };
-        let full_height = measured_height(index, block);
-        let total_visual_rows = block_visual_rows_for_height(block, full_height);
-        let skipped = row as f32 * block_visual_row_height(block);
-        let height = (full_height - skipped).max(VISUAL_BLOCK_GAP + 1.0);
+    let mut measured_height = 0.0;
+    for (index, block) in document.blocks.iter().enumerate().skip(anchor_index) {
         if y >= limit {
             break;
         }
+        let (measure, row) = if index == anchor_index {
+            (anchor, visual_row)
+        } else {
+            (measure_block(block, viewport_width, ty), 0)
+        };
+        let height = (measure.height - row as f32 * measure.row_h).max(VISUAL_BLOCK_GAP + 1.0);
         blocks.push(VisibleBlock {
             index,
             y,
             height,
             source: block.source().clone(),
             visual_row: row,
-            total_visual_rows,
+            total_visual_rows: measure.rows,
         });
+        measured_height += measure.height;
         y += height;
     }
+    let total_height = measured_height / blocks.len().max(1) as f32 * document.blocks.len() as f32;
     VirtualBlockLayout {
         blocks,
         total_height,
@@ -835,56 +1136,11 @@ pub fn layout_visible_blocks(
     }
 }
 
-/// Number of reader rows in one block at the current measure.
+/// Number of reader rows in one block in a column `viewport_width` wide at `ty`.
 #[inline]
-pub fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32) -> usize {
-    block_visual_rows_for_height(block, estimated_block_height(block, viewport_width))
-}
-
-/// The same row count from a height the caller has already measured. Splitting
-/// the arithmetic out keeps `estimated_block_height` — an O(block text) decode —
-/// to one call per block per layout pass; the arithmetic itself is unchanged.
-#[inline]
-fn block_visual_rows_for_height(block: &MarkdownBlock, height: f32) -> usize {
-    let padding = block_visual_padding(block);
-    ((height - padding).max(1.0) / block_visual_row_height(block))
-        .ceil()
-        .max(1.0) as usize
-}
-
-#[inline]
-pub const fn block_visual_row_height(block: &MarkdownBlock) -> f32 {
-    match block {
-        MarkdownBlock::Heading { level, .. } => match level {
-            1 => 38.0,
-            2 => 32.0,
-            3 => 28.0,
-            _ => 24.0,
-        },
-        MarkdownBlock::Paragraph { .. } | MarkdownBlock::ListItem { .. } => 24.0,
-        MarkdownBlock::Quote { .. } => 24.0,
-        MarkdownBlock::CodeBlock { .. } => 22.0,
-        MarkdownBlock::Table { .. } => 30.0,
-        MarkdownBlock::ThematicBreak { .. } => 28.0,
-    }
-}
-
-#[inline]
-const fn block_visual_padding(block: &MarkdownBlock) -> f32 {
-    match block {
-        MarkdownBlock::Heading { level, .. } => {
-            if *level == 1 {
-                16.0
-            } else {
-                14.0
-            }
-        }
-        MarkdownBlock::Paragraph { .. } | MarkdownBlock::ListItem { .. } => 4.0,
-        MarkdownBlock::Quote { .. } => 12.0,
-        MarkdownBlock::CodeBlock { .. } => 28.0,
-        MarkdownBlock::Table { .. } => 20.0,
-        MarkdownBlock::ThematicBreak { .. } => 0.0,
-    }
+#[must_use]
+pub fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32, ty: ReaderType) -> usize {
+    measure_block(block, viewport_width, ty).rows
 }
 
 /// Move by exact visual rows.
@@ -892,6 +1148,7 @@ pub fn move_visual_rows(
     document: &MarkdownDocument,
     location: MarkdownLocation,
     viewport_width: f32,
+    ty: ReaderType,
     delta: isize,
 ) -> MarkdownLocation {
     if document.blocks.is_empty() {
@@ -904,7 +1161,7 @@ pub fn move_visual_rows(
         {
             return rows;
         }
-        let rows = block_visual_rows(&document.blocks[index], viewport_width);
+        let rows = block_visual_rows(&document.blocks[index], viewport_width, ty);
         measured = Some((index, rows));
         rows
     };
@@ -948,6 +1205,65 @@ pub fn move_visual_rows(
                 break;
             }
         }
+    }
+    MarkdownLocation::new(source_anchor_for_visual_row(document, block, row), row)
+}
+
+/// The location whole rows away that fill at most `distance` logical pixels (at least one
+/// row), forward for a positive `direction` and back for a negative one; each row counts its
+/// own block's row height, and leaving a block its insets and gap. A page is
+/// [`move_visual_distance`] by most of the viewport's height.
+pub fn move_visual_distance(
+    document: &MarkdownDocument,
+    location: MarkdownLocation,
+    viewport_width: f32,
+    ty: ReaderType,
+    distance: f32,
+    direction: i32,
+) -> MarkdownLocation {
+    if document.blocks.is_empty() || direction == 0 {
+        return location;
+    }
+    let mut block = block_at_source(document, location.source_anchor).unwrap_or(0);
+    let mut measure = measure_block(&document.blocks[block], viewport_width, ty);
+    let mut row = location.visual_row.min(measure.rows.saturating_sub(1));
+    let start = (block, row);
+    let mut used = 0.0_f32;
+    loop {
+        let chrome = (measure.height - measure.rows as f32 * measure.row_h).max(0.0);
+        let (next, cost) = if direction > 0 {
+            if row + 1 < measure.rows {
+                ((block, row + 1, None), measure.row_h)
+            } else if block + 1 < document.blocks.len() {
+                let next = measure_block(&document.blocks[block + 1], viewport_width, ty);
+                ((block + 1, 0, Some(next)), measure.row_h + chrome)
+            } else {
+                break;
+            }
+        } else if row > 0 {
+            ((block, row - 1, None), measure.row_h)
+        } else if block > 0 {
+            let previous = measure_block(&document.blocks[block - 1], viewport_width, ty);
+            let previous_chrome =
+                (previous.height - previous.rows as f32 * previous.row_h).max(0.0);
+            (
+                (block - 1, previous.rows.saturating_sub(1), Some(previous)),
+                previous.row_h + previous_chrome,
+            )
+        } else {
+            break;
+        };
+        if (block, row) != start && used + cost > distance {
+            break;
+        }
+        used += cost;
+        (block, row) = (next.0, next.1);
+        if let Some(next) = next.2 {
+            measure = next;
+        }
+    }
+    if (block, row) == start {
+        return location;
     }
     MarkdownLocation::new(source_anchor_for_visual_row(document, block, row), row)
 }
@@ -1006,88 +1322,271 @@ pub fn reader_columns(c: char) -> usize {
     aterm_grapheme::char_width(c).max(1)
 }
 
-/// [`reader_columns`] of each char of `text`, up to `limit` chars.
-#[inline]
-fn text_columns(text: &str, limit: usize) -> usize {
-    text.chars().take(limit).map(reader_columns).sum()
+/// The most rows the reader wraps one block into.
+pub const READER_ROW_LIMIT: usize = 131_072;
+
+/// `text` wrapped to rows of `max_columns` columns ([`reader_columns`]) the way the reader
+/// paints it: prose at word (and ideographic) breaks, `preserve_lines` text (code, tables) at
+/// its own lines first. Rows before `skip` are left out; at most `max_lines` rows are made,
+/// the last ending in `…` where text was left over.
+#[must_use]
+pub fn wrap_reader_text(
+    text: &str,
+    max_columns: usize,
+    skip: usize,
+    max_lines: usize,
+    preserve_lines: bool,
+) -> Vec<String> {
+    let mut output = Vec::with_capacity(
+        max_lines
+            .clamp(1, READER_ROW_LIMIT)
+            .saturating_sub(skip)
+            .min(16),
+    );
+    wrap_rows(
+        text,
+        max_columns,
+        skip,
+        max_lines,
+        preserve_lines,
+        Some(&mut output),
+    );
+    output
 }
 
-/// The rows a code block's first `limit` chars take at `chars_per_line` columns
-/// ([`estimated_block_height`]): a row per line, and a wide char that would end
-/// past a row starts the next, as the reader's wrap lays it.
-fn code_visual_lines(code: &str, chars_per_line: usize, limit: usize) -> usize {
-    let mut visual_lines = 1usize;
-    let mut column = 0usize;
-    for character in code.chars().take(limit) {
-        if character == '\n' {
-            visual_lines = visual_lines.saturating_add(1);
-            column = 0;
+/// How many rows [`wrap_reader_text`] makes of `text`, without making them.
+#[must_use]
+pub fn reader_rows(text: &str, max_columns: usize, preserve_lines: bool) -> usize {
+    wrap_rows(
+        text,
+        max_columns,
+        usize::MAX,
+        READER_ROW_LIMIT,
+        preserve_lines,
+        None,
+    )
+}
+
+/// One wrapped row into `output`, made only when there is an `output` to keep it.
+#[inline]
+fn keep(output: &mut Option<&mut Vec<String>>, row: impl FnOnce() -> String) {
+    if let Some(output) = output.as_deref_mut() {
+        output.push(row());
+    }
+}
+
+/// The wrap behind [`wrap_reader_text`] and [`reader_rows`]: the rows it made, kept in
+/// `output` when there is one.
+fn wrap_rows(
+    text: &str,
+    max_columns: usize,
+    skip: usize,
+    max_lines: usize,
+    preserve_lines: bool,
+    mut output: Option<&mut Vec<String>>,
+) -> usize {
+    use reader_columns as columns;
+    let max_columns = max_columns.max(1);
+    let max_lines = max_lines.clamp(1, READER_ROW_LIMIT);
+    let mut produced = 0usize;
+    let mut produced_chars = 0usize;
+    let mut characters: Vec<char> = Vec::new();
+    let mut cjk_starts: Vec<usize> = Vec::new();
+    let mut words: Vec<(bool, &str)> = Vec::new();
+    for source_line in text.lines().chain(text.is_empty().then_some("")) {
+        if produced >= max_lines {
+            break;
+        }
+        if preserve_lines {
+            characters.clear();
+            characters.extend(source_line.chars());
+            cjk_starts.clear();
+            if !source_line.is_ascii() {
+                let mut breaks = aterm_grapheme::line_breaks(source_line)
+                    .into_iter()
+                    .filter(|brk| brk.kind == aterm_grapheme::BreakKind::Ideographic)
+                    .map(|brk| brk.at)
+                    .peekable();
+                for (index, (byte, _)) in source_line.char_indices().enumerate() {
+                    if breaks.next_if_eq(&byte).is_some() {
+                        cjk_starts.push(index);
+                    }
+                }
+            }
+            if characters.is_empty() {
+                if produced >= skip {
+                    keep(&mut output, String::new);
+                }
+                produced += 1;
+            } else {
+                let mut start = 0usize;
+                while start < characters.len() {
+                    if produced >= max_lines {
+                        break;
+                    }
+                    let mut hard_end = start;
+                    let mut used = 0usize;
+                    while let Some(&character) = characters.get(hard_end) {
+                        let width = columns(character);
+                        if hard_end > start && used + width > max_columns {
+                            break;
+                        }
+                        used += width;
+                        hard_end += 1;
+                    }
+                    if hard_end == characters.len() {
+                        if produced >= skip {
+                            keep(&mut output, || characters[start..hard_end].iter().collect());
+                        }
+                        produced += 1;
+                        produced_chars += hard_end - start;
+                        break;
+                    }
+                    let soft_end = characters[start..=hard_end]
+                        .iter()
+                        .rposition(|character| character.is_whitespace())
+                        .map(|offset| start + offset)
+                        .filter(|end| *end > start);
+                    let cjk_end = cjk_starts[..cjk_starts.partition_point(|at| *at <= hard_end)]
+                        .last()
+                        .copied()
+                        .filter(|end| *end > start);
+                    let end = soft_end.max(cjk_end).unwrap_or(hard_end);
+                    if produced >= skip {
+                        keep(&mut output, || characters[start..end].iter().collect());
+                    }
+                    produced += 1;
+                    produced_chars += end - start;
+                    start = end;
+                    while start < characters.len() && characters[start].is_whitespace() {
+                        start += 1;
+                    }
+                }
+            }
             continue;
         }
-        let width = reader_columns(character);
-        if column > 0 && column.saturating_add(width) > chars_per_line {
-            visual_lines = visual_lines.saturating_add(1);
-            column = 0;
+        words.clear();
+        if source_line.is_ascii() {
+            words.extend(source_line.split_whitespace().map(|word| (true, word)));
+        } else {
+            words.extend(
+                aterm_grapheme::pieces(source_line, aterm_grapheme::BreakKind::is_word_boundary)
+                    .into_iter()
+                    .map(|piece| (piece.spaced, piece.text)),
+            );
         }
-        column = column.saturating_add(width);
-        if column >= chars_per_line {
-            visual_lines = visual_lines.saturating_add(1);
-            column = 0;
+        let mut line = String::new();
+        let mut line_columns = 0usize;
+        let mut line_chars = 0usize;
+        for &(spaced, word) in &words {
+            let separator = usize::from(!line.is_empty() && spaced);
+            let word_columns: usize = word.chars().map(columns).sum();
+            if line_columns + separator + word_columns <= max_columns {
+                if separator == 1 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                line_columns += separator + word_columns;
+                line_chars += separator + word.chars().count();
+                continue;
+            }
+            if !line.is_empty() {
+                let row = std::mem::take(&mut line);
+                if produced >= skip {
+                    keep(&mut output, || row);
+                }
+                produced += 1;
+                produced_chars += line_chars;
+                if produced >= max_lines {
+                    break;
+                }
+            }
+            let mut chunk = String::new();
+            let mut chunk_columns = 0usize;
+            let mut chunk_chars = 0usize;
+            for character in word.chars() {
+                let width = columns(character);
+                if chunk_columns + width > max_columns && !chunk.is_empty() {
+                    let row = std::mem::take(&mut chunk);
+                    if produced >= skip {
+                        keep(&mut output, || row);
+                    }
+                    produced += 1;
+                    produced_chars += chunk_chars;
+                    chunk_columns = 0;
+                    chunk_chars = 0;
+                    if produced >= max_lines {
+                        break;
+                    }
+                }
+                chunk.push(character);
+                chunk_columns += width;
+                chunk_chars += 1;
+                if chunk_columns >= max_columns {
+                    let row = std::mem::take(&mut chunk);
+                    if produced >= skip {
+                        keep(&mut output, || row);
+                    }
+                    produced += 1;
+                    produced_chars += chunk_chars;
+                    chunk_columns = 0;
+                    chunk_chars = 0;
+                    if produced >= max_lines {
+                        break;
+                    }
+                }
+            }
+            line = chunk;
+            line_columns = chunk_columns;
+            line_chars = chunk_chars;
+        }
+        if produced >= max_lines {
+            break;
+        }
+        if !line.is_empty() || source_line.is_empty() {
+            if produced >= skip {
+                keep(&mut output, || line);
+            }
+            produced += 1;
+            produced_chars += line_chars;
         }
     }
-    visual_lines
+    if produced == max_lines
+        && text.chars().count() > produced_chars
+        && let Some(last) = output.and_then(|output| output.last_mut())
+    {
+        let keep = max_columns.saturating_sub(1);
+        let mut used = 0usize;
+        *last = last
+            .chars()
+            .take_while(|character| {
+                used += columns(*character);
+                used <= keep
+            })
+            .collect::<String>();
+        last.push('…');
+    }
+    produced
 }
 
-fn estimated_block_height(block: &MarkdownBlock, viewport_width: f32) -> f32 {
-    const MAX_LAYOUT_CHARS_PER_BLOCK: usize = 128 * 1024;
-    let measure = (viewport_width.min(760.0) - 24.0).max(120.0);
-    let (text_len, line_height, vertical_padding, average_advance) = match block {
-        MarkdownBlock::Heading { level, text, .. } => {
-            let line = match level {
-                1 => 38.0,
-                2 => 32.0,
-                3 => 28.0,
-                _ => 24.0,
-            };
-            let advance = match level {
-                1 => 12.0,
-                2 => 10.0,
-                3 => 9.0,
-                _ => 8.0,
-            };
-            (
-                text_columns(text, MAX_LAYOUT_CHARS_PER_BLOCK),
-                line,
-                if *level == 1 { 16.0 } else { 14.0 },
-                advance,
-            )
-        }
-        MarkdownBlock::Paragraph { text, .. } | MarkdownBlock::ListItem { text, .. } => (
-            text_columns(text, MAX_LAYOUT_CHARS_PER_BLOCK),
-            24.0,
-            4.0,
-            8.0,
-        ),
-        MarkdownBlock::Quote { text, .. } => (
-            text_columns(text, MAX_LAYOUT_CHARS_PER_BLOCK),
-            24.0,
-            12.0,
-            8.0,
-        ),
-        MarkdownBlock::CodeBlock { code, .. } => {
-            let chars_per_line = (measure / 8.0).max(12.0) as usize;
-            return code_visual_lines(code, chars_per_line, MAX_LAYOUT_CHARS_PER_BLOCK) as f32
-                * 22.0
-                + 28.0;
-        }
-        MarkdownBlock::Table { rows, .. } => {
-            return (rows.len().saturating_add(1) as f32 * 30.0) + 20.0;
-        }
-        MarkdownBlock::ThematicBreak { .. } => return 28.0,
-    };
-    let chars_per_line = (measure / average_advance).max(8.0) as usize;
-    let lines = text_len.div_ceil(chars_per_line).max(1);
-    lines as f32 * line_height + vertical_padding
+/// The `max_lines` rows of [`wrap_reader_text`] from `visual_row`, as a block shows them: a
+/// row the next rows continue is shown whole, never ended in `…` (the rest is a scroll
+/// away).
+pub fn wrap_reader_text_window(
+    text: &str,
+    max_columns: usize,
+    visual_row: usize,
+    max_lines: usize,
+    preserve_lines: bool,
+) -> Vec<String> {
+    let take = max_lines.clamp(1, 512);
+    let requested = visual_row
+        .saturating_add(take)
+        .saturating_add(1)
+        .clamp(1, READER_ROW_LIMIT);
+    let mut lines = wrap_reader_text(text, max_columns, visual_row, requested, preserve_lines);
+    lines.truncate(take);
+    lines
 }
 
 fn link_policy(destination: &str) -> LinkPolicy {
@@ -1900,6 +2399,15 @@ fn scan_inline_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reader's type at the default size.
+    const TYPE: ReaderType = ReaderType {
+        scale: 1.0,
+        display: 24.0,
+        title: 20.0,
+        body: 13.0,
+        caption: 11.0,
+    };
     use aterm_models_native::{native_markdown_history_model, native_markdown_viewport_model};
     use aterm_spec::derive::Model;
     use aterm_spec::interp::{State, admits};
@@ -2364,7 +2872,7 @@ mod tests {
             .collect::<String>();
         let document = parse(&source);
         let middle = document.blocks[2_500].source().start;
-        let layout = layout_visible_blocks(&document, middle, 0, 680.0, 720.0);
+        let layout = layout_visible_blocks(&document, middle, 0, 680.0, 720.0, TYPE);
         assert_eq!(layout.anchor_index, 2_500);
         assert!(
             layout.blocks.len() < 60,
@@ -2382,11 +2890,34 @@ mod tests {
         );
     }
 
+    /// The reader's type at `scale` times the default size.
+    fn type_at(scale: f32) -> ReaderType {
+        ReaderType {
+            scale,
+            display: TYPE.display * scale,
+            title: TYPE.title * scale,
+            body: TYPE.body * scale,
+            caption: TYPE.caption * scale,
+        }
+    }
+
+    /// The rows the painter wraps `block` into in a column `width` wide at `ty`.
+    fn painted_rows(block: &MarkdownBlock, width: f32, ty: ReaderType) -> usize {
+        let frame = block_frame(BlockShape::of(block), ty).expect("a block with text");
+        wrap_reader_text(
+            &block_paint_text(block),
+            frame.columns(width),
+            0,
+            READER_ROW_LIMIT,
+            frame.preserve_lines,
+        )
+        .len()
+    }
+
     /// A WIDE CHAR RESERVES TWO COLUMNS OF A BLOCK'S ROWS, as the reader's
-    /// wrap lays it on two ([`reader_columns`]): a Japanese paragraph and a
-    /// heading are estimated the rows of Latin text of twice their chars, at
-    /// every width, and a code line no fewer (a wide char that would end
-    /// past a line starts the next).
+    /// wrap lays it on two ([`reader_columns`]): a Japanese paragraph, a
+    /// heading and a code line take no fewer rows than Latin text of twice
+    /// their chars, at every width.
     #[test]
     fn a_wide_char_reserves_two_columns_of_a_blocks_rows() {
         let cjk = "設定ファイルを読み込めませんでした".repeat(12);
@@ -2397,14 +2928,13 @@ mod tests {
             (format!("```\n{cjk}\n```"), format!("```\n{latin}\n```")),
         ] {
             let (wide, narrow) = (parse(&wide), parse(&narrow));
-            let code = matches!(wide.blocks[0], MarkdownBlock::CodeBlock { .. });
             for width in [240.0_f32, 250.0, 480.0, 760.0] {
                 let (wide_rows, narrow_rows) = (
-                    block_visual_rows(&wide.blocks[0], width),
-                    block_visual_rows(&narrow.blocks[0], width),
+                    block_visual_rows(&wide.blocks[0], width, TYPE),
+                    block_visual_rows(&narrow.blocks[0], width, TYPE),
                 );
                 assert!(
-                    wide_rows == narrow_rows || (code && wide_rows > narrow_rows),
+                    wide_rows >= narrow_rows && narrow_rows > 1,
                     "{wide_rows} rows for {narrow_rows} at {width}: {:?}",
                     wide.blocks[0]
                 );
@@ -2419,6 +2949,130 @@ mod tests {
         );
     }
 
+    /// EVERY ROW A BLOCK PAINTS IS A ROW IT IS LAID OUT WITH, at every text
+    /// size the reader takes (0.85 to 2.0) and every width: a block's
+    /// measure is the painter's own wrap of the text it paints, so its
+    /// rectangle holds every row (no row is cut or elided), and moving by
+    /// rows to the end of the document reaches the last row of the last
+    /// block. At 2x the rows grow; the fixed 1x estimate this replaced kept
+    /// the 1x rows, so the painter cut every block and its tail rows could
+    /// never be scrolled to.
+    #[test]
+    fn a_block_lays_out_every_row_it_paints_at_every_text_size() {
+        let source = "# 設定ファイルの読み込み\n\n\
+            設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\
+            コーヒーブレイク中にアップデートをダウンロードしています、ちょっと待ってください。\n\n\
+            ## A second heading that runs long enough to wrap at a narrow width\n\n\
+            ### Third\n\n\
+            - a list item that wraps across the measure of a phone-width reader\n\
+            \x20\x20- a nested one, deeper, that wraps too when the reader is narrow\n\n\
+            > A quoted paragraph that also wraps when the reader is narrow enough.\n\n\
+            ```rust\nfn main() { println!(\"a long line of code that wraps in a narrow pane\"); }\n```\n\n\
+            ```\n設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\n```\n\n\
+            | Column | Another column with words |\n|---|---|\n| 1 | a cell long enough to wrap the table row |\n\n\
+            ---\n\n\
+            The quick brown fox jumps over the lazy dog, and aarch64-apple-darwin wraps \
+            at its spaces as it always did.\n";
+        let document = parse(source);
+        assert!(document.blocks.len() >= 10, "{:?}", document.blocks);
+        for scale in [0.85_f32, 1.0, 1.5, 2.0] {
+            let ty = type_at(scale);
+            for width in [206.0_f32, 326.0, 480.0, 732.0] {
+                for (index, block) in document.blocks.iter().enumerate() {
+                    let measure = measure_block(block, width, ty);
+                    let Some(frame) = block_frame(BlockShape::of(block), ty) else {
+                        assert_eq!(measure.rows, 1);
+                        continue;
+                    };
+                    let painted = painted_rows(block, width, ty);
+                    assert_eq!(
+                        measure.rows, painted,
+                        "block {index} at {scale}x and {width}: {block:?}"
+                    );
+                    assert!(
+                        measure.height - VISUAL_BLOCK_GAP + 0.01
+                            >= frame.inset_top + painted as f32 * frame.line_h,
+                        "block {index} at {scale}x and {width}: its rectangle holds every row"
+                    );
+                    let layout = layout_visible_blocks(
+                        &document,
+                        block.source().start,
+                        0,
+                        width,
+                        100_000.0,
+                        ty,
+                    );
+                    assert_eq!(layout.blocks[0].index, index);
+                    assert_eq!(layout.blocks[0].total_visual_rows, painted);
+                }
+                let start = MarkdownLocation::new(0, 0);
+                let end = move_visual_rows(&document, start, width, ty, isize::MAX);
+                let last = document.blocks.len() - 1;
+                assert_eq!(
+                    end.visual_row,
+                    painted_rows(&document.blocks[last], width, ty) - 1,
+                    "the last row is reachable at {scale}x and {width}"
+                );
+                let mut walked = start;
+                let mut steps = 0usize;
+                loop {
+                    let next = move_visual_rows(&document, walked, width, ty, 1);
+                    if next == walked {
+                        break;
+                    }
+                    walked = next;
+                    steps += 1;
+                }
+                let total: usize = document
+                    .blocks
+                    .iter()
+                    .map(|block| measure_block(block, width, ty).rows)
+                    .sum();
+                assert_eq!(
+                    steps + 1,
+                    total,
+                    "one wheel row at a time visits every row at {scale}x and {width}"
+                );
+                assert_eq!(walked, end);
+            }
+        }
+        let paragraph = &document.blocks[1];
+        assert!(
+            measure_block(paragraph, 326.0, type_at(2.0)).rows
+                > measure_block(paragraph, 326.0, TYPE).rows,
+            "larger text wraps into more rows"
+        );
+    }
+
+    /// A PAGE MOVES BY THE ROWS THAT FILL MOST OF THE VIEWPORT, each counted
+    /// at its own height: at 2x a page holds about half the rows it holds at
+    /// 1x, so paging never jumps past rows the reader did not show.
+    #[test]
+    fn a_page_moves_by_the_rows_that_fill_the_viewport_at_their_height() {
+        let source = (0..400)
+            .map(|line| format!("line-{line:04}\n"))
+            .collect::<String>();
+        let document = parse(&format!("```\n{source}```\n"));
+        let start = MarkdownLocation::new(document.blocks[0].source().start, 0);
+        for scale in [1.0_f32, 2.0] {
+            let ty = type_at(scale);
+            let row_h = measure_block(&document.blocks[0], 600.0, ty).row_h;
+            let page = move_visual_distance(&document, start, 600.0, ty, 400.0, 1);
+            assert_eq!(
+                page.visual_row,
+                (400.0 / row_h).floor() as usize,
+                "a page at {scale}x"
+            );
+            let back = move_visual_distance(&document, page, 600.0, ty, 400.0, -1);
+            assert_eq!(back.visual_row, 0, "a page back at {scale}x");
+            assert_eq!(
+                move_visual_distance(&document, start, 600.0, ty, 1.0, 1).visual_row,
+                1,
+                "at least one row"
+            );
+        }
+    }
+
     #[test]
     fn thousand_line_fence_is_reachable_by_rows_pages_source_lines_and_end() {
         let source = format!(
@@ -2430,16 +3084,16 @@ mod tests {
         let document = parse(&source);
         assert_eq!(document.blocks.len(), 1);
         let width = 680.0;
-        let rows = block_visual_rows(&document.blocks[0], width);
+        let rows = block_visual_rows(&document.blocks[0], width, TYPE);
         assert!(rows >= 1_000, "every authored code line remains reachable");
 
         let start = MarkdownLocation::new(document.blocks[0].source().start, 0);
-        let one_row = move_visual_rows(&document, start, width, 1);
+        let one_row = move_visual_rows(&document, start, width, TYPE, 1);
         assert_eq!(one_row.visual_row, 1, "wheel motion stays intra-block");
 
         let mut paged = start;
         for _ in 0..80 {
-            paged = move_visual_rows(&document, paged, width, 14);
+            paged = move_visual_rows(&document, paged, width, TYPE, 14);
         }
         assert!(
             paged.visual_row >= 900,
@@ -2451,13 +3105,14 @@ mod tests {
             paged.visual_row,
             width,
             320.0,
+            TYPE,
         );
         assert_eq!(visible.blocks[0].index, 0);
         assert_eq!(visible.blocks[0].visual_row, paged.visual_row);
 
-        let end = move_visual_rows(&document, start, width, isize::MAX);
+        let end = move_visual_rows(&document, start, width, TYPE, isize::MAX);
         assert_eq!(end.visual_row, rows - 1);
-        let back = move_visual_rows(&document, end, width, -1);
+        let back = move_visual_rows(&document, end, width, TYPE, -1);
         assert_eq!(back.visual_row, rows - 2);
 
         let source_end = move_source_lines(&document, 0, isize::MAX);
@@ -2475,7 +3130,7 @@ mod tests {
         let mut state = model.init_state();
         for step in 1..=6_i64 {
             let before = state.clone();
-            location = move_visual_rows(&document, location, 680.0, 1);
+            location = move_visual_rows(&document, location, 680.0, TYPE, 1);
             state.insert("actual_row", location.visual_row as i64);
             state.insert("expected_row", step);
             state.insert("steps", step);

@@ -336,13 +336,6 @@ mod tests {
                 2,
             ),
             (
-                "gemini",
-                crate::gemini::fixtures::REPLY_WRAPPED_50,
-                second,
-                last,
-                2,
-            ),
-            (
                 "muse",
                 crate::muse::fixtures::REPLY_WRAPPED_50_1_4_10,
                 second,

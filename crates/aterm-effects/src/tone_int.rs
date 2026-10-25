@@ -94,32 +94,45 @@ pub const fn tanh(x: f64) -> f64 {
 
 /// Derive tone-int's params blob from a tone asset: its i8 tensors verbatim and MULT, b1, b2 and the tanh table by the fixed-point rules of design §12.2, checked by [`int_bag_mlp::check`].
 pub fn derive(asset: &[u8]) -> Result<Vec<u8>, DeriveError> {
+    const fn pow2(n: u32) -> f64 {
+        (1u32 << n) as f64
+    }
+    const fn fits(x: f64, what: &'static str, index: usize) -> Result<i64, DeriveError> {
+        match round_half_away(x) {
+            Some(v) => Ok(v),
+            None => Err(DeriveError::OutOfRange {
+                what,
+                index: index as u32,
+            }),
+        }
+    }
+    const fn narrow(v: i64, what: &'static str, index: usize) -> Result<i32, DeriveError> {
+        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+            Err(DeriveError::OutOfRange {
+                what,
+                index: index as u32,
+            })
+        } else {
+            Ok(v as i32)
+        }
+    }
     let raw = tone::raw(asset).map_err(DeriveError::Asset)?;
     let int8 = |tensor: Tensor, bytes: &[u8]| -> Result<Vec<i8>, DeriveError> {
-        if let Some(index) = bytes.iter().position(|&b| b == 0x80) {
-            return Err(DeriveError::Int8Min {
-                tensor,
-                index: index as u32,
-            });
+        let mut out = Vec::with_capacity(bytes.len());
+        for (index, &b) in bytes.iter().enumerate() {
+            if b == 0x80 {
+                return Err(DeriveError::Int8Min {
+                    tensor,
+                    index: index as u32,
+                });
+            }
+            out.push(b as i8);
         }
-        Ok(bytes.iter().map(|&b| b as i8).collect())
+        Ok(out)
     };
     let emb = int8(Tensor::Emb, raw.emb())?;
     let w1 = int8(Tensor::W1, raw.w1())?;
     let w2 = int8(Tensor::W2, raw.w2())?;
-    let pow2 = |n: u32| f64::from(1u32 << n);
-    let fits = |x: f64, what: &'static str, index: usize| {
-        round_half_away(x).ok_or(DeriveError::OutOfRange {
-            what,
-            index: index as u32,
-        })
-    };
-    let narrow = |v: i64, what: &'static str, index: usize| {
-        i32::try_from(v).map_err(|_| DeriveError::OutOfRange {
-            what,
-            index: index as u32,
-        })
-    };
     let mult = fits(
         f64::from(raw.emb_scale()) * f64::from(raw.w1_scale()) * pow2(F + G),
         "MULT",
@@ -129,29 +142,26 @@ pub fn derive(asset: &[u8]) -> Result<Vec<u8>, DeriveError> {
         what: "MULT",
         index: 0,
     })?;
-    let b1 = raw
-        .b1()
-        .iter()
-        .enumerate()
-        .map(|(k, &x)| narrow(fits(f64::from(x) * pow2(F), "b1", k)?, "b1", k))
-        .collect::<Result<Vec<i32>, _>>()?;
+    let mut b1 = [0i32; tone::HIDDEN];
+    for (k, &x) in raw.b1().iter().enumerate() {
+        b1[k] = narrow(fits(f64::from(x) * pow2(F), "b1", k)?, "b1", k)?;
+    }
     let s2 = f64::from(raw.w2_scale());
-    let b2 = raw
-        .b2()
-        .iter()
-        .enumerate()
-        .map(|(c, &x)| narrow(fits(f64::from(x) * 127.0 / s2, "b2", c)?, "b2", c))
-        .collect::<Result<Vec<i32>, _>>()?;
-    let lut = (0..=2 * T)
-        .enumerate()
-        .map(|(i, at)| {
-            let v = fits(127.0 * tanh(f64::from(at - T) / pow2(F)), "lut", i)?;
-            i8::try_from(v).map_err(|_| DeriveError::OutOfRange {
-                what: "lut",
-                index: i as u32,
-            })
-        })
-        .collect::<Result<Vec<i8>, _>>()?;
+    let mut b2 = [0i32; tone::TONE_COUNT];
+    for (c, &x) in raw.b2().iter().enumerate() {
+        b2[c] = narrow(fits(f64::from(x) * 127.0 / s2, "b2", c)?, "b2", c)?;
+    }
+    let lut_len = (2 * T + 1) as usize;
+    let mut lut = Vec::with_capacity(lut_len);
+    let inv_pow2_f = 1.0 / pow2(F);
+    for (i, at) in (0..=2 * T).enumerate() {
+        let v = fits(127.0 * tanh(f64::from(at - T) * inv_pow2_f), "lut", i)?;
+        let q = i8::try_from(v).map_err(|_| DeriveError::OutOfRange {
+            what: "lut",
+            index: i as u32,
+        })?;
+        lut.push(q);
+    }
     let bytes = int_bag_mlp::build(&Spec {
         dims: DIMS,
         min_ids: MIN_IDS,
@@ -252,31 +262,39 @@ pub struct Line {
 
 /// The workload: every corpus line then every held-out line, in file order, as [`tone::parse_corpus_line`] reads them.
 pub fn workload() -> Vec<Line> {
-    let lines = |tsv: &'static str, held_out: bool| {
-        tsv.lines().filter_map(move |l| {
-            let (tone, lang, text) = tone::parse_corpus_line(l)?;
-            Some(Line {
-                tone,
-                lang,
-                text,
-                held_out,
-            })
-        })
-    };
-    lines(CORPUS_TSV, false)
-        .chain(lines(HOLDOUT_TSV, true))
-        .collect()
+    let mut out = Vec::with_capacity(WORKLOAD_LINES);
+    for (tsv, held_out) in [(CORPUS_TSV, false), (HOLDOUT_TSV, true)] {
+        for l in tsv.lines() {
+            if let Some((tone, lang, text)) = tone::parse_corpus_line(l) {
+                out.push(Line {
+                    tone,
+                    lang,
+                    text,
+                    held_out,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The workload's texts, in order.
 pub fn texts() -> Vec<&'static str> {
-    workload().iter().map(|l| l.text).collect()
+    let lines = workload();
+    let mut out = Vec::with_capacity(lines.len());
+    for l in lines {
+        out.push(l.text);
+    }
+    out
 }
 
 /// `Digest::of(WORKLOAD_DOMAIN, [each workload text])`.
 pub fn workload_digest() -> Digest {
     let texts = texts();
-    let parts: Vec<&[u8]> = texts.iter().map(|t| t.as_bytes()).collect();
+    let mut parts = Vec::with_capacity(texts.len());
+    for t in &texts {
+        parts.push(t.as_bytes());
+    }
     Digest::of(WORKLOAD_DOMAIN, &parts)
 }
 

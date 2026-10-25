@@ -92,12 +92,13 @@ impl BreakLine {
 
 /// Returns the first write-time hold on a due `line`, if any: the break's line gone, the host's
 /// withhold, then the upgrade's notice due (rank 3, which every nudge and the stuck fact wait
-/// for).
+/// for; a wake's line goes over it, the model's `due == 2 || upg == 0`).
 #[must_use]
 pub fn write_held(line: impl Into<BreakLine>, w: AtWrite) -> Option<Guard> {
     use super::fault::{Fault, armed};
     let waits = match line.into() {
         BreakLine::Rule(RuleId::WaitNudge | RuleId::HoldRoom) => !armed(Fault::NudgeOverNotice),
+        BreakLine::Rule(RuleId::Wake) => false,
         BreakLine::Stuck => !armed(Fault::StuckOverNotice),
     };
     [
@@ -355,6 +356,19 @@ pub fn outcome_reason(
     }
 }
 
+/// The reason of a `fact-wake@v1` row `waiting` for wake `ord` of `episode` told by the agent's
+/// own `await wake`, the loop having seen a turn run after its answer (the slice-2 plan's S2,
+/// "heard"): `rule=wake@v1 episode=<hex> ord=<n> told door=await`. Nothing was typed;
+/// [`seed_rows_in`] reads it as [`SeedOutcome::Answered`].
+#[must_use]
+pub fn wake_heard_reason(ord: u16, episode: u64) -> String {
+    format!(
+        "rule={} episode={episode:016x} ord={ord} told door={}",
+        super::wakes_seen::WAKE_RULE,
+        super::wakes_seen::WakeDoor::Await.word()
+    )
+}
+
 /// The task door's mark: every row the occupancy loop books for a managed session's fact word
 /// carries it (intent, outcome, clear and, under `observe`, the would-be note), and no reader of
 /// the typed door's rows ([`seed_rows_in`], [`break_lines_in`], `rules::would_rows_in`, the
@@ -474,8 +488,9 @@ pub fn task_clear_reason(word: super::FactWord, outcome: super::NoteOutcome) -> 
 
 /// Extracts the fact rows for `sid` from ledger `body`, oldest first, for
 /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its
-/// `kind=` word names (the hold where none), and each kind's `typed` or `skipped` row, but none
-/// of the task door's rows ([`is_task_row`]).
+/// `kind=` word names (the hold where none), each kind's `typed` or `skipped` row, and a wake's
+/// `waiting` row told by its await ([`wake_heard_reason`]), but none of the task door's rows
+/// ([`is_task_row`]).
 #[must_use]
 pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, SeedOutcome)> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
@@ -514,6 +529,12 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
             (Some(rule), Some(decision)) => match (FactKind::of_rule(rule), decision) {
                 (Some(kind), "typed") => (kind, SeedOutcome::Typed),
                 (Some(kind), "skipped") => (kind, SeedOutcome::Skipped),
+                (Some(FactKind::Wake), "waiting")
+                    if reason.split(' ').any(|w| w == "told")
+                        && word("door=") == Some(super::wakes_seen::WakeDoor::Await.word()) =>
+                {
+                    (FactKind::Wake, SeedOutcome::Answered)
+                }
                 _ => continue,
             },
             _ => continue,

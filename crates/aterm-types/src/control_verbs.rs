@@ -836,7 +836,7 @@ pub const VERBS: &[VerbSpec] = &[
          denied: …` and closes the connection. Under `[fleet] allow = \"drive\"`, a node named by \
          `aterm fleet allow drive --from` and proved by its key also runs, as Owner, `@<sid> \
          status|text|screen|result|turn|key|send` on a hosted session, `hold <sid> on|off`, \
-         `spawn agent=<claude|codex|gemini|agy|muse>` with its task, `await task`, and `@<sid> close` \
+         `spawn agent=<claude|codex|agy|muse>` with its task, `await task`, and `@<sid> close` \
          on a worker it spawned (`aterm help fleet`).",
     )
     .input(Input::NONE)
@@ -1614,7 +1614,8 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "security-posture [list|off|<name>]: Settings ▸ Security's posture source",
         "— bare, answers `OK posture=<host|off|name> views=<n>`: where Settings ▸ Security reads \
-         its macOS access posture, and how many views draw it. `security-posture list` answers \
+         its macOS access posture (the MACOS ACCESS block, the DEVELOPER TOOLS card and the \
+         debugger row), and how many views draw it. `security-posture list` answers \
          `OK postures=<name>,…`. `security-posture <name|off>` stages a fixture or restores \
          `off` (`dev-seams` builds, headless only; a staged button calls no OS API).",
     )
@@ -1645,7 +1646,7 @@ pub const VERBS: &[VerbSpec] = &[
          (with `\"done\"` tab states) and `menu (none)`. On Windows a `strip-version \
          shown=<yes|no> …` line reports the tab-strip version label (`cols=` for `pointer move -1 \
          <col>`, `action=`, or `reason=no-strip|not-laid-out|no-ui-face|strip-full`). One \
-         `autopilot sid=<sid> window=<id> program=<claude|agy|muse|gemini|codex> \
+         `autopilot sid=<sid> window=<id> program=<claude|agy|muse|codex> \
          face=<cruise|cruise-until|land|landed|theirs|off|master-off|agent-off|unhosted|-> \
          drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer|switch-only> \
          spoken=\"<label>\"|spoken=- description=\"<words>\"|description=-` line per supervised \
@@ -1822,7 +1823,16 @@ pub const VERBS: &[VerbSpec] = &[
          row. SUPERVISOR: `meta set supervisor <holder> [ttl=<1..600000>]` / `meta unset \
          supervisor [holder=<holder>]` (Owner-only; `ERR busy supervisor=<holder>` while another \
          holds it) quiets menu-bar and desktop alerts while the supervisor handles prompts \
-         (`supervisor_proven=1`: a direct foreground `codex-alab@<pid>` connection). HARNESS_ACT: \
+         (`supervisor_proven=1`: a direct foreground `codex-alab@<pid>` connection, or a \
+         contract 3 claim). CONTRACT 3: `meta set supervisor <id>@<pid> contract=3 \
+         scope=<relaunch|upgrade|turn-end|approvals|questions|walls>[,…] \
+         [version=<MAJOR.MINOR.0[+meta]>] [vendor=<version>]` claims a session for a rostered \
+         harness (`grok-alab`: scope `relaunch,upgrade`), bound to its connection and proven or \
+         refused whole (`ERR unproven`: the claimant is not the direct peer that leads the \
+         foreground group on a build of its program from atpkg's store or its dev link; `ERR \
+         usage`: a scope word unknown or outside the row); aterm's built-in engine stands down \
+         from exactly its scope; a rostered holder never claims without `contract=3`, and an \
+         unrostered one's is an ordinary claim, never proven. HARNESS_ACT: \
          `meta set harness_act <act> [until_us=<n>]` and `meta prepare harness_act` (`OK \
          until_us=<n> lease_ms=5000`; `ERR expired harness_act`, `ERR busy harness_act`) record a \
          proven self-claim's act (`timeline` `harness-act act= holder=`, `status last_act=`). \
@@ -1844,7 +1854,10 @@ pub const VERBS: &[VerbSpec] = &[
         "— read-only `[harness]` policy for a self-supervising agent (`meta` \
          `supervisor_proven=1`). `gen=` is the policy generation (`EVENT <local> harness-policy \
          gen=<n>`); `effective=` and `why=` give this session's verdict \
-         (`unhosted|disabled|headless|agent-off|suspended|hold|autopilot-off|enabled`). Followed \
+         (`unhosted|disabled|headless|agent-off|suspended|hold|autopilot-off|enabled`), for the \
+         agent a rostered harness runs when one leads the session (Grok Build under grok-alab); \
+         `contract=` is the set of harness contracts served (2: codex-alab's self-claim, 3: a \
+         rostered harness's scoped `meta set supervisor`). Followed \
          by every `[harness]` key (pct-encoded, `-` when empty, `continue_text=` composed with \
          `rules_file`; `autopilot=` is the table default while the session's word is `status \
          autopilot=`), `questions=<ask|recommended|long-term|short-term>`, and the composed \
@@ -1892,8 +1905,9 @@ pub const VERBS: &[VerbSpec] = &[
          agent_rev= agent_since_ms= agent_gen= agent_fp= \
          program_state=<idle|working|blocked|done|error>[:<permission|question|auth>] \
          program_state_ms= last_act=` (`agent_detail=bash:read-only` is the read-only rule's \
-         advisory verdict on a Bash box's command alone; `program_state=` is a codex's own OSC \
-         7501 report, a claim beside an `agent=` it never moves, `-` under any other program, and \
+         advisory verdict on a Bash box's command alone; `program_state=` is the root OSC 7501 \
+         report of the program in front when it names that program (a codex's `app=codex`, a Grok \
+         Build's `app=grok-build`), a claim beside an `agent=` it never moves, `-` otherwise, and \
          `program_state_ms=` how long it has stood, counted through sleep as the survey's \
          `agent_ms=` is; `agent_since_ms=` and `human_ms=` stop while the Mac sleeps, so across \
          a sleep it is not comparable with them). Theme: `os_appearance= theme_side= reported_scheme= \
@@ -2820,13 +2834,15 @@ pub const VERBS: &[VerbSpec] = &[
          connected=controlled|controller place=window|tab of=<sid> [cwd=<path>]` mints a `both` \
          connection with `of=<sid>` (`controller` sets `ATERM_OBSERVE_SESSION_ID`; `place=window` \
          is `ERR headless` without a GUI). Worker form (Owner-only): `spawn … \
-         agent=<claude|codex|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
+         agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
          len=<n>` replies `GO <n>`, reads `<n>` task bytes (`1..=65536`, no NUL; `ERR spawn \
-         agent=<word>: the task is <n> bytes (max 65536)` beyond; `aterm ctl spawn agent=<word> \
+         agent=<word>: the task is <n> bytes (max 65536)` beyond; `agent=gemini`, the retired \
+         Gemini CLI, is `ERR spawn agent=gemini: Gemini CLI is no longer supported: agy replaces \
+         it (agent=agy)`; `aterm ctl spawn agent=<word> \
          [model=<m>] [cwd=<p>] -` reads stdin), writes `<state>/tasks/` (`ATERM_TASK_FILE`), and \
          at the login shell's (`zsh`/`bash`/`fish`) first prompt launches the interactive agent \
-         (`--prompt-interactive=` for `gemini`/`agy`, `GEMINI_CLI_TRUSTED_FOLDERS_PATH=` for \
-         `gemini`, `--trust-workspace` for `muse`; `codex` is codex-alab, which carries the \
+         (`--prompt-interactive=` for `agy`, `--trust-workspace` for `muse`; `codex` is \
+         codex-alab, which carries the \
          session itself, `supervisor_proven=1`, and whose landing marks `task` `done \
          why=landed` with its rollout's report). Sets `task` to `working` (`from=<sid|ctl>`) \
          and `autopilot` to `land` (or `autopilot=cruise`; `meta set autopilot land` switches \
@@ -2861,7 +2877,7 @@ pub const VERBS: &[VerbSpec] = &[
         "task [mark <state> …]: a worker's task record: OK task rev= state= from= since_ms=",
         "— `result_bytes= [why=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
          attention=` (or `OK task -` when the session has no task; `program_state=` is `status \
-         program_state=`, a codex's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
+         program_state=`, a codex's or Grok Build's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
          harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
          (`why=startup|shell|held`; it resumes `working why=moved` or `working why=turn`). `why=` \
@@ -2886,7 +2902,7 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "result [full]: a worker's result, the report it ended its task with",
         "— replies `OK <n> source=transcript session=<id> uuid=<row> bytes=<n>` (or `OK <n> \
-         source=screen program=<agent> bytes=<n>` for Gemini CLI, agy and Muse Code, `OK <n> \
+         source=screen program=<agent> bytes=<n>` for agy and Muse Code, `OK <n> \
          source=rollout thread=<id> turn=<id> bytes=<n>` for codex-alab) followed by `<n>` lines \
          (up to 24000 chars, ending with `… truncated; full: <path>` when truncated; `result \
          full` adds `full=1` and returns the full transcript exchange since the task prompt, \
@@ -3313,10 +3329,10 @@ pub const VERBS: &[VerbSpec] = &[
          `detail=<pct|->`, `path=<frozen|live>`, `program=<name|-> agent=<word|-> \
          agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> \
          agent_fp=<hex16|->`, `program_state=<idle|working|blocked|done|error>[:<permission|\
-         question|auth>]|-` (a codex's own report, as `status program_state=`: a claim beside \
+         question|auth>]|-` (a codex's or Grok Build's own report, as `status program_state=`: a claim beside \
          `agent=`), `human_ms=<ms|->`, `role=<pct|-> attention=<pct|-> user_title=<pct|->`, \
          `supervisor=<pct|-> supervisor_proven=<0|1>` (`1`: the live claim is a proven \
-         self-claim, as `status` prints it), `autopilot=<off|cruise|land|->`, \
+         self-claim or contract 3 claim, as `status` prints it), `autopilot=<off|cruise|land|->`, \
          `path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`, `copy=<managed|foreign|->`, \
          `upgrade=<-|<state>/<to>/<why>/<age>>`, `land_at=<unix-s|-> task=<open|landed|theirs|-> \
          pause=<unix-s|->`, and `task_state=<working|done|exited|stalled|-> task_rev=<n>`. \

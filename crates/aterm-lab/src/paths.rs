@@ -53,9 +53,15 @@ pub const FORGET_PREFIXES: &[&str] = &[
     "TBH_",
 ];
 
-/// Whether the variable `key` is one a lab forgets.
+/// Whether the variable `key` is one a lab forgets: every one a calling shell's aterm, agent or
+/// package manager sets ([`FORGET_PREFIXES`]), but the directory where the ceiling over this run
+/// reads its waits for the lane or for room ([`aterm_toolchain::waits::VAR`]), which verify sets
+/// for this run alone.
 #[must_use]
 pub fn forgotten(key: &str) -> bool {
+    if key == aterm_toolchain::waits::VAR {
+        return false;
+    }
     let proxy = key.split_once('_').is_some_and(|(head, tail)| {
         !head.is_empty()
             && head.chars().all(|c| c.is_ascii_alphabetic())
@@ -518,6 +524,7 @@ mod tests {
         }
         for k in [
             "LAB_ATERM",
+            aterm_toolchain::waits::VAR,
             "HOME",
             "PATH",
             "AI_AGENTX",

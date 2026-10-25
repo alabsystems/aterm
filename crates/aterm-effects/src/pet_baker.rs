@@ -223,8 +223,8 @@ fn paint_eye_dots(
     let near_cx = eye_meta.near_cx;
     let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
-    let sx_eps = xform.scale_x.max(f32::EPSILON);
-    let sy_eps = xform.scale_y.max(f32::EPSILON);
+    let half_inv_sx = 0.5 / xform.scale_x.max(f32::EPSILON);
+    let half_inv_sy = 0.5 / xform.scale_y.max(f32::EPSILON);
     const fn fx(v: f32) -> u16 {
         (v * (FIXED_ONE as f32))
             .round()
@@ -310,8 +310,8 @@ fn paint_eye_dots(
             let allowed_w = allowed_w.max(core_min_w_px);
             let plug_w = EYE_DASH_CORE_PX.min(w_px * kx).min(allowed_w);
             let plug_h = EYE_DASH_CORE_PX.min(h_px * ky);
-            let hw = plug_w * 0.5 / sx_eps;
-            let hh = plug_h * 0.5 / sy_eps;
+            let hw = plug_w * half_inv_sx;
+            let hh = plug_h * half_inv_sy;
             let (x_lo, x_hi, y_lo, y_hi) = (fx(gx - hw), fx(gx + hw), fx(cy - hh), fx(cy + hh));
             let plug = [
                 PathSeg::Move(x_lo, y_lo),
@@ -593,7 +593,10 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
             self.tile_scratch = None;
             return;
         }
-        self.tile_scratch = self.slots.pop().map(|s| s.tile);
+        self.tile_scratch = match self.slots.pop() {
+            Some(s) => Some(s.tile),
+            None => None,
+        };
         self.slots.clear();
         self.bytes = 0;
         self.version = self.version.wrapping_add(1);
@@ -635,9 +638,13 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
         if want > MAX_ATLAS_BYTES {
             return None;
         }
-        if let Some(i) = self.slots.iter().rposition(|s| s.key == *key) {
-            self.slots[i].last_used = self.clock;
-            return Some(self.slots[i].tile.pixels());
+        let mut i = self.slots.len();
+        while i > 0 {
+            i -= 1;
+            if self.slots[i].key == *key {
+                self.slots[i].last_used = self.clock;
+                return Some(self.slots[i].tile.pixels());
+            }
         }
         if self.bakes_left == 0 {
             return None;

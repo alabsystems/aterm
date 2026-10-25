@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{
-    Access, FAILED_FOR_GOOD, FailureKind, Group, Observation, PassOutcome, Plan, PutBack,
-    RestoreOutcome, Selection, Setting, Standing, Subject, TRIED_TWICE, Unfinished,
+    Access, FailureKind, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome, Selection,
+    Setting, Standing, Subject, TRIED_TWICE, Unfinished,
 };
 
 use crate::native_app::{
@@ -32,7 +32,7 @@ use crate::native_ui::{
     Length, SemanticRole, SemanticValue, StyleRef, TextFieldSpec, TextSpec, UiContent, UiKey,
     UiNode, UiTree,
 };
-use crate::workstation_setup::{Request, SetupAnswer, WorkstationSetupDecision};
+use crate::workstation_setup::{OfferKind, Request, SetupAnswer, WorkstationSetupDecision};
 
 pub(crate) use paint::{BrandSpec, Chip, paint_brand, paint_chip, paint_meter};
 
@@ -42,6 +42,9 @@ pub struct SetupStatus {
     pub plan: Option<Plan>,
     pub check: Option<SetupCheck>,
     pub permissions: Option<InitialSetupPermissionPolicy>,
+    /// The exact current setup run's durable admission, separately from its
+    /// carried Permissions approval. Unknown reads supply no run policy.
+    pub run: Option<InitialSetupRunPolicy>,
     pub busy: bool,
     pub finished: bool,
     /// The plan in force is one aterm chose by itself, which a look that finds the ALab
@@ -91,6 +94,14 @@ pub struct SetupStatus {
     /// could not read (§3.5): every Mac preference group left as is, aterm's own permissions
     /// set up. The page says so in one calm note until a person chooses. Filled by the worker.
     pub recovered: bool,
+    /// A person's Cancel of the first-launch review stands (§3.3): every group reads Leave as
+    /// is, nothing runs, and the page says so in one calm line beside Set up now, which applies
+    /// the plan the review showed ([`CANCELLED_NOTE`]). Filled by the worker.
+    pub cancelled: bool,
+    /// The person closed this launch's review unanswered and no run is admitted (§3.3): the
+    /// page shows the plan the review showed with Set up now, calm, and lights nothing for the
+    /// permissions nobody approved: no Needs you, no diamond, no menu line. Filled by the worker.
+    pub unanswered: bool,
 }
 
 /// A read-only Check again or a Restore the window started: the worker is
@@ -116,6 +127,14 @@ pub struct InitialSetupPermissionPolicy {
     pub allowed: bool,
 }
 
+/// Whether this exact setup run remains admitted and not durably stopped.
+/// This grants no permission gesture or access approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialSetupRunPolicy {
+    pub revision: u64,
+    pub allowed: bool,
+}
+
 /// One result an observation cannot express (a refused action, a stage
 /// error), with no credential values.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,10 +156,9 @@ pub(crate) struct Failure {
     /// A Check's result: a read, whose remedy is pressing Check again, so the page's note alone
     /// says it (§3.6), never the headline, the menu line or the tab's attention.
     pub(crate) check: bool,
-    /// What kind of failure it is (§3.6): one its source says no retry changes is failed for
-    /// good; one naming a row whose reading needs a person is that person's, which the row and
-    /// the headline say as needing you, never as a failure or a wait; any other is transient,
-    /// which aterm tries again while its tries last.
+    /// What kind of failure it is (§3.6): one naming a row whose reading needs a person is that
+    /// person's, which the row and the headline say as needing you, never as a failure or a
+    /// wait; any other is transient, which aterm tries again while its tries last.
     pub(crate) kind: FailureKind,
     /// aterm tries it again by itself (a transient failure whose words say so, or one the run
     /// still retries and whose tries are not spent): the page counts it as waiting (§3.2) and
@@ -259,8 +277,8 @@ impl SetupStatus {
     }
 
     /// The steps the last run could not finish (a stage error, a join the
-    /// vault refused, a change that did not land, a step that failed for good), each with the
-    /// row it names, if one: failures, which the menu line and the tab's attention
+    /// vault refused, a change that did not land), each with the row it
+    /// names, if one: failures, which the menu line and the tab's attention
     /// say as they say a row that failed (§3.6), besides the page's notes,
     /// once nothing tries them again by itself (the run's retries, or a vault try on its own
     /// pause, [`Failure::retried`]) and no row they name needs a person
@@ -279,8 +297,8 @@ impl SetupStatus {
 
     /// Whether the GitHub repositories, which the plan in force manages, need a person (§3.6):
     /// a token the vault has not got, or one GitHub refuses. Their remedy is the vault's, which
-    /// tells the page nothing, so a shown page reads them again by itself
-    /// ([`crate::system_state_host::PERSON_REREAD`]).
+    /// tells the page nothing, so a shown page looks for a renewed token by itself
+    /// ([`crate::system_state_host::TOKEN_LOOK`]).
     pub(crate) fn github_needs_person(&self) -> bool {
         let repositories = Subject::Setting(Setting::Repositories);
         self.plan.as_ref().is_some_and(|plan| {
@@ -332,6 +350,9 @@ impl SetupStatus {
     /// leave it out.
     fn notes(&self, plan: &Plan) -> Vec<String> {
         let mut notes = Vec::new();
+        if self.cancelled {
+            notes.push(CANCELLED_NOTE.to_owned());
+        }
         if self.queued {
             notes.push(self.queued_note().to_owned());
         }
@@ -355,15 +376,20 @@ impl SetupStatus {
             {
                 continue;
             }
+            // A calm line the headline or a row says already: no line says a thing twice.
+            if result.row.status == NOTED && self.said_elsewhere(plan, &result.row.detail) {
+                continue;
+            }
             match result.row.status.as_str() {
-                "not started" | "error" | "failed" | "unverified" | "restored" | NOTED
-                | FAILED_FOR_GOOD => match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
-                    Some((_, names)) if !names.contains(&result.name) => {
-                        names.push(result.name);
+                "not started" | "error" | "failed" | "unverified" | "restored" | NOTED => {
+                    match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
+                        Some((_, names)) if !names.contains(&result.name) => {
+                            names.push(result.name);
+                        }
+                        Some(_) => {}
+                        None => alike.push((result, vec![result.name])),
                     }
-                    Some(_) => {}
-                    None => alike.push((result, vec![result.name])),
-                },
+                }
                 "login" if !at_login.contains(&result.row.name) => {
                     at_login.push(result.row.name.clone());
                 }
@@ -416,6 +442,18 @@ impl SetupStatus {
 pub(crate) const WIDENED_NOTE: &str =
     "aterm found the ALab vault on this network, so it is setting up the rest of this Mac.";
 
+/// The calm line while a person's Cancel of the first-launch review stands
+/// ([`SetupStatus::cancelled`]), beside Set up now.
+pub(crate) const CANCELLED_NOTE: &str =
+    "Setup was cancelled. Set up now applies the setup the review showed.";
+
+/// The headline while the review a person closed this launch waits for an answer
+/// ([`SetupStatus::unanswered`]), beside Set up now.
+pub(crate) const NOT_STARTED: &str = "Setup has not started";
+
+/// The calm line while a review shows the profile this Mac's ALab signal added (§3.5).
+pub(crate) const ALAB_ADDED_NOTE: &str = "This Mac is an ALab Mac, so its profile was added.";
+
 /// The calm note while a person's choice waits for another setup ([`SetupStatus::queued`]).
 pub(crate) const QUEUED_CHOICE_NOTE: &str =
     "Another setup is running; aterm applies your choice when it finishes.";
@@ -457,6 +495,37 @@ impl SetupStatus {
                 .rows
                 .iter()
                 .any(|row| row.name == SETUP_ROW && row.status == NOTED)
+    }
+
+    /// A newer aterm's saved setup is in force ([`NEWER_SETUP_NOTE`]): this aterm can read the
+    /// Mac's rows but names no plan, so it chooses nothing and changes nothing (§3.2).
+    pub(crate) fn newer(&self) -> bool {
+        self.plan.is_none()
+            && self.rows.iter().any(|row| {
+                row.name == SETUP_ROW && row.status == NOTED && row.detail == NEWER_SETUP_NOTE
+            })
+    }
+
+    /// Whether the calm line `words` says what the page says elsewhere (§3.6): a newer aterm's
+    /// setup, which its headline says ([`NEWER_HEADLINE`]), and aterm's not reading this Mac's
+    /// vault settings, a Join refused for them ([`VAULT_UNREAD_NOTE`]) or the launch's Join left
+    /// undone by them ([`VAULT_NOT_JOINED_NOTE`]), while the Secrets vault row `plan` shows
+    /// keeps that reason as its own note.
+    fn said_elsewhere(&self, plan: &Plan, words: &str) -> bool {
+        match words {
+            NEWER_SETUP_NOTE => self.newer(),
+            VAULT_UNREAD_NOTE | VAULT_NOT_JOINED_NOTE => row_view_for_source(
+                Subject::Setting(Setting::Secrets),
+                self,
+                plan.selection,
+                Some(&plan.vault_url),
+            )
+            .note
+            .is_some_and(|note| {
+                note.trim_end_matches('.') == VAULT_UNREAD_NOTE.trim_end_matches('.')
+            }),
+            _ => false,
+        }
     }
 
     /// A setup run that did not finish as a whole (no row named), or a launch's setup that could
@@ -867,8 +936,7 @@ impl Said<'_> {
     /// still manages them), as it starts a setup run that could not go ([`SETUP_ROW`]) again.
     /// A step aterm tries again by itself (`retried`, [`SetupStatus::retries_by_itself`]) is
     /// no failure: it did not finish this time, for the reason it carries if one, and aterm tries
-    /// again by itself (§3.5). A step that failed for good says its reason, which no press
-    /// changes, or else where to learn why ([`FOR_GOOD_NOTE`]), never Set up now.
+    /// again by itself (§3.5).
     fn words(&self, names: &[&str], retried: bool, managed: bool) -> String {
         if self.whole() {
             return self.row.detail.clone();
@@ -890,12 +958,11 @@ impl Said<'_> {
         let step = managed || names == [SETUP_ROW];
         let failed_step = step && !self.check && matches!(status, "error" | "failed");
         let retried = failed_step && retried;
-        let for_good = status == FAILED_FOR_GOOD;
         let what = match status {
             _ if retried => format!("{list} did not finish this time."),
             "unverified" if self.check => format!("Check again could not confirm {list}."),
             "not started" => format!("{list} did not start."),
-            "error" | "failed" | FAILED_FOR_GOOD => format!("{list} failed."),
+            "error" | "failed" => format!("{list} failed."),
             "unverified" => format!("{list} could not be confirmed."),
             "restored" => format!("{list} finished."),
             other => format!("{list}: {other}."),
@@ -907,8 +974,6 @@ impl Said<'_> {
             Some(RETRIES_NOTE)
         } else if !self.row.detail.is_empty() {
             Some(self.row.detail.as_str())
-        } else if for_good {
-            Some(FOR_GOOD_NOTE)
         } else if failed_step {
             Some(SET_UP_NOW_NOTE)
         } else {
@@ -923,6 +988,18 @@ impl Said<'_> {
 
 /// The headline while rows are read: a Check going, or readings still to come.
 const CHECKING: &str = "Checking this Mac…";
+
+/// The headline while the first launch's review waits for Apply or Cancel (§3.3): the only
+/// signal it gives, since the tab is in front; no diamond, no menu line.
+pub(crate) const REVIEW_HEADLINE: &str = "Review this Mac's setup";
+
+/// The headline while a newer aterm's setup is in force ([`SetupStatus::newer`]): calm, and the
+/// one line that says why the groups, Set up now and Restore are not this aterm's to press.
+pub(crate) const NEWER_HEADLINE: &str = "A newer aterm manages this Mac's setup";
+
+/// What the first launch's review says above its buttons, while it counts down and once a
+/// click stopped it (§3.3).
+pub(crate) const REVIEW_NOTE: &str = "Apply sets up this Mac as shown; Cancel leaves it as it is.";
 
 /// The headline while a setup run that did not finish as a whole waits for aterm to try it
 /// again by itself (§3.5), and no row waits.
@@ -954,17 +1031,19 @@ pub const RESTORE_BACKUP_UNREAD_NOTE: &str =
 pub const STATE_UNREAD_NOTE: &str =
     "aterm could not read its saved setup just now; it reads it again by itself.";
 
-/// What the page says while a newer aterm's saved setup is in force (one built later, beside
+/// What the worker says while a newer aterm's saved setup is in force (one built later, beside
 /// this one, which set this Mac up since): this aterm reads none of it and changes nothing of
 /// it, and a read again says the same until that aterm, or a person's choice in it, changes it.
-/// A calm line ([`calm_setup_row`]); the log keeps why.
+/// A calm line ([`calm_setup_row`]) that the page says once, as its headline
+/// ([`NEWER_HEADLINE`]); the log keeps why.
 pub const NEWER_SETUP_NOTE: &str =
     "A newer aterm set up this Mac; this aterm leaves its setup as it is.";
 
 /// What the page says when a Join was refused because aterm cannot read this Mac's vault settings
 /// (a root-owned or newer-format vault configuration): the Join changed nothing, the typed vault
 /// stays in its field for a Join once they read, and `aterm secrets status` says why. A calm line
-/// ([`calm_setup_row`]); the log keeps the file and the error.
+/// ([`calm_setup_row`]), left out while the Secrets vault row says it as its own note; the log
+/// keeps the file and the error.
 pub const VAULT_UNREAD_NOTE: &str =
     "aterm cannot read this Mac's vault settings; aterm secrets status says why.";
 
@@ -972,7 +1051,7 @@ pub const VAULT_UNREAD_NOTE: &str =
 /// Join because aterm cannot read this Mac's vault settings: aterm's own permissions and every
 /// other group went ahead, the vault was not joined, and the typed vault stays in its field for
 /// a Join once they read. A calm line ([`calm_setup_row`]) for as long as the Secrets row reads
-/// so.
+/// so, which the page leaves out while that row's own note says why.
 pub const VAULT_NOT_JOINED_NOTE: &str = "aterm did not join the vault you typed: it cannot read \
                                          this Mac's vault settings; aterm secrets status says \
                                          why.";
@@ -997,10 +1076,6 @@ pub fn calm_setup_row(words: &str) -> SetupStatusRow {
 /// words the worker's page gives a vault try on its own pause too
 /// ([`aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF`]).
 pub(crate) const RETRIES_NOTE: &str = aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF;
-
-/// What a step that failed for good says where its source gave no reason in the page's words
-/// (§3.6): no press changes it, so the note names where to learn why.
-pub(crate) const FOR_GOOD_NOTE: &str = "aterm doctor says why.";
 
 /// What a failed step's note says once the run no longer retries it: the headline's Set up now
 /// runs it again (§3.2).
@@ -1192,6 +1267,20 @@ fn row_view_for_source(
     selection: Selection,
     vault_url: Option<&str>,
 ) -> RowView {
+    row_view_as(subject, status, selection, vault_url, false)
+}
+
+/// [`row_view_for_source`], as the first launch's review shows it when `review` (§3.3): each row
+/// reads as what Apply will do, its value now and what it changes to. A row that would need a
+/// person once setup runs reads as one that will change, with its probe's note alone and no
+/// button: nothing waits on the person until setup runs and asks them.
+fn row_view_as(
+    subject: Subject,
+    status: &SetupStatus,
+    selection: Selection,
+    vault_url: Option<&str>,
+    review: bool,
+) -> RowView {
     let name = subject.name();
     let reading = status
         .observations_for(vault_url)
@@ -1280,6 +1369,11 @@ fn row_view_for_source(
     // be behind other windows.
     let asking = subject == Subject::Access(Access::Debugger)
         && status.access_step == Some(Access::Debugger);
+    // The review reads a row that will need a person as one that will change (§3.3).
+    let standing = match standing {
+        Some(Standing::NeedsYou) if review => Some(Standing::Differs),
+        standing => standing,
+    };
     let open = match subject {
         Subject::Access(access) if standing == Some(Standing::NeedsYou) && !asking => Some(access),
         _ => None,
@@ -1411,7 +1505,7 @@ fn row_view_for_source(
         }
         // A reading that failed keeps its reason in its note. While the run still retries it
         // waits for the next try (§3.5), as the headline and the village say: the waiting chip,
-        // never Failed, unless a step that failed for good says the row failed.
+        // never Failed, unless a step nothing tries again says the row failed.
         Some(Standing::Failed) => {
             note = reading.and_then(|o| o.detail.clone().or_else(|| o.note.clone()));
             if status.failures_signal() || step == Some(Chip::Failed) {
@@ -1488,6 +1582,39 @@ pub(crate) const UNCONFIRMED_NOTE: &str = "Not confirmed";
 /// The note of a row a run set for macOS to take up in full at the next login
 /// (Trackpad scrolling): it reads in place, and says when it is all in effect.
 pub(crate) const AT_LOGIN_NOTE: &str = "Fully in effect after your next login";
+
+/// Every row as it reads now and nothing more, in page order (§3.2): while a newer aterm's setup
+/// is in force ([`SetupStatus::newer`]) this aterm knows no plan, so no row is managed, wanted
+/// or due to change, and none has a chip, a note or a button. A row not read yet reads `—`.
+fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
+    Subject::all()
+        .into_iter()
+        .map(|subject| {
+            let reading = status
+                .observed
+                .iter()
+                .find(|observation| observation.subject == subject);
+            let now = reading
+                .and_then(|observation| observation.now.clone())
+                .filter(|now| !now.trim().is_empty());
+            let label = now.as_deref().map_or_else(
+                || format!("{}: not read", subject.name()),
+                |now| format!("{}: {}", subject.name(), now.replace(" · ", " ")),
+            );
+            RowView {
+                subject,
+                managed: false,
+                value: RowValue::One(now.unwrap_or_else(|| "—".to_owned())),
+                chip: None,
+                note: None,
+                open: None,
+                turn_on_sync: false,
+                standing: reading.map(|observation| observation.standing),
+                label,
+            }
+        })
+        .collect()
+}
 
 /// Every row of the page, in page order.
 pub(crate) fn rows(status: &SetupStatus, selection: Selection) -> Vec<RowView> {
@@ -1623,6 +1750,9 @@ impl Headline {
                         .setup_retried(None)
                         .then(|| Self::line(SETUP_RETRIED))
                 })
+                // A newer aterm's setup names no plan this aterm reads, now or later: its own
+                // calm line, never a check that does not end.
+                .or_else(|| status.newer().then(|| Self::line(NEWER_HEADLINE)))
                 .unwrap_or_else(|| Self::line(CHECKING)),
             _ => Self::line(CHECKING),
         }
@@ -1681,6 +1811,13 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             Access::Debugger.name()
         ));
     }
+    // A review closed unanswered (§3.3): nothing was approved, so no row needs anyone yet.
+    if status.unanswered && !status.busy {
+        return Headline {
+            start: true,
+            ..Headline::line(NOT_STARTED)
+        };
+    }
     let needs: Vec<&RowView> = rows
         .iter()
         .filter(|row| row.managed && row.standing == Some(Standing::NeedsYou))
@@ -1713,8 +1850,7 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         // transient step the last run tried and could not finish (a change that did not take, a
         // stage that failed, a vault try held after two), whose note says Set up now tries it
         // again. A reading that failed by itself names its own remedy in its note, which Set up
-        // now cannot give, and a step that failed for good is one no run changes: Show alone
-        // takes the person there.
+        // now cannot give: Show alone takes the person there.
         return Headline {
             show: Some(*first),
             start: failed.iter().any(|subject| steps.rerun.contains(subject)),
@@ -1780,7 +1916,11 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     let managed = rows.iter().filter(|row| row.managed).count();
     if managed == 0 {
-        return Headline::line("Everything is left as is");
+        // After a person's Cancel, Set up now applies the plan the review showed (§3.3).
+        return Headline {
+            start: status.cancelled,
+            ..Headline::line("Everything is left as is")
+        };
     }
     // A reading that ended without an answer (its reader unwound) says so in
     // its note: no check is under way for it, so the headline names it and
@@ -1860,9 +2000,9 @@ const AS_LAST_READ: &str = "as last read";
 /// draws ([`village_spec`]).
 struct Steps {
     /// Managed rows that failed: a reading that failed once the run no longer retries, or a step
-    /// the run could not finish that nothing tries again by itself, or one that failed for good
-    /// ([`Failure::failed`]). A Check's result is never one: a Check only reads. Nor is a step
-    /// whose row needs a person, which says so instead.
+    /// the run could not finish that nothing tries again by itself ([`Failure::failed`]). A
+    /// Check's result is never one: a Check only reads. Nor is a step whose row needs a person,
+    /// which says so instead.
     failed: Vec<Subject>,
     /// The failed rows Set up now can change: a transient step the last run tried and could not
     /// finish, whose note says Set up now tries it again.
@@ -1904,7 +2044,6 @@ impl Steps {
         let failed = managed(&|row| {
             (signal && row.standing == Some(Standing::Failed)) || stopped.contains(&row.subject)
         });
-        let rerun = named(&|failure| failure.failed() && failure.kind == FailureKind::Transient);
         let retried = managed(&|row| {
             !failed.contains(&row.subject)
                 && (retried.contains(&row.subject) || row.standing == Some(Standing::Failed))
@@ -1919,7 +2058,7 @@ impl Steps {
                 .iter()
                 .any(|failure| failure.check && failure.row.is_none()),
             failed,
-            rerun,
+            rerun: stopped,
             retried,
             unconfirmed,
         }
@@ -2362,6 +2501,15 @@ impl StartupReview {
         changed
     }
 
+    /// The review shows a widened plan (§3.5): its count starts again at 30 seconds, unless a
+    /// touch stopped it for good.
+    fn restart(&mut self) {
+        if !self.stopped {
+            self.remaining = Duration::from_secs(30);
+            self.last_active = None;
+        }
+    }
+
     fn tick(&mut self, now: Instant, active: bool) -> bool {
         if self.stopped || !active {
             self.last_active = None;
@@ -2399,6 +2547,12 @@ pub(crate) struct SystemStateApp {
     status: SetupStatus,
     request: Option<Request>,
     startup_review: Option<StartupReview>,
+    /// The launch's review shows the plan this Mac's ALab signal widened it to (§3.5).
+    review_widened: bool,
+    /// The groups of the launch's review the person cancelled, while the worker's status does
+    /// not say the Cancel stands yet: a status that still names them is one read before the
+    /// worker kept it, and the page keeps every group at Leave as is meanwhile (§3.3).
+    cancel_sent: Option<Selection>,
     actions: VecDeque<SystemStateAction>,
     /// Whether the gesture being handled is a person's (not a control client's).
     by_person: bool,
@@ -2460,6 +2614,8 @@ impl SystemStateApp {
             status: SetupStatus::default(),
             request: None,
             startup_review: None,
+            review_widened: false,
+            cancel_sent: None,
             actions: VecDeque::new(),
             by_person: false,
             anim_ticks: 0,
@@ -2485,13 +2641,66 @@ impl SystemStateApp {
         }
         self.plan = request.initial().clone();
         self.plan_known = true;
-        self.submitted = self.plan.clone();
+        // The review of the groups the ALab signal adds keeps the plan in force as the one the
+        // worker holds: a Cancel leaves its groups as they are (§3.5). The vault it offers is the
+        // worker's, never a draft of the person's.
+        self.submitted = match request.kind() {
+            OfferKind::Launch => self.plan.clone(),
+            OfferKind::Widen { in_force } => Plan {
+                selection: in_force.selection,
+                vault_url: self.plan.vault_url.clone(),
+            },
+        };
         self.url = TextInputState::new(self.plan.vault_url.clone());
         self.password = Password::default();
         self.status = SetupStatus::default();
         self.request = Some(request);
         self.startup_review = Some(StartupReview::new());
+        self.review_widened = false;
+        self.cancel_sent = None;
         true
+    }
+
+    /// Whether the review up is the one of the groups the ALab signal adds (§3.5).
+    fn reviewing_widen(&self) -> bool {
+        self.reviewing()
+            && self
+                .request
+                .as_ref()
+                .is_some_and(|request| matches!(request.kind(), OfferKind::Widen { .. }))
+    }
+
+    /// The worker heard this Mac's ALab signal while the launch's review is up (§3.5): an
+    /// untouched draft widens to `widened` in place, its count starts again at 30 seconds
+    /// unless a touch stopped it, and the page says why ([`ALAB_ADDED_NOTE`]). A draft the
+    /// person edited stays theirs, as it is. Whether the page changed.
+    fn widen_review(&mut self, widened: Plan) -> bool {
+        if !self.reviewing()
+            || self.reviewing_widen()
+            || self.plan != self.submitted
+            || self.vault_draft()
+        {
+            return false;
+        }
+        self.url = TextInputState::new(widened.vault_url.clone());
+        self.plan = widened.clone();
+        self.submitted = widened;
+        self.review_widened = true;
+        if let Some(review) = &mut self.startup_review {
+            review.restart();
+        }
+        true
+    }
+
+    /// The calm lines over the groups: why a review shows the ALab profile, then the
+    /// status's own ([`SetupStatus::notes`]).
+    fn notes(&self, plan: &Plan) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.review_widened || self.reviewing_widen() {
+            notes.push(ALAB_ADDED_NOTE.to_owned());
+        }
+        notes.extend(self.status.notes(plan));
+        notes
     }
 
     /// Take the worker's latest status. Its plan becomes the page's while
@@ -2502,8 +2711,22 @@ impl SystemStateApp {
             self.pause_review();
         }
         let mut changed = self.status != status;
+        // A status read before the worker kept the person's Cancel names the plan the review
+        // offered: the page keeps every group at Leave as is until one says the Cancel stands,
+        // or names another plan (a choice made meanwhile answered for the review).
+        let cancel_unheard = self.cancel_sent.is_some_and(|reviewed| {
+            !status.cancelled
+                && status
+                    .plan
+                    .as_ref()
+                    .is_none_or(|plan| plan.selection == reviewed)
+        });
+        if !cancel_unheard {
+            self.cancel_sent = None;
+        }
         if self.request.is_none()
             && self.awaiting.is_none()
+            && !cancel_unheard
             && let Some(plan) = &status.plan
         {
             if !self.plan_known || self.plan.selection != plan.selection {
@@ -2588,7 +2811,13 @@ impl SystemStateApp {
         {
             self.request = None;
             self.startup_review = None;
+            self.review_widened = false;
         }
+        let widened = self
+            .request
+            .as_ref()
+            .and_then(Request::take_widened)
+            .is_some_and(|widened| self.widen_review(widened));
         if self.reviewing()
             && self
                 .startup_review
@@ -2602,6 +2831,7 @@ impl SystemStateApp {
             walks
         };
         walked
+            || widened
             || before
                 != (
                     self.request.is_some(),
@@ -2642,12 +2872,15 @@ impl SystemStateApp {
         }
     }
 
+    /// A row as the page shows it: for the plan as reviewed, and, while the first launch's review
+    /// is up, as what Apply will do ([`row_view_as`]).
     fn reviewed_row(&self, subject: Subject) -> RowView {
-        row_view_for_source(
+        row_view_as(
             subject,
             &self.status,
             self.plan.selection,
             Some(self.url.value().trim()),
+            self.reviewing(),
         )
     }
 
@@ -2690,7 +2923,7 @@ impl SystemStateApp {
             return if self.status.busy {
                 Headline::before_plan(&self.status)
             } else {
-                Headline::line("Review this Mac's setup")
+                Headline::line(REVIEW_HEADLINE)
             };
         }
         if !self.plan_known {
@@ -2716,8 +2949,13 @@ impl SystemStateApp {
     }
 
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
-    /// failed and the run no longer retries it (§3.5).
+    /// failed and the run no longer retries it (§3.5). Never while the first launch's review is
+    /// up: its headline is the one signal, and its tab is in front (§3.3).
     pub(crate) fn needs_attention(&self) -> bool {
+        // A review closed unanswered approved nothing: nothing needs anyone yet (§3.3).
+        if self.reviewing() || self.status.unanswered {
+            return false;
+        }
         let signal = self.status.failures_signal();
         let reviewed = self.reviewed_plan();
         (self.plan_known
@@ -2759,6 +2997,8 @@ impl SystemStateApp {
         self.status.operation = None;
         self.stopping = false;
         self.startup_review = None;
+        let widened = review && std::mem::take(&mut self.review_widened);
+        self.cancel_sent = None;
         self.awaiting = Some(Awaiting {
             plan: plan.clone(),
             password: password.as_ref().and(self.password.acceptance.clone()),
@@ -2776,6 +3016,7 @@ impl SystemStateApp {
                 },
                 vault_typed: with_vault,
                 changed,
+                widened,
             },
             admission,
         ));
@@ -2824,28 +3065,45 @@ impl SystemStateApp {
     }
 
     /// The host calls this only after the final view has actually detached.
-    /// Closing never cancels (§3.5): an unanswered offer is let go, and setup
-    /// can be offered in a later available window. What the page sent is the
-    /// worker's already.
+    /// Closing never cancels (§3.3): an unanswered review is closed for this
+    /// launch, nothing is recorded, and the next launch offers it again. What
+    /// the page sent is the worker's already.
     pub(crate) fn closed(&mut self, _scope: CloseScope) {
         if let Some(request) = self.request.take() {
-            request.finish(WorkstationSetupDecision::Unavailable);
+            request.finish(WorkstationSetupDecision::Closed);
         }
         self.startup_review = None;
+        self.review_widened = false;
     }
 
+    /// Cancel (§3.3). The launch's review: every group at Leave as is is the person's plan
+    /// now, which the worker records for good; a later group press sets up that group alone,
+    /// and Set up now applies the plan the review showed. The review of the groups the ALab
+    /// signal adds (§3.5): the plan in force stays as it is, the person's from now on.
     fn cancel_review(&mut self) {
         if !self.reviewing() {
             return;
         }
+        let widen = self.reviewing_widen();
         if let Some(request) = self.request.take() {
-            request.finish(WorkstationSetupDecision::Cancelled);
+            request.finish_answer(SetupAnswer {
+                widened: self.review_widened,
+                ..WorkstationSetupDecision::Cancelled.into()
+            });
         }
         self.startup_review = None;
+        self.review_widened = false;
         drop(self.password.take());
+        if !widen {
+            self.cancel_sent = Some(self.submitted.selection);
+            self.submitted = Plan {
+                selection: Selection::none(),
+                vault_url: self.submitted.vault_url.clone(),
+            };
+        }
         self.plan = self.submitted.clone();
         self.url = TextInputState::new(self.submitted.vault_url.clone());
-        self.plan_known = self.status.plan.is_some();
+        self.plan_known = true;
         self.publish(self.status.clone());
         self.actions.push_back(SystemStateAction::CancelReview);
     }
@@ -2870,9 +3128,16 @@ impl SystemStateApp {
 
     /// Whether Check again can start: nothing is busy, or what is busy is a
     /// press waiting for another setup ([`SetupStatus::queued`]), which runs
-    /// nothing meanwhile, so a reading of the rows can go (§3.4).
+    /// nothing meanwhile, so a reading of the rows can go (§3.4). A newer aterm's setup names
+    /// no plan, yet reading writes nothing: Check again reads its rows as they stand (§3.2).
     fn can_check(&self) -> bool {
-        self.plan_known && (!self.status.busy || self.status.queued)
+        (self.plan_known || self.status.newer()) && (!self.status.busy || self.status.queued)
+    }
+
+    /// Whether Restore previous settings can start: nothing is busy, no review is up, and the
+    /// setup records are this aterm's to put back, not a newer aterm's (§3.4).
+    fn can_restore(&self) -> bool {
+        !self.status.busy && !self.reviewing() && !self.status.newer()
     }
 
     /// The settings of the groups the person changed since the page last took
@@ -2927,7 +3192,14 @@ impl SystemStateApp {
     /// disclosure, else open while the vault waits for input here.
     fn vault_shown(&self) -> bool {
         self.vault_open.unwrap_or_else(|| {
-            let row = self.reviewed_row(Subject::Setting(Setting::Secrets));
+            // As the vault reads, whatever the review shows of it: a vault that waits for a
+            // password typed here opens its fields during the review too.
+            let row = row_view_for_source(
+                Subject::Setting(Setting::Secrets),
+                &self.status,
+                self.plan.selection,
+                Some(self.url.value().trim()),
+            );
             row.managed
                 && matches!(row.standing, Some(Standing::NeedsYou | Standing::Failed))
                 && row.note.is_none()
@@ -3062,7 +3334,7 @@ impl SystemStateApp {
                 }
                 self.actions.push_back(SystemStateAction::Check(plan));
             }
-            "system-state/restore" if !self.status.busy && !self.reviewing() => {
+            "system-state/restore" if self.can_restore() => {
                 self.status.busy = true;
                 self.status.operation = Some(SetupOperation::Restore);
                 self.actions.push_back(SystemStateAction::Restore);
@@ -3197,7 +3469,7 @@ impl NativeAppModel for SystemStateApp {
             | AppEvent::ScrollPage(_)
             | AppEvent::PressListPicture(_) => true,
             #[cfg(any(a11y_tree, test))]
-            AppEvent::InsertText(_) => true,
+            AppEvent::InsertText(_) | AppEvent::RevealControl(_) => true,
             _ => false,
         } && self.interact();
         // Scrolling and focus are this view's own; every other change is the
@@ -3212,7 +3484,7 @@ impl NativeAppModel for SystemStateApp {
                     | AppEvent::PressListPicture(_)
             );
         #[cfg(any(a11y_tree, test))]
-        let shared = shared && !matches!(event, AppEvent::RevealControl(_));
+        let shared = interacted || (shared && !matches!(event, AppEvent::RevealControl(_)));
         let handled = match event {
             AppEvent::FocusChanged(focus) => {
                 if let Some(key) = &focus {
@@ -3409,9 +3681,12 @@ impl<'a, 'b> Page<'a, 'b> {
     fn new(app: &'a SystemStateApp, view: &'a SystemStateViewState, cx: &'a ViewCx<'b>) -> Self {
         let m = Metrics::new(cx.viewport.width.max(64.0), cx.viewport.height.max(120.0));
         // Until the page knows the plan in force it cannot say which rows
-        // aterm manages: every row reads `—`, with no chip.
+        // aterm manages: every row reads `—`, with no chip. A newer aterm's
+        // setup names none it can know, so its rows read as they stand.
         let rows = if app.plan_known {
             app.reviewed_rows()
+        } else if app.status.newer() {
+            rows_as_they_stand(&app.status)
         } else {
             rows(&SetupStatus::default(), Selection::all())
         };
@@ -3574,7 +3849,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     audit_id: crate::native_ui::SYSTEM_STATE_BRAND_AUDIT,
                     role: SemanticRole::Text,
                     label: spoken.clone(),
-                    value: Some(spec.value()),
+                    paint: Some(spec.value()),
                     action: None,
                     focusable: false,
                     focused: false,
@@ -3630,7 +3905,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     audit_id: crate::native_ui::RAINBOW_BANNER_AUDIT,
                     role: SemanticRole::Group,
                     label: String::new(),
-                    value: Some(village_spec(
+                    paint: Some(village_spec(
                         &self.app.status,
                         &self.rows,
                         &self.app.reviewed_plan(),
@@ -3997,7 +4272,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 audit_id: crate::native_ui::SYSTEM_STATE_METER_AUDIT,
                 role: SemanticRole::Group,
                 label: String::new(),
-                value: Some(format!("{done},{managed}")),
+                paint: Some(format!("{done},{managed}")),
                 action: None,
                 focusable: false,
                 focused: false,
@@ -4026,33 +4301,7 @@ impl<'a, 'b> Page<'a, 'b> {
             room,
         );
         if self.app.reviewing() {
-            let label = self.app.review_seconds().map_or_else(
-                || "Apply".to_owned(),
-                |seconds| format!("Apply ({seconds})"),
-            );
-            let cancel = self.fitted_button(
-                "system-state/cancel",
-                "Cancel".to_owned(),
-                None,
-                None,
-                StyleRef::Secondary,
-                true,
-                room,
-            );
-            let mut apply = self.fitted_button(
-                "system-state/apply",
-                label,
-                None,
-                None,
-                StyleRef::Primary,
-                !self.busy(),
-                room,
-            );
-            // Pressing stops the countdown before release. Keep its painted
-            // target stable while the visible label changes to plain Apply.
-            apply.1 = self.m.button_w("Apply (30)").min(room).max(apply.1);
-            apply.0.layout.width = Length::Fixed(apply.1);
-            return Self::button_rows("system-state/footer", vec![check, cancel, apply], room);
+            return self.review_footer(check, room);
         }
         // A Restore waiting for another setup says so on its own button, which waits with it.
         let status = &self.app.status;
@@ -4074,7 +4323,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 None,
                 Some("Restore"),
                 StyleRef::Quiet,
-                !self.busy(),
+                self.app.can_restore(),
                 room,
             )
         };
@@ -4112,6 +4361,72 @@ impl<'a, 'b> Page<'a, 'b> {
         )
     }
 
+    /// The first launch's review footer (§3.3): one line saying what Apply and Cancel do, over
+    /// Check again, Cancel and Apply. Apply's face counts down (`Apply (30)`) until a click stops
+    /// it, in a footprint that stays put, its words centred; VoiceOver hears `Apply` alone, with,
+    /// while it counts, that it applies by itself in so many seconds. Returns the node and its
+    /// height.
+    fn review_footer(&self, check: (UiNode, f32, f32), room: f32) -> (UiNode, f32) {
+        let seconds = self.app.review_seconds();
+        let face = seconds.map_or_else(
+            || "Apply".to_owned(),
+            |seconds| format!("Apply ({seconds})"),
+        );
+        let cancel = self.fitted_button(
+            "system-state/cancel",
+            "Cancel".to_owned(),
+            None,
+            None,
+            StyleRef::Secondary,
+            true,
+            room,
+        );
+        let mut apply = self.fitted_button(
+            "system-state/apply",
+            "Apply".to_owned(),
+            Some(&face),
+            None,
+            StyleRef::Primary,
+            !self.busy(),
+            room,
+        );
+        // Pressing stops the countdown before release. Keep its painted
+        // target stable while the visible label changes to plain Apply.
+        apply.1 = self.m.button_w("Apply (30)").min(room).max(apply.1);
+        apply.0.layout.width = Length::Fixed(apply.1);
+        if let UiContent::Button(control) = &mut apply.0.content {
+            control.centred = true;
+            control.spec.description = seconds.map(|seconds| {
+                let unit = if seconds == 1 { "second" } else { "seconds" };
+                format!("Applies by itself in {seconds} {unit}")
+            });
+        }
+        let (buttons, buttons_h) = Self::button_rows(
+            "system-state/footer/buttons",
+            vec![check, cancel, apply],
+            room,
+        );
+        let (line, line_h) = crate::native_settings::wrapped_copy_node(
+            "system-state/footer/review",
+            REVIEW_NOTE,
+            SemanticRole::Text,
+            StyleRef::Secondary,
+            room,
+            self.m.line_h,
+            None,
+        );
+        let height = line_h + 4.0 + buttons_h;
+        (
+            UiNode::new(
+                "system-state/footer",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::column().gap(4.0).height(Length::Fixed(height)))
+            .children(vec![line, buttons]),
+            height,
+        )
+    }
+
     /// The scrolling list: the notes an observation cannot carry, then the
     /// five groups, `list_h` tall. A list that scrolls keeps its last
     /// [`FADE_STRIP`] as a strip its rows fade out in, so a card its room
@@ -4125,7 +4440,7 @@ impl<'a, 'b> Page<'a, 'b> {
         let mut items: Vec<(UiNode, f32)> = Vec::new();
         let mut top = 0.0;
         let reviewed = self.app.reviewed_plan();
-        let notes = self.app.status.notes(&reviewed);
+        let notes = self.app.notes(&reviewed);
         for (index, note) in notes.iter().enumerate() {
             let (node, height) = crate::native_settings::wrapped_copy_node(
                 &format!("system-state/note/{index}"),
@@ -4260,7 +4575,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     audit_id: crate::native_ui::PAGE_SCROLL_AUDIT,
                     role: SemanticRole::Group,
                     label: String::new(),
-                    value: Some(share),
+                    paint: Some(share),
                     action: None,
                     focusable: false,
                     focused: false,
@@ -4663,7 +4978,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     audit_id: crate::native_ui::SYSTEM_STATE_CHIP_AUDIT,
                     role: SemanticRole::Text,
                     label: chip.spoken().to_owned(),
-                    value: Some(chip.value().to_owned()),
+                    paint: Some(chip.value().to_owned()),
                     action: None,
                     focusable: false,
                     focused: false,
@@ -5309,7 +5624,7 @@ fn rule(key: String) -> UiNode {
             audit_id: crate::native_ui::MESSAGES_RULE_AUDIT,
             role: SemanticRole::Group,
             label: String::new(),
-            value: None,
+            paint: None,
             action: None,
             focusable: false,
             focused: false,
@@ -5336,8 +5651,9 @@ pub(crate) const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token: renew 
 /// `check-failed`, `check-unconfirmed`, `mixed`, `named-result-failed`, `restore-at-login`,
 /// `restore-blocked`, `restore-unlogged`, `vault-source-mismatch`, `plan-unread`, `fresh`,
 /// `queued-choice`, `queued-restore`, `set-aside`, `set-aside-non-alab`, `startup-retry`,
-/// `restore-failed`, `setup-retried`, `failed-retrying`, `github-sign-in` and
-/// `vault-unreadable`.
+/// `restore-failed`, `setup-retried`, `failed-retrying`, `github-sign-in`, `vault-unreadable`,
+/// `join-refused`, `vault-not-joined`, `vault-held`, `newer`, `restoring`, the first launch's
+/// review, `review` and `review-stopped` ([`fixture_review`]), and `cancelled`, after it.
 /// Each draws only what the worker gives the page: the readings `init_observe` and the
 /// worker's probes make, and the rows a run, a Check or a Restore reports.
 /// Debug and dev-seam builds only: a release build carries none of
@@ -5627,11 +5943,21 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
         }
         "failed" => {
-            // A reading that failed for a reason that passes (GitHub stopped answering), once
-            // the run's tries are spent: the headline, the menu line and the diamond say it.
-            let mut repositories = setting(Setting::Repositories, Failed, Some("3 of 12"));
-            repositories.detail = Some(GITHUB_STOPPED.to_owned());
-            status.observed = with(in_place(), vec![repositories]);
+            // The run's GitHub repositories step, which GitHub stopped answering partway
+            // through, once the run's tries are spent: aterm no longer tries it by itself, and
+            // Set up now does, so the headline, the row, the menu line and the diamond say it
+            // failed, and the note names Set up now. The worker's page says the stage under its
+            // row in no words of the stage's own (`items_page`; the log keeps GitHub's), and the
+            // row reads the clones the run made.
+            status.observed = with(
+                in_place(),
+                vec![setting(Setting::Repositories, Differs, Some("3 of 12"))],
+            );
+            status.rows = vec![SetupStatusRow {
+                name: Setting::Repositories.name().into(),
+                status: "error".into(),
+                detail: String::new(),
+            }];
         }
         "github-sign-in" => {
             // GitHub refuses the token the vault syncs, as `init_observe` reads the
@@ -5957,10 +6283,113 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
             status.observed = with(in_place(), vec![vault]);
         }
+        "join-refused" | "vault-not-joined" => {
+            // A Join refused because aterm cannot read this Mac's vault settings (main's
+            // `setup_error_row`), or the launch's Join admitted without the Join for them (main's
+            // `add_vault_not_joined`): the Secrets vault row says why in its own note, which the
+            // page's line would only repeat.
+            status = fixture_status("vault-unreadable")?;
+            status.rows = vec![calm_setup_row(if name == "join-refused" {
+                VAULT_UNREAD_NOTE
+            } else {
+                VAULT_NOT_JOINED_NOTE
+            })];
+        }
+        "vault-held" => {
+            // A vault try held after two tries did not take: aterm tries it again only when
+            // this Mac's network or vault changes, so it failed, and Set up now tries it now.
+            status.observed = with(
+                in_place(),
+                vec![
+                    setting(Setting::Secrets, Differs, Some("Not joined")),
+                    token_waiting(),
+                ],
+            );
+            status.rows = vec![SetupStatusRow {
+                name: Setting::Secrets.name().into(),
+                status: "error".into(),
+                detail: TRIED_TWICE.into(),
+            }];
+        }
+        "newer" => {
+            // A newer aterm set this Mac up: this aterm names no plan, reads the rows as they
+            // stand with nothing set up (no account and no network read but on Check again),
+            // and changes nothing.
+            status.plan = None;
+            status.rows = vec![calm_setup_row(NEWER_SETUP_NOTE)];
+            status.observed = with(
+                in_place(),
+                vec![
+                    untold_lan(),
+                    setting(Setting::Dock, Differs, Some("9 apps")),
+                    read(Subject::Setting(Setting::Messages), Unknown, None),
+                    read(Subject::Setting(Setting::FaceTime), Unknown, None),
+                    read(Subject::Setting(Setting::Repositories), Unknown, None),
+                ],
+            );
+        }
+        "restoring" => {
+            // Restore previous settings, which waited for another setup, now holds the records
+            // and puts them back.
+            status.busy = true;
+            status.operation = Some(SetupOperation::Restore);
+            status.observed = in_place();
+        }
+        "cancelled" => {
+            // The first launch's review a person cancelled (§3.3): the worker keeps every group
+            // at Leave as is, and the page says so in one calm line, Set up now beside it applying
+            // the setup the review showed. A grant that would need a person once Permissions run
+            // asks nothing of anyone while Permissions are left as is.
+            status = fixture_status("review")?;
+            status.plan = Some(Plan::from(Selection::none()));
+            status.cancelled = true;
+        }
+        "review" | "review-stopped" => {
+            // The first launch's review on a fresh signed Mac ([`fixture_review`]): every group
+            // set up, most rows to change, and Full Disk Access and Debugger access, which a
+            // person grants once setup runs, read as what Apply changes.
+            status = fixture_status("fresh")?;
+            let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
+            fda.detail = Some(
+                "Full Disk Access keeps macOS from interrupting programs you run here with \
+                 privacy dialogs. Only you can switch it on, in System Settings."
+                    .to_owned(),
+            );
+            let mut debugger = access(Access::Debugger, NeedsYou, Some("Off"));
+            debugger.detail = Some(
+                "Turning it on lets debuggers attach without a password. macOS asks for an \
+                 administrator password in a dialog named SamplingTools."
+                    .to_owned(),
+            );
+            status.observed = with(status.observed, vec![fda, debugger]);
+        }
         _ => return None,
     }
     status.observed_generation = 1;
     Some(status)
+}
+
+/// How a scenario shows the first launch's review (`review`, `review-stopped`): the page is
+/// offered the plan a fresh launch offers, and draws the scenario's status under it, its
+/// countdown going or stopped by a click. Its answer goes nowhere, as every action of a
+/// scenario is inert. Debug and dev-seam builds only.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FixtureReview {
+    /// The countdown goes (`Apply (30)`).
+    Counting,
+    /// A click stopped the countdown (`Apply`).
+    Stopped,
+}
+
+/// The review the scenario `name` shows, if one ([`FixtureReview`]).
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+pub(crate) fn fixture_review(name: &str) -> Option<FixtureReview> {
+    match name {
+        "review" => Some(FixtureReview::Counting),
+        "review-stopped" => Some(FixtureReview::Stopped),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

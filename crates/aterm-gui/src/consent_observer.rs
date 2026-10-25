@@ -992,7 +992,7 @@ pub(crate) struct ObserverState {
 struct AnnouncedPrompt {
     id: String,
     session: u64,
-    pending: bool,
+    pending: Option<Arc<()>>,
 }
 
 impl ObserverState {
@@ -1130,8 +1130,7 @@ impl ObserverState {
         self.requested = ObserverMode::Off;
         self.running = ObserverMode::Off;
         for prompt in &mut self.announced {
-            self.attention_dirty |= prompt.pending;
-            prompt.pending = false;
+            self.attention_dirty |= prompt.pending.take().is_some();
         }
         if self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
@@ -1206,8 +1205,7 @@ impl ObserverState {
             ObserverEvent::Line(line) => {
                 if let TccEvent::Result { msg_id } = &line {
                     for prompt in &mut self.announced {
-                        if &prompt.id == msg_id && prompt.pending {
-                            prompt.pending = false;
+                        if &prompt.id == msg_id && prompt.pending.take().is_some() {
                             self.attention_dirty = true;
                         }
                     }
@@ -1278,7 +1276,7 @@ impl ObserverState {
     pub(crate) fn marks_session(&self, session: u64) -> bool {
         self.announced
             .iter()
-            .any(|p| p.session == session && p.pending)
+            .any(|p| p.session == session && p.pending.is_some())
     }
 
     pub(crate) fn take_attention_changed(&mut self) -> bool {
@@ -1352,21 +1350,24 @@ impl ObserverState {
                 continue;
             };
             if self.announced.len() >= ANNOUNCED_CAP {
-                let Some(done) = self.announced.iter().position(|p| !p.pending) else {
+                let Some(done) = self.announced.iter().position(|p| p.pending.is_none()) else {
                     continue;
                 };
                 self.announced.remove(done);
             }
+            let owner = Arc::new(());
+            let validity = crate::notify::NoticeValidity::new(&owner);
             self.announced.push_back(AnnouncedPrompt {
                 id: prompt.msg_id.to_owned(),
                 session,
-                pending: true,
+                pending: Some(owner),
             });
             self.attention_dirty = true;
             fresh.push(ObservedPrompt {
                 session,
                 blocked_on: blocked_on_token(prompt.service),
                 service: prompt.service.to_owned(),
+                validity,
             });
         }
         fresh
@@ -1420,6 +1421,8 @@ pub(crate) struct ObservedPrompt {
     pub(crate) blocked_on: String,
     /// Raw TCC service name.
     pub(crate) service: String,
+    /// Permission borrowed from the still-pending announced request.
+    pub(crate) validity: crate::notify::NoticeValidity,
 }
 
 impl ObservedPrompt {
@@ -1433,6 +1436,7 @@ impl ObservedPrompt {
             session: self.session,
             title: PROMPT_TITLE,
             body: format!("{asked} The program that asked waits until you answer."),
+            validity: self.validity.clone(),
             decided: (),
         }
     }
@@ -1603,6 +1607,8 @@ pub(crate) struct AttentionNotice {
     pub(crate) title: &'static str,
     /// Notification body.
     pub(crate) body: String,
+    /// Permission borrowed from the condition that still needs an answer.
+    pub(crate) validity: crate::notify::NoticeValidity,
     /// Private: only this module's gate and prompts build a notice, so
     /// [`crate::notify::NotifyMsg::consent`] posts nothing they did not decide.
     decided: (),
@@ -1639,13 +1645,24 @@ const DENIED_TITLE: &str = "aterm · file access denied";
 const PROMPT_TITLE: &str = "aterm · permission waiting";
 
 /// Per-instance rate limiter and session tracker for `EPERM` attention events.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct AttentionGate {
     /// Whether the one notification has been spent.
     spent: bool,
     /// Live sessions whose own protected read was refused. This contribution
     /// ends on a verified grant or session retirement, not on a dismissal.
-    denied_sessions: Vec<(u64, Instant)>,
+    denied_sessions: Vec<DeniedSession>,
+    /// A refusal not attributed to a session still needs the same grant.
+    unattributed_at: Option<Instant>,
+    /// Only the gate owns the one notice's lifetime; queued copies borrow it.
+    notice_owner: Option<Arc<()>>,
+}
+
+#[derive(Debug)]
+struct DeniedSession {
+    id: u64,
+    at: Instant,
+    marked: bool,
 }
 
 impl AttentionGate {
@@ -1654,39 +1671,58 @@ impl AttentionGate {
         Self {
             spent: false,
             denied_sessions: Vec::new(),
+            unattributed_at: None,
+            notice_owner: None,
         }
     }
 
     pub(crate) fn mark_session(&mut self, session: u64, now: Instant) -> bool {
-        if let Some((_, at)) = self
+        if let Some(denied) = self
             .denied_sessions
             .iter_mut()
-            .find(|(id, _)| *id == session)
+            .find(|denied| denied.id == session)
         {
-            *at = now;
-            return false;
+            denied.at = now;
+            return !std::mem::replace(&mut denied.marked, true);
         }
-        self.denied_sessions.push((session, now));
+        self.denied_sessions.push(DeniedSession {
+            id: session,
+            at: now,
+            marked: true,
+        });
         true
     }
 
     pub(crate) fn marks_session(&self, session: u64) -> bool {
-        self.denied_sessions.iter().any(|(id, _)| *id == session)
+        self.denied_sessions
+            .iter()
+            .any(|denied| denied.id == session && denied.marked)
     }
 
     pub(crate) const fn has_denials(&self) -> bool {
-        !self.denied_sessions.is_empty()
+        !self.denied_sessions.is_empty() || self.unattributed_at.is_some()
     }
 
     pub(crate) fn recover(&mut self, observed: Instant) -> bool {
         let before = self.denied_sessions.len();
-        self.denied_sessions
-            .retain(|(_, denied)| *denied > observed);
-        self.denied_sessions.len() != before
+        self.denied_sessions.retain(|denied| denied.at > observed);
+        let unattributed_ended = self.unattributed_at.is_some_and(|at| at <= observed);
+        if unattributed_ended {
+            self.unattributed_at = None;
+        }
+        self.revoke_ended_notice();
+        self.denied_sessions.len() != before || unattributed_ended
     }
 
     pub(crate) fn retire_session(&mut self, session: u64) {
-        self.denied_sessions.retain(|(id, _)| *id != session);
+        self.denied_sessions.retain(|denied| denied.id != session);
+        self.revoke_ended_notice();
+    }
+
+    fn revoke_ended_notice(&mut self) {
+        if !self.has_denials() {
+            self.notice_owner = None;
+        }
     }
 
     /// Whether the per-instance notification has already been sent.
@@ -1697,12 +1733,33 @@ impl AttentionGate {
 
     /// Records `event` and returns the resulting [`AttentionOutcome`].
     pub(crate) fn note(&mut self, event: AttentionEvent) -> AttentionOutcome {
+        self.note_at(event, Instant::now())
+    }
+
+    fn note_at(&mut self, event: AttentionEvent, now: Instant) -> AttentionOutcome {
         match event {
-            AttentionEvent::ProtectedEperm { session } => self.note_eperm(session),
+            AttentionEvent::ProtectedEperm { session } => self.note_eperm(session, now),
         }
     }
 
-    fn note_eperm(&mut self, session: Option<u64>) -> AttentionOutcome {
+    fn note_eperm(&mut self, session: Option<u64>, now: Instant) -> AttentionOutcome {
+        if let Some(session) = session {
+            if let Some(denied) = self
+                .denied_sessions
+                .iter_mut()
+                .find(|denied| denied.id == session)
+            {
+                denied.at = now;
+            } else {
+                self.denied_sessions.push(DeniedSession {
+                    id: session,
+                    at: now,
+                    marked: false,
+                });
+            }
+        } else {
+            self.unattributed_at = Some(now);
+        }
         if self.spent {
             return AttentionOutcome {
                 raise_tab: session,
@@ -1711,6 +1768,9 @@ impl AttentionGate {
             };
         }
         self.spent = true;
+        let owner = Arc::new(());
+        let validity = crate::notify::NoticeValidity::new(&owner);
+        self.notice_owner = Some(owner);
         AttentionOutcome {
             raise_tab: session,
             notice: Some(AttentionNotice {
@@ -1722,6 +1782,7 @@ impl AttentionGate {
                         crate::menu::PrivacyPane::FullDiskAccess
                     )
                 ),
+                validity,
                 decided: (),
             }),
             refresh_status_item: true,
@@ -2347,10 +2408,12 @@ mod tests {
             "macos-permission:SystemPolicyDocumentsFolder"
         );
         assert_eq!(first[0].notice().session, 4);
+        let unknown_owner = Arc::new(());
         let unknown = ObservedPrompt {
             session: 4,
             blocked_on: blocked_on_token("kTCCServiceSomethingNew"),
             service: "kTCCServiceSomethingNew".to_owned(),
+            validity: crate::notify::NoticeValidity::new(&unknown_owner),
         };
         assert!(!unknown.notice().body.contains("kTCCService"));
 

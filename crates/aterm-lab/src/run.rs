@@ -50,10 +50,6 @@ pub struct Run {
     pub codex_bin: String,
     /// Its version, from its store package (`0.163.0`).
     pub codex_ver: String,
-    /// The Gemini CLI the lab launches by path, when there is one.
-    pub gemini_bin: String,
-    /// Its version, from its package (`0.46.0`).
-    pub gemini_ver: String,
     /// The Antigravity CLI (`agy`) the lab launches by path, when there is one.
     pub agy_bin: String,
     /// Its version, from its store build's record (`1.4.0`).
@@ -115,8 +111,6 @@ impl Run {
             ("SEAM", self.seam.clone()),
             ("CODEX_BIN", self.codex_bin.clone()),
             ("CODEX_VER", self.codex_ver.clone()),
-            ("GEMINI_BIN", self.gemini_bin.clone()),
-            ("GEMINI_VER", self.gemini_ver.clone()),
             ("AGY_BIN", self.agy_bin.clone()),
             ("AGY_VER", self.agy_ver.clone()),
             ("MUSE_BIN", self.muse_bin.clone()),
@@ -178,8 +172,6 @@ impl Run {
                 "SEAM" => r.seam = v,
                 "CODEX_BIN" => r.codex_bin = v,
                 "CODEX_VER" => r.codex_ver = v,
-                "GEMINI_BIN" => r.gemini_bin = v,
-                "GEMINI_VER" => r.gemini_ver = v,
                 "AGY_BIN" => r.agy_bin = v,
                 "AGY_VER" => r.agy_ver = v,
                 "MUSE_BIN" => r.muse_bin = v,
@@ -203,15 +195,41 @@ impl Run {
         let _ = atomic_write(&self.run.join("env.sh"), self.render().as_bytes());
     }
 
-    /// The lab `tag` as `env.sh` records it.
+    /// The lab `tag` as `env.sh` records it, for a verb that drives its agent.
+    /// # Errors
+    /// No lab of that tag is up, or its tab runs an agent this build retired ([`Run::admitted`]).
+    pub fn load(tag: &str) -> Result<Run, String> {
+        Run::read(tag)?.admitted()
+    }
+
+    /// The lab `tag` as `env.sh` records it, whatever agent it names: for the verbs that act on
+    /// its jail and never on its agent (`down`, `ps`), so a lab an older aterm-lab brought up with
+    /// a retired agent can still be listed and taken down.
     /// # Errors
     /// No lab of that tag is up.
-    pub fn load(tag: &str) -> Result<Run, String> {
+    pub fn read(tag: &str) -> Result<Run, String> {
         let file = paths().run_dir(tag).join("env.sh");
         let text = std::fs::read_to_string(&file).map_err(|_| {
             format!("no lab '{tag}' is up ({LAB} up {tag}; {LAB} ps lists the labs there are)")
         })?;
         Ok(Run::parse(&text))
+    }
+
+    /// This record, unless its `AGENT` names an agent this build retired
+    /// ([`aterm_phase::RETIRED_AGENTS`], Gemini CLI), which no verb reads as another agent's tab.
+    /// # Errors
+    /// The refusal, naming agy and how to take the lab down.
+    pub fn admitted(self) -> Result<Run, String> {
+        if aterm_phase::retired_agent(&self.agent) {
+            return Err(format!(
+                "lab '{0}': its env.sh names AGENT={1} (an older aterm-lab brought it up): {2}; \
+                 {LAB} down {0}, then {LAB} up {0} and {LAB} agy {0}",
+                self.tag,
+                self.agent,
+                aterm_phase::RETIRED_AGENT
+            ));
+        }
+        Ok(self)
     }
 
     /// The aterm this lab runs (its door, a restart), as `up` recorded it.
@@ -227,12 +245,12 @@ impl Run {
         Ok(std::path::PathBuf::from(&self.aterm))
     }
 
-    /// The agent the tab runs (`claude` unless `codex`, `gemini`, `agy` or `muse` launched one).
+    /// The agent the tab runs (`claude` unless `codex`, `agy` or `muse` launched one). A retired
+    /// agent's record is refused by [`Run::load`], so no verb that drives the agent reads it here.
     #[must_use]
     pub fn agent(&self) -> &str {
         match self.agent.as_str() {
             "codex" => "codex",
-            "gemini" => "gemini",
             "agy" => "agy",
             "muse" => "muse",
             _ => "claude",
@@ -244,7 +262,6 @@ impl Run {
     pub fn fixture_prefix(&self) -> String {
         let ver = match self.agent() {
             "codex" => &self.codex_ver,
-            "gemini" => &self.gemini_ver,
             "agy" => &self.agy_ver,
             "muse" => &self.muse_ver,
             _ => &self.claude_ver,
@@ -359,9 +376,6 @@ mod tests {
             codex_bin: "/Users//o/Library/Application Support/aterm/pkg/store/codex/1/bin/codex"
                 .into(),
             codex_ver: "0.163.0".into(),
-            gemini_bin: "/opt/homebrew/Cellar/gemini-cli/0.46.0/libexec/lib/node_modules/@google/gemini-cli/bundle/gemini.js"
-                .into(),
-            gemini_ver: "0.46.0".into(),
             agy_bin: "/Users//o/Library/Application Support/aterm/pkg/store/agy/1000001000004000000/bin/agy"
                 .into(),
             agy_ver: "1.4.0".into(),
@@ -380,7 +394,6 @@ mod tests {
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");
         for (agent, prefix) in [
-            ("gemini", "gemini-0.46.0"),
             ("agy", "agy-1.4.0"),
             ("muse", "muse-1.4.10-R6427.1"),
             ("claude", "claude-2.1.300"),
@@ -399,6 +412,38 @@ mod tests {
             ..r
         };
         assert_eq!(unread.fixture_prefix(), "muse-?");
+    }
+
+    /// AN OLDER LAB'S GEMINI CLI TAB IS REFUSED, never read as Claude Code's: the env.sh an
+    /// aterm-lab with Gemini CLI wrote for a `lab gemini` tab parses as written, every verb that
+    /// drives the agent ([`Run::load`]) refuses it naming agy and `down`, and the words the lab
+    /// still runs (the empty one of a lab older than `AGENT`, and an unknown one) are admitted as
+    /// before.
+    #[test]
+    fn an_older_labs_gemini_cli_tab_is_refused_never_read_as_claude() {
+        let old = "TAG=g1\nRUN=/s/runs/g1\nW=/s/runs/g1/scratch\nCLAUDE_VER=2.1.300\n\
+                   GEMINI_BIN=/opt/homebrew/bin/gemini\nGEMINI_VER=0.46.0\nAGENT=gemini\n";
+        let r = Run::parse(old);
+        assert_eq!((r.tag.as_str(), r.agent.as_str()), ("g1", "gemini"));
+        for agent in ["gemini", "Gemini", "gemini-cli"] {
+            let e = Run {
+                agent: agent.into(),
+                ..r.clone()
+            }
+            .admitted()
+            .unwrap_err();
+            assert!(e.contains(aterm_phase::RETIRED_AGENT), "{agent}: {e}");
+            assert!(e.contains(&format!("AGENT={agent}")), "{agent}: {e}");
+            assert!(e.contains(&format!("{LAB} down g1")), "{agent}: {e}");
+            assert!(e.contains(&format!("{LAB} agy g1")), "{agent}: {e}");
+        }
+        for agent in ["claude", "codex", "agy", "muse", "", "bogus"] {
+            let r = Run {
+                agent: agent.into(),
+                ..r.clone()
+            };
+            assert_eq!(r.clone().admitted(), Ok(r), "{agent}");
+        }
     }
 
     #[test]

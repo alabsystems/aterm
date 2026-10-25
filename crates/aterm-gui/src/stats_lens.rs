@@ -3406,7 +3406,7 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                     lines.push("No current plan reading on this machine".into());
                 }
             }
-            lines.push("Codex, Gemini and agy tabs are not counted".into());
+            lines.push("Codex and agy tabs are not counted".into());
         }
         _ => {
             if let Some(g) = f.gpu.as_ref() {

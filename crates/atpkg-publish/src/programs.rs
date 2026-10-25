@@ -73,9 +73,11 @@ pub enum Shape {
 /// What a harness row's pack is held to beyond a plain row's
 /// (`docs/DESIGN-harness-repos-2026-10-24.md` §5, §6.1). The pack refuses, before it builds:
 /// a repo `expose` naming anything but [`Self::tool`], any `bundle`, a program-named package
-/// that is absent or not at `MAJOR.MINOR.0`, a checkout that is not clean, and a build number
-/// that is not the checkout's `HEAD` commit count. It builds `--locked` and calls the pack
-/// `MAJOR.MINOR.0+g<9-hex HEAD>`, the publication rule's spelling of a dev build.
+/// that is absent or not at `MAJOR.MINOR.0`, a checkout that is not clean, a `HEAD` that is not
+/// on `origin/main` of the staging owner's repo, and a build number that is not the checkout's
+/// `HEAD` commit count. It builds `--locked` and calls the pack `MAJOR.MINOR.0+g<9-hex HEAD>`,
+/// the publication rule's spelling of a dev build. The index pins none while some client
+/// reading it would install it unasked (`channel::index::READERS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Harness {
     /// The one tool it ships and shims: the repo's binary. A repo that declares no `expose`
@@ -144,8 +146,9 @@ const fn plain(
 }
 
 /// An ALab harness: repo = program (the one-word rule), Apple silicon only, ungrouped, packed
-/// to [`Harness`]'s rule, and outside the client's default set
-/// (`atpkg::harness::in_default_set`).
+/// to [`Harness`]'s rule, outside the client's default set
+/// (`atpkg::harness::in_default_set`), and pinned only once every client reading the index
+/// keeps it there (`channel::index::READERS`).
 const fn harness(name: &'static str, tool: &'static str) -> ProgramDef {
     assert!(
         atpkg::harness::is_harness(name),

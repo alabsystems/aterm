@@ -4,7 +4,7 @@
 //! `autopilot-captures` ([`cmd_autopilot_captures`]): Autopilot's scenes on every harness, side by
 //! side, as one captures page reads them (design §14.2's 2b). One private headless instance per
 //! harness and look, launched in that look, so each program starts on the ground it is shot on: on
-//! the four aterm supervises (Claude Code, agy, Muse Code, Gemini CLI) it drives the forever lab's
+//! the three aterm supervises (Claude Code, agy, Muse Code) it drives the forever lab's
 //! own chains against its stub ([`crate::forever`]: cruise-n's two needs, land-b's open hold,
 //! land-c's repository hold, land-a's landing, Off); on codex-alab, which supervises itself, it
 //! drives `codex-alab-proof`'s legs against its fake model ([`crate::codex_alab_proof`]: Cruise,
@@ -12,7 +12,7 @@
 //! After each scene settles it takes an `image` at rest, points at the chip for its hovered title,
 //! and writes `chrome` and `status` beside each png, then `manifest.tsv` ([`Row`]). [`missing`]
 //! names a row the plan wants and the manifest lacks, and [`faults`] a png row that shows something
-//! wrong. With `--baseline` it also takes one paired Gemini CLI typing take ([`typing_pair`]).
+//! wrong. With `--baseline` it also takes one paired agy typing take ([`typing_pair`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,11 +38,10 @@ pub enum Who {
 
 impl Who {
     /// Every harness, in the order `all` runs them and the manifest lists them.
-    pub const ALL: [Who; 5] = [
+    pub const ALL: [Who; 4] = [
         Who::Agent(Harness::Claude),
         Who::Agent(Harness::Agy),
         Who::Agent(Harness::Muse),
-        Who::Agent(Harness::Gemini),
         Who::CodexAlab,
     ];
 
@@ -70,14 +69,12 @@ impl Who {
 
     /// Why it draws no chip on this tree, so its rest shots have no hovered title beside them;
     /// `None` where it draws one on every scene, and a rest shot with no chip is a
-    /// [`Fault::NoChip`]. The four supervised harnesses' answer is the forever lab's
-    /// ([`forever::surfaces::footless`]). agy draws its chip under Autopilot Off too: only an off
-    /// harness switch (the master's or its agent's) leaves its footer bare, and no scene turns one
-    /// off.
+    /// [`Fault::NoChip`]. Each of the three supervised harnesses draws a footer, so a chip, on
+    /// every scene. agy draws its chip under Autopilot Off too: only an off harness switch (the
+    /// master's or its agent's) leaves its footer bare, and no scene turns one off.
     #[must_use]
-    pub fn chipless(self) -> Option<&'static str> {
+    pub const fn chipless(self) -> Option<&'static str> {
         match self {
-            Who::Agent(h) if forever::surfaces::footless(h.name()) => Some(NO_CHIP_UNTIL_2C),
             Who::Agent(_) => None,
             Who::CodexAlab => Some(NO_CHIP_UNTIL_2D),
         }
@@ -90,10 +87,6 @@ impl Who {
             .unwrap_or(usize::MAX)
     }
 }
-
-/// Why Gemini CLI takes no hovered title: no chip line until 2c.
-pub const NO_CHIP_UNTIL_2C: &str =
-    "Gemini CLI draws no chip on this tree (chrome's why=no-footer) until 2c (§14.2, with 8a)";
 
 /// Why codex-alab takes no hovered title: no chip line until 2d.
 pub const NO_CHIP_UNTIL_2D: &str =
@@ -665,19 +658,19 @@ struct Asked {
 const COLS: u16 = 400;
 const LINES: u16 = 40;
 
-const HELP: &str = "usage: targo --unverified lab autopilot-captures --harness all|claude|agy|muse|gemini|codex-alab
+const HELP: &str = "usage: targo --unverified lab autopilot-captures --harness all|claude|agy|muse|codex-alab
        [--scale 1|2] [--look day|night|both] [--out DIR] [--columns N] [--lines N] [--baseline ATERM]
    or: targo --unverified lab autopilot-captures --baseline ATERM [--out DIR]
    or: targo --unverified lab autopilot-captures --sheets [--out DIR]
 
 Autopilot's scenes on every harness, side by side (design §14.2's 2b), on one private headless
 instance per harness and look, launched in that look (its aterm.toml's theme), so every program
-starts on the ground it is shot on. Claude Code, agy, Muse Code and Gemini CLI run the forever
-lab's chains against its stub: cruise-needs (cruise-n's two needs), land-open (land-b's open hold),
+starts on the ground it is shot on. Claude Code, agy and Muse Code run the forever lab's
+chains against its stub: cruise-needs (cruise-n's two needs), land-open (land-b's open hold),
 land-repo (land-c's repository hold), landed (land-a's landing) and off; same-land is a named skip
 until 3a. codex-alab runs codex-alab-proof's legs against its fake model: cruise, land, landed, off
-and need; its holds are named skips until A3. Gemini CLI needs LAB_GEMINI; codex-alab, the package
-codex-alab-proof would pick.
+and need; its holds are named skips until A3. codex-alab needs the package codex-alab-proof would
+pick.
 
 After each scene settles it takes an image at rest (<harness>-<scene>-<look>-<scale>x-rest.png),
 then points at the chip and takes its hovered title (…-title.png, the rule's band beside it as
@@ -688,10 +681,10 @@ rows under a lock, so one folder holds 1x and 2x, Day and Night, from runs side 
 the instance's (default 1); --columns and --lines its grid (400 x 40, so the rule's slot holds a
 whole title). --out defaults to $LAB_STATE/autopilot-captures.
 
---baseline ATERM also takes one paired Gemini CLI typing take after the captures, or alone without
+--baseline ATERM also takes one paired agy typing take after the captures, or alone without
 --harness (200 keys, then 200 backspaces, under one `video`, harness `continue = false`): on ATERM
-first, then on this lab's aterm, back to back, the same lab binary, Gemini CLI, stub, keys and
-pace (typing-gemini.txt). Take it on a quiet machine.
+first, then on this lab's aterm, back to back, the same lab binary, agy, stub, keys and pace
+(typing-agy.txt). Take it on a quiet machine.
 
 Each harness also gets <harness>-<scale>x-sheet.png (its frames at rest, a scene a row, Day then
 Night) and <harness>-<scale>x-titles.png (its hovered titles' bands, stacked), drawn from the
@@ -729,7 +722,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 } else {
                     vec![Who::of(&w).ok_or_else(|| {
                         usage(&format!(
-                            "unknown harness '{w}' (all, claude, agy, muse, gemini, codex-alab)"
+                            "unknown harness '{w}' (all, claude, agy, muse, codex-alab)"
                         ))
                     })?]
                 };
@@ -772,13 +765,13 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     }
     if a.whos.is_empty() && !a.typing_only && !a.sheets_only && a.baseline.is_none() {
         return Err(usage(
-            "say --harness all|claude|agy|muse|gemini|codex-alab, or --baseline ATERM",
+            "say --harness all|claude|agy|muse|codex-alab, or --baseline ATERM",
         ));
     }
     Ok(Some(a))
 }
 
-/// `autopilot-captures --harness all|claude|agy|muse|gemini|codex-alab [--scale 1|2] [--look
+/// `autopilot-captures --harness all|claude|agy|muse|codex-alab [--scale 1|2] [--look
 /// day|night|both] [--out DIR] [--columns N] [--lines N] [--baseline ATERM]`.
 /// # Errors
 /// Usage, a folder that could not be made, or an interrupt.
@@ -1119,7 +1112,7 @@ fn agent_lab(
             forever::lay_repo(&run, c).map_err(|e| Fail::exit(3, format!("{}: {e}", c.name())))?,
         );
     }
-    let script = forever::launcher(&run, h, &dirs, (false, false))?;
+    let script = forever::launcher(&run, h, &dirs, false)?;
     crate::verbs::set_custom_mode(&run, forever::MODE, &forever::spec_on(&chains, h, &dirs))?;
     let door = Door::new(&run)?;
     println!(
@@ -2034,9 +2027,9 @@ fn raise(lab: &dyn Lab, label: &str) -> Result<String, String> {
     }
 }
 
-/// The Gemini CLI typing take for 8a, paired: the baseline's arm first (this binary again, with
+/// The agy typing take, paired: the baseline's arm first (this binary again, with
 /// `--typing-only` and `LAB_ATERM` the baseline's aterm), then this lab's aterm, back to back;
-/// both lines to `<out>/typing-gemini.txt`. Whether both arms were taken.
+/// both lines to `<out>/typing-agy.txt`. Whether both arms were taken.
 fn typing_pair(a: &Asked, base: &str, out: &Path) -> Result<bool, Fail> {
     let exe = std::env::current_exe()
         .map_err(|e| Fail::die(format!("autopilot-captures: this program's path: {e}")))?;
@@ -2068,25 +2061,25 @@ fn typing_pair(a: &Asked, base: &str, out: &Path) -> Result<bool, Fail> {
     for l in &lines {
         println!("autopilot-captures: {l}");
     }
-    let p = out.join("typing-gemini.txt");
+    let p = out.join("typing-agy.txt");
     crate::sys::put(&p, 0o644, &crate::sys::PutSrc::Bytes(text.as_bytes()))
         .map_err(|e| Fail::die(format!("autopilot-captures: {}: {e}", p.display())))?;
     Ok(lines.iter().all(|l| l.starts_with(TAKEN)))
 }
 
 /// A taken arm's line starts so.
-const TAKEN: &str = "typing gemini ";
+const TAKEN: &str = "typing agy ";
 
 /// An arm not taken starts so, and says why.
 const NOT_TAKEN: &str = "typing NOT TAKEN:";
 
 /// How the typing take is taken and paired, its file's first line.
-const TYPING_SAYS: &str = "the Gemini CLI typing take for 8a: 200 keys (one `send` or `key \
-    space` each, 50 ms apart) then 200 backspaces into the composer of a Gemini CLI under \
+const TYPING_SAYS: &str = "the agy typing take: 200 keys (one `send` or `key \
+    space` each, 50 ms apart) then 200 backspaces into the composer of an agy under \
     Autopilot Cruise (harness continue = false, so nothing is typed into it), after the stub's \
     first reply, under one `video 60 keys` that must outlast the burst, on a private headless \
     lab 144x50 at 1x of its own; the baseline's arm first, then this tree's, back to back, the \
-    same lab binary, Gemini CLI, stub, keys and pace, only the aterm differing; headless, so \
+    same lab binary, agy, stub, keys and pace, only the aterm differing; headless, so \
     frames are n_render with render_p*";
 
 /// The `metrics percentiles` keys a take quotes.
@@ -2105,7 +2098,7 @@ const TAKE_KEYS: [&str; 12] = [
     "render_p99_ms",
 ];
 
-/// One Gemini CLI typing take on this process's aterm (`LAB_ATERM`): its `typing …` line.
+/// One agy typing take on this process's aterm (`LAB_ATERM`): its `typing …` line.
 fn typing_take(a: &Asked) -> Result<String, Fail> {
     let tag = if a.typing_only {
         "apcap-typing-base"
@@ -2131,19 +2124,19 @@ fn typing_take(a: &Asked) -> Result<String, Fail> {
 }
 
 fn typing_in(tag: &str) -> Result<String, Fail> {
-    let h = Harness::Gemini;
+    let h = Harness::Agy;
     let mut run = Run::load(tag)?;
     let (bin, ver) = h.bin_ver(&run);
     let (bin, ver) = (bin.to_string(), ver.to_string());
     if bin.is_empty() {
-        return Err(Fail::exit(3, "no Gemini CLI in the lab (LAB_GEMINI at up)"));
+        return Err(Fail::exit(3, "no agy in the lab (LAB_AGY at up)"));
     }
     run.agent = h.name().into();
     run.save();
     let chain = Chain::Cruise;
     let dir = forever::lay_repo(&run, chain).map_err(Fail::die)?;
     let dirs = std::slice::from_ref(&dir);
-    let script = forever::launcher(&run, h, dirs, (false, false))?;
+    let script = forever::launcher(&run, h, dirs, false)?;
     crate::verbs::set_custom_mode(&run, forever::MODE, &forever::spec_on(&[chain], h, dirs))?;
     let door = Door::new(&run)?;
     let sid = forever::spawn_tab(&door, &dir)?;

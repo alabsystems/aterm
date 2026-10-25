@@ -47,10 +47,6 @@ const ROWS: &[(&str, Check)] = &[
         every_literal_muse_anchor_is_in_the_store_muse,
     ),
     (
-        "every_literal_gemini_anchor_is_in_its_bundle",
-        every_literal_gemini_anchor_is_in_its_bundle,
-    ),
-    (
         "every_literal_grok_anchor_is_in_the_store_grok",
         every_literal_grok_anchor_is_in_the_store_grok,
     ),
@@ -228,18 +224,6 @@ fn literal_anchors_in_build(path: &str, bytes: &[u8], table: &[Anchor]) -> Outco
     ))
 }
 
-fn gemini_bin() -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os("ATERM_GEMINI_BIN") {
-        return Some(path.into());
-    }
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .map(|d| d.join("gemini"))
-        .chain(["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini"].map(Into::into))
-        .find(|p| p.is_file())
-}
-
 fn every_literal_anchor_is_in_the_store_claude() -> Outcome {
     literal_anchors_are_in_the_store("claude", "ATERM_CLAUDE_BIN", ANCHORS)
 }
@@ -359,49 +343,6 @@ fn every_literal_grok_anchor_is_in_the_store_grok() -> Outcome {
 }
 fn every_literal_kimi_anchor_is_in_the_store_kimi() -> Outcome {
     literal_anchors_are_in_the_store("kimi", "ATERM_KIMI_BIN", KIMI_ANCHORS)
-}
-fn every_literal_gemini_anchor_is_in_its_bundle() -> Outcome {
-    let Some((dir, bytes, version)) = gemini_bin().as_deref().and_then(gemini_bundle) else {
-        return Outcome::CouldNotRun(
-            "no Gemini CLI bundle (set ATERM_GEMINI_BIN to its `gemini`; aterm installs \
-             none); anchors not checked"
-                .into(),
-        );
-    };
-    let (owed, newer): (Vec<Anchor>, Vec<Anchor>) = GEMINI_ANCHORS
-        .iter()
-        .copied()
-        .partition(|a| version.as_deref().is_none_or(|v| !newer_than(a.since, v)));
-    if owed.iter().all(|anchor| anchor.kind != AnchorKind::Literal) {
-        return Outcome::CouldNotRun(format!(
-            "{dir} ({}): no literal Gemini anchors apply to this build; no anchors checked",
-            version.as_deref().unwrap_or("unknown version")
-        ));
-    }
-    if !newer.is_empty() {
-        eprintln!(
-            "{dir}: {} anchor(s) are for builds newer than {}, not checked: {:?}",
-            newer.len(),
-            version.as_deref().unwrap_or("?"),
-            newer.iter().map(|a| a.id).collect::<Vec<_>>()
-        );
-    }
-    let missing = missing(&bytes, &owed);
-    assert!(
-        missing.is_empty(),
-        "{dir}: {} literal anchors missing: {missing:?}",
-        missing.len()
-    );
-    eprintln!(
-        "{dir} ({}): every literal Gemini CLI anchor is present",
-        version
-            .as_deref()
-            .unwrap_or("no package version: every anchor owed")
-    );
-    Outcome::Pass(format!(
-        "{dir} ({}): Gemini anchors checked",
-        version.as_deref().unwrap_or("unknown version")
-    ))
 }
 
 fn every_wall_phrase_is_in_the_store_claude() -> Outcome {

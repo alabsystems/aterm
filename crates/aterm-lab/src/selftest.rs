@@ -500,20 +500,13 @@ mod tests {
             owner_strays(&clean, home, &allowed).is_empty(),
             "the control"
         );
-        let gemini = lab_roots(
-            &run,
-            "/opt/homebrew/Cellar/gemini-cli/0.46.0/libexec/bin/gemini",
-            home,
+        let outside = lab_roots(&run, "/opt/lab/agy/bin/agy", home);
+        assert_eq!(
+            outside,
+            ["/Users//o/Developer/lab/runs/t", "/opt/lab/agy/bin/agy"]
         );
         assert_eq!(
-            gemini,
-            [
-                "/Users//o/Developer/lab/runs/t",
-                "/opt/homebrew/Cellar/gemini-cli/0.46.0/libexec/bin/gemini",
-            ]
-        );
-        assert_eq!(
-            owner_strays("p7\nfcwd\nn/Users//o\n", home, &gemini),
+            owner_strays("p7\nfcwd\nn/Users//o\n", home, &outside),
             ["/Users//o"]
         );
         for own in [
@@ -585,7 +578,7 @@ mod tests {
     /// EVERY WITNESS WATCHES EVERY HOME THE LAB GUARDS: [`Watched::of`] the
     /// lab's facts under a scratch `HOME` (a fake account home handed in
     /// through [`crate::paths::Paths::resolve_with`]) is the account's home
-    /// and the scratch one, so the Codex, Gemini and agy witnesses look for
+    /// and the scratch one, so the Codex and agy witnesses look for
     /// `.codex` and `.gemini` in both, the Muse Code witness looks for its
     /// directories in both, and a file of either an agent holds is a stray.
     #[test]

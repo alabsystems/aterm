@@ -299,7 +299,10 @@ where
     if caret_row > 0 {
         let sky_row = caret_row - 1;
         let sky_y = rest.y.saturating_sub(ch);
-        let sky = sky_census.unwrap_or_else(|| census(rest.x, w, sky_row, caret, cols, cw, &ink));
+        let sky = match sky_census {
+            Some(s) => s,
+            None => census(rest.x, w, sky_row, caret, cols, cw, &ink),
+        };
         return seat(query, rest.x, sky_y, sky_row, caret_left, 1, !sky.clear());
     }
 

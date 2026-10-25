@@ -208,8 +208,10 @@ impl CursorGlow {
                     }
                     last_glyph = ci + 1;
                 }
-                ft.pairs
-                    .push(Some((is_glyph.then(|| rgb(cell.fg)), rgb(cell.bg))));
+                ft.pairs.push(Some((
+                    if is_glyph { Some(rgb(cell.fg)) } else { None },
+                    rgb(cell.bg),
+                )));
             }
             if n_cols < ft.cols {
                 ft.pairs.resize(ft.pairs.len() + (ft.cols - n_cols), None);
@@ -242,11 +244,10 @@ impl CursorGlow {
         self.unsettle();
         self.row_cur.clear();
         self.row_cur.extend_from_slice(cols);
-        let fill = cols
-            .iter()
-            .rposition(|&c| c != ' ')
-            .map_or(0, |i| i + 1)
-            .min(u16::MAX as usize) as u16;
+        let fill = match cols.iter().rposition(|&c| c != ' ') {
+            Some(i) => (i + 1).min(u16::MAX as usize) as u16,
+            None => 0,
+        };
         self.row_cur_meta = Some(RowProbe {
             row,
             caret,
@@ -272,22 +273,32 @@ impl CursorGlow {
         if !self.v2.engaged() || out.is_empty() {
             return 0;
         }
-        let source = self
-            .held_park
-            .filter(|p| p.cross_row)
-            .map(|p| p.row)
-            .or_else(|| {
-                (self.type_hint.armed() || !self.type_press_ring.is_empty())
-                    .then_some(self.last)
-                    .flatten()
-                    .map(|(row, _)| row)
-            })
-            .or_else(|| self.insert.armed.and_then(|licence| licence.row));
-        let caret_move = self
-            .last
-            .or_else(|| self.last_visible.map(|(cell, _)| cell))
-            .zip(self.witness_rows[..self.witness_rows_n.min(self.witness_rows.len())].first())
-            .map(|((from, _), to)| (from, to.row));
+        let source = if let Some(p) = self.held_park
+            && p.cross_row
+        {
+            Some(p.row)
+        } else if (self.type_hint.armed() || !self.type_press_ring.is_empty())
+            && let Some((row, _)) = self.last
+        {
+            Some(row)
+        } else {
+            match self.insert.armed {
+                Some(licence) => licence.row,
+                None => None,
+            }
+        };
+        let last_cell = match self.last {
+            Some(cell) => Some(cell),
+            None => self.last_visible.map(|(cell, _)| cell),
+        };
+        let caret_move = if let Some((from, _)) = last_cell
+            && let Some(to) =
+                self.witness_rows[..self.witness_rows_n.min(self.witness_rows.len())].first()
+        {
+            Some((from, to.row))
+        } else {
+            None
+        };
         let n = self.v2.ribbon_rows_at_caret(source, caret_move, out);
         let mut asked = [0u16; RIBBON_LIST_ROWS];
         let kept = n.min(asked.len());

@@ -313,15 +313,13 @@ fn the_page_lists_agy_and_muse_code_sessions_and_no_shells() {
 }
 
 #[test]
-fn the_page_lists_a_gemini_cli_session_read_under_node() {
+fn the_page_lists_an_agent_session_read_under_node() {
     for (program, reader, listed) in [
-        (
-            "node",
-            Some(aterm_phase::Program::Gemini),
-            Some("Gemini CLI"),
-        ),
+        ("node", Some(aterm_phase::Program::Muse), Some("Muse Code")),
         ("node", None, None),
-        ("zsh", Some(aterm_phase::Program::Gemini), None),
+        ("zsh", Some(aterm_phase::Program::Muse), None),
+        ("gemini", None, None),
+        ("gemini", Some(aterm_phase::Program::Generic), None),
     ] {
         let mut app = App::headless_for_test();
         {

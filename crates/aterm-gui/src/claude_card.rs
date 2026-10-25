@@ -675,18 +675,6 @@ impl WindowCards {
         repeats
     }
 
-    /// Let a double click's interval pass since the banner link's last press, as a person's
-    /// next, separate click would: the press is stamped that long ago.
-    #[cfg(all(test, unix))]
-    pub(crate) fn age_link_press(&mut self) {
-        let interval = Duration::from_millis(
-            u64::try_from(crate::multi_click_ms()).expect("a double click's interval") + 1,
-        );
-        self.link_pressed = self
-            .link_pressed
-            .and_then(|(session, at)| Some((session, at.checked_sub(interval)?)));
-    }
-
     /// Mark all cards in this window as hidden.
     pub(crate) fn hide_all(&mut self) {
         for entry in &mut self.entries {

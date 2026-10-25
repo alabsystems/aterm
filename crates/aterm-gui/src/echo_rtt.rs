@@ -33,6 +33,45 @@ static MAX_US: AtomicU64 = AtomicU64::new(0);
 /// Samples whose ring push lost `try_lock`: the PTY reader never blocks on the metrics reader.
 static DROPPED_LOCKED: AtomicU64 = AtomicU64::new(0);
 
+const BURST_SLOTS: usize = 64;
+
+/// Each session's latest output burst, packed like [`ARMED`], in the slot its id picks; a
+/// session that shares a slot reads another's burst as none of its own. An arm reads it back
+/// to catch an answer that arrived before the arm did ([`arm_catching`]).
+static BURSTS: [AtomicU64; BURST_SLOTS] = [const { AtomicU64::new(0) }; BURST_SLOTS];
+
+fn burst_slot(session: u64) -> &'static AtomicU64 {
+    &BURSTS[usize::try_from(session % BURST_SLOTS as u64).unwrap_or(0)]
+}
+
+thread_local! {
+    /// When this thread's first PTY write since [`forget_write_start`] began, in
+    /// [`crate::metrics::now_us`] microseconds (0: none).
+    static WRITE_START_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread is about to hand input bytes to a PTY: the first such write since
+/// [`forget_write_start`] is where an echo's clock starts.
+pub(crate) fn note_write_start() {
+    WRITE_START_US.with(|start| {
+        if start.get() == 0 {
+            start.set(crate::metrics::now_us().max(1));
+        }
+    });
+}
+
+/// Drop this thread's write start, before the work whose first write is to be timed.
+pub(crate) fn forget_write_start() {
+    WRITE_START_US.with(|start| start.set(0));
+}
+
+fn take_write_start() -> Option<u64> {
+    WRITE_START_US.with(|start| match start.replace(0) {
+        0 => None,
+        us => Some(us),
+    })
+}
+
 /// The trailing sample window, in microseconds. Written at most once per
 /// keystroke, read by the `metrics percentiles` verb.
 static RING: Mutex<Ring> = Mutex::new(Ring::new());
@@ -106,14 +145,15 @@ const fn pack(session: u64, now_us: u64) -> u64 {
     ((session & 0xFFFF) << 48) | (now_us & US_MASK)
 }
 
-/// A keystroke's bytes just entered `session`'s PTY: start the clock, unless an
-/// older unanswered write still holds the slot (keep-oldest).
-fn arm_at(session: u64, now_us: u64) {
+/// A keystroke's bytes entered `session`'s PTY at `now_us`: start the clock, unless an
+/// older unanswered write still holds the slot (keep-oldest). Returns the slot's new value
+/// when this write took it.
+fn arm_at(session: u64, now_us: u64) -> Option<u64> {
     let cur = ARMED.load(Ordering::Acquire);
     if cur != 0 {
         if now_us.saturating_sub(cur & US_MASK) < ARM_TTL_US {
             COALESCED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         }
         if ARMED
             .compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -122,21 +162,33 @@ fn arm_at(session: u64, now_us: u64) {
             EXPIRED.fetch_add(1, Ordering::Relaxed);
         } else {
             COALESCED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         }
     }
+    let armed = pack(session, now_us.max(1));
     if ARMED
-        .compare_exchange(
-            0,
-            pack(session, now_us.max(1)),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        )
+        .compare_exchange(0, armed, Ordering::SeqCst, Ordering::Relaxed)
         .is_ok()
     {
         ARMS.fetch_add(1, Ordering::Relaxed);
+        Some(armed)
     } else {
         COALESCED.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+/// Arm for a write to `session` that began at `start_us`, and close at once on an answer that
+/// arrived before the arm. The PTY reader stores its burst and then looks for an arm; this arms
+/// and then looks for a burst. All four steps are `SeqCst`, so at least one of the two sees the
+/// other, and the slot's compare-exchange lets only one of them record the sample.
+fn arm_catching(session: u64, start_us: u64) {
+    let Some(armed) = arm_at(session, start_us) else {
+        return;
+    };
+    let burst = burst_slot(session).load(Ordering::SeqCst);
+    if burst >> 48 == session & 0xFFFF && burst & US_MASK >= start_us {
+        let _ = close_armed(armed, burst & US_MASK);
     }
 }
 
@@ -147,6 +199,12 @@ fn close_at(session: u64, now_us: u64) -> Option<u64> {
     if cur == 0 || cur >> 48 != (session & 0xFFFF) {
         return None;
     }
+    close_armed(cur, now_us)
+}
+
+/// Close the clock if the slot still holds `cur`, recording the interval from its write to
+/// `now_us`.
+fn close_armed(cur: u64, now_us: u64) -> Option<u64> {
     if ARMED
         .compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
@@ -168,40 +226,56 @@ fn close_at(session: u64, now_us: u64) -> Option<u64> {
 
 /// One output burst arrived from `session`.
 pub(crate) fn note_output_burst(session: u64) {
-    if ARMED.load(Ordering::Relaxed) == 0 {
+    note_output_burst_at(session, crate::metrics::now_us());
+}
+
+fn note_output_burst_at(session: u64, now_us: u64) {
+    burst_slot(session).store(pack(session, now_us), Ordering::SeqCst);
+    if ARMED.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let _ = close_at(session, crate::metrics::now_us());
+    let _ = close_at(session, now_us);
 }
 
 /// A key queued behind a paste was just accepted by `session`'s `sink` on the ordered-egress
-/// writer thread: start the clock there (keep-oldest, like every arm).
+/// writer thread: start the clock where that write began (keep-oldest, like every arm).
 pub(crate) fn arm_deferred(session: u64, sink: &aterm_session::sink::SinkWriter) {
-    #[cfg(test)]
-    if DEFERRED_ARM_SINK.load(Ordering::Acquire) != std::ptr::from_ref(sink).addr() {
+    let start_us = take_write_start().unwrap_or_else(crate::metrics::now_us);
+    if !arms_reach_the_statics(sink) {
         return;
     }
-    #[cfg(not(test))]
-    let _ = sink;
-    arm_at(session, crate::metrics::now_us());
+    arm_catching(session, start_us);
 }
 
-/// Tests: the one sink whose ordered-writer arms may reach the process-global
-/// statics. Every other test's writer threads write keys too, and must not
-/// perturb the tests that read these counters exactly (this module's own).
-#[cfg(test)]
-static DEFERRED_ARM_SINK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether an arm for `sink` may reach the process-global statics: always, outside tests.
+#[cfg(not(test))]
+const fn arms_reach_the_statics(_sink: &aterm_session::sink::SinkWriter) -> bool {
+    true
+}
 
-/// Let `sink`'s deferred arms through for as long as the guard lives.
+/// Whether an arm for `sink` may reach the process-global statics: in tests, only the sink
+/// [`arms_for_test`] lets through.
+#[cfg(test)]
+fn arms_reach_the_statics(sink: &aterm_session::sink::SinkWriter) -> bool {
+    ARM_SINK.load(Ordering::Acquire) == std::ptr::from_ref(sink).addr()
+}
+
+/// Tests: the one sink whose arms may reach the process-global statics. Every other test's
+/// keys arm too, on the UI thread and on ordered writer threads, and must not perturb the
+/// tests that read these counters exactly (this module's own).
+#[cfg(test)]
+static ARM_SINK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Let `sink`'s arms through for as long as the guard lives.
 #[cfg(all(test, unix))]
-pub(crate) fn deferred_arms_for_test(sink: &aterm_session::sink::SinkWriter) -> impl Drop + use<> {
+pub(crate) fn arms_for_test(sink: &aterm_session::sink::SinkWriter) -> impl Drop + use<> {
     struct Guard;
     impl Drop for Guard {
         fn drop(&mut self) {
-            DEFERRED_ARM_SINK.store(0, Ordering::Release);
+            ARM_SINK.store(0, Ordering::Release);
         }
     }
-    DEFERRED_ARM_SINK.store(std::ptr::from_ref(sink).addr(), Ordering::Release);
+    ARM_SINK.store(std::ptr::from_ref(sink).addr(), Ordering::Release);
     Guard
 }
 
@@ -227,6 +301,9 @@ pub(crate) fn reset() {
     LAST_US.store(0, Ordering::Relaxed);
     MAX_US.store(0, Ordering::Relaxed);
     DROPPED_LOCKED.store(0, Ordering::Relaxed);
+    for burst in &BURSTS {
+        burst.store(0, Ordering::Relaxed);
+    }
     if let Ok(mut ring) = RING.lock() {
         ring.clear();
     }
@@ -307,20 +384,30 @@ impl crate::App {
         session: Option<u64>,
     ) -> Option<EchoWriteProbe> {
         DEFERRED_IN_BRACKET.with(|deferred| deferred.set(false));
+        forget_write_start();
         let session = session.or_else(|| self.focused_session_id(wid))?;
         let epoch = self.session_by_id(session)?.ctx.sink.input_epoch();
         Some(EchoWriteProbe { session, epoch })
     }
 
-    /// Close the bracket.
+    /// Close the bracket. A write it made starts the clock where the write began, and an
+    /// answer that came back while the dispatch was still running is caught here rather than
+    /// left for the session's next output.
     pub(crate) fn echo_probe_close(&self, probe: Option<EchoWriteProbe>) {
         let deferred = DEFERRED_IN_BRACKET.with(|deferred| deferred.replace(false));
+        let start_us = take_write_start();
         let Some(probe) = probe else { return };
         let Some(session) = self.session_by_id(probe.session) else {
             return;
         };
-        if !deferred && session.ctx.sink.input_epoch() != probe.epoch {
-            arm_at(probe.session, crate::metrics::now_us());
+        if !deferred
+            && session.ctx.sink.input_epoch() != probe.epoch
+            && arms_reach_the_statics(&session.ctx.sink)
+        {
+            arm_catching(
+                probe.session,
+                start_us.unwrap_or_else(crate::metrics::now_us),
+            );
         }
     }
 }
@@ -415,6 +502,79 @@ mod tests {
             Some(42),
             "the NEW write owns the slot"
         );
+    }
+
+    /// A session no other test's reader can be: its tag is not a small id.
+    const QUIET: u64 = 0xBEE7;
+
+    /// The echo came back while the dispatch that wrote it was still running, before the arm:
+    /// it is the sample, measured from where the write began, and the session's next output
+    /// (say, the next keystroke's echo half a second later) answers nothing.
+    #[test]
+    fn an_answer_that_beat_the_arm_is_its_sample_not_the_next_output() {
+        let _g = fresh();
+        note_output_burst_at(QUIET, 1_400);
+        arm_catching(QUIET, 1_000);
+        let s = snapshot();
+        assert_eq!((s.arms, s.total, s.last_us), (1, 1, 400), "{s:?}");
+        note_output_burst_at(QUIET, 500_000);
+        assert_eq!(snapshot().total, 1, "nothing was left armed for it");
+    }
+
+    /// Output from before the write began is no answer to it: the clock stays armed for the
+    /// session's next output.
+    #[test]
+    fn output_from_before_the_write_is_no_answer() {
+        let _g = fresh();
+        note_output_burst_at(QUIET, 900);
+        arm_catching(QUIET, 1_000);
+        assert_eq!(snapshot().total, 0);
+        assert_eq!(close_at(QUIET, 1_250), Some(250));
+    }
+
+    /// A session that shares the burst slot cannot answer for this one.
+    #[test]
+    fn a_slot_sharing_sessions_output_is_not_this_sessions_answer() {
+        let _g = fresh();
+        let other = QUIET + BURST_SLOTS as u64;
+        assert!(std::ptr::eq(burst_slot(other), burst_slot(QUIET)));
+        note_output_burst_at(other, 1_400);
+        arm_catching(QUIET, 1_000);
+        assert_eq!(snapshot().total, 0);
+        assert_eq!(
+            close_at(QUIET, 1_600),
+            Some(600),
+            "its own output still does"
+        );
+    }
+
+    /// A metrics reset forgets the bursts too, so an old one cannot answer a new write.
+    #[test]
+    fn a_reset_forgets_the_last_bursts() {
+        let _g = fresh();
+        note_output_burst_at(QUIET, 9_000);
+        reset();
+        arm_catching(QUIET, 1_000);
+        assert_eq!(snapshot().total, 0);
+    }
+
+    /// A thread's write start is its first write's since it was forgotten.
+    #[test]
+    fn a_write_start_is_the_first_writes_until_forgotten() {
+        forget_write_start();
+        assert_eq!(take_write_start(), None);
+        note_write_start();
+        let first = WRITE_START_US.with(std::cell::Cell::get);
+        note_write_start();
+        assert_eq!(
+            take_write_start(),
+            Some(first),
+            "a later write keeps the first"
+        );
+        assert_eq!(take_write_start(), None, "taking it clears it");
+        note_write_start();
+        forget_write_start();
+        assert_eq!(take_write_start(), None);
     }
 
     /// A slow echo is recorded at its true length, not truncated.

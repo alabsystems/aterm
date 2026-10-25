@@ -74,8 +74,6 @@ pub const SCRATCH_DIRS: &[&str] = &[
     "control-home",
     "control-home/.codex",
     "tmp",
-    "gemini-home",
-    "gemini-home/.gemini",
     "agy-home",
     "agy-home/.gemini",
     "agy-home/.gemini/antigravity-cli",

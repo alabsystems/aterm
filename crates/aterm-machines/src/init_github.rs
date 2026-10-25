@@ -15,6 +15,13 @@ mod native;
 mod repos;
 pub use native::InitialRepositoryInputs;
 
+/// Whether Command Line Tools git, which every clone runs, is installed: the initial
+/// repositories wait on it ([`crate::init_observe::Wait::CommandLineTools`]) until it is.
+#[must_use]
+pub fn git_installed(sys: &dyn System) -> bool {
+    repos::git_installed(sys)
+}
+
 /// Reconcile using locally captured inputs, checking their materialization
 /// identity after inventory and before effects. The check never leases network work.
 /// # Errors

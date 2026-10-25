@@ -114,6 +114,12 @@ pub(super) struct PermissionGate {
 }
 
 impl PermissionGate {
+    /// Whether setup is free of a local decision or Stop.
+    /// The caller supplies the separate exact run's durable authority.
+    pub(super) fn setup_unheld(&self) -> bool {
+        ::std::matches!(self.hold, PermissionHold::None)
+    }
+
     pub(super) fn allowed(&self) -> bool {
         ::std::matches!(self.hold, PermissionHold::None)
             && self.policy.is_some_and(|policy| policy.allowed)

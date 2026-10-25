@@ -770,6 +770,45 @@ fn remapped_roots_keep_their_windows_namespace_and_nesting() {
     );
 }
 
+/// A TAPE AN OLDER BUILD RECORDED STILL DECODES, ITS RETIRED GEMINI CLI SWITCH READ AS NOTHING:
+/// the `[policy]` line `gemini.enabled=…` sets no policy, the header writes it back without it,
+/// and what was read in its stead is said with agy named. NEGATIVE CONTROL: an agent no build
+/// had is still refused as a newer build's.
+#[test]
+fn an_older_tapes_retired_agent_switch_decodes_as_nothing_said() {
+    let opts = SuperviseOpts::default();
+    let text = Header::capture("t", Entry::Watch, None, &watched(), &opts).encode();
+    for value in ["true", "false"] {
+        let older = text.replacen(
+            "[policy]\n",
+            &format!("[policy]\ngemini.enabled={value}\n"),
+            1,
+        );
+        assert_ne!(older, text, "the policy section is there to edit");
+        let back = Header::decode(&older).expect("an older build's tape");
+        assert_same_opts(&back.opts, &opts);
+        assert_eq!(
+            back.encode(),
+            text,
+            "{value}: the retired switch is not written again"
+        );
+        assert!(
+            back.supplied
+                .iter()
+                .any(|note| note.starts_with("[policy] harness.gemini.enabled: ")
+                    && note.contains(aterm_phase::RETIRED_AGENT)),
+            "{value}: {:?}",
+            back.supplied
+        );
+    }
+    let newer = text.replacen("[policy]\n", "[policy]\ngeminix.enabled=true\n", 1);
+    let e = Header::decode(&newer).expect_err("no build had it");
+    assert!(
+        e.contains("geminix.enabled: no agent this build has"),
+        "{e}"
+    );
+}
+
 #[test]
 fn a_claude_header_keeps_reading_its_retired_setup_durations() {
     let setup = watched();

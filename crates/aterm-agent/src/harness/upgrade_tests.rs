@@ -1673,28 +1673,14 @@ fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
         },
         "agy: relaunch on exit and the live upgrade's quiet flow"
     );
-    let relaunch_alone = Lanes {
-        relaunch: true,
-        upgrade: false,
-        restart_in_place: false,
-    };
     assert_eq!(Agent::Agy.record_key("s-0").as_deref(), Some("agy-s-0"));
-    assert_eq!(Agent::parse("gemini"), Some(Agent::Gemini));
-    assert_eq!(Agent::Gemini.word(), Agent::Gemini.program().name());
-    assert_eq!(
-        lanes(Agent::Gemini.program()),
-        relaunch_alone,
-        "gemini: relaunch on exit alone"
-    );
-    assert_eq!(
-        Agent::Gemini.record_key("s-0").as_deref(),
-        Some("gemini-s-0")
-    );
     for bad in [
         "opencode",
         "Codex",
         " codex",
         "generic",
+        "gemini",
+        "gemini-cli",
         "Gemini",
         "agy ",
         "muse-code",

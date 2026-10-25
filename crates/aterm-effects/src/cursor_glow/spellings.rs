@@ -176,9 +176,14 @@ const fn row_names<const N: usize>() -> [&'static str; N] {
 pub const TRAIL_STYLE_NAMES: [&str; TRAIL_STYLES.len()] = row_names();
 
 /// Trim Unicode whitespace with the same property as [`str::trim`], including in const parsers.
+#[inline]
 pub(crate) const fn trim_whitespace_bytes(raw: &str) -> &[u8] {
+    trim_whitespace_slice(raw.as_bytes())
+}
+
+/// Trim Unicode whitespace from a UTF-8 slice cut on scalar boundaries.
+pub(crate) const fn trim_whitespace_slice(mut bytes: &[u8]) -> &[u8] {
     // Each cut removes a whole scalar, leaving both edges on UTF-8 boundaries.
-    let mut bytes = raw.as_bytes();
     while !bytes.is_empty() {
         let (white, width) = scalar_whitespace(bytes);
         if !white {

@@ -1604,3 +1604,119 @@ fn a_startup_subscription_resolution_uses_its_scoped_peer() {
         "a subsequent undirected request cannot inherit the old peer"
     );
 }
+
+/// CONTRACT 3 through the real `meta` dispatch (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1
+/// items 3 and 4): a rostered harness's scoped claim is proven or refused whole; a proven one
+/// replaces the window host's claim and prints `supervisor_proven=1`, but is never codex-alab's
+/// v2 self-claim; a rostered holder never claims without `contract=3`, a scope word unknown or
+/// outside its row refuses the claim, and an unrostered holder's v3 claim is an ordinary claim,
+/// never proven.
+#[test]
+fn a_rostered_harness_claims_its_scope_through_meta_proven_or_refused_whole() {
+    use crate::session_timeline::SupervisorClaim;
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7520, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let host = format!("aterm-harness@{}", std::process::id());
+    claim_supervisor_as(
+        ctx,
+        &host,
+        None,
+        None,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the host's claim");
+    let me = format!("grok-alab@{}", stand_in());
+    let serve = |rest: &str, proves: bool| {
+        let prove = move |_: &str| proves.then(running);
+        super::meta_wakes_proving_for_test(&store, &h.term, 7520, &h.ctx, rest, Some(4), &prove).0
+    };
+    let scoped_now = || {
+        let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = crate::metrics::now_us();
+        (
+            meta.live_claim(now)
+                .and_then(|c: &SupervisorClaim| c.scoped.as_ref())
+                .map(|s| (s.claim.scopes.words(), s.claim.versions())),
+            meta.claim_proven(now),
+        )
+    };
+    let claim = format!(
+        "set supervisor {me} contract=3 scope=relaunch,upgrade version=0.2.0 vendor=1.0.70"
+    );
+
+    let reply = serve(&claim, false);
+    assert!(reply.starts_with("ERR unproven:"), "{reply}");
+    assert_eq!(
+        shown(ctx),
+        (Some(host.clone()), false),
+        "refused whole: the host still holds"
+    );
+
+    for bad in [
+        format!("set supervisor {me}"),
+        format!("set supervisor {me} ttl=500"),
+        format!("set supervisor {me} contract=3"),
+        format!("set supervisor {me} contract=3 scope=walls"),
+        format!("set supervisor {me} contract=3 scope=relaunch,bogus"),
+        format!("set supervisor {me} contract=3 scope=relaunch,relaunch"),
+        format!("set supervisor {me} contract=3 scope=relaunch ttl=500"),
+        format!("set supervisor {me} contract=2 scope=relaunch"),
+        format!("set supervisor {me} contract=3 scope=relaunch version=0.1.1"),
+    ] {
+        let reply = serve(&bad, true);
+        assert!(reply.starts_with("ERR usage"), "{bad}: {reply}");
+        assert_eq!(shown(ctx), (Some(host.clone()), false), "{bad}");
+    }
+
+    assert_eq!(serve(&claim, true), "OK\n");
+    assert_eq!(
+        shown(ctx),
+        (Some(me.clone()), false),
+        "the proof replaced the host's claim, and it is not codex-alab's self-claim"
+    );
+    assert_eq!(
+        scoped_now(),
+        (
+            Some((
+                "relaunch,upgrade".to_string(),
+                "grok-alab 0.2.0 (grok 1.0.70)".to_string()
+            )),
+            true
+        )
+    );
+    let status = serve("", true);
+    assert!(status.contains(" supervisor_proven=1 "), "{status}");
+    assert!(
+        status.contains(&format!(" supervisor={me} "))
+            || status.contains(" supervisor=grok-alab%40"),
+        "{status}"
+    );
+    assert!(
+        serve(&format!("set supervisor {host}"), false).starts_with("ERR busy"),
+        "the host cannot take a proven claim back"
+    );
+
+    assert!(release_supervisor(
+        ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(
+        serve(
+            "set supervisor kimi-alab@4242 contract=3 scope=relaunch",
+            true
+        ),
+        "OK\n"
+    );
+    assert_eq!(shown(ctx), (Some("kimi-alab@4242".to_string()), false));
+    assert_eq!(
+        scoped_now(),
+        (None, false),
+        "an unrostered holder's claim is never proven"
+    );
+}

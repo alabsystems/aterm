@@ -44,6 +44,8 @@ macro_rules! verify_island {
 }
 
 pub mod config;
+/// The smallest edits that turn one text into another.
+pub mod diff;
 /// The editor's pure reducer: commands, keymaps, views and the workspace.
 pub mod editor;
 /// The shared input reducer: one key-to-command semantics for every face.

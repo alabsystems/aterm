@@ -129,8 +129,9 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["rustup"],
         also: "stable's foreign stds and clippy",
-        runs: "the foreign cells (or each --cell), linted for their own triples; with a Windows cell, both \
-               windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) (STOCK EXCEPTION)",
+        runs: "every forge cell but this machine's own (or each --cell), linted for its own triple; with \
+               a Windows cell, both windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) \
+               (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::WasmSmoke,
@@ -227,7 +228,8 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["desktop"],
         also: "--app <APP>",
-        runs: "aterm-conformance's paint/spin rows, then the GUI typing smoke, on <APP> (alone)",
+        runs: "aterm-conformance's paint/spin/aos/rewind rows, then the GUI typing smoke, on <APP> (alone); \
+               a row a bundle this checkout's HEAD did not build has no answer to is named, not judged",
     },
     Spec {
         check: Check::CodexAlab,

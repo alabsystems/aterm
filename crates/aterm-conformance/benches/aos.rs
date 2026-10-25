@@ -15,6 +15,7 @@ mod measuring {
 
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::aos::{AosRow, measure};
+    use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
     const ROWS: &[(&str, AosRow)] = &[(
@@ -29,6 +30,7 @@ mod measuring {
     fn take(rig: &Rig, row: &AosRow) -> Outcome {
         let report = match measure(rig, row) {
             Ok(report) => report,
+            Err(CouldNotRun::Unanswered(why)) => return Outcome::Unanswered(why),
             Err(why) => {
                 return Outcome::CouldNotRun(format!(
                     "AOS COULD NOT RUN: the probe decided nothing: {why}"

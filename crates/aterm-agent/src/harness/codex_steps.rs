@@ -23,7 +23,9 @@ use super::transcript;
 /// exactly the builds those reductions' own `# codex <build>` lines name, read by `build.rs` from the files the
 /// checkout holds. A release builds from a clean clone, so there a build is listed when its reductions are committed
 /// (`lab codex-measure`) and by nothing else; in a working tree an uncommitted reduction counts too, which is why
-/// `lab codex-measure` refuses one HEAD does not hold. Sorted, matched whole.
+/// `lab codex-measure` refuses one HEAD does not hold. Sorted, matched whole. Each is named as its
+/// rollouts name it (`session_meta`'s `cli_version`): by its client version
+/// (`atpkg::alab::client_version`), never by codex-alab's own version.
 pub const CODEX_MEASURED_BUILDS: &[&str] =
     include!(concat!(env!("OUT_DIR"), "/codex_measured_builds.rs"));
 

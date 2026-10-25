@@ -2011,16 +2011,22 @@ mod tests {
         assert_eq!(m.key.as_deref(), Some(KEY_MANAGED));
 
         let three = managed_current(
-            "claude 2.1.280 (Anthropic latest); codex 0.156.1 (OpenAI latest); gemini 1.0",
+            "claude 2.1.280 (Anthropic latest); codex 0.156.1 (OpenAI latest); agy 1.0",
             0,
             true,
             HookDialect::Zsh,
         )
         .unwrap();
-        for name in ["2.1.280", "0.156.1", "gemini 1.0"] {
+        for name in ["2.1.280", "0.156.1", "Antigravity CLI 1.0"] {
             assert!(three.title.contains(name), "{name}: {}", three.title);
         }
         assert!(!three.title.contains("latest") && !three.detail[0].contains("latest"));
+        let unknown = managed_current("nosuchagent 1.0", 0, true, HookDialect::Zsh).unwrap();
+        assert!(
+            unknown.title.contains("nosuchagent 1.0"),
+            "a name no vendor spec knows is said as the wire spells it: {}",
+            unknown.title
+        );
         assert!(
             managed_current("  ;  ", 0, true, HookDialect::Zsh).is_none(),
             "an empty body records nothing"

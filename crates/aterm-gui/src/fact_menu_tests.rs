@@ -368,6 +368,7 @@ fn the_account_menu_says_why_the_week_is_missing() {
         WeeklyGap::Unoffered(Refusal::Line),
         WeeklyGap::Unoffered(Refusal::Argv),
         WeeklyGap::Unoffered(Refusal::Settings),
+        WeeklyGap::Unoffered(Refusal::Room),
         WeeklyGap::Untapped,
         WeeklyGap::Unrestarted,
         WeeklyGap::NoReply,
@@ -784,6 +785,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
             class: accounts::Class::Dedicated,
             dir: None,
             email: Some("main@example.test".into()),
+            identity_email: Some("canonical@example.test".into()),
             ..accounts::Row::default()
         }],
     };
@@ -834,6 +836,18 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
         "main \u{b7} dedicated \u{b7} 61% left \u{b7} 30m ago".to_string(),
         true,
     );
+    for label in [Some("main"), None] {
+        assert_eq!(
+            row(label, Some("canonical@example.test")),
+            ("main \u{b7} dedicated \u{b7} 10% left".into(), true),
+            "the provider identity selects the alias row's newer figure"
+        );
+        assert_eq!(
+            row(label, Some("main@example.test")),
+            kept,
+            "the sign-in alias is not evidence of the provider identity"
+        );
+    }
     assert_eq!(
         row(Some("main"), Some("other@example.test")),
         kept,
@@ -1324,6 +1338,7 @@ fn no_weekly_why_tells_the_person_to_open_usage() {
         WeeklyGap::Unoffered(Refusal::Line),
         WeeklyGap::Unoffered(Refusal::Argv),
         WeeklyGap::Unoffered(Refusal::Settings),
+        WeeklyGap::Unoffered(Refusal::Room),
         WeeklyGap::Untapped,
         WeeklyGap::Unrestarted,
         WeeklyGap::NoReply,

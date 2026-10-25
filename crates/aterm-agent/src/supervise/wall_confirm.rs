@@ -885,7 +885,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => None,
         };
         let Some(w) = wall else {
@@ -979,7 +978,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         if reading.wall.is_some() || !claude || reading.phase != Phase::Idle {
@@ -1087,7 +1085,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => {
                 return false;
             }
@@ -1221,7 +1218,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         if !claude
@@ -1257,7 +1253,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         if !claude || !aterm_phase::phase::carried_wait_alone(&screen.rows) {

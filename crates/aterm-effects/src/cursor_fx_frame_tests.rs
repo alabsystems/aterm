@@ -292,6 +292,96 @@ fn the_knob_law_is_what_the_frame_reads() {
     );
 }
 
+/// One licensed jump of `rows` rows and `cols` columns after a few typed keys, and the frames
+/// its light lives through, folded into one hash.
+fn jump_frames(raw: &str, length: usize, ground: (u32, u32), rows: u16, cols: u16) -> u64 {
+    let mut k = knobs();
+    k.length = length;
+    let mut session = Session::new(raw, k, false, ground);
+    let mut hash = aterm_hash::FxHasher::default();
+    let (mut ms, mut col) = (0, 4);
+    session.frame(ms, (2, col), &mut hash);
+    for _ in 0..6 {
+        ms += 120;
+        session.key(ms);
+        col += 1;
+        session.frame(ms, (2, col), &mut hash);
+    }
+    ms += 200;
+    session.jump(ms);
+    for _ in 0..12 {
+        session.frame(ms, (2 + rows, col + cols), &mut hash);
+        ms += 40;
+    }
+    hash.finish()
+}
+
+/// [`GlowStyle::jump_reach`] is where Trail length stops changing a jump, read off the frames
+/// the engine draws: at its reach a jump draws as it does at the longest length, a cell short of
+/// it it draws otherwise, and where it says Length shapes nothing, no length changes anything.
+#[test]
+fn the_jump_reach_is_where_trail_length_stops_changing_a_jump() {
+    let styles = [
+        "lumen",
+        "phaser",
+        "sparkle",
+        "fire",
+        "laser",
+        "beam",
+        "water",
+        "comet",
+        "classic",
+        "rainbow kitty pet",
+    ];
+    let aspect = geom().ch as f32 / geom().cw as f32;
+    let mut wrong = Vec::new();
+    for raw in styles {
+        let style = GlowSpelling::parse(raw).style.expect("a built-in style");
+        for ground in [DARK, LIGHT] {
+            let ctx = KnobContext {
+                dark: ground == DARK,
+                ring: true,
+                ..KnobContext::EMPTY
+            };
+            // Hops and leaps along a row, and Enters down to the next rows: the moves the
+            // reach describes (a short move off its row on paper keeps only its head's row).
+            for (rows, cols) in [(0, 3), (0, 6), (0, 8), (0, 12), (1, 30), (2, 40)] {
+                let side = if ground == DARK { "dark" } else { "light" };
+                let longest = jump_frames(raw, 512, ground, rows, cols);
+                let reach = style.jump_reach(rows, cols, aspect, ctx);
+                match reach {
+                    Some(reach) => {
+                        let at = reach.ceil() as usize;
+                        if jump_frames(raw, at, ground, rows, cols) != longest {
+                            wrong.push(format!(
+                                "{raw} {side} ({rows},{cols}): Length {at} still changes it"
+                            ));
+                        }
+                        let short = (reach.floor() as usize).saturating_sub(1).max(1);
+                        if short < at && jump_frames(raw, short, ground, rows, cols) == longest {
+                            wrong.push(format!(
+                                "{raw} {side} ({rows},{cols}): Length {short} draws as {at}"
+                            ));
+                        }
+                    }
+                    None => {
+                        if jump_frames(raw, 1, ground, rows, cols) != longest {
+                            wrong.push(format!(
+                                "{raw} {side} ({rows},{cols}): no reach, yet Length 1 changes it"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "jump reach vs frame:\n{}",
+        wrong.join("\n")
+    );
+}
+
 #[test]
 fn the_accent_follows_the_ring_where_the_ring_is_its_only_mark() {
     for raw in ["phaser", "sparkle"] {

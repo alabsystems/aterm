@@ -24,7 +24,6 @@ fn every_fact() -> BoxFacts {
         trusted_cwd: Some(PathBuf::from("/Users//owner/src/app")),
         bypass: true,
         limit_reset_passed: true,
-        limit_retry: true,
         worker: Some(Ok(WorkerEnv::from_env(vec![
             "ANTHROPIC_API_KEY=sk-planted-secret".to_string(),
             "PATH=/usr/bin".to_string(),
@@ -54,9 +53,10 @@ fn every_fact() -> BoxFacts {
         box_call: Some("Bash".to_string()),
         login_carry: true,
         login_back: true,
+        login_roster: true,
         login_renewed: true,
         login_method: Some(aterm_phase::LoginMethod::Subscription),
-        worker_agent: Some(aterm_phase::Program::Gemini),
+        worker_agent: Some(aterm_phase::Program::Agy),
     }
 }
 
@@ -81,8 +81,8 @@ fn facts_read_back_as_written() {
     assert_eq!(back.cwd, facts.cwd);
     assert_eq!(back.trusted_cwd, facts.trusted_cwd);
     assert_eq!(back.shell_cwds, facts.shell_cwds);
-    assert_eq!(back.worker_agent, Some(aterm_phase::Program::Gemini));
-    assert!(text.contains("\"worker_agent\":\"gemini\""), "{text}");
+    assert_eq!(back.worker_agent, Some(aterm_phase::Program::Agy));
+    assert!(text.contains("\"worker_agent\":\"agy\""), "{text}");
     let old = text.replacen(
         '{',
         r#"{"box_command":{"Ok":{"id":"toolu_lab16914d0fee39f3eb","command":"echo x"}},"#,
@@ -91,6 +91,14 @@ fn facts_read_back_as_written() {
     let (old_back, old_needs) = read(&old);
     assert!(old_needs.is_empty(), "{old_needs:?}");
     assert_eq!(written(&old_back), text, "the old field is dropped");
+    let retired = text.replacen('{', r#"{"limit_retry":true,"#, 1);
+    let (retired_back, retired_needs) = read(&retired);
+    assert!(retired_needs.is_empty(), "{retired_needs:?}");
+    assert_eq!(
+        written(&retired_back),
+        text,
+        "the retired Gemini CLI limit fact is dropped"
+    );
     let worker = back.worker.expect("read").expect("ok");
     assert_eq!(worker.pid(), Some(4242));
     assert_eq!(
@@ -208,5 +216,5 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert_eq!(ctx.python_allow, vec!["x*.py".to_string()]);
     assert_eq!(ctx.box_call.as_deref(), Some("Bash"));
     assert_eq!(ctx.shell_cwds, facts.shell_cwds);
-    assert_eq!(ctx.worker_agent, Some(aterm_phase::Program::Gemini));
+    assert_eq!(ctx.worker_agent, Some(aterm_phase::Program::Agy));
 }

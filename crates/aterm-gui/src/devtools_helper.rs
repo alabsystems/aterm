@@ -26,6 +26,13 @@ pub(crate) const PRESENT_WITHIN: Duration = Duration::from_secs(5 * 60);
 /// How often a waiting hand-over looks for its quiet moment while an aterm window is focused.
 pub(crate) const RECHECK_EVERY: Duration = Duration::from_secs(5);
 
+/// When a page aterm brings up now is past its ten minutes ([`atpkg::devtools::REOPEN_AFTER_S`]),
+/// read after its marker was written: the marker counts them in whole seconds from its own, so
+/// a look from then on never finds the page recent.
+pub(crate) fn past_its_ten_minutes() -> Instant {
+    Instant::now() + Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S)
+}
+
 /// How long a hand-over a control verb asked for waits for its quiet moment.
 pub(crate) const ASKED_LAPSE: Duration = Duration::from_secs(30 * 60);
 
@@ -200,6 +207,10 @@ pub(crate) struct Facts {
     /// The window's own Full Disk Access probe reads the grant on
     /// ([`Refusal::NoFullDiskAccess`]).
     pub(crate) fda_on: bool,
+    /// aterm already brought this page up under the access revision
+    /// (`App::devtools_shown_this_revision`), judged as the page would open: a hand-over asked
+    /// while no revision stood waits queued for one.
+    pub(crate) shown_this_revision: bool,
 }
 
 /// Why a hand-over did nothing.
@@ -219,7 +230,7 @@ pub(crate) enum Refusal {
     /// add or switch on (`atpkg::devtools::Step::ListedOn`).
     Listed,
     /// aterm already brought the page up for this approved revision, unasked
-    /// ([`FdaFacts::shown_this_revision`]).
+    /// ([`FdaFacts::shown_this_revision`], [`Facts::shown_this_revision`]).
     Shown,
     /// The window's own Developer Tools hand-over waits for Full Disk Access to read on:
     /// without it the list cannot be read back, so a switch flipped there could not be
@@ -299,6 +310,9 @@ pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
     if !facts.grant_stable && !now {
         return Admit::Refuse(Refusal::Unstable);
     }
+    if origin == Origin::Automatic && facts.shown_this_revision {
+        return Admit::Refuse(Refusal::Shown);
+    }
     if facts.recent {
         return Admit::Refuse(Refusal::Recent);
     }
@@ -320,9 +334,34 @@ pub(crate) struct FdaFacts {
     pub(crate) recent: bool,
     pub(crate) devtools_recent: bool,
     /// aterm already brought this page up under the approved setup revision (`fda-pane-opened`'s
-    /// key, `atpkg::devtools::same_step`).
+    /// key, `atpkg::devtools::same_step`; [`fda_opened_word`] keeps it across a press while no
+    /// revision stands).
     pub(crate) shown_this_revision: bool,
     pub(crate) own: bool,
+}
+
+/// The word `fda-pane-opened` takes for the Full Disk Access page brought up now under `key`
+/// (`App::access_marks`): `key` while an access revision stands (`revision`). With none (after
+/// Stop, during a decision hold) `key` names the running version, and a word `opened` that names
+/// a revision's step for this TCC identity is kept instead: Set up keeps the access revision, so
+/// the press must not cost the window's once-per-revision check ([`FdaFacts::shown_this_revision`])
+/// the page that revision already brought up. A word under a version, or one another bundle id
+/// or Mac wrote (wherever both words carry one, as `atpkg::devtools::same_step` reads a word
+/// written cold), gives way to `key`.
+pub(crate) fn fda_opened_word(revision: bool, opened: Option<&str>, key: &str) -> String {
+    let kept = opened.filter(|word| {
+        let step = word.split('@').next().unwrap_or_default();
+        let names_revision = step
+            .strip_prefix('r')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+        let same_identity = word
+            .split('@')
+            .skip(1)
+            .zip(key.split('@').skip(1))
+            .all(|(left, right)| left == right);
+        !revision && names_revision && same_identity
+    });
+    kept.unwrap_or(key).to_owned()
 }
 
 /// Who may bring the Full Disk Access page up, and when. A control client's act on System State's
@@ -2138,6 +2177,143 @@ struct Queued {
     at: Instant,
     next_check: Instant,
     listed: Option<Result<(), String>>,
+    /// Another origin's ask the window's own step holds in its place: one hand-over waits per
+    /// page and the step never lapses, so an ask that comes while it waits, or that it takes the
+    /// place of, rides with it ([`Lane::take_rider`]).
+    rider: Option<Rider>,
+    /// The window's own step waits out a page brought up while no access revision stood
+    /// ([`came_up`]), until a revision stands ([`Lane::revision_stands`]).
+    kept: bool,
+    /// When the ten minutes of a page the step waits out are up ([`came_up`],
+    /// [`Lane::wait_out_page`]): it looks no sooner, whatever [`Self::next_check`] says, and
+    /// a later page only lengthens the wait.
+    page_wait: Option<Instant>,
+}
+
+/// An ask the window's own step carries ([`Queued::rider`]): who asked and when, and what the
+/// `spctl` run it made answered, if one did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Rider {
+    pub(crate) origin: Origin,
+    pub(crate) at: Instant,
+    pub(crate) listed: Option<Result<(), String>>,
+}
+
+impl Queued {
+    /// `origin`'s hand-over, asked at `at`, in the place of `waiting`: the window's own step
+    /// carries the ask it takes the place of, or the one the step it replaces carried.
+    fn in_place_of(
+        waiting: Option<&Self>,
+        origin: Origin,
+        at: Instant,
+        next_check: Instant,
+        listed: Option<Result<(), String>>,
+    ) -> Self {
+        let rider = waiting
+            .filter(|_| origin == Origin::Automatic)
+            .and_then(|waiting| {
+                if waiting.origin == Origin::Automatic {
+                    waiting.rider.clone()
+                } else {
+                    Some(Rider {
+                        origin: waiting.origin,
+                        at: waiting.at,
+                        listed: waiting.listed.clone(),
+                    })
+                }
+            });
+        // A step of its own that another replaces keeps the page it waits out, and kept, keeps.
+        let own = waiting
+            .filter(|waiting| origin == Origin::Automatic && waiting.origin == Origin::Automatic);
+        Self {
+            origin,
+            at,
+            next_check,
+            listed,
+            rider,
+            kept: own.is_some_and(|waiting| waiting.kept),
+            page_wait: own.and_then(|waiting| waiting.page_wait),
+        }
+    }
+
+    /// When the hand-over looks next: its [`Self::next_check`], or once the page it waits out
+    /// is ten minutes old ([`Self::page_wait`]), whichever is later.
+    fn look_at(&self) -> Instant {
+        self.page_wait
+            .map_or(self.next_check, |end| end.max(self.next_check))
+    }
+
+    /// Wait out a page's ten minutes, up at `end`, unless one it waits out ends later.
+    fn wait_out_page(&mut self, end: Instant) {
+        self.page_wait = Some(self.page_wait.map_or(end, |held| held.max(end)));
+    }
+
+    /// Whether the window's own step waits here, which keeps its place: an ask from another
+    /// origin (`rider`) then rides with it.
+    fn carry(&mut self, rider: Rider) -> bool {
+        if self.origin != Origin::Automatic {
+            return false;
+        }
+        if rider.origin != Origin::Automatic {
+            self.rider = Some(rider);
+        }
+        true
+    }
+}
+
+/// A page came up (`Lane::page_came_up`): what waits in `slot` for it is answered, except the
+/// window's own step while no access revision stands (`revision`). A page brought up then is
+/// not that revision's (the Developer Tools record has no revision to take it, and
+/// [`fda_opened_word`] keeps the revision's word), so the step waits on for the revision, with
+/// no rider (the page was the ask's), and looks again no sooner than `look_after`
+/// ([`Queued::page_wait`]). A page's caller passes [`past_its_ten_minutes`], taken once the page
+/// came up: after its marker was written (the window writes the Full Disk Access page's), or,
+/// for a control verb's `now`, after the window's answer, whose asker brings the Developer Tools
+/// page up and writes its marker later. A Developer Tools marker still within its ten minutes at
+/// that look holds the step on (`App::devtools_page_holds_the_step`), so neither page refuses
+/// the step as [`Refusal::Recent`], which would leave the revision's step unasked in this
+/// process.
+fn came_up(slot: &mut Option<Queued>, revision: bool, look_after: Instant) {
+    match slot.as_mut() {
+        Some(queued) if !revision && queued.origin == Origin::Automatic => {
+            queued.rider = None;
+            queued.kept = true;
+            queued.wait_out_page(look_after);
+        }
+        _ => *slot = None,
+    }
+}
+
+/// `rider` rides with the window's own step waiting in `slot` again, unless the step carries an
+/// ask asked after it (one waits, the newest, as [`Lane::queue`] keeps).
+fn ride_on(slot: &mut Option<Queued>, rider: Rider) {
+    if let Some(queued) = slot
+        .as_mut()
+        .filter(|queued| queued.origin == Origin::Automatic)
+        && queued.rider.as_ref().is_none_or(|held| held.at <= rider.at)
+    {
+        queued.rider = Some(rider);
+    }
+}
+
+/// `rider` unless it lapsed by `now` ([`Origin::lapses_after`], from when it was asked), as
+/// `page`'s hand-over says in aterm.log when it does.
+fn unlapsed(rider: Option<Rider>, now: Instant, page: &str) -> Option<Rider> {
+    let rider = rider?;
+    if rider
+        .origin
+        .lapses_after()
+        .is_some_and(|after| now.saturating_duration_since(rider.at) >= after)
+    {
+        aterm_log::info!(
+            "{page} hand-over ({}): asked {} minutes ago or more, it lapsed while it rode the \
+             window's own step",
+            rider.origin.as_str(),
+            ASKED_LAPSE.as_secs() / 60
+        );
+        return None;
+    }
+    Some(rider)
 }
 
 /// A hand-over [`Lane::take_queued`] gives back at its quiet moment: who asked, and what the
@@ -2208,6 +2384,12 @@ pub(crate) struct Lane {
     reading: Option<Reading>,
     queued: Option<Queued>,
     fda_queued: Option<Queued>,
+    /// The ask each page's step carried when [`Self::take_queued`] (Developer Tools, first) or
+    /// [`Self::take_queued_fda`] gave it back, until the window takes it.
+    taken_riders: [Option<Rider>; 2],
+    /// The ask the Developer Tools step carried when it went to its `spctl` run, until the run
+    /// ends ([`Self::take_listing_rider`]).
+    listing_rider: Option<Rider>,
     fda_ended: Option<FdaEnded>,
     listing: Option<Listing>,
     waiting: Waiting,
@@ -2259,6 +2441,8 @@ impl Lane {
             reading: None,
             queued: None,
             fda_queued: None,
+            taken_riders: [None, None],
+            listing_rider: None,
             fda_ended: None,
             listing: None,
             waiting: Waiting::default(),
@@ -2417,21 +2601,28 @@ impl Lane {
         }
     }
 
-    /// Hold a hand-over for its quiet moment.
+    /// Hold a hand-over for its quiet moment. One waits: the window's own step keeps its place
+    /// and carries another origin's ask ([`Self::take_rider`]); otherwise the newest ask waits.
     pub(crate) fn queue(&mut self, origin: Origin, now: Instant) {
+        let rider = Rider {
+            origin,
+            at: now,
+            listed: None,
+        };
         if self
             .queued
-            .as_ref()
-            .is_some_and(|q| q.origin == Origin::Automatic)
+            .as_mut()
+            .is_some_and(|queued| queued.carry(rider))
         {
             return;
         }
-        self.queued = Some(Queued {
+        self.queued = Some(Queued::in_place_of(
+            self.queued.as_ref(),
             origin,
-            at: now,
-            next_check: now,
-            listed: None,
-        });
+            now,
+            now,
+            None,
+        ));
     }
 
     /// The `spctl` run a hand-over the owner did not press made at its quiet moment ended at `now`,
@@ -2445,15 +2636,21 @@ impl Lane {
     ) {
         match self.queued.as_mut() {
             Some(queued) if queued.origin == Origin::Automatic && origin != Origin::Automatic => {
-                queued.listed.get_or_insert(listed);
-            }
-            _ => {
-                self.queued = Some(Queued {
+                queued.listed.get_or_insert_with(|| listed.clone());
+                queued.carry(Rider {
                     origin,
                     at: now,
-                    next_check: now + RECHECK_EVERY,
                     listed: Some(listed),
                 });
+            }
+            _ => {
+                self.queued = Some(Queued::in_place_of(
+                    self.queued.as_ref(),
+                    origin,
+                    now,
+                    now + RECHECK_EVERY,
+                    Some(listed),
+                ));
             }
         }
     }
@@ -2472,9 +2669,36 @@ impl Lane {
         })
     }
 
-    /// The owner reached the page another way: nothing waits any longer.
-    pub(crate) fn drop_queued(&mut self) {
-        self.queued = None;
+    /// The Developer Tools page, or its panel, came up: what waits for it is answered, except
+    /// the window's own step while no access revision stands (`revision`), which waits on for
+    /// the revision with no rider and looks again no sooner than `look_after` ([`came_up`]).
+    pub(crate) fn page_came_up(&mut self, revision: bool, look_after: Instant) {
+        came_up(&mut self.queued, revision, look_after);
+    }
+
+    /// Which pages' own steps wait out a page brought up while no access revision stood
+    /// ([`came_up`]): Developer Tools first, then Full Disk Access.
+    pub(crate) fn kept(&self) -> [bool; 2] {
+        [&self.queued, &self.fda_queued].map(|slot| slot.as_ref().is_some_and(|q| q.kept))
+    }
+
+    /// An access revision stands at `now`, and `shown` says, for each page's kept step
+    /// ([`Self::kept`]), whether it brought that page up already. Such a step looks at once,
+    /// where it is refused as shown, rather than holding the steps behind it for the rest of
+    /// the page's ten minutes; any other waits on as it was. Each is asked once.
+    pub(crate) fn revision_stands(&mut self, now: Instant, shown: [bool; 2]) {
+        for (slot, shown) in [&mut self.queued, &mut self.fda_queued]
+            .into_iter()
+            .zip(shown)
+        {
+            if let Some(queued) = slot.as_mut().filter(|queued| queued.kept) {
+                queued.kept = false;
+                if shown {
+                    queued.page_wait = None;
+                    queued.next_check = now;
+                }
+            }
+        }
     }
 
     /// Whether a Full Disk Access hand-over or panel goes first: a Developer Tools one waits behind
@@ -2490,24 +2714,29 @@ impl Lane {
 
     /// Whether the waiting hand-over's next look at the moment is due.
     pub(crate) fn hand_over_due(&self, now: Instant) -> bool {
-        !self.fda_first() && self.queued.as_ref().is_some_and(|q| now >= q.next_check)
+        !self.fda_first() && self.queued.as_ref().is_some_and(|q| now >= q.look_at())
     }
 
-    /// Hold the Full Disk Access hand-over for its quiet moment.
+    /// Hold the Full Disk Access hand-over for its quiet moment. One waits: the window's own
+    /// step keeps its place and carries another origin's ask ([`Self::take_fda_rider`]);
+    /// otherwise the first ask waits.
     pub(crate) fn queue_fda(&mut self, origin: Origin, now: Instant) {
-        if self
-            .fda_queued
-            .as_ref()
-            .is_some_and(|q| q.origin == Origin::Automatic || origin != Origin::Automatic)
-        {
+        if self.fda_queued.as_mut().is_some_and(|queued| {
+            queued.carry(Rider {
+                origin,
+                at: now,
+                listed: None,
+            }) || origin != Origin::Automatic
+        }) {
             return;
         }
-        self.fda_queued = Some(Queued {
+        self.fda_queued = Some(Queued::in_place_of(
+            self.fda_queued.as_ref(),
             origin,
-            at: now,
-            next_check: now,
-            listed: None,
-        });
+            now,
+            now,
+            None,
+        ));
     }
 
     /// The origin of the Full Disk Access hand-over waiting for its quiet moment.
@@ -2530,34 +2759,64 @@ impl Lane {
         self.fda_queued.is_some()
     }
 
-    /// The owner reached the Full Disk Access page another way, or the grant reads held: nothing
-    /// waits any longer.
+    /// The grant reads held: nothing waits for the Full Disk Access page any longer.
     pub(crate) fn drop_queued_fda(&mut self) {
         self.fda_queued = None;
     }
 
+    /// [`Self::page_came_up`] for the Full Disk Access page.
+    pub(crate) fn fda_page_came_up(&mut self, revision: bool, look_after: Instant) {
+        came_up(&mut self.fda_queued, revision, look_after);
+    }
+
     /// Whether the waiting Full Disk Access hand-over's next look at the moment is due.
     pub(crate) fn fda_hand_over_due(&self, now: Instant) -> bool {
-        self.fda_queued
-            .as_ref()
-            .is_some_and(|q| now >= q.next_check)
+        self.fda_queued.as_ref().is_some_and(|q| now >= q.look_at())
     }
 
     /// The probe the waiting Full Disk Access hand-over judges by is being read again: look at
-    /// `at`, not now (a look on a pending read would refuse it as unknown).
+    /// `at`, not now (a look on a pending read would refuse it as unknown), and no sooner than a
+    /// page it waits out allows.
     pub(crate) const fn defer_fda(&mut self, at: Instant) {
         if let Some(queued) = self.fda_queued.as_mut() {
             queued.next_check = at;
         }
     }
 
-    /// The waiting Developer Tools hand-over looks at `at`, not before: aterm brought the
-    /// page up within [`atpkg::devtools::REOPEN_AFTER_S`], and a new access revision's
-    /// page waits until those ten minutes are up (`App::rearm_devtools_step`).
+    /// The waiting Full Disk Access hand-over waits out a page up until `end` (the Developer
+    /// Tools page's ten minutes, or a new access revision's wait behind its own page,
+    /// `App::rearm_fda_step`): it looks no sooner, and a nearer `end` changes nothing.
+    pub(crate) fn fda_wait_out_page(&mut self, end: Instant) {
+        if let Some(queued) = self.fda_queued.as_mut() {
+            queued.wait_out_page(end);
+        }
+    }
+
+    /// The waiting Developer Tools hand-over looks at `at`, not before, and no sooner than a
+    /// page it waits out allows: the window's own Full Disk Access reading is still out
+    /// (`App::hold_devtools_for_fda_reading`).
     pub(crate) fn defer(&mut self, at: Instant) {
         if let Some(queued) = self.queued.as_mut() {
             queued.next_check = at;
         }
+    }
+
+    /// The waiting Developer Tools hand-over waits out a page up until `end`: aterm brought the
+    /// page up within [`atpkg::devtools::REOPEN_AFTER_S`] and a new access revision's page
+    /// waits until those ten minutes are up (`App::rearm_devtools_step`), or a page the step
+    /// already waits out is younger than it allowed for (`App::devtools_page_holds_the_step`).
+    /// It looks no sooner, and a nearer `end` changes nothing.
+    pub(crate) fn wait_out_page(&mut self, end: Instant) {
+        if let Some(queued) = self.queued.as_mut() {
+            queued.wait_out_page(end);
+        }
+    }
+
+    /// Whether the window's own Developer Tools step waits out a page ([`Queued::page_wait`]).
+    pub(crate) fn waits_out_a_page(&self) -> bool {
+        self.queued
+            .as_ref()
+            .is_some_and(|q| q.origin == Origin::Automatic && q.page_wait.is_some())
     }
 
     /// Whether a Developer Tools hand-over waits for its quiet moment, or its `spctl` run is out.
@@ -2567,7 +2826,8 @@ impl Lane {
 
     /// The waiting Full Disk Access hand-over, when `quiet` and no panel is up (an owner's
     /// Developer Tools panel is not taken away from them); otherwise it looks again
-    /// [`RECHECK_EVERY`] later, or (a control client's act, after [`ASKED_LAPSE`]) lapses.
+    /// [`RECHECK_EVERY`] later (no sooner than a page it waits out allows), or (a control
+    /// client's act, after [`ASKED_LAPSE`]) lapses.
     pub(crate) fn take_queued_fda(&mut self, now: Instant, quiet: bool) -> Option<Origin> {
         let panel_up = self.panel.is_some();
         let queued = self.fda_queued.as_mut()?;
@@ -2585,7 +2845,9 @@ impl Lane {
             return None;
         }
         if quiet && !panel_up {
-            return self.fda_queued.take().map(|q| q.origin);
+            let taken = self.fda_queued.take()?;
+            self.taken_riders[1] = taken.rider;
+            return Some(taken.origin);
         }
         queued.next_check = now + RECHECK_EVERY;
         None
@@ -2614,7 +2876,8 @@ impl Lane {
     }
 
     /// The waiting hand-over, when `quiet` (the caller judged [`quiet`] at `now`), with what its
-    /// earlier `spctl` run answered; otherwise it looks again [`RECHECK_EVERY`] later, or lapses.
+    /// earlier `spctl` run answered; otherwise it looks again [`RECHECK_EVERY`] later (no sooner
+    /// than a page it waits out allows), or lapses.
     pub(crate) fn take_queued(&mut self, now: Instant, quiet: bool) -> Option<TakenHandOver> {
         let fda_first = self.fda_first();
         let queued = self.queued.as_mut()?;
@@ -2636,10 +2899,63 @@ impl Lane {
             return None;
         }
         if quiet {
-            return self.queued.take().map(|q| (q.origin, q.listed));
+            let taken = self.queued.take()?;
+            self.taken_riders[0] = taken.rider;
+            return Some((taken.origin, taken.listed));
         }
         queued.next_check = now + RECHECK_EVERY;
         None
+    }
+
+    /// The ask the Developer Tools step [`Self::take_queued`] last gave back carried, unless it
+    /// lapsed by `now`: the window judges it by its own rules once the step is refused, since a
+    /// refusal of the step (a page this revision already brought up) need not be the ask's.
+    pub(crate) fn take_rider(&mut self, now: Instant) -> Option<Rider> {
+        unlapsed(self.taken_riders[0].take(), now, "devtools")
+    }
+
+    /// The control verb's ask the waiting Developer Tools step carries, taken at that ask's own
+    /// quiet moment while the step waits on for its step moment: the verb keeps the quiet moment
+    /// alone ([`Origin::system_state_step`]), so riding the step never makes it wait for an
+    /// approved revision or System State in front. A System State step's own rider waits on.
+    pub(crate) fn take_quiet_rider(&mut self, now: Instant) -> Option<Rider> {
+        let queued = self.queued.as_mut()?;
+        if queued
+            .rider
+            .as_ref()
+            .is_none_or(|rider| rider.origin.system_state_step())
+        {
+            return None;
+        }
+        unlapsed(queued.rider.take(), now, "devtools")
+    }
+
+    /// [`Self::take_rider`] for the Full Disk Access step [`Self::take_queued_fda`] gave back.
+    pub(crate) fn take_fda_rider(&mut self, now: Instant) -> Option<Rider> {
+        unlapsed(self.taken_riders[1].take(), now, "full disk access")
+    }
+
+    /// The step a [`Self::take_rider`] came from waits again: `rider` rides with it, unless it
+    /// carries a newer ask already (one waits, the newest).
+    pub(crate) fn ride(&mut self, rider: Rider) {
+        ride_on(&mut self.queued, rider);
+    }
+
+    /// [`Self::ride`] for the Full Disk Access step.
+    pub(crate) fn ride_fda(&mut self, rider: Rider) {
+        ride_on(&mut self.fda_queued, rider);
+    }
+
+    /// The step a [`Self::take_rider`] came from went to its `spctl` run: `rider` waits for the
+    /// run's end ([`Self::take_listing_rider`]), then for what the step makes of it.
+    pub(crate) fn ride_listing(&mut self, rider: Rider) {
+        self.listing_rider = Some(rider);
+    }
+
+    /// The ask that waited for the `spctl` run [`Self::take_listed`] gave back the end of, unless
+    /// it lapsed by `now`.
+    pub(crate) fn take_listing_rider(&mut self, now: Instant) -> Option<Rider> {
+        unlapsed(self.listing_rider.take(), now, "devtools")
     }
 
     /// Start `spctl developer-mode enable-terminal` on a worker for `listing`.
@@ -2989,7 +3305,7 @@ impl Lane {
         let waiting = [devtools, self.fda_queued.as_ref()];
         if waiting.iter().any(Option::is_some) && focused() {
             for queued in waiting.into_iter().flatten() {
-                fold(queued.next_check);
+                fold(queued.look_at());
             }
         }
         soonest
@@ -4755,6 +5071,20 @@ pub(crate) mod test_arms {
         }
     }
 
+    /// [`fda_opening`], whose `fda-pane-opened` reads `last_opened` and is written by
+    /// `note_opened`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fda_marking(
+        last_opened: fn() -> Option<(String, u64)>,
+        note_opened: fn(&str),
+    ) -> FdaReach {
+        FdaReach {
+            last_opened,
+            note_opened,
+            ..fda_opening()
+        }
+    }
+
     /// [`fda_opening`], with the owner's Not now on the panel holding, said under
     /// approved setup revision 1.
     #[cfg(target_os = "macos")]
@@ -5112,6 +5442,47 @@ mod tests {
         );
     }
 
+    /// A page brought up while no access revision stands keeps the marker's revision step for
+    /// this bundle and Mac (Set up keeps the revision, so its page stays shown); under a revision,
+    /// or over a word under a version or another bundle's or Mac's, the page's own key is written.
+    #[test]
+    fn a_full_disk_access_page_up_with_no_revision_keeps_this_identitys_revision_step() {
+        const KEY: &str = "0.137.0@com.aterm.aterm@HOST-A";
+        let word = |revision: bool, opened: Option<&str>| fda_opened_word(revision, opened, KEY);
+        for kept in [
+            "r4@com.aterm.aterm@HOST-A",
+            "r4@com.aterm.aterm",
+            "r4",
+            "r12",
+        ] {
+            assert_eq!(word(false, Some(kept)), kept, "{kept}: kept");
+            assert_eq!(
+                word(true, Some(kept)),
+                KEY,
+                "{kept}: a revision writes its own key"
+            );
+        }
+        for other in [
+            "r4@com.aterm.aterm.dev@HOST-A",
+            "r4@com.aterm.aterm@HOST-B",
+            "0.136.0@com.aterm.aterm@HOST-A",
+            "rc1@com.aterm.aterm@HOST-A",
+            "r@com.aterm.aterm@HOST-A",
+            "",
+        ] {
+            assert_eq!(word(false, Some(other)), KEY, "{other:?}: gives way");
+        }
+        assert_eq!(word(false, None), KEY);
+        assert_eq!(
+            fda_opened_word(
+                true,
+                Some("r3@com.aterm.aterm@HOST-A"),
+                "r4@com.aterm.aterm@HOST-A"
+            ),
+            "r4@com.aterm.aterm@HOST-A"
+        );
+    }
+
     fn fda_show(bundle: Option<PathBuf>) -> Show {
         Show {
             page: Page::FullDiskAccess,
@@ -5341,6 +5712,7 @@ mod tests {
             grant_stable,
             recent,
             fda_on: true,
+            shown_this_revision: false,
         };
         let presses = [Origin::Settings, Origin::Digest];
         let asked = [
@@ -5455,6 +5827,28 @@ mod tests {
             ),
             Admit::Hand {
                 list_terminal: true
+            }
+        );
+        // The page already up in this revision holds only the window's own step, judged as it
+        // would open.
+        let shown = Facts {
+            shown_this_revision: true,
+            ..facts(DevToolGrant::NotGranted, absent(2), false, true, false)
+        };
+        for moment in [Moment::Asked, Moment::Quiet] {
+            assert_eq!(
+                admit(Origin::Automatic, moment, &shown),
+                Admit::Refuse(Refusal::Shown)
+            );
+        }
+        assert_eq!(
+            admit(Origin::Ctl { now: false }, Moment::Asked, &shown),
+            Admit::Queue
+        );
+        assert_eq!(
+            admit(Origin::Settings, Moment::Asked, &shown),
+            Admit::Hand {
+                list_terminal: false
             }
         );
         // Without Full Disk Access the window's own waits (the list could not be read
@@ -6494,6 +6888,294 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(60), "hang");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// The window's own step keeps its place in each page's queue, and another origin's ask it
+    /// holds in its place rides with it, with what its own `spctl` run answered: one that comes
+    /// while it waits, the one it replaces, or the one a step it replaces carried. The window
+    /// takes the rider once the step is given back and judges it by its own rules
+    /// ([`Lane::take_rider`]); a client's rider lapses as it would alone, and one that waits
+    /// again with the step, or for the step's `spctl` run, keeps its time unless the step carries
+    /// a newer ask. The control verb's rider is also taken at its own quiet moment while the
+    /// step waits on ([`Lane::take_quiet_rider`]); a System State act stays with the step.
+    #[test]
+    fn the_window_s_own_step_carries_the_ask_it_holds_in_its_place() {
+        fn who(rider: Option<Rider>) -> Option<(Origin, Instant)> {
+            rider.map(|rider| (rider.origin, rider.at))
+        }
+        let t0 = Instant::now();
+        let t1 = t0 + RECHECK_EVERY;
+        let ctl = Origin::Ctl { now: false };
+        let mut lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
+        lane.queue(Origin::Automatic, t0);
+        assert_eq!(lane.take_queued(t0, true), Some((Origin::Automatic, None)));
+        assert_eq!(lane.take_rider(t0), None, "nothing rode");
+        lane.queue(Origin::Automatic, t0);
+        lane.queue(ctl, t1);
+        assert_eq!(lane.queued(), Some(Origin::Automatic));
+        assert_eq!(lane.take_queued(t0, true), Some((Origin::Automatic, None)));
+        assert_eq!(who(lane.take_rider(t0)), Some((ctl, t1)));
+        assert_eq!(lane.take_rider(t0), None, "taken once");
+        lane.queue(Origin::SystemStateAct, t0);
+        lane.queue(Origin::Automatic, t1);
+        lane.queue(Origin::Automatic, t0 + RECHECK_EVERY * 2);
+        assert_eq!(
+            lane.take_queued(t0, true),
+            Some((Origin::Automatic, None)),
+            "the step took the act's place"
+        );
+        assert_eq!(who(lane.take_rider(t0)), Some((Origin::SystemStateAct, t0)));
+        lane.queue(Origin::Automatic, t0);
+        lane.queue_after_listing(ctl, t0, Err("spctl exited 1".to_string()));
+        let _ = lane.take_queued(t0, true);
+        assert_eq!(
+            lane.take_rider(t0 + ASKED_LAPSE),
+            None,
+            "a client's ask lapses as it would alone"
+        );
+        lane.queue(Origin::Automatic, t0);
+        lane.queue_after_listing(ctl, t0, Ok(()));
+        let _ = lane.take_queued(t0, true);
+        assert_eq!(
+            lane.take_rider(t0).map(|rider| rider.listed),
+            Some(Some(Ok(()))),
+            "the rider keeps its own run's answer"
+        );
+        lane.queue(ctl, t0);
+        lane.queue_after_listing(Origin::Automatic, t1, Ok(()));
+        assert_eq!(
+            lane.take_queued(t1, true),
+            Some((Origin::Automatic, Some(Ok(()))))
+        );
+        assert_eq!(
+            who(lane.take_rider(t1)),
+            Some((ctl, t0)),
+            "the ask a listed step took the place of"
+        );
+        lane.queue(Origin::Automatic, t0);
+        lane.queue(Origin::SystemStateAct, t0);
+        assert_eq!(
+            lane.take_quiet_rider(t0),
+            None,
+            "a client's act waits for the step moment with the step"
+        );
+        let _ = lane.take_queued(t0, true);
+        assert_eq!(
+            who(lane.take_rider(t0)),
+            Some((Origin::SystemStateAct, t0)),
+            "and still rides it"
+        );
+        lane.queue(Origin::Automatic, t0);
+        lane.queue_after_listing(ctl, t0, Ok(()));
+        let rider = lane.take_quiet_rider(t0).expect("the control verb's ask");
+        assert_eq!(
+            (rider.origin, rider.listed),
+            (ctl, Some(Ok(()))),
+            "the control verb's keeps its own quiet moment, and its run's answer"
+        );
+        assert_eq!(lane.queued(), Some(Origin::Automatic), "the step waits on");
+        assert_eq!(lane.take_quiet_rider(t0), None, "taken once");
+        lane.queue(ctl, t0);
+        assert_eq!(lane.take_quiet_rider(t0 + ASKED_LAPSE), None, "lapsed");
+        let _ = lane.take_queued(t0, true);
+        assert_eq!(lane.take_rider(t0), None, "and gone");
+        lane.queue(Origin::Automatic, t0);
+        lane.queue(ctl, t0);
+        let _ = lane.take_queued(t0, true);
+        let rider = lane.take_rider(t0).expect("the client's ask");
+        lane.queue(Origin::Automatic, t1);
+        lane.ride(rider.clone());
+        let _ = lane.take_queued(t1, true);
+        assert_eq!(
+            who(lane.take_rider(t0)),
+            Some((ctl, t0)),
+            "it waited again as asked"
+        );
+        lane.queue(Origin::Automatic, t1);
+        lane.queue(Origin::SystemStateAct, t1);
+        lane.ride(rider.clone());
+        let _ = lane.take_queued(t1, true);
+        assert_eq!(
+            who(lane.take_rider(t1)),
+            Some((Origin::SystemStateAct, t1)),
+            "the step keeps the newer ask"
+        );
+        lane.ride_listing(rider.clone());
+        assert_eq!(
+            lane.take_listing_rider(t0),
+            Some(rider.clone()),
+            "it waited for the run"
+        );
+        assert_eq!(lane.take_listing_rider(t0), None, "taken once");
+        lane.ride_listing(rider);
+        assert_eq!(lane.take_listing_rider(t0 + ASKED_LAPSE), None, "lapsed");
+
+        let queue_fda = |lane: &mut Lane, origin: Origin, at: Instant| {
+            #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
+            lane.queue_fda(origin, at);
+        };
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        queue_fda(&mut lane, Origin::SystemStateAct, t1);
+        assert_eq!(lane.take_queued_fda(t0, true), Some(Origin::Automatic));
+        assert_eq!(
+            who(lane.take_fda_rider(t0)),
+            Some((Origin::SystemStateAct, t1))
+        );
+        queue_fda(&mut lane, Origin::SystemStateAct, t0);
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        assert_eq!(lane.take_queued_fda(t0, true), Some(Origin::Automatic));
+        let rider = lane
+            .take_fda_rider(t0)
+            .expect("the act the step took the place of");
+        assert_eq!(who(Some(rider.clone())), Some((Origin::SystemStateAct, t0)));
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        lane.ride_fda(rider.clone());
+        assert_eq!(lane.take_queued_fda(t0, true), Some(Origin::Automatic));
+        assert_eq!(lane.take_fda_rider(t0), Some(rider), "it waited again");
+        assert_eq!(lane.take_rider(t0), None, "each page keeps its own");
+    }
+
+    /// A page that comes up answers what waits for it, except the window's own step while no
+    /// access revision stands: that page is not the revision's, so the step waits on for it,
+    /// without the ask it carried (the page was that ask's), and looks again only once the
+    /// page's ten minutes are past, so it is not refused as recent: a look that finds no moment
+    /// meanwhile, another step of its own taking its place, a nearer look asked of it
+    /// (`Lane::defer`, a reading still out) or a nearer page keeps that. Once a revision
+    /// stands, a kept step whose page that revision brought up already looks at once. Under a
+    /// revision, or for another origin's ask, the page answers it.
+    #[test]
+    fn a_page_up_with_no_revision_leaves_the_window_s_own_step_waiting() {
+        let t0 = Instant::now();
+        let ten = Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+        let ctl = Origin::Ctl { now: false };
+        let mut lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
+        lane.queue(Origin::Automatic, t0);
+        lane.queue(ctl, t0);
+        lane.page_came_up(false, t0 + ten);
+        assert_eq!(lane.queued(), Some(Origin::Automatic), "the step waits on");
+        assert_eq!(lane.kept(), [true, false]);
+        assert_eq!(lane.take_queued(t0, false), None, "no moment");
+        assert!(
+            !lane.hand_over_due(t0 + ten - RECHECK_EVERY),
+            "within the page's ten minutes"
+        );
+        lane.queue_after_listing(Origin::Automatic, t0, Ok(()));
+        assert!(
+            !lane.hand_over_due(t0 + ten - RECHECK_EVERY),
+            "its own step in its place keeps the wait"
+        );
+        lane.defer(t0 + RECHECK_EVERY);
+        lane.wait_out_page(t0 + RECHECK_EVERY);
+        assert!(
+            !lane.hand_over_due(t0 + ten - RECHECK_EVERY),
+            "a nearer look or page keeps the wait"
+        );
+        assert_eq!(
+            lane.next_deadline(t0, || true),
+            Some(t0 + ten),
+            "and wakes for it"
+        );
+        assert!(lane.hand_over_due(t0 + ten), "then it looks");
+        let _ = lane.take_queued(t0 + ten, true);
+        assert_eq!(lane.take_rider(t0), None, "the page was the ask's");
+        lane.queue(Origin::Automatic, t0);
+        lane.page_came_up(false, t0 + ten);
+        lane.revision_stands(t0, [false, false]);
+        assert_eq!(lane.kept(), [false, false], "asked once");
+        assert!(!lane.hand_over_due(t0), "not shown: it waits out the page");
+        lane.page_came_up(false, t0 + ten);
+        lane.revision_stands(t0, [true, false]);
+        assert!(lane.hand_over_due(t0), "shown: it looks at once");
+        lane.page_came_up(true, t0);
+        assert_eq!(lane.queued(), None, "a revision's page answers its step");
+        lane.queue(ctl, t0);
+        lane.page_came_up(false, t0);
+        assert_eq!(lane.queued(), None, "and any other ask");
+
+        let queue_fda = |lane: &mut Lane, origin: Origin, at: Instant| {
+            #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
+            lane.queue_fda(origin, at);
+        };
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        queue_fda(&mut lane, Origin::SystemStateAct, t0);
+        lane.fda_page_came_up(false, t0 + ten);
+        assert_eq!(
+            lane.fda_queued(),
+            Some(Origin::Automatic),
+            "the step waits on"
+        );
+        assert_eq!(lane.kept(), [false, true]);
+        assert_eq!(lane.take_queued_fda(t0, false), None, "no moment");
+        assert!(!lane.fda_hand_over_due(t0 + ten - RECHECK_EVERY));
+        lane.defer_fda(t0 + RECHECK_EVERY);
+        lane.fda_wait_out_page(t0 + RECHECK_EVERY);
+        assert!(
+            !lane.fda_hand_over_due(t0 + ten - RECHECK_EVERY),
+            "a nearer look or page keeps the wait"
+        );
+        lane.defer_fda(t0 + ten + RECHECK_EVERY);
+        assert!(!lane.fda_hand_over_due(t0 + ten), "a later one moves it");
+        assert!(lane.fda_hand_over_due(t0 + ten + RECHECK_EVERY));
+        assert_eq!(
+            lane.take_queued_fda(t0 + ten + RECHECK_EVERY, true),
+            Some(Origin::Automatic)
+        );
+        assert_eq!(lane.take_fda_rider(t0), None, "the page was the act's");
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        lane.fda_page_came_up(true, t0);
+        assert_eq!(lane.fda_queued(), None);
+    }
+
+    /// A page a step waits out (a new access revision's step behind a page under ten minutes
+    /// old, `App::rearm_devtools_step`) holds it whatever else asks it to look: a reading still
+    /// out (`Lane::defer`), a look that finds no moment, or another step of its own taking its
+    /// place with its `spctl` run's answer. Only the reading's own look moves freely, and only
+    /// after the page.
+    #[test]
+    fn a_page_the_step_waits_out_holds_every_nearer_look() {
+        let t0 = Instant::now();
+        let ten = Duration::from_secs(atpkg::devtools::REOPEN_AFTER_S);
+        let mut lane = Lane::windowed_for_test(Reach::inert(), DevToolsHelperArm::inert());
+        lane.queue(Origin::Automatic, t0);
+        assert!(!lane.waits_out_a_page());
+        lane.wait_out_page(t0 + ten);
+        assert!(lane.waits_out_a_page());
+        lane.queue(Origin::Automatic, t0);
+        lane.defer(t0 + PANEL_TICK);
+        assert!(!lane.hand_over_due(t0 + ten - RECHECK_EVERY), "a reading");
+        assert_eq!(lane.take_queued(t0, false), None);
+        assert!(!lane.hand_over_due(t0 + ten - RECHECK_EVERY), "no moment");
+        lane.queue_after_listing(Origin::Automatic, t0, Ok(()));
+        assert!(!lane.hand_over_due(t0 + ten - RECHECK_EVERY), "its own run");
+        assert!(lane.waits_out_a_page());
+        assert!(lane.hand_over_due(t0 + ten));
+        lane.defer(t0 + ten + PANEL_TICK);
+        assert!(!lane.hand_over_due(t0 + ten), "a reading after the page");
+        assert!(lane.hand_over_due(t0 + ten + PANEL_TICK));
+        lane.queue(Origin::Ctl { now: false }, t0);
+        assert!(lane.waits_out_a_page(), "an ask rides the step");
+        let _ = lane.take_queued(t0 + ten + PANEL_TICK, true);
+        lane.queue(Origin::Ctl { now: false }, t0);
+        lane.wait_out_page(t0 + ten);
+        assert!(!lane.waits_out_a_page(), "only the window's own step");
+
+        let queue_fda = |lane: &mut Lane, origin: Origin, at: Instant| {
+            #[expect(clippy::disallowed_methods, reason = "the lane's own test")]
+            lane.queue_fda(origin, at);
+        };
+        queue_fda(&mut lane, Origin::Automatic, t0);
+        lane.fda_wait_out_page(t0 + ten);
+        lane.defer_fda(t0 + PANEL_TICK);
+        assert!(
+            !lane.fda_hand_over_due(t0 + ten - RECHECK_EVERY),
+            "a reading"
+        );
+        assert_eq!(lane.take_queued_fda(t0, false), None);
+        assert!(
+            !lane.fda_hand_over_due(t0 + ten - RECHECK_EVERY),
+            "no moment"
+        );
+        assert!(lane.fda_hand_over_due(t0 + ten));
     }
 
     #[test]

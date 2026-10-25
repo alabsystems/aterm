@@ -381,7 +381,7 @@ impl Standing {
 
 /// What can end a failure (design §3.6), decided where the failure is found and carried to
 /// System State's page, its menu line, the tab's diamond and the setup run's retry loop alike,
-/// so none of them says a step waits that only a person, or nothing quick, can finish.
+/// so none of them says a step waits that only a person can finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FailureKind {
     /// A retry can help: a network blip, a vault that did not answer, a busy lock, a process
@@ -394,10 +394,6 @@ pub enum FailureKind {
     /// them at once, and no pass retries it. A reading says it as [`Standing::NeedsYou`], with
     /// its remedy in the row's note, and the run's row for it parks the run.
     NeedsPerson,
-    /// Neither a retry nor a quick act ends it: it failed at once, with its reason, and
-    /// `aterm doctor` says more. A step's row says it with [`FAILED_FOR_GOOD`], and no pass
-    /// retries it.
-    ForGood,
 }
 
 impl FailureKind {
@@ -415,14 +411,10 @@ impl FailureKind {
     pub fn of_status(status: &str) -> Option<Self> {
         match status {
             "error" | "failed" => Some(Self::Transient),
-            FAILED_FOR_GOOD => Some(Self::ForGood),
             _ => None,
         }
     }
 }
-
-/// The status of a setup step's row that failed for good ([`FailureKind::ForGood`]).
-pub const FAILED_FOR_GOOD: &str = "failed for good";
 
 /// What a failed setup step's row says, in System State's words, while aterm still tries it
 /// again by itself on its own pause ([`FailureKind::Transient`], a Secrets vault try): it waits
@@ -1060,8 +1052,11 @@ pub mod access_record {
             }
             // Ordered ahead of the rename: a power loss leaves the old file or
             // the new one, never a torn one, and a lost last step is read again
-            // from macOS on the next look.
-            aterm_durable::ordered(&file)?;
+            // from macOS on the next look. A loss costs a repeat, so a volume
+            // that refuses both ordered flushes (a network home whose server
+            // takes no `F_FULLFSYNC`) takes a plain `fsync` rather than no
+            // record at all, which would ask every step again each launch.
+            aterm_durable::ordered_or_fsync(&file)?;
         }
         std::fs::rename(&staged, &path)
     }
@@ -1524,16 +1519,11 @@ mod tests {
             FailureKind::of_status("failed"),
             Some(FailureKind::Transient)
         );
-        assert_eq!(
-            FailureKind::of_status(FAILED_FOR_GOOD),
-            Some(FailureKind::ForGood)
-        );
         for calm in ["ok", "applied", "waiting", "blocked", "unverified", "noted"] {
             assert_eq!(FailureKind::of_status(calm), None, "{calm}");
         }
         assert!(FailureKind::Transient.retried());
         assert!(!FailureKind::NeedsPerson.retried());
-        assert!(!FailureKind::ForGood.retried());
     }
 
     #[test]

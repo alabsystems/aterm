@@ -265,7 +265,7 @@ struct Local {
 
 fn run(sys: &dyn System, cmd: &Cmd, what: &str) -> Result<Ran, String> {
     sys.run_complete_stdout(cmd)
-        .map_err(|_| format!("cannot run git {what} in the checkout"))
+        .map_err(|why| format!("cannot run git {what} in the checkout: {why}"))
 }
 
 fn stdout(ran: &Ran) -> String {

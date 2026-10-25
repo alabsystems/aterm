@@ -13,7 +13,8 @@ pub fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
     aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes).ok()
 }
 
-/// Atomically writes `text` to `path` using `flush` ([`Flush::Ordered`], [`Flush::Durable`]).
+/// Atomically writes `text` to `path` using `flush` ([`Flush::Ordered`], [`Flush::Durable`]),
+/// as [`finish`] does it.
 pub fn write_marker(
     path: &Path,
     text: &str,
@@ -53,7 +54,7 @@ pub fn write_marker(
     let mut file = options.open(&tmp)?;
     let written = file
         .write_all(text.as_bytes())
-        .and_then(|()| crate::durable::finish(&file, flush));
+        .and_then(|()| finish(&file, flush));
     drop(file);
     let written = written.and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
@@ -74,6 +75,18 @@ pub fn write_marker(
         }
     }
     Ok(())
+}
+
+/// A marker's flush. [`Flush::Durable`] is kept as asked. [`Flush::Ordered`] is
+/// [`aterm_durable::ordered_or_fsync`]: an ordered marker records that something was asked,
+/// answered or checked, and its loss costs only a repeat. So a volume that refuses both ordered
+/// flushes (a network home whose server takes no `F_FULLFSYNC`) takes a plain `fsync` rather
+/// than no marker at all, which would ask again at every launch.
+fn finish(file: &std::fs::File, flush: Flush) -> std::io::Result<()> {
+    match flush {
+        Flush::Durable => crate::durable::sync_all(file),
+        Flush::Ordered => aterm_durable::ordered_or_fsync(file),
+    }
 }
 
 /// Remove the marker at `path`, if a regular file is there ([`write_marker`]).

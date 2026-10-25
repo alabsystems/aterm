@@ -803,12 +803,20 @@ impl Peer {
         let short = self.host.split('.').next().unwrap_or(&self.host);
         self.node
             .as_deref()
-            .is_some_and(|node| node == what || (what.len() >= 8 && node.starts_with(&what)))
+            .is_some_and(|node| names_node(node, &what))
             || self.host.eq_ignore_ascii_case(&what)
             || short.eq_ignore_ascii_case(&what)
             || self.addr.is_some_and(|addr| addr.to_string() == what)
             || self.target().eq_ignore_ascii_case(&what)
     }
+}
+
+/// Whether `what` names the node `node`: its whole id, or 8 characters or more of its head, in any
+/// case.
+#[must_use]
+pub fn names_node(node: &str, what: &str) -> bool {
+    let what = what.trim().to_ascii_lowercase();
+    node == what || (what.len() >= 8 && node.starts_with(&what))
 }
 
 fn same_host(a: &str, b: &str) -> bool {
@@ -1587,7 +1595,8 @@ pub enum Undriven {
     /// No grant names its node.
     Unlisted(String),
     /// A grant names its node under another key than the one it proved: the node id was
-    /// bound afresh since the person here let it drive.
+    /// bound afresh since the person here let it drive, or another machine claims it. No read
+    /// of a book makes it the node the grant was made for.
     Rekeyed(String),
     /// Only this machine's copy of its issuer's book binds its node, the copy is older than
     /// [`COPY_DRIVES_FOR`], and the issuer's book could not be read again ([`proven_driver`]).
@@ -1597,6 +1606,16 @@ pub enum Undriven {
         /// Why the issuer's book was not read.
         why: String,
     },
+    /// A grant names its node, which neither this machine's book nor its copy of its issuer's
+    /// book binds, and the issuer's book could not be read again to find whether it joined since.
+    Unread {
+        /// The node.
+        node: String,
+        /// Why the issuer's book was not read.
+        why: String,
+    },
+    /// A grant names its node, which the issuer's book, read again just now, binds no more.
+    Unjoined(String),
 }
 
 impl fmt::Display for Undriven {
@@ -1626,6 +1645,20 @@ impl fmt::Display for Undriven {
                 COPY_DRIVES_FOR.as_secs(),
                 aterm_codec::tty::one_line(why, 160)
             ),
+            Self::Unread { node, why } => write!(
+                f,
+                "node {} is bound to no key by this Mac's copy of its issuer's book, and this Mac \
+                 could not read that book again to find whether it joined since ({}): it drives \
+                 once this Mac reaches its issuer (aterm fleet peers, there, says why it does not)",
+                short(node),
+                aterm_codec::tty::one_line(why, 160)
+            ),
+            Self::Unjoined(node) => write!(
+                f,
+                "node {} is bound to no key here, nor by its issuer's book read just now: it drives \
+                 once it joins the issuer",
+                short(node)
+            ),
         }
     }
 }
@@ -1634,17 +1667,23 @@ impl std::error::Error for Undriven {}
 
 impl Keyring {
     /// The driver behind `proof`: the node it proved under the key this keyring binds it to
-    /// ([`Self::proven`]), when `grants` names that node with that same key.
+    /// ([`Self::proven`]), when `grants` names that node with that same key. A node no grant
+    /// names is refused as that before its key is judged, and one that proved another key than
+    /// its grant holds as [`Undriven::Rekeyed`] wherever this keyring binds it no other key.
     pub fn driver(
         &self,
         proof: Option<&NodeProof>,
         grants: &[DriveGrant],
     ) -> Result<String, Undriven> {
-        let node = self.proven(proof).map_err(Undriven::Unproven)?;
-        match grants.iter().find(|grant| grant.node == node) {
-            None => Err(Undriven::Unlisted(node)),
-            Some(grant) if proof.is_some_and(|proof| proof.key == grant.key) => Ok(node),
-            Some(_) => Err(Undriven::Rekeyed(node)),
+        let proof = proof.ok_or(Undriven::Unproven(Unproven::NoProof))?;
+        let Some(grant) = grants.iter().find(|grant| grant.node == proof.node) else {
+            return Err(Undriven::Unlisted(proof.node.clone()));
+        };
+        match self.proven(Some(proof)) {
+            Ok(node) | Err(Unproven::Unbound(node)) if proof.key != grant.key => {
+                Err(Undriven::Rekeyed(node))
+            }
+            proven => proven.map_err(Undriven::Unproven),
         }
     }
 }
@@ -1660,8 +1699,10 @@ pub const RECHECK_WITHIN: Duration = Duration::from_secs(3);
 
 /// The driver of a fleet connection this machine's listener serves: [`Keyring::driver`] over
 /// the book in `state_dir`, read fresh on each call, so on the issuer a `peers rm` or a join
-/// counts at once. A node only a copy older than [`COPY_DRIVES_FOR`] binds is checked against
-/// the issuer's book, read again within [`RECHECK_WITHIN`] and kept as the new copy.
+/// counts at once. A node only a copy older than [`COPY_DRIVES_FOR`] binds, and a node a grant
+/// names that the copy does not bind (it may have joined since) proving the key its grant holds,
+/// is checked against the issuer's book, read again within [`RECHECK_WITHIN`] and kept as the new
+/// copy.
 pub fn proven_driver(
     served: &Served,
     state_dir: &Path,
@@ -1702,19 +1743,26 @@ fn driver_as_of(
     let written = issuer_book_written(state_dir);
     let (peers, copies) = book_and_copies(state_dir);
     let keys = Keyring::of(peers.iter().chain(&copies));
-    let node = keys.driver(proof, grants)?;
-    let fresh = written
-        .and_then(|written| now.duration_since(written).ok())
-        .is_some_and(|age| age <= COPY_DRIVES_FOR);
-    if fresh || !keys.copied_alone(&node) {
-        return Ok(node);
-    }
-    let unchecked = |why: String| Undriven::Unchecked {
-        node: node.clone(),
-        why,
+    let issuer = issuer_of(&peers);
+    let (node, unread): (String, fn(String, String) -> Undriven) = match keys.driver(proof, grants)
+    {
+        Err(Undriven::Unproven(Unproven::Unbound(node))) if issuer.is_some() => {
+            (node, |node, why| Undriven::Unread { node, why })
+        }
+        driven => {
+            let node = driven?;
+            let fresh = written
+                .and_then(|written| now.duration_since(written).ok())
+                .is_some_and(|age| age <= COPY_DRIVES_FOR);
+            if fresh || !keys.copied_alone(&node) {
+                return Ok(node);
+            }
+            (node, |node, why| Undriven::Unchecked { node, why })
+        }
     };
-    let issuer = issuer_of(&peers).ok_or_else(|| unchecked("this Mac names no issuer".into()))?;
-    let book = fetch(&target_of(issuer)).map_err(|why| unchecked(unread_words(&why)))?;
+    let unchecked = |why: String| unread(node.clone(), why);
+    let issuer = issuer.ok_or_else(|| unchecked("this Mac names no issuer".into()))?;
+    let book = fetch(&target_of(issuer)).map_err(|why| unchecked(why.to_string()))?;
     if !book.proven {
         return Err(unchecked(
             "this Mac binds no key to its issuer, so its book binds none".into(),
@@ -1726,33 +1774,18 @@ fn driver_as_of(
         secret,
         Some((&book.node, &copies_of(&book, own.as_deref()))),
     );
-    keys.with_book(&book, own.as_deref()).driver(proof, grants)
+    keys.with_book(&book, own.as_deref())
+        .driver(proof, grants)
+        .map_err(|refused| match refused {
+            Undriven::Unproven(Unproven::Unbound(node)) => Undriven::Unjoined(node),
+            refused => refused,
+        })
 }
 
 fn issuer_book_written(state_dir: &Path) -> Option<std::time::SystemTime> {
     std::fs::symlink_metadata(state_dir.join(ISSUER_BOOK_FILE))
         .and_then(|meta| meta.modified())
         .ok()
-}
-
-fn unread_words(why: &BookUnread) -> String {
-    let short = |node: &str| node.get(..8).unwrap_or(node).to_owned();
-    match why {
-        BookUnread::Older(at) => {
-            format!("the issuer at {at} runs an older aterm, which shares no book")
-        }
-        BookUnread::NoBook { at, why, .. } => format!("the machine at {at} shares no book: {why}"),
-        BookUnread::NotNow { at, why, .. } => {
-            format!("the issuer at {at} cannot share its book now: {why}")
-        }
-        BookUnread::OtherNode(at, node) => {
-            format!(
-                "{at} answered as node {}, not this Mac's issuer",
-                short(node)
-            )
-        }
-        BookUnread::Unreached(unreached) => unreached.to_string(),
-    }
 }
 
 fn issuer_of(book: &[Peer]) -> Option<&Peer> {
@@ -2320,6 +2353,28 @@ pub enum BookUnread {
     OtherNode(SocketAddr, String),
     /// Not reached, or its answer was no book.
     Unreached(Unreached),
+}
+
+impl fmt::Display for BookUnread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short = |node: &str| node.get(..8).unwrap_or(node).to_owned();
+        match self {
+            Self::Older(at) => write!(
+                f,
+                "the issuer at {at} runs an older aterm, which shares no book"
+            ),
+            Self::NoBook { at, why, .. } => write!(f, "the machine at {at} shares no book: {why}"),
+            Self::NotNow { at, why, .. } => {
+                write!(f, "the issuer at {at} cannot share its book now: {why}")
+            }
+            Self::OtherNode(at, node) => write!(
+                f,
+                "{at} answered as node {}, not this Mac's issuer",
+                short(node)
+            ),
+            Self::Unreached(unreached) => write!(f, "{unreached}"),
+        }
+    }
 }
 
 /// The member's end of a book read: dial `issuer` for op `book` by `deadline` (and the
@@ -3614,6 +3669,18 @@ pub fn survey_all(
     })
 }
 
+/// [`survey_all`] of the one `target`, by a `deadline` set from `within` that a read before it
+/// (its issuer's book, read again for a word no book here holds) may have spent part of.
+pub fn survey_one_by(
+    target: &Target,
+    keys: &Keyring,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    deadline: (Instant, Duration),
+) -> Result<Surveyed, Unreached> {
+    let held = std::sync::Arc::new(HeldAddrs::default());
+    read_one_by(target, keys, (secret, me), deadline, "survey", &held)
+}
+
 /// What [`dial`] takes for `peer`, and the node and key it should be.
 #[must_use]
 pub fn target_of(peer: &Peer) -> Target {
@@ -4280,16 +4347,15 @@ impl Drop for Driven {
 }
 
 /// Dial `target` to drive it (`aterm ctl --host`): [`FleetOp::Drive`], proved with `secret`
-/// and this machine's node `me` (a drive with no node is never admitted), within one deadline
-/// `within` for the dial and every exchange after it. When the first address that answers is
-/// not the target's bound node, the host name's other addresses are tried.
+/// and this machine's node `me` (a drive with no node is never admitted), by one `deadline` (set
+/// from the `within` its reasons name) for the dial and every exchange after it. When the first
+/// address that answers is not the target's bound node, the host name's other addresses are tried.
 pub fn drive(
     target: &Target,
     keys: &Keyring,
     (secret, me): (&FleetSecret, &NodeIdentity),
-    within: Duration,
+    deadline: (Instant, Duration),
 ) -> Result<Driven, Unreached> {
-    let deadline = (Instant::now() + within, within);
     let (reached, node) = reach_node(target, keys, (secret, me), FleetOp::Drive, deadline)?;
     driven(reached, node, deadline)
 }

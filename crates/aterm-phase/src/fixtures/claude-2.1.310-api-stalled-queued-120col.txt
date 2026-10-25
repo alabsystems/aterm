@@ -1,0 +1,17 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.135.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's stalled-stream row with a message queued behind it: the stub sent the stream's head and first event, then nothing (custom mode stream, pace_s 400), _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 so the stream watchdog arms against the stub, the composer's placeholder Press up to edit queued messages, 120 columns
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.iEfN/proj
+
+
+❯ say hi
+
+❯ also say bye
+  ctrl+enter to send now
+
+✻ Waiting for API response · will retry in 2m 33s · check your network
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt

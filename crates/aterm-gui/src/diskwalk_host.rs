@@ -359,8 +359,12 @@ pub(crate) struct DiskReport {
     pub(crate) exclusive_bytes: u64,
     /// Bytes of them two or more panes claim.
     pub(crate) shared_bytes: u64,
-    /// A walk is queued or running for one of its roots.
+    /// A walk is queued or running for one of its roots, or its roots are [`Self::undiscovered`].
     pub(crate) walking: bool,
+    /// No discovery has derived the scope's roots from the panes' current facts yet (a scope
+    /// asked for the first time, before the walker heard the ask): its roots are owed, not absent,
+    /// so `roots` and the byte totals are lower bounds.
+    pub(crate) undiscovered: bool,
     /// The §10.8 rows across its roots (and, for the aterm scope, the build profiles outside every root), most entries first.
     pub(crate) warnings: Vec<HugeDir>,
     /// Σ growth of the outermost complete roots.
@@ -407,6 +411,9 @@ pub(crate) struct Published {
     pub(crate) outside: BTreeSet<PathBuf>,
     /// Moves whenever `huge` does.
     pub(crate) huge_seq: u64,
+    /// The scopes the last discovery derived `tab_claims` and `own_claims` for, when it read the
+    /// facts `tabs` was published from (else none): a scope outside it has no roots *yet*.
+    pub(crate) discovered: BTreeSet<DiskScope>,
 }
 
 type Proxy = aterm_window::event_loop::EventLoopProxy<crate::Wake>;
@@ -592,6 +599,7 @@ fn build_report(scope: DiskScope, p: &Published, walker: WalkerState) -> DiskRep
         DiskScope::Aterm => None,
     };
     let unknown_tab = matches!(scope, DiskScope::Tab(_)) && label.is_none();
+    let undiscovered = !(p.discovered.contains(&scope) || p.discovered.contains(&DiskScope::Aterm));
     let mut by_id: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
     let mut key_of: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     let mut all_paths: Vec<&PathBuf> = p
@@ -740,7 +748,7 @@ fn build_report(scope: DiskScope, p: &Published, walker: WalkerState) -> DiskRep
     }
     let mut total_bytes = 0u64;
     let mut shared_bytes = 0u64;
-    let mut walking = false;
+    let mut walking = undiscovered;
     let mut warnings: Vec<HugeDir> = Vec::new();
     let mut growth: Option<Growth> = None;
     for row in &out {
@@ -784,6 +792,7 @@ fn build_report(scope: DiskScope, p: &Published, walker: WalkerState) -> DiskRep
         exclusive_bytes: total_bytes - shared_bytes,
         shared_bytes,
         walking,
+        undiscovered,
         warnings,
         growth,
         unknown_tab,
@@ -1735,6 +1744,10 @@ impl Engine {
             huge: self.huge.clone(),
             outside: self.outside.clone(),
             huge_seq: self.huge_seq,
+            discovered: match &self.discovered {
+                Some((_, seq, scopes)) if *seq == self.facts_seq => scopes.clone(),
+                _ => BTreeSet::new(),
+            },
         });
         if self.out.send(published).is_ok()
             && let Some(proxy) = self.proxy.as_ref()

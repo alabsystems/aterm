@@ -1824,7 +1824,44 @@ fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
             node: None,
         }],
         note: Some(STUB_NOTE.to_owned()),
+        alone: None,
     })
+}
+
+const ALONE: &str = "survey --fleet read no other machine: stub-alone-5c1e";
+
+fn no_peer(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
+    Ok(FleetRead {
+        peers: Vec::new(),
+        note: None,
+        alone: Some(ALONE.to_owned()),
+    })
+}
+
+#[test]
+fn a_fleet_read_that_asked_no_other_machine_says_why_on_stderr() {
+    let parts = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
+    let here = || Ok(vec![reply(0, vec![shell(2)])]);
+    for form in [&[][..], &["--json"]] {
+        let mut words = vec!["survey", "--fleet"];
+        words.extend_from_slice(form);
+        let printed = read_survey(
+            &parse_args(&parts(&words)).unwrap(),
+            Some(no_peer),
+            here,
+            None,
+        );
+        assert_eq!(
+            (printed.code, &printed.err[..]),
+            (0, &[ALONE.to_owned()][..]),
+            "{form:?}"
+        );
+        let out = printed.out.expect("this machine's block");
+        assert!(
+            !out.contains(ALONE) && out.contains("1000"),
+            "{form:?}: {out}"
+        );
+    }
 }
 
 #[test]

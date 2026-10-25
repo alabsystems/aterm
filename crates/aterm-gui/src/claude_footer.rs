@@ -35,7 +35,6 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
             aterm_phase::Program::Codex
             | aterm_phase::Program::Grok
             | aterm_phase::Program::Kimi
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic => false,
         })
 }
@@ -295,8 +294,6 @@ struct CachedPaneText {
     rule_run: std::cell::Cell<Option<KeptRun>>,
     /// The top rule's plain run on frame row `.frame_row` ([`read_top_run`], [`Self::rule_run`]).
     top_run: std::cell::Cell<Option<KeptTop>>,
-    /// Gemini CLI's top line on `rows` ([`top_line`]).
-    gemini_top: std::cell::OnceCell<Option<usize>>,
     /// Codex's top line on `rows` ([`TopLine::Slab`], [`top_line`]).
     codex_pad: std::cell::OnceCell<Option<usize>>,
     /// The harness card's reading of `rows`.
@@ -836,7 +833,6 @@ impl PaneTextCache {
             plan: std::cell::OnceCell::new(),
             rule_run: std::cell::Cell::new(rule_run),
             top_run: std::cell::Cell::new(top_run),
-            gemini_top: std::cell::OnceCell::new(),
             codex_pad: std::cell::OnceCell::new(),
             card,
             card_before: std::cell::Cell::new(card_before),
@@ -2646,14 +2642,19 @@ struct TapAsks {
     /// Whether aterm's restart in place is offered for process `pid` in tab `tab` now
     /// ([`crate::restart_act::offered_for`]), asked at a read whose footer would promise it.
     restart: fn(&str, u32) -> bool,
+    /// Whether the relaunch line aterm would type for process `pid` in tab `tab` has room for
+    /// the tap ([`crate::restart_act::tap_room_for`]), asked where a restart is offered.
+    room: fn(&str, u32) -> bool,
 }
 
-/// A window with no usage tap: no seat, every settings chain admitting it, every restart offered.
+/// A window with no usage tap: no seat, every settings chain admitting it, every restart offered
+/// with room for the tap.
 #[cfg(test)]
 const NO_TAP: TapAsks = TapAsks {
     seat: TapSeat::default,
     settings: |_, _| true,
     restart: |_, _| true,
+    room: |_, _| true,
 };
 
 /// What the usage tap gives a read ([`TapAsks::seat`]).
@@ -2706,6 +2707,7 @@ const LIVE: Asks = Asks {
         seat: live_tap,
         settings: crate::harness_netprobe::tap_settings_admit_line,
         restart: crate::restart_act::offered_for,
+        room: crate::restart_act::tap_room_for,
     },
 };
 
@@ -2918,7 +2920,6 @@ fn resolve_facts_at_with_cwd(
             aterm_phase::Program::Codex
             | aterm_phase::Program::Grok
             | aterm_phase::Program::Kimi
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Generic,
         )
         | None => (false, true),
@@ -3377,12 +3378,16 @@ fn weekly_into(
             WeeklyGap::Unoffered(tap::Refusal::Exe)
         } else if let Some(why) = tap_refusal(identity, asks, roster, now) {
             WeeklyGap::Unoffered(why)
-        } else if gated
+        } else if let Some((tab, pid)) = gated
             .flatten()
             .zip(u32::try_from(identity.pid).ok())
-            .is_some_and(|(tab, pid)| (asks.tap.restart)(tab, pid))
+            .filter(|(tab, pid)| (asks.tap.restart)(tab, *pid))
         {
-            WeeklyGap::Untapped
+            if (asks.tap.room)(tab, pid) {
+                WeeklyGap::Untapped
+            } else {
+                WeeklyGap::Unoffered(tap::Refusal::Room)
+            }
         } else {
             WeeklyGap::Unrestarted
         }
@@ -4519,7 +4524,7 @@ impl App {
                 0
             } ^ gate.rotate_left(11);
             let top = match identified {
-                Some(prog @ (aterm_phase::Program::Gemini | aterm_phase::Program::Codex)) => {
+                Some(prog @ aterm_phase::Program::Codex) => {
                     self.bare_top_term(ws, session, prog, agent, &claims)
                 }
                 _ => 0,
@@ -4573,7 +4578,7 @@ impl App {
         }
     }
 
-    /// The harness switch and the theme Gemini CLI's or Codex's top line (`prog`) wears.
+    /// The harness switch and the theme Codex's top line (`prog`) wears.
     fn bare_top_harness(
         &self,
         ws: &crate::WindowState,
@@ -4606,7 +4611,7 @@ impl App {
         (switch, theme.filter(|_| switch.is_some()))
     }
 
-    /// The repaint key's term for Gemini CLI's or Codex's top line ([`Self::bare_top_harness`]).
+    /// The repaint key's term for Codex's top line ([`Self::bare_top_harness`]).
     fn bare_top_term(
         &self,
         ws: &crate::WindowState,
@@ -5055,15 +5060,13 @@ impl App {
                 };
                 let blank = source.implicit_blank;
                 let bare_top = match identified {
-                    Some(prog @ (aterm_phase::Program::Gemini | aterm_phase::Program::Codex)) => {
-                        Some(prog)
-                    }
+                    Some(prog @ aterm_phase::Program::Codex) => Some(prog),
                     _ => None,
                 };
                 if !held && gate.is_none() {
                     // No drawer and no facts: a card this window keeps for the session left
                     // by its identity (Claude stopped or gone) bounds its next show
-                    // (`claude_card::RESHOW_MS`). Only a Gemini CLI or Codex top line is read.
+                    // (`claude_card::RESHOW_MS`). Only a Codex top line is read.
                     if ws.claude_card.keeps(session) {
                         cards.push(crate::claude_card::drawerless_leaf(
                             leaf_index, session, pane,
@@ -6008,18 +6011,6 @@ fn top_line(program: aterm_phase::Program, cached: &CachedPaneText) -> Option<(u
             .reach
             .and_then(|r| r.rules())
             .map(|(top, _)| (top, TopLine::Rule)),
-        Program::Gemini => cached
-            .gemini_top
-            .get_or_init(|| {
-                crate::reader_guard::read_or_none(
-                    session,
-                    "Gemini CLI top rule",
-                    &cached.rows,
-                    || aterm_phase::gemini::top_rule(&cached.rows),
-                )
-                .flatten()
-            })
-            .map(|row| (row, TopLine::Rule)),
         Program::Codex => cached
             .codex_pad
             .get_or_init(|| {
@@ -6514,7 +6505,6 @@ const fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
         aterm_phase::Program::Codex => Some(CliMark::Codex),
         aterm_phase::Program::Agy => Some(CliMark::Agy),
         aterm_phase::Program::Muse => Some(CliMark::Muse),
-        aterm_phase::Program::Gemini => Some(CliMark::Gemini),
         aterm_phase::Program::Grok | aterm_phase::Program::Kimi | aterm_phase::Program::Generic => {
             None
         }
@@ -9300,7 +9290,6 @@ mod tests {
                 aterm_phase::Program::Codex
                 | aterm_phase::Program::Grok
                 | aterm_phase::Program::Kimi
-                | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic => false,
             });
             assert_eq!(
@@ -14520,7 +14509,10 @@ mod tests {
             oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + frame_row * ch + ch / 2) as f64;
         assert_eq!(app.frame_cell_at(wid, x, y), Some((frame_row, col)));
         app.windows.get_mut(&wid).expect("window").last_cursor_px = (x, y);
-        assert!(app.press_claude_light(wid), "the switch takes the press");
+        assert!(
+            app.press_claude_light(wid, std::time::Instant::now()),
+            "the switch takes the press"
+        );
         assert_eq!(
             app.session_autopilot(session).0,
             Some(Autopilot::Off),

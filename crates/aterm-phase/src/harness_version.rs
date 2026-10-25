@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Unified incremental numeric versioning for every CLI harness (`codex-alab`, `claude`, `agy`,
-//! `grok`, `kimi`, `muse`, `gemini`).
+//! `grok`, `kimi`, `muse`).
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -214,8 +214,6 @@ pub enum CliHarness {
     Kimi,
     /// Meta Muse Code (`muse`).
     Muse,
-    /// Google Gemini CLI (`gemini`).
-    Gemini,
 }
 
 #[inline]
@@ -226,8 +224,7 @@ const fn next_cli_harness(h: CliHarness) -> Option<CliHarness> {
         CliHarness::Agy => Some(CliHarness::Grok),
         CliHarness::Grok => Some(CliHarness::Kimi),
         CliHarness::Kimi => Some(CliHarness::Muse),
-        CliHarness::Muse => Some(CliHarness::Gemini),
-        CliHarness::Gemini => None,
+        CliHarness::Muse => None,
     }
 }
 
@@ -249,14 +246,13 @@ const _: () = {
 
 impl CliHarness {
     /// Every CLI harness in declaration order.
-    pub const ALL: [CliHarness; 7] = [
+    pub const ALL: [CliHarness; 6] = [
         CliHarness::CodexAlab,
         CliHarness::ClaudeCode,
         CliHarness::Agy,
         CliHarness::Grok,
         CliHarness::Kimi,
         CliHarness::Muse,
-        CliHarness::Gemini,
     ];
 
     /// The five primary named CLI harnesses (`codex-alab`, `claude code`, `agy`, `grok`, `kimi`).
@@ -279,7 +275,6 @@ impl CliHarness {
             CliHarness::Grok => "grok",
             CliHarness::Kimi => "kimi",
             CliHarness::Muse => "muse",
-            CliHarness::Gemini => "gemini",
         }
     }
 
@@ -294,7 +289,6 @@ impl CliHarness {
             CliHarness::Grok => "grok",
             CliHarness::Kimi => "kimi",
             CliHarness::Muse => "muse",
-            CliHarness::Gemini => "gemini",
         }
     }
 
@@ -309,7 +303,6 @@ impl CliHarness {
             CliHarness::Grok => "Grok",
             CliHarness::Kimi => "Kimi Code",
             CliHarness::Muse => "Muse Code",
-            CliHarness::Gemini => "Gemini CLI",
         }
     }
 
@@ -324,7 +317,6 @@ impl CliHarness {
             CliHarness::Grok => crate::grok::HARNESS_VER,
             CliHarness::Kimi => crate::kimi::HARNESS_VER,
             CliHarness::Muse => crate::muse::HARNESS_VER,
-            CliHarness::Gemini => crate::gemini::HARNESS_VER,
         }
     }
 
@@ -363,7 +355,6 @@ impl CliHarness {
             "grok" | "grok-build" => Some(CliHarness::Grok),
             "kimi" | "kimi-code" | "kimi-cli" => Some(CliHarness::Kimi),
             "muse" | "muse-code" => Some(CliHarness::Muse),
-            "gemini" | "gemini-cli" => Some(CliHarness::Gemini),
             _ => None,
         }
     }
@@ -428,8 +419,6 @@ mod tests {
         for (name, harness) in [
             ("grok build", CliHarness::Grok),
             (" \tGrOk BuIlD\n", CliHarness::Grok),
-            ("gemini cli", CliHarness::Gemini),
-            ("\nGeMiNi ClI\t ", CliHarness::Gemini),
         ] {
             assert_eq!(CliHarness::for_name(name), Some(harness), "{name:?}");
         }
@@ -448,8 +437,14 @@ mod tests {
             assert_eq!(CliHarness::for_name(harness.product()), Some(harness));
         }
         assert_eq!(CliHarness::for_name("Grok Build"), Some(CliHarness::Grok));
-        assert_eq!(CliHarness::for_name("Gemini CLI"), Some(CliHarness::Gemini));
         assert_eq!(CliHarness::for_name("Kimi Code"), Some(CliHarness::Kimi));
+        for retired in ["gemini", "gemini-cli", "Gemini CLI"] {
+            assert_eq!(
+                CliHarness::for_name(retired),
+                None,
+                "{retired:?}: agy replaces it"
+            );
+        }
         assert_eq!(
             CliHarness::for_name("codex-cli"),
             Some(CliHarness::CodexAlab)

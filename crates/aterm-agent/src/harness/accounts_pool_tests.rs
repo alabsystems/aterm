@@ -22,6 +22,18 @@ fn launch_env(seat: &Seat<'_>, cli: Cli, read: ReadUsage<'_>) -> Option<LoginEnv
 #[path = "accounts_pool_launch_tests.rs"]
 mod launch_admission;
 
+#[path = "accounts_pool_launch_policy_tests.rs"]
+mod launch_policy;
+
+#[path = "accounts_pool_usage_policy_tests.rs"]
+mod usage_policy;
+
+#[path = "accounts_sample_context_tests.rs"]
+mod sample_context;
+
+#[path = "accounts_pool_move_policy_tests.rs"]
+mod move_policy;
+
 struct World {
     _dir: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -328,10 +340,13 @@ fn a_grok_line_drops_a_carried_leader_socket() {
     };
     assert_eq!(
         relaunch::pool_line(&how, Cli::Grok, &work).expect("row line"),
-        " ( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH' -u 'GROK_LEADER_SOCKET' \
-         'GROK_AUTH_PATH=/l/work/auth.json' '/opt/grok/bin/grok' '-m' 'grok-4' \
-         '--always-approve' '--leader-socket' '/Users//u/.grok/leader-work-99068163.sock' \
-         '--resume' 'abc' )"
+        format!(
+            " {}( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH' -u 'GROK_LEADER_SOCKET' \
+             'GROK_AUTH_PATH=/l/work/auth.json' '/opt/grok/bin/grok' '-m' 'grok-4' \
+             '--always-approve' '--leader-socket' '/Users//u/.grok/leader-work-99068163.sock' \
+             '--resume' 'abc' )",
+            crate::harness::upgrade::BASH_LINE_OPENS
+        )
     );
     let main = LoginEnv {
         value: None,
@@ -340,9 +355,12 @@ fn a_grok_line_drops_a_carried_leader_socket() {
     };
     assert_eq!(
         relaunch::pool_line(&how, Cli::Grok, &main).expect("default line"),
-        " ( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH_PATH' -u 'GROK_AUTH' \
-         '/opt/grok/bin/grok' '-m' 'grok-4' '--leader-socket' '/Users//u/dev/leader.sock' \
-         '--always-approve' '--resume' 'abc' )"
+        format!(
+            " {}( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH_PATH' -u 'GROK_AUTH' \
+             '/opt/grok/bin/grok' '-m' 'grok-4' '--leader-socket' '/Users//u/dev/leader.sock' \
+             '--always-approve' '--resume' 'abc' )",
+            crate::harness::upgrade::BASH_LINE_OPENS
+        )
     );
 
     // Negative: another CLI's flags ride as they are; a Kimi Code line removes only the
@@ -680,11 +698,14 @@ fn a_launch_and_a_move_read_a_renewed_rows_login_where_logins_json_binds_it() {
         "the move names the renewed home: {line}"
     );
 
-    // Negative: a row no renewal bound has no login here, so it is neither pinned nor picked.
+    // Negative: with explicitly empty bindings, the configured row has no login here, so it
+    // is neither pinned nor picked. A lost snapshot is unknown, not an empty binding set.
     let bare = World::new("renewed-none");
     renewed_work(&bare);
-    std::fs::remove_file(bare.seat().store(Cli::Codex).dir.join("logins.json"))
-        .expect("no bindings");
+    bare.seat()
+        .store(Cli::Codex)
+        .save_logins(&accounts::Logins::default())
+        .expect("known empty bindings");
     assert!(pin(&bare, Cli::Codex, "work").is_err(), "work has no login");
     wall(&bare, Cli::Codex, "main", NOW + HOUR);
     assert_eq!(launch_env(&bare.seat(), Cli::Codex, &no_usage), None);
@@ -876,6 +897,112 @@ fn a_moved_session_that_served_its_turn_proves_its_row_and_can_leave_early_again
         matches!(&second.advice, Advice::Move { to, .. } if to == "main"),
         "the served turn proved work, so its low session leaves early: {:?}",
         second.advice
+    );
+}
+
+#[test]
+fn a_superseded_session_observation_cannot_prove_the_current_login() {
+    let world = World::new("superseded-observation");
+    let old = renewed_work(&world);
+    let store = world.seat().store(Cli::Codex);
+    let renewed = world.root.join("logins/codex/work+2");
+    std::fs::create_dir_all(&renewed).unwrap();
+    std::fs::write(renewed.join("auth.json"), "{}").unwrap();
+    store
+        .transact_logins(NOW, &mut None, |state, logins| {
+            let events = accounts::note_renewed(
+                state,
+                logins,
+                "work",
+                old.to_str(),
+                renewed.to_str().unwrap(),
+                None,
+                NOW,
+            );
+            state.active = Some("work".into());
+            state.proven = false;
+            accounts::note_auth(state, "work", accounts::Auth::SignedOut, NOW);
+            Ok(events)
+        })
+        .unwrap();
+    let exe = Path::new("/opt/codex-old/bin/codex");
+    let old_text = old.to_string_lossy();
+    let old_env = [("CODEX_HOME", old_text.as_ref())];
+    let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Off, exe);
+    s.env = &old_env;
+    s.sample = None;
+    let _ = session_move(&world.seat(), &s);
+    let state = world.load(Cli::Codex);
+    assert!(
+        !state.proven,
+        "the old login cannot release the new login's canary"
+    );
+    assert_eq!(state.account("work").auth, accounts::Auth::SignedOut);
+
+    let new_text = renewed.to_string_lossy();
+    let new_env = [("CODEX_HOME", new_text.as_ref())];
+    s.env = &new_env;
+    let _ = session_move(&world.seat(), &s);
+    assert!(
+        world.load(Cli::Codex).proven,
+        "a current login still proves the canary"
+    );
+}
+
+#[test]
+fn a_renewal_after_observation_retains_usage_without_proving_the_new_login() {
+    let world = World::new("observation-usage-race");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let seat = world.seat();
+    let captured = seat
+        .bound_roster(Cli::Codex)
+        .unwrap()
+        .row("main")
+        .unwrap()
+        .clone();
+    let who = accounts::ProcessLogin::of_env_for(Cli::Codex, []);
+    let renewed = world.root.join("new-main");
+    seat.store(Cli::Codex)
+        .transact_logins(NOW, &mut None, |state, logins| {
+            let events = accounts::note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                renewed.to_str().unwrap(),
+                None,
+                NOW,
+            );
+            state.proven = false;
+            Ok(events)
+        })
+        .unwrap();
+    let exe = Path::new("/opt/codex-old/bin/codex");
+    let s = session(Cli::Codex, Supervisor::Aterm, Mode::Off, exe);
+    let current = record_session(&seat, &s, &who, &captured).unwrap();
+    assert_eq!(
+        current.row("main").unwrap().dir.as_deref(),
+        renewed.to_str()
+    );
+    assert_eq!(
+        who.me(&current).left,
+        Some("main"),
+        "advice receives the updated binding"
+    );
+    let state = world.load(Cli::Codex);
+    assert!(!state.proven);
+    let input = s.sample.clone().unwrap();
+    let expected = Sample {
+        session_read_at: Some(input.at),
+        week_read_at: Some(input.at),
+        by: state.machine.clone(),
+        ..input
+    };
+    assert_eq!(
+        state.account("main").sample,
+        Some(expected),
+        "the old login still consumed the account's budget"
     );
 }
 
@@ -1247,8 +1374,14 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
     )
     .expect("lazy roster");
     assert_eq!(
-        launch_env(&lazy.seat(), Cli::Codex, &|_, _, _| {
-            Some(week_walled.clone())
+        launch_env(&lazy.seat(), Cli::Codex, &|_, _, now| {
+            Some(Usage {
+                sample: Sample {
+                    at: now,
+                    ..week_walled.sample.clone()
+                },
+                ..week_walled.clone()
+            })
         }),
         None
     );

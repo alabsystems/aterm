@@ -863,10 +863,7 @@ impl Meteor {
     #[inline]
     #[must_use]
     pub fn handed_over(&self) -> bool {
-        self.chained
-            || self
-                .retired_at
-                .is_some_and(|at| !self.landed && at < self.arrival())
+        self.chained || (!self.landed && matches!(self.retired_at, Some(at) if at < self.arrival()))
     }
 
     /// Whether this train has a head in the air at `at`.
@@ -885,7 +882,7 @@ impl Meteor {
         let base = if age <= t {
             1.0
         } else {
-            (-(age - t) * (1.0 / TRAIN_COLOUR_TAU_MS)).exp()
+            crate::color_math::exp_f32(-(age - t) * (1.0 / TRAIN_COLOUR_TAU_MS))
         };
         base * self.retire_alpha(now)
     }
@@ -896,7 +893,7 @@ impl Meteor {
             None => 1.0,
             Some(at) => {
                 let u = ms_since(at, now) * (1.0 / FLIGHT_RETIRE_MS);
-                (-u.max(0.0) * RETIRE_DECAY).exp()
+                crate::color_math::exp_f32(-u.max(0.0) * RETIRE_DECAY)
             }
         }
     }
@@ -1175,7 +1172,10 @@ impl Landing {
     #[must_use]
     pub fn end(&self) -> Instant {
         const BASE_LIFE_MS: f32 = PIN_MS.max(FLASH_COLOUR_MS).max(SPARK_LIFE_MAX_MS);
-        let burst_ms = self.burst.map_or(0.0, |b| b.ms);
+        let burst_ms = match self.burst {
+            Some(b) => b.ms,
+            None => 0.0,
+        };
         let life = BASE_LIFE_MS.max(burst_ms);
         self.pin.at + Duration::from_secs_f32(life * (1.0 / 1000.0))
     }
@@ -1671,10 +1671,12 @@ impl Meteors {
             self.hand_floor = None;
             return;
         }
-        self.hand_floor = self
-            .hand_floor
-            .filter(|&(row, _)| row >= rows)
-            .map(|(row, col)| (row - rows, col));
+        if let Some((row, _)) = &mut self.hand_floor {
+            match row.checked_sub(rows) {
+                Some(r) => *row = r,
+                None => self.hand_floor = None,
+            }
+        }
         let dy = f32::from(rows) * f32::from(cell_h);
         self.live.retain_mut(|m| {
             m.y0 -= dy;
@@ -1715,9 +1717,12 @@ impl Meteors {
             self.hand_floor = None;
             return;
         }
-        self.hand_floor = self
-            .hand_floor
-            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+        if let Some((row, _)) = &mut self.hand_floor {
+            match band_row(*row, top, bottom, delta) {
+                Some(r) => *row = r,
+                None => self.hand_floor = None,
+            }
+        }
         let px = BandPx::new(top, bottom, delta, cell_h, origin_y);
         self.live.retain_mut(|m| px.span(&mut m.y0, &mut m.y1));
         self.landings.retain_mut(|l| px.point(&mut l.y));
@@ -1773,7 +1778,7 @@ impl Meteors {
         let (x0, y0) = geom.cell_center(from.0, from.1);
         let (x1, y1) = geom.cell_center(to.0, to.1);
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        let len = (x1 - x0).hypot(y1 - y0);
+        let len = crate::color_math::hypot_f32(x1 - x0, y1 - y0);
         if len < 1.0 {
             return None;
         }
@@ -1865,12 +1870,15 @@ impl Meteors {
             for (i, x) in self.live.iter().enumerate() {
                 if x.retired_at.is_some() {
                     let end = x.end();
-                    if victim.is_none_or(|(_, best)| end < best) {
+                    if !matches!(victim, Some((_, best)) if end >= best) {
                         victim = Some((i, end));
                     }
                 }
             }
-            self.live.remove(victim.map_or(0, |(i, _)| i));
+            self.live.remove(match victim {
+                Some((i, _)) => i,
+                None => 0,
+            });
         }
         self.live.push(m);
 
@@ -2386,7 +2394,7 @@ const HEAD_FOLD_MS: f32 = 50.0;
 impl Flight {
     fn of(m: &Meteor, ctx: &Ctx<'_>) -> Option<Self> {
         let (dx, dy) = m.delta();
-        let l = dx.hypot(dy);
+        let l = crate::color_math::hypot_f32(dx, dy);
         if !l.is_finite() || l < 1.0 {
             return None;
         }
@@ -2408,8 +2416,8 @@ impl Flight {
                 (1.0, 1.0)
             } else {
                 (
-                    (-after * (1.0 / TRAIN_WHITE_TAU_MS)).exp(),
-                    (-after * (1.0 / TRAIN_COLOUR_TAU_MS)).exp(),
+                    crate::color_math::exp_f32(-after * (1.0 / TRAIN_WHITE_TAU_MS)),
+                    crate::color_math::exp_f32(-after * (1.0 / TRAIN_COLOUR_TAU_MS)),
                 )
             };
             (clamp01(age * inv_t_ms), alpha_w, alpha_c)
@@ -2488,7 +2496,8 @@ impl Flight {
             stretch: if u >= 1.0 {
                 1.0
             } else {
-                1.0 + NUCLEUS_STRETCH_GAIN * (1.0 - u).powf(FLIGHT_ENTER_EXP - 1.0)
+                1.0 + NUCLEUS_STRETCH_GAIN
+                    * crate::color_math::powf_pos_f32(1.0 - u, FLIGHT_ENTER_EXP - 1.0)
             },
             flash: if reduced { 1.0 } else { flash_scale(after) },
             stride: (l * (1.0 / STATIONS_MAX as f32)).max(STATION_STRIDE_MIN_PX),
@@ -2692,7 +2701,7 @@ fn build_stations(
                     let ink = if s <= f.shoulder {
                         light_peak
                     } else {
-                        light_peak * (-(s - f.shoulder) * inv_colour_fall).exp()
+                        light_peak * crate::color_math::exp_f32(-(s - f.shoulder) * inv_colour_fall)
                     };
                     let half = f.width_at(s) * 0.5 * LIGHT_RAIL_SQUASH;
                     // The paper train's fades along it, in time and at its
@@ -2751,7 +2760,7 @@ fn build_stations(
                     let exp_fall = if s <= 0.0 {
                         1.0
                     } else {
-                        (-s * inv_colour_fall).exp()
+                        crate::color_math::exp_f32(-s * inv_colour_fall)
                     };
                     let k = exp_fall * alpha * shows;
                     let half = f.width_at(s) * 0.5;
@@ -2803,7 +2812,7 @@ fn build_stations(
                 let exp_tail = if tail <= 0.0 {
                     1.0
                 } else {
-                    (-tail * inv_white_fall).exp()
+                    crate::color_math::exp_f32(-tail * inv_white_fall)
                 };
                 let fade = exp_tail * alpha * shows;
                 let (k, half) = if light || square || !clean {
@@ -2903,9 +2912,9 @@ fn draw_head(
         let shrink = folded * text.at(cx, cy);
         (
             level,
-            (COMA_COV_SHARE * f.fade_c).sqrt() * shrink,
+            crate::color_math::sqrt_f32(COMA_COV_SHARE * f.fade_c) * shrink,
             level,
-            f.fade_w.sqrt() * shrink,
+            crate::color_math::sqrt_f32(f.fade_w) * shrink,
         )
     } else {
         (coma_cov, 1.0, core_cov, 1.0)
@@ -2933,7 +2942,7 @@ fn draw_head(
             }
             out
         };
-        let (ss, cs) = spin.sin_cos();
+        let (ss, cs) = crate::supernova::sin_cos_f32(spin);
         for (i, &(si, ci)) in COMA_PETAL_UNIT.iter().enumerate() {
             let ca = cs * ci - ss * si;
             let sa = ss * ci + cs * si;
@@ -3008,7 +3017,7 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     } else if close >= 1.0 {
         0.0
     } else {
-        (1.0 - close).powf(PIN_ARM_EXP)
+        crate::color_math::powf_pos_f32(1.0 - close, PIN_ARM_EXP)
     };
     let arm = PIN_ARM_CH * ch * arm_scale;
     let alpha = if u <= PIN_ALPHA_HOLD_U {
@@ -3085,7 +3094,7 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     let colour_scale = colour_share * intensity;
     let white_scale = white_share * intensity;
     for k in -FLASH_CELLS..=FLASH_CELLS {
-        let blank = l.sky.is_some_and(|s| s.flash_blank(k));
+        let blank = matches!(l.sky, Some(s) if s.flash_blank(k));
         let cap = if blank {
             FLASH_FULL_COV
         } else {

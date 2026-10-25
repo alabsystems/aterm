@@ -893,7 +893,7 @@ fn modified_names_a_colour_default_with_its_colour() {
             .iter()
             .find(|node| node.key.as_str() == format!("settings/label/{key}/chip"))
             .and_then(|node| match &node.content {
-                UiContent::Custom(spec) => spec.value.clone(),
+                UiContent::Custom(spec) => spec.paint.clone(),
                 _ => None,
             })
     };
@@ -952,7 +952,7 @@ fn modified_names_a_colour_default_with_its_colour() {
                     || node.key.as_str() == "settings/detail/foreground/chip"
             })
             .and_then(|node| match &node.content {
-                UiContent::Custom(spec) => spec.value.clone(),
+                UiContent::Custom(spec) => spec.paint.clone(),
                 _ => None,
             });
         assert_eq!(

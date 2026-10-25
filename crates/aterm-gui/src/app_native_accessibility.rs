@@ -137,6 +137,14 @@ impl App {
             }
         };
         let (update, routes, virtual_text) = projection.into_update_routes_and_virtual_text();
+        #[cfg(a11y_tree)]
+        let update = match self
+            .with_mixed_terminal_panes(wid, plan, update)
+            .and_then(|update| self.with_window_chrome(wid, update))
+        {
+            Ok(update) => update,
+            Err(error) => return Some(Err(error)),
+        };
         let primary = focused_native
             .and_then(|view| owners.iter().copied().find(|owner| owner.view == view))
             .unwrap_or(owners[0]);
@@ -387,29 +395,41 @@ impl App {
             }
             self.sync_window(wid);
         }
-        let event = match routed {
-            RoutedAccessibilityAction::Focus { key } => AppEvent::FocusChanged(Some(key)),
-            RoutedAccessibilityAction::Activate { action, value, .. } => {
-                AppEvent::Action(ActionInvocation { id: action, value })
+        let result = match routed {
+            RoutedAccessibilityAction::Activate { key, action, value } => self
+                .dispatch_native_control_action(
+                    wid,
+                    owner.view,
+                    key,
+                    ActionInvocation { id: action, value },
+                    true,
+                ),
+            RoutedAccessibilityAction::Focus { key } => {
+                self.focus_native_control(wid, owner.view, key, true)
             }
-            RoutedAccessibilityAction::Scroll { key, lines } => AppEvent::ScrollAt { lines, key },
-            RoutedAccessibilityAction::ScrollIntoView { key } => AppEvent::RevealControl(key),
+            RoutedAccessibilityAction::Scroll { key, lines } => {
+                self.dispatch_native_view_event(wid, owner.view, AppEvent::ScrollAt { lines, key })
+            }
+            RoutedAccessibilityAction::ScrollIntoView { key } => {
+                self.dispatch_native_view_event(wid, owner.view, AppEvent::RevealControl(key))
+            }
             RoutedAccessibilityAction::ReplaceSelectedText { text, .. } => {
-                AppEvent::InsertText(text)
+                self.dispatch_native_view_event(wid, owner.view, AppEvent::InsertText(text))
             }
             RoutedAccessibilityAction::SetTextSelection {
                 anchor_byte,
                 focus_byte,
                 ..
-            } => AppEvent::EditorSetSelection {
-                anchor: anchor_byte,
-                head: focus_byte,
-            },
+            } => self.dispatch_native_view_event(
+                wid,
+                owner.view,
+                AppEvent::EditorSetSelection {
+                    anchor: anchor_byte,
+                    head: focus_byte,
+                },
+            ),
         };
-        if self
-            .dispatch_native_view_event(wid, owner.view, event)
-            .is_err()
-        {
+        if result.is_err() {
             return;
         }
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -913,6 +933,132 @@ mod tests {
             target_node: node,
             data: value.map(|text| aterm_a11y::model::ActionData::Value(text.into())),
         }
+    }
+
+    fn startup_review_ax_navigation(action: Action) {
+        use crate::workstation_setup::{Request, WorkstationSetupDecision};
+        use aterm_types::macos_setup::Plan;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 24;
+        window.cols = 90;
+        window.os_window_for_test = true;
+        assert!(app.open_system_state_tab());
+        app.set_system_state_handlers_for_test(crate::InitialSetupHandlers::inert_for_test());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        // The real offer entry, with only the display's presence stood in:
+        // every platform port remains the headless App's inert one.
+        app.headless = false;
+        app.offer_system_state(request.clone());
+        app.headless = true;
+        assert!(request.pending());
+        assert!(app.commit_glassless_native_frame(wid));
+        let start = Instant::now();
+        app.tick_system_state(start);
+
+        let key = UiKey::new(if action == Action::ScrollIntoView {
+            "system-state/row/repositories"
+        } else {
+            "system-state/group/0/set-up"
+        });
+        set_a11y_active(&mut app, wid, true);
+        assert!(app.prepare_native_input_scratch(wid));
+        let (update, published) = app.take_native_accessibility_update(wid).unwrap().unwrap();
+        let target_node = stable_node_id_for_view(view, &key);
+        let control = &update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == target_node)
+            .expect("the review publishes the target row or control")
+            .1;
+        assert!(control.supports_action(action));
+        if action == Action::ScrollIntoView {
+            assert!(control.is_offscreen());
+        }
+        let context = control.action_context();
+        assert!(context.is_some());
+        app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
+        let scroll = |app: &App| match app.native_runtime.view_state(view).unwrap() {
+            AppViewState::SystemState(state) => state.list_scroll().0,
+            _ => panic!("the review remains System State"),
+        };
+        let before = scroll(&app);
+        app.on_native_accessibility_action(
+            wid,
+            ActionRequest {
+                context,
+                action,
+                target_tree: TreeId::ROOT,
+                target_node,
+                data: None,
+            },
+        );
+        if action == Action::ScrollIntoView {
+            assert!(scroll(&app) > before, "Show item really moves the list");
+            assert!(app.commit_glassless_native_frame(wid));
+            assert!(
+                !app.compiled_native_ui(wid)
+                    .unwrap()
+                    .semantic(&key)
+                    .unwrap()
+                    .offscreen,
+                "the requested row is now visible"
+            );
+        } else {
+            assert_eq!(scroll(&app), before);
+            assert_eq!(
+                app.native_runtime
+                    .view_state(view)
+                    .unwrap()
+                    .common()
+                    .last_focus,
+                Some(key)
+            );
+        }
+        app.tick_system_state(start + Duration::from_secs(60));
+        if action == Action::ScrollIntoView {
+            assert!(
+                request.pending(),
+                "Show item must stop automatic Apply while retaining the offer"
+            );
+            assert!(receive.try_recv().is_err());
+            let apply = publish_vault_action(&mut app, wid, view, "system-state/apply", None);
+            app.on_native_accessibility_action(wid, apply);
+        }
+        let mut answer = receive.try_recv().expect("the review answers once");
+        assert_eq!(
+            answer.decision,
+            WorkstationSetupDecision::Begin(Plan::default())
+        );
+        assert_eq!(
+            answer.receipt.as_ref().unwrap().admission(),
+            if action == Action::ScrollIntoView {
+                crate::system_state::Admission::Person
+            } else {
+                crate::system_state::Admission::Automatic
+            }
+        );
+        answer.receipt.take().unwrap().accept();
+        app.resolve_system_state_apply();
+        assert!(!request.pending());
+        assert!(receive.try_recv().is_err());
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn startup_review_ax_show_item_stops_automatic_apply() {
+        startup_review_ax_navigation(Action::ScrollIntoView);
+    }
+
+    #[test]
+    fn startup_review_ax_focus_preserves_the_existing_countdown() {
+        startup_review_ax_navigation(Action::Focus);
     }
 
     #[cfg(target_os = "macos")]
@@ -1497,6 +1643,124 @@ mod tests {
     }
 
     #[test]
+    fn platform_focus_gives_the_editor_visible_focus_and_an_ime_anchor() {
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("focus.txt");
+        let source = "aéz\nsecond λ\n";
+        std::fs::write(&path, source).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab_in_window(
+            wid,
+            AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+        )
+        .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::EditorSetSelection { anchor: 1, head: 3 },
+        )
+        .unwrap();
+        app.reconcile_active_editor_viewport(wid).unwrap();
+        let editor_state = |app: &App| {
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("the Editor view remains attached")
+            };
+            state.as_ref().clone()
+        };
+        let document_state = |app: &App| {
+            let snapshot = app.document_store.snapshot(document).unwrap();
+            (
+                snapshot.seq,
+                snapshot.text,
+                app.document_store.dirty(document),
+                app.document_store.checkpoint_seq(document),
+            )
+        };
+        let before = editor_state(&app);
+        let document_before = document_state(&app);
+        let input_before = before.common.input_lifetime();
+        assert!(before.common.last_focus.is_none());
+        assert!(!before.common.focus_visible);
+        let key = UiKey::new("editor/buffer");
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        assert!(compiled.focus_order.contains(&key));
+        let anchor_before = compiled
+            .ime_caret_rect()
+            .expect("the quiet editor already owns text input");
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+        let node = projection.id_for_key(&key).unwrap();
+        let (_, routes) = projection.into_update_and_routes();
+        let generation = app.native_runtime.view_generation(view).unwrap();
+        app.windows.get_mut(&wid).unwrap().native_a11y_published =
+            Some(PublishedNativeAccessibility::new(view, generation, routes));
+        let request = ActionRequest {
+            context: Some(aterm_a11y::model::ActionContext::new(
+                view.get(),
+                generation,
+            )),
+            action: Action::Focus,
+            target_tree: TreeId::ROOT,
+            target_node: node,
+            data: None,
+        };
+        let mut stale = request.clone();
+        stale.context = Some(aterm_a11y::model::ActionContext::new(
+            view.get(),
+            generation.saturating_add(1),
+        ));
+        app.on_native_accessibility_action(wid, stale);
+        assert_eq!(editor_state(&app), before);
+        assert!(std::sync::Arc::ptr_eq(
+            &input_before,
+            &editor_state(&app).common.input_lifetime()
+        ));
+
+        app.on_native_accessibility_action(wid, request.clone());
+        let focused = editor_state(&app);
+        assert_eq!(focused.common.last_focus.as_ref(), Some(&key));
+        let input_focused = focused.common.input_lifetime();
+        assert!(!std::sync::Arc::ptr_eq(&input_before, &input_focused));
+        let mut failures = Vec::new();
+        if !focused.common.focus_visible {
+            failures.push("platform Focus did not make the Editor field visibly focused");
+        }
+        let painted = app.compiled_native_ui(wid).unwrap();
+        let viewport = painted
+            .paint
+            .iter()
+            .find_map(|paint| {
+                if paint.key != key {
+                    return None;
+                }
+                match &paint.content {
+                    crate::native_ui::UiContent::TextViewport(spec) => Some(spec),
+                    _ => None,
+                }
+            })
+            .unwrap();
+        if !viewport.focused {
+            failures.push("platform Focus did not reach the focused viewport projection");
+        }
+        if painted.ime_caret_rect() != Some(anchor_before) {
+            failures.push("platform Focus moved the existing text target's IME anchor");
+        }
+        app.on_native_accessibility_action(wid, request);
+        assert!(std::sync::Arc::ptr_eq(
+            &input_focused,
+            &editor_state(&app).common.input_lifetime()
+        ));
+        assert_eq!(editor_state(&app).buffer, before.buffer);
+        assert_eq!(document_state(&app), document_before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(app.structural_invariants_ok());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn platform_focus_routes_to_exact_live_view_and_rejects_stale_generation() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1546,6 +1810,12 @@ mod tests {
                 .last_focus,
             Some(key.clone())
         );
+        let visible_focus = app
+            .compiled_native_ui(wid)
+            .unwrap()
+            .semantic(&key)
+            .and_then(|node| node.state)
+            .is_some_and(|state| state.focus_visible);
 
         app.native_runtime
             .view_state_mut(view)
@@ -1607,6 +1877,10 @@ mod tests {
                 .native_a11y_published
                 .is_none(),
             "stale routes are discarded fail-closed"
+        );
+        assert!(
+            visible_focus,
+            "platform Focus exposes the Settings focus indicator"
         );
     }
 
@@ -2065,8 +2339,10 @@ mod tests {
         }
         assert!(app.open_settings_tab(SettingsRoute::Home));
         let (_, native_view) = app.active_native_view(wid).expect("Settings view");
-        let (_, terminal_view) =
+        let (session, terminal_view) =
             app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        crate::term_lock(&app.pool.get(session).expect("stub session").term)
+            .process(b"mixed pane text");
         assert_eq!(app.active_native_view(wid), None);
         assert_eq!(
             app.active_visible_leaf_plan(wid).unwrap().focused,
@@ -2089,25 +2365,238 @@ mod tests {
             .take_native_accessibility_update(wid)
             .expect("visible native sibling despite terminal focus")
             .expect("valid mixed tree");
+        let node = |id| &update.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
         let window_root = update.tree.as_ref().unwrap().root;
         let native_root = stable_node_id_for_view(native_view, &root_key);
+        let children = node(window_root).children();
         assert_eq!(
-            update
-                .nodes
-                .iter()
-                .find(|(id, _)| *id == window_root)
-                .unwrap()
-                .1
-                .children(),
-            [native_root]
+            children.len(),
+            2,
+            "one child per visible leaf: {children:?}"
+        );
+        assert_eq!(children[0], native_root);
+        let pane = children[1];
+        assert_eq!(node(pane).role(), aterm_a11y::model::Role::Terminal);
+        assert_eq!(
+            node(pane).label(),
+            Some(format!("{} — pane 2 of 2", crate::accessibility::LABEL).as_str())
+        );
+        assert!(
+            node(pane)
+                .value()
+                .is_some_and(|text| text.contains("mixed pane text")),
+            "the terminal leaf publishes its own text: {:?}",
+            node(pane).value()
         );
         assert_eq!(
-            update.focus, window_root,
-            "terminal focus is represented by the host root, never a hidden native control"
+            update.focus, pane,
+            "terminal focus is the terminal's own document, never a hidden native control"
         );
+        assert!(published.route_owner(pane).is_none());
         assert_eq!(
             published.route_owner(native_root).unwrap().view,
             native_view
+        );
+    }
+
+    #[test]
+    fn a_mixed_tab_s_native_focus_keeps_its_terminal_sibling_readable() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(window) = app.windows.get_mut(&wid) {
+            window.cols = 120;
+            window.rows = 42;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (_, native_view) = app.active_native_view(wid).expect("Settings view");
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+        crate::term_lock(&app.pool.get(session).expect("stub session").term)
+            .process(b"sibling text");
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.tab_set.active_mut())
+                .is_some_and(|tab| tab.set_focus(native_view)),
+            "the native leaf is live"
+        );
+        app.sync_window(wid);
+        assert_eq!(
+            app.active_native_view(wid).map(|(_, view)| view),
+            Some(native_view)
+        );
+        set_a11y_active(&mut app, wid, true);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let (update, published) = app
+            .take_native_accessibility_update(wid)
+            .expect("visible native leaf")
+            .expect("valid mixed tree");
+        let node = |id| &update.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
+        let window_root = update.tree.as_ref().unwrap().root;
+        let children = node(window_root).children();
+        assert_eq!(
+            children.len(),
+            2,
+            "one child per visible leaf: {children:?}"
+        );
+        let pane = children[1];
+        assert!(
+            node(pane)
+                .value()
+                .is_some_and(|text| text.contains("sibling text"))
+        );
+        assert!(
+            published
+                .route_owner(update.focus)
+                .is_some_and(|owner| owner.view == native_view),
+            "native focus stays on the native control"
+        );
+        assert!(
+            node(pane).text_selection().is_none(),
+            "no caret in an unfocused pane"
+        );
+    }
+
+    #[test]
+    fn a_mixed_tab_s_terminal_text_moves_with_its_native_sibling_in_a_centred_frame() {
+        use aterm_window::dpi::PhysicalSize;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(window) = app.windows.get_mut(&wid) {
+            window.cols = 120;
+            window.rows = 42;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        crate::term_lock(&app.pool.get(session).expect("stub session").term).process(b"placed");
+        set_a11y_active(&mut app, wid, true);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let full = {
+            let window = &app.windows[&wid];
+            app.frame_px(
+                u16::try_from(window.input_scratch.cells.len()).unwrap(),
+                window.cols,
+            )
+        };
+        let placed = |app: &mut App, extra: u32| {
+            app.windows.get_mut(&wid).unwrap().win_px = Some(PhysicalSize::new(
+                full.width.saturating_add(extra),
+                full.height.saturating_add(extra),
+            ));
+            assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+            let (update, _) = app
+                .take_native_accessibility_update(wid)
+                .expect("visible native leaf")
+                .expect("valid mixed tree");
+            let node = |id| &update.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
+            let children = node(update.tree.as_ref().unwrap().root).children();
+            assert_eq!(
+                children.len(),
+                2,
+                "one child per visible leaf: {children:?}"
+            );
+            let native = node(children[0])
+                .transform()
+                .expect("a native leaf root is placed")
+                .as_coeffs();
+            let pane = node(children[1])
+                .bounds()
+                .expect("a terminal pane has bounds");
+            ((native[4], native[5]), (pane.x0, pane.y0))
+        };
+        let (native_snug, pane_snug) = placed(&mut app, 0);
+        let (native_wide, pane_wide) = placed(&mut app, 16);
+        let moved = |wide: (f64, f64), snug: (f64, f64)| (wide.0 - snug.0, wide.1 - snug.1);
+        let native_moved = moved(native_wide, native_snug);
+        let centred_y = if cfg!(target_os = "linux") { 0.0 } else { 8.0 };
+        assert_eq!(
+            native_moved,
+            (8.0, centred_y),
+            "PRECONDITION: a larger surface centres the frame and its native leaf"
+        );
+        assert_eq!(
+            moved(pane_wide, pane_snug),
+            native_moved,
+            "the terminal leaf's text moves with its native sibling"
+        );
+        assert!(
+            pane_snug.0 > native_snug.0,
+            "the terminal leaf sits right of its native sibling"
+        );
+    }
+
+    #[test]
+    fn a_native_tab_publishes_the_band_it_paints_and_its_buttons_act() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let id = app.post_message(
+            aterm_messages::Message::new(
+                aterm_messages::tags::TOOLCHAIN,
+                aterm_messages::Severity::Info,
+                "Toolchain ready",
+            )
+            .key("native-band")
+            .action(aterm_messages::Intent::OpenSettings {
+                route: "/packages".into(),
+            })
+            .hold(aterm_messages::Hold::Live {
+                stale_after: aterm_messages::STALE_TAILED,
+            }),
+        );
+        set_a11y_active(&mut app, wid, true);
+        assert!(app.prepare_native_input_scratch(wid));
+        let (update, published) = app
+            .take_native_accessibility_update(wid)
+            .expect("visible native leaf")
+            .expect("valid native tree");
+        let node = |id| &update.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
+        let window_root = update.tree.as_ref().unwrap().root;
+        let children = node(window_root).children();
+        let band = children
+            .iter()
+            .copied()
+            .find(|child| node(*child).label() == Some("Toolchain ready"))
+            .expect("the painted band row is published");
+        let native_root = *children.last().unwrap();
+        assert!(
+            published.route_owner(native_root).is_some(),
+            "the native leaf follows the chrome: {children:?}"
+        );
+        assert!(
+            children.iter().position(|child| *child == band)
+                < children.iter().position(|child| *child == native_root),
+            "chrome reads before the tab's content"
+        );
+        assert!(
+            published.route_owner(update.focus).is_some(),
+            "with no menu or find open, focus stays on the native control"
+        );
+        let (capsule, button) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == aterm_a11y::model::Role::Button && node.label() == Some("Packages")
+            })
+            .expect("the band row's button is published");
+        assert!(node(band).children().contains(capsule));
+        app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
+        app.on_accessibility_action(
+            wid,
+            ActionRequest {
+                context: button.action_context(),
+                action: Action::Click,
+                target_tree: TreeId::ROOT,
+                target_node: *capsule,
+                data: None,
+            },
+        );
+        assert_eq!(
+            app.messages.live(id).unwrap().acted.map(|(index, _)| index),
+            Some(aterm_messages::ActionIndex(0)),
+            "the reader's press reaches the message"
         );
     }
 

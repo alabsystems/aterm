@@ -266,6 +266,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn limited(&self, open: bool) {
         let _ = open;
     }
+    /// The reset the loop's open limit episode holds its wall to (`reset_unix`, unix seconds;
+    /// `None`: it knows none), told as the episode opens ([`Self::limited`]) and again whenever a
+    /// later limit point moves it later: the reset at which, plus its grace, the loop takes the
+    /// wall as spent and rests there, where a host's line could go. A host that publishes the
+    /// wall to others (the `disk-free@v1` seat rule's board) dates it by this, so the two never
+    /// disagree on when the wall is spent.
+    fn limit_wall(&self, reset_unix: Option<i64>) {
+        let _ = reset_unix;
+    }
     fn limit_until(&self) -> Option<u64> {
         None
     }
@@ -426,6 +435,12 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn login_label(&self) -> Option<String> {
         None
     }
+
+    /// The session's login was lost and no roster row names it ([`Self::login_label`]), before
+    /// any `/login` is typed into it: discover its row now, as the accounts' upkeep would (its
+    /// sync, which adopts the default login's address as a row). The loop reads the label again
+    /// after it.
+    fn login_discover(&self) {}
 
     fn login_superseded(&self) -> bool {
         false

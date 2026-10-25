@@ -84,6 +84,8 @@ pub mod install;
 pub mod landing;
 /// `atpkg lane`.
 pub mod lane;
+/// aterm's usage tap at launch, the block a managed Claude Code twin carries.
+pub mod launch_tap;
 /// Laying executables (shims, stubs, tombstones).
 pub mod lay;
 /// Toolchain leases.

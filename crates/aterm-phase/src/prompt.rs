@@ -3050,6 +3050,20 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.283-api-retrying-queued-80col-measured.txt");
     pub const API_RETRYING_QUEUED_DRAFT_MEASURED: &str =
         include_str!("fixtures/claude-2.1.283-api-retrying-queued-draft-measured.txt");
+    pub const API_NO_RESPONSE_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-no-response-120col.txt");
+    pub const API_NO_RESPONSE_QUEUED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-no-response-queued-120col.txt");
+    pub const API_NO_RESPONSE_QUEUED_60_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-no-response-queued-60col.txt");
+    pub const API_UNREACHABLE_QUEUED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-unreachable-queued-120col.txt");
+    pub const API_DROPPED_QUEUED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-dropped-queued-120col.txt");
+    pub const API_ROUTE_QUEUED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-route-queued-120col.txt");
+    pub const API_STALLED_QUEUED_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-api-stalled-queued-120col.txt");
     pub const API_ERROR_QUEUED_SENT_MEASURED: &str =
         include_str!("fixtures/claude-2.1.283-api-error-queued-sent-measured.txt");
     pub const API_ERROR_TWICE_MEASURED: &str =

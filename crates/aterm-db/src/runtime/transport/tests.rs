@@ -206,6 +206,89 @@ fn cancellation_before_socket_install_cannot_be_reversed() {
     assert!(channel.socket.is_none());
 }
 
+#[test]
+fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
+    let lab = Lab::new();
+    let mut hints = Hints::new([61; 32]);
+    // Bind all three first so the kernel cannot reuse an old listener's port.
+    let listeners: Vec<_> = (0..3)
+        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .collect();
+    let now = Instant::now();
+    let mut old_addresses = Vec::new();
+    for listener in &listeners[..2] {
+        let address = listener.local_addr().unwrap();
+        hints.observe(&Hints::new([62; 32]).wire(address.port()), address, now);
+        let (chosen, repair) = hints.next(now).unwrap();
+        assert_eq!(chosen, address);
+        let client = Worker::start(
+            lab.endpoints[1].clone(),
+            None,
+            Some(address),
+            Scope::Loopback,
+            repair,
+        )
+        .unwrap();
+        let server = Worker::start(
+            lab.endpoints[0].clone(),
+            Some(accept_ready(listener)),
+            None,
+            Scope::Loopback,
+            Repair::default(),
+        )
+        .unwrap();
+        let (_, repair, success) = client.task.join().unwrap();
+        assert!(server.task.join().unwrap().2);
+        assert!(success);
+        hints.finish(address, repair, success, now);
+        old_addresses.push(address);
+    }
+    let mut listeners = listeners;
+    let current = listeners.pop().unwrap();
+    drop(listeners);
+    // Observe real failed dials, not an untrusted beacon's claim of failure.
+    let retry = now + Duration::from_secs(10);
+    for _ in 0..2 {
+        let (address, repair) = hints.next(retry).unwrap();
+        assert!(old_addresses.contains(&address));
+        let client = Worker::start(
+            lab.endpoints[1].clone(),
+            None,
+            Some(address),
+            Scope::Loopback,
+            repair,
+        )
+        .unwrap();
+        let (_, repair, success) = client.task.join().unwrap();
+        assert!(!success);
+        hints.finish(address, repair, success, retry);
+    }
+    let address = current.local_addr().unwrap();
+    hints.observe(&Hints::new([63; 32]).wire(address.port()), address, retry);
+    let (chosen, repair) = hints
+        .next(retry)
+        .expect("failed verified ports must not block the current listener for ten minutes");
+    assert_eq!(chosen, address);
+    let client = Worker::start(
+        lab.endpoints[1].clone(),
+        None,
+        Some(address),
+        Scope::Loopback,
+        repair,
+    )
+    .unwrap();
+    let server = Worker::start(
+        lab.endpoints[0].clone(),
+        Some(accept_ready(&current)),
+        None,
+        Scope::Loopback,
+        Repair::default(),
+    )
+    .unwrap();
+    assert!(client.task.join().unwrap().2);
+    assert!(server.task.join().unwrap().2);
+}
+
 fn loopback(endpoint: Arc<Endpoint>, port: u16, token: [u8; 32]) -> Transport {
     let listener = if endpoint.pending() {
         None

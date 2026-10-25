@@ -1540,7 +1540,10 @@ fn occupancy_fact_keys_are_appended_wire_and_an_older_reader_skips_them() {
         at(Key::FactN).map_or(0, |i| i + 1),
         "the last key"
     );
-    assert_eq!(FACT_RULE_WORDS, ["wait-nudge@v1", "hold-room@v1"]);
+    assert_eq!(
+        FACT_RULE_WORDS,
+        ["wait-nudge@v1", "hold-room@v1", "wake@v1"]
+    );
     assert!(
         Fields::new().word(Key::FactRule, "hold-room").is_err(),
         "a rule is named with its version"

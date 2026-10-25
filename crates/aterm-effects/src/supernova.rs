@@ -410,6 +410,7 @@ pub fn emit_super(
     } else if t_ms < SHOCK_END_MS {
         let q = (t_ms - DETONATION_END_MS) as f32 * INV_SHOCK_SPAN_MS;
         let fade = 1.0 - q;
+        let ring_cov = (crate::color_math::sqrt_f32(fade) * env.intensity).min(1.0);
         let n0 = sink.out.len();
         for (ring, rscale) in [(0usize, 1.0f32), (1, 0.72)] {
             let r = env.r_max * ease_out(q) * rscale;
@@ -420,13 +421,7 @@ pub fn emit_super(
             } else {
                 mix_rgb(hsv2rgb(hue, 0.7, 1.0), 0x00FF_FFFF, 0.35)
             };
-            emit_ring_chords(
-                &mut sink,
-                env,
-                r,
-                thick,
-                premul(tone, (fade.sqrt() * env.intensity).min(1.0)),
-            );
+            emit_ring_chords(&mut sink, env, r, thick, premul(tone, ring_cov));
         }
         counts.ring = sink.out.len() - n0;
     }
@@ -489,7 +484,14 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
             by_end.sort_unstable_by_key(|q| u32::from(q.x) + u32::from(q.w));
             let row = &*row;
             for (yi, y_edge) in row.iter().enumerate() {
-                if row[..yi].iter().any(|q| q.y == y_edge.y) {
+                let mut dup = false;
+                for prev in &row[..yi] {
+                    if prev.y == y_edge.y {
+                        dup = true;
+                        break;
+                    }
+                }
+                if dup {
                     continue;
                 }
                 let py = u32::from(y_edge.y);
@@ -650,12 +652,16 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
     let ch = env.cell_h;
     sink.push(env.cx - ch, env.cy - ch / 2, 2 * ch, ch, core);
     sink.push(env.cx - ch / 2, env.cy - ch, ch, 2 * ch, core);
-    let segs: [(f32, i32, i32, u32); 3] = std::array::from_fn(|seg| {
+    let ch_scale = ch as f32 * 0.6;
+    let mut segs = [(0.0f32, 0i32, 0i32, 0u32); 3];
+    let mut seg = 0;
+    while seg < 3 {
         let (f0, cov_scale, tone) = CROWN_SEG_SPECS[seg];
         let d = reach * f0;
-        let sz = ((1.0 - f0) * ch as f32 * 0.6).max(2.0) as i32;
-        (d, sz, sz / 2, premul(tone, env_a * cov_scale))
-    });
+        let sz = ((1.0 - f0) * ch_scale).max(2.0) as i32;
+        segs[seg] = (d, sz, sz / 2, premul(tone, env_a * cov_scale));
+        seg += 1;
+    }
     for &(sin_a, cos_a) in crown_dirs() {
         let (dx, dy) = (cos_a, sin_a * 0.75);
         for &(d, sz, half_sz, color) in &segs {
@@ -702,9 +708,9 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
             continue;
         }
         let dy2 = dy * dy;
-        let xo = (ro2 - dy2).sqrt();
+        let xo = crate::color_math::sqrt_f32(ro2 - dy2);
         let xi = if dy.abs() < ri {
-            (ri2 - dy2).sqrt()
+            crate::color_math::sqrt_f32(ri2 - dy2)
         } else {
             0.0
         };
@@ -812,7 +818,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                         if d2 >= 1.0 {
                             continue;
                         }
-                        (1.0 - d2).powf(0.8)
+                        crate::color_math::powf_pos_f32(1.0 - d2, 0.8)
                     };
                     let a = base_a * falloff;
                     if a < 14.0 {
@@ -832,13 +838,14 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 }
             }
         }
-        let crown_segs: [(f32, u8); 3] = std::array::from_fn(|i| {
+        let mut crown_segs = [(0.0f32, 0u8); 3];
+        for (i, slot) in crown_segs.iter_mut().enumerate() {
             let seg = (i + 1) as f32;
-            (
+            *slot = (
                 env.r_max * 0.3 * seg,
                 (230.0 * env_a * (1.0 - 0.2 * seg)) as u8,
-            )
-        });
+            );
+        }
         for &(sin_a, cos_a) in crown_dirs() {
             if out.len() >= cap {
                 break;
@@ -908,8 +915,10 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         } else {
             (0.85, 1.0, DecoBlend::Add)
         };
-        let alphas = [1.0, crate::effect_util::TWINKLE_FLOOR]
-            .map(|tw| (255.0 * env.intensity * tw * fade_p) as u8);
+        let alphas = [
+            (255.0 * env.intensity * 1.0 * fade_p) as u8,
+            (255.0 * env.intensity * crate::effect_util::TWINKLE_FLOOR * fade_p) as u8,
+        ];
         let half_cw = env.cell_w / 2;
         let half_ch = env.cell_h / 2;
         let hue_drift = p * 90.0;
@@ -921,7 +930,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             let ang = (s & 4095) as f32 * ANG_SCALE;
             let speed = 0.5 + (s >> 13 & 0xff) as f32 * INV_255;
             let r = base_r * speed;
-            let (sin_a, cos_a) = ang.sin_cos();
+            let (sin_a, cos_a) = sin_cos_f32(ang);
             let x = env.cx + (cos_a * r) as i32;
             let y = env.cy + (sin_a * r * 0.7) as i32 + grav_y;
             if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
@@ -970,7 +979,10 @@ fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
     let mut keys = [EMPTY; SHADE_TAB];
     let mut sums = [0u32; SHADE_TAB];
     let mut peak = 0u32;
-    for d in decos.iter().filter(|d| is_shade(d)) {
+    for d in decos {
+        if !is_shade(d) {
+            continue;
+        }
         debug_assert_eq!((d.dx, d.dy), (0, 0));
         let key = u64::from(d.row) << 16 | u64::from(d.col);
         let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SHADE_TAB_BITS)) as usize;
@@ -992,19 +1004,23 @@ fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
 }
 
 fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
-    decos
-        .iter()
-        .filter(|d| is_shade(d))
-        .map(|d| {
-            debug_assert_eq!((d.dx, d.dy), (0, 0));
-            decos
-                .iter()
-                .filter(|other| is_shade(other) && other.row == d.row && other.col == d.col)
-                .map(|other| u32::from(other.alpha))
-                .sum()
-        })
-        .max()
-        .unwrap_or(0)
+    let mut peak = 0u32;
+    for d in decos {
+        if !is_shade(d) {
+            continue;
+        }
+        debug_assert_eq!((d.dx, d.dy), (0, 0));
+        let mut sum = 0u32;
+        for other in decos {
+            if is_shade(other) && other.row == d.row && other.col == d.col {
+                sum += u32::from(other.alpha);
+            }
+        }
+        if sum > peak {
+            peak = sum;
+        }
+    }
+    peak
 }
 
 /// Bound the eclipse's full-cell source-over opacity per host cell. Every
@@ -1015,7 +1031,12 @@ fn bound_shade_opacity(decos: &mut [WordDecoration]) {
     if decos.is_empty() {
         return;
     }
-    let shade_count = decos.iter().filter(|d| is_shade(d)).count();
+    let mut shade_count = 0usize;
+    for d in decos.iter() {
+        if is_shade(d) {
+            shade_count += 1;
+        }
+    }
     if shade_count == 0 {
         return;
     }
@@ -1027,8 +1048,10 @@ fn bound_shade_opacity(decos: &mut [WordDecoration]) {
     if peak <= MAX_VIEWPORT_OVERLAY {
         return;
     }
-    for d in decos.iter_mut().filter(|d| is_shade(d)) {
-        d.alpha = (u32::from(d.alpha) * MAX_VIEWPORT_OVERLAY / peak) as u8;
+    for d in decos {
+        if is_shade(d) {
+            d.alpha = (u32::from(d.alpha) * MAX_VIEWPORT_OVERLAY / peak) as u8;
+        }
     }
 }
 

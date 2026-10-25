@@ -429,6 +429,7 @@ fn a_report_counts_each_folder_once_and_names_who_shares_it() {
         ]),
         huge: BTreeMap::from([(outside_row.path.clone(), outside_row.clone())]),
         outside: BTreeSet::from([outside_row.path.clone()]),
+        discovered: BTreeSet::from([DiskScope::Aterm]),
         ..Published::default()
     };
     let report = |scope| build_report(scope, &view, WalkerState::Running);
@@ -559,6 +560,87 @@ fn nested_roots_of_two_panes_share_the_inner_folder_once() {
     assert_eq!((alone.exclusive_bytes, alone.shared_bytes), (100, 0));
     assert!(alone.roots[0].shared_with.is_empty());
     assert_eq!(report(&view, DiskScope::Aterm).shared_bytes, 0);
+}
+
+/// A FIRST ASK IS OWED, NOT ZERO: a pane the facts name but no discovery has derived yet (the
+/// walker hears a reader's ask after the reader reads the board) reports `undiscovered` and
+/// `walking`, never "0 roots, 0 B"; so does the aterm scope until a discovery covered it, and every
+/// scope once the facts moved past the discovery a publication carries.
+#[test]
+fn a_scope_no_discovery_has_derived_on_these_facts_is_owed_not_empty() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let b = base(&tmp);
+    let (home, w, _scratch) = scratch_home(&b);
+    let pane = |key: u64, cwd: &Path| TabFacts {
+        key,
+        label: format!("Tab {key}"),
+        shell_pid: u32::MAX - 7 - u32::try_from(key).unwrap_or(0),
+        reported_cwd: Some(cwd.to_path_buf()),
+    };
+    let facts = |tabs: Vec<TabFacts>| {
+        ToWalker::Facts(Facts {
+            tabs,
+            home: Some(home.clone()),
+            ..Facts::default()
+        })
+    };
+    let (_inbox_tx, inbox) = std::sync::mpsc::channel();
+    let (out, from_engine) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(inbox, out, None);
+    let board = || from_engine.try_iter().last().expect("a publication");
+    let report = |p: &Published, scope| build_report(scope, p, WalkerState::Running);
+    let now = Instant::now();
+    assert!(
+        report(&Published::default(), DiskScope::Aterm).undiscovered,
+        "an empty board has derived nothing"
+    );
+    engine.apply(facts(vec![pane(1, &w), pane(2, &home)]));
+    engine.apply(ToWalker::Demand {
+        scope: DiskScope::Tab(1),
+        detail: Detail::Sizes,
+        at: now,
+    });
+    engine.discover_if_due(now);
+    engine.publish_if_dirty();
+    let p = board();
+    let one = report(&p, DiskScope::Tab(1));
+    assert!(!one.undiscovered && !one.roots.is_empty(), "{one:#?}");
+    let two = report(&p, DiskScope::Tab(2));
+    assert_eq!(two.label.as_deref(), Some("Tab 2"), "the facts name it");
+    assert!(!two.unknown_tab);
+    assert!(
+        two.undiscovered && two.walking && two.roots.is_empty(),
+        "a known pane with no derived roots is owed, not empty: {two:#?}"
+    );
+    let all = report(&p, DiskScope::Aterm);
+    assert!(all.undiscovered && all.walking, "{all:#?}");
+    assert!(!all.roots.is_empty(), "what is derived still shows");
+
+    engine.apply(facts(vec![pane(1, &w), pane(2, &home), pane(3, &w)]));
+    engine.dirty = true;
+    engine.publish_if_dirty();
+    let p = board();
+    assert!(
+        report(&p, DiskScope::Tab(1)).undiscovered,
+        "a discovery of older facts covers none of the panes these name"
+    );
+
+    engine.apply(ToWalker::Demand {
+        scope: DiskScope::Aterm,
+        detail: Detail::Sizes,
+        at: now,
+    });
+    engine.discover_if_due(now);
+    engine.publish_if_dirty();
+    let p = board();
+    for scope in [
+        DiskScope::Tab(1),
+        DiskScope::Tab(2),
+        DiskScope::Tab(3),
+        DiskScope::Aterm,
+    ] {
+        assert!(!report(&p, scope).undiscovered, "{scope:?} derived");
+    }
 }
 
 fn huge(path: &str, entries: u32) -> (PathBuf, HugeDir) {

@@ -368,11 +368,22 @@ impl SessionMeta {
         self.supervisor_revision
     }
 
-    /// Whether the live claim at `now_us` is a proven self-claim ([`crate::self_claim`]).
+    /// Whether the live claim at `now_us` is a proven codex-alab self-claim (contract v2,
+    /// [`crate::self_claim`]): the agent supervises itself, so what acts for that self-claim acts.
+    /// A proven contract v3 claim is not one ([`Self::live_scoped`]).
     #[must_use]
     pub(crate) fn supervisor_proven(&self, now_us: u64) -> bool {
         self.live_claim(now_us)
             .is_some_and(|claim| claim.proven.is_some())
+    }
+
+    /// The wire's `supervisor_proven=1`: the live claim at `now_us` is proven, a codex-alab
+    /// self-claim ([`Self::supervisor_proven`]) or a rostered harness's scoped claim
+    /// ([`SupervisorClaim::scoped`], [`crate::harness_claim`]).
+    #[must_use]
+    pub(crate) fn claim_proven(&self, now_us: u64) -> bool {
+        self.live_claim(now_us)
+            .is_some_and(SupervisorClaim::is_proven)
     }
 
     /// When the `ttl=` claim lapses ([`crate::metrics::now_us`]), live or not.
@@ -400,7 +411,7 @@ impl SessionMeta {
         if claim.holder == own_holder {
             return (None, true);
         }
-        if claim.proven.is_some() {
+        if claim.is_proven() {
             return (None, false);
         }
         match claim.expires_us {
@@ -685,7 +696,26 @@ pub(crate) struct SupervisorClaim {
     pub(crate) holder: String,
     pub(crate) conn: Option<u64>,
     pub(crate) expires_us: Option<u64>,
+    /// A proven codex-alab self-claim (contract v2).
     pub(crate) proven: Option<crate::self_claim::Proven>,
+    /// A proven rostered harness's scoped claim (contract v3); never set with `proven`.
+    pub(crate) scoped: Option<crate::harness_claim::Scoped>,
+}
+
+impl SupervisorClaim {
+    /// The process a proof of this claim named, a v2 self-claim's or a v3 scoped claim's.
+    #[must_use]
+    pub(crate) fn identity(&self) -> Option<&crate::self_claim::Proven> {
+        self.proven
+            .as_ref()
+            .or_else(|| self.scoped.as_ref().map(|s| &s.proven))
+    }
+
+    /// Whether the claim is proven ([`Self::identity`]).
+    #[must_use]
+    pub(crate) fn is_proven(&self) -> bool {
+        self.identity().is_some()
+    }
 }
 
 /// Whether `token` is a well-formed attention owner key or supervisor holder name.
@@ -1248,39 +1278,68 @@ pub(crate) fn claim_supervisor_as(
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> Result<Claimed, String> {
+    claim_supervisor_with(ctx, holder, conn, expires_us, proven, None, now_us, by)
+}
+
+/// `meta set supervisor <id>@<pid> contract=3 scope=…`: a rostered harness's proven scoped claim
+/// ([`crate::harness_claim`]), bound to `conn`, under the same [`claim_rule`] as a proof.
+pub(crate) fn claim_supervisor_scoped(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    conn: Option<u64>,
+    scoped: crate::harness_claim::Scoped,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> Result<Claimed, String> {
+    claim_supervisor_with(ctx, holder, conn, None, None, Some(scoped), now_us, by)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_supervisor_with(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    conn: Option<u64>,
+    expires_us: Option<u64>,
+    proven: Option<crate::self_claim::Proven>,
+    scoped: Option<crate::harness_claim::Scoped>,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> Result<Claimed, String> {
     let looked = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        meta.live_claim(now_us).and_then(|c| c.proven.clone())
+        meta.live_claim(now_us).and_then(|c| c.identity().cloned())
     };
     let looked_gone = looked.as_ref().is_some_and(|p| !p.alive());
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let standing = meta
         .live_claim(now_us)
-        .map(|c| (c.holder.clone(), c.proven.clone()));
+        .map(|c| (c.holder.clone(), c.identity().cloned()));
     let gone = looked_gone
         && standing
             .as_ref()
             .is_some_and(|(_, p)| p.is_some() && *p == looked);
+    let identity = proven
+        .clone()
+        .or_else(|| scoped.as_ref().map(|s| s.proven.clone()));
     let rule = claim_rule(
         standing.as_ref().map(|(h, p)| (h.as_str(), p.is_some())),
         gone,
         holder,
-        proven.is_some(),
+        identity.is_some(),
     );
     if rule == ClaimRule::Busy {
         return Err(standing.map(|(h, _)| h).unwrap_or_default());
     }
     let was_proven = standing.as_ref().is_some_and(|(_, p)| p.is_some());
-    let now_proven = proven.is_some();
-    let renewed_identity_changed = rule == ClaimRule::Renew
-        && standing
-            .as_ref()
-            .is_some_and(|(_, old)| old.as_ref() != proven.as_ref());
+    let now_proven = identity.is_some();
+    let renewed_identity_changed =
+        rule == ClaimRule::Renew && standing.as_ref().is_some_and(|(_, old)| *old != identity);
     let revision = meta.set_supervisor(Some(SupervisorClaim {
         holder: holder.to_string(),
         conn,
         expires_us,
         proven,
+        scoped,
     }));
     let changed = match rule {
         ClaimRule::Renew => was_proven != now_proven,
@@ -1408,7 +1467,7 @@ pub(crate) fn release_proven_if_gone(
 ) -> bool {
     let proven = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        meta.live_claim(now_us).and_then(|c| c.proven.clone())
+        meta.live_claim(now_us).and_then(|c| c.identity().cloned())
     };
     let Some(proven) = proven else {
         return false;
@@ -1417,7 +1476,7 @@ pub(crate) fn release_proven_if_gone(
         return false;
     }
     release_supervisor_if(ctx, now_us, aterm_slog::Actor::Aterm, |claim| {
-        claim.proven.as_ref() == Some(&proven)
+        claim.identity() == Some(&proven)
     })
 }
 
@@ -1559,6 +1618,7 @@ pub(crate) fn seed_carried_claims(
             conn: None,
             expires_us: Some(now_us.saturating_add(ms.saturating_mul(1000))),
             proven: None,
+            scoped: None,
         }));
     }
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -2447,7 +2507,6 @@ impl SessionTimeline {
                 | aterm_phase::Program::Kimi
                 | aterm_phase::Program::Agy
                 | aterm_phase::Program::Muse
-                | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic,
             )
             | None => false,
@@ -3299,7 +3358,6 @@ impl SessionTimeline {
                 | aterm_phase::Program::Codex
                 | aterm_phase::Program::Grok
                 | aterm_phase::Program::Kimi
-                | aterm_phase::Program::Gemini
                 | aterm_phase::Program::Generic,
             )
             | None => false,

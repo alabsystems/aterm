@@ -224,9 +224,8 @@ impl Spine {
             return;
         }
         self.verdict = None;
-        if self
-            .driven_at
-            .is_some_and(|t| now.saturating_duration_since(t) < FLOW_FREEZE_DUR)
+        if let Some(t) = self.driven_at
+            && now.saturating_duration_since(t) < FLOW_FREEZE_DUR
         {
             return;
         }
@@ -245,14 +244,17 @@ impl Spine {
     pub fn drain_delete(&mut self, now: Instant) {
         self.momentum.delete(now);
         self.run = 0;
-        let prior = self
-            .mark
-            .filter(|m| now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S);
         let here = self.birth_disp();
+        let (disp, count) = match self.mark {
+            Some(m) if now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S => {
+                (m.disp.max(here), m.count.saturating_add(1))
+            }
+            _ => (here, 1),
+        };
         self.mark = Some(EraseMark {
             at: now,
-            disp: prior.map_or(here, |m| m.disp.max(here)),
-            count: prior.map_or(1, |m| m.count.saturating_add(1)),
+            disp,
+            count,
         });
     }
 
@@ -306,9 +308,8 @@ impl Spine {
     pub fn update(&mut self, now: Instant) {
         // The hot-resume door closes by itself on the follower's tick, so a
         // session that goes dark re-earns its price.
-        if self
-            .verdict
-            .is_some_and(|at| now.saturating_duration_since(at) > VERDICT_WINDOW_DUR)
+        if let Some(at) = self.verdict
+            && now.saturating_duration_since(at) > VERDICT_WINDOW_DUR
         {
             self.verdict = None;
         }
@@ -343,7 +344,7 @@ impl Spine {
             } else {
                 1.0 / DISP_ATTACK_S
             };
-            self.disp += rise * (1.0 - (-dt * inv_ease).exp());
+            self.disp += rise * (1.0 - crate::color_math::exp_f32(-dt * inv_ease));
         }
         if self.disp < DISP_SNAP_ZERO {
             self.disp = 0.0;
@@ -351,8 +352,11 @@ impl Spine {
         self.disp_peak = if self.disp >= self.disp_peak {
             self.disp
         } else {
-            (self.disp_peak * (-dt * (std::f32::consts::LN_2 / DISP_PEAK_HALF_LIFE_S)).exp())
-                .max(self.disp)
+            (self.disp_peak
+                * crate::color_math::exp_f32(
+                    -dt * (std::f32::consts::LN_2 / DISP_PEAK_HALF_LIFE_S),
+                ))
+            .max(self.disp)
         };
         if self.disp_peak < DISP_SNAP_ZERO {
             self.disp_peak = 0.0;
@@ -367,7 +371,7 @@ impl Spine {
             self.phase = if (0.0..PHASE_RING).contains(&next_phase) {
                 next_phase
             } else {
-                next_phase.rem_euclid(PHASE_RING)
+                next_phase - (next_phase * (1.0 / PHASE_RING)).floor() * PHASE_RING
             };
         }
     }
@@ -413,8 +417,10 @@ impl Spine {
     #[must_use]
     #[cfg(test)]
     pub fn verdict_open(&self, now: Instant) -> bool {
-        self.verdict
-            .is_some_and(|at| now.saturating_duration_since(at) <= VERDICT_WINDOW_DUR)
+        matches!(
+            self.verdict,
+            Some(at) if now.saturating_duration_since(at) <= VERDICT_WINDOW_DUR
+        )
     }
 
     /// The pending [`EraseMark`], live or stale (diagnostic; nothing is armed on it).

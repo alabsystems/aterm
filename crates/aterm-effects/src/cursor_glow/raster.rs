@@ -1006,7 +1006,7 @@ pub(super) fn push_paper_bead(
             if rest <= 0.0 {
                 continue;
             }
-            let half = rest.sqrt();
+            let half = crate::color_math::sqrt_f32(rest);
             let rows = (rr - dy.abs() + 0.5).clamp(0.0, 1.0);
             let (xl, xr) = (cx - half, cx + half);
             let mut lay = |x: i32, w: i32, f: f32| {
@@ -1214,14 +1214,14 @@ pub(super) fn push_crescent(
         if dy.abs() >= r {
             continue;
         }
-        let half = (r2 - dy * dy).sqrt();
+        let half = crate::color_math::sqrt_f32(r2 - dy * dy);
         let (xl, xr) = (cx - half, cx + half);
         let ds = yc - sy;
         if ds.abs() >= sr {
             span(y, xl, xr);
             continue;
         }
-        let shalf = (sr2 - ds * ds).sqrt();
+        let shalf = crate::color_math::sqrt_f32(sr2 - ds * ds);
         let (sl, sr_x) = (sx - shalf, sx + shalf);
         span(y, xl, xr.min(sl));
         span(y, xl.max(sr_x), xr);
@@ -1346,10 +1346,10 @@ pub(crate) fn push_ripple_ring(
         }
         let dy_mid = dy as f32 + h as f32 * 0.5;
         let ym = dy_mid * inv_ry;
-        let outer = rx * (1.0 - ym * ym).max(0.0).sqrt();
+        let outer = rx * crate::color_math::sqrt_f32((1.0 - ym * ym).max(0.0));
         let inner = if inv_inner_ry > 0.0 {
             let yin = dy_mid * inv_inner_ry;
-            inner_rx * (1.0 - yin * yin).max(0.0).sqrt()
+            inner_rx * crate::color_math::sqrt_f32((1.0 - yin * yin).max(0.0))
         } else {
             0.0
         };
@@ -1420,13 +1420,13 @@ pub(crate) const fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let p = v * (1.0 - s);
     let q = v * (1.0 - s * f);
     let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
+    let (r, g, b) = match i {
         1 => (q, v, p),
         2 => (p, v, t),
         3 => (p, q, v),
         4 => (t, p, v),
-        _ => (v, p, q),
+        5 => (v, p, q),
+        _ => (v, t, p),
     };
     #[inline]
     const fn u(c: f32) -> u32 {

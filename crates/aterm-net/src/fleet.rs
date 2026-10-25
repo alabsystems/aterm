@@ -1036,6 +1036,7 @@ pub struct Served {
     release: Release,
     transport: TlsTransport<ServerConnection>,
     peer: Option<NodeProof>,
+    scope: FleetScope,
     admission: Admission,
 }
 
@@ -1050,6 +1051,12 @@ impl Served {
     #[must_use]
     pub const fn peer_node(&self) -> Option<&NodeProof> {
         self.peer.as_ref()
+    }
+
+    /// The fleet level this listener proved on the connection.
+    #[must_use]
+    pub const fn scope(&self) -> FleetScope {
+        self.scope
     }
 
     /// Relay the connection to `local` via [`tls::relay_answers`], releasing the listener hold
@@ -1171,6 +1178,31 @@ pub fn serve<H, E>(
     );
 }
 
+/// [`serve`], each connection proving the level and serving the ops `offer` names as it is
+/// accepted, in place of `listening`'s: a level or an op the listener's owner changes applies to
+/// the next connection, and none in flight is cut by it.
+pub fn serve_offering<H, E>(
+    listener: &TcpListener,
+    listening: &Listening,
+    offer: &dyn Fn() -> (FleetScope, &'static [FleetOp]),
+    running: &AtomicBool,
+    hand_over: H,
+    on_event: E,
+) where
+    H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
+    E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
+{
+    serve_inner(
+        ListenerSocket::Fleet(listener),
+        (listening, offer),
+        running,
+        Locality::Fleet,
+        HANDSHAKE_WITHIN,
+        hand_over,
+        on_event,
+    );
+}
+
 /// Supply the handshake policy explicitly; test peers use their hang detector.
 pub(crate) fn serve_with_handshake<H, E>(
     listener: &TcpListener,
@@ -1185,7 +1217,7 @@ pub(crate) fn serve_with_handshake<H, E>(
 {
     serve_inner(
         ListenerSocket::Fleet(listener),
-        listening,
+        (listening, &|| (listening.scope, listening.serves)),
         running,
         Locality::Fleet,
         handshake_within,
@@ -1212,7 +1244,7 @@ pub fn serve_lan<H, E>(
     let locality = Locality::Link(listener.scope);
     serve_inner(
         ListenerSocket::Link(listener),
-        listening,
+        (listening, &|| (listening.scope, listening.serves)),
         running,
         locality,
         HANDSHAKE_WITHIN,
@@ -1223,7 +1255,7 @@ pub fn serve_lan<H, E>(
 
 fn serve_inner<H, E>(
     listener: ListenerSocket<'_>,
-    listening: &Listening,
+    (listening, offer): (&Listening, &dyn Fn() -> (FleetScope, &'static [FleetOp])),
     running: &AtomicBool,
     locality: Locality,
     handshake_within: Duration,
@@ -1309,13 +1341,12 @@ fn serve_inner<H, E>(
         };
         let Listening {
             secret,
-            scope,
             node,
-            serves,
             per_source,
             slots: most,
             ..
         } = listening.clone();
+        let (scope, serves) = offer();
         let hand_over = hand_over.clone();
         let tell = on_event.clone();
         #[cfg(unix)]
@@ -1373,6 +1404,7 @@ fn serve_inner<H, E>(
                             transport,
                             release,
                             peer: proof,
+                            scope,
                             admission,
                         };
                         FleetEvent::Closed {

@@ -1319,6 +1319,7 @@ pub(crate) mod paste_order {
     }
 
     fn run_one(mut job: Job) {
+        crate::echo_rtt::forget_write_start();
         let receipt = match &job.echo {
             Some(echo) => tracked_egress_metered(
                 &job.term,
@@ -4447,7 +4448,13 @@ impl App {
                         self.reset_blink(wid);
                     }
                     let pmode = self.predict_mode();
-                    let act: Option<PredictKey> = if pmode == crate::predict::PredictMode::Off {
+                    // A mixed tab paints no predictions, so a guess there would only expire.
+                    let act: Option<PredictKey> = if pmode == crate::predict::PredictMode::Off
+                        || self
+                            .windows
+                            .get(&wid)
+                            .is_some_and(|ws| ws.last_frame_was_mixed())
+                    {
                         None
                     } else {
                         predict_candidate
@@ -5713,8 +5720,10 @@ impl App {
                 ws.scroll_frac_px = sp.sample(now).0.round() as i32;
             }
             ws.scroll_pill.touch(now);
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
+            // The glide sample above asked for a frame if a row moved; the band offset and pill
+            // are drawn only where the front draws them.
+            if ws.front_draws_sub_row_scroll() {
+                ws.request_redraw();
             }
             return;
         }
@@ -5750,8 +5759,9 @@ impl App {
             });
         }
         ws.scroll_pill.touch(now);
-        if let Some(w) = ws.os_window.as_ref() {
-            w.request_redraw();
+        // No row has moved yet: the glide's ticks move them and ask for their frames.
+        if ws.front_draws_sub_row_scroll() {
+            ws.request_redraw();
         }
     }
 
@@ -5780,6 +5790,7 @@ impl App {
             return;
         };
         let (row_floor, s) = crate::scroll_motion::decompose(pos_px, cell_h);
+        let mut moved = false;
         let (offset, mut frac) = if s == 0 {
             (row_floor, 0)
         } else {
@@ -5821,6 +5832,9 @@ impl App {
                 t.scroll_display(delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
             }
             let landed = i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX);
+            // Against the offset the last frame drew, not the glide's own record: output that
+            // repinned the viewport since the last tick can make a real row step land back on it.
+            moved = landed != cur;
             if let Some(st) = ws.scroll_glide.as_mut() {
                 st.engine_row = landed;
             }
@@ -5845,8 +5859,9 @@ impl App {
             ws.scroll_frac_px = 0;
         }
         ws.scroll_pill.touch(now);
-        if let Some(w) = ws.os_window.as_ref() {
-            w.request_redraw();
+        // A tick that only moves the band within a row changes nothing a native or mixed frame draws.
+        if moved || ws.front_draws_sub_row_scroll() {
+            ws.request_redraw();
         }
     }
 
@@ -5940,8 +5955,9 @@ impl App {
             ws.scroll_frac_px = 0;
         }
         ws.scroll_pill.touch(now);
-        if let Some(w) = ws.os_window.as_ref() {
-            w.request_redraw();
+        // A bounce is all sub-row displacement.
+        if ws.front_draws_sub_row_scroll() {
+            ws.request_redraw();
         }
     }
 

@@ -631,7 +631,7 @@ impl Witness {
                 && c.typing
                 && c.row == hand.0
                 && c.col == last
-                && best_cell.is_none_or(|(b, _)| c.born >= b)
+                && !matches!(best_cell, Some((b, _)) if c.born < b)
             {
                 best_cell = Some((c.born, c.cohort));
             }
@@ -644,10 +644,11 @@ impl Witness {
                 && c.row == hand.0
                 && c.cohort == cohort
                 && c.col <= last
-                && glyph.is_none_or(|g| c.col > g)
-                && self
-                    .find(c.row, c.col, c.born)
-                    .is_some_and(|i| !self.seen[i].released)
+                && !matches!(glyph, Some(g) if c.col <= g)
+                && matches!(
+                    self.find(c.row, c.col, c.born),
+                    Some(i) if !self.seen[i].released
+                )
             {
                 glyph = Some(c.col);
             }
@@ -747,13 +748,14 @@ impl Witness {
                     SoleArrival::ShortPark => v.relaid >= 3,
                     SoleArrival::Hand { glyph, to } => {
                         target == to
-                            && self
-                                .follow_armed
-                                .binary_search_by_key(&glyph, |a| a.0)
-                                .is_ok_and(|i| {
-                                    let (col, unit, _, arrivals) = self.follow_armed[i];
-                                    arrivals & bit != 0 && unit_at(there.cols, col) == unit
-                                })
+                            && if let Ok(i) =
+                                self.follow_armed.binary_search_by_key(&glyph, |a| a.0)
+                            {
+                                let (col, unit, _, arrivals) = self.follow_armed[i];
+                                arrivals & bit != 0 && unit_at(there.cols, col) == unit
+                            } else {
+                                false
+                            }
                     }
                 };
             let enough = (v.found >= 2 || sole_stands) && v.found * 2 >= counted;
@@ -970,9 +972,10 @@ impl Witness {
             let Some(own) = own else {
                 continue;
             };
-            let gone = self
-                .find(cell.row, cell.col, cell.born)
-                .is_some_and(|i| unit_at(own.cols, cell.col) != self.seen[i].unit);
+            let gone = matches!(
+                self.find(cell.row, cell.col, cell.born),
+                Some(i) if unit_at(own.cols, cell.col) != self.seen[i].unit
+            );
             if gone {
                 self.follow_runs.push(run);
             }
@@ -996,10 +999,11 @@ impl Witness {
                 }
                 if cell.leaving() {
                     let dark_release = cell.released_at.is_some()
-                        && cell.retract_at.is_some_and(|at| {
-                            now.saturating_duration_since(at).as_secs_f32()
+                        && matches!(
+                            cell.retract_at,
+                            Some(at) if now.saturating_duration_since(at).as_secs_f32()
                                 >= super::ribbon::RETRACT_FADE_S
-                        });
+                        );
                     if !dark_release {
                         leaving_max = Some(leaving_max.map_or(cell.col, |m| m.max(cell.col)));
                     }
@@ -1013,7 +1017,7 @@ impl Witness {
                     Some(i) => Some(self.seen[i].unit),
                     None => None,
                 };
-                let gone = rec.is_some_and(|u| unit_at(own.cols, cell.col) != u);
+                let gone = matches!(rec, Some(u) if unit_at(own.cols, cell.col) != u);
                 self.shift_cells.push((cell.col, rec, gone));
             }
             if released {
@@ -1023,7 +1027,7 @@ impl Witness {
             self.shift_cells.dedup_by_key(|c| c.0);
             let caret_col = caret.filter(|c| c.0 == row).map(|c| c.1);
             if let Some((lo, hi, dc)) = find_shift(&self.shift_cells, own.cols, caret_col)
-                && leaving_max.is_none_or(|m| m < lo)
+                && !matches!(leaving_max, Some(m) if m >= lo)
             {
                 out.push(ShiftRun {
                     row,
@@ -1053,9 +1057,10 @@ impl Witness {
                 }
                 true
             } else {
-                !s.col
-                    .checked_add_signed(-dc)
-                    .is_some_and(|src| moved.binary_search(&(s.row, src, s.born)).is_ok())
+                !matches!(
+                    s.col.checked_add_signed(-dc),
+                    Some(src) if moved.binary_search(&(s.row, src, s.born)).is_ok()
+                )
             }
         });
         if any {
@@ -1181,9 +1186,9 @@ impl Witness {
                         .unwrap_or(u32::MAX)
                 });
                 for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
-                    if s.row
-                        .checked_add_signed(dr)
-                        .is_some_and(|r| r >= first_new && r < bottom)
+                    if let Some(r) = s.row.checked_add_signed(dr)
+                        && r >= first_new
+                        && r < bottom
                     {
                         s.pending |= 1 << k;
                         s.pend_ms[k] = pend_ms;
@@ -1371,8 +1376,10 @@ impl Witness {
                 if let Some(i) = self.find(cell.row, cell.col, cell.born) {
                     self.seen[i].live = true;
                     if !self.seen[i].released
-                        && row_sample
-                            .is_some_and(|s| unit_at(s.cols, cell.col) != self.seen[i].unit)
+                        && matches!(
+                            row_sample,
+                            Some(s) if unit_at(s.cols, cell.col) != self.seen[i].unit
+                        )
                     {
                         self.seen[i].deferred = true;
                     }
@@ -1390,10 +1397,12 @@ impl Witness {
                     && let Some(i) = self.find(cell.row, cell.col, cell.born)
                     && self.seen[i].released
                 {
-                    let replaced = row_sample.is_some_and(|sample| {
+                    let replaced = if let Some(sample) = row_sample {
                         let unit = unit_at(sample.cols, cell.col);
                         !unit.is_blank() && unit != self.seen[i].unit
-                    });
+                    } else {
+                        false
+                    };
                     if replaced {
                         Self::push_unit(retire, cell.row, cell.col, cell.born, self.seen[i].unit);
                     } else {
@@ -1546,15 +1555,17 @@ impl Witness {
                     continue;
                 }
                 if retired {
-                    let still_blank = match sample_row {
-                        Some((r, s)) if r == cell.row => s,
-                        _ => {
-                            let s = rows.iter().find(|s| s.row == cell.row).copied();
-                            sample_row = Some((cell.row, s));
-                            s
-                        }
-                    }
-                    .is_some_and(|s| unit_at(s.cols, cell.col).is_blank());
+                    let still_blank = matches!(
+                        match sample_row {
+                            Some((r, s)) if r == cell.row => s,
+                            _ => {
+                                let s = rows.iter().find(|s| s.row == cell.row).copied();
+                                sample_row = Some((cell.row, s));
+                                s
+                            }
+                        },
+                        Some(s) if unit_at(s.cols, cell.col).is_blank()
+                    );
                     if !still_blank || self.standing_runs.binary_search(&run).is_err() {
                         retire.push((cell.row, cell.col, cell.born));
                     }
@@ -1692,9 +1703,9 @@ impl Witness {
         }
         let standing = self.standing_glyphs_of(run);
         if col < lo {
-            standing.first().is_none_or(|s| s.2 > col)
+            !matches!(standing.first(), Some(s) if s.2 <= col)
         } else {
-            standing.last().is_none_or(|s| s.2 < col)
+            !matches!(standing.last(), Some(s) if s.2 >= col)
         }
     }
 
@@ -1974,11 +1985,12 @@ impl Witness {
 
     /// The sampled glyph is the exact identity held by a released cell.
     pub(super) fn released_cell_matches(&self, cell: &Cell, cols: &[char]) -> bool {
-        self.find(cell.row, cell.col, cell.born)
-            .is_some_and(|index| {
-                let seen = self.seen[index];
-                seen.released && seen.restorable && seen.unit == unit_at(cols, cell.col)
-            })
+        if let Some(index) = self.find(cell.row, cell.col, cell.born) {
+            let seen = self.seen[index];
+            seen.released && seen.restorable && seen.unit == unit_at(cols, cell.col)
+        } else {
+            false
+        }
     }
 
     /// Releases whose original cells and glyphs are back, as sorted `(cohort, stamp)`.
@@ -2001,10 +2013,10 @@ impl Witness {
             {
                 continue;
             }
-            if !self
-                .find(cell.row, cell.col, cell.born)
-                .is_some_and(|i| self.seen[i].restorable)
-            {
+            if !matches!(
+                self.find(cell.row, cell.col, cell.born),
+                Some(i) if self.seen[i].restorable
+            ) {
                 continue;
             }
             self.restore_runs.push(RestoreRun {

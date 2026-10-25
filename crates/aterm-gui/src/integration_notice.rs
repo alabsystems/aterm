@@ -62,7 +62,6 @@ pub(crate) const fn heal_for(
         Some(
             aterm_phase::Program::Agy
             | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini
             | aterm_phase::Program::Grok
             | aterm_phase::Program::Kimi
             | aterm_phase::Program::Generic,

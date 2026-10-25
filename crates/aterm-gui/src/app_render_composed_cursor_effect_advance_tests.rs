@@ -2606,3 +2606,370 @@ fn a_composed_cursor_frame_keeps_the_pet_s_veil() {
         off.len()
     );
 }
+
+/// Make the mixed fixture's window draw through the real redraw path on a scripted CPU surface.
+fn present_mixed(app: &mut App, wid: WindowId) {
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.focused = true;
+    ws.present = Some(crate::PresentTarget::Cpu {
+        surface: crate::present::CpuSurface::Scripted(Default::default()),
+    });
+}
+
+/// A mixed tab draws no cursor cat: one its typing summoned is grounded at the tab's frame, and
+/// once a mixed frame was drawn the cat buys the window no frame cadence.
+#[test]
+fn a_mixed_frame_grounds_the_cat_it_does_not_draw() {
+    let (mut app, wid, _) = mixed_fixture("rainbow kitty");
+    present_mixed(&mut app, wid);
+    let t0 = Instant::now();
+    // Typing at 60 ms summons the cat within 3.6 s (`summon_latency_is_bounded_across_typing_cadences`).
+    let summon = |app: &mut App, from: Instant| -> Instant {
+        let cat = &mut app
+            .windows
+            .get_mut(&wid)
+            .expect("the window")
+            .fx
+            .companions_mut()
+            .cursor_cat;
+        let mut at = from;
+        for _ in 0..160 {
+            cat.on_key(at, true);
+            if cat.is_active() {
+                return at;
+            }
+            at += Duration::from_millis(60);
+        }
+        panic!("PRECONDITION: the typing summoned the cat");
+    };
+    let t1 = summon(&mut app, t0) + Duration::from_millis(16);
+    app.redraw_window_at(wid, t1);
+    let ws = &app.windows[&wid];
+    assert!(
+        !ws.fx.companions().cursor_cat.is_active(),
+        "the mixed frame grounded the cat"
+    );
+
+    let t2 = summon(&mut app, t1) + Duration::from_millis(16);
+    let ws = &app.windows[&wid];
+    assert!(
+        ws.front_terminal().is_some(),
+        "PRECONDITION: the focused leaf is the terminal"
+    );
+    assert!(
+        !ws.cursor_dependents_need_frame_cadence(t2, true),
+        "a cat the front does not draw buys no frame cadence"
+    );
+}
+
+/// A celebration fired at a mixed tab lights the glow its route draws, then settles: its bar
+/// fans and outro are taken there, so it leaves the window no deadline.
+#[test]
+fn a_celebration_at_a_mixed_tab_runs_out_and_settles() {
+    use aterm_effects::kitty_sing::{
+        CelebrateOn, SING_BAR_SECONDS, SING_WIND_DOWN, song_signature,
+    };
+    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+    present_mixed(&mut app, wid);
+    let t0 = Instant::now();
+    {
+        let sing = &mut app
+            .windows
+            .get_mut(&wid)
+            .expect("the window")
+            .fx
+            .companions_mut()
+            .kitty_sing;
+        sing.arm_external(t0, session, song_signature('C'), 2, CelebrateOn::Done)
+            .expect("armed");
+        assert!(sing.note_program_done(t0, session), "PRECONDITION: fired");
+        assert!(sing.next_external_deadline(t0).is_some());
+    }
+    let end = t0 + Duration::from_secs_f32(SING_BAR_SECONDS * 2.0 + SING_WIND_DOWN + 1.0);
+    let mut now = t0;
+    let mut played = false;
+    while now < end {
+        app.redraw_window_at(wid, now);
+        // Only a frame that drove the song takes a bar for its riff (`step_cursor_companions`).
+        played |= app.windows[&wid].fx.companions().sing_riff_bar.is_some();
+        now += Duration::from_millis(100);
+    }
+    assert!(played, "a mixed frame played the celebration's bars");
+    app.redraw_window_at(wid, end);
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    assert_eq!(
+        ws.fx
+            .companions_mut()
+            .kitty_sing
+            .next_external_deadline(end),
+        None,
+        "the celebration settled"
+    );
+}
+
+/// A mixed tab whose native leaf has focus draws no glow, and the scheduler plans no celebration
+/// deadline for it, so a celebration fired there waits for the terminal leaf: no bar is played to
+/// a tab that shows none of it.
+#[test]
+fn a_celebration_waits_out_a_mixed_tab_s_native_focus() {
+    use aterm_effects::kitty_sing::{CelebrateOn, song_signature};
+    let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+    present_mixed(&mut app, wid);
+    assert!(
+        app.windows[&wid].front_terminal().is_some(),
+        "PRECONDITION: the terminal leaf has focus"
+    );
+    let native_view = app
+        .active_visible_leaf_plan(wid)
+        .expect("a mixed plan")
+        .leaves
+        .iter()
+        .find(|leaf| !leaf.focused)
+        .expect("the settings leaf")
+        .view;
+    assert!(
+        app.windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.tab_set.active_mut())
+            .is_some_and(|tab| tab.set_focus(native_view)),
+        "the native leaf is live"
+    );
+    app.sync_window(wid);
+    assert!(
+        app.windows[&wid].front_terminal().is_none(),
+        "PRECONDITION: the native leaf has focus"
+    );
+    let t0 = Instant::now();
+    {
+        let sing = &mut app
+            .windows
+            .get_mut(&wid)
+            .expect("the window")
+            .fx
+            .companions_mut()
+            .kitty_sing;
+        sing.arm_external(t0, session, song_signature('C'), 2, CelebrateOn::Done)
+            .expect("armed");
+        assert!(sing.note_program_done(t0, session), "PRECONDITION: fired");
+    }
+    app.redraw_window_at(wid, t0);
+    let ws = &app.windows[&wid];
+    assert_eq!(
+        app.active_visible_frame_layout(wid).map(|(_, route)| route),
+        Some(crate::VisibleContentRoute::Heterogeneous),
+        "PRECONDITION: the frame took the mixed route"
+    );
+    assert_eq!(
+        ws.fx.companions().sing_riff_bar,
+        None,
+        "no bar is played under the native leaf's focus"
+    );
+    assert!(
+        ws.fx
+            .companions()
+            .kitty_sing
+            .next_external_deadline(t0)
+            .is_some(),
+        "the song is still owed"
+    );
+}
+
+/// A mixed tab never ticks the resident pet, so once a mixed frame was drawn a pet left mid-walk
+/// buys the window no frame cadence, and a settled pet's next pose change no effect-lane
+/// deadline; the same pet under a terminal frame buys both.
+#[test]
+fn a_mixed_frame_buys_the_pet_no_frames() {
+    use crate::VisibleContentRoute::{Heterogeneous, Terminal};
+    let (mut app, wid, _) = mixed_fixture("rainbow kitty");
+    let route = app
+        .active_visible_content_route(wid)
+        .expect("a visible route");
+    assert_eq!(route, Heterogeneous, "PRECONDITION: a mixed tab");
+    let _ = app.prepare_layout_coordinate_space(wid, route);
+    let now = Instant::now();
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    ws.focused = true;
+    ws.fx
+        .companion_mut()
+        .set_species(aterm_effects::kitty_pet::PetSpecies::Dog);
+    let set_route = |ws: &mut crate::WindowState, route| {
+        ws.last_layout_coordinate_space
+            .as_mut()
+            .expect("PRECONDITION: the mixed frame's coordinate space")
+            .route = route;
+    };
+    // The caret jumps at 400 ms, so the pet walks, then settles.
+    let mut t = now;
+    let tick = |ws: &mut crate::WindowState, t: Instant| {
+        let caret = if t < now + Duration::from_millis(400) {
+            (2, 2)
+        } else {
+            (2, 34)
+        };
+        let _ = crate::app_render::pet_tick_for_test(
+            ws,
+            aterm_effects::host::CaptureMode::Present,
+            aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
+                now: t,
+                caret: Some(caret),
+                rows: 24,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            },
+        );
+    };
+    while t <= now + Duration::from_millis(420) {
+        tick(ws, t);
+        t += Duration::from_millis(16);
+    }
+    assert!(
+        ws.fx.companion().needs_frames(),
+        "PRECONDITION: a walking pet owes frames"
+    );
+    assert!(
+        ws.front_terminal().is_some(),
+        "PRECONDITION: the focused leaf is the terminal"
+    );
+    assert!(
+        !ws.cursor_dependents_need_frame_cadence(t, true),
+        "a walking pet the mixed route never ticks buys no frame cadence"
+    );
+    set_route(ws, Terminal { composed: true });
+    assert!(
+        ws.cursor_dependents_need_frame_cadence(t, true),
+        "control: under a terminal frame the walking pet buys frame cadence"
+    );
+    set_route(ws, Heterogeneous);
+
+    while ws.fx.companion().needs_frames() {
+        assert!(
+            t < now + Duration::from_secs(60),
+            "PRECONDITION: the pet settles"
+        );
+        tick(ws, t);
+        t += Duration::from_millis(16);
+    }
+    assert!(
+        ws.fx.companion_mut().next_change_deadline(t).is_some(),
+        "PRECONDITION: the settled pet has a next pose change"
+    );
+    assert_eq!(
+        ws.plan_terminal_effect_lane(t, true, true),
+        None,
+        "a settled pet the mixed route never ticks buys no effect-lane deadline"
+    );
+    set_route(ws, Terminal { composed: true });
+    assert!(
+        ws.plan_terminal_effect_lane(t, true, true).is_some(),
+        "control: under a terminal frame its next pose change does"
+    );
+}
+
+/// A mixed tab draws no cat, so a collection hello started there (a favourite kitty worn while
+/// its terminal leaf has focus) waits unseen time out paused: a later terminal frame shows the
+/// hello's whole hold instead of a cat whose greeting expired off screen.
+#[test]
+fn a_mixed_frame_pauses_the_collection_hello_it_does_not_draw() {
+    let (mut app, wid, _) = mixed_fixture("rainbow kitty");
+    present_mixed(&mut app, wid);
+    assert!(
+        app.windows[&wid].front_terminal().is_some(),
+        "PRECONDITION: the terminal leaf has focus"
+    );
+    let t0 = Instant::now();
+    app.windows
+        .get_mut(&wid)
+        .expect("the window")
+        .fx
+        .companions_mut()
+        .cursor_cat
+        .on_collect(t0, aterm_effects::kitty_registry::KittyLook::default());
+    app.redraw_window_at(wid, t0 + Duration::from_millis(16));
+    let resume = t0 + Duration::from_secs(10);
+    app.redraw_window_at(wid, resume);
+    let cat = &mut app
+        .windows
+        .get_mut(&wid)
+        .expect("the window")
+        .fx
+        .companions_mut()
+        .cursor_cat;
+    cat.set_collection_presentable(resume, true);
+    let frame = cat.frame(resume + Duration::from_millis(400));
+    assert!(
+        frame.discovery,
+        "the hello's hold waited out the mixed frames: {frame:?}"
+    );
+}
+
+/// A mixed tab draws its terminal leaf's output-streak comets whichever leaf has focus, so with
+/// the native leaf focused the scheduler still plans their next frame instead of leaving them
+/// frozen mid-flight.
+#[test]
+fn a_mixed_tab_s_comets_keep_their_frames_under_native_focus() {
+    let (mut app, wid, session) = mixed_fixture("fire");
+    enable_output_streak(&mut app);
+    let native_view = app
+        .active_visible_leaf_plan(wid)
+        .expect("a mixed plan")
+        .leaves
+        .iter()
+        .find(|leaf| !leaf.focused)
+        .expect("the settings leaf")
+        .view;
+    assert!(
+        app.windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.tab_set.active_mut())
+            .is_some_and(|tab| tab.set_focus(native_view)),
+        "the native leaf is live"
+    );
+    app.sync_window(wid);
+    assert!(
+        app.windows[&wid].front_terminal().is_none(),
+        "PRECONDITION: the native leaf has focus"
+    );
+    let term = app.pool.get(session).expect("terminal leaf").term.clone();
+    term_lock(&term).process(b"ink");
+    let t0 = Instant::now();
+    assert!(
+        app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+            wid,
+            Some(ComposedCursorFxClock::Advance(t0)),
+        )
+        .is_some()
+    );
+    term_lock(&term).process(b"!");
+    let t1 = t0 + Duration::from_millis(400);
+    assert!(
+        app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+            wid,
+            Some(ComposedCursorFxClock::Advance(t1)),
+        )
+        .is_some()
+    );
+    let ws = app.windows.get_mut(&wid).expect("the window");
+    assert!(
+        ws.fx.streak_panes().any(|engine| engine.is_active()),
+        "PRECONDITION: a comet flies in the terminal leaf"
+    );
+    assert!(
+        ws.plan_terminal_effect_lane_with_recording(
+            t1 + Duration::from_millis(1),
+            false,
+            false,
+            true,
+            false,
+            10.0,
+            true,
+        )
+        .is_some(),
+        "the scheduler plans the comet's next frame"
+    );
+}

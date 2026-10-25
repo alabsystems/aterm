@@ -329,14 +329,13 @@ fn the_harness_route_renders_its_cards_and_controls() {
     }
     let rows = harness_page_rows().collect::<Vec<_>>();
     assert_eq!(
-        rows[..6],
+        rows[..5],
         [
             prefs::EDIT_HARNESS_ENABLED,
             prefs::EDIT_HARNESS_CLAUDE_ENABLED,
             prefs::EDIT_HARNESS_CODEX_ENABLED,
             prefs::EDIT_HARNESS_AGY_ENABLED,
             prefs::EDIT_HARNESS_MUSE_ENABLED,
-            prefs::EDIT_HARNESS_GEMINI_ENABLED,
         ],
         "{rows:?}"
     );
@@ -544,7 +543,7 @@ fn the_harness_route_says_what_it_has_not_got() {
     let pages = every_page(&mut runtime, instance, view, &view_cx());
     assert_eq!(
         node(&pages, "harness/sessions/empty").label,
-        "No Claude Code, Codex, Antigravity CLI, Muse Code or Gemini CLI session is open"
+        "No Claude Code, Codex, Antigravity CLI or Muse Code session is open"
     );
     assert!(
         pages.iter().all(|page| page

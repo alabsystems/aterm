@@ -729,26 +729,8 @@ pub(crate) fn walker_roots(
         {
             growth = Some(growth.unwrap_or(0).saturating_add(bps));
         }
-        if report.unknown_tab
-            && let DiskScope::Tab(key) = report.scope
-        {
-            let queued = RootSize::Walking {
-                walked_entries: 0,
-                partial_alloc: None,
-                last: None,
-            };
-            for r in cwd_roots(
-                &cwds
-                    .iter()
-                    .filter(|c| c.key == key)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                queued,
-            ) {
-                if !roots.iter().any(|have| have.path == r.path) {
-                    roots.push(r);
-                }
-            }
+        if report.unknown_tab {
+            queue_cwds(&mut roots, cwds, report.scope);
             walking = true;
             continue;
         }
@@ -819,6 +801,10 @@ pub(crate) fn walker_roots(
                 roots[*at - 1].inside = Some(*parent);
             }
         }
+        if report.undiscovered {
+            queue_cwds(&mut roots, cwds, report.scope);
+            walking = true;
+        }
         for h in &report.warnings {
             let path = h.path.display().to_string();
             if warnings.iter().any(|w| w.path == path) {
@@ -835,14 +821,25 @@ pub(crate) fn walker_roots(
             });
         }
     }
-    let total = roots
+    // The roots the balance folds: one report's own outermost rows (its totals are the
+    // report's), else each root no other root holds.
+    let single = matches!(reports, [one] if !one.unknown_tab);
+    let folded: Vec<&Root> = roots
         .iter()
         .filter(|r| r.inside.is_none())
         .filter(|r| {
-            !roots
-                .iter()
-                .any(|o| o.path != r.path && std::path::Path::new(&r.path).starts_with(&o.path))
+            single
+                || !roots
+                    .iter()
+                    .any(|o| o.path != r.path && std::path::Path::new(&r.path).starts_with(&o.path))
         })
+        .collect();
+    let not_measured: Vec<&'static str> = folded
+        .iter()
+        .filter_map(|r| r.size.not_measured_why())
+        .collect();
+    let total = folded
+        .iter()
         .map(|r| match &r.size {
             RootSize::Complete(c) => c.alloc,
             RootSize::Walking {
@@ -858,7 +855,7 @@ pub(crate) fn walker_roots(
         })
         .fold(0u64, u64::saturating_add);
     let (total, exclusive) = match reports {
-        [one] if !one.unknown_tab => (one.total_bytes, one.exclusive_bytes.min(one.total_bytes)),
+        [one] if single => (one.total_bytes, one.exclusive_bytes.min(one.total_bytes)),
         _ => (total, exclusive.min(total)),
     };
     warnings.sort_by_key(|w| std::cmp::Reverse(w.entries));
@@ -867,10 +864,35 @@ pub(crate) fn walker_roots(
         exclusive,
         shared: total - exclusive,
         walking,
+        not_measured,
         growth_bps: growth,
         warnings,
     };
     (roots, Some(totals))
+}
+
+/// The cwd of each of `scope`'s panes as a root the walker owes: walking, its size unknown,
+/// unless a row already has the folder.
+fn queue_cwds(roots: &mut Vec<Root>, cwds: &[PaneCwd], scope: crate::diskwalk_host::DiskScope) {
+    use crate::diskwalk_host::DiskScope;
+    let queued = RootSize::Walking {
+        walked_entries: 0,
+        partial_alloc: None,
+        last: None,
+    };
+    let owed: Vec<PaneCwd> = cwds
+        .iter()
+        .filter(|c| match scope {
+            DiskScope::Tab(key) => c.key == key,
+            DiskScope::Aterm => true,
+        })
+        .cloned()
+        .collect();
+    for r in cwd_roots(&owed, queued) {
+        if !roots.iter().any(|have| have.path == r.path) {
+            roots.push(r);
+        }
+    }
 }
 
 fn growth_bps(g: crate::diskwalk_host::Growth) -> Option<i64> {

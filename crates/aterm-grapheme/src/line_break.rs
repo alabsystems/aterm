@@ -491,19 +491,44 @@ pub fn line_breaks(text: &str) -> Vec<LineBreak> {
     breaks
 }
 
-/// Where an identifier wider than a whole line may break inside itself ([`break_inside`]).
-fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
+/// Where an identifier wider than a whole line may break inside itself ([`break_inside`]), in
+/// the tiers a typesetter tries in turn.
+struct IdentifierJoints {
+    /// Before a separator (`/`, `.`, `_`, `@`, …), after a hyphen (the hyphen ends its line,
+    /// never starts the next), after a `:` between letters.
+    joints: Vec<usize>,
+    /// Before the `.` of a file's extension, which stays with its word while any other
+    /// joint will do ("sunset-over-the-" / "bay.png", never "sunset-over-the-bay" / ".png").
+    extension: Vec<usize>,
+    /// Before a hyphen that ends a word of letters, only where the word and its hyphen are
+    /// wider than the line and the word has no syllable that fits ("/aterm" / "-lab", never
+    /// the word cut in two: "/ate" / "rm-"). A run with digits in it (a hash, a build id) is
+    /// cut inside instead: no word is cut there.
+    before_hyphen: Vec<usize>,
+    /// Between a number's digit groups ("192.168.1" / ".114").
+    in_numbers: Vec<usize>,
+}
+
+/// Whether `rest`, what follows a `.`, is a file's extension: letters and digits (one letter
+/// at least) to the token's end, closing punctuation aside.
+fn is_extension(rest: &[(usize, char)]) -> bool {
+    let core = rest
+        .iter()
+        .rposition(|(_, c)| !closes_a_word(*c))
+        .map_or(&rest[..0], |last| &rest[..=last]);
+    !core.is_empty()
+        && core.iter().all(|(_, c)| c.is_alphanumeric())
+        && core.iter().any(|(_, c)| c.is_alphabetic())
+}
+
+fn identifier_joints(token: &str) -> IdentifierJoints {
     let chars: Vec<(usize, char)> = token.char_indices().collect();
-    let url_like = chars.iter().enumerate().any(|(index, (_, c))| {
-        matches!(c, '/' | '\\' | '@')
-            || (*c == '.'
-                && index > 0
-                && chars[index - 1].1.is_alphanumeric()
-                && chars
-                    .get(index + 1)
-                    .is_some_and(|(_, next)| next.is_alphabetic()))
-    });
-    let (mut joints, mut in_numbers) = (Vec::new(), Vec::new());
+    let mut tiers = IdentifierJoints {
+        joints: Vec::new(),
+        extension: Vec::new(),
+        before_hyphen: Vec::new(),
+        in_numbers: Vec::new(),
+    };
     for index in 1..chars.len() {
         let (at, cur) = chars[index];
         let prev = chars[index - 1].1;
@@ -513,14 +538,10 @@ fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
             '.' | '_' | '+' | '@' | '#' | '~' | '?' | '&' | '=' | ',' | '/' | '\\'
         ) && (prev.is_alphanumeric() || matches!(prev, ')' | ']' | '}'))
             && next.is_some_and(|next| !next.is_whitespace());
-        let at_hyphen = if url_like {
-            cur == '-' && prev.is_alphanumeric() && next.is_some_and(char::is_alphanumeric)
-        } else {
-            prev == '-'
-                && cur.is_alphanumeric()
-                && index >= 2
-                && chars[index - 2].1.is_alphanumeric()
-        };
+        let after_hyphen = prev == '-'
+            && cur.is_alphanumeric()
+            && index >= 2
+            && chars[index - 2].1.is_alphanumeric();
         let after_colon = prev == ':'
             && cur.is_alphanumeric()
             && index >= 2
@@ -529,12 +550,26 @@ fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
             && prev.is_ascii_digit()
             && next.is_some_and(|next| next.is_ascii_digit());
         if before && in_number {
-            in_numbers.push(at);
-        } else if before || at_hyphen || after_colon {
-            joints.push(at);
+            tiers.in_numbers.push(at);
+        } else if before && cur == '.' && is_extension(&chars[index + 1..]) {
+            tiers.extension.push(at);
+        } else if before || after_hyphen || after_colon {
+            tiers.joints.push(at);
+        }
+        let ends_a_word = chars[..index]
+            .iter()
+            .rev()
+            .take_while(|(_, c)| c.is_alphanumeric())
+            .all(|(_, c)| c.is_alphabetic());
+        if cur == '-'
+            && prev.is_alphabetic()
+            && ends_a_word
+            && next.is_some_and(char::is_alphanumeric)
+        {
+            tiers.before_hyphen.push(at);
         }
     }
-    (joints, in_numbers)
+    tiers
 }
 
 /// A PIECE WIDER THAN A WHOLE LINE, BROKEN INSIDE ITSELF where a typesetter
@@ -610,9 +645,11 @@ struct Inside<'a> {
     /// Whether the piece's word is prose ([`TokenKind::Word`]), which a break marks.
     word: bool,
     /// The places it may break, in tiers tried in turn, each with whether
-    /// it takes the mark: a word's syllables; an identifier's joints, then
-    /// the points between a number's digits, then the syllables of its runs
-    /// of letters, with none.
+    /// it takes the mark: a word's syllables, then those a narrow measure
+    /// takes (two letters after the hyphen); an identifier's joints, then
+    /// the dot of its file extension, then the points between a number's
+    /// digits, then the syllables of its runs of letters, then before a
+    /// hyphen that ends a word, with none.
     tiers: Vec<Vec<(usize, bool)>>,
     /// Every one of them, in order.
     points: Vec<usize>,
@@ -642,17 +679,38 @@ impl<'a> Inside<'a> {
                 .map(|at| (at, with_mark))
                 .collect()
         };
-        let tiers: Vec<Vec<(usize, bool)>> = if word {
-            vec![inside(crate::hyphen_points(token), true)]
+        let (tiers, before_hyphen): (Vec<Vec<(usize, bool)>>, Option<usize>) = if word {
+            let narrow = crate::hyphenate::narrow_hyphen_points(token);
+            (
+                vec![
+                    inside(crate::hyphen_points(token), true),
+                    inside(narrow, true),
+                ],
+                None,
+            )
         } else {
-            let (joints, in_numbers) = identifier_joints(token);
-            vec![
+            let IdentifierJoints {
+                joints,
+                extension,
+                before_hyphen,
+                in_numbers,
+            } = identifier_joints(token);
+            let tiers = vec![
                 inside(joints, false),
+                inside(extension, false),
                 inside(in_numbers, false),
                 inside(crate::hyphenate::syllable_points(token), false),
-            ]
+                inside(before_hyphen, false),
+            ];
+            (tiers, Some(4))
         };
-        let mut points: Vec<usize> = tiers.iter().flatten().map(|(at, _)| *at).collect();
+        // A break before a hyphen is the one after it, moved back: it ends no unit of its own.
+        let mut points: Vec<usize> = tiers
+            .iter()
+            .enumerate()
+            .filter(|(tier, _)| Some(*tier) != before_hyphen)
+            .flat_map(|(_, tier)| tier.iter().map(|(at, _)| *at))
+            .collect();
         points.sort_unstable();
         let boundaries = text[piece.start..word_end]
             .grapheme_indices()
@@ -683,10 +741,16 @@ impl<'a> Inside<'a> {
         self.tiers.iter().find_map(|tier| {
             tier.iter()
                 .rev()
-                .filter(|(at, _)| *at > start)
+                .filter(|(at, _)| *at > start && self.says_something(start, *at))
                 .find(|(at, with_mark)| fits(&self.marked(start, *at, *with_mark)))
                 .copied()
         })
+    }
+
+    /// Whether a line from `start` to `at` holds a letter or a digit: never a lone separator
+    /// ("-" / "lab").
+    fn says_something(&self, start: usize, at: usize) -> bool {
+        self.text[start..at].chars().any(char::is_alphanumeric)
     }
 
     fn anywhere(&self, start: usize, fits: &dyn Fn(&str) -> bool) -> (usize, bool) {
@@ -716,14 +780,18 @@ impl<'a> Inside<'a> {
             .copied()
             .find(|point| *point > at)
             .unwrap_or(self.word_end);
-        while count(at, unit_end) < 3 && count(start, at) > 3 {
-            let Some(back) = ahead.iter().rev().find(|back| **back < at).copied() else {
-                break;
-            };
-            if unit_end == self.word_end && !fits(&self.text[back..self.piece_end]) {
-                break;
+        // The cut carries three graphemes of its unit over while the line keeps more than
+        // three, and never one alone: "Ope-" / "n" is "Op-" / "en".
+        for least in [3, 2] {
+            while count(at, unit_end) < least && count(start, at) > least {
+                let Some(back) = ahead.iter().rev().find(|back| **back < at).copied() else {
+                    break;
+                };
+                if unit_end == self.word_end && !fits(&self.text[back..self.piece_end]) {
+                    break;
+                }
+                at = back;
             }
-            at = back;
         }
         (at, self.word)
     }
@@ -921,11 +989,10 @@ mod tests {
         );
         assert_eq!(inside("aterm.toml", "-", 7), ["aterm", ".toml"]);
         assert_eq!(inside("/Applications", "-", 10), ["/Applica", "tions"]);
-        assert_eq!(inside("ai-fleet.toml", "-", 10), ["ai-fleet", ".toml"]);
-        assert_eq!(inside("ai-fleet.toml", "-", 7), ["ai", "-fleet", ".toml"]);
+        assert_eq!(inside("ai-fleet.toml", "-", 7), ["ai-", "fleet", ".toml"]);
         assert_eq!(
             inside("/-Users-someone/75d5bccd-9c38-431b", "-", 10),
-            ["/-Users", "-someone", "/75d5bccd", "-9c38-431b"]
+            ["/-Users-", "someone", "/75d5bccd-", "9c38-431b"]
         );
         assert_eq!(
             inside("OpenAI-compatible", "-", 10),
@@ -965,6 +1032,78 @@ mod tests {
         assert_eq!(inside("background", "", 6), ["back", "ground"]);
         assert_eq!(inside("cursor_style", "", 7), ["cursor", "_style"]);
     }
+    /// A typesetter breaks a name AFTER its hyphens (the hyphen ends the line, never starts
+    /// the next) and keeps a file's extension with the word before it.
+    #[test]
+    fn a_name_breaks_after_its_hyphens_and_keeps_its_extension() {
+        for (text, width, lines) in [
+            (
+                "sunset-over-the-bay.png",
+                16,
+                &["sunset-over-the-", "bay.png"][..],
+            ),
+            (
+                "sunset-over-the-bay.png",
+                20,
+                &["sunset-over-the-", "bay.png"],
+            ),
+            ("ai-fleet.toml", 10, &["ai-", "fleet.toml"]),
+            ("/aterm-r14-br2", 11, &["/aterm-r14-", "br2"]),
+            (
+                "75d5bccd-9c38-431b-99e5-ef81935c6fbd",
+                15,
+                &["75d5bccd-9c38-", "431b-99e5-", "ef81935c6fbd"],
+            ),
+            (
+                "user-name@mail-host.example",
+                16,
+                &["user-name@mail-", "host.example"],
+            ),
+        ] {
+            let broken = inside(text, "-", width);
+            assert_eq!(broken, lines, "{text:?} in {width}");
+            for line in &broken[1..] {
+                assert!(!line.starts_with(['-', '.']), "{text:?}: {broken:?}");
+            }
+        }
+        // Only where a word and its hyphen are wider than the line does the hyphen start the
+        // next line, rather than the word being cut in two ("/ate" / "rm-lab").
+        assert_eq!(inside("/aterm-lab", "-", 6), ["/aterm", "-lab"]);
+        assert_eq!(inside("/75d5bccd-9c38", "-", 9), ["/75d5bc", "cd-9c38"]);
+        assert_eq!(
+            inside("m1-MacBook-Air", "-", 7),
+            ["m1-", "Mac", "Book-", "Air"]
+        );
+        assert_eq!(
+            inside("/aterm-lab-instance-runner", "-", 6),
+            ["/aterm", "-lab-", "in", "stance", "-run", "ner"]
+        );
+    }
+
+    /// A word no break of the usual kind fits (three letters after the hyphen) still breaks
+    /// where a syllable ends, two letters from its end, as a narrow column sets it: never cut
+    /// where no syllable ends ("recor-" / "ded", "men-" / "ded").
+    #[test]
+    fn a_narrow_measure_keeps_a_word_to_its_syllables() {
+        assert_eq!(inside("recorded", "-", 7), ["record-", "ed"]);
+        assert_eq!(
+            inside("Recommended", "-", 5),
+            ["Rec-", "om-", "mend-", "ed"]
+        );
+        // The usual breaks come first wherever one fits.
+        assert_eq!(inside("automatically", "-", 12), ["automati-", "cally"]);
+        assert_eq!(inside("Recommended", "-", 10), ["Recom-", "mended"]);
+        // A word with no syllable to break at is still cut where its line ends, and never
+        // carries one letter alone over ("Ope-" / "n" where the mark costs no room).
+        assert_eq!(inside("Changed", "-", 5), ["Chan-", "ged"]);
+        let three_letters = |line: &str| line.trim_end_matches('-').chars().count() <= 3;
+        let open: Vec<String> = break_inside("Open", 0..4, "-", &three_letters)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(open, ["Op-", "en"]);
+    }
+
     #[test]
     fn cjk_breaks_between_characters_with_kinsoku() {
         assert_eq!(

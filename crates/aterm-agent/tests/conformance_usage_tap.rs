@@ -115,13 +115,13 @@ fn real_gate(s: &S) -> Option<String> {
 type Gate = dyn Fn(&S) -> Option<String>;
 
 /// What a launch's value does in state `s`: whether it taps, and whether it put the plain tap
-/// over the owner's own statusLine instead of carrying it (`tap::chained_of`).
+/// over the owner's own statusLine instead of carrying it (`tap::carrying_of`).
 fn gate_taps(s: &S, gate: &Gate) -> (bool, bool) {
     let value = gate(s);
     let displaced = s["userline"] == 1
         && value
             .as_deref()
-            .is_some_and(|value| tap::chained_of(value) != Some(Some(OWNER_LINE.to_string())));
+            .is_some_and(|value| tap::carrying_of(value) != Some(true));
     (value.is_some(), displaced)
 }
 

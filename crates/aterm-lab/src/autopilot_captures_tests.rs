@@ -77,7 +77,7 @@ fn shown() -> Vec<Row> {
         };
         let line = match who.chipless() {
             None => r#"window=0 program=claude face=cruise drawn="∞" title="autopilot: cruise""#,
-            Some(_) => "window=0 program=gemini face=- drawn=- why=no-footer",
+            Some(_) => "window=0 program=codex face=- drawn=- why=no-footer",
         };
         let caption = format!("{}; {}", scene.what(), chip_words(line));
         if who.chipless().is_none() {
@@ -471,7 +471,7 @@ fn a_look_is_its_instances_theme_from_launch() {
     );
     // `LAB_ATERM_TOML`'s own top-level theme gives way; a table's `theme` is its own.
     let mine = themed(
-        "theme = \"Nord\"\nfont_px = 13\n[gemini]\ntheme = \"x\"",
+        "theme = \"Nord\"\nfont_px = 13\n[agy]\ntheme = \"x\"",
         Look::Night.theme(),
     );
     let v = doc(&mine);
@@ -480,11 +480,7 @@ fn a_look_is_its_instances_theme_from_launch() {
         v.get("font_px").and_then(aterm_toml::Value::as_integer),
         Some(13)
     );
-    assert_eq!(
-        v.get("gemini").and_then(theme).as_deref(),
-        Some("x"),
-        "{mine}"
-    );
+    assert_eq!(v.get("agy").and_then(theme).as_deref(), Some("x"), "{mine}");
 }
 
 /// A lab whose `chrome` names `labels`, selecting `selected` before a `tab` and `after` once one

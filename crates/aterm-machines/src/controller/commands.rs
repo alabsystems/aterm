@@ -939,7 +939,7 @@ fn print_host_tabs_rows(
             s.agent.is_some()
                 || matches!(
                     s.program.as_deref(),
-                    Some("claude" | "codex" | "agy" | "muse" | "gemini")
+                    Some("claude" | "codex" | "agy" | "muse")
                 )
         })
         .count();
@@ -999,7 +999,7 @@ fn print_host_tabs_rows(
                 s.agent.is_some()
                     || matches!(
                         s.program.as_deref(),
-                        Some("claude" | "codex" | "agy" | "muse" | "gemini")
+                        Some("claude" | "codex" | "agy" | "muse")
                     )
             })
             .count();

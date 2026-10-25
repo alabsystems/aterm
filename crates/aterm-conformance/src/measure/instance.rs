@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A private headless instance of the binary under measurement, and the client that drives it.
+//! A private instance of the binary under measurement, headless or windowed, and the client that
+//! drives it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,19 +24,51 @@ const CTL_TIMEOUT_SECS: u64 = 120;
 
 /// Why a take decided nothing: never a pass and never a paint finding.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CouldNotRun(pub String);
+pub enum CouldNotRun {
+    /// The instance, the machine or the instrument stopped the take.
+    Refused(String),
+    /// The subject has no answer to what the take asked: it does not know a verb, or its reply
+    /// carries no field the row reads. A build older than the row answers so; what that says about
+    /// the subject is for whoever knows which build it is (`verify measure` compares its commit
+    /// with the checkout's).
+    Unanswered(String),
+}
+
+impl CouldNotRun {
+    /// The reason, in words.
+    #[must_use]
+    pub fn why(&self) -> &str {
+        match self {
+            Self::Refused(why) | Self::Unanswered(why) => why,
+        }
+    }
+
+    /// The same kind of reason, reworded by `f`.
+    #[must_use]
+    pub fn map(self, f: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Self::Refused(why) => Self::Refused(f(why)),
+            Self::Unanswered(why) => Self::Unanswered(f(why)),
+        }
+    }
+}
 
 impl std::fmt::Display for CouldNotRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.why())
     }
 }
 
 impl std::error::Error for CouldNotRun {}
 
-/// Shorthand for a [`CouldNotRun`] result.
+/// Shorthand for a [`CouldNotRun::Refused`] result.
 pub fn could_not_run<T>(why: impl Into<String>) -> Result<T, CouldNotRun> {
-    Err(CouldNotRun(why.into()))
+    Err(CouldNotRun::Refused(why.into()))
+}
+
+/// Shorthand for a [`CouldNotRun::Unanswered`] result.
+pub fn unanswered<T>(why: impl Into<String>) -> Result<T, CouldNotRun> {
+    Err(CouldNotRun::Unanswered(why.into()))
 }
 
 /// A take's whole-run limit.
@@ -66,7 +99,7 @@ impl Budget {
     /// The reason a take gives up when the budget ran out during `what`.
     #[must_use]
     pub fn spent(&self, what: &str) -> CouldNotRun {
-        CouldNotRun(format!(
+        CouldNotRun::Refused(format!(
             "the take's {}s budget ran out during {what}",
             self.secs
         ))
@@ -90,7 +123,7 @@ impl Budget {
                 return Err(if self.left().is_none() {
                     self.spent(&format!("the wait for {what}"))
                 } else {
-                    CouldNotRun(format!("{what} did not happen within {MUST_HAPPEN:?}"))
+                    CouldNotRun::Refused(format!("{what} did not happen within {MUST_HAPPEN:?}"))
                 });
             }
             std::thread::sleep(POLL_GAP.min(deadline - now));
@@ -270,10 +303,18 @@ impl std::fmt::Display for Band {
     }
 }
 
-/// A running headless instance.
+/// How an instance runs: `--headless` on its lifeline, or in a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Face {
+    Headless,
+    Windowed,
+}
+
+/// A running instance.
 pub struct Instance {
     child: spawnfd::Child,
-    _lifeline: aterm_uds::lifeline::Lifeline,
+    /// A headless instance's lifeline; a window takes none.
+    _lifeline: Option<aterm_uds::lifeline::Lifeline>,
     pub log: PathBuf,
     pub ctl: Ctl,
     /// The band the subject runs in.
@@ -285,28 +326,54 @@ impl Instance {
     /// # Errors
     /// The launch failed, the instance exited before it listened (its log tail is in the reason), or it never listened.
     pub fn launch(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
-        let log = std::fs::File::create(&world.log)
-            .map_err(|e| CouldNotRun(format!("cannot create {}: {e}", world.log.display())))?;
+        Self::start(bin, world, budget, Face::Headless)
+    }
+
+    /// [`Instance::launch`] with a window: AppKit's loop and its proxies, which `--headless`
+    /// never runs. A window takes no lifeline (aterm refuses `--lifeline-fd` without
+    /// `--headless`: a window is a person's to close), so it is this process's child in this
+    /// process's group, ended by its pid on drop and with the group when `verify`'s ceiling or an
+    /// interrupt ends the run.
+    /// # Errors
+    /// As [`Instance::launch`].
+    pub fn launch_windowed(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
+        Self::start(bin, world, budget, Face::Windowed)
+    }
+
+    fn start(bin: &Path, world: &World, budget: Budget, face: Face) -> Result<Self, CouldNotRun> {
+        let log = std::fs::File::create(&world.log).map_err(|e| {
+            CouldNotRun::Refused(format!("cannot create {}: {e}", world.log.display()))
+        })?;
         let err = log
             .try_clone()
-            .map_err(|e| CouldNotRun(format!("cannot share the instance log: {e}")))?;
-        let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&world.root)
-            .map_err(|e| CouldNotRun(format!("the lifeline could not be made: {e}")))?;
+            .map_err(|e| CouldNotRun::Refused(format!("cannot share the instance log: {e}")))?;
         let mut cmd = spawnfd::command(bin);
         cmd.env_clear()
             .envs(world.env())
-            .args(["--headless", "--no-reroute"])
-            .arg(aterm_uds::lifeline::FLAG)
-            .arg(aterm_uds::lifeline::STDIN.to_string())
-            .arg("--control-sock")
-            .arg(&world.sock)
             .current_dir(&world.home)
-            .stdin(far)
             .stdout(log)
             .stderr(err);
+        let lifeline = match face {
+            Face::Headless => {
+                let (lifeline, far) =
+                    aterm_uds::lifeline::Lifeline::open(&world.root).map_err(|e| {
+                        CouldNotRun::Refused(format!("the lifeline could not be made: {e}"))
+                    })?;
+                cmd.args(["--headless", "--no-reroute"])
+                    .arg(aterm_uds::lifeline::FLAG)
+                    .arg(aterm_uds::lifeline::STDIN.to_string())
+                    .stdin(far);
+                Some(lifeline)
+            }
+            Face::Windowed => {
+                cmd.arg("--no-reroute").stdin(spawnfd::Stdio::null());
+                None
+            }
+        };
+        cmd.arg("--control-sock").arg(&world.sock);
         let child = cmd
             .spawn()
-            .map_err(|e| CouldNotRun(format!("cannot launch {}: {e}", bin.display())))?;
+            .map_err(|e| CouldNotRun::Refused(format!("cannot launch {}: {e}", bin.display())))?;
         let band = Band::take(child.id());
         let mut inst = Self {
             child,
@@ -330,7 +397,7 @@ impl Instance {
                 .then_some(Ok(()))
         })?
         .map_err(|status| {
-            CouldNotRun(format!(
+            CouldNotRun::Refused(format!(
                 "the instance exited ({status}) before its control socket listened; log tail:\n{}",
                 inst.log_tail()
             ))
@@ -375,6 +442,22 @@ impl Reply {
     pub fn line(&self) -> &str {
         self.stdout.lines().next().unwrap_or("")
     }
+
+    /// The server's refusal of `verb` itself, wherever the client printed it (on stderr it
+    /// leads with `aterm-ctl: `): it does not know the verb (`ERR unknown verb …`), or only a
+    /// debug build answers it (`ERR <verb> needs a debug build`).
+    #[must_use]
+    pub fn refuses_verb(&self, verb: &str) -> Option<&str> {
+        let debug_only = format!("ERR {verb} needs a debug build");
+        self.stdout
+            .lines()
+            .chain(self.stderr.lines())
+            .map(|line| {
+                let line = line.trim();
+                line.strip_prefix("aterm-ctl: ").unwrap_or(line)
+            })
+            .find(|line| line.starts_with("ERR unknown verb") || *line == debug_only)
+    }
 }
 
 /// The binary's own control client, aimed at one instance.
@@ -394,7 +477,10 @@ impl Ctl {
             return Reply {
                 code: None,
                 stdout: String::new(),
-                stderr: self.budget.spent(&format!("ctl {}", args.join(" "))).0,
+                stderr: self
+                    .budget
+                    .spent(&format!("ctl {}", args.join(" ")))
+                    .to_string(),
             };
         };
         let timeout = left.as_secs().saturating_add(1).min(CTL_TIMEOUT_SECS);
@@ -426,13 +512,20 @@ impl Ctl {
 
     /// A request that must succeed: its first stdout line.
     /// # Errors
-    /// The request failed; the reason quotes it.
+    /// The request failed; the reason quotes it. It is [`CouldNotRun::Unanswered`] when the subject
+    /// refuses the verb itself ([`Reply::refuses_verb`]).
     pub fn ok(&self, args: &[&str]) -> Result<String, CouldNotRun> {
         let reply = self.call(args);
         if reply.ok() {
             Ok(reply.line().to_string())
         } else if self.budget.left().is_none() {
             Err(self.budget.spent(&format!("ctl {}", args.join(" "))))
+        } else if let Some(refusal) = reply.refuses_verb(args.first().copied().unwrap_or_default())
+        {
+            unanswered(format!(
+                "ctl {}: the subject has no such verb ({refusal})",
+                args.join(" ")
+            ))
         } else {
             could_not_run(format!(
                 "ctl {} failed (exit {:?}): {} {}",
@@ -457,11 +550,11 @@ impl Ctl {
 
     /// The `key=value` field `key` of a request's first line.
     /// # Errors
-    /// The request failed or its line has no such field.
+    /// The request failed, or its line has no such field ([`CouldNotRun::Unanswered`]).
     pub fn field(&self, args: &[&str], key: &str) -> Result<String, CouldNotRun> {
         let line = self.ok(args)?;
         field(&line, key).map(str::to_string).ok_or_else(|| {
-            CouldNotRun(format!(
+            CouldNotRun::Unanswered(format!(
                 "ctl {} reported no {key}= ({line})",
                 args.join(" ")
             ))
@@ -535,6 +628,67 @@ mod tests {
             text.ends_with(CONFIG_OFF),
             "the lanes-off tables close it: {text}"
         );
+    }
+
+    #[test]
+    fn a_verb_the_subject_lacks_is_told_from_other_refusals() {
+        let reply = |stdout: &str, stderr: &str| Reply {
+            code: Some(1),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        let unknown = reply("ERR unknown verb (try: help)\n", "");
+        assert_eq!(
+            unknown.refuses_verb("rewind"),
+            Some("ERR unknown verb (try: help)")
+        );
+        let unknown = reply("", "aterm-ctl: ERR unknown verb (try: help)\n");
+        assert_eq!(
+            unknown.refuses_verb("rewind"),
+            Some("ERR unknown verb (try: help)")
+        );
+        assert!(
+            reply("ERR aos needs a debug build\n", "")
+                .refuses_verb("aos")
+                .is_some()
+        );
+        for other in [
+            reply("ERR aos bundle needs a debug build\n", ""),
+            reply("ERR aos attach refused: no window\n", ""),
+            reply("", "aterm-ctl: connect: No such file or directory\n"),
+        ] {
+            assert_eq!(other.refuses_verb("aos"), None, "{other:?}");
+        }
+    }
+
+    /// A refused verb is unanswered; any other failure is refused.
+    #[test]
+    fn a_request_the_subject_has_no_verb_for_is_unanswered() {
+        let client = |bin: &str| Ctl {
+            bin: PathBuf::from(bin),
+            sock: PathBuf::from("/nonexistent.sock"),
+            home: PathBuf::from("/"),
+            budget: Budget::from_now(60),
+        };
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let stand_in = dir.path().join("refuses");
+        std::fs::write(
+            &stand_in,
+            "#!/bin/sh\necho 'aterm-ctl: ERR unknown verb (try: help)' >&2\nexit 1\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(
+            &stand_in,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+        let refused = client(stand_in.to_str().expect("utf-8")).ok(&["rewind", "open"]);
+        assert!(
+            matches!(&refused, Err(CouldNotRun::Unanswered(why)) if why.contains("ctl rewind open")),
+            "{refused:?}"
+        );
+        let failed = client("/usr/bin/false").ok(&["rewind", "open"]);
+        assert!(matches!(failed, Err(CouldNotRun::Refused(_))), "{failed:?}");
     }
 
     #[test]

@@ -2454,7 +2454,7 @@ fn status_counts_a_harness_needs() {
             "ask needs_n=2",
         ),
         (
-            asked(needs, "gemini needs you: sign it \u{2014} carrying on"),
+            asked(needs, "agy needs you: sign it \u{2014} carrying on"),
             "ask needs_n=1",
         ),
         (
@@ -2933,6 +2933,7 @@ fn autopilot_off_on_a_box_codex_alab_left_owes_no_second_banner() {
             pid: 4242,
             start: "Mon Oct 20 16:37:58 2026".to_string(),
         }),
+        scoped: None,
     });
     rig.app.refresh_presence_session(rig.sid);
     rig.write(BOX_BLOCKED);

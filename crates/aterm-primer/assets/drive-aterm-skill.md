@@ -188,7 +188,7 @@ settle=submitted` types key by key, returns `task_rev=<n>` once the composer cle
 `aterm drive` runs the window harness's readers (`classify`, `phase`, `answer`, `ledger`,
 `tape`, `replay`; see `aterm drive --help`):
 
-- Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window is already
+- Every Claude Code, agy and Muse Code session in an aterm window is already
   supervised by `supervisor=aterm-harness@<pid>` (`codex-alab` supervises itself); acquire
   a `lease` before driving one yourself. aterm does not parse Codex screens (`agent=unknown`,
   `program_state=` is its own report, `drive phase` always reads `idle` and `drive answer`

@@ -308,14 +308,14 @@ fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Durat
         Err(refused) if refused.again => return Leg::Again(io::Error::other(refused)),
         Err(refused) => return Leg::Failed(io::Error::other(refused)),
     };
-    let label = link.label;
+    let (label, cut) = (link.label, crate::remote::Within::Drive(within));
     if let Err(e) = io::Write::write_all(&mut link.stream, request.as_bytes())
         .and_then(|()| io::Write::flush(&mut link.stream))
     {
         return if redial::is_hangup(&e) {
             Leg::Again(e)
         } else {
-            Leg::Failed(crate::remote::closed(&label, request, within, e))
+            Leg::Failed(crate::remote::closed(&label, request, cut, e))
         };
     }
     let leg = read_leg(
@@ -329,7 +329,7 @@ fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Durat
         },
     );
     match leg {
-        Leg::Failed(e) => Leg::Failed(crate::remote::closed(&label, request, within, e)),
+        Leg::Failed(e) => Leg::Failed(crate::remote::closed(&label, request, cut, e)),
         leg => leg,
     }
 }

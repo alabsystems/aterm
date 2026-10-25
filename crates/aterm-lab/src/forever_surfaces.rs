@@ -811,12 +811,6 @@ pub fn drawn_is_face(c: &Chip) -> bool {
     }
 }
 
-/// Whether harness `program` draws no chip (its line `face=- drawn=- why=no-footer`): Gemini CLI.
-/// `autopilot-captures` reads it too, for which harnesses take a hovered title.
-pub(crate) fn footless(program: &str) -> bool {
-    program == "gemini"
-}
-
 /// Whether a chip line is the footless one.
 fn no_footer(c: &Chip) -> bool {
     c.face == "-" && c.drawn.is_none() && c.why.as_deref() == Some("no-footer")
@@ -1326,15 +1320,6 @@ fn chip_faces(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let mut bad = Vec::new();
     for (t, l) in &lines {
         let c = chip(l);
-        if footless(cx.program) {
-            if !no_footer(&c) {
-                bad.push(format!(
-                    "+{} {l} (wanted face=- drawn=- why=no-footer)",
-                    at(cx.t0, *t)
-                ));
-            }
-            continue;
-        }
         let allowed = faces_at(cx.chain, done, *t);
         if !allowed.contains(&c.face.as_str()) {
             bad.push(format!(
@@ -1458,13 +1443,7 @@ fn l1_face(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     };
     let until = seen.first_after("DONE ", *t1).map_or(i64::MAX, |(t, _)| *t);
     let lines = chips_in(seen, *t1, until);
-    let want = |c: &Chip| {
-        if footless(cx.program) {
-            no_footer(c)
-        } else {
-            c.face == "land"
-        }
-    };
+    let want = |c: &Chip| c.face == "land";
     let faces: Vec<String> = lines.iter().map(|(_, c, _)| c.face.clone()).collect();
     match lines.iter().find(|(_, c, _)| want(c)) {
         Some((t, _, l)) => Verdict::Pass(format!(
@@ -1614,19 +1593,15 @@ fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     }
 }
 
-/// L5: `face=landed` after the landing (Gemini CLI: its no-footer line), and the page's state for it `landed <time>`.
+/// L5: `face=landed` after the landing, and the page's state for it `landed <time>`.
 fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L5's records)".into());
     };
     let w = &seen.window;
-    let face = chips_in(seen, *d, i64::MAX).into_iter().find(|(_, c, _)| {
-        if footless(cx.program) {
-            no_footer(c)
-        } else {
-            c.face == "landed"
-        }
-    });
+    let face = chips_in(seen, *d, i64::MAX)
+        .into_iter()
+        .find(|(_, c, _)| c.face == "landed");
     let page = standing(&w.page, *d, i64::MAX)
         .into_iter()
         .find(|(_, p)| page_field(p, "state").is_some_and(|s| s.starts_with("landed ")));
@@ -1845,8 +1820,7 @@ pub fn title_says(t: &str, mode: &str) -> TitleSays {
 /// Every chain's chip title says its mode's sentence (§12.4.1, 4d), read where its chip is
 /// drawn: the opening sweep, the front tab's reads, END's sweep. The opening precedes the
 /// first prompt except for a spawned worker, whose spawn supplies its task before the sweep.
-/// A tab whose chip is not drawn names no title (Gemini CLI's no footer, agy's bare footer
-/// under its off switch).
+/// A tab whose chip is not drawn names no title (agy's bare footer under its off switch).
 fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
     let mode = cx.chain.autopilot();
@@ -1902,7 +1876,7 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
             undrawn_n += 1;
             continue;
         }
-        if footless(cx.program) || bare_under_switch(cx.program, c) && switch_only(c) {
+        if bare_under_switch(cx.program, c) && switch_only(c) {
             if title == "-" {
                 bare += 1;
             } else {
@@ -1952,12 +1926,7 @@ fn title_words(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         },
         if bare > 0 {
             format!(
-                "; {bare} undrawn ({}), no title, as no chip is drawn to hover",
-                if footless(cx.program) {
-                    "no footer"
-                } else {
-                    "agy's footer bare under its off switch"
-                }
+                "; {bare} undrawn (agy's footer bare under its off switch), no title, as no chip is drawn to hover"
             )
         } else {
             String::new()
@@ -2584,7 +2553,7 @@ fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     }
 }
 
-/// N1–N4 on the window: every chip line standing in the span drawn as its face (the front tab; Gemini CLI its no-footer line), and, settled, its need row naming the first need with no count (every other need has a row of its own one level in, [`n_further`]), and its page state naming the first need with the others' count (` (+1 more)`), the need alone, or none.
+/// N1–N4 on the window: every chip line standing in the span drawn as its face (the front tab), and, settled, its need row naming the first need with no count (every other need has a row of its own one level in, [`n_further`]), and its page state naming the first need with the others' count (` (+1 more)`), the need alone, or none.
 fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, cx.t0, k) {
         Ok(s) => s,
@@ -2593,14 +2562,7 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let w = &seen.window;
     let mut bad = Vec::new();
     let chips = chips_in(seen, from, until);
-    if footless(cx.program) {
-        if let Some((t, _, l)) = chips.iter().find(|(_, c, _)| !no_footer(c)) {
-            bad.push(format!(
-                "+{} {l} (wanted face=- drawn=- why=no-footer)",
-                at(cx.t0, *t)
-            ));
-        }
-    } else if !w.front_tab {
+    if !w.front_tab {
         return Verdict::Unobserved(format!(
             "{} was not the front tab: its chip is never drawn",
             w.label
@@ -2868,9 +2830,7 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
             continue;
         }
         let c = chip(l);
-        let (ok, want) = if footless(program) {
-            (no_footer(&c), "")
-        } else if bare_under_switch(program, &c) {
+        let (ok, want) = if bare_under_switch(program, &c) {
             let ok = switch_only(&c);
             if ok {
                 bare.push(chain.name());

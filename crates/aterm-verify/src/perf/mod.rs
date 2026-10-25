@@ -878,7 +878,13 @@ fn main(args: &[String]) -> ExitCode {
         let record = cli.record.contains(lane);
         eprintln!("--- {} ---", lane.name());
         let skip = no_windows && lane.opens_windows();
-        let quiet = (!skip).then(|| quiet(*lane, admit)).flatten();
+        let quiet = match (!skip).then(|| quiet(*lane, admit)).transpose() {
+            Ok(quiet) => quiet.flatten(),
+            Err(why) => {
+                eprintln!("verify perf: COULD NOT RUN — {why}");
+                return ExitCode::from(3);
+            }
+        };
         let started = Instant::now();
         let from = aterm_capacity::Live.read(None);
         let run = match lane {
@@ -974,7 +980,10 @@ fn main(args: &[String]) -> ExitCode {
 /// admitted alone among quiet claims once the load is low (saying once a minute what it waits
 /// for), or at once under `--admit now`; its own build runs under it too. A ledger that cannot be
 /// used is said, and the lane runs unadmitted.
-fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Option<aterm_capacity::Claim> {
+///
+/// # Errors
+/// An interrupt ended the wait (WAIT-INTERRUPT): why, and the run ends COULD NOT RUN.
+fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Result<Option<aterm_capacity::Claim>, String> {
     let need = aterm_capacity::Need::timing(format!("verify perf {}", lane.name()));
     match aterm_capacity::admit(need, mode) {
         Ok(claim) => {
@@ -988,11 +997,15 @@ fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Option<aterm_capacity::Clai
                 },
                 to.brief()
             );
-            Some(claim)
+            Ok(Some(claim))
         }
+        Err(e @ aterm_capacity::Error::Stopped { .. }) => Err(format!(
+            "{}: its quiet claim was {e}; it started nothing",
+            lane.name()
+        )),
         Err(e) => {
             eprintln!("  {e}; the lane runs unadmitted");
-            None
+            Ok(None)
         }
     }
 }

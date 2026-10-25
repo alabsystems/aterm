@@ -384,7 +384,6 @@ pub(super) fn look_at_exit(
         agent: Agent::Muse,
         crashed: word.map(|w| w == ExitKind::Crashed),
         refused: word == Some(ExitKind::Refused),
-        restarted_itself: false,
     }
 }
 
@@ -503,7 +502,7 @@ pub(super) fn after_exit_onto(
         relaunched_before = true;
     }
     let word = match left {
-        ExitRecord::Crashed | ExitRecord::Restarted => Some(ExitKind::Crashed),
+        ExitRecord::Crashed => Some(ExitKind::Crashed),
         ExitRecord::Removed => Some(ExitKind::Clean),
         ExitRecord::Refused => Some(ExitKind::Refused),
         ExitRecord::Unread | ExitRecord::Survived(_) if cause == ExitCause::Exit => {
@@ -674,8 +673,9 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
     };
     let heal = atpkg::hooks::hook_file(&opts.home, dialect.hook_ext()).map(|(p, _)| p);
     let want = st.cwd.clone();
-    let cd =
-        (!want.is_empty() && k.cwd(st.shell).as_deref() != Some(want.as_str())).then_some(want);
+    let cd = (!want.is_empty()
+        && !super::super::relaunch::same_dir(k.cwd(st.shell).as_deref(), &want))
+    .then_some(want);
     let flags = mz::rewrite_argv(&st.argv, Some(&st.thread)).map_err(|e| NoPlan::Refused {
         why: format!("argv:{e}"),
         what: e.to_string(),
@@ -699,6 +699,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
         shell: st.shell,
         dialect,
         line,
+        tap_dropped: None,
     })
 }
 

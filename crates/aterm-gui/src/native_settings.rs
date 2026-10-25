@@ -1610,6 +1610,8 @@ pub(crate) struct SettingsViewState {
     /// The chrome the page last drew its list in at each window, text size and bars ([`page`]).
     page_chromes: RefCell<Vec<(ChromeAt, PageChrome)>>,
     page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
+    /// The reach the search last decided, with everything that decision read ([`SearchQuery::of`]).
+    search_reach: RefCell<Option<ReachMemo>>,
     /// The page's name and its height where nothing over its list names it
     /// ([`pinned_heading`]): the first list the page seats leads with it
     /// ([`SettingsViewState::take_list_head`]).
@@ -1650,7 +1652,9 @@ pub(crate) struct SettingsViewState {
     manual_search_expanded: bool,
     font_families: Option<Arc<aterm_render::font_catalog::MonospaceFamilies>>,
     drawn_faces: Option<aterm_render::DrawnFaces>,
-    font_text_entry: Option<String>,
+    /// The row whose usual control is a list or a slider ([`entry_on_demand`]) that is
+    /// showing its text field instead, for a value typed exactly.
+    text_entry: Option<String>,
     font_refusals: Vec<crate::native_font_catalog::FontRefusal>,
     semantic_font_refusals: std::cell::RefCell<Vec<crate::native_font_catalog::FontRefusal>>,
 }
@@ -1816,6 +1820,7 @@ impl SettingsViewState {
             page_chrome_at: Cell::new(None),
             page_chromes: RefCell::new(Vec::new()),
             page_chrome_memo: RefCell::new(None),
+            search_reach: RefCell::new(None),
             list_head: RefCell::new(None),
             bar_seats: RefCell::new(Vec::new()),
             showcase_blocks: RefCell::new(None),
@@ -1843,7 +1848,7 @@ impl SettingsViewState {
             manual_search_expanded: false,
             font_families: None,
             drawn_faces: None,
-            font_text_entry: None,
+            text_entry: None,
             font_refusals: Vec::new(),
             semantic_font_refusals: std::cell::RefCell::new(Vec::new()),
         };
@@ -2406,13 +2411,42 @@ impl SettingsViewState {
         .collect()
     }
 
-    fn font_row_takes_text(&self, key: &str) -> bool {
-        self.font_text_entry.as_deref() == Some(key) || self.field_has_unsaved_draft(key)
+    fn entry_row_takes_text(&self, key: &str) -> bool {
+        self.text_entry.as_deref() == Some(key) || self.field_has_unsaved_draft(key)
     }
 
     fn row_takes_text(&self, field: &EditField) -> bool {
         field_accepts_text_input(field)
-            && (!font_picker_key(field.key) || self.font_row_takes_text(field.key))
+            && (!entry_on_demand(field) || self.entry_row_takes_text(field.key))
+    }
+
+    /// Show `key`'s text field in place of its list or slider, holding `typed`, or the
+    /// saved value selected so that typing replaces it (a draft already typed is kept).
+    fn open_text_entry(&mut self, key: &str, typed: Option<&str>) {
+        let seed = self
+            .field_by_key(key)
+            .and_then(|field| field.seed.clone())
+            .unwrap_or_default();
+        self.clear_field_edit();
+        match typed {
+            Some(text) => {
+                self.field_inputs.insert(
+                    key.to_string(),
+                    crate::native_text_input::TextInputState::new(text.to_string()),
+                );
+            }
+            None => {
+                self.field_inputs.entry(key.to_string()).or_insert_with(|| {
+                    let mut input = crate::native_text_input::TextInputState::new(seed);
+                    input.select_all();
+                    input
+                });
+            }
+        }
+        self.text_entry = Some(key.to_string());
+        self.editing_field = Some(key.to_string());
+        self.common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
+        self.common.focus_visible = true;
     }
 
     /// Take the MACOS ACCESS block off this view (its posture source publishes nothing now).
@@ -2715,7 +2749,7 @@ impl SettingsViewState {
     }
 
     fn clear_field_edit(&mut self) {
-        self.font_text_entry = None;
+        self.text_entry = None;
         if let Some(key) = self.editing_field.take() {
             self.common.retire_input();
             let owned_focus = self.editing_field_has_focus(&key);
@@ -2787,7 +2821,7 @@ impl SettingsViewState {
     }
 
     fn discard_field_edit(&mut self) {
-        self.font_text_entry = None;
+        self.text_entry = None;
         if let Some(key) = self.editing_field.take() {
             self.common.retire_input();
             if self.editing_field_has_focus(&key) {
@@ -3427,11 +3461,18 @@ impl SettingsViewState {
     }
 
     fn focused_slider(&self) -> bool {
-        self.focused_color_brightness().is_some()
-            || self.focused_setting_key().is_some_and(|key| {
-                self.field_by_key(key)
-                    .is_some_and(|field| numeric_slider_value(field).is_some())
+        self.focused_color_brightness().is_some() || self.focused_slider_row().is_some()
+    }
+
+    /// The focused setting drawn as a slider, not while it shows its text field.
+    fn focused_slider_row(&self) -> Option<String> {
+        self.focused_setting_key()
+            .filter(|key| {
+                self.field_by_key(key).is_some_and(|field| {
+                    numeric_slider_value(field).is_some() && !self.row_takes_text(field)
+                })
             })
+            .map(str::to_string)
     }
 
     fn focused_segment(&self) -> Option<(&'static str, usize, usize, usize)> {
@@ -3477,7 +3518,7 @@ impl SettingsViewState {
             .filter(|key| {
                 self.choice_picker.is_none()
                     && font_picker_key(key)
-                    && !self.font_row_takes_text(key)
+                    && !self.entry_row_takes_text(key)
             })
             .map(str::to_string)
     }
@@ -3958,8 +3999,11 @@ impl SettingsApp {
             return true;
         };
         let field = &view.legacy.fields[index];
-        if !field_accepts_text_input(field) {
-            // Typed pointer positions are valid only for actual text fields.
+        if !field_accepts_text_input(field)
+            || (numeric_slider_value(field).is_some() && !view.row_takes_text(field))
+        {
+            // Typed pointer positions are valid only for actual text fields, a slider's
+            // only while it shows its exact field.
             return true;
         }
         let seed = field.seed.clone().unwrap_or_default();
@@ -4131,7 +4175,7 @@ impl SettingsApp {
         let Some(range) = slider_domain(view, field.key) else {
             return;
         };
-        let target = current + range.step * steps;
+        let target = slider_step_target(current, steps, range);
         let Some(value) = normalize_slider_value(target, range) else {
             return;
         };
@@ -4719,7 +4763,7 @@ impl SettingsApp {
                         .entry(key.to_string())
                         .or_insert_with(|| crate::native_text_input::TextInputState::new(seed));
                 }
-                view.font_text_entry = Some(key.to_string());
+                view.text_entry = Some(key.to_string());
                 view.editing_field = Some(key.to_string());
                 view.common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
                 cx.repaint(crate::native_app::DamageRegion::All);
@@ -5053,8 +5097,8 @@ impl SettingsApp {
                 return EventResult::Handled;
             }
             if invocation.value.is_none() && numeric_slider_value(field).is_some() {
-                view.clear_field_edit();
-                view.common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
+                // Return on the slider, or a click on its number, takes an exact value.
+                view.open_text_entry(key, None);
                 cx.repaint(crate::native_app::DamageRegion::All);
                 return EventResult::Handled;
             }
@@ -5071,7 +5115,7 @@ impl SettingsApp {
                     )
                 });
                 if font_picker_key(key) {
-                    view.font_text_entry = Some(key.to_string());
+                    view.text_entry = Some(key.to_string());
                 }
                 view.common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
                 cx.repaint(crate::native_app::DamageRegion::All);
@@ -5086,7 +5130,7 @@ impl SettingsApp {
             let value = if let Some(SemanticInput::Number(value)) = invocation.value.as_ref()
                 && let Some(range) = slider_domain(view, field.key)
             {
-                let Some(value) = normalize_slider_value(*value, range) else {
+                let Some(value) = exact_slider_value(*value, range, field.kind) else {
                     view.feedback = Some("Value must be a finite number".to_string());
                     cx.repaint(crate::native_app::DamageRegion::All);
                     return EventResult::Handled;
@@ -8300,6 +8344,18 @@ impl SettingsApp {
                 }
                 true
             }
+            AppEvent::TextInput(TextInputEvent::Commit(text))
+                if view.focused_slider_row().is_some()
+                    && text.trim_start().starts_with(|c: char| {
+                        c.is_ascii_digit() || matches!(c, '.' | '-' | '+')
+                    }) =>
+            {
+                // A number typed on a slider is the start of an exact value.
+                if let Some(key) = view.focused_slider_row() {
+                    view.open_text_entry(&key, Some(text.trim_start()));
+                }
+                true
+            }
             AppEvent::TextInput(TextInputEvent::Backspace) if view.searchable_picker_open() => view
                 .narrow_font_picker(|filter| {
                     filter.pop();
@@ -9078,7 +9134,13 @@ fn field_accepts_text_input(field: &EditField) -> bool {
     !matches!(
         field.kind,
         EditKind::Bool | EditKind::Enum { .. } | EditKind::Theme
-    ) && numeric_slider_value(field).is_none()
+    )
+}
+
+/// Whether `field`'s row shows a list (a font picker) or a slider and its text field
+/// only on demand ([`SettingsViewState::open_text_entry`]).
+fn entry_on_demand(field: &EditField) -> bool {
+    font_picker_key(field.key) || numeric_slider_value(field).is_some()
 }
 
 fn apply_pointer_selection(
@@ -11049,6 +11111,17 @@ fn renderer_preview_spec_for_key_with_font(
                 .raw_value(focused_key)
                 .filter(|saved| aterm_types::scheme::parse_hex(saved).is_some())
                 .unwrap_or_else(|| effective_default_for_field(focused_key))
+        } else if let Some(field) = state
+            .field_by_key(focused_key)
+            .filter(|field| prefs::range_of(field.key).is_some())
+            && refused_number(state, field, &value)
+        {
+            // The preview draws the saved number while a typed one is refused, so it
+            // names that one, not the draft.
+            state
+                .raw_value(focused_key)
+                .filter(|saved| !refused_number(state, field, saved))
+                .unwrap_or_else(|| effective_default_for_field(focused_key))
         } else {
             value
         }
@@ -12373,6 +12446,9 @@ struct BarButton {
     label: String,
     visual: String,
     qualifier: Option<&'static str>,
+    /// The whole shorter form a stacked button says where its words take more than one line
+    /// ("Discard" for "Discard Draft").
+    brief: Option<&'static str>,
     style: StyleRef,
 }
 
@@ -12429,6 +12505,7 @@ impl DraftBar {
                         label: "Cancel, and keep unsaved Settings drafts".to_string(),
                         visual: "Cancel".to_string(),
                         qualifier: None,
+                        brief: None,
                         style: StyleRef::Secondary,
                     },
                     BarButton {
@@ -12436,6 +12513,7 @@ impl DraftBar {
                         label,
                         visual: visual.to_string(),
                         qualifier: None,
+                        brief: Some("Discard"),
                         style: StyleRef::Danger,
                     },
                 ],
@@ -12465,18 +12543,20 @@ impl DraftBar {
                 label: format!("Review in Modified: {count} unsaved Settings {noun}"),
                 visual: "Review".to_string(),
                 qualifier: Some(" in Modified"),
+                brief: None,
                 style: StyleRef::Secondary,
             });
         }
         buttons.push(BarButton {
             key: "settings/drafts/discard-all",
             label: if one {
-                format!("Discard: drop your unsaved {name} draft")
+                format!("Discard your unsaved {name} draft")
             } else {
                 format!("Discard All {count} unsaved Settings drafts")
             },
             visual: if one { "Discard" } else { "Discard All" }.to_string(),
             qualifier: None,
+            brief: (!one).then_some("Discard"),
             style: StyleRef::Secondary,
         });
         Self {
@@ -12503,6 +12583,7 @@ fn reset_all_buttons(view: &SettingsViewState) -> Vec<BarButton> {
             label: "Cancel Reset All: keep every setting".to_string(),
             visual: "Cancel".to_string(),
             qualifier: None,
+            brief: None,
             style: StyleRef::Secondary,
         },
         BarButton {
@@ -12513,6 +12594,7 @@ fn reset_all_buttons(view: &SettingsViewState) -> Vec<BarButton> {
             ),
             visual: "Reset All".to_string(),
             qualifier: None,
+            brief: Some("Reset"),
             style: StyleRef::Danger,
         },
     ]
@@ -12566,10 +12648,13 @@ fn bar_actions_height(buttons: &[BarButton], room: f32) -> f32 {
     }
 }
 
+/// A stacked button's words and height: the fullest whole form one line holds at the stack's
+/// width (its words, else its brief form), and only where none does, its words over lines.
 fn stacked_bar_button(button: &BarButton, room: f32) -> (String, f32) {
     let words = button.words(false);
     let spec = ButtonSpec::new(button.label.clone()).visual_label(words.clone());
-    let (words, lines) = button_words_in(&spec, &words, &[], room);
+    let brief: Vec<&str> = button.brief.into_iter().collect();
+    let (words, lines) = button_words_in(&spec, &words, &brief, room);
     let height = crate::native_ui::native_button_height_for_lines(lines, scaled_control_height());
     (words, height)
 }
@@ -13131,7 +13216,7 @@ fn status_words_node_at(
             audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
             role: SemanticRole::Group,
             label: String::new(),
-            value: Some(share),
+            paint: Some(share),
             action: None,
             focusable: false,
             focused: false,
@@ -13150,7 +13235,7 @@ fn status_words_node_at(
             audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
             role: SemanticRole::Status,
             label: feedback.to_string(),
-            value: None,
+            paint: None,
             action: None,
             focusable: true,
             focused: false,
@@ -14356,7 +14441,7 @@ fn navigation(
                 audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
                 role: SemanticRole::Group,
                 label: String::new(),
-                value: Some(share),
+                paint: Some(share),
                 action: None,
                 focusable: false,
                 focused: false,
@@ -17066,7 +17151,7 @@ fn choice_picker_card(
                 audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
                 role: SemanticRole::Group,
                 label: String::new(),
-                value: Some(format!("{},{},{}", window.start, window.len(), rows.len())),
+                paint: Some(format!("{},{},{}", window.start, window.len(), rows.len())),
                 action: None,
                 focusable: false,
                 focused: false,
@@ -18244,7 +18329,6 @@ fn top_setting_row(
     key: &str,
     projected_value: Option<String>,
     width: SettingsWidth,
-    direct: bool,
 ) -> Option<TopRow> {
     let (index, field) = state
         .legacy
@@ -18259,30 +18343,9 @@ fn top_setting_row(
         seed: projected_value.or_else(|| field.seed.clone()),
         placeholder: field.placeholder.clone(),
     };
-    let form = if direct {
-        RowForm::Direct
-    } else {
-        RowForm::List {
-            modified_only: false,
-        }
-    };
-    let parts = setting_row_parts_in(state, index, &projected, form, width);
+    let parts = setting_row_parts(state, index, &projected, false, width);
     let mut row = parts.row;
-    let name = if direct && width == SettingsWidth::Compact && settings_text_scale() > 1.25 {
-        match field.key {
-            prefs::EDIT_THEME => "Theme",
-            prefs::EDIT_WINDOW_THEME => "Window",
-            prefs::EDIT_TRAIL_SOUNDS => "Music",
-            prefs::EDIT_FONT_FAMILY => "Font",
-            prefs::EDIT_FONT_PX => "Size",
-            SPARKLE_WORDS_KEY => "Sparkles",
-            KEYWORD_KITTIES_KEY => "Kitties",
-            _ => field.label,
-        }
-        .to_string()
-    } else {
-        parts.name
-    };
+    let name = parts.name;
     if matches!(field.kind, EditKind::Enum { .. } | EditKind::Theme) {
         let control = if width == SettingsWidth::Compact {
             row.children
@@ -18321,6 +18384,20 @@ struct TopRow {
 enum ThemeRowsHost {
     Top,
     List { modified_only: bool, preview: bool },
+}
+
+impl ThemeRowsHost {
+    /// Whether the rows sit on Modified, which says each row's default instead of
+    /// tagging it Changed.
+    const fn modified_only(self) -> bool {
+        matches!(
+            self,
+            Self::List {
+                modified_only: true,
+                ..
+            }
+        )
+    }
 }
 
 fn theme_card_rows(
@@ -18363,7 +18440,6 @@ fn theme_card_rows(
         if !matches!(host, ThemeRowsHost::List { preview: false, .. }) {
             rows.push(theme_preview_side_row(
                 state,
-                host,
                 width,
                 text_width,
                 pickers_fill,
@@ -18394,14 +18470,9 @@ fn theme_card_rows(
             ..
         }
     ) {
-        let row = theme_showcase_row(host, width, text_width, pickers_fill);
+        let row = theme_showcase_row(width, text_width, pickers_fill);
         let height = fixed_height(&row);
         sized.push((row, height));
-    }
-    if host == ThemeRowsHost::Top {
-        for (row, _) in &mut sized {
-            top_row_label_paints_only(row);
-        }
     }
     sized
 }
@@ -18439,7 +18510,6 @@ fn theme_rows_reserve(
     if !matches!(host, ThemeRowsHost::List { preview: false, .. }) {
         follow.push(theme_preview_side_row(
             state,
-            host,
             width,
             text_width,
             dark_stacked || light_stacked,
@@ -18447,14 +18517,6 @@ fn theme_rows_reserve(
     }
     let follow: f32 = follow.iter().map(|row| fixed_height(row) + gap).sum();
     (follow - single.map_or(0.0, |height| height + gap)).max(0.0)
-}
-
-fn top_row_label_paints_only(row: &mut UiNode) {
-    if let Some(label) = row.children.first_mut()
-        && label.key.as_str().starts_with("settings/label/")
-    {
-        label.paint_only = true;
-    }
 }
 
 /// One theme card row and whether it stacked its controls under its name.
@@ -18701,19 +18763,14 @@ fn fit_theme_row_buttons(row: &mut UiNode, text_width: f32) {
 
 const THEME_SLOT_RESET_PREFIX: &str = "settings/theme-slot-reset/";
 
-/// A list theme row's Reset, else the place it keeps. Rows with no Reset of their own that follow
-/// the card's pickers (Preview side, Browse themes…) end where the pickers end: before Reset's
-/// place where the pickers sit on their names' lines, at the line's end where they fill it.
-fn theme_row_trailing(
-    host: ThemeRowsHost,
-    key: &str,
-    reset: Option<UiNode>,
-    pickers_fill: bool,
-) -> Option<UiNode> {
-    match host {
-        ThemeRowsHost::Top => None,
-        ThemeRowsHost::List { .. } if reset.is_none() && pickers_fill => None,
-        ThemeRowsHost::List { .. } => Some(reset.unwrap_or_else(|| reset_slot(key))),
+/// A theme row's Reset, else the place it keeps. Rows with no Reset of their own that follow the
+/// card's pickers (Preview side, Browse themes…) end where the pickers end: before Reset's place
+/// where the pickers sit on their names' lines, at the line's end where they fill it.
+fn theme_row_trailing(key: &str, reset: Option<UiNode>, pickers_fill: bool) -> Option<UiNode> {
+    if reset.is_none() && pickers_fill {
+        None
+    } else {
+        Some(reset.unwrap_or_else(|| reset_slot(key)))
     }
 }
 
@@ -18814,24 +18871,14 @@ fn theme_slot_row(
     let changed = !name.eq_ignore_ascii_case(default);
     let mut tags = RowTags::default();
     let mut worst = RowTags::default();
-    match host {
-        ThemeRowsHost::List {
-            modified_only: false,
-            ..
-        } => {
-            if changed {
-                tags.state.push(CHANGED_WORD.to_string());
-            }
-            worst.state.push(CHANGED_WORD.to_string());
+    if host.modified_only() {
+        tags.facts.push(format!("Default theme: {default}"));
+        worst.facts.push(format!("Default theme: {default}"));
+    } else {
+        if changed {
+            tags.state.push(CHANGED_WORD.to_string());
         }
-        ThemeRowsHost::List {
-            modified_only: true,
-            ..
-        } => {
-            tags.facts.push(format!("Default theme: {default}"));
-            worst.facts.push(format!("Default theme: {default}"));
-        }
-        ThemeRowsHost::Top => {}
+        worst.state.push(CHANGED_WORD.to_string());
     }
     let reset = changed.then(|| {
         let reset_action = format!("{THEME_SLOT_RESET_PREFIX}{}", appearance_word(side));
@@ -18849,7 +18896,7 @@ fn theme_slot_row(
         vec![control],
         // A slot that fills its line under its name is the line its
         // followers end at; on its name's line it keeps Reset's place.
-        theme_row_trailing(host, &key, reset, control_width == Length::Fill),
+        theme_row_trailing(&key, reset, control_width == Length::Fill),
         width,
         text_width,
         inline_width.is_some(),
@@ -18860,7 +18907,6 @@ fn theme_slot_row(
 /// ([`theme_row_trailing`]).
 fn theme_preview_side_row(
     state: &SettingsViewState,
-    host: ThemeRowsHost,
     width: SettingsWidth,
     text_width: f32,
     pickers_fill: bool,
@@ -18915,7 +18961,7 @@ fn theme_preview_side_row(
         "Preview",
         Default::default(),
         vec![control],
-        theme_row_trailing(host, "theme-preview-side", None, pickers_fill),
+        theme_row_trailing("theme-preview-side", None, pickers_fill),
         width,
         text_width,
         true,
@@ -18939,7 +18985,7 @@ fn theme_mode_row(
         );
         own(&dark, aterm_types::Appearance::Dark) && own(&light, aterm_types::Appearance::Light)
     };
-    let reset = (at_own_pair && matches!(host, ThemeRowsHost::List { .. })).then(|| {
+    let reset = at_own_pair.then(|| {
         let action = format!("settings/reset/{}", prefs::EDIT_THEME);
         row_trailing_button(
             action.clone(),
@@ -18950,23 +18996,15 @@ fn theme_mode_row(
     let name = "Follow system light/dark";
     let mut tags = RowTags::default();
     let mut worst = RowTags::default();
-    if matches!(
-        host,
-        ThemeRowsHost::List {
-            modified_only: false,
-            ..
-        }
-    ) {
+    if !host.modified_only() {
         if reset.is_some() {
             tags.state.push(CHANGED_WORD.to_string());
         }
         worst.state.push(CHANGED_WORD.to_string());
     }
-    let list = matches!(host, ThemeRowsHost::List { .. });
-    let inline = !list
-        || width != SettingsWidth::Compact
-        || compact_row_inline(&EditKind::Bool, text_width, true);
-    let trailing = list.then(|| reset.unwrap_or_else(|| reset_slot(THEME_MODE_KEY)));
+    let inline =
+        width != SettingsWidth::Compact || compact_row_inline(&EditKind::Bool, text_width, true);
+    let trailing = Some(reset.unwrap_or_else(|| reset_slot(THEME_MODE_KEY)));
     let controls = vec![
         UiNode::new(
             THEME_MODE_ACTION,
@@ -19118,7 +19156,7 @@ fn top_cards(
     previews: TopPreviews,
 ) -> [SplitCard; 4] {
     let row = |key: &str, projected: Option<String>| {
-        top_card_row(state, key, projected, width, text_width, true)
+        top_card_row(state, key, projected, width, text_width, false)
     };
     let preview = |key: &str, semantic_key: &str, height: f32| {
         top_preview_at(state, key, semantic_key, height, cx, text_width)
@@ -19127,8 +19165,8 @@ fn top_cards(
 
     let mut color_rows: Vec<(UiNode, f32)> =
         theme_card_rows(state, ThemeRowsHost::Top, width, text_width, || {
-            // Top keeps no Reset, so no row lines up with a place it keeps.
-            top_card_row(state, prefs::EDIT_THEME, None, width, text_width, true)
+            // No row follows Top's theme picker to end where it does.
+            top_card_row(state, prefs::EDIT_THEME, None, width, text_width, false)
                 .map(|(row, height)| (row, height, false))
         });
     let sample_at = usize::from(!color_rows.is_empty());
@@ -19192,7 +19230,7 @@ fn top_cards(
         text_width,
     );
 
-    let mut playful_rows = music_effects_rows(state, width, cx, text_width, true);
+    let mut playful_rows = music_effects_rows(state, width, cx, text_width, false);
     playful_rows.extend(row(
         SPARKLE_WORDS_KEY,
         Some(top_projected_toy_value(state, SPARKLE_WORDS_KEY).to_string()),
@@ -19259,13 +19297,8 @@ const THEME_SHOWCASE_ROW_LABEL: &str = "More themes";
 
 /// The theme card's way to Settings ▸ Themes on a list: a row of its own, its button ending where
 /// the card's theme pickers end ([`theme_row_trailing`]), its label fitted to what that leaves.
-fn theme_showcase_row(
-    host: ThemeRowsHost,
-    width: SettingsWidth,
-    text_width: f32,
-    pickers_fill: bool,
-) -> UiNode {
-    let trailing = theme_row_trailing(host, "theme-browse", None, pickers_fill);
+fn theme_showcase_row(width: SettingsWidth, text_width: f32, pickers_fill: bool) -> UiNode {
+    let trailing = theme_row_trailing("theme-browse", None, pickers_fill);
     let kept = trailing.as_ref().map_or(0.0, |_| reset_slot_width() + 12.0);
     theme_card_row(
         "theme-browse",
@@ -19281,24 +19314,27 @@ fn theme_showcase_row(
     .0
 }
 
+/// `key`'s row in a Top-style card: the shared row anatomy (Changed, facts, timing,
+/// Reset and its place), and the row's note where `notes` (Top's cards say what their
+/// rows do in their own description, so Top leaves the notes to the setting's page).
 fn top_card_row(
     state: &SettingsViewState,
     key: &str,
     projected: Option<String>,
     width: SettingsWidth,
     text_width: f32,
-    direct: bool,
+    notes: bool,
 ) -> Option<(UiNode, f32)> {
-    let with_reset = !direct;
     let kind = state.field_by_key(key).map(|field| field.kind);
     let inline = width == SettingsWidth::Compact
-        && kind.is_some_and(|kind| compact_row_inline(&kind, text_width, with_reset));
+        && kind.is_some_and(|kind| compact_row_inline(&kind, text_width, true));
     let mut row_width = if inline { SettingsWidth::Medium } else { width };
-    let mut top = top_setting_row(state, key, projected.clone(), row_width, direct)?;
+    let mut top = top_setting_row(state, key, projected.clone(), row_width)?;
     if row_width != SettingsWidth::Compact
         && let Some(kind) = kind
     {
-        let short = one_line_name_floor(&top.name) - row_label_room(&top.row, false, text_width);
+        let short =
+            one_line_name_floor(&top.name) - one_line_label_room_signed(&top.row, text_width);
         let least = match kind {
             EditKind::Bool => f32::INFINITY,
             EditKind::Enum { .. } | EditKind::Theme => COMPACT_INLINE_CHOICE_MIN,
@@ -19317,7 +19353,7 @@ fn top_card_row(
                 }
                 _ => {
                     row_width = SettingsWidth::Compact;
-                    top = top_setting_row(state, key, projected, row_width, direct)?;
+                    top = top_setting_row(state, key, projected, row_width)?;
                 }
             }
         }
@@ -19347,10 +19383,7 @@ fn top_card_row(
     fit_row_button_words(&mut row, &name, text_width, stacked);
     let room = row_label_room(&row, stacked, text_width);
     let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, false);
-    if direct {
-        top_row_label_paints_only(&mut row);
-    }
-    let note = (!direct).then(|| row_footnote(state, key)).flatten();
+    let note = notes.then(|| row_footnote(state, key)).flatten();
     let note = note.as_deref();
     let detail = row_second_line(&placement, timing, note, text_width);
     let row = with_row_detail(row, key, &detail, stacked);
@@ -19363,7 +19396,7 @@ fn music_effects_rows(
     width: SettingsWidth,
     cx: &ViewCx<'_>,
     text_width: f32,
-    top: bool,
+    notes: bool,
 ) -> Vec<(UiNode, f32)> {
     let music = top_card_row(
         state,
@@ -19371,7 +19404,7 @@ fn music_effects_rows(
         Some(top_projected_music_value(state).to_string()),
         width,
         text_width,
-        top,
+        notes,
     );
     match (music, top_music_suppression_reason(state, cx.motion)) {
         (Some(music), Some(reason)) => vec![music, top_music_suppression_node(reason, text_width)],
@@ -19595,7 +19628,7 @@ fn display_face_rows(
                 audit_id: crate::native_ui::DISPLAY_FACE_NAME_AUDIT,
                 role: SemanticRole::Text,
                 label: font.label.to_string(),
-                value: Some(font.id.to_string()),
+                paint: Some(font.id.to_string()),
                 action: None,
                 focusable: false,
                 focused: false,
@@ -20009,11 +20042,17 @@ fn cursor_styles_page(
         page_preview_width(state, width, cx.viewport),
     );
     let natural = preview.as_ref().map_or(0.0, fixed_height);
+    // The preview yields toward the least height it demonstrates at, no lower than 64pt or
+    // than its header's first line over a prompt row: a height a style tried under the
+    // pointer never moves, where the row shows the style while a longer header ("Trying: …")
+    // drops its words. Under a large text size or line height, a flat 64pt left room for
+    // neither the row nor the header's lines: an empty card.
     let floor = match preview.as_ref().map(|preview| &preview.content) {
-        Some(UiContent::SettingsPreview(spec)) => spec.minimum_height(48.0),
+        Some(UiContent::SettingsPreview(spec)) => spec
+            .minimum_height(48.0)
+            .min(spec.steady_minimum_height(48.0).max(64.0)),
         _ => 64.0,
     }
-    .min(64.0)
     .min(natural);
     let pin_room = steady_room + settings_status_bar_kept(state, width, cx.viewport);
     let tallest_in = |items: &[ListItem], room: f32| {
@@ -21257,7 +21296,7 @@ fn top_settings_page(
         ThemeRowsHost::Top,
         width,
         text_width,
-        top_card_row(state, prefs::EDIT_THEME, None, width, text_width, true)
+        top_card_row(state, prefs::EDIT_THEME, None, width, text_width, false)
             .map(|(_, height)| height),
         6.0,
     );
@@ -21417,7 +21456,7 @@ fn top_text_band(
     let half = ((inner - COLUMN_GAP) / 2.0).max(48.0);
     let rows: Vec<(UiNode, f32)> = [prefs::EDIT_FONT_FAMILY, prefs::EDIT_FONT_PX]
         .into_iter()
-        .filter_map(|key| top_card_row(state, key, None, width, half, true))
+        .filter_map(|key| top_card_row(state, key, None, width, half, false))
         .collect();
     if rows.len() != 2 {
         return None;
@@ -21512,7 +21551,7 @@ fn rainbow_banner_node() -> UiNode {
             audit_id: RAINBOW_BANNER_AUDIT,
             role: SemanticRole::Text,
             label: String::new(),
-            value: None,
+            paint: None,
             action: None,
             focusable: false,
             focused: false,
@@ -22754,7 +22793,7 @@ fn settings_fields_page(
                 SettingsRoute::Sound => (
                     "settings/sound/music-effects",
                     "Music effects",
-                    music_effects_rows(state, width, cx, text_width, false),
+                    music_effects_rows(state, width, cx, text_width, true),
                 ),
                 _ => return None,
             };
@@ -29451,6 +29490,12 @@ fn compact_inline_control_width(kind: &EditKind, text_width: f32) -> Option<f32>
 }
 
 fn one_line_label_room(row: &UiNode, text_width: f32) -> f32 {
+    one_line_label_room_signed(row, text_width).max(0.0)
+}
+
+/// [`one_line_label_room`] below zero where the row's fixed controls alone are wider
+/// than `text_width`, so a shortfall counts all that is missing.
+fn one_line_label_room_signed(row: &UiNode, text_width: f32) -> f32 {
     let fixed: f32 = row
         .children
         .iter()
@@ -29460,7 +29505,7 @@ fn one_line_label_room(row: &UiNode, text_width: f32) -> f32 {
             _ => 0.0,
         })
         .sum();
-    (text_width - fixed - row.layout.gap * row.children.len().saturating_sub(1) as f32).max(0.0)
+    text_width - fixed - row.layout.gap * row.children.len().saturating_sub(1) as f32
 }
 
 fn shared_inactive_reason(state: &SettingsViewState, keys: &[&str]) -> Option<(String, String)> {
@@ -29640,7 +29685,7 @@ fn chip_after_line(
                 audit_id: crate::native_ui::COLOR_CHIP_AUDIT,
                 role: SemanticRole::Group,
                 label: String::new(),
-                value: Some(format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2])),
+                paint: Some(format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2])),
                 action: None,
                 focusable: false,
                 focused: false,
@@ -30476,12 +30521,6 @@ fn setting_row(
     setting_row_parts(state, index, field, modified_only, width).row
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RowForm {
-    List { modified_only: bool },
-    Direct,
-}
-
 struct SettingRowParts {
     row: UiNode,
     name: String,
@@ -30651,23 +30690,7 @@ fn setting_row_parts(
     modified_only: bool,
     width: SettingsWidth,
 ) -> SettingRowParts {
-    setting_row_parts_in(state, index, field, RowForm::List { modified_only }, width)
-}
-
-fn setting_row_parts_in(
-    state: &SettingsViewState,
-    index: usize,
-    field: &EditField,
-    form: RowForm,
-    width: SettingsWidth,
-) -> SettingRowParts {
-    let direct = form == RowForm::Direct;
-    let modified_only = form
-        == RowForm::List {
-            modified_only: true,
-        };
-    let offers_reset = !direct && (modified_only || state.is_explicit(field.key));
-    let reserve_reset_slot = !direct;
+    let offers_reset = modified_only || state.is_explicit(field.key);
     let setting_effect = setting_effect_projection(
         state,
         None,
@@ -30772,10 +30795,7 @@ fn setting_row_parts_in(
         .collect();
     let semantic_field_label = format!("{}{semantic_facts}", field.label);
     let field_error = state.field_errors.get(field.key);
-    let takes_typing = matches!(
-        field.kind,
-        EditKind::Text | EditKind::Integer | EditKind::Float | EditKind::Color
-    ) && numeric_slider_value(field).is_none();
+    let takes_typing = state.row_takes_text(field);
     let setting_description = field_error
         .map(|error| {
             if takes_typing {
@@ -30833,7 +30853,7 @@ fn setting_row_parts_in(
             control_state,
         )
     });
-    let font_list = font_picker_key(field.key) && !state.font_row_takes_text(field.key);
+    let font_list = font_picker_key(field.key) && !state.entry_row_takes_text(field.key);
     let choice_words = if field.key == prefs::EDIT_THEME && field.seed.is_some() {
         theme_value_words(&state.assets.themes, Some(&value))
     } else {
@@ -30920,7 +30940,8 @@ fn setting_row_parts_in(
             .style(StyleRef::Setting),
         ),
         EditKind::Float | EditKind::Integer
-            if numeric_slider_value_for_state(state, field).is_some() =>
+            if numeric_slider_value_for_state(state, field).is_some()
+                && !state.row_takes_text(field) =>
         {
             let (numeric, display_value) = numeric_slider_value_for_state(state, field)
                 .expect("guard checked numeric slider value");
@@ -30929,8 +30950,13 @@ fn setting_row_parts_in(
             UiContent::Slider(
                 Control::new(
                     SliderSpec {
-                        description: (!setting_description.is_empty())
-                            .then(|| setting_description.clone()),
+                        description: Some(
+                            [setting_description.as_str(), SLIDER_EXACT_HINT]
+                                .into_iter()
+                                .filter(|part| !part.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(FACT_SEPARATOR),
+                        ),
                         track: slider_track(field.key, range, numeric),
                         label: semantic_field_label.clone(),
                         step: range.step,
@@ -31002,19 +31028,19 @@ fn setting_row_parts_in(
             )
         }
     };
-    let (mut tags, mut worst) = if !modified_only && !direct {
-        changed_tags(state, field.key)
-    } else {
+    let (mut tags, mut worst) = if modified_only {
         Default::default()
+    } else {
+        changed_tags(state, field.key)
     };
     let theme_fallback = state.theme_fallback_for(field.key);
-    if theme_fallback.is_some() && !direct {
+    if theme_fallback.is_some() {
         if state.is_explicit(field.key) {
             tags.state.push(OVERRIDES_THEME_WORD.to_string());
         }
         worst.state.push(OVERRIDES_THEME_WORD.to_string());
     }
-    for (fact, own_value) in visual_facts.iter().filter(|_| !direct) {
+    for (fact, own_value) in &visual_facts {
         if !fact.is_empty() {
             tags.facts.push(fact.clone());
         }
@@ -31037,7 +31063,7 @@ fn setting_row_parts_in(
     if modified_only && let Some([r, g, b]) = color_picker::default_color_chip(state, field) {
         label.push_str(&format!(", #{r:02X}{g:02X}{b:02X}"));
     }
-    if let Some(timing) = timing.filter(|_| !direct) {
+    if let Some(timing) = timing {
         label.push_str(FACT_SEPARATOR);
         label.push_str(timing);
     }
@@ -31091,10 +31117,8 @@ fn setting_row_parts_in(
         } else {
             setting_reset_button_to(field, theme_fallback.as_ref())
         })
-    } else if reserve_reset_slot {
-        Some(reset_slot(field.key))
     } else {
-        None
+        Some(reset_slot(field.key))
     };
     let label_node = match reset {
         Some(reset) if width == SettingsWidth::Compact && !matches!(field.kind, EditKind::Bool) => {
@@ -31814,6 +31838,13 @@ fn color_submission_error(field: &EditField, raw: Option<&str>) -> Option<String
     })
 }
 
+/// Whether Return on bounded number `field`'s row refuses `text` (outside its range, not a
+/// number, or not whole on a whole-number row).
+fn refused_number(state: &SettingsViewState, field: &EditField, text: &str) -> bool {
+    submission_error(field, Some(text)).is_some()
+        || window_top_submission_error(state, field, Some(text)).is_some()
+}
+
 fn submission_error(field: &EditField, raw: Option<&str>) -> Option<String> {
     if let Some(message) =
         bounded_numeric_submission_error(field, raw).or_else(|| color_submission_error(field, raw))
@@ -31860,6 +31891,40 @@ fn slider_edits(view: &SettingsViewState, key: &str, value: String) -> Vec<Confi
     }];
     edits.extend(window_top_follows_sides(view, key, value.as_deref()));
     edits
+}
+
+/// What a slider row says it takes beyond its arrows' steps ([`SettingsViewState::open_text_entry`]).
+const SLIDER_EXACT_HINT: &str = "press Return or type a number for an exact value";
+
+/// `value` as a slider row writes a value set outright (VoiceOver, `aterm ctl act`, a
+/// click): inside the row's domain, whole on a whole-number row and free of binary-float
+/// noise, but never pulled onto the arrow keys' grid (15.5 px stays 15.5).
+fn exact_slider_value(value: f64, range: prefs::Range, kind: EditKind) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    let value = value.clamp(range.min, range.max);
+    let value = if kind == EditKind::Integer {
+        value.round()
+    } else {
+        (value * 1e6).round() / 1e6
+    };
+    Some(compact_f64(value))
+}
+
+/// Where an arrow takes a slider from `current`: `steps` grid points on, counting the
+/// nearest grid point that way as the first where `current` is off the grid (13.5 px:
+/// Right is 14, Left is 13).
+fn slider_step_target(current: f64, steps: f64, range: prefs::Range) -> f64 {
+    let index = (current - range.min) / range.step;
+    let base = if (index - index.round()).abs() <= 1e-6 {
+        index.round()
+    } else if steps > 0.0 {
+        index.floor()
+    } else {
+        index.ceil()
+    };
+    range.min + (base + steps) * range.step
 }
 
 fn normalize_slider_value(value: f64, range: prefs::Range) -> Option<String> {
@@ -31998,7 +32063,7 @@ fn about_page(
             audit_id: crate::native_ui::WORDMARK_AUDIT,
             role: SemanticRole::Heading,
             label: "aterm".to_string(),
-            value: None,
+            paint: None,
             action: None,
             focusable: false,
             focused: false,
@@ -35546,7 +35611,7 @@ fn messages_rule(key: &str) -> UiNode {
             audit_id: crate::native_ui::MESSAGES_RULE_AUDIT,
             role: SemanticRole::Group,
             label: String::new(),
-            value: None,
+            paint: None,
             action: None,
             focusable: false,
             focused: false,
@@ -35767,7 +35832,7 @@ fn messages_head_node(
             audit_id: crate::native_ui::MESSAGES_SEVERITY_AUDIT,
             role: SemanticRole::Group,
             label: String::new(),
-            value: Some(format!("{}:{}", entry.severity, entry.glyph)),
+            paint: Some(format!("{}:{}", entry.severity, entry.glyph)),
             action: None,
             focusable: false,
             focused: false,
@@ -36532,7 +36597,7 @@ fn messages_scroll_node(
             audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
             role: SemanticRole::Group,
             label: String::new(),
-            value: Some(format!("{},{},{total}", rows.start, rows.len())),
+            paint: Some(format!("{},{},{total}", rows.start, rows.len())),
             action: None,
             focusable: false,
             focused: false,
@@ -38410,19 +38475,34 @@ pub(crate) struct SearchQuery<'a> {
 
 impl<'a> SearchQuery<'a> {
     /// `text` (trimmed, ASCII-lowercased) as a search over `state`, at the reach its results set.
+    ///
+    /// The decision scans every row, page and aterm.toml key for a word start, and a frame asks it
+    /// of one query several times (the list, its count, the preview's focus, the host's font and
+    /// animation passes): it is made once per query and per everything it reads
+    /// ([`ReachMemo::reads`]), so no frame pays for it twice and none reads a stale answer.
     pub(crate) fn of(state: &SettingsViewState, text: &'a str) -> Self {
         let words = Self {
             text,
             reach: MatchReach::Words,
         };
-        if text.is_empty() || search_has_a_result(state, words) {
-            words
-        } else {
-            Self {
-                text,
-                reach: MatchReach::Loose,
-            }
+        if text.is_empty() {
+            return words;
         }
+        if let Some(memo) = state.search_reach.borrow().as_ref()
+            && memo.reads(state, text)
+        {
+            return Self {
+                text,
+                reach: memo.reach,
+            };
+        }
+        let reach = if search_has_a_result(state, words) {
+            MatchReach::Words
+        } else {
+            MatchReach::Loose
+        };
+        *state.search_reach.borrow_mut() = Some(ReachMemo::of(state, text, reach));
+        Self { text, reach }
     }
 
     const fn is_empty(self) -> bool {
@@ -38430,11 +38510,55 @@ impl<'a> SearchQuery<'a> {
     }
 }
 
+/// A search's decided reach ([`SearchQuery::of`]) and the inputs the decision read: the query,
+/// which rows a search may show (the keys `aterm.toml` sets or retired, and what this Mac and
+/// build offer) and the theme names it matches. Row labels, keywords, page names and the
+/// aterm.toml schema are fixed for the build.
+struct ReachMemo {
+    text: String,
+    authored: Vec<String>,
+    retired: BTreeSet<&'static str>,
+    availability: SettingsAvailability,
+    themes: Arc<crate::app_config::ThemeCatalog>,
+    reach: MatchReach,
+}
+
+impl ReachMemo {
+    fn of(state: &SettingsViewState, text: &str, reach: MatchReach) -> Self {
+        Self {
+            text: text.to_owned(),
+            authored: state.raw_values.keys().cloned().collect(),
+            retired: state.retired_authored.clone(),
+            availability: SettingsAvailability::for_state(state),
+            themes: Arc::clone(&state.assets.themes),
+            reach,
+        }
+    }
+
+    /// Whether this answer was decided for `text` over what `state` holds now. The catalog is
+    /// held, so a new one never takes the old one's address.
+    fn reads(&self, state: &SettingsViewState, text: &str) -> bool {
+        self.text == text
+            && Arc::ptr_eq(&self.themes, &state.assets.themes)
+            && self.availability == SettingsAvailability::for_state(state)
+            && self.retired == state.retired_authored
+            && state.raw_values.keys().eq(self.authored.iter())
+    }
+}
+
 fn folded_search(state: &SettingsViewState) -> String {
     state.search.trim().to_ascii_lowercase()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`search_has_a_result`] has scanned on this thread.
+    pub(crate) static REACH_SCANS: Cell<usize> = const { Cell::new(0) };
+}
+
 fn search_has_a_result(state: &SettingsViewState, query: SearchQuery<'_>) -> bool {
+    #[cfg(test)]
+    REACH_SCANS.with(|scans| scans.set(scans.get() + 1));
     let mut scratch = String::new();
     state
         .legacy

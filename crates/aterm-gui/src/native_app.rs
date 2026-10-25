@@ -1192,7 +1192,7 @@ impl NativeAppModel for RecoveryApp {
                     RecoveryLineStyle::Secondary => (SemanticRole::Text, StyleRef::Secondary),
                     RecoveryLineStyle::Code => (SemanticRole::Text, StyleRef::Code),
                 };
-                UiNode::new(
+                let node = UiNode::new(
                     format!("recovery/line/{}/{}", projection.page, index),
                     UiContent::Text(TextSpec {
                         text: line.text.clone(),
@@ -1200,7 +1200,14 @@ impl NativeAppModel for RecoveryApp {
                         style,
                     }),
                 )
-                .layout(Layout::default().height(Length::Fixed(projection.line_height)))
+                .layout(Layout::default().height(Length::Fixed(projection.line_height)));
+                // A blank line is spacing between paragraphs: a screen reader would stop on an
+                // element with nothing to say.
+                if line.text.trim().is_empty() {
+                    node.paint_only()
+                } else {
+                    node
+                }
             })
             .collect::<Vec<_>>();
         let actions = if projection.stacked_actions {
@@ -1583,6 +1590,46 @@ mod recovery_tests {
             }
             compiled.validate_parity().unwrap();
         }
+    }
+
+    /// A blank line in the diagnostics is the space between paragraphs: it paints, and a screen
+    /// reader never stops on it, as it would on an element with nothing to say.
+    #[test]
+    fn a_recovery_pages_blank_lines_are_not_spoken() {
+        let mut app = recovery(None);
+        app.metadata = "first=1\n\nsecond=2\n".to_string();
+        let viewport = LogicalRect::new(0.0, 0.0, 800.0, 600.0);
+        let compiled = app
+            .view(
+                &RecoveryViewState::default(),
+                &ViewCx {
+                    viewport,
+                    animation_phase_ms: 0,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 13.0,
+                    terminal_scale: 1.0,
+                    semantic_font: None,
+                    document: None,
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let blank = compiled
+            .paint
+            .iter()
+            .find(|node| {
+                node.key.as_str().starts_with("recovery/line/")
+                    && matches!(&node.content, crate::native_ui::UiContent::Text(spec) if spec.text.trim().is_empty())
+            })
+            .expect("the blank line paints");
+        assert!(compiled.semantic(&blank.key).is_none(), "{:?}", blank.key);
+        assert!(
+            compiled
+                .semantics
+                .iter()
+                .any(|node| node.label == "second=2"),
+            "the lines around it are read"
+        );
     }
 
     #[test]
@@ -3898,13 +3945,18 @@ struct MarkdownReaderGeometry {
     split_gap: f32,
     preview_content_width: f32,
     preview_viewport_height: f32,
+    viewport_height: f32,
 }
 
 impl MarkdownReaderGeometry {
+    /// The geometry with the header at its one-row height; [`MarkdownApp::reader_layout`]
+    /// sets the height the header's rows measure ([`Self::with_header_height`]).
     fn new(mode: MarkdownViewMode, viewport_width: f32, viewport_height: f32) -> Self {
         let wide_outline = mode == MarkdownViewMode::Preview
             && viewport_width >= 920.0
             && viewport_height >= 380.0;
+        // The outline keeps its width at every text size (its rows wrap instead), so
+        // the reading column keeps its room.
         let outline_width = if wide_outline { 220.0 } else { 0.0 };
         let main_width = (viewport_width - outline_width).max(280.0);
         let compact = main_width < 590.0 || viewport_height < 440.0;
@@ -3916,7 +3968,6 @@ impl MarkdownReaderGeometry {
             ((main_width - 760.0) / 2.0).max(28.0)
         };
         let content_width = (main_width - horizontal_padding * 2.0).max(252.0);
-        let header_height = if compact { 92.0 } else { 102.0 };
         let main_vertical_padding = if compact { 12.0 } else { 20.0 };
         let main_gap = if compact { 8.0 } else { 10.0 };
         let preview_horizontal_inset = if compact { 10.0 } else { 14.0 };
@@ -3927,12 +3978,6 @@ impl MarkdownReaderGeometry {
         } else {
             (content_width - preview_horizontal_inset * 2.0).max(180.0)
         };
-        let preview_viewport_height = (viewport_height
-            - header_height
-            - main_vertical_padding * 2.0
-            - main_gap
-            - preview_vertical_inset * 2.0)
-            .max(120.0);
         Self {
             wide_outline,
             outline_width,
@@ -3940,16 +3985,224 @@ impl MarkdownReaderGeometry {
             compact,
             horizontal_padding,
             content_width,
-            header_height,
+            header_height: 0.0,
             main_vertical_padding,
             main_gap,
             preview_horizontal_inset,
             preview_vertical_inset,
             split_gap,
             preview_content_width,
-            preview_viewport_height,
+            preview_viewport_height: 0.0,
+            viewport_height,
+        }
+        .with_header_height(MarkdownReaderHeader::rows_height(compact, 1, false))
+    }
+
+    /// The geometry under a header `header_height` tall.
+    fn with_header_height(mut self, header_height: f32) -> Self {
+        self.header_height = header_height;
+        self.preview_viewport_height = (self.viewport_height
+            - header_height
+            - self.main_vertical_padding * 2.0
+            - self.main_gap
+            - self.preview_vertical_inset * 2.0)
+            .max(120.0);
+        self
+    }
+}
+
+/// The reader's text scale, as every native view reads it.
+fn markdown_text_scale() -> f32 {
+    let scale = crate::native_appearance::text_scale();
+    if scale.is_finite() && scale > 0.0 {
+        scale.clamp(0.85, 2.0)
+    } else {
+        1.0
+    }
+}
+
+/// The reader header's rows at the current text size: the controls row, then the reading
+/// status beside Prev and Next when it fits there, else on rows of its own above them,
+/// wrapped at whole words. Every row is as tall as the text it holds.
+#[derive(Clone, Debug)]
+struct MarkdownReaderHeader {
+    controls_h: f32,
+    status_line_h: f32,
+    status_lines: Vec<String>,
+    stacked: bool,
+    height: f32,
+}
+
+impl MarkdownReaderHeader {
+    /// The most rows the status wraps to before its last one ends in `…`.
+    const MAX_STATUS_LINES: usize = 3;
+    /// The header's vertical padding, and the gap between its rows.
+    const PADDING: f32 = 10.0;
+    const GAP: f32 = 4.0;
+
+    /// The controls row's height: its buttons' label, and the wide header's title.
+    fn controls_height(compact: bool) -> f32 {
+        let button = crate::native_ui::native_button_line_height() + 20.0;
+        let title = if compact {
+            0.0
+        } else {
+            (crate::native_ui::text_paint_metrics(
+                crate::native_ui::SemanticRole::Heading,
+                crate::native_ui::StyleRef::Primary,
+            )
+            .0 * 1.25)
+                .ceil()
+        };
+        button.max(title).max(if compact { 36.0 } else { 42.0 })
+    }
+
+    /// One status row's height: the status line, and the Prev and Next labels.
+    fn status_line_height() -> f32 {
+        let (px, _) = crate::native_ui::text_paint_metrics(
+            crate::native_ui::SemanticRole::Status,
+            crate::native_ui::StyleRef::Primary,
+        );
+        (px * 1.45)
+            .ceil()
+            .max(crate::native_ui::native_button_line_height() + 8.0)
+            .max(28.0)
+    }
+
+    /// The height of `lines` status rows `line` tall stacked above the Prev and Next row.
+    fn stacked_status_height(lines: usize, line: f32) -> f32 {
+        let lines = lines.max(1) as f32;
+        lines * line + Self::GAP * lines + line
+    }
+
+    /// The header's height with `lines` status lines, `stacked` above Prev and Next or
+    /// beside them. At the default size one row beside them is the 92pt (compact) or 102pt
+    /// header it always was.
+    fn rows_height(compact: bool, lines: usize, stacked: bool) -> f32 {
+        let line = Self::status_line_height();
+        let status_rows = if stacked {
+            Self::stacked_status_height(lines, line)
+        } else {
+            line
+        };
+        let rest = if compact { 4.0 } else { 8.0 };
+        Self::PADDING * 2.0 + Self::controls_height(compact) + Self::GAP + status_rows + rest
+    }
+}
+
+/// One destination of the wide reader's outline (a section, a link, an image): a navigation
+/// row whose name wraps to [`Self::MAX_LINES`] lines in the outline's room at the current
+/// text size, the row as tall as its lines; past them the last line ends in `…`. Its lines
+/// start where a text row's do (its pictogram gives way to its name, as a narrow Settings
+/// row's does), a section's indented by its depth, so the outline reads as a hierarchy. Its
+/// accessible name is the whole name.
+struct MarkdownOutlineItem {
+    key: String,
+    label: String,
+    /// How many levels in its lines start: a section's heading level past the first.
+    depth: usize,
+    icon: crate::native_ui::ButtonIcon,
+    action: String,
+    enabled: bool,
+    selected: bool,
+}
+
+impl MarkdownOutlineItem {
+    const MAX_LINES: usize = 3;
+    /// The deepest a section's lines are indented.
+    const MAX_DEPTH: usize = 3;
+
+    /// A one-line destination's height.
+    fn single_height() -> f32 {
+        (crate::native_ui::native_button_line_height() + 16.0).max(32.0)
+    }
+
+    fn spec(&self) -> crate::native_ui::ButtonSpec {
+        crate::native_ui::ButtonSpec::new(self.label.clone())
+            .visual_icon(self.icon)
+            .icon_hidden(true)
+    }
+
+    /// The lines its name paints on in a row `room` wide: wrapped at whole words in the
+    /// label room the painter gives it ([`crate::native_ui::navigation_label_room`]), each
+    /// line indented by its depth.
+    fn lines(&self, room: f32) -> Vec<String> {
+        let measure = &crate::native_ui::navigation_label_width;
+        let indent = "  ".repeat(self.depth.min(Self::MAX_DEPTH));
+        let label_room = (crate::native_ui::navigation_label_room(&self.spec(), room)
+            - measure(&indent))
+        .max(0.0);
+        let mut lines = crate::native_settings::wrap_to_box(&self.label, label_room, measure);
+        if lines.len() > Self::MAX_LINES {
+            let rest = lines.split_off(Self::MAX_LINES - 1).join(" ");
+            lines.push(fit_to_width_with(&rest, label_room, measure));
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+            .into_iter()
+            .map(|line| format!("{indent}{line}"))
+            .collect()
+    }
+
+    /// The height of a destination whose name paints on `lines` lines.
+    fn height(lines: usize) -> f32 {
+        crate::native_ui::navigation_row_height_for_lines(lines.max(1), Self::single_height())
+    }
+
+    /// The destination's row, its name on `lines` ([`Self::lines`]).
+    fn node(self, lines: &[String]) -> crate::native_ui::UiNode {
+        use crate::native_ui::{
+            ActionId, Control, ControlState, Layout, Length, StyleRef, UiContent, UiNode,
+        };
+
+        let spec = self.spec().visual_label(lines.join("\n"));
+        UiNode::new(
+            self.key,
+            UiContent::Button(
+                Control::new(spec, ActionId::new(self.action))
+                    .state(ControlState {
+                        enabled: self.enabled,
+                        selected: self.selected,
+                        ..ControlState::default()
+                    })
+                    .style(StyleRef::Navigation),
+            ),
+        )
+        .layout(
+            Layout::default()
+                .height(Length::Fixed(Self::height(lines.len())))
+                .width(Length::Fill),
+        )
+    }
+}
+
+/// `text` cut at its last whole word that fits `room` by `measure`, with a closing `…`;
+/// where not one word fits, as many of its chars as do.
+fn fit_to_width_with(text: &str, room: f32, measure: &dyn Fn(&str) -> f32) -> String {
+    let fits = |candidate: &str| measure(candidate) <= room + crate::native_ui::TEXT_FIT_SLACK;
+    if fits(text) {
+        return text.to_string();
+    }
+    let mut kept = String::new();
+    for word in text.split_inclusive(char::is_whitespace) {
+        let candidate = format!("{kept}{word}");
+        if !fits(&format!("{}…", candidate.trim_end())) {
+            break;
+        }
+        kept = candidate;
+    }
+    if kept.trim().is_empty() {
+        kept.clear();
+        for c in text.chars() {
+            let candidate = format!("{kept}{c}");
+            if !fits(&format!("{candidate}…")) {
+                break;
+            }
+            kept = candidate;
         }
     }
+    format!("{}…", kept.trim_end())
 }
 
 /// Compact Markdown controller.
@@ -4032,23 +4285,177 @@ impl MarkdownApp {
         geometry: &MarkdownReaderGeometry,
         direction: i32,
     ) -> crate::native_markdown::MarkdownLocation {
-        let rows = (geometry.preview_viewport_height / 22.0 * 0.82)
-            .floor()
-            .max(1.0) as isize;
-        let delta = rows.saturating_mul(direction.signum() as isize);
+        let ty = crate::native_ui::reader_type();
+        let page = geometry.preview_viewport_height * 0.82;
         if view.mode == MarkdownViewMode::Source {
+            // The source pane's rows are its code frame's.
+            let row_h = crate::native_markdown::block_frame(
+                crate::native_markdown::BlockShape::Code {
+                    labelled: true,
+                    dense: false,
+                },
+                ty,
+            )
+            .map_or(22.0, |frame| frame.line_h);
+            let delta = ((page / row_h).floor().max(1.0) as isize)
+                .saturating_mul(direction.signum() as isize);
             crate::native_markdown::MarkdownLocation::new(
                 crate::native_markdown::move_source_lines(&self.parsed, view.source_anchor, delta),
                 0,
             )
         } else {
-            crate::native_markdown::move_visual_rows(
+            crate::native_markdown::move_visual_distance(
                 &self.parsed,
                 Self::location(view),
                 geometry.preview_content_width,
-                delta,
+                ty,
+                page,
+                direction,
             )
         }
+    }
+
+    /// The reader's status line: a notice while one stands, else the reading position. The
+    /// `compact` form leaves the section's name out. `widest` gives the position's numbers at
+    /// their widest (the last section or block, 100% read), so a layout measured with it
+    /// does not change as the reader moves.
+    fn reader_status(&self, view: &MarkdownViewState, compact: bool, widest: bool) -> String {
+        if let Some(notice) = view.notice.as_deref().or(self.recovery_status.as_deref()) {
+            return bounded_markdown_text(notice, 180);
+        }
+        let state_suffix = if self.selection(view).is_some() {
+            " · source selected"
+        } else if self.dirty {
+            " · modified"
+        } else {
+            ""
+        };
+        let blocks = self.parsed.blocks.len();
+        if blocks == 0 {
+            return format!("Empty document{state_suffix}");
+        }
+        let percent = if widest {
+            100
+        } else {
+            view.source_anchor
+                .min(self.parsed.source_len)
+                .saturating_mul(100)
+                .checked_div(self.parsed.source_len)
+                .unwrap_or(0)
+        };
+        let section_count = self.parsed.outline.len();
+        if section_count == 0 {
+            let block = if widest {
+                blocks
+            } else {
+                crate::native_markdown::block_at_source(&self.parsed, view.source_anchor)
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .min(blocks)
+            };
+            return if compact {
+                format!("Block {block}/{blocks} · {percent}% read{state_suffix}")
+            } else {
+                format!("{percent}% read · block {block} of {blocks}{state_suffix}")
+            };
+        }
+        let current = crate::native_markdown::heading_at_source(&self.parsed, view.source_anchor);
+        let section = if widest {
+            section_count
+        } else {
+            current.map_or(0, |index| index.saturating_add(1)).max(1)
+        };
+        if compact {
+            format!("Section {section}/{section_count} · {percent}% read{state_suffix}")
+        } else {
+            let name = current
+                .and_then(|index| self.parsed.outline.get(index))
+                .map_or("Document", |heading| heading.text.as_str());
+            format!(
+                "{} · section {section} of {section_count} · {percent}% read{state_suffix}",
+                bounded_markdown_label(name, 42),
+            )
+        }
+    }
+
+    /// The header's rows for `geometry`, measured at the current text size: the status
+    /// stays beside Prev and Next while it fits there; the wide header's long form (with
+    /// the section's name) gives way to the short one first; past that the status takes
+    /// rows of its own above Prev and Next, wrapped at whole words. The rows are measured
+    /// with the position at its widest, so reading on never moves the page under them.
+    fn reader_header(
+        &self,
+        view: &MarkdownViewState,
+        geometry: &MarkdownReaderGeometry,
+    ) -> MarkdownReaderHeader {
+        use crate::native_ui::{SemanticRole, StyleRef};
+
+        let compact = geometry.compact;
+        let scale = markdown_text_scale();
+        let inset = if compact { 10.0 } else { 14.0 };
+        let room = (geometry.content_width - inset * 2.0).max(0.0);
+        let (previous_label, previous_min, next_min) = if compact {
+            ("Prev", 46.0, 46.0)
+        } else {
+            ("Previous", 68.0, 54.0)
+        };
+        let beside = (room
+            - markdown_toolbar_label_width(previous_label, previous_min, scale)
+            - markdown_toolbar_label_width("Next", next_min, scale)
+            - 12.0)
+            .max(0.0);
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Primary);
+        let width = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px);
+        let fits = |text: &str, room: f32| width(text) <= room + crate::native_ui::TEXT_FIT_SLACK;
+        let short = compact || !fits(&self.reader_status(view, false, true), beside);
+        let shown = self.reader_status(view, short, false);
+        let measured = self.reader_status(view, short, true);
+        let controls_h = MarkdownReaderHeader::controls_height(compact);
+        let status_line_h = MarkdownReaderHeader::status_line_height();
+        if fits(&measured, beside) && fits(&shown, beside) {
+            return MarkdownReaderHeader {
+                controls_h,
+                status_line_h,
+                status_lines: vec![shown],
+                stacked: false,
+                height: MarkdownReaderHeader::rows_height(compact, 1, false),
+            };
+        }
+        let wrap = |text: &str| crate::native_settings::wrap_to_box(text, room, &width);
+        let rows = wrap(&measured)
+            .len()
+            .max(wrap(&shown).len())
+            .clamp(1, MarkdownReaderHeader::MAX_STATUS_LINES);
+        let mut lines = wrap(&shown);
+        if lines.len() > rows {
+            let rest = lines.split_off(rows - 1).join(" ");
+            lines.push(crate::native_ui::fit_text_label(
+                &rest,
+                room,
+                SemanticRole::Status,
+                StyleRef::Primary,
+            ));
+        }
+        MarkdownReaderHeader {
+            controls_h,
+            status_line_h,
+            status_lines: lines,
+            stacked: true,
+            height: MarkdownReaderHeader::rows_height(compact, rows, true),
+        }
+    }
+
+    /// The reader's geometry in a viewport `width` by `height`, under its measured header.
+    fn reader_layout(
+        &self,
+        view: &MarkdownViewState,
+        width: f32,
+        height: f32,
+    ) -> (MarkdownReaderGeometry, MarkdownReaderHeader) {
+        let geometry = MarkdownReaderGeometry::new(view.mode, width, height);
+        let header = self.reader_header(view, &geometry);
+        (geometry.with_header_height(header.height), header)
     }
 
     fn outline_target(&self, view: &MarkdownViewState, delta: isize) -> Option<usize> {
@@ -4126,10 +4533,14 @@ impl NativeAppModel for MarkdownApp {
                 EventResult::Handled
             }
             AppEvent::ScrollLines(lines) => {
+                // The window sends its scrolls as `MarkdownScroll`, with the viewport they
+                // measure against; a bare `ScrollLines` has none and moves rows of a
+                // reader column of the default width.
                 let next = crate::native_markdown::move_visual_rows(
                     &self.parsed,
                     Self::location(view),
                     680.0,
+                    crate::native_ui::reader_type(),
                     lines.clamp(-256, 256) as isize,
                 );
                 Self::navigate(view, next);
@@ -4138,7 +4549,7 @@ impl NativeAppModel for MarkdownApp {
             AppEvent::MarkdownScroll {
                 lines,
                 viewport_width,
-                viewport_height: _,
+                viewport_height,
             } => {
                 let extreme = lines.unsigned_abs() >= 10_000;
                 match view.mode {
@@ -4165,10 +4576,18 @@ impl NativeAppModel for MarkdownApp {
                         } else {
                             lines.clamp(-256, 256) as isize
                         };
+                        // Rows of the column the reader lays out in this viewport, not of
+                        // the viewport itself.
+                        let geometry = MarkdownReaderGeometry::new(
+                            view.mode,
+                            viewport_width.max(1.0),
+                            viewport_height.max(1.0),
+                        );
                         let next = crate::native_markdown::move_visual_rows(
                             &self.parsed,
                             Self::location(view),
-                            viewport_width.max(1.0),
+                            geometry.preview_content_width,
+                            crate::native_ui::reader_type(),
                             delta,
                         );
                         Self::navigate(view, next);
@@ -4181,8 +4600,7 @@ impl NativeAppModel for MarkdownApp {
                 viewport_width,
                 viewport_height,
             } => {
-                let geometry =
-                    MarkdownReaderGeometry::new(view.mode, viewport_width, viewport_height);
+                let (geometry, _) = self.reader_layout(view, viewport_width, viewport_height);
                 let next = self.page_target(view, &geometry, direction);
                 Self::navigate(view, next);
                 EventResult::Handled
@@ -4440,8 +4858,8 @@ impl NativeAppModel for MarkdownApp {
             UiNode,
         };
 
-        let geometry =
-            MarkdownReaderGeometry::new(view.mode, cx.viewport.width, cx.viewport.height);
+        let (geometry, reader_header) =
+            self.reader_layout(view, cx.viewport.width, cx.viewport.height);
         let MarkdownReaderGeometry {
             wide_outline,
             outline_width,
@@ -4457,6 +4875,7 @@ impl NativeAppModel for MarkdownApp {
             split_gap,
             preview_content_width,
             preview_viewport_height,
+            viewport_height: _,
         } = geometry;
         let visible = crate::native_markdown::layout_visible_blocks(
             &self.parsed,
@@ -4464,6 +4883,7 @@ impl NativeAppModel for MarkdownApp {
             view.visual_row,
             preview_content_width,
             preview_viewport_height,
+            crate::native_ui::reader_type(),
         );
         let anchor_index = visible.anchor_index;
         let current_location = Self::location(view);
@@ -4473,9 +4893,6 @@ impl NativeAppModel for MarkdownApp {
         let can_page_forward = next_page != current_location;
         let current_heading =
             crate::native_markdown::heading_at_source(&self.parsed, view.source_anchor);
-        let current_section = current_heading
-            .and_then(|index| self.parsed.outline.get(index))
-            .map_or("Document", |heading| heading.text.as_str());
         let selected = self.selection(view);
         let visible_source_start = visible
             .blocks
@@ -4493,59 +4910,6 @@ impl NativeAppModel for MarkdownApp {
         let mut preview_blocks = Vec::with_capacity(visible.blocks.len() + 2);
         let section_count = self.parsed.outline.len();
         let section_position = current_heading.map_or(0, |index| index.saturating_add(1));
-        let progress_percent = view
-            .source_anchor
-            .min(self.parsed.source_len)
-            .saturating_mul(100)
-            .checked_div(self.parsed.source_len)
-            .unwrap_or(0);
-        let state_suffix = if selected.is_some() {
-            " · source selected"
-        } else if self.dirty {
-            " · modified"
-        } else {
-            ""
-        };
-        let progress = if self.parsed.blocks.is_empty() {
-            format!("Empty document{state_suffix}")
-        } else if section_count == 0 {
-            if compact {
-                format!(
-                    "Block {}/{} · {}% read{state_suffix}",
-                    anchor_index.saturating_add(1).min(self.parsed.blocks.len()),
-                    self.parsed.blocks.len(),
-                    progress_percent,
-                )
-            } else {
-                format!(
-                    "{}% read · block {} of {}{state_suffix}",
-                    progress_percent,
-                    anchor_index.saturating_add(1).min(self.parsed.blocks.len()),
-                    self.parsed.blocks.len(),
-                )
-            }
-        } else if compact {
-            format!(
-                "Section {}/{} · {}% read{state_suffix}",
-                section_position.max(1),
-                section_count,
-                progress_percent,
-            )
-        } else {
-            format!(
-                "{} · section {} of {} · {}% read{state_suffix}",
-                bounded_markdown_label(current_section, if compact { 24 } else { 42 }),
-                section_position.max(1),
-                section_count,
-                progress_percent,
-            )
-        };
-        let reader_status = view
-            .notice
-            .as_deref()
-            .or(self.recovery_status.as_deref())
-            .map_or(progress, |notice| bounded_markdown_text(notice, 180));
-        let reader_status = bounded_markdown_label(&reader_status, if compact { 52 } else { 96 });
         let show_history_controls =
             !wide_outline || view.history.can_back() || view.history.can_forward();
 
@@ -4793,6 +5157,120 @@ impl NativeAppModel for MarkdownApp {
                 ),
             ]);
         }
+        let page_button_width = |label: &str, minimum: f32| {
+            Length::Fixed(markdown_toolbar_label_width(label, minimum, text_scale))
+        };
+        let page_buttons = vec![
+            button(
+                "markdown/previous-page-button".to_string(),
+                ButtonSpec::new(if compact {
+                    "Prev: the previous reading page"
+                } else {
+                    "Previous reading page"
+                })
+                .visual_label(if compact { "Prev" } else { "Previous" }),
+                format!(
+                    "markdown/page/{}/{}",
+                    previous_page.source_anchor, previous_page.visual_row
+                ),
+                can_page_back,
+                false,
+                page_button_width(
+                    if compact { "Prev" } else { "Previous" },
+                    if compact { 46.0 } else { 68.0 },
+                ),
+            ),
+            button(
+                "markdown/next-page-button".to_string(),
+                ButtonSpec::new("Next reading page").visual_label("Next"),
+                format!(
+                    "markdown/page/{}/{}",
+                    next_page.source_anchor, next_page.visual_row
+                ),
+                can_page_forward,
+                false,
+                page_button_width("Next", if compact { 46.0 } else { 54.0 }),
+            ),
+        ];
+        let MarkdownReaderHeader {
+            controls_h,
+            status_line_h,
+            status_lines,
+            stacked,
+            height: _,
+        } = reader_header;
+        let status_line = |index: usize, text: String| {
+            UiNode::new(
+                if index == 0 {
+                    "markdown/status".to_string()
+                } else {
+                    format!("markdown/status/{index}")
+                },
+                UiContent::Text(TextSpec {
+                    text,
+                    role: SemanticRole::Status,
+                    style: StyleRef::Primary,
+                }),
+            )
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(status_line_h)),
+            )
+        };
+        let status_row = if stacked {
+            // The status on rows of its own, Prev and Next on the row under it.
+            let rows = status_lines.len();
+            let mut children = status_lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| status_line(index, line))
+                .collect::<Vec<_>>();
+            children.push(
+                UiNode::new(
+                    "markdown/page-row",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(Layout::row().height(Length::Fixed(status_line_h)).gap(6.0))
+                .children(
+                    std::iter::once(
+                        UiNode::new(
+                            "markdown/page-row/lead",
+                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                        )
+                        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+                    )
+                    .chain(page_buttons)
+                    .collect(),
+                ),
+            );
+            UiNode::new(
+                "markdown/status-row",
+                UiContent::Group(GroupSpec::new("Reading position and page navigation")),
+            )
+            .layout(
+                Layout::column()
+                    .height(Length::Fixed(MarkdownReaderHeader::stacked_status_height(
+                        rows,
+                        status_line_h,
+                    )))
+                    .gap(MarkdownReaderHeader::GAP),
+            )
+            .children(children)
+        } else {
+            let mut children = status_lines
+                .into_iter()
+                .take(1)
+                .map(|line| status_line(0, line))
+                .collect::<Vec<_>>();
+            children.extend(page_buttons);
+            UiNode::new(
+                "markdown/status-row",
+                UiContent::Group(GroupSpec::new("Reading position and page navigation")),
+            )
+            .layout(Layout::row().height(Length::Fixed(status_line_h)).gap(6.0))
+            .children(children)
+        };
         let header = UiNode::new(
             "markdown/header",
             UiContent::Group(GroupSpec::new(header_label).style(StyleRef::Secondary)),
@@ -4800,71 +5278,20 @@ impl NativeAppModel for MarkdownApp {
         .layout(
             Layout::column()
                 .height(Length::Fixed(header_height))
-                .padding(Insets::symmetric(if compact { 10.0 } else { 14.0 }, 10.0))
-                .gap(4.0),
+                .padding(Insets::symmetric(
+                    if compact { 10.0 } else { 14.0 },
+                    MarkdownReaderHeader::PADDING,
+                ))
+                .gap(MarkdownReaderHeader::GAP),
         )
         .children(vec![
             UiNode::new(
                 "markdown/header-row",
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
-            .layout(
-                Layout::row()
-                    .height(Length::Fixed(if compact { 36.0 } else { 42.0 }))
-                    .gap(6.0),
-            )
+            .layout(Layout::row().height(Length::Fixed(controls_h)).gap(6.0))
             .children(header_row_children),
-            UiNode::new(
-                "markdown/status-row",
-                UiContent::Group(GroupSpec::new("Reading position and page navigation")),
-            )
-            .layout(Layout::row().height(Length::Fixed(28.0)).gap(6.0))
-            .children(vec![
-                UiNode::new(
-                    "markdown/status",
-                    UiContent::Text(TextSpec {
-                        text: reader_status,
-                        role: SemanticRole::Status,
-                        style: StyleRef::Primary,
-                    }),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-                button(
-                    "markdown/previous-page-button".to_string(),
-                    ButtonSpec::new(if compact {
-                        "Prev: the previous reading page"
-                    } else {
-                        "Previous reading page"
-                    })
-                    .visual_label(if compact { "Prev" } else { "Previous" }),
-                    format!(
-                        "markdown/page/{}/{}",
-                        previous_page.source_anchor, previous_page.visual_row
-                    ),
-                    can_page_back,
-                    false,
-                    Length::Fixed(markdown_toolbar_label_width(
-                        if compact { "Prev" } else { "Previous" },
-                        if compact { 46.0 } else { 68.0 },
-                        text_scale,
-                    )),
-                ),
-                button(
-                    "markdown/next-page-button".to_string(),
-                    ButtonSpec::new("Next reading page").visual_label("Next"),
-                    format!(
-                        "markdown/page/{}/{}",
-                        next_page.source_anchor, next_page.visual_row
-                    ),
-                    can_page_forward,
-                    false,
-                    Length::Fixed(markdown_toolbar_label_width(
-                        "Next",
-                        if compact { 46.0 } else { 54.0 },
-                        text_scale,
-                    )),
-                ),
-            ]),
+            status_row,
         ]);
         if self.parsed.blocks.is_empty() {
             preview_blocks.push(
@@ -4902,6 +5329,7 @@ impl NativeAppModel for MarkdownApp {
                 ]),
             );
         }
+        let reader_type = crate::native_ui::reader_type();
         for visible_block in visible
             .blocks
             .into_iter()
@@ -4912,8 +5340,30 @@ impl NativeAppModel for MarkdownApp {
                 continue;
             };
             let key = format!("markdown/block/{index}");
-            let paint_height =
-                (visible_block.height - crate::native_markdown::VISUAL_BLOCK_GAP).max(20.0);
+            // The height the layout measured ([`crate::native_markdown::measure_block`]),
+            // so each block stands where the layout counted it.
+            let mut paint_height =
+                (visible_block.height - crate::native_markdown::VISUAL_BLOCK_GAP).max(1.0);
+            // The preview shows whole rows: a block the bottom edge would cut ends at its
+            // last row that fits, and the rows after it are a scroll away.
+            let room = preview_viewport_height - visible_block.y;
+            if paint_height > room + 0.01 {
+                let whole = crate::native_markdown::block_frame(
+                    crate::native_markdown::BlockShape::of(block),
+                    reader_type,
+                )
+                .map_or(0.0, |frame| {
+                    if room - frame.inset_top + 0.01 < frame.line_h {
+                        0.0
+                    } else {
+                        frame.inset_top + frame.rows_in(room) as f32 * frame.line_h
+                    }
+                });
+                if whole <= 0.0 {
+                    break;
+                }
+                paint_height = whole;
+            }
             let kind = match block {
                 MarkdownBlock::Heading { level, .. } => MarkdownBlockKind::Heading(*level),
                 MarkdownBlock::Paragraph { .. } => MarkdownBlockKind::Paragraph,
@@ -4941,14 +5391,14 @@ impl NativeAppModel for MarkdownApp {
                     selection.start < block.source().end && selection.end > block.source().start
                 }),
                 source: block.source().clone(),
-                estimated_height: paint_height.clamp(20.0, 1_000_000.0),
+                estimated_height: paint_height.min(1_000_000.0),
                 visual_row: visible_block.visual_row,
                 total_visual_rows: visible_block.total_visual_rows,
             });
             preview_blocks.push(
                 UiNode::new(key, node).layout(
                     Layout::default()
-                        .height(Length::Fixed(paint_height.clamp(20.0, 1_000_000.0)))
+                        .height(Length::Fixed(paint_height.min(1_000_000.0)))
                         .width(Length::Fill),
                 ),
             );
@@ -5045,22 +5495,142 @@ impl NativeAppModel for MarkdownApp {
 
         let mut shell_children = Vec::with_capacity(if wide_outline { 2 } else { 1 });
         if wide_outline {
-            let row_budget = (((cx.viewport.height - 116.0) / 34.0).floor() as usize).clamp(3, 18);
-            let resource_reserve = usize::from(!visible_links.is_empty())
-                .saturating_add(visible_links.len())
-                .saturating_add(usize::from(!visible_images.is_empty()))
-                .saturating_add(visible_images.len());
-            let outline_limit = row_budget.saturating_sub(resource_reserve).clamp(3, 16);
-            let outline_range = crate::native_markdown::outline_window(
+            // The outline's rows at the current text size: a title row as tall as its caption,
+            // the section line as a status line, and each destination as tall as its name's
+            // lines ([`MarkdownOutlineItem`]). They fill the outline's column by their heights,
+            // never past it: the sections nearest the current one, and the links and images in
+            // view beside them while the column holds both.
+            let title_h =
+                (crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet).0
+                    * 1.45)
+                    .ceil()
+                    .max(20.0);
+            let section_h = MarkdownReaderHeader::status_line_height();
+            let item_room = (outline_width - 32.0).max(0.0);
+            const OUTLINE_GAP: f32 = 6.0;
+            const OUTLINE_MOST_SECTIONS: usize = 16;
+            const OUTLINE_LEAST_SECTIONS: usize = 3;
+            let column = (cx.viewport.height - 32.0).max(0.0);
+            let measured = |item: MarkdownOutlineItem| {
+                let lines = item.lines(item_room);
+                let height = MarkdownOutlineItem::height(lines.len());
+                (item, lines, height)
+            };
+            let mut links = visible_links
+                .iter()
+                .filter_map(|&index| {
+                    let link = self.parsed.links.get(index)?;
+                    let local =
+                        matches!(link.policy, crate::native_markdown::LinkPolicy::LocalAnchor);
+                    let mark = if local { "#" } else { "Link" };
+                    Some(measured(MarkdownOutlineItem {
+                        key: format!("markdown/link-item/{index}"),
+                        label: format!("{mark} {}", bounded_markdown_text(&link.label, 180)),
+                        depth: 0,
+                        icon: ButtonIcon::Forward,
+                        action: format!("markdown/link/{index}"),
+                        enabled: self.link_enabled(index),
+                        selected: false,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let mut images = visible_images
+                .iter()
+                .filter_map(|&index| {
+                    let image = self.parsed.images.get(index)?;
+                    let label = image.alt.as_deref().unwrap_or(&image.source_uri);
+                    Some(measured(MarkdownOutlineItem {
+                        key: format!("markdown/image-item/{index}"),
+                        label: format!("Image {}", bounded_markdown_text(label, 180)),
+                        depth: 0,
+                        icon: ButtonIcon::Image,
+                        action: format!("markdown/image/{index}"),
+                        enabled: !matches!(
+                            crate::native_markdown::reduce_image_action(image, true),
+                            crate::native_markdown::MarkdownImageAction::Denied { .. }
+                        ),
+                        selected: false,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            // The sections in the widest window, measured once: every narrower window around
+            // the current section lies inside it ([`crate::native_markdown::outline_window`]).
+            let widest = crate::native_markdown::outline_window(
                 &self.parsed,
                 view.source_anchor,
-                outline_limit,
+                OUTLINE_MOST_SECTIONS,
             );
+            let mut sections = widest
+                .clone()
+                .filter_map(|index| {
+                    let heading = self.parsed.outline.get(index)?;
+                    Some(measured(MarkdownOutlineItem {
+                        key: format!("markdown/outline-item/{index}"),
+                        label: bounded_markdown_text(&heading.text, 180),
+                        depth: usize::from(heading.level.saturating_sub(1)),
+                        icon: ButtonIcon::Text,
+                        action: format!("markdown/outline/{index}"),
+                        enabled: true,
+                        selected: current_heading == Some(index),
+                    }))
+                })
+                .map(Some)
+                .collect::<Vec<_>>();
+            let window = |limit: usize| {
+                let range =
+                    crate::native_markdown::outline_window(&self.parsed, view.source_anchor, limit);
+                range.start.saturating_sub(widest.start)..range.end.saturating_sub(widest.start)
+            };
+            let rows_height = |rows: &[(MarkdownOutlineItem, Vec<String>, f32)]| {
+                rows.iter()
+                    .map(|(_, _, height)| OUTLINE_GAP + height)
+                    .sum::<f32>()
+            };
+            let resource_height = |rows: &[(MarkdownOutlineItem, Vec<String>, f32)]| {
+                if rows.is_empty() {
+                    0.0
+                } else {
+                    OUTLINE_GAP + title_h + rows_height(rows)
+                }
+            };
+            let sections_height = |range: std::ops::Range<usize>| {
+                if widest.is_empty() {
+                    OUTLINE_GAP + section_h
+                } else {
+                    sections
+                        .get(range)
+                        .unwrap_or_default()
+                        .iter()
+                        .flatten()
+                        .map(|(_, _, height)| OUTLINE_GAP + height)
+                        .sum::<f32>()
+                }
+            };
+            let fixed = title_h + OUTLINE_GAP + section_h;
+            // The links and images give way, the last first, until the sections nearest the
+            // current one fit beside them.
+            let least = window(OUTLINE_LEAST_SECTIONS);
+            while fixed
+                + resource_height(&links)
+                + resource_height(&images)
+                + sections_height(least.clone())
+                > column + 0.01
+            {
+                if images.pop().is_none() && links.pop().is_none() {
+                    break;
+                }
+            }
+            let used = fixed + resource_height(&links) + resource_height(&images);
+            let shown = (1..=OUTLINE_MOST_SECTIONS)
+                .rev()
+                .map(window)
+                .find(|range| used + sections_height(range.clone()) <= column + 0.01)
+                .unwrap_or_else(|| window(1));
             let mut outline = Vec::with_capacity(
-                outline_range
+                shown
                     .len()
-                    .saturating_add(visible_links.len())
-                    .saturating_add(visible_images.len())
+                    .saturating_add(links.len())
+                    .saturating_add(images.len())
                     .saturating_add(4),
             );
             outline.push(
@@ -5072,7 +5642,7 @@ impl NativeAppModel for MarkdownApp {
                         style: StyleRef::Quiet,
                     }),
                 )
-                .layout(Layout::default().height(Length::Fixed(20.0))),
+                .layout(Layout::default().height(Length::Fixed(title_h))),
             );
             outline.push(
                 UiNode::new(
@@ -5081,15 +5651,27 @@ impl NativeAppModel for MarkdownApp {
                         text: if section_count == 0 {
                             "NO SECTIONS".to_string()
                         } else {
-                            format!("SECTION {} OF {}", section_position.max(1), section_count)
+                            let long =
+                                format!("SECTION {} OF {}", section_position.max(1), section_count);
+                            let (px, face) = crate::native_ui::text_paint_metrics(
+                                SemanticRole::Status,
+                                StyleRef::Primary,
+                            );
+                            if crate::tray_raster::ui_text_width_for(face, &long, px)
+                                <= item_room + crate::native_ui::TEXT_FIT_SLACK
+                            {
+                                long
+                            } else {
+                                format!("SECTION {}/{}", section_position.max(1), section_count)
+                            }
                         },
                         role: SemanticRole::Status,
                         style: StyleRef::Primary,
                     }),
                 )
-                .layout(Layout::default().height(Length::Fixed(28.0))),
+                .layout(Layout::default().height(Length::Fixed(section_h))),
             );
-            if outline_range.is_empty() {
+            if widest.is_empty() {
                 outline.push(
                     UiNode::new(
                         "markdown/no-outline",
@@ -5099,133 +5681,38 @@ impl NativeAppModel for MarkdownApp {
                             style: StyleRef::Quiet,
                         }),
                     )
-                    .layout(Layout::default().height(Length::Fixed(32.0))),
+                    .layout(Layout::default().height(Length::Fixed(section_h))),
                 );
             } else {
-                for index in outline_range {
-                    let Some(heading) = self.parsed.outline.get(index) else {
-                        continue;
-                    };
-                    let indent = "  ".repeat(usize::from(heading.level.saturating_sub(1)).min(3));
-                    let visual = format!(
-                        "{indent}{}",
-                        bounded_markdown_label(
-                            &heading.text,
-                            32usize.saturating_sub(indent.chars().count())
-                        )
-                    );
-                    outline.push(
-                        UiNode::new(
-                            format!("markdown/outline-item/{index}"),
-                            UiContent::Button(
-                                Control::new(
-                                    ButtonSpec::new(visual),
-                                    ActionId::new(format!("markdown/outline/{index}")),
-                                )
-                                .state(ControlState {
-                                    selected: current_heading == Some(index),
-                                    ..ControlState::default()
-                                })
-                                .style(StyleRef::Navigation),
-                            ),
-                        )
-                        .layout(
-                            Layout::default()
-                                .height(Length::Fixed(32.0))
-                                .width(Length::Fill),
-                        ),
-                    );
+                for (item, lines, _) in sections
+                    .get_mut(shown)
+                    .unwrap_or_default()
+                    .iter_mut()
+                    .filter_map(Option::take)
+                {
+                    outline.push(item.node(&lines));
                 }
             }
-            if !visible_links.is_empty() {
+            for (title_key, title, rows) in [
+                ("markdown/links-title", "LINKS HERE", links),
+                ("markdown/images-title", "IMAGES HERE", images),
+            ] {
+                if rows.is_empty() {
+                    continue;
+                }
                 outline.push(
                     UiNode::new(
-                        "markdown/links-title",
+                        title_key,
                         UiContent::Text(TextSpec {
-                            text: "LINKS HERE".to_string(),
+                            text: title.to_string(),
                             role: SemanticRole::Heading,
                             style: StyleRef::Quiet,
                         }),
                     )
-                    .layout(Layout::default().height(Length::Fixed(20.0))),
+                    .layout(Layout::default().height(Length::Fixed(title_h))),
                 );
-                for index in visible_links {
-                    let Some(link) = self.parsed.links.get(index) else {
-                        continue;
-                    };
-                    let local =
-                        matches!(link.policy, crate::native_markdown::LinkPolicy::LocalAnchor);
-                    let mark = if local { "#" } else { "Link" };
-                    outline.push(
-                        UiNode::new(
-                            format!("markdown/link-item/{index}"),
-                            UiContent::Button(
-                                Control::new(
-                                    ButtonSpec::new(format!(
-                                        "{mark} {}",
-                                        bounded_markdown_label(&link.label, 24)
-                                    )),
-                                    ActionId::new(format!("markdown/link/{index}")),
-                                )
-                                .state(ControlState {
-                                    enabled: self.link_enabled(index),
-                                    ..ControlState::default()
-                                })
-                                .style(StyleRef::Navigation),
-                            ),
-                        )
-                        .layout(
-                            Layout::default()
-                                .height(Length::Fixed(32.0))
-                                .width(Length::Fill),
-                        ),
-                    );
-                }
-            }
-            if !visible_images.is_empty() {
-                outline.push(
-                    UiNode::new(
-                        "markdown/images-title",
-                        UiContent::Text(TextSpec {
-                            text: "IMAGES HERE".to_string(),
-                            role: SemanticRole::Heading,
-                            style: StyleRef::Quiet,
-                        }),
-                    )
-                    .layout(Layout::default().height(Length::Fixed(20.0))),
-                );
-                for index in visible_images {
-                    let Some(image) = self.parsed.images.get(index) else {
-                        continue;
-                    };
-                    let label = image.alt.as_deref().unwrap_or(&image.source_uri);
-                    outline.push(
-                        UiNode::new(
-                            format!("markdown/image-item/{index}"),
-                            UiContent::Button(
-                                Control::new(
-                                    ButtonSpec::new(format!(
-                                        "Image {}",
-                                        bounded_markdown_label(label, 22)
-                                    )),
-                                    ActionId::new(format!("markdown/image/{index}")),
-                                )
-                                .state(ControlState {
-                                    enabled: !matches!(
-                                        crate::native_markdown::reduce_image_action(image, true),
-                                        crate::native_markdown::MarkdownImageAction::Denied { .. }
-                                    ),
-                                    ..ControlState::default()
-                                })
-                                .style(StyleRef::Navigation),
-                            ),
-                        )
-                        .layout(
-                            Layout::default()
-                                .height(Length::Fixed(32.0))
-                                .width(Length::Fill),
-                        ),
-                    );
+                for (item, lines, _) in rows {
+                    outline.push(item.node(&lines));
                 }
             }
             shell_children.push(
@@ -5238,7 +5725,7 @@ impl NativeAppModel for MarkdownApp {
                         .width(Length::Fixed(outline_width))
                         .height(Length::Fill)
                         .padding(Insets::all(16.0))
-                        .gap(6.0)
+                        .gap(OUTLINE_GAP)
                         .clipped(),
                 )
                 .children(outline),
@@ -5517,7 +6004,7 @@ pub(crate) fn bounded_markdown_block_paint(
     Vec<(std::ops::Range<usize>, crate::native_markdown::InlineStyle)>,
 ) {
     use crate::native_markdown::MarkdownBlock;
-    let text = bounded_markdown_block_text(block);
+    let text = crate::native_markdown::block_paint_text(block).into_owned();
     let own = match block {
         MarkdownBlock::Heading { text, .. }
         | MarkdownBlock::Paragraph { text, .. }
@@ -5534,49 +6021,6 @@ pub(crate) fn bounded_markdown_block_paint(
     (text, inline)
 }
 
-fn bounded_markdown_block_text(block: &crate::native_markdown::MarkdownBlock) -> String {
-    use crate::native_markdown::MarkdownBlock;
-    const LIMIT: usize = 128 * 1024;
-
-    let source = match block {
-        MarkdownBlock::Heading { text, .. }
-        | MarkdownBlock::Paragraph { text, .. }
-        | MarkdownBlock::ListItem { text, .. }
-        | MarkdownBlock::Quote { text, .. } => return bounded_markdown_text(text, LIMIT),
-        MarkdownBlock::CodeBlock { code, .. } => return bounded_markdown_text(code, LIMIT),
-        MarkdownBlock::Table { .. } => None,
-        MarkdownBlock::ThematicBreak { .. } => return String::new(),
-    };
-    if let Some(source) = source {
-        return bounded_markdown_text(source, LIMIT);
-    }
-    let MarkdownBlock::Table { header, rows, .. } = block else {
-        return String::new();
-    };
-    let mut output = String::new();
-    for row in std::iter::once(header).chain(rows) {
-        for (index, cell) in row.iter().enumerate() {
-            if index > 0 {
-                output.push_str("  │  ");
-            }
-            let remaining = LIMIT.saturating_sub(output.len());
-            if remaining == 0 {
-                break;
-            }
-            output.push_str(&bounded_markdown_text(cell, remaining));
-        }
-        if output.len() >= LIMIT {
-            break;
-        }
-        output.push('\n');
-    }
-    if output.len() >= LIMIT {
-        output.truncate(output.floor_char_boundary(LIMIT.saturating_sub('…'.len_utf8())));
-        output.push('…');
-    }
-    output
-}
-
 /// The reader's `command`-modifier chord for `key`, spelled the way this platform's
 /// keyboard reaches it.
 fn reader_command_chord(key: &str) -> String {
@@ -5589,13 +6033,7 @@ fn reader_command_chord(key: &str) -> String {
 }
 
 fn bounded_markdown_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let end = text.floor_char_boundary(limit.saturating_sub('…'.len_utf8()));
-    let mut output = text[..end].to_string();
-    output.push('…');
-    output
+    crate::native_markdown::bounded_text(text, limit).into_owned()
 }
 
 /// Bounded visual label projection in displayed characters.
@@ -5625,6 +6063,7 @@ fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f
 }
 
 /// Filename-like chrome keeps both identity-bearing ends.
+#[cfg(test)]
 fn bounded_middle_label(text: &str, max_chars: usize) -> String {
     bounded_middle_label_from_graphemes(&text.graphemes().collect::<Vec<_>>(), max_chars)
 }
@@ -5932,9 +6371,6 @@ impl NativeAppModel for EditorApp {
                     view.common.presentation_revision.saturating_add(1);
                 EventResult::Handled
             }
-            AppEvent::Action(invocation) if invocation.id.as_str() == "editor/focus-buffer" => {
-                EventResult::Handled
-            }
             _ => EventResult::Bubble,
         }
     }
@@ -6011,16 +6447,21 @@ impl NativeAppModel for EditorApp {
             completion_count,
             toolbar,
         );
-        let editor_geometry = crate::native_ui::text_viewport_geometry(editor_rect);
+        // The footer first: its rows are the body's to give, so the rows the document shows
+        // are counted under the footer this frame paints.
+        let footer = editor_footer(self, view, cx.document, editor_rect);
+        let editor_geometry = crate::native_ui::text_viewport_geometry(editor_rect, footer.rows);
         let line_capacity = crate::native_ui::editor_visible_line_capacity_with_palette(
             cx.viewport,
             completion_count,
             toolbar,
+            footer.rows,
         );
         let painted_capacity = crate::native_ui::editor_painted_line_capacity_with_palette(
             cx.viewport,
             completion_count,
             toolbar,
+            footer.rows,
         );
         let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
             / editor_geometry.cell_w)
@@ -6061,9 +6502,9 @@ impl NativeAppModel for EditorApp {
                 editor_cursor_label_with(&lines, buffer)
             })
         });
-        let footer_width = (editor_rect.width - 88.0).max(112.0);
+        let footer_width = crate::native_ui::editor_footer_text_width(editor_rect.width);
         let footer_chars = ((footer_width / 7.0).floor() as usize).clamp(16, 256);
-        let minibuffer_width = (editor_rect.width - 88.0 - 1.0).max(0.0);
+        let minibuffer_width = (footer_width - 1.0).max(0.0);
         let (minibuffer, minibuffer_caret) = view.buffer.as_ref().map_or((None, None), |buffer| {
             editor_minibuffer_projection(
                 buffer,
@@ -6073,15 +6514,12 @@ impl NativeAppModel for EditorApp {
                 minibuffer_width,
             )
         });
-        let semantic_status = editor_status_message(
-            self,
-            view,
-            projection.as_ref(),
-            cx.document.is_some_and(|snapshot| snapshot.text.is_empty()),
-        );
-        let status = semantic_status
-            .as_deref()
-            .map(|label| crate::native_ui::fit_native_status_label(label, footer_width));
+        let EditorFooter {
+            semantic: semantic_status,
+            lines: footer_lines,
+            ..
+        } = footer;
+        let status = semantic_status.as_ref().map(|_| footer_lines.join("\n"));
         let document_preedit = if view
             .buffer
             .as_ref()
@@ -6091,19 +6529,30 @@ impl NativeAppModel for EditorApp {
         } else {
             view.preedit.clone()
         };
-        let title_chars = (((editor_rect.width
-            - if self.checkpoint_pending {
-                188.0
-            } else {
-                158.0
-            })
-        .max(84.0)
-            / 7.0)
-            .floor() as usize)
-            .clamp(12, 96);
-        let title = bounded_middle_label(&self.title, title_chars);
-        let focused = view.common.focus_visible
-            && view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
+        // The title fitted to the room the header's measured plan leaves it, the unsaved
+        // mark included ([`crate::native_ui::editor_header_layout`]).
+        let header = crate::native_ui::editor_header_layout(
+            editor_rect,
+            cursor_label.as_deref(),
+            self.checkpoint_pending,
+        );
+        let title_px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get();
+        let mark = if self.dirty {
+            crate::tray_raster::ui_text_width_for(
+                crate::widget::TextFace::UiBold,
+                crate::native_ui::EDITOR_DIRTY_MARK,
+                title_px,
+            )
+        } else {
+            0.0
+        };
+        let title = bounded_middle_label_to_width_for_face(
+            &bounded_middle_label_from_graphemes(&self.title.graphemes().collect::<Vec<_>>(), 96),
+            header.title_right - header.title_x - mark,
+            title_px,
+            crate::widget::TextFace::UiBold,
+        );
+        let focused = view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
         let buffer_ready = view.buffer.is_some();
         let config_diagnostic_count = if self.config_editor {
             self.config_analysis.as_ref().map_or(
@@ -6172,13 +6621,15 @@ impl NativeAppModel for EditorApp {
                         .as_ref()
                         .is_some_and(crate::native_editor::EditorBufferView::can_start_search),
                 ),
-                "editor/goto-line-button" => {
-                    ("Go to line (M-g g)", "editor/goto-line", buffer_ready)
-                }
+                "editor/goto-line-button" => (
+                    "Go to line (M-g g)",
+                    "editor/goto-line",
+                    buffer_ready && !minibuffer_active,
+                ),
                 "editor/revert-button" => (
                     "Discard Changes and Reload from Disk",
                     "editor/revert",
-                    buffer_ready && !self.checkpoint_pending,
+                    buffer_ready && !minibuffer_active && !self.checkpoint_pending,
                 ),
                 "editor/config-problem-previous-button" => (
                     "Prev Issue: the previous config problem (Shift-F8)",
@@ -6193,7 +6644,7 @@ impl NativeAppModel for EditorApp {
                 _ => (
                     "Commands: run a command by name (M-x)",
                     "editor/commands",
-                    buffer_ready,
+                    buffer_ready && !minibuffer_active,
                 ),
             };
             command_button(key, words, width, label, action, enabled)
@@ -6204,35 +6655,39 @@ impl NativeAppModel for EditorApp {
             command_gap,
         );
         let edit_header_row = view.edit_header.as_ref().map(|header| {
-            let part =
-                |key: &'static str, words: &'static str, label: String, action: &'static str| {
-                    UiNode::new(
-                        key,
-                        UiContent::Button(
-                            Control::new(
-                                ButtonSpec::new(label).visual_label(words),
-                                ActionId::new(action),
-                            )
-                            .state(ControlState {
-                                enabled: buffer_ready,
-                                ..ControlState::default()
-                            })
-                            .style(StyleRef::Secondary),
-                        ),
-                    )
-                    .layout(
-                        Layout::default()
-                            .width(Length::Fixed(
-                                crate::native_ui::editor_toolbar_button_width(words),
-                            ))
-                            .height(Length::Fill),
-                    )
-                };
+            let part = |key: &'static str,
+                        words: &'static str,
+                        label: String,
+                        action: &'static str,
+                        enabled: bool| {
+                UiNode::new(
+                    key,
+                    UiContent::Button(
+                        Control::new(
+                            ButtonSpec::new(label).visual_label(words),
+                            ActionId::new(action),
+                        )
+                        .state(ControlState {
+                            enabled,
+                            ..ControlState::default()
+                        })
+                        .style(StyleRef::Secondary),
+                    ),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fixed(
+                            crate::native_ui::editor_toolbar_button_width(words),
+                        ))
+                        .height(Length::Fill),
+                )
+            };
             let mut parts = vec![part(
                 "editor/finish",
                 EDIT_DONE_WORDS,
                 header.done_label(),
                 "editor/finish",
+                buffer_ready && !minibuffer_active,
             )];
             if header.offers_abort() {
                 parts.push(part(
@@ -6240,6 +6695,7 @@ impl NativeAppModel for EditorApp {
                     EDIT_ABORT_WORDS,
                     header.abort_label(),
                     "editor/abort",
+                    buffer_ready && !minibuffer_active && !self.checkpoint_pending,
                 ));
             }
             let parts_width: f32 = std::iter::once(EDIT_DONE_WORDS)
@@ -6716,6 +7172,7 @@ impl NativeAppModel for EditorApp {
                     dirty: self.dirty,
                     saving: self.checkpoint_pending,
                     focused,
+                    focus_visible: focused && view.common.focus_visible,
                     action: Some(ActionId::new("editor/focus-buffer")),
                 }),
             )
@@ -6781,19 +7238,19 @@ impl NativeAppModel for EditorApp {
                 id: ActionId::new("editor/goto-line"),
                 title: "Go to Line".to_string(),
                 shortcut: Some("M-g g".to_string()),
-                enabled: buffer_ready,
+                enabled: buffer_ready && !minibuffer_active,
             },
             Command {
                 id: ActionId::new("editor/commands"),
                 title: "Execute Command…".to_string(),
                 shortcut: Some("M-x".to_string()),
-                enabled: buffer_ready,
+                enabled: buffer_ready && !minibuffer_active,
             },
             Command {
                 id: ActionId::new("editor/revert"),
                 title: "Discard Changes and Reload from Disk".to_string(),
                 shortcut: None,
-                enabled: self.dirty && !self.checkpoint_pending,
+                enabled: self.dirty && !minibuffer_active && !self.checkpoint_pending,
             },
         ]);
         if let Some(header) = &view.edit_header {
@@ -6801,14 +7258,14 @@ impl NativeAppModel for EditorApp {
                 id: ActionId::new("editor/finish"),
                 title: "Done: Save and Close".to_string(),
                 shortcut: Some("C-c C-c \u{b7} C-x #".to_string()),
-                enabled: buffer_ready,
+                enabled: buffer_ready && !minibuffer_active,
             });
             if header.offers_abort() {
                 out.push(Command {
                     id: ActionId::new("editor/abort"),
                     title: "Abort: Discard Changes and Close".to_string(),
                     shortcut: Some("C-c C-k".to_string()),
-                    enabled: buffer_ready,
+                    enabled: buffer_ready && !minibuffer_active && !self.checkpoint_pending,
                 });
             }
         }
@@ -6953,14 +7410,116 @@ pub(crate) const DISK_CONFLICT_RECOVERY: &str = "File changed on disk; Save is b
 pub(crate) const DISK_EXISTENCE_RECOVERY: &str =
     "File was deleted or replaced on disk; Save is blocked. Copy any local edits you need to keep.";
 
+/// The editor footer of `app`'s view `view` in an editor in `editor_rect`: the status
+/// sentence, the lines it paints on ([`crate::native_ui::editor_footer_lines`]), and the rows
+/// the footer takes (the minibuffer's one while it shows).
+struct EditorFooter {
+    semantic: Option<String>,
+    lines: Vec<String>,
+    rows: usize,
+}
+
+fn editor_footer(
+    app: &EditorApp,
+    view: &EditorViewState,
+    document: Option<&crate::document_store::DocumentSnapshot>,
+    editor_rect: LogicalRect,
+) -> EditorFooter {
+    let total_lines = document
+        .filter(|_| view.buffer.is_some())
+        .map_or(1, |snapshot| {
+            let starts = app.line_index(snapshot);
+            match starts.as_deref() {
+                Some(starts) => {
+                    crate::native_editor::EditorLines::indexed(&snapshot.text, starts).total()
+                }
+                None => crate::native_editor::EditorLines::scanning(&snapshot.text).total(),
+            }
+        });
+    let forms = editor_status_forms(
+        app,
+        view,
+        total_lines,
+        document.is_some_and(|snapshot| snapshot.text.is_empty()),
+    );
+    let semantic = forms.first().cloned();
+    let lines = if forms.is_empty() {
+        Vec::new()
+    } else {
+        crate::native_ui::editor_footer_lines(&forms, editor_rect)
+    };
+    let minibuffer_shows = view.buffer.as_ref().is_some_and(|buffer| {
+        buffer.prefix_hud.is_some()
+            || !matches!(
+                buffer.minibuffer,
+                crate::native_editor::Minibuffer::Inactive
+            )
+    });
+    let rows = if minibuffer_shows {
+        1
+    } else {
+        lines
+            .len()
+            .clamp(1, crate::native_ui::EDITOR_FOOTER_MAX_ROWS)
+    };
+    EditorFooter {
+        semantic,
+        lines,
+        rows,
+    }
+}
+
+impl EditorApp {
+    /// The rows the footer of view `view` takes in an editor in `editor_rect`
+    /// ([`editor_footer`]), for the document rows counted outside a frame.
+    pub(crate) fn footer_rows_in(
+        &self,
+        view: &EditorViewState,
+        document: Option<&crate::document_store::DocumentSnapshot>,
+        editor_rect: LogicalRect,
+    ) -> usize {
+        editor_footer(self, view, document, editor_rect).rows
+    }
+}
+
+/// The editor's whole status sentence ([`editor_status_forms`]).
+#[cfg(test)]
 fn editor_status_message(
     app: &EditorApp,
     view: &EditorViewState,
-    projection: Option<&crate::native_editor::EditorViewportProjection>,
+    total_lines: usize,
     empty: bool,
 ) -> Option<String> {
-    let lines = projection.map_or(1, |projection| projection.total_lines.max(1));
+    editor_status_forms(app, view, total_lines, empty)
+        .into_iter()
+        .next()
+}
+
+/// The editor's status as the whole sentence first, then shorter forms that leave out what
+/// matters least (a diagnostic's key hint, then its place) for a footer too small for it
+/// ([`crate::native_ui::editor_footer_lines`]).
+fn editor_status_forms(
+    app: &EditorApp,
+    view: &EditorViewState,
+    total_lines: usize,
+    empty: bool,
+) -> Vec<String> {
+    let lines = total_lines.max(1);
     let line_noun = if lines == 1 { "line" } else { "lines" };
+    let watcher = app
+        .config_editor
+        .then_some(view.config_watch_status.as_deref())
+        .flatten()
+        .filter(|status| !status.is_empty());
+    let with_watcher = |forms: Vec<String>| -> Vec<String> {
+        match watcher {
+            Some(watcher) => forms
+                .into_iter()
+                .map(|label| format!("{label} · Reload warning · {watcher}"))
+                .collect(),
+            None => forms,
+        }
+    };
     let label = if app.disk_conflict {
         let recovery = app
             .recovery_status
@@ -6982,12 +7541,12 @@ fn editor_status_message(
         format!("Recovery · {recovery}")
     } else if let Some(revealed) = view.reveal_status.as_deref() {
         revealed.to_string()
-    } else if let Some(summary) = app
+    } else if let Some(forms) = app
         .config_analysis
         .as_ref()
-        .and_then(|analysis| analysis.summary_at(view.config_diagnostic_selected))
+        .and_then(|analysis| analysis.summary_forms_at(view.config_diagnostic_selected))
     {
-        summary
+        return with_watcher(forms);
     } else if let Some(status) = view.status.as_deref().filter(|status| {
         !status.is_empty() && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
     }) {
@@ -7000,15 +7559,7 @@ fn editor_status_message(
     } else {
         format!("{lines} {line_noun} · Ready")
     };
-    let watcher = app
-        .config_editor
-        .then_some(view.config_watch_status.as_deref())
-        .flatten()
-        .filter(|status| !status.is_empty());
-    Some(match watcher {
-        Some(watcher) => format!("{label} · Reload warning · {watcher}"),
-        None => label,
-    })
+    with_watcher(vec![label])
 }
 
 fn command_palette_status(matches: usize, compact: bool) -> String {
@@ -7343,6 +7894,297 @@ mod markdown_reader_tests {
             )
             .unwrap();
         (runtime, instance, view)
+    }
+
+    /// THE READER PAINTS EVERY ROW OF EVERY BLOCK, AND ITS HEADER WHOLE, AT
+    /// EVERY TEXT SIZE: the reader lays each block out with the painter's
+    /// own type and wrap ([`crate::native_markdown::block_frame`]), so a
+    /// block wholly inside the preview paints all its rows (none elided or
+    /// sliced), wheeling row by row from the top to the end shows every row
+    /// of every block, and the end leaves the last row in view. The header
+    /// measures its status at the text size and gives it rows of its own
+    /// where it does not fit beside Prev and Next; the wide outline wraps.
+    /// At 2x the fixed 1x estimate this replaced elided every block and left
+    /// rows no scroll could reach, and the status lost its words.
+    #[test]
+    fn the_reader_paints_every_row_and_its_header_whole_at_every_text_size() {
+        use crate::native_appearance::{
+            AppearancePreferences, current_preferences, install_preferences,
+        };
+        struct RestoreAppearance(AppearancePreferences);
+        impl Drop for RestoreAppearance {
+            fn drop(&mut self) {
+                install_preferences(self.0);
+            }
+        }
+        let _restore = RestoreAppearance(current_preferences());
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let source = "# 設定ファイルの読み込み\n\n\
+            設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\
+            コーヒーブレイク中にアップデートをダウンロードしています、ちょっと待ってください。\n\n\
+            ```\n設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません。\n```\n\n\
+            ## A second section whose heading runs long enough to wrap\n\n\
+            - a list item that wraps across the measure of a phone-width reader\n\n\
+            > A quoted paragraph that also wraps when the reader is narrow enough.\n\n\
+            ```rust\nfn main() { println!(\"a line of code long enough to wrap\"); }\n```\n\n\
+            | Column | Another column |\n|---|---|\n| 1 | a cell long enough to wrap the row |\n\n\
+            The quick brown fox jumps over the lazy dog, and aarch64-apple-darwin wraps \
+            at its spaces as it always did.\n";
+        let field = |line: &str, name: &str| -> String {
+            let at = line.find(&format!(" {name}=")).expect(name) + name.len() + 2;
+            line[at..].split(' ').next().unwrap().to_string()
+        };
+        for scale in [0.85_f32, 1.0, 1.5, 2.0] {
+            install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for (width, height) in [(444.0_f32, 574.0_f32), (724.0, 476.0), (934.0, 574.0)] {
+                let context = format!("{width}x{height} at {scale}x");
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                let (mut runtime, instance, view) = markdown_runtime(source);
+                let parsed = crate::native_markdown::parse(source);
+                let blocks = parsed.blocks.len();
+                let mut seen: std::collections::BTreeMap<
+                    usize,
+                    (usize, std::collections::BTreeSet<usize>),
+                > = std::collections::BTreeMap::new();
+                let mut previous = None;
+                for _ in 0..2_000 {
+                    let compiled = runtime
+                        .render(instance, view, &cx(viewport, None))
+                        .unwrap()
+                        .compile(viewport)
+                        .unwrap();
+                    assert!(
+                        compiled.fit_failures().is_empty(),
+                        "{context}: {:?}",
+                        compiled.fit_failures()
+                    );
+                    for line in compiled
+                        .paint_audit_lines()
+                        .into_iter()
+                        .filter(|line| line.starts_with("paint-markdown key=\"markdown/block/"))
+                    {
+                        let key = field(&line, "key");
+                        let index = key
+                            .trim_matches('"')
+                            .rsplit('/')
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        let node = compiled
+                            .paint
+                            .iter()
+                            .find(|node| format!("{:?}", node.key.as_str()) == key)
+                            .expect("the block's node");
+                        let (row, total) = field(&line, "visual-row")
+                            .split_once('/')
+                            .map(|(row, total)| {
+                                (
+                                    row.parse::<usize>().unwrap(),
+                                    total.parse::<usize>().unwrap(),
+                                )
+                            })
+                            .unwrap();
+                        let wrapped = field(&line, "wrapped-lines").parse::<usize>().unwrap();
+                        let visible = field(&line, "visible-lines").parse::<usize>().unwrap();
+                        assert!(
+                            node.rect.bottom() <= node.clip.bottom() + 0.01
+                                && node.rect.y >= node.clip.y - 0.01,
+                            "{context}: the preview shows whole blocks and rows: {line}"
+                        );
+                        assert_eq!(
+                            field(&line, "elided"),
+                            "false",
+                            "{context}: a block paints every row it has room for: {line}"
+                        );
+                        let frame = crate::native_markdown::block_frame(
+                            crate::native_markdown::BlockShape::of(&parsed.blocks[index]),
+                            crate::native_ui::reader_type(),
+                        );
+                        if let Some(frame) = frame {
+                            let holds = frame.rows_in(node.rect.height);
+                            assert_eq!(wrapped, (total - row).min(holds), "{context}: {line}");
+                        }
+                        let entry = seen.entry(index).or_insert((total, Default::default()));
+                        assert_eq!(entry.0, total, "{context}: block {index} keeps its rows");
+                        entry.1.extend(row..row + visible);
+                    }
+                    let state = match runtime.view_state(view).unwrap() {
+                        AppViewState::Markdown(state) => (state.source_anchor, state.visual_row),
+                        _ => unreachable!(),
+                    };
+                    if previous == Some(state) {
+                        break;
+                    }
+                    previous = Some(state);
+                    runtime
+                        .dispatch(
+                            instance,
+                            view,
+                            AppEvent::MarkdownScroll {
+                                lines: 1,
+                                viewport_width: width,
+                                viewport_height: height,
+                            },
+                        )
+                        .unwrap();
+                }
+                assert_eq!(seen.len(), blocks, "{context}: every block was painted");
+                for (index, (total, rows)) in &seen {
+                    assert_eq!(
+                        rows.len(),
+                        *total,
+                        "{context}: every row of block {index} was in view"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE WIDE OUTLINE FITS ITS COLUMN BY ITS ROWS' HEIGHTS AND READS AS A
+    /// HIERARCHY: each destination is as tall as the lines its name wraps to,
+    /// and the outline takes the sections nearest the current one (and the
+    /// links and images in view beside them) only while their heights fit
+    /// the column, so no destination runs past its bottom or is cut by it.
+    /// Every line of a name starts at the row's lead, indented by the
+    /// section's depth, never centred. Counted as single-height rows, the
+    /// wrapped destinations ran past the column and the last was cut.
+    #[test]
+    fn the_wide_outline_fits_its_column_by_its_rows_heights_and_reads_as_a_hierarchy() {
+        use crate::native_appearance::{
+            AppearancePreferences, current_preferences, install_preferences,
+        };
+        struct RestoreAppearance(AppearancePreferences);
+        impl Drop for RestoreAppearance {
+            fn drop(&mut self) {
+                install_preferences(self.0);
+            }
+        }
+        let _restore = RestoreAppearance(current_preferences());
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let mut source = String::from(
+            "# A philosophy of naming whose title runs long enough to wrap\n\n\
+             See [the reroute design document with a long name](#reroute), \
+             [the second linked design note](https://example.com/a) and \
+             ![a diagram of every lane the toolchain takes](lanes.png).\n\n",
+        );
+        for section in 1..=14 {
+            let hashes = if section % 3 == 0 { "###" } else { "##" };
+            source.push_str(&format!(
+                "{hashes} {section}. A section heading long enough to wrap in the outline\n\n\
+                 Body text for section {section}.\n\n"
+            ));
+        }
+        let mut saw_deep = false;
+        for scale in [1.0_f32, 2.0] {
+            install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for (width, height) in [(1_074.0_f32, 684.0_f32), (934.0, 420.0)] {
+                let context = format!("{width}x{height} at {scale}x");
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                let (runtime, instance, view) = markdown_runtime(&source);
+                let compiled = runtime
+                    .render(instance, view, &cx(viewport, None))
+                    .unwrap()
+                    .compile(viewport)
+                    .unwrap();
+                assert!(
+                    compiled.fit_failures().is_empty(),
+                    "{context}: {:?}",
+                    compiled.fit_failures()
+                );
+                let column = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "markdown/outline")
+                    .expect("the wide outline")
+                    .rect;
+                let destinations = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        let key = node.key.as_str();
+                        key.starts_with("markdown/outline-item/")
+                            || key.starts_with("markdown/link-item/")
+                            || key.starts_with("markdown/image-item/")
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    destinations
+                        .iter()
+                        .any(|node| node.key.as_str().starts_with("markdown/outline-item/")),
+                    "{context}: the sections nearest the current one"
+                );
+                let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+                for node in &destinations {
+                    assert!(
+                        node.rect.bottom() <= column.bottom() - 16.0 + 0.01 && !node.clipped(),
+                        "{context}: {} runs past the outline's column {column:?}: {:?}",
+                        node.key.as_str(),
+                        node.rect
+                    );
+                    let UiContent::Button(control) = &node.content else {
+                        panic!("{context}: a destination is a button");
+                    };
+                    let lines = control
+                        .spec
+                        .visual_label
+                        .as_deref()
+                        .unwrap_or(&control.spec.label)
+                        .split('\n')
+                        .collect::<Vec<_>>();
+                    let depth = lines[0].len() - lines[0].trim_start().len();
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|line| line.len() - line.trim_start().len() == depth),
+                        "{context}: every line of {} keeps its depth: {lines:?}",
+                        node.key.as_str()
+                    );
+                    let starts = prims
+                        .iter()
+                        .filter_map(|prim| match prim {
+                            crate::widget::DrawPrim::Text { x, baseline, .. }
+                                if *baseline > node.rect.y
+                                    && *baseline < node.rect.bottom()
+                                    && *x >= node.rect.x
+                                    && *x < node.rect.right() =>
+                            {
+                                Some(*x)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        starts.len(),
+                        lines.len(),
+                        "{context}: {}",
+                        node.key.as_str()
+                    );
+                    assert!(
+                        starts.iter().all(|x| (*x - starts[0]).abs() < 0.01)
+                            && starts[0] < node.rect.x + 16.0,
+                        "{context}: {} starts every line at its lead: {starts:?}",
+                        node.key.as_str()
+                    );
+                }
+                if let Some(deep) = destinations.iter().find_map(|node| match &node.content {
+                    UiContent::Button(control) if control.spec.label.starts_with("3. ") => {
+                        control.spec.visual_label.clone()
+                    }
+                    _ => None,
+                }) {
+                    assert!(deep.starts_with("    3. "), "{context}: {deep:?}");
+                    saw_deep = true;
+                }
+            }
+        }
+        assert!(saw_deep, "a third-level section was in view");
     }
 
     #[test]
@@ -7848,7 +8690,7 @@ mod markdown_reader_tests {
                 )
             })
             .unwrap();
-        let bounded = bounded_markdown_block_text(code);
+        let bounded = crate::native_markdown::block_paint_text(code).into_owned();
         assert!(bounded.len() <= 128 * 1024);
         assert!(bounded.ends_with('…'));
         assert!(bounded.is_char_boundary(bounded.len()));
@@ -8154,7 +8996,7 @@ mod markdown_reader_tests {
         view.config_watch_status =
             Some("aterm.toml reload rejected: the file is not valid UTF-8.".to_string());
 
-        let warning = editor_status_message(&app, &view, None, false).unwrap();
+        let warning = editor_status_message(&app, &view, 1, false).unwrap();
         assert!(warning.contains("not valid UTF-8"), "{warning}");
         assert!(
             warning.contains("font_px"),
@@ -8163,7 +9005,7 @@ mod markdown_reader_tests {
         assert_eq!(view.status.as_deref(), Some("Saved"));
 
         view.config_watch_status = None;
-        let recovered = editor_status_message(&app, &view, None, false).unwrap();
+        let recovered = editor_status_message(&app, &view, 1, false).unwrap();
         assert!(!recovered.contains("not valid UTF-8"), "{recovered}");
         assert_eq!(view.status.as_deref(), Some("Saved"));
     }
@@ -8175,17 +9017,17 @@ mod markdown_reader_tests {
         app.config_editor = true;
         app.config_analysis = Some(crate::native_config_language::analyze(source));
         app.recovery_status = Some(crate::app_documents::CARRIED_DRAFT_NOTICE.to_string());
-        let before = editor_status_message(&app, &view, None, false).unwrap();
+        let before = editor_status_message(&app, &view, 1, false).unwrap();
         assert!(before.starts_with("Recovery · "), "{before}");
 
         view.status = Some("Save blocked · Config error · Ln 1, Col 11 · bad".to_string());
-        let refused = editor_status_message(&app, &view, None, false).unwrap();
+        let refused = editor_status_message(&app, &view, 1, false).unwrap();
         assert!(refused.starts_with("Save blocked"), "{refused}");
 
         view.status = None;
         app.checkpoint_pending = true;
         assert_eq!(
-            editor_status_message(&app, &view, None, false).as_deref(),
+            editor_status_message(&app, &view, 1, false).as_deref(),
             Some("Saving…")
         );
     }
@@ -8343,7 +9185,7 @@ mod markdown_reader_tests {
                     .semantic(&UiKey::new("editor/buffer"))
                     .expect("the buffer")
                     .rect;
-                let geometry = crate::native_ui::text_viewport_geometry(rect);
+                let geometry = editor_spec(&compiled).geometry(rect);
                 let projection = editor_spec(&compiled)
                     .projection
                     .as_ref()
@@ -8466,7 +9308,7 @@ mod markdown_reader_tests {
             projection.total_lines
         );
 
-        let geometry = crate::native_ui::text_viewport_geometry(buffer.rect);
+        let geometry = editor_spec(&compiled).geometry(buffer.rect);
         let painted_rows = (geometry.body_h / geometry.line_h).floor() as usize;
         assert!(
             painted_rows >= 6,
@@ -8569,37 +9411,175 @@ mod markdown_reader_tests {
         }
     }
 
+    /// THE CONFIG EDITOR'S FOOTER PAINTS ITS WHOLE DIAGNOSTIC wherever its
+    /// rows can hold it: the status wraps at whole words in the footer's real
+    /// slot (the editor's width inside the footer inset, the one width the
+    /// view fits to, the painter draws in and the audit measures), and the
+    /// footer takes the rows it needs (the rows the editor always leaves it,
+    /// and past them every row the document can spare). Where even those
+    /// rows cannot hold the sentence it paints the longest shorter form that
+    /// fits whole (the key hint goes first, then the place, then the label; the
+    /// message stays whole), and it cuts only when not even the message fits.
+    /// The body's
+    /// rows are counted under the footer the frame paints. The verifier's
+    /// cases (50 and 70 columns) paint the whole sentence. The negative
+    /// control: at the narrow widths the sentence is wider than one row, so a
+    /// one-row footer (the cut this replaces) could not have painted it.
     #[test]
-    fn manual_config_footer_bounds_paint_but_retains_full_unicode_diagnostic() {
-        let source = "future = true\n";
-        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
-        app.config_editor = true;
+    fn the_config_footer_paints_its_whole_diagnostic_wherever_it_fits() {
+        use crate::native_appearance::{
+            AppearancePreferences, current_preferences, install_preferences,
+        };
+        struct RestoreAppearance(AppearancePreferences);
+        impl Drop for RestoreAppearance {
+            fn drop(&mut self) {
+                install_preferences(self.0);
+            }
+        }
+        let _restore = RestoreAppearance(current_preferences());
+        let source = "future = true\nzzz = 1\n";
+        let fixture = |message: &str| {
+            let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+            app.config_editor = true;
+            let mut analysis = crate::native_config_language::analyze(source);
+            analysis.diagnostics = vec![crate::native_config_language::ConfigDiagnostic {
+                bytes: 14..17,
+                line: 2,
+                column: 1,
+                severity: crate::native_config_language::ConfigDiagnosticSeverity::Warning,
+                message: message.to_string(),
+            }];
+            app.config_analysis = Some(analysis);
+            app.config_analysis_revision = snapshot.seq.0;
+            (app, view, snapshot)
+        };
+        let realistic = "zzz is unknown to this build and has no effect";
         let unknown_key = "future.👩‍💻.e\u{301}.🇺🇳.a-deliberately-long-forward-compatible-key";
-        let mut analysis = crate::native_config_language::analyze(source);
-        analysis.diagnostics = vec![crate::native_config_language::ConfigDiagnostic {
-            bytes: 0..6,
-            line: 1,
-            column: 1,
-            severity: crate::native_config_language::ConfigDiagnosticSeverity::Warning,
-            message: format!("unknown configuration key {unknown_key}"),
-        }];
-        app.config_analysis = Some(analysis);
-        app.config_analysis_revision = snapshot.seq.0;
-        let viewport = LogicalRect::new(0.0, 0.0, 286.5, 558.0);
-        let compiled = app
-            .view(&view, &cx(viewport, Some(&snapshot)))
-            .compile(viewport)
-            .unwrap();
-        let spec = editor_spec(&compiled);
-        let semantic = spec
-            .semantic_status
-            .as_deref()
-            .expect("complete diagnostic status");
-        let visual = spec.status.as_deref().expect("bounded diagnostic footer");
-        assert!(semantic.contains(unknown_key), "{semantic}");
-        assert_ne!(visual, semantic);
-        assert!(visual.ends_with('…'), "{visual}");
-        compiled.validate_parity().unwrap();
+        let long = format!("unknown configuration key {unknown_key}");
+        let mut wrapped = false;
+        for scale in [1.0_f32, 2.0] {
+            install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for message in [realistic, long.as_str()] {
+                let (app, view, snapshot) = fixture(message);
+                let forms = app
+                    .config_analysis
+                    .as_ref()
+                    .unwrap()
+                    .summary_forms_at(0)
+                    .unwrap();
+                for width in [1_074.0_f32, 738.0, 514.0, 486.0, 374.0, 286.5, 248.0, 234.0] {
+                    let context = format!("{width} at {scale}x: {message}");
+                    let viewport = LogicalRect::new(0.0, 0.0, width, 558.0);
+                    let compiled = app
+                        .view(&view, &cx(viewport, Some(&snapshot)))
+                        .compile(viewport)
+                        .unwrap();
+                    let spec = editor_spec(&compiled);
+                    let semantic = spec.semantic_status.as_deref().expect("the diagnostic");
+                    let painted = spec.status.as_deref().expect("the footer");
+                    assert_eq!(semantic, forms[0], "{context}");
+                    let rect = compiled
+                        .semantic(&UiKey::new("editor/buffer"))
+                        .expect("the buffer")
+                        .rect;
+                    let slot = crate::native_ui::editor_footer_text_width(rect.width);
+                    let cap = crate::native_ui::editor_footer_row_cap(rect);
+                    let needs = |form: &str| {
+                        crate::native_settings::wrap_to_box(
+                            form,
+                            slot,
+                            &crate::native_ui::native_status_label_width,
+                        )
+                        .len()
+                    };
+                    for line in painted.lines() {
+                        assert!(
+                            crate::native_ui::native_status_label_width(line)
+                                <= slot + crate::native_ui::TEXT_FIT_SLACK,
+                            "{context}: {line:?} fits the slot {slot}"
+                        );
+                    }
+                    wrapped |= needs(semantic) > 1;
+                    match forms
+                        .iter()
+                        .position(|form| crate::native_ui::footer_shows_whole(form, painted))
+                    {
+                        Some(shown) => {
+                            assert!(
+                                forms[..shown].iter().all(|longer| needs(longer) > cap),
+                                "{context}: a longer form fits the {cap} rows: {painted:?}"
+                            );
+                            assert!(painted.contains(message.split(' ').next().unwrap()));
+                        }
+                        None => {
+                            assert!(
+                                needs(&forms[forms.len() - 1]) > cap
+                                    && spec.footer_rows() == cap
+                                    && painted.ends_with('…'),
+                                "{context}: cut only past every row the footer may take: {painted:?}"
+                            );
+                        }
+                    }
+                    if message == realistic && scale == 1.0 && width >= 374.0 {
+                        assert!(
+                            crate::native_ui::footer_shows_whole(semantic, painted),
+                            "{context}: the whole sentence: {painted:?}"
+                        );
+                    }
+                    if message == realistic && needs(message) <= cap {
+                        // The message is never cut where the footer's rows hold it alone (at
+                        // 32 columns at 2x, three rows hold it, not with its label).
+                        assert!(
+                            forms
+                                .iter()
+                                .any(|form| crate::native_ui::footer_shows_whole(form, painted)),
+                            "{context}: the message whole: {painted:?}"
+                        );
+                    }
+                    assert!(
+                        compiled.fit_failures().is_empty(),
+                        "{context}: {:?}",
+                        compiled.fit_failures()
+                    );
+                    // The body's rows are the rows under this footer.
+                    let geometry = spec.geometry(rect);
+                    assert_eq!(spec.footer_rows(), painted.lines().count(), "{context}");
+                    assert!(
+                        (geometry.body_h + geometry.footer_h + geometry.header_h - rect.height)
+                            .abs()
+                            < 0.01,
+                        "{context}"
+                    );
+                    let palette = if compiled
+                        .semantic(&UiKey::new("editor/config-assist"))
+                        .is_some()
+                    {
+                        crate::native_ui::EditorPalette::Help
+                    } else {
+                        crate::native_ui::EditorPalette::None
+                    };
+                    let painted_rows = spec.projection.as_ref().expect("projection").lines.len();
+                    assert!(
+                        painted_rows
+                            <= crate::native_ui::editor_painted_line_capacity_with_palette(
+                                viewport,
+                                palette,
+                                app.toolbar_in(&view),
+                                spec.footer_rows(),
+                            ),
+                        "{context}"
+                    );
+                    compiled.validate_parity().unwrap();
+                }
+            }
+        }
+        assert!(
+            wrapped,
+            "the sentence is wider than one row at the narrow widths"
+        );
     }
 
     /// The editor toolbar compiles as a measured whole-word plan across widths and toolbar variants.
@@ -8992,7 +9972,7 @@ mod markdown_reader_tests {
             "horizontal projection preserves the canonical document byte across fonts"
         );
         let rect = after.semantic(&UiKey::new("editor/buffer")).unwrap().rect;
-        let geometry = crate::native_ui::text_viewport_geometry(rect);
+        let geometry = spec.geometry(rect);
         assert_eq!(
             crate::native_ui::text_viewport_byte_at(
                 spec,
@@ -9045,7 +10025,7 @@ mod markdown_reader_tests {
             .iter()
             .find(|node| matches!(node.content, UiContent::TextViewport(_)))
             .unwrap();
-        let geometry = crate::native_ui::text_viewport_geometry(viewport_node.rect);
+        let geometry = spec.geometry(viewport_node.rect);
         assert!(caret.y >= geometry.body_y + geometry.body_h);
         assert!(
             spec.preedit.is_empty(),
@@ -9054,9 +10034,12 @@ mod markdown_reader_tests {
         recovered.validate_parity().unwrap();
 
         editor_input_focus(&mut app, &mut view, false);
-        assert!(
-            render(&app, &view).ime_caret_rect().is_none(),
-            "the real focus-loss event releases candidate geometry"
+        let without_control_focus = render(&app, &view);
+        assert!(!editor_spec(&without_control_focus).focused);
+        assert_eq!(
+            without_control_focus.ime_caret_rect(),
+            Some(caret),
+            "clearing control focus does not change the editor's typed prompt target"
         );
     }
 
@@ -9113,8 +10096,11 @@ mod markdown_reader_tests {
                 let caret = compiled
                     .ime_caret_rect()
                     .expect("focused marked caret fits");
+                // The footer's one text slot ([`crate::native_ui::editor_footer_text_width`]).
+                let slot = crate::native_ui::editor_footer_text_width(node.rect.width);
+                let inset = (node.rect.width - slot) / 2.0;
                 assert!(
-                    caret.x >= node.rect.x + 72.0 && caret.right() <= node.rect.right(),
+                    caret.x >= node.rect.x + inset && caret.right() <= node.rect.x + inset + slot,
                     "scale={scale}, width={width}, caret={caret:?}"
                 );
                 let px =
@@ -9122,11 +10108,10 @@ mod markdown_reader_tests {
                 let measured =
                     crate::tray_raster::measure_text(label, px, crate::widget::TextWeight::Regular);
                 assert!(
-                    measured + 1.0 <= node.rect.width - 88.0,
+                    measured + 1.0 <= slot,
                     "text and end caret retain the right gutter: scale={scale}, width={width}"
                 );
-                let historical_chars =
-                    (((node.rect.width - 88.0).max(112.0) / 7.0).floor() as usize).clamp(16, 256);
+                let historical_chars = ((slot / 7.0).floor() as usize).clamp(16, 256);
                 let (historical, _) = editor_prompt_projection(
                     "M-x ",
                     &query,
@@ -9140,7 +10125,7 @@ mod markdown_reader_tests {
                     px,
                     crate::widget::TextWeight::Regular,
                 ) + 1.0
-                    > node.rect.width - 72.0;
+                    > slot;
                 view.preedit_caret = None;
                 let at_end = app
                     .view(&view, &cx(viewport, Some(&snapshot)))

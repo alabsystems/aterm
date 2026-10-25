@@ -1468,6 +1468,7 @@ fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
         supervised: &live,
         barred: &[],
         live: &live,
+        held: &[],
         alive: &alive,
     };
     let t = env.now * 1000;
@@ -3542,6 +3543,7 @@ struct FakeHost<'a> {
     status: &'a dyn Fn(&str) -> Result<Captured, String>,
     login: Result<i32, String>,
     writes_home: bool,
+    after_login: Option<&'a dyn Fn()>,
     now: i64,
     unaskable: Option<String>,
     asked: std::cell::RefCell<Vec<String>>,
@@ -3555,6 +3557,7 @@ impl<'a> FakeHost<'a> {
             status,
             login: Ok(0),
             writes_home: false,
+            after_login: None,
             now: 0,
             unaskable: None,
             asked: std::cell::RefCell::new(Vec::new()),
@@ -3584,6 +3587,9 @@ impl AccountsHost for FakeHost<'_> {
             && let Some(dir) = dir
         {
             std::fs::write(Path::new(dir).join(".claude.json"), "{}").expect("write");
+        }
+        if let Some(change) = self.after_login {
+            change();
         }
         self.login.clone()
     }
@@ -3929,12 +3935,13 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     );
     assert_eq!(code, exit(1));
     assert!(out.starts_with("CLAUDE_CONFIG_DIR="), "{out}");
-    assert_eq!(*tty.logins.borrow(), vec![Some(dir_text.clone())]);
+    assert_ne!(tty.logins.borrow()[0].as_deref(), Some(dir_text.as_str()));
 
     login_made_in(&dir);
     let signed_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&signed_in);
     tty.tty = true;
+    tty.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
             label: "check-2".to_string(),
@@ -3943,7 +3950,9 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
         &tty,
     );
     assert_eq!(code, exit(0), "{err}");
-    assert_eq!(*tty.asked.borrow(), vec![dir_text]);
+    let staging = tty.logins.borrow()[0].as_ref().unwrap().clone();
+    assert_ne!(staging, dir_text);
+    assert_eq!(*tty.asked.borrow(), vec![staging]);
 }
 
 #[test]
@@ -4026,10 +4035,7 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     let login = |label: &str| AccountsCmd::Login {
         label: label.to_string(),
     };
-    let line = format!(
-        "CLAUDE_CONFIG_DIR='{}' claude auth login\n",
-        odd.replace('\'', r"'\''")
-    );
+    let line = "aterm harness accounts login work-2\n";
 
     let piped = FakeHost::new(&never_asked);
     let (code, out, _) = acc(login("work-2"), &env, &piped);
@@ -4042,15 +4048,13 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     tty.tty = true;
     let (code, out, _) = acc(login("work-2"), &env, &tty);
     assert_eq!(code, exit(1));
-    assert!(out.starts_with(&line), "{out}");
-    assert_eq!(
-        *tty.logins.borrow(),
-        vec![Some(odd.clone())],
-        "the dir, verbatim"
-    );
+    assert!(out.starts_with("CLAUDE_CONFIG_DIR="), "{out}");
+    let staging = tty.logins.borrow()[0].as_ref().unwrap().clone();
+    assert_ne!(staging, odd);
+    assert!(Path::new(&staging).is_dir());
     assert!(
-        Path::new(&odd).is_dir(),
-        "the flow has a directory to write"
+        !Path::new(&odd).exists(),
+        "the original profile is untouched"
     );
 
     tty.login = Err("No such file or directory (os error 2)".to_string());
@@ -4063,7 +4067,7 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     let before = tty.logins.borrow().len();
     let (code, out, _) = acc(login("main"), &env, &piped);
     assert_eq!(code, exit(0));
-    assert_eq!(out, "claude auth login\n");
+    assert_eq!(out, "aterm harness accounts login main\n");
     assert!(piped.logins.borrow().is_empty(), "nothing was run");
     let (code, out, _) = acc(login("nobody"), &env, &tty);
     assert_eq!(code, exit(1));
@@ -4072,7 +4076,7 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
 }
 
 #[test]
-fn a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out() {
+fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     let tmp = tmp_dir("accounts-login-failed");
     let env = env_at(&tmp);
     let (work, _) = three_accounts(&tmp, &env);
@@ -4109,9 +4113,9 @@ fn a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out() {
     }
     assert_eq!(tty.logins.borrow().len(), 6, "each flow was run");
     assert!(tty.asked.borrow().is_empty(), "and nothing under a login");
-    assert!(
-        Path::new(&work).join(".claude.json").is_file(),
-        "the start wrote"
+    assert_eq!(
+        std::fs::read(Path::new(&work).join("a-login-file")).unwrap(),
+        b"{}"
     );
     assert_eq!(files(), before, "nothing was recorded");
     #[cfg(unix)]
@@ -4131,23 +4135,26 @@ fn a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out() {
     tty.writes_home = true;
     let (code, out, err) = acc(login("work-3"), &env, &tty);
     assert_eq!(code, exit(1), "{err}");
-    assert!(
-        out.starts_with(&format!(
-            "CLAUDE_CONFIG_DIR='{}' claude auth login\n",
-            fresh.display()
-        )),
-        "{out}"
-    );
-    assert!(fresh.join(".claude.json").is_file(), "it wrote");
+    assert!(out.starts_with("CLAUDE_CONFIG_DIR="), "{out}");
+    assert!(!fresh.join(".claude.json").exists());
+    let staging = tty
+        .logins
+        .borrow()
+        .last()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(Path::new(&staging).join(".claude.json").is_file());
     assert!(tty.asked.borrow().is_empty(), "still nothing was asked");
     let (state, _) = store.load(env.now).expect("this build's state");
-    assert_eq!(state.account("work-3").auth, Auth::SignedOut);
+    assert_eq!(state.account("work-3").auth, Auth::Unseen);
     assert_eq!(state.account("work-2").auth, Auth::Ok, "not touched");
     let rows = store.tail(20).expect("ledger");
-    assert_eq!(rows.len(), 3, "one row more: {rows:?}");
     assert_eq!(
-        (rows[2].kind, rows[2].account.as_str(), rows[2].why.as_str()),
-        (accounts::Kind::Auth, "work-3", "signed-out")
+        rows.len(),
+        2,
+        "failed staging does not change the account: {rows:?}"
     );
     #[cfg(unix)]
     assert_eq!(wake_id(&store), woken, "nobody is woken");
@@ -4185,6 +4192,7 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     let mut tty = FakeHost::new(&signed_in);
     tty.tty = true;
     tty.now = env.now + 600;
+    tty.writes_home = true;
     let (code, out, err) = acc(
         AccountsCmd::Login {
             label: "work-2".to_string(),
@@ -4193,12 +4201,21 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
         &tty,
     );
     assert_eq!(code, exit(0), "{err}");
-    assert!(
-        out.starts_with(&format!("CLAUDE_CONFIG_DIR='{work}' claude auth login\n")),
-        "{out}"
+    assert!(out.starts_with("CLAUDE_CONFIG_DIR="), "{out}");
+    let staging = tty.logins.borrow()[0].as_ref().unwrap().clone();
+    assert_ne!(staging, work);
+    assert_eq!(*tty.asked.borrow(), vec![staging.clone()]);
+    assert_eq!(
+        store
+            .load_logins(env.now)
+            .unwrap()
+            .0
+            .get("work-2")
+            .unwrap()
+            .dir
+            .as_deref(),
+        Some(staging.as_str())
     );
-    assert_eq!(*tty.logins.borrow(), vec![Some(work.clone())]);
-    assert_eq!(*tty.asked.borrow(), vec![work], "that login, and no other");
 
     let later = env.now + 600;
     let (state, _) = store.load(later).expect("this build's state");
@@ -4206,7 +4223,7 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     assert_eq!(state.account("work-2").auth_at, Some(later));
     assert_eq!(state.account("main").auth_at, Some(env.now), "not touched");
     let rows = store.tail(20).expect("ledger");
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
     assert_eq!(
         (
             rows[2].kind,
@@ -4221,7 +4238,7 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
 }
 
 #[test]
-fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
+fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     let tmp = tmp_dir("accounts-login-signed-out");
     let env = env_at(&tmp);
     let (work, _) = three_accounts(&tmp, &env);
@@ -4236,23 +4253,17 @@ fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
     let signed_out = |_: &str| said(false);
     let mut tty = FakeHost::new(&signed_out);
     tty.tty = true;
+    tty.writes_home = true;
     let (code, _, err) = acc(login, &env, &tty);
     assert_eq!(code, exit(1), "{err}");
-    assert_eq!(*tty.asked.borrow(), vec![work]);
+    let staging = tty.logins.borrow()[0].as_ref().unwrap().clone();
+    assert_ne!(staging, work);
+    assert_eq!(*tty.asked.borrow(), vec![staging]);
     let (state, _) = store.load(env.now).expect("this build's state");
-    assert_eq!(state.account("work-2").auth, Auth::SignedOut);
+    assert_eq!(state.account("work-2").auth, Auth::Ok);
     assert_eq!(state.account("main").auth, Auth::Ok);
     let rows = store.tail(20).expect("ledger");
-    assert_eq!(rows.len(), 3);
-    assert_eq!(
-        (
-            rows[2].kind,
-            rows[2].account.as_str(),
-            rows[2].why.as_str(),
-            rows[2].t
-        ),
-        (accounts::Kind::Auth, "work-2", "signed-out", env.now)
-    );
+    assert_eq!(rows.len(), 2);
     assert_eq!(state.account("work-2").auth_at, Some(env.now));
     #[cfg(unix)]
     assert_eq!(wake_id(&store), woken, "nobody is woken");
@@ -4276,13 +4287,14 @@ fn a_login_nobody_could_ask_afterwards_is_not_started() {
             &tty,
         );
         assert_eq!(code, exit(1), "{label}");
-        assert_eq!(out.lines().count(), 1, "the line, and no answer: {out}");
+        assert!(out.is_empty(), "no flow was started: {out}");
     }
     assert!(tty.logins.borrow().is_empty(), "no flow was started");
     assert!(tty.asked.borrow().is_empty());
     assert!(!env.accounts_store().state_file().exists());
 
     tty.unaskable = None;
+    tty.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
             label: "work-2".to_string(),
@@ -4291,7 +4303,7 @@ fn a_login_nobody_could_ask_afterwards_is_not_started() {
         &tty,
     );
     assert_eq!(code, exit(0), "{err}");
-    assert_eq!(*tty.logins.borrow(), vec![Some(work)]);
+    assert_ne!(tty.logins.borrow()[0].as_deref(), Some(work.as_str()));
 }
 
 /// THE LOGIN FLOW'S CHILD ([`login_command`]) RUNS UNDER THE HOME IT IS
@@ -4519,14 +4531,16 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
         let status = |_: &str| answer.clone();
         let mut tty = FakeHost::new(&status);
         tty.tty = true;
-        let (code, out, _) = acc(login.clone(), &env, &tty);
+        tty.writes_home = true;
+        let (code, _, err) = acc(login.clone(), &env, &tty);
         assert_eq!(code, exit(1), "{case}");
-        assert!(out.contains("\nwork-2: could not run ("), "{case}: {out}");
+        assert!(err.contains("work-2: could not run ("), "{case}: {err}");
         assert!(!store.state_file().exists(), "{case}: nothing recorded");
     }
     let signed_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&signed_in);
     tty.tty = true;
+    tty.writes_home = true;
     let (code, _, err) = acc(login, &env, &tty);
     assert_eq!(code, exit(0), "{err}");
     let (state, _) = store.load(env.now).expect("this build's state");
@@ -4537,16 +4551,26 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
 fn login_keeps_no_byte_of_the_vendors_output() {
     let tmp = tmp_dir("accounts-secrecy");
     let env = env_at(&tmp);
-    let (work, pool) = three_accounts(&tmp, &env);
+    let (_, pool) = three_accounts(&tmp, &env);
     login_made_in(&pool);
     const SECRETS: [&str; 4] = ["zq.nobody", "example.invalid", "Invented", "Org-9"];
     let document = r#"{"loggedIn":true,"authMethod":"claude.ai","email":"zq.nobody@example.invalid","orgName":"Invented Org-9"}"#;
     let plain = "Not logged in as zq.nobody@example.invalid (Invented Org-9)";
     let in_the_key = r#"{"loggedIn":"zq.nobody@example.invalid of Invented Org-9"}"#;
     let status = |login: &str| {
-        let (stdout, code) = if login.is_empty() {
+        let (stdout, code) = if Path::new(login)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("main+")
+        {
             (document, 0)
-        } else if login == work {
+        } else if Path::new(login)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-2+")
+        {
             (plain, 1)
         } else {
             (in_the_key, 0)
@@ -4563,6 +4587,7 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     }
     let mut host = FakeHost::new(&status);
     host.tty = true;
+    host.writes_home = true;
     let (mut out, mut err) = (String::new(), String::new());
     for (label, code) in [("main", 0), ("work-2", 1), ("pool-a", 1)] {
         let (ran, said_out, said_err) = acc(
@@ -4581,8 +4606,8 @@ fn login_keeps_no_byte_of_the_vendors_output() {
         out.contains("main: signed in"),
         "the document was read: {out}"
     );
-    assert!(out.contains("work-2: could not run"), "{out}");
-    assert!(out.contains("pool-a: could not run"), "{out}");
+    assert!(err.contains("work-2: could not run"), "{err}");
+    assert!(err.contains("pool-a: could not run"), "{err}");
 
     let (_, report, report_err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
     let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
@@ -4713,6 +4738,7 @@ fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     let signed_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&signed_in);
     tty.tty = true;
+    tty.writes_home = true;
     let (code, _, err) = acc(
         AccountsCmd::Login {
             label: "work-2".to_string(),
@@ -5179,6 +5205,7 @@ fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     let all_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&all_in);
     tty.tty = true;
+    tty.writes_home = true;
     let (code, out, err) = acc(
         AccountsCmd::Login {
             label: "main".to_string(),
@@ -5187,9 +5214,9 @@ fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
         &tty,
     );
     assert_eq!(code, exit(0), "{err}");
-    assert!(out.starts_with("claude auth login\n"), "{out}");
-    assert_eq!(*tty.logins.borrow(), vec![None], "the default home");
-    assert_eq!(*tty.asked.borrow(), vec![String::new()]);
+    assert!(out.starts_with("CLAUDE_CONFIG_DIR="), "{out}");
+    let staging = tty.logins.borrow()[0].as_ref().unwrap().clone();
+    assert_eq!(*tty.asked.borrow(), vec![staging]);
     let (state, _) = store.load(env.now).expect("this build's state");
     assert_eq!(
         (state.account("main").auth, state.account("main").auth_at),
@@ -7409,19 +7436,27 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
     let env = env_at(&tmp);
     let (ok, text, err) = go(&Cmd::Versions { json: false }, &env);
     assert!(ok, "err={err}");
-    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse", "gemini"] {
+    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse"] {
         assert!(text.contains(slug), "missing {slug} in:\n{text}");
     }
+    assert!(
+        !text.contains("gemini"),
+        "a retired harness listed:\n{text}"
+    );
     assert!(text.contains("v0.1"), "expected v0.1 in:\n{text}");
 
     let (ok_json, json, err_json) = go(&Cmd::Versions { json: true }, &env);
     assert!(ok_json, "err={err_json}");
-    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse", "gemini"] {
+    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse"] {
         assert!(
             json.contains(&format!(r#""slug":"{slug}""#)),
             "missing {slug} in json:\n{json}"
         );
     }
+    assert!(
+        !json.contains(r#""slug":"gemini""#),
+        "a retired harness listed:\n{json}"
+    );
     assert!(json.contains(r#""version":"0.1","major":0,"minor":1"#));
 }
 
@@ -7431,11 +7466,23 @@ mod signin;
 #[path = "cli_identity_tests.rs"]
 mod identity;
 
+#[path = "cli_adopt_identity_tests.rs"]
+mod adopt_identity;
+
+#[path = "cli_attempt_generation_tests.rs"]
+mod attempt_generation;
+
+#[path = "cli_signin_policy_tests.rs"]
+mod signin_policy;
+
 #[path = "cli_state_tests.rs"]
 mod state_read;
 
 #[path = "cli_retention_tests.rs"]
 mod retention;
+
+#[path = "cli_binding_retention_tests.rs"]
+mod binding_retention;
 
 #[path = "cli_admission_tests.rs"]
 mod admission;

@@ -5062,22 +5062,35 @@ fn read_kitty_file(path: &Path) -> Option<Vec<u8>> {
 const KITTY_TEMP_FILE_MARKER: &str = "tty-graphics-protocol";
 
 fn consume_kitty_temp_file(path: &Path) {
-    consume_kitty_temp_file_with(path, || {});
+    consume_kitty_temp_file_with(path, &kitty_temp_dirs(), || {});
 }
 
-fn consume_kitty_temp_file_with(path: &Path, before_unlink: impl FnOnce()) {
+/// Delete the client's temp file `path` where the protocol allows it, judged against the
+/// canonical temporary directories `temps`; `before_unlink` runs between judgement and unlink.
+fn consume_kitty_temp_file_with(
+    path: &Path,
+    temps: &[std::path::PathBuf],
+    before_unlink: impl FnOnce(),
+) {
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
-        consume_kitty_temp_entry(dir, name, before_unlink); // the client's temp file
+        consume_kitty_temp_entry(dir, name, temps, before_unlink);
     }
 }
 
-fn kitty_temp_entry_deletable(entry: &Path) -> bool {
+/// Whether the canonical `entry` may be deleted: its path names the protocol's marker and lies
+/// under one of `temps`.
+fn kitty_temp_entry_deletable(entry: &Path, temps: &[std::path::PathBuf]) -> bool {
     entry.to_string_lossy().contains(KITTY_TEMP_FILE_MARKER)
-        && kitty_temp_dirs().iter().any(|tmp| entry.starts_with(tmp))
+        && temps.iter().any(|tmp| entry.starts_with(tmp))
 }
 
 #[cfg(unix)]
-fn consume_kitty_temp_entry(dir: &Path, name: &std::ffi::OsStr, before_unlink: impl FnOnce()) {
+fn consume_kitty_temp_entry(
+    dir: &Path,
+    name: &std::ffi::OsStr,
+    temps: &[std::path::PathBuf],
+    before_unlink: impl FnOnce(),
+) {
     use aterm_dirfd::{AtFlags, CWD, FileType, Mode, OFlags, fstat, openat, unlinkat};
     use std::path::Component;
 
@@ -5098,7 +5111,7 @@ fn consume_kitty_temp_entry(dir: &Path, name: &std::ffi::OsStr, before_unlink: i
             _ => return,
         }
     }
-    if !kitty_temp_entry_deletable(&dir.join(name)) {
+    if !kitty_temp_entry_deletable(&dir.join(name), temps) {
         return;
     }
     let leaf = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
@@ -5112,17 +5125,24 @@ fn consume_kitty_temp_entry(dir: &Path, name: &std::ffi::OsStr, before_unlink: i
 }
 
 #[cfg(not(unix))]
-fn consume_kitty_temp_entry(dir: &Path, name: &std::ffi::OsStr, before_unlink: impl FnOnce()) {
+fn consume_kitty_temp_entry(
+    dir: &Path,
+    name: &std::ffi::OsStr,
+    temps: &[std::path::PathBuf],
+    before_unlink: impl FnOnce(),
+) {
     let Ok(dir) = std::fs::canonicalize(dir) else {
         return;
     };
     let entry = dir.join(name);
-    if kitty_temp_entry_deletable(&entry) {
+    if kitty_temp_entry_deletable(&entry, temps) {
         before_unlink();
         let _ = std::fs::remove_file(entry);
     }
 }
 
+/// The protocol's temporary directories on this machine, canonical: /tmp, /dev/shm, `$TMPDIR`
+/// and the platform's temporary directory, where each exists.
 fn kitty_temp_dirs() -> Vec<std::path::PathBuf> {
     let named = [
         Some(std::path::PathBuf::from("/tmp")),
@@ -11092,32 +11112,40 @@ mod kitty_transfer_tests {
         Scratch(dir)
     }
 
-    fn outside_temp_dirs(tag: &str) -> (aterm_tempfile::TempDir, std::path::PathBuf) {
-        let temps = kitty_temp_dirs();
-        let target = std::env::current_exe()
-            .ok()
-            .and_then(|exe| Some(exe.parent()?.parent()?.to_path_buf()));
-        let var_tmp = cfg!(unix).then(|| std::path::PathBuf::from("/var/tmp"));
-        for parent in [target, var_tmp].into_iter().flatten() {
-            let Ok(resolved) = std::fs::canonicalize(&parent) else {
-                continue;
+    /// A declared temporary root and a directory outside it, canonical, side by side in one
+    /// scratch directory: the deletion rule is judged against `temp` alone, so its cases never
+    /// depend on where the build or the machine's temporary directories live.
+    struct Roots {
+        _scratch: Scratch,
+        temp: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    impl Roots {
+        fn new(tag: &str) -> Self {
+            let scratch = scratch_in(&std::env::temp_dir(), tag);
+            let made = |name: &str| {
+                let dir = scratch.0.join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::canonicalize(dir).unwrap()
             };
-            if temps.iter().any(|temp| resolved.starts_with(temp)) {
-                continue;
+            let (temp, outside) = (made("tmp"), made("outside"));
+            Self {
+                _scratch: scratch,
+                temp,
+                outside,
             }
-            let Ok(dir) = aterm_tempfile::Builder::new()
-                .prefix(&format!("aterm-kft-{tag}-"))
-                .tempdir_in(&resolved)
-            else {
-                continue;
-            };
-            let canonical = std::fs::canonicalize(dir.path()).unwrap();
-            return (dir, canonical);
         }
-        aterm_spec::host::could_not_run(format!(
-            "no writable directory outside the temporary ones ({temps:?}): neither the \
-             build's target directory nor /var/tmp"
-        ))
+
+        /// What the engine's consume does with a t=t file it read: reports whether the read
+        /// returned bytes, then deletes the file where `temp` allows it.
+        fn consume(&self, path: &Path) -> bool {
+            let read = read_kitty_file(path).is_some();
+            if read {
+                consume_kitty_temp_file_with(path, std::slice::from_ref(&self.temp), || {});
+            }
+            read
+        }
     }
 
     fn cell_file(dir: &Path, name: &str) -> std::path::PathBuf {
@@ -11133,78 +11161,138 @@ mod kitty_transfer_tests {
         !term_lock(&term).cell_frame(24, 80).images[0].is_empty()
     }
 
+    /// A T=T FILE IS DELETED ONLY WHERE THE PROTOCOL ALLOWS (kitty-file-medium): its canonical
+    /// path must name the marker and lie under a temporary directory. The cases run against a
+    /// declared root, so the verdict never depends on where the build lives (it once borrowed
+    /// the build's target directory as "outside", and failed wherever that was under /tmp).
     #[test]
     fn a_temp_file_is_deleted_only_where_the_protocol_allows() {
         const MARKER: &str = "tty-graphics-protocol";
-        let temp_scratch = scratch_in(&std::env::temp_dir(), "t");
-        let temp = &temp_scratch.0;
-        let (_outside_scratch, canonical) = outside_temp_dirs("kept");
-        let outside = &canonical;
+        let roots = Roots::new("t");
+        let (temp, outside) = (&roots.temp, &roots.outside);
 
         let plain = cell_file(temp, "plain.rgba");
-        let placed = transmit_temp_file(&plain);
+        assert!(
+            roots.consume(&plain),
+            "a t=t file without the marker is read"
+        );
         assert!(
             plain.exists(),
             "a t=t file without the marker is never deleted"
         );
-        assert!(placed, "a t=t file without the marker is still read");
 
         let consumed = cell_file(temp, &format!("x-{MARKER}.rgba"));
-        assert!(transmit_temp_file(&consumed), "a proper t=t file is placed");
+        assert!(roots.consume(&consumed), "a proper t=t file is read");
         assert!(!consumed.exists(), "a proper t=t file is deleted");
 
+        let marked = temp.join(MARKER);
+        std::fs::create_dir_all(&marked).unwrap();
+        let inside = cell_file(&marked, "inside.rgba");
+        assert!(
+            roots.consume(&inside),
+            "a file in a marked directory is read"
+        );
+        assert!(
+            !inside.exists(),
+            "a file in a marked temporary directory is deleted: the marker is in its path"
+        );
+
         let kept = cell_file(outside, &format!("x-{MARKER}.rgba"));
-        let placed = transmit_temp_file(&kept);
+        assert!(roots.consume(&kept), "the file is still read");
         assert!(
             kept.exists(),
             "a file outside the temporary directories is kept"
         );
-        assert!(placed, "the file is still read");
 
-        let climb = temp.join(MARKER);
-        std::fs::create_dir_all(&climb).unwrap();
-        let victim = cell_file(outside, "victim.rgba");
-        let mut escaped = climb;
+        let mut escaped = marked.clone();
         for _ in 0..64 {
             escaped.push("..");
         }
         escaped.extend(
-            canonical
+            outside
                 .components()
                 .filter(|part| matches!(part, std::path::Component::Normal(_))),
         );
-        escaped.push("victim.rgba");
-        let placed = transmit_temp_file(&escaped);
-        assert!(victim.exists(), "`..` cannot carry the delete out of /tmp");
-        assert!(placed, "the file is still read");
+        escaped.push(format!("x-{MARKER}.rgba"));
+        assert!(
+            escaped.starts_with(temp) && escaped.to_string_lossy().contains(MARKER),
+            "as written, the path names the marker under the temporary root"
+        );
+        assert!(roots.consume(&escaped), "the file is still read");
+        assert!(kept.exists(), "`..` cannot carry the delete out of /tmp");
 
         let unmarked = cell_file(temp, "unmarked.rgba");
-        let lent = temp.join(MARKER).join("..").join("unmarked.rgba");
-        let placed = transmit_temp_file(&lent);
+        let lent = marked.join("..").join("unmarked.rgba");
+        assert!(roots.consume(&lent), "the file is still read");
         assert!(
             unmarked.exists(),
             "a passing marked directory lends no mark"
         );
-        assert!(placed, "the file is still read");
+    }
+
+    /// The program's t=t file goes through the reader's prefetch and the engine, is placed, and
+    /// is consumed under this machine's own temporary directories: the platform's is one of
+    /// them, so a marked file there is deleted and an unmarked one kept.
+    #[test]
+    fn a_transmitted_temp_file_is_placed_then_consumed() {
+        let scratch = scratch_in(&std::env::temp_dir(), "sent");
+        let plain = cell_file(&scratch.0, "plain.rgba");
+        assert!(transmit_temp_file(&plain), "an unmarked t=t file is placed");
+        assert!(plain.exists(), "an unmarked t=t file is kept");
+        let marked = cell_file(&scratch.0, "x-tty-graphics-protocol.rgba");
+        assert!(transmit_temp_file(&marked), "a marked t=t file is placed");
+        assert!(!marked.exists(), "a marked t=t file is deleted");
+    }
+
+    /// The machine's temporary directories are the protocol's: /tmp, /dev/shm, `$TMPDIR` and
+    /// the platform's own, each where it exists, each canonical.
+    #[test]
+    fn the_temporary_directories_are_the_protocols() {
+        let temps = kitty_temp_dirs();
+        let named = [
+            Some(std::path::PathBuf::from("/tmp")),
+            Some(std::path::PathBuf::from("/dev/shm")),
+            std::env::var_os("TMPDIR").map(std::path::PathBuf::from),
+            Some(std::env::temp_dir()),
+        ];
+        for dir in named.into_iter().flatten() {
+            if let Ok(canonical) = std::fs::canonicalize(&dir) {
+                assert!(
+                    temps.contains(&canonical),
+                    "{dir:?} is a temporary directory"
+                );
+            }
+        }
+        for temp in &temps {
+            assert_eq!(
+                std::fs::canonicalize(temp).ok().as_ref(),
+                Some(temp),
+                "{temp:?} is canonical"
+            );
+        }
+        assert!(
+            !temps.is_empty(),
+            "the platform's temporary directory always exists"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn a_directory_swapped_after_the_judgement_moves_no_delete() {
         const MARKER: &str = "tty-graphics-protocol";
-        let temp_scratch = scratch_in(&std::env::temp_dir(), "swap");
-        let (_outside_scratch, outside) = outside_temp_dirs("swap-kept");
-        let marked = temp_scratch.0.join(MARKER);
+        let roots = Roots::new("swap");
+        let outside = &roots.outside;
+        let marked = roots.temp.join(MARKER);
         std::fs::create_dir_all(&marked).unwrap();
         let sent = cell_file(&marked, "victim.rgba");
-        let victim = cell_file(&outside, "victim.rgba");
-        let held = temp_scratch.0.join("held");
+        let victim = cell_file(outside, "victim.rgba");
+        let held = roots.temp.join("held");
 
         let mut swapped = false;
         let read = read_kitty_file(&sent);
-        consume_kitty_temp_file_with(&sent, || {
+        consume_kitty_temp_file_with(&sent, std::slice::from_ref(&roots.temp), || {
             std::fs::rename(&marked, &held).unwrap();
-            std::os::unix::fs::symlink(&outside, &marked).unwrap();
+            std::os::unix::fs::symlink(outside, &marked).unwrap();
             swapped = true;
         });
 

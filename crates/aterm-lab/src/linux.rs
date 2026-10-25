@@ -1035,8 +1035,10 @@ impl LaneLock {
                 holder_name(holder.as_ref()),
                 path.display()
             ))),
-            Err(Refused::Stopped(holder)) => Err(Fail {
-                stopped: stopped().err().map(|s| s.0),
+            Err(Refused::Stopped { holder, signal }) => Err(Fail {
+                stopped: signal
+                    .inspect(|sig| crate::stop::note(*sig))
+                    .or_else(|| stopped().err().map(|s| s.0)),
                 ..not_run(format!(
                     "interrupted while waiting for {}, which holds the lane ({}); this run took \
                      no part of it",
@@ -1310,18 +1312,34 @@ type Admission = Result<atpkg::admit_disk::Admitted, atpkg::admit_disk::Error>;
 /// What admits a boot's claim: the run, and where its lines go.
 type Admitter<'a> = dyn FnMut(atpkg::admit_disk::Run, &mut dyn FnMut(&str)) -> Admission + 'a;
 
-/// [`claim_boot_disk`] through `admit`.
+/// [`claim_boot_disk`] through `admit`. A run already ending on an interrupt
+/// ([`crate::stop::check`]) asks for no claim: none of its work waits anew.
 fn claim_boot_disk_with(
     lane: &str,
     run: atpkg::admit_disk::Run,
     admit: &mut Admitter<'_>,
 ) -> Result<Option<atpkg::admit_disk::Admitted>, Fail> {
+    if let Err(s) = crate::stop::check() {
+        return Err(Fail {
+            stopped: Some(s.0),
+            ..not_run(format!(
+                "{lane}: the boot's disk claim was not asked for: the run was interrupted; this \
+                 run booted nothing"
+            ))
+        });
+    }
     match admit(run, &mut |line| println!("{lane}: {line}")) {
         Ok(held) => Ok(Some(held)),
         Err(atpkg::admit_disk::Error::Never(why)) => Err(not_run(format!(
             "{why}; the VM can never boot there. Fix: free room on that volume, or move the VM \
              to a larger one"
         ))),
+        Err(e @ atpkg::admit_disk::Error::Stopped { signal, .. }) => Err(Fail {
+            stopped: signal.inspect(|sig| crate::stop::note(*sig)),
+            ..not_run(format!(
+                "{lane}: the boot's disk claim was {e}; this run booted nothing"
+            ))
+        }),
         Err(e) => {
             eprintln!(
                 "aterm-lab: {lane}: the boot's disk is not claimed ({e}); it boots without one"
@@ -2713,6 +2731,77 @@ mod tests {
             )))
         });
         assert!(matches!(unclaimed, Ok(None)));
+    }
+
+    /// Set, the test binary is [`standin_boot_disk_claim_interrupted`].
+    const BOOT_STANDIN: &str = "ATERM_LAB_BOOT_DISK_INTERRUPT_STANDIN";
+
+    /// Run by [`an_interrupted_boot_disk_claim_ends_the_run_not_run`] in a process of its own,
+    /// since the interrupt becomes the run's: a boot's disk claim that an interrupt (SIGTERM)
+    /// ended is NOT RUN carrying it, the run's own interrupt path has it, and a later boot's
+    /// claim is refused without being asked for; it exits as the lab's main would.
+    #[test]
+    fn standin_boot_disk_claim_interrupted() {
+        if std::env::var_os(BOOT_STANDIN).is_none() {
+            return;
+        }
+        let base = Path::new("/Users//u/.lima");
+        let run = boot_run(
+            "linux",
+            base,
+            base.join(VM),
+            base.join(".aterm-linux.boot-footprint.json"),
+            BOOT_COLD_DISK,
+        );
+        let f = claim_boot_disk_with("linux", run.clone(), &mut |_, _| {
+            Err(atpkg::admit_disk::Error::Stopped {
+                signal: Some(libc::SIGTERM),
+                short: None,
+            })
+        })
+        .expect_err("the interrupt ended the claim");
+        assert_eq!((f.code, f.stopped), (NOT_RUN, Some(libc::SIGTERM)));
+        assert!(
+            crate::stop::ended_a_wait(),
+            "the claim handed its interrupt on"
+        );
+        assert_eq!(
+            crate::stop::check(),
+            Err(crate::stop::Stopped(libc::SIGTERM))
+        );
+        let again = claim_boot_disk_with("linux", run, &mut |_, _| {
+            panic!("a boot's disk claim asked for once the run is ending")
+        })
+        .expect_err("no claim once the run is ending");
+        println!("{}", f.msg.unwrap_or_default());
+        println!("{}", again.msg.unwrap_or_default());
+        std::process::exit(crate::stop::status(f.code, false));
+    }
+
+    /// An interrupt that ended a boot's disk claim ends the run NOT RUN (exit 3), naming it,
+    /// and no later boot of the run asks for a claim.
+    #[test]
+    fn an_interrupted_boot_disk_claim_ends_the_run_not_run() {
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        cmd.args([
+            "--exact",
+            "linux::tests::standin_boot_disk_claim_interrupted",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(BOOT_STANDIN, "1");
+        let out = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
+            .expect("the stand-in ends within the hang detector");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(NOT_RUN), "{}\n{text}", out.status);
+        assert!(
+            text.contains("NOT RUN: linux: the boot's disk claim was interrupted (SIGTERM)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT RUN: linux: the boot's disk claim was not asked for"),
+            "{text}"
+        );
     }
 
     use crate::linux_driver::fake::{Answer, Call, Guest};

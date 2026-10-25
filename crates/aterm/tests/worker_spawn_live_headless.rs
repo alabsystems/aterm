@@ -14,14 +14,14 @@ use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 
-/// The stand-in `claude` (and `codex`, `gemini`, `agy`, `muse`: the same script under
+/// The stand-in `claude` (and `codex`, `agy`, `muse`: the same script under
 /// each name): `--version` answers at once (the helper runs every fake once
 /// that way, `headless_boot::standin`), and so, unrecorded, do agy's quota and
 /// model reads (`-p /usage`, `-p /model`), which an agy spawn makes before its
 /// launch: recorded, one could stand in for the launch at the test's read. Any
-/// other call writes the trusted-folders file its environment names (Gemini
-/// CLI's `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, empty where none) to
-/// `$HOME/trust.txt`, then its argv NUL-separated to `$HOME/argv.bin`, whole
+/// other call writes the trusted-folders file its environment names (the
+/// retired Gemini CLI's `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, which no worker is
+/// handed any more, so empty) to `$HOME/trust.txt`, then its argv NUL-separated to `$HOME/argv.bin`, whole
 /// (written aside, then renamed), and exits 0.
 const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
@@ -54,7 +54,7 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                     .expect("write the config");
             }
             let bin = tmp.join("bin");
-            for word in ["claude", "codex", "gemini", "agy", "muse"] {
+            for word in ["claude", "codex", "agy", "muse"] {
                 headless_boot::standin(&bin.join(word), STANDIN);
             }
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
@@ -247,40 +247,16 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         .position(|a| *a == b"--session-id")
         .and_then(|at| argv.get(at + 1))
         .map(|id| String::from_utf8_lossy(id).into_owned());
-    if word == "gemini" {
-        let id = session.as_deref().expect("Gemini CLI's own session id");
-        let bytes = id.as_bytes();
-        assert!(
-            bytes.len() == 36
-                && [8, 13, 18, 23].iter().all(|&k| bytes[k] == b'-')
-                && bytes[14] == b'4',
-            "a version-4 UUID: {id}"
-        );
-        want.extend([b"--session-id".as_slice(), bytes]);
-    } else {
-        assert_eq!(session, None, "{word}: no session id of the line's");
-    }
+    assert_eq!(session, None, "{word}: no session id of the line's");
     let trust = std::fs::read_to_string(home.join("trust.txt")).expect("the stand-in's trust");
-    if word == "gemini" {
-        let path = tasks.join(format!("{worker}-1.trust.json"));
-        assert_eq!(Path::new(&trust), path, "its own file");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let folders = std::fs::read_to_string(&path).expect("the trusted folders");
-        let trusted = std::fs::canonicalize(inst.tmp.join("work")).expect("the folder");
-        assert!(
-            folders.contains(&format!("\"{}\"", trusted.display()))
-                && folders.matches("TRUST_FOLDER").count() == 1
-                && folders.matches('"').count() == 4,
-            "the one folder: {folders}"
-        );
-    } else {
-        assert_eq!(trust, "", "{word}: no trusted-folders file");
-    }
+    assert_eq!(trust, "", "{word}: no trusted-folders file");
+    assert!(
+        !tasks.join(format!("{worker}-1.trust.json")).exists(),
+        "{word}: no trusted-folders sidecar"
+    );
     let attached = [b"--prompt-interactive=".as_slice(), whole].concat();
     match word {
-        "gemini" | "agy" => want.extend([attached.as_slice(), b"".as_slice()]),
+        "agy" => want.extend([attached.as_slice(), b"".as_slice()]),
         _ => want.extend([b"--".as_slice(), whole, b"".as_slice()]),
     }
     assert!(
@@ -316,16 +292,6 @@ fn a_worker_runs_its_task_as_claudes_argv_in_a_background_tab_under_bash() {
 }
 
 #[test]
-fn a_gemini_worker_runs_its_task_as_its_prompt_interactive_argv() {
-    run_agent_worker(
-        "g",
-        headless_boot::need_zsh(),
-        Some("gemini-2.5-pro"),
-        "gemini",
-    );
-}
-
-#[test]
 fn an_agy_worker_runs_its_task_as_its_prompt_interactive_argv() {
     run_agent_worker("a", "/bin/bash", None, "agy");
 }
@@ -338,6 +304,34 @@ fn a_codex_worker_runs_its_task_after_the_end_of_options() {
 #[test]
 fn a_muse_worker_runs_its_task_after_the_end_of_options() {
     run_agent_worker("m", headless_boot::need_zsh(), Some("m-1"), "muse");
+}
+
+/// The retired Gemini CLI (`agent=gemini`, `agent=gemini-cli`) is refused by
+/// name with agy named in its place, on a supervised instance where any
+/// other agent would start, and nothing is spawned: never another agent.
+#[test]
+fn a_spawn_of_the_retired_gemini_cli_is_refused_and_spawns_nothing() {
+    let inst = boot("r", "/bin/bash", Some(SUPERVISED), None);
+    let (_, manager) = boot_session(&inst);
+    let work = inst.tmp.join("work");
+    let rows = || ctl_ok(&inst, &["sessions"]).lines().count();
+    let before = rows();
+    for word in ["gemini", "gemini-cli"] {
+        let agent = format!("agent={word}");
+        let (ok, stdout, stderr) = spawn_as(
+            &inst,
+            &manager,
+            &work,
+            &["@self", "spawn", &agent, "-"],
+            b"a task",
+        );
+        assert!(
+            !ok && stderr.contains("Gemini CLI is no longer supported: agy replaces it"),
+            "{word}: {stdout} {stderr}"
+        );
+    }
+    assert_eq!(rows(), before, "nothing was spawned");
+    assert!(!inst.tmp.join("home/argv.bin").exists(), "no stand-in ran");
 }
 
 /// With the window harness off nothing would finish a worker's task: `ERR

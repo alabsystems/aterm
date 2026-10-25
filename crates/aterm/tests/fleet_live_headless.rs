@@ -1098,8 +1098,8 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     fleet_ok(&member.tmp, &["allow", "content"], None);
     let refused = drive_refused(&issuer.tmp, &target, &[&at, "status"]);
     assert!(
-        refused.contains("is not one this Mac lets drive it"),
-        "a grant taken back refuses the next drive before the listener moves: {refused}"
+        refused.contains("lets no one drive it"),
+        "a grant taken back refuses the next drive at once: {refused}"
     );
     unloadable(&cfg, false);
     hold_ends(&member, &worker);
@@ -1170,6 +1170,7 @@ fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
             fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
             cmd.env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
+                .env("ATERM_DEBUG_FLEET_LIFETIME_MS", NEVER_MS)
                 .args(["--lines", "24", "--columns", "80"]);
         },
         |_| true,
@@ -1188,6 +1189,94 @@ fn a_grant_taken_back_while_aterm_toml_does_not_load_still_ends_the_drive() {
     fleet_ok(&member.tmp, &["allow", "content"], None);
     hold_ends(&member, &worker);
     drive_refused(&issuer.tmp, &target, &[&format!("@{worker}"), "status"]);
+}
+
+fn open_drive(root: &Path, target: &str) -> aterm_net::fleet_member::Driven {
+    let state = root.join("state");
+    let secret = aterm_net::fleet::read_key_file(&state).expect("the fleet's key");
+    let me = read_node_identity(&state)
+        .expect("its node key")
+        .expect("a node key");
+    let book = read_peers(&state).expect("its book");
+    let peer = book
+        .iter()
+        .find(|peer| format!("127.0.0.1:{}", peer.port) == target)
+        .unwrap_or_else(|| panic!("no entry at {target}: {book:?}"));
+    aterm_net::fleet_member::drive(
+        &aterm_net::fleet_member::target_of(peer),
+        &Keyring::of(&book),
+        (&secret, &me),
+        (Instant::now() + HANG, HANG),
+    )
+    .unwrap_or_else(|why| panic!("{why}"))
+}
+
+#[test]
+fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_away() {
+    let (issuer, member, worker, target) = driven_pair(("afgi", "afgm"));
+    let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
+    let third = World(headless_boot::scratch_root("afgt"));
+    let (holder, third_port) = hold_a_port();
+    drop(holder);
+    fleet_ok(
+        &third.0,
+        &[
+            "join",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &third_port.to_string(),
+        ],
+        Some(&code),
+    );
+    let third_node =
+        std::fs::read_to_string(third.0.join("state/fleet-node")).expect("its node id");
+    let third_node = third_node.trim().to_owned();
+    let at = format!("@{worker}");
+    drive_refused(&third.0, &target, &[&at, "status"]);
+    let mut open = open_drive(&issuer.tmp, &target);
+    let read = ask(&mut open, &format!("{at} status"));
+    assert!(read.starts_with("OK schema="), "{read}");
+
+    fleet_ok(
+        &member.tmp,
+        &["allow", "drive", "--from", &third_node],
+        None,
+    );
+    let (read, _) = drive_ok(&third.0, &target, &[&at, "status"]);
+    assert!(
+        read.starts_with("OK schema="),
+        "a grant drives once its write returns: {read}"
+    );
+    let serves = format!("fleet listening on {target} (serving content; 2 node(s) may drive it)");
+    let mut log = String::new();
+    let stood = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        log = std::fs::read_to_string(&member.log).unwrap_or_default();
+        log.contains(&serves).then_some(())
+    });
+    assert!(
+        stood.is_some(),
+        "the listener never served the grant: {log}"
+    );
+    let read = ask(&mut open, &format!("{at} status"));
+    assert!(
+        read.starts_with("OK schema="),
+        "a grant written cut no drive it still lets in: {read}"
+    );
+
+    let before = log.len();
+    fleet_ok(&member.tmp, &["allow", "content"], None);
+    let cut = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        log = std::fs::read_to_string(&member.log).unwrap_or_default();
+        log.get(before..)?
+            .contains("connection(s) it no longer serves are cut")
+            .then_some(())
+    });
+    assert!(cut.is_some(), "the listener never cut the drive: {log}");
+    assert!(
+        closed(&mut open),
+        "a grant taken back cuts the drive it let in"
+    );
 }
 
 #[test]

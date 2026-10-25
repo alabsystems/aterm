@@ -6,6 +6,8 @@ use std::sync::Mutex;
 
 use super::*;
 
+const OWN: Within = Within::Drive(DRIVE_WITHIN);
+
 fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(String::from).collect()
 }
@@ -69,19 +71,24 @@ fn a_drive_names_each_session_by_its_sid() {
 #[test]
 fn a_turn_over_a_drive_waits_inside_its_connection() {
     let mut bare = words("@s-a1 turn fix the test");
-    turn_wait(&mut bare).unwrap();
+    turn_wait(&mut bare, "lab-mini").unwrap();
     assert_eq!(bare, words("@s-a1 turn timeout=20000 fix the test"));
     let mut named = words("@s-a1 turn settle=submitted timeout=15000 go");
-    turn_wait(&mut named).unwrap();
+    turn_wait(&mut named, "lab-mini").unwrap();
     assert_eq!(named, words("@s-a1 turn settle=submitted timeout=15000 go"));
     let mut in_text = words("@s-a1 turn set timeout=90000 in the config");
-    turn_wait(&mut in_text).unwrap();
+    turn_wait(&mut in_text, "lab-mini").unwrap();
     assert_eq!(in_text[2], "timeout=20000", "{in_text:?}");
     for long in ["timeout=60000", "timeout=soon"] {
-        let refusal = turn_wait(&mut words(&format!("@s-a1 turn {long} go")))
+        let refusal = turn_wait(&mut words(&format!("@s-a1 turn {long} go")), "lab-mini")
             .expect_err(long)
             .to_string();
-        assert!(refusal.contains("settle=submitted"), "{long}: {refusal}");
+        assert!(
+            refusal.contains("give it a shorter timeout=, or say settle=submitted")
+                && refusal.contains("`aterm ctl --host lab-mini await task @s-a1:<task_rev>`")
+                && refusal.contains("`aterm ctl --host lab-mini @s-a1 status` (or `text`)"),
+            "{long}: {refusal}"
+        );
     }
 }
 
@@ -110,14 +117,16 @@ fn a_turns_leading_options_keep_their_place_over_a_drive() {
         ),
     ] {
         let mut parts = words(sent);
-        turn_wait(&mut parts).unwrap();
+        turn_wait(&mut parts, "lab-mini").unwrap();
         assert_eq!(parts, words(wire), "{sent}");
     }
     for long in [
         "@s-a1 turn id=k:1:2 timeout=60000 go",
         "@s-a1 turn if-supervisor=h-9 id=k timeout=60000 go",
     ] {
-        let refusal = turn_wait(&mut words(long)).expect_err(long).to_string();
+        let refusal = turn_wait(&mut words(long), "lab-mini")
+            .expect_err(long)
+            .to_string();
         assert!(
             refusal.contains("at most timeout=22000"),
             "{long}: {refusal}"
@@ -259,7 +268,7 @@ fn an_exchange_is_framed_as_on_one_mac() {
             _ => "OK 2\nrow one\nrow two\n".to_owned(),
         }
     }
-    let ran = |line: &str, verb: &str| exchange(link(answer, &SEEN), line, verb).unwrap();
+    let ran = |line: &str, verb: &str| exchange(link(answer, &SEEN), line, verb, OWN).unwrap();
     assert_eq!(ran("@s-a1 close\n", "close"), ExitCode::FAILURE);
     assert_eq!(
         ran("@s-a1 turn timeout=20000 go\n", "turn"),
@@ -292,11 +301,11 @@ fn a_workers_task_crosses_only_after_go() {
     let task = b"read the README\nand say one line";
     let head = format!("spawn agent=claude len={}", task.len());
     assert_eq!(
-        spawn_exchange(link(go, &SEEN), &head, task).unwrap(),
+        spawn_exchange(link(go, &SEEN), &head, task, OWN).unwrap(),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        spawn_exchange(link(deny, &SEEN), &head, task).unwrap(),
+        spawn_exchange(link(deny, &SEEN), &head, task, OWN).unwrap(),
         ExitCode::FAILURE
     );
     let seen = SEEN.lock().unwrap();
@@ -369,25 +378,27 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
         stream: Box::new(Cut),
         label: "lab-mini".to_owned(),
     };
-    let turned = exchange(cut(), "@s-a1 turn timeout=20000 go\n", "turn")
+    let turned = exchange(cut(), "@s-a1 turn timeout=20000 go\n", "turn", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
         turned.starts_with(
             "lab-mini cut the drive connection before it answered (its person took back"
-        ) && turned.contains(
-            "what this `turn` sent may have landed: `aterm ctl --host lab-mini @s-a1 status`"
-        ) && !turned.contains("docs.rs"),
+        ) && turned.contains("lowered its fleet level, its fleet key or listen place changed, or")
+            && turned.contains(
+                "what this `turn` sent may have landed: `aterm ctl --host lab-mini @s-a1 status`"
+            )
+            && !turned.contains("docs.rs"),
         "{turned}"
     );
-    let held = exchange(cut(), "hold s-a1 on\n", "hold")
+    let held = exchange(cut(), "hold s-a1 on\n", "hold", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
         held.contains("`aterm ctl --host lab-mini @s-a1 status`"),
         "{held}"
     );
-    let read = exchange(cut(), "@s-a1 text\n", "text")
+    let read = exchange(cut(), "@s-a1 text\n", "text", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
@@ -395,14 +406,14 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
             && !read.contains("landed"),
         "{read}"
     );
-    let surveyed = exchange(cut(), "survey\n", "survey")
+    let surveyed = exchange(cut(), "survey\n", "survey", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
         surveyed.contains("`aterm ctl --host lab-mini survey …` again says which"),
         "{surveyed}"
     );
-    let spawned = spawn_exchange(cut(), "spawn agent=claude len=2", b"go")
+    let spawned = spawn_exchange(cut(), "spawn agent=claude len=2", b"go", OWN)
         .expect_err("cut")
         .to_string();
     assert!(spawned.contains("the worker may have started"), "{spawned}");
@@ -433,7 +444,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
         label: "lab-mini".to_owned(),
     };
     let turned =
-        exchange(frozen(), "@s-a1 turn timeout=20000 go\n", "turn").expect_err("unanswered");
+        exchange(frozen(), "@s-a1 turn timeout=20000 go\n", "turn", OWN).expect_err("unanswered");
     assert_eq!(turned.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
     let turned = turned.to_string();
     assert!(
@@ -444,7 +455,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
             && !turned.contains("os error"),
         "{turned}"
     );
-    let read = exchange(frozen(), "@s-a1 text\n", "text")
+    let read = exchange(frozen(), "@s-a1 text\n", "text", OWN)
         .expect_err("unanswered")
         .to_string();
     assert!(
@@ -452,7 +463,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
             && !read.contains("landed"),
         "{read}"
     );
-    let spawned = spawn_exchange(frozen(), "spawn agent=claude len=2", b"go")
+    let spawned = spawn_exchange(frozen(), "spawn agent=claude len=2", b"go", OWN)
         .expect_err("unanswered")
         .to_string();
     assert!(
@@ -461,12 +472,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
     );
     let reader_gone = io::Error::new(io::ErrorKind::BrokenPipe, crate::StdoutClosed);
     assert!(
-        crate::is_stdout_closed(&closed(
-            "lab-mini",
-            "@s-a1 text\n",
-            DRIVE_WITHIN,
-            reader_gone
-        )),
+        crate::is_stdout_closed(&closed("lab-mini", "@s-a1 text\n", OWN, reader_gone)),
         "a closed stdout is no cut of the drive"
     );
     fn drive(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
@@ -484,4 +490,111 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
             && awaited.contains("`aterm ctl --host lab-mini await …` again is safe"),
         "{awaited}"
     );
+}
+
+#[test]
+fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
+    fn drive(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Ok(DriveLink {
+            stream: Box::new(Frozen),
+            label: "lab-mini".to_owned(),
+        })
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(drive),
+        ..LocalVerbs::NONE
+    };
+    let five = Some(Some(Duration::from_secs(5)));
+    let turned = run("lab-mini", &words("@s-a1 turn go"), five, &local).expect_err("unanswered");
+    assert_eq!(turned.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
+    let turned = turned.to_string();
+    assert!(
+        turned.starts_with(
+            "no answer came from lab-mini within this call's --timeout of 5 s (a `turn` there \
+             answers once it settles or its timeout= runs out, 20000 ms where it names none; a \
+             longer --timeout, or 0, waits up to the drive's own 28 s), so what this `turn` sent \
+             may have landed"
+        ) && !turned.contains("frozen"),
+        "{turned}"
+    );
+    let read = run("lab-mini", &words("@s-a1 status"), five, &local)
+        .expect_err("unanswered")
+        .to_string();
+    assert!(
+        read.starts_with(
+            "no answer came from lab-mini within this call's --timeout of 5 s (a longer"
+        ) && read.contains("`aterm ctl --host lab-mini @s-a1 status …` again is safe"),
+        "{read}"
+    );
+    let spawned = spawn_exchange(
+        drive("lab-mini", DRIVE_WITHIN).expect("a link"),
+        "spawn agent=claude len=2",
+        b"go",
+        Within::Timeout(Duration::from_secs(5)),
+    )
+    .expect_err("unanswered")
+    .to_string();
+    assert!(
+        spawned.starts_with("no answer came from lab-mini within this call's --timeout of 5 s")
+            && spawned.contains("may have started"),
+        "{spawned}"
+    );
+    for total in [None, Some(None), Some(Some(Duration::from_secs(60)))] {
+        let own = run("lab-mini", &words("@s-a1 turn go"), total, &local)
+            .expect_err("unanswered")
+            .to_string();
+        assert!(
+            own.starts_with("lab-mini did not answer within 28 s (its aterm is stopped"),
+            "{total:?}: {own}"
+        );
+    }
+}
+
+#[test]
+fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
+    static ASKED: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
+    fn frozen(_: &str, within: Duration) -> Result<DriveLink, DriveRefused> {
+        ASKED.lock().unwrap_or_else(|p| p.into_inner()).push(within);
+        Err(DriveRefused {
+            unserved: true,
+            ..DriveRefused::once(format!(
+                "127.0.0.1:7100: connected, but no fleet handshake within {:.1}s",
+                within.as_secs_f64()
+            ))
+        })
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(frozen),
+        ..LocalVerbs::NONE
+    };
+    let five = Duration::from_secs(5);
+    for (total, within) in [
+        (Some(Some(five)), five),
+        (None, DRIVE_WITHIN),
+        (Some(None), DRIVE_WITHIN),
+        (Some(Some(Duration::from_secs(60))), DRIVE_WITHIN),
+    ] {
+        let refused =
+            run("lab-mini", &words("@s-a1 status"), total, &local).expect_err("never served");
+        assert_eq!(crate::exit_for(&refused), ExitCode::from(2), "{refused}");
+        assert_eq!(
+            ASKED.lock().unwrap().pop(),
+            Some(within),
+            "{total:?}: {refused}"
+        );
+    }
+    let awaited = await_task::run_driven(&words("await task @s-a1"), None, "lab-mini", frozen)
+        .expect_err("never served");
+    assert_eq!(crate::exit_for(&awaited), ExitCode::from(2), "{awaited}");
+    fn cut(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Err(DriveRefused::once(
+            "127.0.0.1:7100: no connection within 5.0s".to_owned(),
+        ))
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(cut),
+        ..LocalVerbs::NONE
+    };
+    let refused = run("lab-mini", &words("@s-a1 status"), None, &local).expect_err("refused");
+    assert_eq!(crate::exit_for(&refused), ExitCode::FAILURE, "{refused}");
 }

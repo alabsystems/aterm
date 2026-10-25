@@ -991,6 +991,80 @@ fn push_terminal_document(
     nodes.push((id, grid));
 }
 
+/// Emit one split pane's terminal document, returning its node id.
+fn push_pane_document(
+    nodes: &mut Vec<(NodeId, Node)>,
+    pane: &GridPane,
+    geom: Option<GridGeometry>,
+) -> NodeId {
+    let id = NodeId(PANE_BASE + pane.slot as u64);
+    push_terminal_document(
+        nodes,
+        id,
+        pane.slot + 1,
+        pane.label.clone(),
+        &pane.snap,
+        (pane.row_off, pane.col_off),
+        geom,
+        pane.selection,
+    );
+    id
+}
+
+/// Splice a mixed tab's terminal panes into its native window tree.
+///
+/// `update` is the composite tree of the tab's native leaves, whose window root lists one child per
+/// native leaf in layout order. Each pane takes its `slot` among the `leaves` children and the
+/// native roots fill the other slots in order. A focused pane takes the focus the composite left on
+/// its window root. Returns the colliding id, leaving `update` unchanged, when a pane's node id is
+/// already one of the native nodes.
+pub(crate) fn splice_terminal_panes(
+    update: &mut TreeUpdate,
+    panes: &[GridPane],
+    geom: Option<GridGeometry>,
+    leaves: usize,
+) -> Result<(), NodeId> {
+    let Some(root) = update.tree.as_ref().map(|tree| tree.root) else {
+        return Ok(());
+    };
+    let mut documents = Vec::new();
+    let mut focused_pane = None;
+    for pane in panes {
+        let id = push_pane_document(&mut documents, pane, geom);
+        if pane.focused {
+            focused_pane = Some(id);
+        }
+    }
+    let native: aterm_hash::FxHashSet<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+    if let Some((id, _)) = documents.iter().find(|(id, _)| native.contains(id)) {
+        return Err(*id);
+    }
+    let Some((_, window)) = update.nodes.iter_mut().find(|(id, _)| *id == root) else {
+        return Ok(());
+    };
+    let slots = panes
+        .iter()
+        .map(|pane| pane.slot + 1)
+        .fold(leaves, usize::max);
+    let mut native_roots = window.children().to_vec().into_iter();
+    let mut children = Vec::with_capacity(slots);
+    for slot in 0..slots {
+        match panes.iter().find(|pane| pane.slot == slot) {
+            Some(pane) => children.push(NodeId(PANE_BASE + pane.slot as u64)),
+            None => children.extend(native_roots.next()),
+        }
+    }
+    children.extend(native_roots);
+    window.set_children(children);
+    update.nodes.append(&mut documents);
+    if update.focus == root
+        && let Some(pane) = focused_pane
+    {
+        update.focus = pane;
+    }
+    Ok(())
+}
+
 fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
     let mut run = Node::new(Role::TextRun);
     run.set_value(find.query.clone());
@@ -1096,22 +1170,33 @@ fn push_message(
     id
 }
 
-/// Build the [`TreeUpdate`] for a terminal window frame.
-pub(crate) fn grid_tree(
-    snap: &crate::accessibility::AccessibleSnapshot,
+/// The focus the window chrome claims over the window's content, in precedence order.
+struct ChromeFocus {
+    menu: Option<(NodeId, Option<NodeId>)>,
+    find: bool,
+    lens: Option<NodeId>,
+}
+
+impl ChromeFocus {
+    /// The open menu's row (or the menu), else the find field, else the keyboard-driven lens.
+    fn focus(&self) -> Option<NodeId> {
+        match self.menu {
+            Some((id, row)) => Some(row.unwrap_or(id)),
+            None if self.find => Some(FIND),
+            None => self.lens,
+        }
+    }
+}
+
+/// Emit the window chrome of `frame` (tab list, stats, messages, find, rewind, chips, menu) in
+/// reading order, appending each top-level id to `root_children`; `cols` is the grid's width.
+fn push_chrome(
+    nodes: &mut Vec<(NodeId, Node)>,
+    root_children: &mut Vec<NodeId>,
     geom: Option<GridGeometry>,
     frame: &GridFrame<'_>,
-) -> TreeUpdate {
-    let rows = if frame.panes.is_empty() {
-        snap.value().split_inclusive('\n').count()
-    } else {
-        snap.rows
-    };
-    let mut nodes: Vec<(NodeId, Node)> =
-        Vec::with_capacity(rows + frame.tabs.len() + frame.panes.len() + frame.messages.len() + 5);
-    let mut root_children: Vec<NodeId> =
-        Vec::with_capacity(3 + frame.panes.len() + frame.messages.len());
-
+    cols: usize,
+) -> ChromeFocus {
     if !frame.tabs.is_empty() {
         let mut items: Vec<NodeId> = Vec::with_capacity(frame.tabs.len());
         for tab in frame.tabs {
@@ -1147,7 +1232,7 @@ pub(crate) fn grid_tree(
             list.set_bounds(Rect {
                 x0: g.origin_x,
                 y0: g.strip_y,
-                x1: g.origin_x + snap.cols as f64 * g.cell_w,
+                x1: g.origin_x + cols as f64 * g.cell_w,
                 y1: g.strip_y + g.strip_h,
             });
         }
@@ -1157,9 +1242,9 @@ pub(crate) fn grid_tree(
 
     let mut lens_focus = None;
     if let Some(stats) = frame.stats {
-        root_children.push(push_stats(&mut nodes, stats));
+        root_children.push(push_stats(nodes, stats));
         if let Some(lens) = &stats.lens {
-            let (id, focus) = push_stats_lens(&mut nodes, lens);
+            let (id, focus) = push_stats_lens(nodes, lens);
             root_children.push(id);
             lens_focus = lens.keys.then_some(focus);
         }
@@ -1169,24 +1254,86 @@ pub(crate) fn grid_tree(
         .iter()
         .filter_map(|kind| frame.messages.iter().find(|m| m.message == *kind))
     {
-        root_children.push(push_message(&mut nodes, message, geom, snap.cols));
+        root_children.push(push_message(nodes, message, geom, cols));
     }
 
     if let Some(find) = frame.find {
-        push_find_field(&mut nodes, find);
+        push_find_field(nodes, find);
         root_children.push(FIND);
     }
 
     if let Some(rewind) = frame.rewind {
-        push_rewind(&mut nodes, rewind);
+        push_rewind(nodes, rewind);
         root_children.push(REWIND);
     }
 
-    root_children.extend(push_chips(&mut nodes, frame.chips, geom));
-    let menu = frame.menu.map(|menu| push_menu(&mut nodes, menu, geom));
+    root_children.extend(push_chips(nodes, frame.chips, geom));
+    let menu = frame.menu.map(|menu| push_menu(nodes, menu, geom));
     if let Some((id, _)) = menu {
         root_children.push(id);
     }
+
+    ChromeFocus {
+        menu,
+        find: frame.find.is_some(),
+        lens: lens_focus,
+    }
+}
+
+/// Splice the window chrome of `frame` into a native tab's window tree.
+///
+/// The chrome goes ahead of the tab's leaves, as in the terminal grid's tree, and an open menu,
+/// find field or keyboard-driven lens takes the focus. `frame`'s panes, selection and title are
+/// not read. Returns the colliding id, leaving `update` unchanged, when a chrome node's id is
+/// already one of the tree's nodes.
+pub(crate) fn splice_chrome(
+    update: &mut TreeUpdate,
+    geom: Option<GridGeometry>,
+    frame: &GridFrame<'_>,
+    cols: usize,
+) -> Result<(), NodeId> {
+    let Some(root) = update.tree.as_ref().map(|tree| tree.root) else {
+        return Ok(());
+    };
+    let mut chrome_nodes = Vec::new();
+    let mut chrome_children = Vec::new();
+    let chrome = push_chrome(&mut chrome_nodes, &mut chrome_children, geom, frame, cols);
+    if chrome_children.is_empty() {
+        return Ok(());
+    }
+    let present: aterm_hash::FxHashSet<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+    if let Some((id, _)) = chrome_nodes.iter().find(|(id, _)| present.contains(id)) {
+        return Err(*id);
+    }
+    let Some((_, window)) = update.nodes.iter_mut().find(|(id, _)| *id == root) else {
+        return Ok(());
+    };
+    chrome_children.extend_from_slice(window.children());
+    window.set_children(chrome_children);
+    update.nodes.append(&mut chrome_nodes);
+    if let Some(focus) = chrome.focus() {
+        update.focus = focus;
+    }
+    Ok(())
+}
+
+/// Build the [`TreeUpdate`] for a terminal window frame.
+pub(crate) fn grid_tree(
+    snap: &crate::accessibility::AccessibleSnapshot,
+    geom: Option<GridGeometry>,
+    frame: &GridFrame<'_>,
+) -> TreeUpdate {
+    let rows = if frame.panes.is_empty() {
+        snap.value().split_inclusive('\n').count()
+    } else {
+        snap.rows
+    };
+    let mut nodes: Vec<(NodeId, Node)> =
+        Vec::with_capacity(rows + frame.tabs.len() + frame.panes.len() + frame.messages.len() + 5);
+    let mut root_children: Vec<NodeId> =
+        Vec::with_capacity(3 + frame.panes.len() + frame.messages.len());
+
+    let chrome = push_chrome(&mut nodes, &mut root_children, geom, frame, snap.cols);
 
     let mut focused_pane: Option<NodeId> = None;
     if frame.panes.is_empty() {
@@ -1203,17 +1350,7 @@ pub(crate) fn grid_tree(
         root_children.push(GRID);
     } else {
         for pane in frame.panes {
-            let id = NodeId(PANE_BASE + pane.slot as u64);
-            push_terminal_document(
-                &mut nodes,
-                id,
-                pane.slot + 1,
-                pane.label.clone(),
-                &pane.snap,
-                (pane.row_off, pane.col_off),
-                geom,
-                pane.selection,
-            );
+            let id = push_pane_document(&mut nodes, pane, geom);
             if pane.focused {
                 focused_pane = Some(id);
             }
@@ -1221,13 +1358,10 @@ pub(crate) fn grid_tree(
         }
     }
 
-    let focus = match (menu, frame.find.is_some(), focused_pane) {
-        (Some((id, row)), _, _) => row.unwrap_or(id),
-        (None, true, _) => FIND,
-        (None, false, _) if lens_focus.is_some() => lens_focus.unwrap_or(GRID),
-        (None, false, Some(pane)) => pane,
-        (None, false, None) => root_children.last().copied().unwrap_or(GRID),
-    };
+    let focus = chrome
+        .focus()
+        .or(focused_pane)
+        .unwrap_or_else(|| root_children.last().copied().unwrap_or(GRID));
 
     let mut root = Node::new(Role::Window);
     root.set_label(if frame.window_title.is_empty() {
@@ -1781,6 +1915,158 @@ mod tests {
             None,
             "a pane id is never decoded as a tab switch"
         );
+    }
+
+    fn native_composite(roots: &[NodeId], focus: Option<NodeId>) -> TreeUpdate {
+        let window_root = NodeId(0xA11E);
+        let mut nodes: Vec<(NodeId, Node)> = roots
+            .iter()
+            .map(|id| (*id, Node::new(Role::Group)))
+            .collect();
+        let mut window = Node::new(Role::Window);
+        window.set_children(roots.to_vec());
+        nodes.push((window_root, window));
+        TreeUpdate {
+            nodes,
+            tree: Some(Tree::new(window_root)),
+            tree_id: TreeId::ROOT,
+            focus: focus.unwrap_or(window_root),
+        }
+    }
+
+    fn pane(slot: usize, text: &[u8], focused: bool) -> GridPane {
+        GridPane {
+            slot,
+            label: format!("aterm terminal — pane {} of 4", slot + 1),
+            snap: live_grid(2, 10, text, focused.then_some((0, 0))),
+            row_off: 0,
+            col_off: slot * 11,
+            focused,
+            selection: None,
+        }
+    }
+
+    #[test]
+    fn a_mixed_tab_s_terminal_panes_take_their_layout_slots() {
+        let (a, b) = (NodeId(0xA), NodeId(0xB));
+        let mut update = native_composite(&[a, b], None);
+        let window_root = update.tree.as_ref().unwrap().root;
+        let panes = [pane(0, b"first", true), pane(2, b"third", false)];
+        splice_terminal_panes(&mut update, &panes, Some(GEOM), 4).expect("no collision");
+        let (first, third) = (NodeId(PANE_BASE), NodeId(PANE_BASE + 2));
+        assert_eq!(
+            node(&update, window_root).children(),
+            [first, a, third, b],
+            "terminal and native leaves interleave in layout order"
+        );
+        assert_eq!(node(&update, first).value(), Some("first\n\n"));
+        assert_eq!(node(&update, third).value(), Some("third\n\n"));
+        assert_eq!(
+            node(&update, third).bounds().unwrap().x0,
+            GEOM.origin_x + 22.0 * GEOM.cell_w
+        );
+        assert_eq!(
+            update.focus, first,
+            "the focused pane takes the root's focus"
+        );
+        assert_eq!(
+            node(&update, first).children()[0],
+            NodeId(ROW_BASE + PANE_STRIDE),
+            "pane rows keep the split grid's ids"
+        );
+    }
+
+    #[test]
+    fn a_native_focus_keeps_its_node_when_terminal_panes_join() {
+        let (a, b) = (NodeId(0xA), NodeId(0xB));
+        let mut update = native_composite(&[a, b], Some(b));
+        splice_terminal_panes(&mut update, &[pane(1, b"mid", true)], None, 3)
+            .expect("no collision");
+        assert_eq!(update.focus, b, "a native control's focus is never taken");
+    }
+
+    #[test]
+    fn a_native_tab_s_chrome_reads_first_and_takes_focus_only_when_open() {
+        let native = NodeId(0xA);
+        let find = GridFind {
+            query: "needle".into(),
+            caret: 6,
+            status: String::new(),
+        };
+        let band = GridMessage {
+            message: ChromeMessage::BandRow0,
+            context: None,
+            text: "Toolchain ready".into(),
+            detail: None,
+            progress: None,
+            busy: false,
+            alarm: false,
+            activates: false,
+            bar_row: Some(0),
+            capsules: Vec::new(),
+        };
+        let messages = [band];
+        let mut update = native_composite(&[native], Some(native));
+        let window_root = update.tree.as_ref().unwrap().root;
+        let quiet = GridFrame {
+            messages: &messages,
+            ..GridFrame::default()
+        };
+        splice_chrome(&mut update, Some(GEOM), &quiet, 20).expect("no collision");
+        let band_id = ChromeMessage::BandRow0.node_id();
+        assert_eq!(node(&update, window_root).children(), [band_id, native]);
+        assert_eq!(node(&update, band_id).label(), Some("Toolchain ready"));
+        assert_eq!(update.focus, native, "a band never takes a control's focus");
+
+        let mut update = native_composite(&[native], Some(native));
+        let finding = GridFrame {
+            messages: &messages,
+            find: Some(&find),
+            ..GridFrame::default()
+        };
+        splice_chrome(&mut update, Some(GEOM), &finding, 20).expect("no collision");
+        assert_eq!(
+            node(&update, window_root).children(),
+            [band_id, FIND, native]
+        );
+        assert_eq!(update.focus, FIND, "an open find field owns the keyboard");
+
+        let mut update = native_composite(&[native], Some(native));
+        let before = update.clone();
+        splice_chrome(&mut update, Some(GEOM), &GridFrame::default(), 20).expect("nothing to add");
+        assert_eq!(
+            update, before,
+            "no chrome on screen leaves the tree as composed"
+        );
+    }
+
+    #[test]
+    fn a_chrome_id_that_collides_leaves_the_native_tree_unchanged() {
+        let find = GridFind {
+            query: String::new(),
+            caret: 0,
+            status: String::new(),
+        };
+        let mut update = native_composite(&[NodeId(0xA), FIND], None);
+        let before = update.clone();
+        let frame = GridFrame {
+            find: Some(&find),
+            ..GridFrame::default()
+        };
+        assert_eq!(splice_chrome(&mut update, None, &frame, 20), Err(FIND));
+        assert_eq!(update, before);
+    }
+
+    #[test]
+    fn a_terminal_pane_id_that_collides_leaves_the_native_tree_unchanged() {
+        let clash = NodeId(PANE_BASE + 1);
+        let mut update = native_composite(&[NodeId(0xA), clash], None);
+        let before = update.clone();
+        assert_eq!(
+            splice_terminal_panes(&mut update, &[pane(1, b"x", true)], None, 3),
+            Err(clash)
+        );
+        assert_eq!(update, before);
     }
 
     #[test]

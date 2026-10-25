@@ -4270,73 +4270,6 @@ fn leads_with(a: &TurnEndAction, needle: &str) -> bool {
         if reason.chars().take(120).collect::<String>().contains(needle))
 }
 
-fn gemini_point(fixture: &str) -> TurnEndReading {
-    let rows = aterm_phase::prompt::fixtures::screen(fixture);
-    let reading = aterm_phase::read(Some("node"), &rows, None);
-    let r = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
-    assert_eq!(r.program, Program::Gemini, "named by its screen");
-    r
-}
-
-#[test]
-fn an_error_gemini_cli_does_not_retry_is_escalated_never_typed_at() {
-    let t = t0();
-    let stopped = gemini_point(aterm_phase::gemini::fixtures::LIMIT_STOPPED);
-    assert!(
-        matches!(
-            stopped.wall,
-            Some(WallKind::ApiError {
-                retryable: false,
-                ..
-            })
-        ),
-        "{:?}",
-        stopped.wall
-    );
-    let mut st = TurnEndState::default();
-    let a = act(&mut st, &stopped, t);
-    assert!(is_escalate(&a, "An unknown error occurred."), "{a:?}");
-    assert!(
-        leads_with(&a, "not retried") && leads_with(&a, "/stats model"),
-        "said within the badge's 120 cells: {a:?}"
-    );
-    let again = TurnEndReading {
-        worked: None,
-        ..stopped.clone()
-    };
-    assert!(
-        !matches!(
-            at(&mut st, &again, t + 10 * MIN),
-            TurnEndAction::Type { .. } | TurnEndAction::TypeCommand { .. }
-        ),
-        "nothing typed at the next point"
-    );
-    let retried_by_it = TurnEndReading {
-        wall: Some(WallKind::ApiError {
-            code: Some(503),
-            retryable: true,
-            cause: ApiCause::Server,
-        }),
-        ..stopped.clone()
-    };
-    let codex = TurnEndReading {
-        program: Program::Codex,
-        ..stopped
-    };
-    for (what, r) in [("a 503", retried_by_it), ("Codex's", codex)] {
-        assert!(
-            matches!(
-                at(&mut TurnEndState::default(), &r, t),
-                TurnEndAction::WaitUntil {
-                    wait: WaitKind::Retry,
-                    ..
-                }
-            ),
-            "{what}: the retry ladder"
-        );
-    }
-}
-
 fn agy_point(fixture: &str) -> TurnEndReading {
     let rows = aterm_phase::prompt::fixtures::screen(fixture);
     let reading = aterm_phase::read(Some("agy"), &rows, None);
@@ -4394,197 +4327,6 @@ fn an_api_refusal_of_agys_request_is_escalated_never_typed_at() {
     }
 }
 
-#[test]
-fn a_key_gemini_cli_was_refused_types_nothing_and_says_how_it_signs_in() {
-    let t = t0();
-    let escalation = |r: &TurnEndReading, c: &SupervisorConfig| {
-        let mut st = TurnEndState::default();
-        st.observe(r, t);
-        match decide_turn_end(&st, r, c, t) {
-            TurnEndAction::Escalate { reason } => reason,
-            other => panic!("escalated: {other:?}"),
-        }
-    };
-    let mut off = cfg();
-    off.retry_api_errors = false;
-    for fixture in [
-        aterm_phase::gemini::fixtures::ERROR_401,
-        aterm_phase::gemini::fixtures::ERROR_400_KEY,
-    ] {
-        let gemini = gemini_point(fixture);
-        assert_eq!(gemini.wall, Some(WallKind::Auth));
-        let a = act(&mut TurnEndState::default(), &gemini, t);
-        assert!(is_escalate(&a, "the login is gone"), "{a:?}");
-        assert!(is_escalate(&a, "\"code\""), "the wall's words: {a:?}");
-        assert!(
-            leads_with(&a, "/auth in its tab")
-                && leads_with(&a, "run it again with a valid GEMINI_API_KEY"),
-            "said within the badge's 120 cells, ahead of Google's JSON: {a:?}"
-        );
-        let reason = escalation(&gemini, &off);
-        assert!(
-            reason.starts_with("the login is gone, sign Gemini CLI in with /auth")
-                && reason.contains("(retry_api_errors is off): "),
-            "{reason}"
-        );
-        let codex = TurnEndReading {
-            program: Program::Codex,
-            ..gemini.clone()
-        };
-        let reason = escalation(&codex, &cfg());
-        assert!(
-            reason.starts_with("the login is gone: [API Error:")
-                && reason.ends_with(" (sign in to Codex again with codex login)"),
-            "the control: {reason}"
-        );
-        let claude = TurnEndReading {
-            program: Program::Claude,
-            ..gemini.clone()
-        };
-        let reason = escalation(&claude, &off);
-        assert!(
-            reason.starts_with("the login is gone: [API Error:")
-                && reason.ends_with(" (retry_api_errors is off; sign in with /login)"),
-            "the control: {reason}"
-        );
-        let claude = TurnEndReading {
-            program: Program::Claude,
-            ..gemini
-        };
-        assert!(
-            matches!(
-                act(&mut TurnEndState::default(), &claude, t),
-                TurnEndAction::TypeCommand { ref command, .. } if command == "/login"
-            ),
-            "the control"
-        );
-    }
-}
-
-#[test]
-fn a_box_gemini_clis_person_refused_holds_the_point() {
-    let t = t0();
-    let refused = gemini_point(aterm_phase::gemini::fixtures::BOX_DENIED);
-    assert!(refused.interrupted, "read as the person's stop");
-    assert!(
-        matches!(
-            at(&mut TurnEndState::default(), &refused, t),
-            TurnEndAction::WaitUntil { ref why, .. } if why == "a person stopped the turn with Esc"
-        ),
-        "held"
-    );
-    let theirs_not = TurnEndReading {
-        interrupted: false,
-        ..refused
-    };
-    assert!(
-        !matches!(
-            at(&mut TurnEndState::default(), &theirs_not, t),
-            TurnEndAction::WaitUntil { ref why, .. } if why == "a person stopped the turn with Esc"
-        ),
-        "the control"
-    );
-}
-
-#[test]
-fn a_command_gemini_clis_sandbox_denied_is_continued_as_any_turn() {
-    use aterm_phase::gemini::fixtures as g;
-    let t = t0();
-    for fixture in [
-        g::SANDBOX_DENIED,
-        g::SANDBOX_DENIED_NETWORK,
-        g::SANDBOX_RETRY_ALLOWED,
-        g::SANDBOX_NESTED_DENIED,
-        g::SANDBOX_TOOLS_EXPANSION_REFUSED,
-        g::SANDBOX_TOOLS_NARROW_EXPANSION_REFUSED,
-    ] {
-        let point = gemini_point(fixture);
-        assert!(point.wall.is_none() && !point.interrupted, "{fixture:.120}");
-        assert!(
-            matches!(
-                act(&mut TurnEndState::default(), &point, t),
-                TurnEndAction::Type { .. }
-            ),
-            "{fixture:.120}: continued"
-        );
-    }
-    let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
-    let ago = Duration::from_secs(30);
-    for fixture in [
-        g::SANDBOX_TOOLS_EXPANSION_REFUSED,
-        g::SANDBOX_TOOLS_NARROW_EXPANSION_REFUSED,
-    ] {
-        let keyed = TurnEndReading {
-            person: Some(ago),
-            ..gemini_point(fixture)
-        };
-        assert_eq!(
-            at(&mut TurnEndState::default(), &keyed, t),
-            TurnEndAction::Nothing,
-            "{fixture:.120}: theirs"
-        );
-        let mut st = TurnEndState::default();
-        let typed_at = act(&mut st, &gemini_point(g::SANDBOX_END_OF_TURN), t);
-        assert!(
-            matches!(typed_at, TurnEndAction::Type { .. }),
-            "{typed_at:?}"
-        );
-        st.took();
-        let now = t + 10 * MIN;
-        let a = at(&mut st, &keyed, now);
-        assert!(
-            waits_until(&a, now + grace - ago)
-                && matches!(&a, TurnEndAction::WaitUntil { why, .. } if why == "a person is typing"),
-            "{fixture:.120}: the continuation's turn, held for the person's key: {a:?}"
-        );
-    }
-    let carried = || {
-        let mut st = TurnEndState::default();
-        at(&mut st, &idle("Stage 1 landed.", Some(10 * MIN)), t);
-        assert_eq!(
-            act(&mut st, &idle("Stage 1 landed.", None), t),
-            typed(RULE_CONTINUE)
-        );
-        at(
-            &mut st,
-            &idle("Stage 2 landed.", Some(10 * MIN)),
-            t + 10 * MIN,
-        );
-        st
-    };
-    let now = t + 20 * MIN;
-    let keyed = |ago| TurnEndReading {
-        person: Some(ago),
-        ..gemini_point(g::SANDBOX_TOOLS_EXPANSION_REFUSED)
-    };
-    let mut st = carried();
-    let a = at(&mut st, &keyed(ago), now);
-    assert!(
-        waits_until(&a, now + grace - ago)
-            && matches!(&a, TurnEndAction::WaitUntil { why, .. } if why == "a person is typing"),
-        "a carried task's keyed turn, held: {a:?}"
-    );
-    assert!(!st.left_to_person(), "never theirs while carried");
-    let mut st = carried();
-    let late = keyed(grace + Duration::from_secs(1));
-    at(&mut st, &late, now);
-    assert!(
-        matches!(act(&mut st, &late, now), TurnEndAction::Type { .. }),
-        "the key older than the grace: continued"
-    );
-    for fixture in [g::SANDBOX_RETRY_REFUSED, g::SANDBOX_TOOLS_NETWORK_REFUSED] {
-        let refused = gemini_point(fixture);
-        assert!(refused.interrupted, "{fixture:.120}");
-        assert!(
-            matches!(
-                at(&mut TurnEndState::default(), &refused, t),
-                TurnEndAction::WaitUntil { ref why, .. } if why == "a person stopped the turn with Esc"
-            ),
-            "{fixture:.120}: the control, held"
-        );
-    }
-}
-
 fn refused_point(program: &str, fixture: &str) -> TurnEndReading {
     let rows = aterm_phase::prompt::fixtures::screen(fixture);
     let reading = aterm_phase::read(Some(program), &rows, None);
@@ -4601,67 +4343,60 @@ fn held_for_esc_until(a: &TurnEndAction, until: Instant) -> bool {
 
 #[test]
 fn a_persons_esc_is_held_from_its_own_read_not_from_an_old_point() {
-    use aterm_phase::{gemini::fixtures as g, prompt::fixtures as f};
+    use aterm_phase::prompt::fixtures as f;
     let t = t0();
     let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
     assert!(grace > Duration::ZERO, "the default grace holds");
-    for (program, fixture) in [
-        ("claude", f::QUESTION_DECLINED_ESC),
-        ("node", g::BOX_DENIED),
-    ] {
-        let refused = refused_point(program, fixture);
-        let ended = TurnEndReading {
-            interrupted: false,
-            worked: Some(JOB),
-            ..refused.clone()
-        };
-        let esc = t + 30 * MIN;
-        let mut st = TurnEndState::default();
-        at(&mut st, &ended, t);
-        st.box_up();
-        let a = at(&mut st, &refused, esc);
-        assert!(held_for_esc_until(&a, esc + grace), "{program}: {a:?}");
-        let a = at(&mut st, &refused, esc + grace / 2);
-        assert!(
-            held_for_esc_until(&a, esc + grace),
-            "{program}: the same point read again: {a:?}"
-        );
-        let a = at(&mut st, &refused, esc + grace);
-        assert!(
-            !matches!(a, TurnEndAction::WaitUntil { ref why, .. } if why.contains("Esc")),
-            "{program}: the grace spent: {a:?}"
-        );
+    let (program, fixture) = ("claude", f::QUESTION_DECLINED_ESC);
+    let refused = refused_point(program, fixture);
+    let ended = TurnEndReading {
+        interrupted: false,
+        worked: Some(JOB),
+        ..refused.clone()
+    };
+    let esc = t + 30 * MIN;
+    let mut st = TurnEndState::default();
+    at(&mut st, &ended, t);
+    st.box_up();
+    let a = at(&mut st, &refused, esc);
+    assert!(held_for_esc_until(&a, esc + grace), "{program}: {a:?}");
+    let a = at(&mut st, &refused, esc + grace / 2);
+    assert!(
+        held_for_esc_until(&a, esc + grace),
+        "{program}: the same point read again: {a:?}"
+    );
+    let a = at(&mut st, &refused, esc + grace);
+    assert!(
+        !matches!(a, TurnEndAction::WaitUntil { ref why, .. } if why.contains("Esc")),
+        "{program}: the grace spent: {a:?}"
+    );
 
-        let mut st = TurnEndState::default();
-        at(&mut st, &refused, t);
-        let a = at(&mut st, &refused, esc);
-        assert!(
-            !matches!(a, TurnEndAction::WaitUntil { ref why, .. } if why.contains("Esc")),
-            "{program}: the control: {a:?}"
-        );
-        let theirs_not = TurnEndReading {
-            interrupted: false,
-            ..refused.clone()
-        };
-        let mut st = TurnEndState::default();
-        at(&mut st, &ended, t);
-        let a = at(&mut st, &theirs_not, esc);
-        assert!(
-            !matches!(a, TurnEndAction::WaitUntil { ref why, .. } if why.contains("Esc")),
-            "{program}: the control: {a:?}"
-        );
-    }
+    let mut st = TurnEndState::default();
+    at(&mut st, &refused, t);
+    let a = at(&mut st, &refused, esc);
+    assert!(
+        !matches!(a, TurnEndAction::WaitUntil { ref why, .. } if why.contains("Esc")),
+        "{program}: the control: {a:?}"
+    );
+    let theirs_not = TurnEndReading {
+        interrupted: false,
+        ..refused.clone()
+    };
+    let mut st = TurnEndState::default();
+    at(&mut st, &ended, t);
+    let a = at(&mut st, &theirs_not, esc);
+    assert!(
+        !matches!(a, TurnEndAction::WaitUntil { ref why, .. } if why.contains("Esc")),
+        "{program}: the control: {a:?}"
+    );
 }
 
 #[test]
 fn an_esc_after_a_box_is_held_afresh() {
-    use aterm_phase::{gemini::fixtures as g, prompt::fixtures as f};
+    use aterm_phase::prompt::fixtures as f;
     let t = t0();
     let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
-    for (program, fixture) in [
-        ("claude", f::QUESTION_DECLINED_ESC),
-        ("node", g::BOX_DENIED),
-    ] {
+    for (program, fixture) in [("claude", f::QUESTION_DECLINED_ESC)] {
         let refused = refused_point(program, fixture);
         let again = t + 20 * MIN;
         for (between, held) in [("a box", true), ("a turn", true), ("nothing", false)] {
@@ -4710,52 +4445,6 @@ fn a_loop_that_follows_holds_an_esc_from_the_point_its_record_marks() {
             "marked {marked}, a box {boxed}: {a:?}"
         );
     }
-}
-
-#[test]
-fn a_box_kept_over_gemini_clis_composer_is_never_typed_at() {
-    use aterm_phase::gemini::fixtures as g;
-    let t = t0();
-    for fixture in [
-        g::DRAWER_KEPT_BOX_SHELL,
-        g::DRAWER_KEPT_BOX_SHELL_DRAFT,
-        g::DRAWER_KEPT_BOX_SHELL_QUEUED,
-        g::DRAWER_KEPT_DETAILS_HIDDEN_BOX_SHELL,
-    ] {
-        let point = gemini_point(fixture);
-        let mut st = TurnEndState::default();
-        for later in [Duration::ZERO, 10 * MIN, 60 * MIN] {
-            let a = act(&mut st, &point, t + later);
-            assert!(
-                !matches!(
-                    a,
-                    TurnEndAction::Type { .. } | TurnEndAction::TypeCommand { .. }
-                ),
-                "{fixture:.120}: {a:?}"
-            );
-        }
-    }
-    let mut rows = aterm_phase::prompt::fixtures::screen(g::DRAWER_KEPT_BOX_SHELL);
-    let top = rows
-        .iter()
-        .rposition(|r| r.starts_with('╭'))
-        .expect("the box");
-    let bottom = rows
-        .iter()
-        .rposition(|r| r.starts_with('╰'))
-        .expect("the box");
-    for row in &mut rows[top..=bottom] {
-        row.clear();
-    }
-    let reading = aterm_phase::read(Some("node"), &rows, None);
-    let rest = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
-    assert!(
-        matches!(
-            act(&mut TurnEndState::default(), &rest, t),
-            TurnEndAction::Type { .. }
-        ),
-        "the control: the composer at rest is continued"
-    );
 }
 
 /// A no-progress fact a reading may carry ([`crate::supervise::facts`]).
@@ -15749,12 +15438,11 @@ fn renewable(r: &TurnEndReading, label: &str) -> TurnEndReading {
 /// browser sign-in only a person could finish) and tells no one; it waits on the row's own
 /// sign-in and is moved onto the login it made, even where nothing can move it yet (`relaunch`
 /// off). `/login` is typed only over a login the roster names no row of, and where the roster
-/// names the row by the time its browser hand-off shows, the sign-in is told as that row's own
-/// account.
+/// names the row by the time its browser hand-off shows, aterm backs out of that dialog and waits
+/// on the row's sign-in as well, `/login` typed once.
 #[test]
 fn a_renewable_logins_end_waits_on_its_rows_own_sign_in() {
-    use super::super::exception::{Urgency, exception_for};
-    use super::super::outlook::ExceptionKind;
+    use super::super::exception::exception_for;
     let t = t0();
     let gone = walled(
         WallKind::Auth,
@@ -15831,23 +15519,40 @@ fn a_renewable_logins_end_waits_on_its_rows_own_sign_in() {
         login_label: Some("m7-a".to_string()),
         ..real_point(aterm_phase::prompt::fixtures::LOGIN_HANDOFF)
     };
-    st.observe(&handoff, t + MIN + Duration::from_secs(5));
-    let e = exception_for(&st, &handoff, &by_hand, t + 2 * MIN).expect("the owner is needed now");
+    let shown = t + MIN + Duration::from_secs(5);
+    let a = at_under(&mut st, &handoff, shown, &by_hand);
     assert_eq!(
-        (e.kind, e.when, e.escalated),
-        (ExceptionKind::Login, Urgency::Now, false)
+        a,
+        TurnEndAction::Cancel {
+            rule_id: super::super::login::RULE_LOGIN_BACK_OUT
+        },
+        "the roster named the row by the hand-off: aterm backs out of its own /login"
     );
-    let n = e.notice.as_ref().expect("a notice");
     assert_eq!(
-        n.id,
-        crate::supervise::policy::notice::LOGIN_SIGN_IN_AS.id,
-        "the sign-in is the owner's, as the row's own account: {e:?}"
+        exception_for(&st, &handoff, &by_hand, shown),
+        None,
+        "no one is asked to sign the row in"
     );
-    assert!(e.action.contains("m7-a"), "{e:?}");
+    st.acted(&a, &handoff, shown);
+    let left = TurnEndReading {
+        login_label: Some("m7-a".to_string()),
+        ..real_point(aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED)
+    };
+    let a = at_under(&mut st, &left, t + 2 * MIN, &by_hand);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "the row's own sign-in is waited on, nothing moving the tab yet: {a:?}"
+    );
     assert_eq!(
-        at_under(&mut st, &ended, t + 3 * MIN, &by_hand),
-        TurnEndAction::Nothing,
-        "`/login` once"
+        st.account_point(&left, &by_hand),
+        Some(AccountPoint::LoginEnded)
+    );
+    assert_eq!(exception_for(&st, &left, &by_hand, t + 2 * MIN), None);
+    assert_eq!(st.login_track(), Some(1), "`/login` once");
+    let a = at_under(&mut st, &ended, t + 3 * MIN, &by_hand);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "`/login` once: {a:?}"
     );
     assert_eq!(
         at(&mut TurnEndState::default(), &gone, t + MIN),
@@ -17535,23 +17240,29 @@ fn a_login_another_tab_signs_in_is_waited_on_and_delivered_again_once() {
     assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
 }
 
+/// THE DIALOG OF THE `/login` ATERM TYPED, ITS LOGIN BACK IN ANOTHER TAB: nobody needs its
+/// sign-in, so aterm closes it with its own Esc (the hand-off's, a turn-end act fenced on its
+/// `Esc to cancel` row; the picker's is the approval loop's) and tells no one to close it, waits
+/// out the Esc's pause, and once the dialog is gone continues the turn there. Negative controls:
+/// with the login not back, the dialog stands and its sign-in is told; a person typing since aterm
+/// typed `/login` holds the Esc; a `/login` typed after the turn was delivered again, the host
+/// still reporting the login back, gets no Esc at its picker or its hand-off; and a person's own
+/// `/login` over the login back gets no key.
 #[test]
-fn a_dialog_whose_login_came_back_elsewhere_is_told_to_be_closed() {
+fn a_dialog_whose_login_came_back_elsewhere_is_backed_out_of() {
     use super::super::exception::{Urgency, exception_for};
-    use super::super::notice::LOGIN_BACK_DIALOG;
+    use super::super::login::{PickerGate, RULE_LOGIN_BACK_OUT, picker_gate};
+    use super::super::notice::LOGIN_SIGN_IN;
     use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER};
     let t = t0();
+    let wall = walled(
+        WallKind::Auth,
+        "Login expired · Please run /login",
+        Some(3 * MIN),
+    );
     let typed = || {
         let mut st = TurnEndState::default();
-        let a = act(
-            &mut st,
-            &walled(
-                WallKind::Auth,
-                "Login expired · Please run /login",
-                Some(3 * MIN),
-            ),
-            t,
-        );
+        let a = act(&mut st, &wall, t);
         assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
         st
     };
@@ -17561,39 +17272,125 @@ fn a_dialog_whose_login_came_back_elsewhere_is_told_to_be_closed() {
         }),
         ..r
     };
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_BACK_OUT,
+    };
     for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
         let mut st = typed();
         let r = shared(real_point(text), true);
         assert!(r.login_screen.is_some(), "{text}");
-        assert_eq!(at(&mut st, &r, t + MIN), TurnEndAction::Nothing, "{text}");
-        let e = exception_for(&st, &r, &cfg(), t + MIN).expect("the owner is needed now");
-        assert_eq!((e.when, e.escalated), (Urgency::Now, false), "{e:?}");
+        let now = t + MIN;
+        let a = at(&mut st, &r, now);
+        if text == LOGIN_PICKER {
+            assert_ne!(a, cancel, "the picker is a box, the approval loop's");
+            assert!(
+                picker_gate(
+                    st.login_typed_at().is_some(),
+                    st.login_back_from(r.login_shared.as_ref()),
+                    false,
+                    false
+                )
+                .backs_out(),
+                "the approval loop backs out of the picker"
+            );
+            st.login_backed_out_at(now);
+        } else {
+            assert_eq!(a, cancel, "{text}");
+            st.acted(&a, &r, now);
+        }
+        assert_eq!(exception_for(&st, &r, &cfg(), now), None, "{text}");
+        let closing = at(&mut st, &r, now + Duration::from_secs(1));
         assert_eq!(
-            e.notice.as_ref().map(|n| n.id),
-            Some(LOGIN_BACK_DIALOG.id),
-            "{text}: {e:?}"
+            closing.rule_id(),
+            None,
+            "one Esc, the dialog left to close: {text}"
+        );
+        assert_eq!(
+            exception_for(&st, &r, &cfg(), now + Duration::from_secs(1)),
+            None,
+            "nobody told while it closes: {text}"
         );
         let gone = shared(real_point(LOGIN_INTERRUPTED), true);
         let a = at(&mut st, &gone, t + 2 * MIN);
         assert_eq!(a.rule_id(), Some(RULE_LOGIN_BACK), "{text}: {a:?}");
         assert_eq!(exception_for(&st, &gone, &cfg(), t + 2 * MIN), None);
-        let mut st = typed();
-        let r = shared(real_point(text), false);
-        assert_eq!(at(&mut st, &r, t + MIN), TurnEndAction::Nothing, "{text}");
-        let e = exception_for(&st, &r, &cfg(), t + MIN).expect("the owner is needed now");
-        assert_ne!(
-            e.notice.as_ref().map(|n| n.id),
-            Some(LOGIN_BACK_DIALOG.id),
-            "{text}: {e:?}"
-        );
-        assert!(e.notice.is_some(), "{text}: {e:?}");
     }
+    // The login not back: the hand-off stands, its sign-in told.
+    let mut st = typed();
+    let r = shared(real_point(LOGIN_HANDOFF), false);
+    let a = at(&mut st, &r, t + MIN);
+    assert_eq!(a, TurnEndAction::Nothing, "{a:?}");
+    let e = exception_for(&st, &r, &cfg(), t + MIN).expect("the owner is needed now");
+    assert_eq!((e.when, e.escalated), (Urgency::Now, false), "{e:?}");
+    assert_eq!(
+        e.notice.as_ref().map(|n| n.id),
+        Some(LOGIN_SIGN_IN.id),
+        "{e:?}"
+    );
+    // A person typing since aterm typed `/login`: the Esc is held for them.
+    let mut st = typed();
+    let r = TurnEndReading {
+        person: Some(Duration::from_secs(1)),
+        ..shared(real_point(LOGIN_HANDOFF), true)
+    };
+    let a = at(&mut st, &r, t + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { .. }),
+        "the key held for the person: {a:?}"
+    );
+    // The turn already delivered again once the login came back (login-back@v1) and met by the
+    // wall again: it signs in itself, and a `Back` the host still reports (the login back in
+    // another tab again while that `/login` stands) is the delivered one's. Neither its picker
+    // (the approval loop's gate) nor its hand-off (the turn end) is backed out of, and its sign-in
+    // is told, the two judged alike.
+    let mut st = TurnEndState::default();
+    let back_wall = shared(wall.clone(), true);
+    let a = act(&mut st, &back_wall, t);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN_BACK), "{a:?}");
+    let a = act(&mut st, &back_wall, t + MIN);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "its own sign-in: {a:?}");
+    let r = shared(real_point(LOGIN_PICKER), true);
+    assert!(!st.login_back_from(r.login_shared.as_ref()));
+    assert_eq!(
+        picker_gate(
+            st.login_typed_at().is_some(),
+            st.login_back_from(r.login_shared.as_ref()),
+            false,
+            false
+        ),
+        PickerGate::Carried,
+        "its picker gets the method, no Esc"
+    );
+    let r = shared(real_point(LOGIN_HANDOFF), true);
+    let a = at(&mut st, &r, t + 2 * MIN);
+    assert_eq!(a, TurnEndAction::Nothing, "no Esc at its hand-off: {a:?}");
+    let e = exception_for(&st, &r, &cfg(), t + 2 * MIN).expect("its sign-in is told");
+    assert_eq!(
+        e.notice.as_ref().map(|n| n.id),
+        Some(LOGIN_SIGN_IN.id),
+        "{e:?}"
+    );
+    // A person's own `/login` over the login back: no key.
+    let mut st = TurnEndState::default();
+    st.observe(&shared(wall.clone(), true), t);
+    let r = shared(real_point(LOGIN_HANDOFF), true);
+    let a = at(&mut st, &r, t + MIN);
+    assert_eq!(a.rule_id(), None, "a person's own dialog: {a:?}");
+    assert_eq!(
+        picker_gate(
+            false,
+            st.login_back_from(r.login_shared.as_ref()),
+            false,
+            false
+        ),
+        PickerGate::Persons,
+        "a person's own picker"
+    );
 }
 
 #[test]
 fn a_renewal_made_while_the_login_was_up_is_followed_once_it_is_left() {
     use super::super::exception::exception_for;
-    use super::super::notice::LOGIN_CANCELLED;
     use aterm_phase::prompt::fixtures::LOGIN_INTERRUPTED;
     let t = t0();
     let wall = TurnEndReading {
@@ -17646,18 +17443,22 @@ fn a_renewal_made_while_the_login_was_up_is_followed_once_it_is_left() {
         None,
         "no sign-in asked again"
     );
+    // No renewal yet, and no move advised: the `/login` left over the row is no person's ask,
+    // and the tab waits on the row's own sign-in, `/login` typed once.
     let mut st = TurnEndState::default();
     let a = act(&mut st, &typed_wall, t);
     assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
-    let gone = left(false);
+    let gone = TurnEndReading {
+        account: None,
+        ..left(false)
+    };
     let a = at(&mut st, &gone, t + MIN);
-    assert!(!matches!(a, TurnEndAction::Restart { .. }), "{a:?}");
-    let e = exception_for(&st, &gone, &cfg(), t + MIN).expect("told");
-    assert_eq!(
-        e.notice.as_ref().map(|n| n.id),
-        Some(LOGIN_CANCELLED.id),
-        "{e:?}"
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "{a:?}"
     );
+    assert_eq!(exception_for(&st, &gone, &cfg(), t + MIN), None);
+    assert_eq!(st.login_track(), Some(1), "`/login` once");
 }
 
 #[test]
@@ -17708,8 +17509,8 @@ fn a_renewal_over_a_landings_lost_login_is_asked_for_once_its_login_is_left() {
     assert!(st.task_done(), "the landing stands through the wall");
     assert_eq!(
         st.account_point(&gone, &cfg()),
-        Some(AccountPoint::TurnEnd),
-        "the host is asked"
+        Some(AccountPoint::LoginEnded),
+        "the host is asked, as at the row's own wall"
     );
     let moved = TurnEndReading {
         account: Some(AccountAdvice::Move {
@@ -17737,10 +17538,19 @@ fn a_renewal_over_a_landings_lost_login_is_asked_for_once_its_login_is_left() {
     assert_eq!(st.account_point(&end, &cfg()), None, "not asked");
 }
 
+/// THE DIALOG OF THE `/login` ATERM TYPED BEFORE THE ROSTER NAMED THE LOGIN'S ROW: aterm backs
+/// out of it by itself (the picker's Esc, pressed by the approval loop, or the hand-off's, a
+/// turn-end act fenced on its `Esc to cancel` row), tells no one, and waits on the row's own
+/// sign-in as at the row's wall: the tab relaunches onto the renewed login where it can, and the
+/// host is told the login ended. Whether the row was renewed yet or not, and with `relaunch` off.
+/// Negative controls: a person's own `/login` over the same row is left alone (no Esc, theirs
+/// once left), and over a login no row names `/login` is typed once and its sign-in told, no
+/// second `/login` after it is left.
 #[test]
-fn a_dialog_over_a_renewed_login_is_told_to_be_closed() {
+fn the_dialog_aterm_opened_over_a_roster_row_is_backed_out_of() {
     use super::super::exception::{Urgency, exception_for};
-    use super::super::notice::{LOGIN_RENEWED_DIALOG, LOGIN_SIGN_IN_AS};
+    use super::super::login::RULE_LOGIN_BACK_OUT;
+    use super::super::notice::{LOGIN_CANCELLED, LOGIN_LEFT, LOGIN_SIGN_IN};
     use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER};
     let t = t0();
     let wall = TurnEndReading {
@@ -17774,39 +17584,269 @@ fn a_dialog_over_a_renewed_login_is_told_to_be_closed() {
         }),
         ..renewable(&real_point(text), "m7-a")
     };
-    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
-        let mut st = typed();
-        let r = over(text, true);
-        assert!(r.login_screen.is_some(), "{text}");
-        assert_eq!(at(&mut st, &r, t + MIN), TurnEndAction::Nothing, "{text}");
-        let e = exception_for(&st, &r, &cfg(), t + MIN).expect("the owner is needed now");
-        assert_eq!((e.when, e.escalated), (Urgency::Now, false), "{e:?}");
-        let notice = e.notice.as_ref().expect("a notice");
-        assert_eq!(notice.id, LOGIN_RENEWED_DIALOG.id, "{text}: {e:?}");
-        assert!(notice.expect.contains("m7-a"), "{text}: {e:?}");
-        let gone = over(LOGIN_INTERRUPTED, true);
-        let a = at(&mut st, &gone, t + 2 * MIN);
-        assert!(
-            matches!(&a, TurnEndAction::Restart { why: Restart::Account { to, at: AccountAt::Wall }, .. } if to == "m7-a"),
-            "{text}: {a:?}"
-        );
-        assert_eq!(exception_for(&st, &gone, &cfg(), t + 2 * MIN), None);
-    }
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_BACK_OUT,
+    };
     let no_relaunch = SupervisorConfig {
         relaunch: false,
         ..cfg()
     };
-    for (superseded, c) in [(false, cfg()), (true, no_relaunch)] {
-        let mut st = typed();
-        let r = over(LOGIN_HANDOFF, superseded);
-        assert_eq!(at(&mut st, &r, t + MIN), TurnEndAction::Nothing);
-        let e = exception_for(&st, &r, &c, t + MIN).expect("the owner is needed now");
-        assert_eq!(
-            e.notice.as_ref().map(|n| n.id),
-            Some(LOGIN_SIGN_IN_AS.id),
-            "superseded {superseded}: {e:?}"
-        );
+    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
+        for (superseded, c) in [(true, cfg()), (false, cfg()), (true, no_relaunch.clone())] {
+            let case = format!("{text} superseded {superseded} relaunch {}", c.relaunch);
+            let mut st = typed();
+            let r = over(text, superseded);
+            assert!(r.login_screen.is_some(), "{case}");
+            let now = t + MIN;
+            let a = at_under(&mut st, &r, now, &c);
+            if text == LOGIN_PICKER {
+                assert_ne!(
+                    a, cancel,
+                    "the picker is a box, the approval loop's: {case}"
+                );
+                st.login_backed_out_at(now);
+            } else {
+                assert_eq!(a, cancel, "{case}");
+                st.acted(&a, &r, now);
+            }
+            assert_eq!(exception_for(&st, &r, &c, now), None, "{case}");
+            let closing = at_under(&mut st, &r, now + Duration::from_secs(1), &c);
+            assert_eq!(
+                closing.rule_id(),
+                None,
+                "one Esc, the dialog left to close: {case}"
+            );
+            assert!(
+                text == LOGIN_PICKER
+                    || matches!(&closing, TurnEndAction::WaitUntil { until, .. } if *until == now + st.timing.take_within),
+                "waited until the Esc had its time to close the dialog: {case}: {closing:?}"
+            );
+            assert_eq!(
+                exception_for(&st, &r, &c, now + Duration::from_secs(1)),
+                None,
+                "{case}"
+            );
+            let gone = over(LOGIN_INTERRUPTED, superseded);
+            let later = t + 2 * MIN;
+            let a = at_under(&mut st, &gone, later, &c);
+            if superseded && c.relaunch {
+                assert!(
+                    matches!(&a, TurnEndAction::Restart { why: Restart::Account { to, at: AccountAt::Wall }, .. } if to == "m7-a"),
+                    "{case}: {a:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+                    "the row's own sign-in waited on: {case}: {a:?}"
+                );
+            }
+            if !superseded {
+                assert_eq!(
+                    st.account_point(&gone, &c),
+                    Some(AccountPoint::LoginEnded),
+                    "the host is told the login ended: {case}"
+                );
+            }
+            assert_eq!(exception_for(&st, &gone, &c, later), None, "{case}");
+            assert_eq!(st.login_track(), Some(1), "`/login` once: {case}");
+        }
     }
+    // A person's own `/login` over the same row: aterm typed none and backs out of none.
+    let mut st = TurnEndState::default();
+    let a = at(&mut st, &wall, t);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { .. }),
+        "no /login over the row: {a:?}"
+    );
+    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
+        let r = over(text, false);
+        let a = at(&mut st, &r, t + MIN);
+        assert_ne!(a, cancel, "a person's own dialog: {text}");
+        assert_eq!(
+            a.rule_id(),
+            None,
+            "no key in a person's own dialog: {text}: {a:?}"
+        );
+        assert_eq!(exception_for(&st, &r, &cfg(), t + MIN), None, "{text}");
+    }
+    let gone = over(LOGIN_INTERRUPTED, false);
+    let a = at(&mut st, &gone, t + 2 * MIN);
+    assert_ne!(
+        a.rule_id(),
+        Some(RULE_LOGIN),
+        "no /login over their cancel: {a:?}"
+    );
+    assert_eq!(st.login_track(), Some(0), "nothing typed");
+    let e = exception_for(&st, &gone, &cfg(), t + 2 * MIN);
+    assert_eq!(
+        e.as_ref().and_then(|e| e.notice.as_ref()).map(|n| n.id),
+        Some(LOGIN_LEFT.id),
+        "their cancel is theirs: {e:?}"
+    );
+    // A login no row names: `/login` typed once, its sign-in told, no Esc and no second `/login`.
+    let mut st = typed();
+    let handoff = TurnEndReading {
+        login_label: None,
+        ..over(LOGIN_HANDOFF, false)
+    };
+    let a = at(&mut st, &handoff, t + MIN);
+    assert_ne!(a, cancel, "no roster row: the sign-in stands");
+    let e = exception_for(&st, &handoff, &cfg(), t + MIN).expect("the sign-in told");
+    assert_eq!((e.when, e.escalated), (Urgency::Now, false), "{e:?}");
+    assert_eq!(
+        e.notice.as_ref().map(|n| n.id),
+        Some(LOGIN_SIGN_IN.id),
+        "{e:?}"
+    );
+    let gone = TurnEndReading {
+        login_label: None,
+        ..over(LOGIN_INTERRUPTED, false)
+    };
+    let a = at(&mut st, &gone, t + 2 * MIN);
+    assert_ne!(a.rule_id(), Some(RULE_LOGIN), "`/login` once: {a:?}");
+    assert_eq!(st.login_track(), Some(1), "`/login` once");
+    let e = exception_for(&st, &gone, &cfg(), t + 2 * MIN);
+    assert_eq!(
+        e.as_ref().and_then(|e| e.notice.as_ref()).map(|n| n.id),
+        Some(LOGIN_CANCELLED.id),
+        "{e:?}"
+    );
+}
+
+/// THE DIALOG ATERM BACKED OUT OF, STILL DRAWN ONCE ITS ESC HAD ITS TIME TO CLOSE IT (an Esc
+/// Claude Code dropped): still the `/login` aterm typed, so the Esc is pressed again, each time
+/// after a pause twice the last, and no one is told to sign the row in, at the hand-off or at
+/// the picker (whose gate stays aterm's back-out). Negative control: the same dialog read gone
+/// once (the composer back) is left, and the tab waits on the row's sign-in.
+#[test]
+fn a_dialog_still_drawn_after_aterms_esc_gets_the_esc_again() {
+    use super::super::exception::exception_for;
+    use super::super::login::{PickerGate, RULE_LOGIN_BACK_OUT, picker_gate};
+    use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER};
+    let t = t0();
+    let typed_wall = TurnEndReading {
+        restartable: true,
+        login_label: None,
+        ..renewable(
+            &walled(WallKind::Auth, "Login expired · Please run /login", None),
+            "m7-a",
+        )
+    };
+    let over = |text: &str| TurnEndReading {
+        restartable: true,
+        ..renewable(&real_point(text), "m7-a")
+    };
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_BACK_OUT,
+    };
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &typed_wall, t);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+    let take = st.timing.take_within;
+    let handoff = over(LOGIN_HANDOFF);
+    let mut esc_at = t + MIN;
+    let mut pause = take;
+    for n in 1..=3 {
+        let a = at(&mut st, &handoff, esc_at);
+        assert_eq!(a, cancel, "Esc {n}");
+        st.acted(&a, &handoff, esc_at);
+        assert_eq!(
+            exception_for(&st, &handoff, &cfg(), esc_at),
+            None,
+            "Esc {n}"
+        );
+        let held = at(&mut st, &handoff, esc_at + pause - Duration::from_secs(1));
+        assert!(
+            matches!(&held, TurnEndAction::WaitUntil { until, .. } if *until == esc_at + pause),
+            "Esc {n}: the next one waits the pause: {held:?}"
+        );
+        assert_eq!(
+            exception_for(
+                &st,
+                &handoff,
+                &cfg(),
+                esc_at + pause - Duration::from_secs(1)
+            ),
+            None,
+            "Esc {n}: no one told while it closes"
+        );
+        esc_at += pause;
+        pause *= 2;
+    }
+    let picker = over(LOGIN_PICKER);
+    st.observe(&picker, esc_at);
+    assert_eq!(
+        picker_gate(st.login_typed_at().is_some(), false, true, false),
+        PickerGate::Roster,
+        "the picker still drawn is still aterm's to back out of"
+    );
+    assert_eq!(
+        exception_for(&st, &picker, &cfg(), esc_at),
+        None,
+        "no one asked to choose a method"
+    );
+    let gone = over(LOGIN_INTERRUPTED);
+    let a = at(&mut st, &gone, esc_at + MIN);
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("m7-a")),
+        "the row's own sign-in waited on: {a:?}"
+    );
+    assert!(st.login_typed_left(), "the /login aterm typed was left");
+    assert_eq!(st.login_track(), Some(1), "`/login` once");
+}
+
+/// A PERSON'S OWN `/login` AFTER THE DIALOG ATERM BACKED OUT OF WAS READ GONE: theirs. No Esc at
+/// their picker or hand-off, however long after aterm's Esc, the picker's gate a person's, and
+/// nobody told anything there. Negative control for `a_dialog_still_drawn_after_aterms_esc_gets_the_esc_again`.
+#[test]
+fn a_persons_login_after_aterms_back_out_is_left_alone() {
+    use super::super::exception::exception_for;
+    use super::super::login::{PickerGate, RULE_LOGIN_BACK_OUT, picker_gate};
+    use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER};
+    let t = t0();
+    let typed_wall = TurnEndReading {
+        restartable: true,
+        login_label: None,
+        ..renewable(
+            &walled(WallKind::Auth, "Login expired · Please run /login", None),
+            "m7-a",
+        )
+    };
+    let over = |text: &str| TurnEndReading {
+        restartable: true,
+        ..renewable(&real_point(text), "m7-a")
+    };
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_BACK_OUT,
+    };
+    let mut st = TurnEndState::default();
+    let a = act(&mut st, &typed_wall, t);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+    let handoff = over(LOGIN_HANDOFF);
+    let a = at(&mut st, &handoff, t + MIN);
+    assert_eq!(a, cancel, "aterm's own dialog backed out of");
+    st.acted(&a, &handoff, t + MIN);
+    let gone = over(LOGIN_INTERRUPTED);
+    let _ = at(&mut st, &gone, t + 2 * MIN);
+    assert!(st.login_typed_left(), "aterm's /login left");
+    assert_eq!(st.login_typed_at(), None, "no /login of aterm's stands");
+    let later = t + 10 * MIN;
+    let picker = over(LOGIN_PICKER);
+    let a = at(&mut st, &picker, later);
+    assert_eq!(a.rule_id(), None, "no key at a person's picker: {a:?}");
+    assert_eq!(
+        picker_gate(st.login_typed_at().is_some(), false, true, false),
+        PickerGate::Persons,
+        "the person's own picker"
+    );
+    assert_eq!(exception_for(&st, &picker, &cfg(), later), None, "picker");
+    let a = at(&mut st, &handoff, later + MIN);
+    assert_eq!(a.rule_id(), None, "no Esc at a person's hand-off: {a:?}");
+    assert_eq!(
+        exception_for(&st, &handoff, &cfg(), later + MIN),
+        None,
+        "hand-off"
+    );
 }
 
 fn on_credits(r: &TurnEndReading, reset: Option<Instant>) -> TurnEndReading {
@@ -18447,7 +18487,6 @@ fn every_wall_act_ends_on_the_needs_you_sentence() {
         Program::Codex,
         Program::Agy,
         Program::Muse,
-        Program::Gemini,
         Program::Generic,
     ];
     let causes = [
@@ -18598,7 +18637,7 @@ fn a_sign_in_at_a_usage_limit_is_no_switch_until_the_worker_works_past_it() {
 
 /// A LIMIT ENDED WHERE ANOTHER PROGRAM'S SCREEN IS READ SAYS SO
 /// ([`TurnEndState::limit_ended_elsewhere`]): Claude Code's session limit,
-/// then Muse Code's or Gemini CLI's idle point in the same tab, which did no
+/// then Muse Code's idle point in the same tab, which did no
 /// work — the track ends there ([`met_under_another`]), and the end is
 /// another program's, so the loop's end row names that, not the worker's
 /// work or another wall. Measured before: the row the loop wrote there read
@@ -18611,7 +18650,6 @@ fn a_limit_ended_at_another_programs_screen_is_said_as_such() {
     let t = t0();
     for (next, worked, elsewhere) in [
         (Program::Muse, None, true),
-        (Program::Gemini, None, true),
         (Program::Claude, Some(5 * MIN), false),
     ] {
         let mut limit = walled(
@@ -19032,7 +19070,7 @@ fn a_lost_login_over_a_landing_is_told_the_task_is_landed() {
 
 fn opened(said: &str, msg: &str) -> TurnEndReading {
     TurnEndReading {
-        program: aterm_phase::Program::Gemini,
+        program: aterm_phase::Program::Muse,
         opened_by: Some(crate::supervise::approvals::words_lead(msg)),
         ..idle(said, None)
     }
@@ -19124,7 +19162,7 @@ fn a_draft_submitted_and_answered_before_any_read_saw_it_run_is_taken_by_the_tur
     const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
     const FIRST: &str = "Wrote the parser module.";
     let fast = Duration::from_millis(600);
-    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Muse] {
         let shown = |said: &str, msg: &str| match program {
             aterm_phase::Program::Claude => closing(said, msg, None),
             _ => opened(said, msg),
@@ -19225,7 +19263,7 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
     const FIRST: &str = "Wrote the parser module.";
     let secs = Duration::from_secs;
     let t = t0();
-    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Muse] {
         let shown = |said: &str, msg: &str| match program {
             aterm_phase::Program::Claude => closing(said, msg, None),
             _ => opened(said, msg),
@@ -19504,7 +19542,7 @@ fn a_turn_asked_since_the_point_is_told_by_its_submission_whatever_its_words() {
         crate::supervise::approvals::words_lead(AGAIN),
         "one lead"
     );
-    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Muse] {
         let shown = |said: &str, msg: &str| match program {
             aterm_phase::Program::Claude => closing(said, msg, None),
             _ => opened(said, msg),
@@ -19665,7 +19703,7 @@ fn an_act_typed_again_and_answered_the_same_is_taken_by_its_submission() {
     const REPLY: &str = "Continuing: the lexer is next.";
     let secs = Duration::from_secs;
     let fast = Duration::from_millis(600);
-    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Muse] {
         let shown = |said: &str, msg: &str| match program {
             aterm_phase::Program::Claude => closing(said, msg, None),
             _ => opened(said, msg),
@@ -19725,7 +19763,7 @@ fn the_harnesss_own_keys_ask_no_turn() {
     const REPLY: &str = "Here is where it stands: the parser module is written and tested.";
     let secs = Duration::from_secs;
     let t = t0();
-    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Muse] {
         let shown = |said: &str, msg: &str| match program {
             aterm_phase::Program::Claude => closing(said, msg, None),
             _ => opened(said, msg),
@@ -19807,7 +19845,7 @@ fn a_turn_judged_under_a_draft_spends_its_submission() {
     const LEXER: &str = "The lexer is next; it is not started.";
     let secs = Duration::from_secs;
     let t = t0();
-    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Gemini] {
+    for program in [aterm_phase::Program::Claude, aterm_phase::Program::Muse] {
         let shown = |said: &str, msg: &str| match program {
             aterm_phase::Program::Claude => closing(said, msg, None),
             _ => opened(said, msg),
@@ -19889,7 +19927,7 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
             submits,
             inputs_before: inputs,
             screen_mark: Some(200),
-            program: aterm_phase::Program::Gemini,
+            program: aterm_phase::Program::Muse,
             ..idle("", None)
         };
     let rewrapped = |st: &TurnEndState, submits: Option<u64>| TurnEndReading {
@@ -19899,7 +19937,7 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
         submits,
         inputs_before: Some(7),
         screen_mark: Some(200),
-        program: aterm_phase::Program::Gemini,
+        program: aterm_phase::Program::Muse,
         ..idle("", None)
     };
     let mut st = start();

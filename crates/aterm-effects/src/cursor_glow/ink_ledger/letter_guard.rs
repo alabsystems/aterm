@@ -184,9 +184,9 @@ fn ramp_row(
     let (Some(&(lo, _)), Some(&(hi, _))) = (cuts.first(), cuts.last()) else {
         return;
     };
-    let share_of = |col: i32| {
-        cuts.binary_search_by_key(&col, |c| c.0)
-            .map_or(1.0, |i| cuts[i].1)
+    let share_of = |col: i32| match cuts.binary_search_by_key(&col, |c| c.0) {
+        Ok(i) => cuts[i].1,
+        Err(_) => 1.0,
     };
     let reach = WORD_GAP_COLS + 1;
     for col in (lo - reach).max(0)..=hi + reach {
@@ -360,14 +360,19 @@ impl LetterGuard {
         (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
         has_over: bool,
     ) -> bool {
-        let additive = self.cell.iter().all(|&(stream, i)| match stream {
-            Stream::Under => under[i as usize].alpha | under[i as usize].alpha2 == 0,
-            Stream::Over => over[i as usize].alpha | over[i as usize].alpha2 == 0,
-            Stream::HaloAdd => true,
-            Stream::HaloOver => false,
-        });
-        if !additive {
-            return false;
+        let mut ci = 0;
+        while ci < self.cell.len() {
+            let (stream, i) = self.cell[ci];
+            let ok = match stream {
+                Stream::Under => under[i as usize].alpha | under[i as usize].alpha2 == 0,
+                Stream::Over => over[i as usize].alpha | over[i as usize].alpha2 == 0,
+                Stream::HaloAdd => true,
+                Stream::HaloOver => false,
+            };
+            if !ok {
+                return false;
+            }
+            ci += 1;
         }
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
         let mut lu = std::mem::take(&mut self.lift_under);
@@ -724,7 +729,15 @@ impl LetterGuard {
         bar: f32,
         streams: (&[GlowQuad], &[GlowQuad], &[RainHalo]),
     ) -> f32 {
-        let has_over = self.cell.iter().any(|&(stream, _)| stream != Stream::Under);
+        let mut has_over = false;
+        let mut ci = 0;
+        while ci < self.cell.len() {
+            if self.cell[ci].0 != Stream::Under {
+                has_over = true;
+                break;
+            }
+            ci += 1;
+        }
         let additive = self.prepare(j, streams, has_over);
         if !additive {
             self.index_pixels(j, streams);
@@ -1344,13 +1357,16 @@ impl CursorGlow {
             if comb || guard.cuts.is_empty() {
                 continue;
             }
-            let skip = caret.filter(|&(r, _)| r == row).map(|(_, c)| c);
+            let skip = match caret {
+                Some((r, c)) if r == row => Some(c),
+                _ => None,
+            };
             #[cfg(any(test, debug_assertions))]
             let climb = guard.gaps_climb;
             #[cfg(not(any(test, debug_assertions)))]
             let climb = false;
             let cuts = std::mem::take(&mut guard.cuts);
-            let lettered = |col: i32| text.pair(row, col).is_some_and(|(ink, _)| ink.is_some());
+            let lettered = |col: i32| matches!(text.pair(row, col), Some((Some(_), _)));
             ramp_row(&cuts, skip, climb, lettered, |col, share| {
                 match cuts.binary_search_by_key(&col, |c| c.0) {
                     Ok(i) => ledger.dims[row_from + i].share = share,
@@ -1458,38 +1474,33 @@ impl CursorGlow {
             {
                 return ans;
             }
-            let ans = (|| {
-                let ink = solid_ink(ink, ground);
-                let la = lum(ink);
-                let ratio_ink = |b: u32| {
-                    let lb = lum(b);
-                    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-                };
-                let bare = ratio_ink(ground);
-                if bare >= PET_VEIL_THEME_BARE {
-                    return None;
-                }
+            let solid = solid_ink(ink, ground);
+            let la = lum(solid);
+            let ratio_ink = |b: u32| {
+                let lb = lum(b);
+                (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+            };
+            let bare = ratio_ink(ground);
+            let ans = if bare >= PET_VEIL_THEME_BARE {
+                None
+            } else {
                 let bar = (letter_bar(bare, false) + PET_VEIL_GUARD).min(bare);
                 // The worst coat is the letter's own colour (a coat may wear any).
-                let coat = ink;
+                let coat = solid;
                 let mut prev_g = coat;
-                let mut holds = |a: u8| {
-                    let g = aterm_render::over_premul(coat, premul_rgb(ground, a), a) & 0x00FF_FFFF;
-                    if g == prev_g {
-                        return false;
-                    }
-                    prev_g = g;
-                    ratio_ink(g) >= bar
-                };
                 let mut found = u8::MAX;
                 for a in 1..=u8::MAX {
-                    if holds(a) {
-                        found = a;
-                        break;
+                    let g = aterm_render::over_premul(coat, premul_rgb(ground, a), a) & 0x00FF_FFFF;
+                    if g != prev_g {
+                        prev_g = g;
+                        if ratio_ink(g) >= bar {
+                            found = a;
+                            break;
+                        }
                     }
                 }
                 Some(found)
-            })();
+            };
             veil_memo = Some(((ink, ground), ans));
             ans
         };
@@ -1614,7 +1625,10 @@ impl CursorGlow {
             };
             let feathers = [(edges.0, y0, 1, -1, y0 - 1), (edges.1, y1 - 1, -1, 1, y1)];
             for (open, edge, inward, outward, first) in feathers {
-                let Some(clip) = open.then(|| edge_span(edge)).flatten() else {
+                if !open {
+                    continue;
+                }
+                let Some(clip) = edge_span(edge) else {
                     continue;
                 };
                 let r = if deep { rise } else { depth(edge, inward) };
@@ -1648,29 +1662,36 @@ impl CursorGlow {
                 continue;
             }
             let lettered = |j: Option<usize>| {
-                j.and_then(|j| text.rows.get(j).copied().flatten())
-                    .is_some_and(|(f, e)| ox + e * cw > bx0 && ox + f * cw < bx1)
+                let Some(j) = j else {
+                    return false;
+                };
+                let Some(Some((f, e))) = text.rows.get(j).copied() else {
+                    return false;
+                };
+                ox + e * cw > bx0 && ox + f * cw < bx1
             };
             let edges = (
                 y0 == top && !lettered(i.checked_sub(1)),
                 y1 == bottom && !lettered(i.checked_add(1)),
             );
-            let caret_col = caret
-                .filter(|&(r, _)| i32::from(r) == row)
-                .map(|(_, c)| i32::from(c));
+            let caret_col = match caret {
+                Some((r, c)) if i32::from(r) == row => Some(i32::from(c)),
+                _ => None,
+            };
             // `(first column, page, opacity)` of the open run.
             let mut run: Option<(i32, u32, u8)> = None;
             for col in first..=end {
-                let at = (col < end
+                let at = if col < end
                     && caret_col != Some(col)
                     && ox + (col + 1) * cw > bx0
-                    && ox + col * cw < bx1)
-                    .then(|| text.pair(row, col))
-                    .flatten()
-                    .and_then(|(ink, ground)| {
-                        let ground = ground & 0x00FF_FFFF;
-                        Some((ground, veil(ink? & 0x00FF_FFFF, ground)?))
-                    });
+                    && ox + col * cw < bx1
+                    && let Some((Some(ink), ground)) = text.pair(row, col)
+                {
+                    let ground = ground & 0x00FF_FFFF;
+                    veil(ink & 0x00FF_FFFF, ground).map(|b| (ground, b))
+                } else {
+                    None
+                };
                 match (run, at) {
                     (Some((c0, page, a)), Some((g, b))) if g == page => {
                         run = Some((c0, page, a.max(b)));
@@ -1775,12 +1796,19 @@ impl CursorGlow {
         let print = match self.veil_frame {
             Some((caret, geom)) => {
                 let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
-                let sprite = self.pet_body.and_then(|body| {
-                    sprites.iter().find(|s| {
+                let mut sprite = None;
+                if let Some(body) = self.pet_body {
+                    let mut si = 0;
+                    while si < sprites.len() {
+                        let s = &sprites[si];
                         let (x, y) = (s.x + ox, s.y + oy);
-                        (x, x + i32::from(s.w), y, y + i32::from(s.h)) == body
-                    })
-                });
+                        if (x, x + i32::from(s.w), y, y + i32::from(s.h)) == body {
+                            sprite = Some(s);
+                            break;
+                        }
+                        si += 1;
+                    }
+                }
                 self.veil_letters_on_pet(out, caret, geom, sprite)
             }
             None => 0,

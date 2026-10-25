@@ -60,9 +60,8 @@ pub fn app_basename(commandline: &str) -> Option<String> {
             continue;
         }
         let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
-        let base = if base
-            .get(base.len().saturating_sub(4)..)
-            .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"))
+        let base = if let Some(ext) = base.get(base.len().saturating_sub(4)..)
+            && ext.eq_ignore_ascii_case(".exe")
         {
             &base[..base.len() - 4]
         } else {

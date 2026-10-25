@@ -17,7 +17,7 @@
 //! admitted lexically before anything at it is read, and admitted again before every read, which
 //! never follows a link ([`files`]); its reads run outside the books' lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(test))]
 use std::sync::LazyLock;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
@@ -26,13 +26,15 @@ use std::time::{Duration, Instant};
 use aterm_agent::supervise::occupancy::declarer::{self, AgentId, DeclarerRefusal, ProcLink};
 use aterm_agent::supervise::occupancy::due::{DueClock, K_LOOKS};
 use aterm_agent::supervise::occupancy::reading::LOOK_EVERY_MS;
-use aterm_agent::supervise::occupancy::rules::RuleId;
+use aterm_agent::supervise::occupancy::rules::{self, RuleId};
 use aterm_agent::supervise::occupancy::wake_atoms::AdmittedPath;
 use aterm_agent::supervise::occupancy::wakes::{
     Atom, Change, DeclaredWake, Ended, Levels, ParkAnswer, ParkBook, SourceAtom, SysWait, WakeBook,
     WakeReq,
 };
-use aterm_agent::supervise::occupancy::wakes_seen::{Declarer, ExpireWhy, WakeState};
+use aterm_agent::supervise::occupancy::wakes_seen::{
+    Declarer, ExpireWhy, WakeDoor, WakeState, WakesSeen,
+};
 use aterm_agent::supervise::{Guard, Occupancy};
 use aterm_types::MutexExt as _;
 use aterm_vitals::model::{SlotsView, Snapshot};
@@ -233,8 +235,6 @@ pub(crate) trait Env: Send + Sync {
     /// `sid`'s loop's last word: its open hold's start, unix ms, and the guard holding its line;
     /// `None` where no loop told this window a word.
     fn said(&self, sid: &str) -> Option<Said>;
-    /// Whether a loop of this build reads `sid`'s book, so that only it tells an answer heard.
-    fn hosted(&self, sid: &str) -> bool;
     /// What a file atom's admission and reads touch.
     fn fs(&self) -> &dyn WakeFs;
 }
@@ -495,6 +495,10 @@ impl Levels for ShelfLevels<'_> {
 struct Books {
     shelves: BTreeMap<String, Shelf>,
     outs: Vec<Out>,
+    /// The sessions a loop of this build reads the book of ([`WakeHost::seen_for`]) until it goes
+    /// ([`WakeHost::left`]): only that loop tells an answer heard, so there an answer written
+    /// stays `Answered` until it does (the plan's S2).
+    hosted: BTreeSet<String>,
 }
 
 impl Books {
@@ -554,7 +558,7 @@ impl Books {
     fn sample(&mut self, env: &dyn Env, sid: &str, now_ms: i64) {
         let prompt = env.mode() == Occupancy::Prompt;
         let said = env.said(sid);
-        let hosted = env.hosted(sid);
+        let hosted = self.hosted.contains(sid);
         let Some(shelf) = self.shelves.get_mut(sid) else {
             return;
         };
@@ -1065,12 +1069,88 @@ impl WakeHost {
     /// THE ANSWER TO `ord` OF `sid` WAS WRITTEN (`ok`) or not: told (answered, in a hosted
     /// session), or ready again for the next wait.
     pub(crate) fn answered(&self, env: &dyn Env, sid: &str, ord: u16, ok: bool) {
-        let hosted = env.hosted(sid);
         let now_ms = env.now_ms();
-        if let Some(shelf) = self.lock().shelves.get_mut(sid) {
+        let mut books = self.lock();
+        let hosted = books.hosted.contains(sid);
+        if let Some(shelf) = books.shelves.get_mut(sid) {
             shelf.book.answer_done(ord, ok, hosted, now_ms);
         }
+        drop(books);
         self.changed.notify_all();
+    }
+
+    /// THE BOOK AS `sid`'S LOOP READS IT (`IdleHost::wakes`): its live wakes, each need as the last
+    /// look latched it; nothing under the owner's `off`. The session is hosted from here on.
+    pub(crate) fn seen_for(&self, env: &dyn Env, sid: &str) -> WakesSeen {
+        let mut books = self.lock();
+        if books.off(env) {
+            return WakesSeen::default();
+        }
+        books.hosted.insert(sid.to_string());
+        books
+            .shelves
+            .get(sid)
+            .map(|shelf| shelf.book.seen_by(|w| shelf.need_met(w)))
+            .unwrap_or_default()
+    }
+
+    /// `sid`'S LOOP TOLD wake `ord` of `episode` through `door` (`IdleHost::wake_told`): an answer
+    /// heard (`await`), or a claimed line written. Anything else, and anything under the owner's
+    /// `off`, changes nothing.
+    pub(crate) fn told_for(
+        &self,
+        env: &dyn Env,
+        sid: &str,
+        ord: u16,
+        episode: u64,
+        door: WakeDoor,
+    ) {
+        let now_ms = env.now_ms();
+        let mut books = self.lock();
+        if books.off(env) {
+            return;
+        }
+        let told = books
+            .shelves
+            .get_mut(sid)
+            .is_some_and(|shelf| shelf.book.told(ord, episode, door, now_ms));
+        drop(books);
+        if told {
+            self.changed.notify_all();
+        }
+    }
+
+    /// `sid`'S LOOP WENT (its worker ended): no door is left to tell an answer heard, so each
+    /// answer written is told now, as an unhosted session's is at its write.
+    pub(crate) fn left(&self, env: &dyn Env, sid: &str) {
+        let now_ms = env.now_ms();
+        let mut books = self.lock();
+        if !books.hosted.remove(sid) {
+            return;
+        }
+        if let Some(shelf) = books.shelves.get_mut(sid) {
+            let answered: Vec<u16> = shelf
+                .book
+                .wakes
+                .iter()
+                .filter(|w| matches!(w.state, WakeState::Answered { .. }))
+                .map(|w| w.ord)
+                .collect();
+            for ord in answered {
+                shelf.book.heard(ord, now_ms);
+            }
+        }
+        drop(books);
+        self.changed.notify_all();
+    }
+
+    /// Whether a wake of `sid`'s is ready with its need met ([`rules::wake_met`]): the ring counts
+    /// the session ready (the plan's F14).
+    pub(crate) fn met(&self, sid: &str) -> bool {
+        self.lock()
+            .shelves
+            .get(sid)
+            .is_some_and(|shelf| rules::wake_met(&shelf.book.seen_by(|w| shelf.need_met(w))))
     }
 
     /// Wait for a change of any book, until `until` at most.
@@ -1206,7 +1286,7 @@ impl WakeHost {
             self.changed.notify_all();
             return;
         }
-        let Books { shelves, outs } = &mut *books;
+        let Books { shelves, outs, .. } = &mut *books;
         let mut gone: Vec<String> = Vec::new();
         for (sid, levels) in read {
             let Some(shelf) = shelves.get_mut(&sid) else {
@@ -1262,7 +1342,7 @@ impl WakeHost {
     /// out of `prompt` every K Entry is owed its end.
     pub(crate) fn note_mode(&self, mode: Occupancy) {
         let mut books = self.lock();
-        let Books { shelves, outs } = &mut *books;
+        let Books { shelves, outs, .. } = &mut *books;
         for (sid, shelf) in shelves.iter_mut() {
             if mode == Occupancy::Off {
                 shelf.disarm_off();
@@ -1287,7 +1367,10 @@ impl WakeHost {
     /// one holds the files' lock, that read lets the watches go once it finds the shelf gone, and
     /// the next tick's pass at the latest.
     pub(crate) fn forget(&self, sid: &str) {
-        self.lock().shelves.remove(sid);
+        let mut books = self.lock();
+        books.shelves.remove(sid);
+        books.hosted.remove(sid);
+        drop(books);
         self.close_files(Take::IfFree, |files| files.forget(sid));
         self.changed.notify_all();
     }
@@ -1722,11 +1805,6 @@ impl Env for Live {
             .map(|said| (said.hold.map(|h| h.since_ms), said.guard()))
     }
 
-    fn hosted(&self, _sid: &str) -> bool {
-        // No loop of this build reads the book (the plan's 2.7 does): an answer written is told.
-        false
-    }
-
     fn fs(&self) -> &dyn WakeFs {
         &files::Disk
     }
@@ -2112,6 +2190,26 @@ pub(crate) fn states_for_test(sid: &str) -> Vec<WakeState> {
 /// Tab `sid` closed: its book goes.
 pub(crate) fn forget(sid: &str) {
     host().forget(sid);
+}
+
+/// `sid`'s book as its loop reads it ([`WakeHost::seen_for`]).
+pub(crate) fn seen_for(sid: &str) -> WakesSeen {
+    host().seen_for(&Live, sid)
+}
+
+/// `sid`'s loop told wake `ord` of `episode` through `door` ([`WakeHost::told_for`]).
+pub(crate) fn told_for(sid: &str, ord: u16, episode: u64, door: WakeDoor) {
+    host().told_for(&Live, sid, ord, episode, door);
+}
+
+/// `sid`'s loop went ([`WakeHost::left`]).
+pub(crate) fn left(sid: &str) {
+    host().left(&Live, sid);
+}
+
+/// Whether a wake of `sid`'s is ready with its need met ([`WakeHost::met`]).
+pub(crate) fn met(sid: &str) -> bool {
+    host().met(sid)
 }
 
 /// `sid`'s book as its session record carries it.

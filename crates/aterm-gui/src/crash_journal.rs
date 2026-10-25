@@ -3305,8 +3305,7 @@ pub(crate) mod tests {
             Some(
                 aterm_agent::harness::upgrade::Agent::Codex
                 | aterm_agent::harness::upgrade::Agent::Agy
-                | aterm_agent::harness::upgrade::Agent::Muse
-                | aterm_agent::harness::upgrade::Agent::Gemini,
+                | aterm_agent::harness::upgrade::Agent::Muse,
             )
             | None => false,
         };
@@ -4599,7 +4598,7 @@ pub(crate) mod tests {
             let leaf = record(word);
             assert!(leaf.agent().is_none(), "{word}: no agent this build knows");
             for runs in [
-                Runs::Agent(Program::Gemini),
+                Runs::Agent(Program::Agy),
                 Runs::Agent(Program::Claude),
                 Runs::Other,
             ] {
@@ -4647,21 +4646,17 @@ pub(crate) mod tests {
         assert!(!Runs::Agent(Program::Claude).may_be(&agy));
         assert_eq!(record("agy").agent(), None);
         assert!(!Runs::Agent(Program::Agy).may_be(&record("agy")));
-        let gemini = restore::AgentRestore {
-            session: None,
-            run: Some(restore::RunRestore::Gemini(restore::GeminiRestore {
-                session: Some("11edd4f1-7048-4ff7-8ff2-83cce0095a7c".into()),
-                home: "/h/.gemini".into(),
-                chats: Some("/h/.gemini/tmp/b/chats".into()),
-                env: Vec::new(),
-                started_ms: 1_792_261_698_000,
-            })),
-            ..record("gemini")
-        };
-        assert!(Runs::Agent(Program::Gemini).may_be(&gemini));
-        assert!(!Runs::Agent(Program::Claude).may_be(&gemini));
-        assert_eq!(record("gemini").agent(), None);
-        assert!(!Runs::Agent(Program::Gemini).may_be(&record("gemini")));
+        let gemini = record("gemini");
+        assert!(gemini.retired(), "the retired Gemini CLI's leaf");
+        assert_eq!(gemini.agent(), None, "is no agent this build hosts");
+        for runs in [
+            Runs::Agent(Program::Agy),
+            Runs::Agent(Program::Claude),
+            Runs::Other,
+        ] {
+            assert!(!runs.may_be(&gemini), "gemini under {runs:?}");
+        }
+        assert!(Runs::Unread.may_be(&gemini), "gemini: unread, it stands");
     }
 
     #[test]

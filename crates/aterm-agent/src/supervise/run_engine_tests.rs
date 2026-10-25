@@ -3663,6 +3663,8 @@ struct TestHost {
     ends: AtomicBool,
     again: std::sync::atomic::AtomicUsize,
     limits: std::sync::Mutex<Vec<bool>>,
+    /// Each limit wall told ([`IdleHost::limit_wall`]), its `reset_unix`.
+    walls: std::sync::Mutex<Vec<Option<i64>>>,
     exceptions: std::sync::Mutex<Vec<Option<&'static str>>>,
     turn_ends: std::sync::atomic::AtomicUsize,
     withheld: std::sync::Mutex<Vec<Guard>>,
@@ -3833,6 +3835,9 @@ impl IdleHost for TestHost {
     fn limited(&self, open: bool) {
         self.limits.lock().unwrap().push(open);
     }
+    fn limit_wall(&self, reset_unix: Option<i64>) {
+        self.walls.lock().unwrap().push(reset_unix);
+    }
     fn withheld(&self, guard: Guard) {
         self.withheld.lock().unwrap().push(guard);
     }
@@ -3914,6 +3919,52 @@ fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
     assert_eq!(*host.limits.lock().unwrap(), [true, false], "{lines:#?}");
     assert_eq!(host.steps.load(Ordering::SeqCst), 0, "no step at a wall");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_host_dates_a_limit_wall_by_the_reset_the_episode_holds_it_to() {
+    let session_limit = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)";
+    let host = Arc::new(TestHost::default());
+    let mut m = Mock::new(vec![limited_screen()]);
+    let mut s = session(&mut m, None);
+    s.set_clock(TEST_NOW, PDT);
+    s.set_zone_lookup(test_zones);
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let first_text = Some("7:30pm (America/Los_Angeles)");
+    assert_eq!(
+        s.open_episode(101, session_limit, first_text, true, &mut Alone),
+        Ok(())
+    );
+    let first = s.limit.as_ref().and_then(|ep| ep.reset_unix);
+    assert!(first.is_some(), "the session limit's reset is placed");
+    assert_eq!(*host.walls.lock().unwrap(), [first], "told at the open");
+    s.refresh_reset(Some(WEEKLY_RESET));
+    let later = s.limit.as_ref().and_then(|ep| ep.reset_unix);
+    assert!(later > first, "a weekly limit's point moves the wall later");
+    assert_eq!(
+        *host.walls.lock().unwrap(),
+        [first, later],
+        "the host dates the wall where the loop takes it spent"
+    );
+    s.refresh_reset(first_text);
+    assert_eq!(s.limit.as_ref().and_then(|ep| ep.reset_unix), later);
+    assert_eq!(
+        *host.walls.lock().unwrap(),
+        [first, later],
+        "an earlier reset moves nothing, so nothing new is told"
+    );
+    let mut m = Mock::new(vec![limited_screen()]);
+    let mut s = session(&mut m, None);
+    s.set_clock(TEST_NOW, PDT);
+    let host = Arc::new(TestHost::default());
+    s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let spend = "You're out of extra usage · add funds to continue";
+    assert_eq!(s.open_episode(101, spend, None, true, &mut Alone), Ok(()));
+    assert_eq!(
+        *host.walls.lock().unwrap(),
+        [None],
+        "an episode with no reset of its own leaves the host its transcript's"
+    );
 }
 
 #[test]
@@ -13435,18 +13486,32 @@ fn a_word_that_only_moves_at_an_unchanged_point_is_passed_over_at_the_count() {
     }
 }
 
-const GEMINI_DIGIT_BOXES: [(&str, &str); 3] = [
-    ("tool", aterm_phase::gemini::fixtures::BOX_SHELL),
-    ("trust", aterm_phase::gemini::fixtures::TRUST),
-    ("question", aterm_phase::gemini::fixtures::QUESTION),
+/// Muse Code's automatic answer routes: one-shot tool permission, folder
+/// trust, and a question, each answered by Enter on its focused option under
+/// every guard (`if-human=`, `if-gen=`, `if=`). Each fixture reaches the real
+/// watch policy (its positive control) before a guard-negative case says
+/// anything about its press.
+/// An automatic press: Enter, under the person count, the generation and the
+/// row it answers.
+fn guarded_enter(press: &str) -> bool {
+    press.ends_with(" enter")
+        && press.contains("if-human=")
+        && press.contains("if-gen=")
+        && press.contains(" if=")
+}
+
+const MUSE_ANSWER_BOXES: [(&str, &str); 3] = [
+    ("tool", aterm_phase::muse::fixtures::BOX_SHELL),
+    ("trust", aterm_phase::muse::fixtures::TRUST_1_4_10),
+    ("question", aterm_phase::muse::fixtures::QUESTION),
 ];
 
-fn gemini_digit_server(fixture: &str) -> Mock {
+fn muse_answer_server(fixture: &str) -> Mock {
     let mut m = questioned(vec![
         q(fixture),
-        q(aterm_phase::gemini::fixtures::BUSY_THINKING),
+        q(aterm_phase::muse::fixtures::BUSY_1_4_10),
     ]);
-    m.program = "node";
+    m.program = "muse";
     m.human = vec!["150000"];
     m.human_ms = Some(150_000);
     m.human_seq = Some(7);
@@ -13455,7 +13520,7 @@ fn gemini_digit_server(fixture: &str) -> Mock {
     m
 }
 
-fn watch_gemini_digit(m: &mut Mock) -> Vec<String> {
+fn watch_muse_answer(m: &mut Mock) -> Vec<String> {
     let opts = SuperviseOpts {
         policy: SupervisorConfig::default(),
         ..auto(30)
@@ -13463,11 +13528,11 @@ fn watch_gemini_digit(m: &mut Mock) -> Vec<String> {
     watch_lines(m, &opts).0
 }
 
-fn gemini_digit_positive(fixture: &str) {
-    let mut m = gemini_digit_server(fixture);
-    let lines = watch_gemini_digit(&mut m);
+fn muse_answer_positive(fixture: &str) {
+    let mut m = muse_answer_server(fixture);
+    let lines = watch_muse_answer(&mut m);
     assert_eq!(m.presses().len(), 1, "{lines:#?}\n{:#?}", m.requests);
-    assert!(m.presses()[0].ends_with(" 1"), "{:#?}", m.requests);
+    assert!(guarded_enter(m.presses()[0]), "{:#?}", m.requests);
     assert!(
         lines.iter().any(|l| l.starts_with("APPROVED ")),
         "the real watch approved the control: {lines:#?}\n{:#?}",
@@ -13476,48 +13541,45 @@ fn gemini_digit_positive(fixture: &str) {
 }
 
 #[test]
-fn an_automatic_digit_requires_the_judged_reads_person_count() {
+fn an_automatic_answer_requires_the_judged_reads_person_count() {
     let mut wrote = Vec::new();
-    for (name, fixture) in GEMINI_DIGIT_BOXES {
-        gemini_digit_positive(fixture);
-        let mut m = gemini_digit_server(fixture);
+    for (name, fixture) in MUSE_ANSWER_BOXES {
+        muse_answer_positive(fixture);
+        let mut m = muse_answer_server(fixture);
         m.human_seq = None;
-        let lines = watch_gemini_digit(&mut m);
+        let lines = watch_muse_answer(&mut m);
         if !m.presses().is_empty() {
             wrote.push((name, lines, m.requests));
         }
     }
-    assert!(wrote.is_empty(), "missing-count digit writes: {wrote:#?}");
+    assert!(wrote.is_empty(), "missing-count answer writes: {wrote:#?}");
 }
 
 #[test]
-fn a_person_who_keys_before_an_automatic_digit_gets_the_box() {
+fn a_person_who_keys_before_an_automatic_answer_gets_the_box() {
     let mut crossed = Vec::new();
-    for (name, fixture) in GEMINI_DIGIT_BOXES {
-        gemini_digit_positive(fixture);
-        let mut m = gemini_digit_server(fixture);
+    for (name, fixture) in MUSE_ANSWER_BOXES {
+        muse_answer_positive(fixture);
+        let mut m = muse_answer_server(fixture);
         m.person_at_key = 1;
         m.human_on.insert(1, "0");
         m.status_human_from.insert(2, 0);
-        let lines = watch_gemini_digit(&mut m);
+        let lines = watch_muse_answer(&mut m);
         assert_eq!(m.human_seq, Some(8), "the race reached the dispatcher");
         if m.person_skipped.len() != 1 || lines.iter().any(|l| l.starts_with("APPROVED ")) {
             crossed.push((name, lines, m.requests, m.person_skipped));
         }
     }
-    assert!(
-        crossed.is_empty(),
-        "the person's digit crossed: {crossed:#?}"
-    );
+    assert!(crossed.is_empty(), "the person's key crossed: {crossed:#?}");
 }
 
 #[test]
-fn an_automatic_digit_never_downgrades_its_generation_guard() {
+fn an_automatic_answer_never_downgrades_its_generation_guard() {
     let mut downgraded = Vec::new();
-    for (name, fixture) in GEMINI_DIGIT_BOXES {
-        gemini_digit_positive(fixture);
+    for (name, fixture) in MUSE_ANSWER_BOXES {
+        muse_answer_positive(fixture);
         for case in ["unsupported", "omitted", "refused"] {
-            let mut m = gemini_digit_server(fixture);
+            let mut m = muse_answer_server(fixture);
             match case {
                 "unsupported" => {
                     m.gen_fence = false;
@@ -13527,7 +13589,7 @@ fn an_automatic_digit_never_downgrades_its_generation_guard() {
                 "refused" => m.key_replies.push_back(bare_err()),
                 _ => unreachable!(),
             }
-            let lines = watch_gemini_digit(&mut m);
+            let lines = watch_muse_answer(&mut m);
             let weaker: Vec<String> = m
                 .presses()
                 .into_iter()
@@ -13548,51 +13610,51 @@ fn an_automatic_digit_never_downgrades_its_generation_guard() {
     assert!(downgraded.is_empty(), "guard downgrades: {downgraded:#?}");
 }
 
-fn gemini_controller_digit() -> Mock {
+fn muse_controller_answer() -> Mock {
     let mut m = questioned(vec![
-        q(aterm_phase::gemini::fixtures::QUESTION),
-        q(aterm_phase::gemini::fixtures::QUESTION_ANSWERED),
+        q(aterm_phase::muse::fixtures::QUESTION),
+        q(aterm_phase::muse::fixtures::QUESTION_ANSWERED),
     ]);
-    m.program = "node";
+    m.program = "muse";
     m.human = vec!["150000"];
     m.human_seq = Some(7);
     m
 }
 
-fn gemini_controller_positive() {
-    let mut m = gemini_controller_digit();
+fn muse_controller_positive() {
+    let mut m = muse_controller_answer();
     let (line, code) = controller_answer(&mut m, "1", None);
     assert_eq!(code, 0, "{line}\n{:#?}", m.requests);
     assert!(line.starts_with("ANSWERED "), "{line}");
     assert_eq!(m.presses().len(), 1, "{:#?}", m.requests);
-    assert!(m.presses()[0].ends_with(" 1"), "{:#?}", m.requests);
+    assert!(guarded_enter(m.presses()[0]), "{:#?}", m.requests);
 }
 
 #[test]
-fn a_controllers_digit_answer_requires_a_known_person_count() {
-    gemini_controller_positive();
-    let mut m = gemini_controller_digit();
+fn a_controllers_answer_requires_a_known_person_count() {
+    muse_controller_positive();
+    let mut m = muse_controller_answer();
     m.human_seq = None;
     let (line, code) = controller_answer(&mut m, "1", None);
     assert!(
         m.presses().is_empty(),
-        "missing-count controller digit wrote: {line} code={code}\n{:#?}",
+        "missing-count controller answer wrote: {line} code={code}\n{:#?}",
         m.requests
     );
     assert_eq!(code, EXIT_NOT_SERVED, "{line}");
 }
 
 #[test]
-fn a_person_who_keys_before_a_controllers_digit_keeps_the_question() {
-    gemini_controller_positive();
-    let mut m = gemini_controller_digit();
+fn a_person_who_keys_before_a_controllers_answer_keeps_the_question() {
+    muse_controller_positive();
+    let mut m = muse_controller_answer();
     m.person_at_key = 1;
     let (line, code) = controller_answer(&mut m, "1", None);
     assert_eq!(m.human_seq, Some(8), "the race reached the dispatcher");
     assert_eq!(
         m.person_skipped.len(),
         1,
-        "the person's controller digit crossed: {line}\n{:#?}",
+        "the person's controller key crossed: {line}\n{:#?}",
         m.requests
     );
     assert!(line.starts_with("LEFT "), "{line}");
@@ -13600,14 +13662,14 @@ fn a_person_who_keys_before_a_controllers_digit_keeps_the_question() {
 }
 
 #[test]
-fn a_controllers_digit_answer_requires_a_known_quiet_stamp() {
-    gemini_controller_positive();
-    let mut m = gemini_controller_digit();
+fn a_controllers_answer_requires_a_known_quiet_stamp() {
+    muse_controller_positive();
+    let mut m = muse_controller_answer();
     m.human.clear();
     let (line, code) = controller_answer(&mut m, "1", None);
     assert!(
         m.presses().is_empty(),
-        "unknown-quiet controller digit wrote: {line} code={code}\n{:#?}",
+        "unknown-quiet controller answer wrote: {line} code={code}\n{:#?}",
         m.requests
     );
     assert_eq!(code, EXIT_NOT_SERVED, "{line}");

@@ -29,7 +29,7 @@ pub struct Args {
     /// `--fix`: `fmt` rewrites what it finds.
     pub fix: bool,
     /// `--cell`: the forge cells `cells` checks, in the order given; empty is
-    /// every cell no fleet machine hosts.
+    /// every cell but this machine's own.
     pub cells: Vec<String>,
     pub no_windows: bool,
     /// `--admit now|wait`: whether the run waits for room for the disk it will write and its
@@ -298,7 +298,8 @@ Options:
                           Linux lane's lab is given it too
       --test-threads <n>  RUST_TEST_THREADS for every test binary
       --test-jobs <n>     test binaries at once (default 8)
-      --timeout <s|off>   hang ceiling for each child (default 3h)
+      --timeout <s|off>   hang ceiling on each child's work (default 3h); its
+                          waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
                           <target>/verify/logs.noindex, the newest 20 kept)
   -h, --help

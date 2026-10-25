@@ -16,7 +16,6 @@ fn program_of(name: &str) -> Option<Program> {
         ("claude-", Program::Claude),
         ("agy-", Program::Agy),
         ("muse-", Program::Muse),
-        ("gemini-", Program::Gemini),
     ]
     .into_iter()
     .find_map(|(p, program)| file.starts_with(p).then_some(program))
@@ -59,23 +58,18 @@ fn every_measured_half_frame_is_read_again() {
     assert_eq!(reader.phase(&half), Phase::Idle);
     assert!(reader.composer(&half).is_some());
     assert!(reader.frame_torn(&half));
-    for (program, file) in [
-        (Program::Agy, "agy-1.4.0-lab-split-half.txt"),
-        (Program::Gemini, "gemini-0.46.0-lab-erase-half.txt"),
-    ] {
-        let half = rows(file);
-        let reader = program.reader();
-        assert_ne!(
-            reader.phase(&half),
-            Phase::Busy,
-            "{file}: the busy row is not drawn"
-        );
-        assert!(reader.composer(&half).is_none(), "{file}: nor the composer");
-    }
+    let file = "agy-1.4.0-lab-split-half.txt";
+    let half = rows(file);
+    let reader = Program::Agy.reader();
+    assert_ne!(
+        reader.phase(&half),
+        Phase::Busy,
+        "{file}: the busy row is not drawn"
+    );
+    assert!(reader.composer(&half).is_none(), "{file}: nor the composer");
     for (program, file) in [
         (Program::Claude, "claude-2.1.308-lab-split-whole.txt"),
         (Program::Agy, "agy-1.4.0-lab-split-whole.txt"),
-        (Program::Gemini, "gemini-0.46.0-lab-erase-whole.txt"),
     ] {
         let whole = rows(file);
         let reader = program.reader();
@@ -120,7 +114,7 @@ fn a_muse_composer_cut_above_its_footer_reads_torn() {
 
 /// THE GEOMETRIC CHECK, per reader: on each program's whole frame, the composer's bottom edge
 /// cut to 109 cells (where Claude Code's measured split cut its own) and nothing drawn under it
-/// is no composer to agy's, Muse Code's and Gemini CLI's readers, and a torn frame to Claude
+/// is no composer to agy's and Muse Code's readers, and a torn frame to Claude
 /// Code's. A finder that took the cut frame whole would judge a redraw caught midway.
 #[test]
 fn a_composer_edge_cut_short_is_no_whole_frame() {
@@ -128,7 +122,6 @@ fn a_composer_edge_cut_short_is_no_whole_frame() {
     for (program, file) in [
         (Program::Claude, "claude-2.1.308-lab-split-whole.txt"),
         (Program::Agy, "agy-1.4.0-lab-split-whole.txt"),
-        (Program::Gemini, "gemini-0.46.0-lab-erase-whole.txt"),
         (Program::Muse, "muse-1.4.10-R6427.1-idle.txt"),
     ] {
         let Some((_, whole)) = screens.iter().find(|(n, _)| n.ends_with(file)) else {

@@ -529,8 +529,14 @@ fn any_program_but_an_agent_or_its_runtime_takes_the_terminal_off_it() {
     for editor in ["vim", "nvim", "nano", "emacs", "hx", "sh", "less", "-zsh"] {
         assert!(super::hands_the_terminal_off(editor), "{editor}");
     }
+    for retired in aterm_phase::RETIRED_AGENTS {
+        assert!(
+            super::hands_the_terminal_off(retired),
+            "{retired}: the retired Gemini CLI is a program like any other"
+        );
+    }
     for agent in [
-        "claude", "Claude", "codex", "agy", "muse", "gemini", "node", "bun", "deno",
+        "claude", "Claude", "codex", "agy", "muse", "node", "bun", "deno",
     ] {
         assert!(!super::hands_the_terminal_off(agent), "{agent}");
     }

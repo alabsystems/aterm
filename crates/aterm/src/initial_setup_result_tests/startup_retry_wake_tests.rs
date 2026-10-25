@@ -3,9 +3,16 @@
 
 use super::*;
 
-fn startup() -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer> {
+fn startup()
+-> LiveSetupStartup<impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer> {
+    startup_answering(|_, _, _| aterm_gui::WorkstationSetupDecision::Unavailable.into())
+}
+
+fn startup_answering(
+    offer: impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer,
+) -> LiveSetupStartup<impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer> {
     LiveSetupStartup {
-        offer: |_, _| aterm_gui::WorkstationSetupDecision::Unavailable.into(),
+        offer,
         receipt: None,
         authorization: None,
         last_failure: None,
@@ -16,6 +23,7 @@ fn startup() -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::
         sent: StartupSent::default(),
         retry_seen: SETUP_WAKES.count(),
         recovered: false,
+        reviewed: None,
     }
 }
 
@@ -132,4 +140,28 @@ fn startup_retry_wake_a_refused_local_choice_releases_startup_recovery() {
         "recovery must hear the refusal after the choice releases its claim"
     );
     assert!(!host.backoff_for(Duration::ZERO));
+}
+
+/// The review comes to the front as it is offered, which is a setup wake: when no window could
+/// keep it (Unavailable), the wait before the next offer still runs its course, so an offer is
+/// never shown again at once on the strength of its own showing.
+#[test]
+fn startup_retry_wake_an_offers_own_coming_to_the_front_does_not_end_its_retry_wait() {
+    let _globals = globals();
+    let _io = TestIo::install();
+    watch_setup_signals();
+    aterm_types::macos_setup::set_system_state_front(false);
+    let mut host = startup_answering(|_, _, _| {
+        aterm_types::macos_setup::set_system_state_front(true);
+        aterm_types::macos_setup::set_system_state_front(false);
+        aterm_gui::WorkstationSetupDecision::Unavailable.into()
+    });
+    assert_eq!(
+        host.offer(Plan::default()),
+        aterm_gui::WorkstationSetupDecision::Unavailable
+    );
+    assert!(
+        !host.backoff_for(Duration::ZERO),
+        "the review's own coming to the front ended the wait before the next offer"
+    );
 }

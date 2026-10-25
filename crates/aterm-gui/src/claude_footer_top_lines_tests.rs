@@ -71,20 +71,6 @@ fn marks_on(app: &App, wid: WindowId, session: u64) -> usize {
         .count()
 }
 
-fn top_cost(app: &mut App, wid: WindowId) -> (usize, usize, usize) {
-    let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
-    let _ = (
-        crate::work_counts::take_footer_top_reads(),
-        crate::work_counts::take_footer_tops_composed(),
-    );
-    let (_, allocations) = crate::work_counts::allocations_in(|| pass_on(app, wid, &plan, route));
-    (
-        allocations,
-        crate::work_counts::take_footer_top_reads(),
-        crate::work_counts::take_footer_tops_composed(),
-    )
-}
-
 fn pane_of(rows: u16, cols: u16, program: &str) -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -92,110 +78,6 @@ fn pane_of(rows: u16, cols: u16, program: &str) -> (App, WindowId, u64) {
     assert!(app.apply_term_resize(wid, rows, cols));
     set_program(&app, session, program);
     (app, wid, session)
-}
-
-#[test]
-fn gemini_wears_the_lockup_on_its_live_zone_rule() {
-    for (fixture, cols) in [
-        (
-            include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-idle.txt"),
-            144u16,
-        ),
-        (
-            include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-end-of-turn.txt"),
-            144,
-        ),
-        (
-            include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-narrow-end-of-turn.txt"),
-            72,
-        ),
-    ] {
-        let rows = fixture_rows(fixture);
-        let rule = aterm_phase::gemini::top_rule(&rows).expect("Gemini's live-zone rule");
-        assert!(
-            rows[rule].chars().all(|c| c == '\u{2500}')
-                && rows[rule].chars().count() == cols.into(),
-            "the rule full width: {:?}",
-            rows[rule]
-        );
-        let (mut app, wid, session) = pane_of(50, cols, "gemini");
-        let _host = held(&mut app, session);
-        feed(&app, session, &rows);
-        refill(&mut app, wid);
-        let before = pane_cells(&app, wid);
-        let _ = pass(&mut app, wid);
-        let after = pane_cells(&app, wid);
-        assert_eq!(
-            changed_rows(&before, &after),
-            vec![rule],
-            "{cols}: the rule alone is written"
-        );
-        refill(&mut app, wid);
-        let _ = pass(&mut app, wid);
-        assert_eq!(
-            pane_cells(&app, wid),
-            after,
-            "{cols}: the second frame's glass"
-        );
-        let line = glass_chars(&app, wid, rule);
-        assert!(
-            line.starts_with("\u{2500}\u{2500}    gemini \u{2500}")
-                && line
-                    .trim_end()
-                    .ends_with(" alab harness \u{25cf} on \u{2500}\u{2500}"),
-            "{cols}: the lockup and the lit switch: {line:?}"
-        );
-        assert_eq!(marks_on(&app, wid, session), 1, "{cols}: one mark layer");
-        assert!(
-            app.windows[&wid]
-                .claude_lights
-                .border_toggles
-                .iter()
-                .any(|b| b.session == session && b.program == aterm_phase::Program::Gemini),
-            "{cols}: the switch is a target"
-        );
-        for i in 0..6 {
-            if i % 2 == 0 {
-                refill(&mut app, wid);
-            }
-            let (allocations, reads, composed) = top_cost(&mut app, wid);
-            assert_eq!(
-                (reads, composed),
-                (0, 0),
-                "{cols}, frame {i}: nothing read or composed"
-            );
-            if i % 2 == 1 {
-                assert_eq!(allocations, 0, "{cols}, frame {i}: nothing allocated");
-            }
-            assert_eq!(glass_chars(&app, wid, rule), line, "{cols}, frame {i}");
-        }
-        set_program(&app, session, "zsh");
-        refill(&mut app, wid);
-        let before = pane_cells(&app, wid);
-        let _ = pass(&mut app, wid);
-        assert_eq!(
-            changed_rows(&before, &pane_cells(&app, wid)),
-            Vec::<usize>::new(),
-            "CONTROL {cols}: a shell's screen is its own"
-        );
-        assert_eq!(marks_on(&app, wid, session), 0, "CONTROL {cols}: no layer");
-    }
-    let rows = fixture_rows(include_str!(
-        "../../aterm-phase/src/fixtures/gemini-0.46.0-details-hidden-idle.txt"
-    ));
-    assert_eq!(aterm_phase::gemini::top_rule(&rows), None);
-    let (mut app, wid, session) = pane_of(50, 144, "gemini");
-    let _host = held(&mut app, session);
-    feed(&app, session, &rows);
-    refill(&mut app, wid);
-    let before = pane_cells(&app, wid);
-    let _ = pass(&mut app, wid);
-    assert_eq!(
-        changed_rows(&before, &pane_cells(&app, wid)),
-        Vec::<usize>::new(),
-        "CONTROL: no rule, nothing written"
-    );
-    assert_eq!(marks_on(&app, wid, session), 0, "CONTROL: no layer");
 }
 
 fn codex_screen(cols: usize, slab: Option<[u8; 3]>) -> String {
@@ -468,6 +350,7 @@ fn set_proven(app: &App, session: u64, proven: bool) {
             pid: PGID as u32,
             start: "Mon Oct 20 16:37:58 2026".to_string(),
         }),
+        scoped: None,
     });
 }
 
@@ -590,7 +473,7 @@ fn codex_gets_a_switch_only_as_codex_alab() {
         }
     }
     assert!(lockups > 100 && alab_names > 100, "{lockups} {alab_names}");
-    app.press_harness_switch(wid, session, HarnessSwitch::On);
+    app.press_harness_switch(wid, session, HarnessSwitch::On, std::time::Instant::now());
     assert_eq!(
         app.session_autopilot(session).0,
         None,
@@ -1056,7 +939,7 @@ fn hover_title_on_the_glass() {
     );
     app.windows.get_mut(&wid).expect("window").last_cursor_px = (x, y);
     assert!(
-        !app.press_claude_light(wid),
+        !app.press_claude_light(wid, std::time::Instant::now()),
         "a press on the lockup is the pane's"
     );
     for i in 0..3 {
@@ -1200,7 +1083,7 @@ fn a_regrid_hit_tests_the_glass_it_lands_on() {
     );
     assert_eq!(switch_hovered(&app, wid), None, "nothing is hovered");
     assert!(
-        !app.press_claude_light(wid),
+        !app.press_claude_light(wid, std::time::Instant::now()),
         "a press there is the pane's: no switch the glass shows is there"
     );
     next_frame(&mut app, wid);

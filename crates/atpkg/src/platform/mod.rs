@@ -533,7 +533,27 @@ pub(crate) fn twin_prelude(
     }
     let mut s = sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs);
     s.push_str(&sh_yolo_prelude(program, yolo, verbs));
+    s.push_str(&sh_harness_prelude(program, prefix));
     s
+}
+
+/// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`]): once the
+/// harness's tool is on `<prefix>/bin`, the twin execs it with `run --` and the argv the yolo block
+/// left, so the session runs under the harness (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step
+/// 6); `--no-alab-harness`, `--no-harness` (each sets `ATERM_NO_HARNESS=1` above) or the variable
+/// itself runs the vendor alone, and so does a harness that is not installed. Empty for an agent
+/// with no such harness.
+#[cfg(any(unix, test))]
+pub(crate) fn sh_harness_prelude(program: &str, prefix: &Path) -> String {
+    let Some((harness, tool)) = crate::harness::twin_harness(program) else {
+        return String::new();
+    };
+    let exe = sh_shim_quote(&prefix.join("bin").join(tool));
+    format!(
+        "# atpkg: {harness}, the harness, runs this session once it is installed \
+         (`--no-alab-harness` runs {program} alone).\n\
+         if [ \"${{ATERM_NO_HARNESS-}}\" != 1 ] && [ -x {exe} ]; then exec {exe} run -- \"$@\"; fi\n"
+    )
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that `exec`s the store binary.
@@ -2196,6 +2216,87 @@ mod sh_shim_tests {
             sh_shim_content_twin(target, &env, None, ""),
             sh_shim_content_env(target, &env)
         );
+    }
+
+    /// THE HARNESS HAND-OFF EXECUTED: grok's laid twin execs `<prefix>/bin/grok-alab run --` with
+    /// the argv its yolo block left once grok-alab is installed, runs the store build alone under
+    /// `--no-alab-harness`, `--no-harness` or `ATERM_NO_HARNESS=1`, and before grok-alab is
+    /// installed; no other agent's twin carries the hand-off.
+    #[cfg(unix)]
+    #[test]
+    fn the_grok_twin_hands_its_session_to_grok_alab_once_installed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::testdir::dir("atpkg-sh-harness-twin-");
+        let script = |path: &Path, tag: &str| {
+            std::fs::write(
+                path,
+                format!("#!/bin/sh\nprintf '{tag}'\nprintf '<%s>' \"$@\"\nprintf '\\n'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let target = root.join("store-build");
+        script(&target, "V");
+        let prefix = root.join("Application Support").join("pkg");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let prelude = twin_prelude("grok", &prefix, None, &[], &crate::yolo::policy_of("grok"));
+        assert_eq!(
+            prelude
+                .lines()
+                .filter(|l| l.contains("ATERM_NO_HARNESS-"))
+                .count(),
+            1,
+            "{prelude}"
+        );
+        let twin = root.join("grok");
+        std::fs::write(
+            &twin,
+            sh_shim_content_twin(&target, &crate::shim_env::ShimEnv::NONE, None, &prelude),
+        )
+        .unwrap();
+        std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_shim(&twin).as_deref(), Some(target.as_path()));
+        let run = |args: &[&str], no_harness: bool| {
+            let out = aterm_spec::wait::past_text_busy(|| {
+                let mut cmd = std::process::Command::new(&twin);
+                cmd.args(args).env_remove("ATERM_NO_HARNESS");
+                if no_harness {
+                    cmd.env("ATERM_NO_HARNESS", "1");
+                }
+                cmd.output()
+            })
+            .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let alone = run(&["-m", "grok-4", "fix it"], false);
+        assert!(
+            alone.starts_with("V<"),
+            "not installed: the store build: {alone}"
+        );
+        script(&prefix.join("bin").join("grok-alab"), "H");
+        let handed = run(&["-m", "grok-4", "fix it"], false);
+        assert_eq!(
+            handed,
+            format!("H<run><-->{}", alone.strip_prefix('V').unwrap()),
+            "the harness gets `run --` and the very argv the store build got"
+        );
+        assert_eq!(
+            run(&["--no-alab-harness", "-m", "grok-4", "fix it"], false),
+            alone
+        );
+        assert_eq!(
+            run(&["--no-harness", "-m", "grok-4", "fix it"], false),
+            alone
+        );
+        assert_eq!(run(&["-m", "grok-4", "fix it"], true), alone);
+        for other in ["claude", "codex", "agy", "muse", "kimi"] {
+            let prelude = twin_prelude(other, &prefix, None, &[], &crate::yolo::policy_of(other));
+            assert!(
+                !prelude.contains("grok-alab") && !prelude.contains(" run -- "),
+                "{other}"
+            );
+        }
     }
 
     /// THE YOLO BLOCK EXECUTED: laid twins over a store build that prints its argv.

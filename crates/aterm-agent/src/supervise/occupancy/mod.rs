@@ -29,8 +29,8 @@ pub use door::{
 pub use fact_word::{FactWord, NoteOutcome};
 pub use hold::{Close, HoldChange, HoldClock, HoldEvent, waiting_declared};
 pub use reading::{OccupancyReading, SlotsSeen};
-pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, decide};
-pub use said::{OccupancySaid, SaidHold, SaidReadyIdle, SaidRule, SaidVerdict};
+pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, WakeSight, decide};
+pub use said::{OccupancySaid, SaidHold, SaidReadyIdle, SaidRule, SaidVerdict, SaidWake};
 pub use templates::FactLine;
 pub use wakes_seen::{WakeClaim, WakeDoor, WakeSeen, WakesSeen};
 
@@ -142,6 +142,20 @@ pub mod fault {
         /// (`Session::managed_at_write`): the managed guard judges a worker no one has read as
         /// unmanaged.
         ManagedUnread,
+        /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed) holds the whole wake
+        /// kind told from one wake's typed row, as the hold's is held: a successor never tells
+        /// the session's next wake.
+        KindWideWakeSeed,
+        /// The break's write takes a due wake's line under `prompt` as any rule's, before the
+        /// write that lands it (the slice-2 plan's 2.8).
+        WakeTypedEarly,
+        /// The task door notes a managed session's wake line as any rule's, before the write that
+        /// lands it (the slice-2 plan's 2.8).
+        WakeNotedEarly,
+        /// The loop's K clock is fed a wake's line, as the window's own wake K clock is.
+        WakeFeedsK,
+        /// A read of the book keeps the told wakes it no longer names.
+        WakeToldKept,
     }
 
     thread_local! {
@@ -210,6 +224,11 @@ pub(crate) mod fault {
         NoteUnderObserve,
         NoteOnManagedAlone,
         ManagedUnread,
+        KindWideWakeSeed,
+        WakeTypedEarly,
+        WakeNotedEarly,
+        WakeFeedsK,
+        WakeToldKept,
     }
 
     /// The shipped build: never armed.

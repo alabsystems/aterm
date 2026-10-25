@@ -767,16 +767,26 @@ impl PageMarkers {
     /// Note that aterm opened the page now, under `version` (a [`revision_key`], or the running
     /// version).
     pub fn note_opened(self, version: &str) {
-        let Some(path) = self.opened_marker() else {
+        let (Some(state), Some(now)) = (aterm_types::dirs::state_dir(), aterm_time::unix_secs())
+        else {
             return;
         };
-        if let Some(dir) = path.parent() {
-            let _ = aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755);
-        }
-        let Some(now) = aterm_time::unix_secs() else {
-            return;
-        };
-        let _ = std::fs::write(&path, format!("{version} {now}\n"));
+        let _ = self.note_opened_in(&state, version, now);
+    }
+
+    /// [`Self::note_opened`] with `<state>` and the clock (`now`, unix seconds) given.
+    ///
+    /// # Errors
+    /// `<state>` cannot take the marker's new file, or the write fails; the marker is left as it
+    /// was ([`write_marker`]).
+    pub fn note_opened_in(
+        self,
+        state: &std::path::Path,
+        version: &str,
+        now: u64,
+    ) -> std::io::Result<()> {
+        let _ = aterm_types::fs_restricted::create_dir_all_unshared(state, 0o755);
+        write_marker(&state.join(self.opened), &format!("{version} {now}\n"))
     }
 
     /// Where aterm notes that the owner said Not now to the page's helper panel, or closed it
@@ -816,18 +826,58 @@ impl PageMarkers {
     /// Note that the owner declined the page now, under `version` (a [`revision_key`], or the
     /// running version).
     pub fn note_declined(self, version: &str) {
-        let Some(path) = self.declined_marker() else {
+        let (Some(state), Some(now)) = (aterm_types::dirs::state_dir(), aterm_time::unix_secs())
+        else {
             return;
         };
-        if let Some(dir) = path.parent() {
-            let _ = aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755);
-        }
-        let Some(now) = aterm_time::unix_secs() else {
-            return;
-        };
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::write(&path, with_decline(&text, version, now));
+        let _ = self.note_declined_in(&state, version, now);
     }
+
+    /// [`Self::note_declined`] with `<state>` and the clock (`now`, unix seconds) given; a marker
+    /// that cannot be read is replaced by this decline alone.
+    ///
+    /// # Errors
+    /// As [`Self::note_opened_in`].
+    pub fn note_declined_in(
+        self,
+        state: &std::path::Path,
+        version: &str,
+        now: u64,
+    ) -> std::io::Result<()> {
+        let _ = aterm_types::fs_restricted::create_dir_all_unshared(state, 0o755);
+        let path = state.join(self.declined);
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        write_marker(&path, &with_decline(&text, version, now))
+    }
+}
+
+/// Write a page marker whole: a new file beside it, flushed, then renamed over it. A crash, a
+/// power loss or a failed write leaves the old marker or the new one, never an empty or torn one,
+/// which would read as no page opened and no Not now. The flush is
+/// [`aterm_durable::ordered_or_fsync`], so a volume that refuses both ordered flushes (a network
+/// home whose server takes no `F_FULLFSYNC`) still takes the marker, as safe as its `fsync`.
+fn write_marker(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    write_marker_with(path, text, aterm_durable::ordered_or_fsync)
+}
+
+/// [`write_marker`] with its flush given: a flush that fails leaves the marker as it was.
+fn write_marker_with(
+    path: &std::path::Path,
+    text: &str,
+    flush: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a page marker with no folder"))?;
+    let staging = aterm_tempfile::Builder::new()
+        .prefix(".page-marker-")
+        .tempdir_in(dir)?;
+    let staged = staging.path().join("marker");
+    let mut file = std::fs::File::create_new(&staged)?;
+    file.write_all(text.as_bytes())?;
+    flush(&file)?;
+    std::fs::rename(&staged, path)
 }
 
 /// The markers' key for an approved System State setup revision: `r<revision>`. A key that does
@@ -1602,6 +1652,75 @@ mod tests {
             Some(("r4".to_string(), 5_000_000_000))
         );
         assert_eq!(DEVELOPER_TOOLS.last_declined_in(state.path()), None);
+    }
+
+    /// A page marker is replaced whole: each note reads back as the newest and nothing is left
+    /// beside it, and a write that cannot finish (into a folder that takes no new file, or one
+    /// whose flush fails) leaves the marker as it was, where a write in place would have
+    /// replaced it.
+    #[cfg(unix)]
+    #[test]
+    fn a_page_marker_is_replaced_whole_or_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        FULL_DISK_ACCESS
+            .note_opened_in(&state, "r4", 1_000)
+            .expect("noted");
+        FULL_DISK_ACCESS
+            .note_opened_in(&state, "r5", 2_000)
+            .expect("noted again");
+        assert_eq!(
+            FULL_DISK_ACCESS.last_opened_in(&state),
+            Some(("r5".to_owned(), 2_000))
+        );
+        DEVELOPER_TOOLS
+            .note_declined_in(&state, "r4", 1_000)
+            .expect("declined");
+        DEVELOPER_TOOLS
+            .note_declined_in(&state, "r5", 2_000)
+            .expect("declined again");
+        assert_eq!(
+            DEVELOPER_TOOLS.last_declined_in(&state),
+            Some(("r5".to_owned(), 2_000))
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&state)
+            .expect("the state folder")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["devtools-declined", "fda-pane-opened"],
+            "nothing staged is left"
+        );
+        let text = |name: &str| std::fs::read_to_string(state.join(name)).expect("a marker");
+        let before = (
+            text(FULL_DISK_ACCESS.opened),
+            text(DEVELOPER_TOOLS.declined),
+        );
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500))
+            .expect("a folder that takes no new file");
+        let refused = (
+            FULL_DISK_ACCESS.note_opened_in(&state, "r6", 3_000),
+            DEVELOPER_TOOLS.note_declined_in(&state, "r6", 3_000),
+        );
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
+            .expect("the folder writable again");
+        assert!(refused.0.is_err() && refused.1.is_err(), "{refused:?}");
+        assert_eq!(
+            (
+                text(FULL_DISK_ACCESS.opened),
+                text(DEVELOPER_TOOLS.declined)
+            ),
+            before
+        );
+        let path = state.join(FULL_DISK_ACCESS.opened);
+        let failed = write_marker_with(&path, "r7 4000\n", |_| {
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(failed.map_err(|e| e.raw_os_error()), Err(Some(5)));
+        assert_eq!(text(FULL_DISK_ACCESS.opened), before.0, "a failed flush");
     }
 
     /// The words every surface shares: the drag is never offered without the + route;

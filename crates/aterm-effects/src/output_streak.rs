@@ -240,14 +240,39 @@ impl ObservedGlyph {
     }
 
     #[inline]
-    fn same_row(old: &[Self], new: &[aterm_core::terminal::RenderCell]) -> bool {
-        if old.len() == new.len() {
-            return old.iter().zip(new).all(|(&o, n)| o == Self::of(n));
+    const fn eq_glyph(self, other: Self) -> bool {
+        self.ch == other.ch && self.presentation == other.presentation
+    }
+
+    #[inline]
+    const fn same_row(old: &[Self], new: &[aterm_core::terminal::RenderCell]) -> bool {
+        let common = if old.len() < new.len() {
+            old.len()
+        } else {
+            new.len()
+        };
+        let mut col = 0;
+        while col < common {
+            if !old[col].eq_glyph(Self::of(&new[col])) {
+                return false;
+            }
+            col += 1;
         }
-        (0..old.len().max(new.len())).all(|col| {
-            old.get(col).copied().unwrap_or(Self::BLANK)
-                == new.get(col).map_or(Self::BLANK, Self::of)
-        })
+        let mut col = common;
+        while col < old.len() {
+            if !old[col].eq_glyph(Self::BLANK) {
+                return false;
+            }
+            col += 1;
+        }
+        let mut col = common;
+        while col < new.len() {
+            if !Self::of(&new[col]).eq_glyph(Self::BLANK) {
+                return false;
+            }
+            col += 1;
+        }
+        true
     }
 }
 
@@ -395,7 +420,7 @@ impl OutputStreak {
     /// A submitted turn boundary at `now`.
     #[inline]
     pub fn note_turn_boundary(&mut self, now: Instant) {
-        if self.last_key.is_none_or(|accepted| accepted <= now) {
+        if !matches!(self.last_key, Some(accepted) if accepted > now) {
             self.last_key = None;
         }
     }
@@ -455,45 +480,58 @@ impl OutputStreak {
         } else {
             cursor_row.saturating_sub(1)
         };
-        let span = visible
-            .get(anchor_row)
-            .and_then(|row| {
-                if baseline || input_hot || self.within_echo_window(now) {
-                    return None;
+        let span = if !baseline
+            && !input_hot
+            && !self.within_echo_window(now)
+            && let Some(row) = visible.get(anchor_row)
+        {
+            let old_anchor = &self.observed_rows[anchor_row];
+            let mut extent: Option<(usize, usize)> = None;
+            for (col, cell) in row.iter().enumerate() {
+                let old = old_anchor.get(col).copied().unwrap_or(ObservedGlyph::BLANK);
+                let new = ObservedGlyph::of(cell);
+                let continuation = cell.wide && matches!(extent, Some((_, end)) if end + 1 == col);
+                if (new.has_ink() && old != new) || continuation {
+                    extent = Some(match extent {
+                        Some((left, end)) if end + 1 == col => (left, col),
+                        _ => (col, col),
+                    });
                 }
-                let old_anchor = &self.observed_rows[anchor_row];
-                let mut extent: Option<(usize, usize)> = None;
-                for (col, cell) in row.iter().enumerate() {
-                    let old = old_anchor.get(col).copied().unwrap_or(ObservedGlyph::BLANK);
-                    let new = ObservedGlyph::of(cell);
-                    let continuation = cell.wide && extent.is_some_and(|(_, end)| end + 1 == col);
-                    if (new.has_ink() && old != new) || continuation {
-                        extent = Some(match extent {
-                            Some((left, end)) if end + 1 == col => (left, col),
-                            _ => (col, col),
-                        });
-                    }
-                }
-                let extent = extent?;
-                let moved_row = self.observed_rows.iter().enumerate().any(|(index, old)| {
-                    index != anchor_row
+            }
+            if let Some((start, end)) = extent {
+                let mut moved_row = false;
+                for (index, old) in self.observed_rows.iter().enumerate() {
+                    if index != anchor_row
                         && ObservedGlyph::same_row(old, row)
                         && !ObservedGlyph::same_row(old, &visible[index])
-                });
-                (!moved_row).then_some(extent)
-            })
-            .map(|(start, end)| {
-                [(
-                    anchor_row as u16,
-                    u16::try_from(start).unwrap_or(u16::MAX),
-                    u16::try_from(end).unwrap_or(u16::MAX),
-                )]
-            });
+                    {
+                        moved_row = true;
+                        break;
+                    }
+                }
+                if moved_row {
+                    None
+                } else {
+                    Some([(
+                        anchor_row as u16,
+                        u16::try_from(start).unwrap_or(u16::MAX),
+                        u16::try_from(end).unwrap_or(u16::MAX),
+                    )])
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.observed_rows.resize_with(visible.len(), Vec::new);
         self.observed_viewport = Some(viewport);
         for (old, row) in self.observed_rows.iter_mut().zip(visible) {
             old.clear();
-            old.extend(row.iter().map(ObservedGlyph::of));
+            old.reserve(row.len());
+            for cell in row {
+                old.push(ObservedGlyph::of(cell));
+            }
         }
         if baseline {
             self.comets = Default::default();
@@ -505,36 +543,83 @@ impl OutputStreak {
         }
         self.note_output(
             token,
-            span.as_ref().map_or(&[][..], |s| &s[..]),
+            match &span {
+                Some(s) => s.as_slice(),
+                None => &[],
+            },
             now,
             input_hot,
         )
     }
 
+    #[inline]
+    const fn no_comets(&self) -> bool {
+        let mut i = 0;
+        while i < MAX_COMETS {
+            if self.comets[i].is_some() {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    #[inline]
+    const fn has_comet_on_row(&self, row: u16) -> bool {
+        let mut i = 0;
+        while i < MAX_COMETS {
+            if let Some(c) = self.comets[i]
+                && c.row == row
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    #[inline]
+    fn row_span_inked(observed: &[Vec<ObservedGlyph>], row: u16, from: i32, to: i32) -> bool {
+        if to < 0 || from > to {
+            return false;
+        }
+        let Some(cells) = observed.get(usize::from(row)) else {
+            return false;
+        };
+        let start = usize::try_from(from.max(0)).unwrap_or(usize::MAX);
+        let end = match usize::try_from(to) {
+            Ok(e) => e.saturating_add(1).min(cells.len()),
+            Err(_) => 0,
+        };
+        if start >= end {
+            return false;
+        }
+        let mut i = start;
+        while i < end {
+            if cells[i].has_ink() {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn retire_light_over_erased_ink(&mut self) {
-        if self.comets.iter().all(Option::is_none) && self.ribbon.is_none() {
+        if self.no_comets() && self.ribbon.is_none() {
             return;
         }
         let observed = &self.observed_rows;
-        let inked = |row: u16, from: i32, to: i32| {
-            to >= 0
-                && from <= to
-                && observed.get(usize::from(row)).is_some_and(|cells| {
-                    let start = usize::try_from(from.max(0)).unwrap_or(usize::MAX);
-                    let end = usize::try_from(to)
-                        .ok()
-                        .map_or(0, |e| e.saturating_add(1).min(cells.len()));
-                    start < end && cells[start..end].iter().any(|glyph| glyph.has_ink())
-                })
-        };
-        for slot in &mut self.comets {
-            if slot.is_some_and(|c| !inked(c.row, c.from_col, c.to_col)) {
-                *slot = None;
+        let mut i = 0;
+        while i < MAX_COMETS {
+            if let Some(c) = self.comets[i]
+                && !Self::row_span_inked(observed, c.row, c.from_col, c.to_col)
+            {
+                self.comets[i] = None;
             }
+            i += 1;
         }
-        if self
-            .ribbon
-            .is_some_and(|r| !inked(r.row, r.from_col, r.to_col))
+        if let Some(r) = self.ribbon
+            && !Self::row_span_inked(observed, r.row, r.from_col, r.to_col)
         {
             self.ribbon = None;
         }
@@ -543,9 +628,10 @@ impl OutputStreak {
     /// Whether `now` sits inside the echo shadow of the last accepted input.
     #[inline]
     fn within_echo_window(&self, now: Instant) -> bool {
-        self.last_key.is_some_and(|k| {
-            now.saturating_duration_since(k) <= Duration::from_millis(ECHO_DISCOUNT_MS)
-        })
+        matches!(
+            self.last_key,
+            Some(k) if now.saturating_duration_since(k) <= Duration::from_millis(ECHO_DISCOUNT_MS)
+        )
     }
 
     /// Advance one frame at `now` and append this frame's light to `out`.
@@ -603,9 +689,12 @@ impl OutputStreak {
     #[inline]
     fn idle_drained(&self, now: Instant, cfg: &StreakConfig) -> bool {
         let Some(last) = self.last_output else {
-            return self.comets.iter().all(Option::is_none) && self.ribbon.is_none();
+            return self.no_comets() && self.ribbon.is_none();
         };
-        idle_duration(cfg.idle_secs).is_none_or(|idle| now.saturating_duration_since(last) >= idle)
+        match idle_duration(cfg.idle_secs) {
+            Some(idle) => now.saturating_duration_since(last) >= idle,
+            None => true,
+        }
     }
 
     fn spend_pending(
@@ -630,7 +719,7 @@ impl OutputStreak {
         {
             return None;
         }
-        if self.comets.iter().flatten().any(|c| c.row == pending.row) {
+        if self.has_comet_on_row(pending.row) {
             return None;
         }
         let slot = self.free_slot(cfg)?;
@@ -772,13 +861,16 @@ impl OutputStreak {
 
     /// Advance every resident comet's sweep and retire the finished ones.
     #[inline]
-    fn advance_comets(&mut self, dt: f32) {
-        for slot in &mut self.comets {
-            let Some(c) = slot else { continue };
-            c.progress += dt / c.dur_s.max(0.001);
-            if c.progress >= 1.0 {
-                *slot = None;
+    const fn advance_comets(&mut self, dt: f32) {
+        let mut i = 0;
+        while i < MAX_COMETS {
+            if let Some(c) = &mut self.comets[i] {
+                c.progress += dt / c.dur_s.max(0.001);
+                if c.progress >= 1.0 {
+                    self.comets[i] = None;
+                }
             }
+            i += 1;
         }
     }
 
@@ -788,11 +880,13 @@ impl OutputStreak {
         let Some(r) = self.ribbon.as_mut() else {
             return;
         };
-        r.hue = (r.hue + dt * RIBBON_DRIFT).rem_euclid(1.0);
+        let next_hue = r.hue + dt * RIBBON_DRIFT;
+        r.hue = next_hue - next_hue.floor();
         r.since_output_s += dt;
-        let stale = self.last_output.is_some_and(|t| {
-            now.saturating_duration_since(t) > Duration::from_millis(RIBBON_LINGER_MS)
-        });
+        let stale = match self.last_output {
+            Some(t) => now.saturating_duration_since(t) > Duration::from_millis(RIBBON_LINGER_MS),
+            None => false,
+        };
         if stale || m < EPISODE_LOW {
             self.ribbon = None;
         }
@@ -808,7 +902,13 @@ impl OutputStreak {
         let mut fp: u64 = 0;
         let (cw_i, ch_i) = (geom.cw as i32, geom.ch as i32);
 
-        for c in self.comets.iter().flatten() {
+        let mut ci = 0;
+        while ci < MAX_COMETS {
+            let Some(c) = self.comets[ci] else {
+                ci += 1;
+                continue;
+            };
+            ci += 1;
             let life = 1.0 - c.progress;
             let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
             let tail_f = f32::from(c.tail);
@@ -884,7 +984,7 @@ impl OutputStreak {
         if a == 0 {
             return;
         }
-        let base = spectrum(hue_t.rem_euclid(1.0));
+        let base = spectrum(hue_t - hue_t.floor());
         let x = col * w;
 
         if cfg.dark_theme {
@@ -921,9 +1021,11 @@ const fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
 /// The mandatory idle duration.
 #[inline]
 fn idle_duration(idle_secs: f32) -> Option<Duration> {
-    (idle_secs.is_finite() && idle_secs > 0.0)
-        .then(|| Duration::try_from_secs_f32(idle_secs).ok())
-        .flatten()
+    if idle_secs.is_finite() && idle_secs > 0.0 {
+        Duration::try_from_secs_f32(idle_secs).ok()
+    } else {
+        None
+    }
 }
 
 /// Equal-power pan position `-1..=1` from a span's centre column.

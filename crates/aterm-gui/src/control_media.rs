@@ -2687,7 +2687,7 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|codex|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
+pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
 
 /// Parsed `agent=<word>` worker specification for `spawn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2854,6 +2854,12 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     }
 }
 
+/// The refusal of a spawn line naming a retired agent (`agent=gemini`), ahead of the usage line.
+fn spawn_retired_refusal(rest: &str) -> Option<String> {
+    let tokens = split_quoted_tokens(rest)?;
+    crate::task_launch::retired_worker(tokens.iter().find_map(|tok| tok.strip_prefix("agent=")))
+}
+
 fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
     use crate::spawn_folder::Fault;
     let (SpawnForm::Plain { cwd, .. } | SpawnForm::Connected { cwd, .. }) = form;
@@ -2911,6 +2917,9 @@ fn worker_order(
 
 /// Handles `spawn ...`, creating a new terminal session or worker on the main thread.
 pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
+    if let Some(refusal) = spawn_retired_refusal(rest) {
+        return refusal;
+    }
     let Ok(form) = parse_spawn_args(rest) else {
         return SPAWN_USAGE.to_string();
     };
@@ -3046,19 +3055,12 @@ pub(crate) struct WorkerStart {
 impl WorkerStart {
     fn seed(&self) -> crate::task_launch::TaskSeed {
         let from = self.order.fact_line.then_some(self.from.as_str());
-        let seed = crate::task_launch::TaskSeed::new(crate::task_launch::task_text(
+        crate::task_launch::TaskSeed::new(crate::task_launch::task_text(
             &self.order.task,
             from,
             self.order.autopilot,
             self.order.agent,
-        ));
-        let trust = aterm_agent::harness::worker::worker_cli(self.order.agent)
-            .and_then(|cli| cli.trust_file_env)
-            .and(self.order.trusted_cwd.as_deref());
-        match trust {
-            Some(folder) => seed.with_trust_file(folder),
-            None => seed,
-        }
+        ))
     }
 }
 
@@ -3403,10 +3405,7 @@ impl crate::App {
         seed: crate::task_launch::TaskSeed,
     ) -> Result<PendingWorker, String> {
         match self.start_worker(sid, worker) {
-            Ok(mut launch) => {
-                launch.trust_file = seed.trust_file();
-                Ok(PendingWorker { launch, seed })
-            }
+            Ok(launch) => Ok(PendingWorker { launch, seed }),
             Err(why) => {
                 self.unspawn_worker(sid, Some(&seed));
                 Err(why)
@@ -3460,7 +3459,6 @@ impl crate::App {
             agent: worker.order.agent,
             model: worker.order.model,
             trusted_cwd: worker.order.trusted_cwd,
-            trust_file: None,
             caller,
         })
     }
@@ -3725,7 +3723,9 @@ mod fx_parse_tests {
 mod spawn_parse_tests {
     #[cfg(unix)]
     use super::spawn_cwd_refusal;
-    use super::{AgentSpec, SpawnForm, parse_spawn_args, split_quoted_tokens};
+    use super::{
+        AgentSpec, SpawnForm, parse_spawn_args, spawn_retired_refusal, split_quoted_tokens,
+    };
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
 
     #[cfg(unix)]
@@ -3859,9 +3859,9 @@ mod spawn_parse_tests {
             })
         );
         assert_eq!(
-            agent_of("agent=gemini model=gemini-2.5-pro- from=s-ab12 len=3"),
+            agent_of("agent=agy model=gemini-2.5-pro- from=s-ab12 len=3"),
             Some(AgentSpec::Worker {
-                agent: aterm_phase::Program::Gemini,
+                agent: aterm_phase::Program::Agy,
                 model: Some("gemini-2.5-pro-".to_string()),
                 autopilot: None,
                 from: Some(aterm_session::SessionId::new("s-ab12")),
@@ -3895,7 +3895,6 @@ mod spawn_parse_tests {
             aterm_phase::Program::Codex,
             aterm_phase::Program::Agy,
             aterm_phase::Program::Muse,
-            aterm_phase::Program::Gemini,
         ] {
             assert_eq!(
                 agent_of(&format!(
@@ -3935,6 +3934,8 @@ mod spawn_parse_tests {
             "agent=claude connected=controlled place=tab of=s-a",
             "agent=gemini connected=controlled place=tab of=s-a",
             "agent=Gemini len=1",
+            "agent=gemini len=1",
+            "agent=gemini-cli len=1",
             "agent=codex-old len=1",
             "agent=muse model=a/b len=1",
             "agent=gemini model=--yolo len=1",
@@ -3945,9 +3946,45 @@ mod spawn_parse_tests {
             assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
         }
         assert!(super::SPAWN_USAGE.contains(
-            "agent=<claude|codex|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
+            "agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
              [from=<sid>] len=<n>"
         ));
+    }
+
+    /// A SPAWN NAMING THE RETIRED GEMINI CLI IS REFUSED BY NAME, with agy, which
+    /// replaces it, named; never the usage line and never another worker.
+    #[test]
+    fn a_spawn_of_the_retired_gemini_cli_is_refused_with_agy_named() {
+        for (rest, word) in [
+            ("agent=gemini len=3", "gemini"),
+            ("cwd=/w agent=Gemini model=m-1 len=1", "Gemini"),
+            ("agent=gemini-cli", "gemini-cli"),
+        ] {
+            assert_eq!(
+                spawn_retired_refusal(rest).as_deref(),
+                Some(
+                    format!(
+                        "ERR spawn agent={word}: Gemini CLI is no longer supported: agy \
+                         replaces it (agent=agy)\n"
+                    )
+                    .as_str()
+                ),
+                "{rest}"
+            );
+            assert_eq!(
+                parse_spawn_args(rest),
+                Err(()),
+                "{rest}: no worker of any agent"
+            );
+        }
+        for rest in [
+            "agent=agy len=1",
+            "agent=geminix len=1",
+            "agent=/bin/gemini len=1",
+            "",
+        ] {
+            assert_eq!(spawn_retired_refusal(rest), None, "the control: {rest}");
+        }
     }
 
     #[test]
@@ -4521,14 +4558,11 @@ mod worker_start_app_tests {
             assert!(!path.exists(), "a closed worker's task file goes with it");
 
             let sid = sid_of(&app, 3);
-            let mut requested = worker();
-            requested.order.agent = aterm_phase::Program::Gemini;
-            requested.order.trusted_cwd = Some(state.path().to_string_lossy().into_owned());
+            let requested = worker();
             let seed = requested.seed();
             let task = seed.write_for(&SessionId::new(sid.as_str())).unwrap();
             let pending = app.ready_worker(&sid, requested, seed).unwrap();
-            let trust = pending.launch.trust_file.clone().expect("owned sidecar");
-            assert!(task.exists() && trust.exists(), "both precede the launcher");
+            assert!(task.exists(), "the task file precedes the launcher");
             let prompt = {
                 let mut terminal = crate::term_lock(&pending.launch.term);
                 terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
@@ -4547,7 +4581,7 @@ mod worker_start_app_tests {
                 "close wins final admission"
             );
             drop(pending);
-            assert!(!task.exists() && !trust.exists(), "neither file reappears");
+            assert!(!task.exists(), "the task file does not reappear");
         });
     }
 
@@ -4564,7 +4598,7 @@ mod worker_start_app_tests {
             for (local, args, word) in [
                 (1, "agent=claude autopilot=cruise len=8", Autopilot::Cruise),
                 (2, "agent=claude len=8", Autopilot::Land),
-                (3, "agent=gemini autopilot=cruise len=8", Autopilot::Cruise),
+                (3, "agent=muse autopilot=cruise len=8", Autopilot::Cruise),
                 (4, "agent=agy len=8", Autopilot::Land),
                 (5, "agent=muse len=8", Autopilot::Land),
                 (6, "agent=codex autopilot=cruise len=8", Autopilot::Cruise),

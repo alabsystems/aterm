@@ -8,38 +8,46 @@ use aterm_machines::items::Ctx;
 use aterm_machines::model::Mode;
 use aterm_machines::port::System;
 
-/// Why aterm sets up no repositories on this Mac, whatever it tries again: it sets them up for
-/// the one user account a Mac has, and this one has another number of them. In the page's
-/// words, which `aterm doctor` prints too.
-const ONE_USER: &str = "aterm sets up GitHub repositories only on a Mac with one user account.";
-
-/// Whether the repositories failed for good on this Mac ([`ONE_USER`]): no retry, no vault and
-/// no sign-in changes the number of its user accounts.
-fn failed_for_good(ctx: &Ctx) -> bool {
-    ctx.users.len() != 1
-}
-
 pub(super) fn run(
     sys: &dyn System,
     ctx: &Ctx,
     vault: Option<&Plan>,
     mode: Mode,
 ) -> Result<Vec<Row>, String> {
-    if failed_for_good(ctx) {
-        return Ok(vec![Row {
-            name: Stage::Repositories.name().into(),
-            status: aterm_types::macos_setup::FAILED_FOR_GOOD.into(),
-            detail: ONE_USER.into(),
-        }]);
-    }
+    run_reading(sys, ctx, vault, mode).map(|(rows, _)| rows)
+}
+
+/// [`run`], and whether its rows stopped for want of Apple's Command Line Tools
+/// ([`want_developer_tools`]).
+pub(super) fn run_reading(
+    sys: &dyn System,
+    ctx: &Ctx,
+    vault: Option<&Plan>,
+    mode: Mode,
+) -> Result<(Vec<Row>, bool), String> {
     Ok(match items(sys, ctx, vault, mode)? {
-        Some(rows) => item_rows(rows),
-        None => vec![readiness_row(
-            Stage::Repositories.name(),
+        Some(rows) => {
+            let wanted = want_developer_tools(&rows);
+            (item_rows(rows), wanted)
+        }
+        None => (
+            vec![readiness_row(
+                Stage::Repositories.name(),
+                false,
+                "the selected secrets vault changed or is still syncing; repository inputs wait for a complete version".into(),
+            )],
             false,
-            "the selected secrets vault changed or is still syncing; repository inputs wait for a complete version".into(),
-        )],
+        ),
     })
+}
+
+/// Whether the repositories' item `rows` stopped for want of Apple's Command Line Tools: the
+/// reading their probe took, never the engine's English (System State design §3.3). A vault
+/// still syncing reads no item, so it never asks for them.
+pub(super) fn want_developer_tools(rows: &[aterm_machines::model::ItemReport]) -> bool {
+    use aterm_machines::init_observe::{Reading, Wait};
+    rows.iter()
+        .any(|row| Reading::of(row) == Some(Reading::Waits(Wait::CommandLineTools)))
 }
 
 pub(super) fn observe(
@@ -48,13 +56,6 @@ pub(super) fn observe(
     vault: Option<&Plan>,
 ) -> Result<aterm_types::macos_setup::Observation, String> {
     use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
-    if failed_for_good(ctx) {
-        return Ok(Observation {
-            standing: Standing::Failed,
-            detail: Some(ONE_USER.into()),
-            ..Observation::unknown(Subject::Setting(Setting::Repositories))
-        });
-    }
     Ok(match items(sys, ctx, vault, Mode::Plan)? {
         Some(rows) => aterm_machines::init_observe::observation(
             Setting::Repositories,
@@ -348,17 +349,17 @@ mod tests {
         );
     }
 
-    /// A Mac with another number of user accounts than one is no Mac aterm sets repositories
-    /// up on, whatever it tries again (System State design §3.6): the run says it failed for
-    /// good, which parks it, and the row reads failed with the same words, asking nothing of
+    /// The repositories go into the home of the account signed in, on a Mac with any number of
+    /// accounts: setup's context names that account alone. A context that names more is a
+    /// caller's mistake, which the stage refuses as an error the run tries again like any other
+    /// failure (System State design §3.6), never as one no try changes, and it asks nothing of
     /// GitHub or the vault.
     #[test]
-    fn a_mac_with_two_user_accounts_fails_the_repositories_for_good() {
-        use aterm_types::macos_setup::{FAILED_FOR_GOOD, FailureKind, Standing};
-
+    fn a_context_naming_two_accounts_is_an_error_the_run_retries() {
         let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.secrets");
         let home = root.path().join("home");
-        joined(&home, &root.path().join("team.secrets"));
+        joined(&home, &source);
         let (sys, mut ctx) = fake(&home);
         let other = User {
             name: "other".into(),
@@ -367,22 +368,15 @@ mod tests {
             ..ctx.users[0].clone()
         };
         ctx.users.push(other);
-        let rows = run(&sys, &ctx, None, Mode::Apply).unwrap();
-        assert_eq!(
-            rows.iter()
-                .map(|row| (row.name.as_str(), row.status.as_str(), row.detail.as_str()))
-                .collect::<Vec<_>>(),
-            [("GitHub repositories", FAILED_FOR_GOOD, ONE_USER)]
-        );
-        assert_eq!(
-            FailureKind::of_status(&rows[0].status),
-            Some(FailureKind::ForGood)
-        );
-        let seen = observe(&sys, &ctx, None).unwrap();
-        assert_eq!(
-            (seen.standing, seen.detail.as_deref()),
-            (Standing::Failed, Some(ONE_USER))
-        );
+        let plan = Plan {
+            vault_url: source.to_string_lossy().into_owned(),
+            ..Plan::default()
+        };
+        for vault in [None, Some(&plan)] {
+            let why = run(&sys, &ctx, vault, Mode::Apply).unwrap_err();
+            assert!(why.contains("exactly one"), "{why}");
+            assert!(observe(&sys, &ctx, vault).is_err());
+        }
         assert!(
             sys.calls().iter().all(|call| !call.contains(" agh ")),
             "{:?}",

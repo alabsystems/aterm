@@ -13,8 +13,8 @@ fn a_task_frame_is_at_most_64_kib() {
         Err("ERR spawn agent=claude: the task is 65537 bytes (max 65536)\n".to_string())
     );
     assert_eq!(
-        frame_len("65537", worker_word(Some("gemini"))),
-        Err("ERR spawn agent=gemini: the task is 65537 bytes (max 65536)\n".to_string())
+        frame_len("65537", worker_word(Some("muse"))),
+        Err("ERR spawn agent=muse: the task is 65537 bytes (max 65536)\n".to_string())
     );
     assert!(
         frame_len("99999999999999999999999", "claude")
@@ -26,8 +26,25 @@ fn a_task_frame_is_at_most_64_kib() {
             "{bad:?}"
         );
     }
-    for word in ["claude", "codex", "gemini", "agy", "muse"] {
+    for word in ["claude", "codex", "agy", "muse"] {
         assert_eq!(worker_word(Some(word)), word);
+        assert_eq!(retired_worker(Some(word)), None, "{word}: no retired agent");
+    }
+    for retired in ["gemini", "Gemini", "gemini-cli", "GEMINI-CLI"] {
+        assert_eq!(
+            retired_worker(Some(retired)).as_deref(),
+            Some(
+                format!(
+                    "ERR spawn agent={retired}: Gemini CLI is no longer supported: agy replaces \
+                     it (agent=agy)\n"
+                )
+                .as_str()
+            ),
+            "the retired Gemini CLI is refused by name, agy named"
+        );
+    }
+    for none in [Some("geminis"), Some("gemini-cli-2"), Some(""), None] {
+        assert_eq!(retired_worker(none), None, "CONTROL: {none:?}");
     }
     for none in [Some("codex-old"), Some("bash"), Some(""), None] {
         assert_eq!(worker_word(none), "claude", "CONTROL: {none:?}");
@@ -72,14 +89,14 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
     let root = root.ancestors().last().expect("a root").to_string_lossy();
     let order = TaskOrder::of_frame(
         Some(task.clone()),
-        aterm_phase::Program::Gemini,
+        aterm_phase::Program::Muse,
         Some("opus".into()),
         Some(&root),
         Some(from.clone()),
     )
     .expect("an order");
     assert_eq!(order.task, task);
-    assert_eq!(order.agent, aterm_phase::Program::Gemini);
+    assert_eq!(order.agent, aterm_phase::Program::Muse);
     assert_eq!(order.model.as_deref(), Some("opus"));
     assert_eq!(order.caller, Some(from));
     assert_eq!(order.trusted_cwd.as_deref(), Some(&*root));
@@ -113,9 +130,9 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     );
     assert!(fact.contains("`NEEDS YOU:`"), "a need goes on: {fact}");
     assert!(fact.contains("`spawn agent=claude`"), "{fact}");
-    let gemini = fact_line("s-ab12", Autopilot::Land, "gemini");
-    assert!(gemini.contains("`spawn agent=gemini`"), "{gemini}");
-    assert!(!gemini.contains("agent=claude"), "CONTROL: {gemini}");
+    let muse = fact_line("s-ab12", Autopilot::Land, "muse");
+    assert!(muse.contains("`spawn agent=muse`"), "{muse}");
+    assert!(!muse.contains("agent=claude"), "CONTROL: {muse}");
     let cruise = fact_line("s-ab12", Autopilot::Cruise, "claude");
     assert!(cruise.contains("Autopilot Cruise"), "{cruise}");
     assert!(
@@ -129,8 +146,8 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
         );
     }
     assert_eq!(
-        task_text(b"do it", Some("ctl"), Autopilot::Land, Program::Gemini),
-        format!("do it\n\n{}\n", fact_line("ctl", Autopilot::Land, "gemini")).into_bytes()
+        task_text(b"do it", Some("ctl"), Autopilot::Land, Program::Muse),
+        format!("do it\n\n{}\n", fact_line("ctl", Autopilot::Land, "muse")).into_bytes()
     );
     assert_eq!(
         task_text(
@@ -164,12 +181,7 @@ fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
         text(Program::Agy),
         "First paragraph.\n\u{a0}keep me\nSecond paragraph.\n"
     );
-    for agent in [
-        Program::Claude,
-        Program::Codex,
-        Program::Gemini,
-        Program::Muse,
-    ] {
+    for agent in [Program::Claude, Program::Codex, Program::Muse] {
         assert_eq!(
             text(agent),
             task,
@@ -212,12 +224,7 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
         format!("{folded}{}\n", fact_line("s-ab12", Autopilot::Land, "agy"))
     );
     assert_eq!(text(task.as_bytes(), None, Program::Agy), folded);
-    for agent in [
-        Program::Claude,
-        Program::Codex,
-        Program::Gemini,
-        Program::Muse,
-    ] {
+    for agent in [Program::Claude, Program::Codex, Program::Muse] {
         let fact = fact_line("s-ab12", Autopilot::Land, agent.name());
         assert_eq!(
             text(task.as_bytes(), Some("s-ab12"), agent),
@@ -311,14 +318,12 @@ fn the_task_file_is_private_and_never_overwritten() {
         .expect("scratch dir");
     let dir = scratch.path().join("tasks");
     let sid = SessionId::new("s-0123abcd");
-    let seed = TaskSeed::new(b"the task\n".to_vec()).with_trust_file("/w/proj");
+    let seed = TaskSeed::new(b"the task\n".to_vec());
     let path = seed.write_in(&dir, &sid).expect("written");
     assert_eq!(path, dir.join("s-0123abcd-1.txt"));
     assert_eq!(std::fs::read(&path).unwrap(), b"the task\n");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!((mode(&dir), mode(&path)), (0o700, 0o600));
-    let trust = seed.trust_file().expect("its sidecar was written with it");
-    assert_eq!(mode(&trust), 0o600);
     assert!(
         TaskSeed::new(b"other".to_vec())
             .write_in(&dir, &sid)
@@ -329,10 +334,9 @@ fn the_task_file_is_private_and_never_overwritten() {
     assert!(path.exists(), "a seed that wrote nothing removes nothing");
     seed.discard();
     assert!(!path.exists(), "discarded");
-    assert!(!trust.exists(), "the same discard owns its sidecar");
     seed.discard();
 
-    let cancelled = TaskSeed::new(b"never started".to_vec()).with_trust_file("/w/late");
+    let cancelled = TaskSeed::new(b"never started".to_vec());
     let late = cancelled.clone();
     cancelled.discard();
     let sid = SessionId::new("s-0001");
@@ -341,9 +345,8 @@ fn the_task_file_is_private_and_never_overwritten() {
         std::io::ErrorKind::Interrupted
     );
     assert!(!dir.join(task_file_name(&sid)).exists());
-    assert!(!dir.join(trust_file_name(&sid)).exists());
 
-    let racing = TaskSeed::new(b"cancelled during write".to_vec()).with_trust_file("/w/racing");
+    let racing = TaskSeed::new(b"cancelled during write".to_vec());
     let cancel = racing.clone();
     let sid = SessionId::new("s-0002");
     let path = dir.join(task_file_name(&sid));
@@ -355,19 +358,14 @@ fn the_task_file_is_private_and_never_overwritten() {
     });
     assert_eq!(outcome.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
     assert!(!path.exists(), "the late owned file was retired");
-    assert!(
-        !dir.join(trust_file_name(&sid)).exists(),
-        "nor can its late sidecar outlive cancellation"
-    );
     assert!(racing.write_in(&dir, &sid).is_err(), "discard stays sticky");
 
-    let running = TaskSeed::new(b"still needed".to_vec()).with_trust_file("/w/running");
+    let running = TaskSeed::new(b"still needed".to_vec());
     let path = running.write_in(&dir, &SessionId::new("s-0003")).unwrap();
-    let trust = running.trust_file().expect("running sidecar");
     drop(running);
-    assert_eq!(std::fs::read(&path).unwrap(), b"still needed");
-    assert!(
-        trust.exists(),
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"still needed",
         "a launch with an unobserved outcome keeps it"
     );
 }
@@ -468,71 +466,49 @@ fn a_workers_line_trusts_only_the_folder_its_shell_stands_in() {
     assert_eq!(flagged, ["muse"]);
 }
 
-/// A GEMINI CLI WORKER'S TRUSTED-FOLDERS FILE IS ITS OWN AND PRIVATE: 0600
-/// in a 0700 directory, under its sid, never written over, trusting its one
-/// folder (`aterm_agent::harness::worker::trusted_folders_text`).
+/// A TRUSTED-FOLDERS SIDECAR AN OLDER ATERM WROTE BESIDE A GEMINI CLI WORKER'S TASK FILE GOES
+/// WITH ITS WORKER: a session handed across the upgrade can still have one; another
+/// worker's stays.
 #[cfg(unix)]
 #[test]
-fn a_gemini_workers_trust_file_is_private_and_goes_with_it() {
-    use std::os::unix::fs::PermissionsExt as _;
+fn an_older_builds_trust_sidecar_goes_with_its_worker() {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-trust-file")
         .tempdir()
         .expect("scratch dir");
     let dir = scratch.path().join("tasks");
     let (gone, kept) = (SessionId::new("s-0d"), SessionId::new("s-0e"));
-    let seed = TaskSeed::new(b"task".to_vec()).with_trust_file("/w/proj");
-    seed.write_in(&dir, &gone).expect("written");
-    let path = seed.trust_file().expect("sidecar");
-    assert_eq!(path, dir.join("s-0d-1.trust.json"));
+    let task = TaskSeed::new(b"task".to_vec())
+        .write_in(&dir, &gone)
+        .expect("written");
+    let other_task = TaskSeed::new(b"other task".to_vec())
+        .write_in(&dir, &kept)
+        .expect("written");
+    let (path, other) = (
+        dir.join(trust_file_name(&gone)),
+        dir.join(trust_file_name(&kept)),
+    );
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        aterm_agent::harness::worker::trusted_folders_text("/w/proj")
+        path,
+        dir.join("s-0d-1.trust.json"),
+        "the name it was written under"
     );
-    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!((mode(&dir), mode(&path)), (0o700, 0o600));
-    assert!(
-        TaskSeed::new(b"other".to_vec())
-            .with_trust_file("/")
-            .write_in(&dir, &gone)
-            .is_err(),
-        "never over one"
-    );
-    assert!(
-        std::fs::read_to_string(&path).unwrap().contains("/w/proj"),
-        "kept"
-    );
-    let other = TaskSeed::new(b"other task".to_vec()).with_trust_file("/w/other");
-    other.write_in(&dir, &kept).expect("written");
-    let other = other.trust_file().expect("other sidecar");
-
-    let occupied = SessionId::new("s-0f");
-    let sentinel = dir.join(trust_file_name(&occupied));
-    std::fs::write(&sentinel, "existing").unwrap();
-    let blocked = TaskSeed::new(b"untrusted task".to_vec()).with_trust_file("/");
-    let task = blocked
-        .write_in(&dir, &occupied)
-        .expect("task still starts");
-    assert_eq!(blocked.trust_file(), None, "no owned sidecar was written");
-    blocked.discard();
-    assert!(!task.exists());
-    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "existing");
+    for sidecar in [&path, &other] {
+        std::fs::write(sidecar, "{}").unwrap();
+    }
     retire_task_file_in(&dir, &gone);
-    assert!(!path.exists(), "removed with its worker");
-    assert!(other.exists(), "another worker's stays");
+    assert!(!task.exists() && !path.exists(), "removed with its worker");
+    assert!(
+        other_task.exists() && other.exists(),
+        "another worker's stays"
+    );
 }
 
 #[test]
 fn a_starter_not_named_yet_is_read_from_its_terminal() {
     use aterm_phase::Program;
     let unread = || -> Option<i32> { panic!("the front group is not read") };
-    for agent in [
-        Program::Claude,
-        Program::Codex,
-        Program::Gemini,
-        Program::Agy,
-        Program::Muse,
-    ] {
+    for agent in [Program::Claude, Program::Codex, Program::Agy, Program::Muse] {
         assert_eq!(
             starter_group(Some(agent), 41, unread, agent),
             Some(StarterGroup::Named(41)),

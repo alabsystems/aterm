@@ -5,17 +5,14 @@
 use super::super::policy::WorkerEnv;
 use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
-    AnswerTarget, ApprovalCtx, Choice, DeclineStep, LimitTry, QuestionPriority,
-    RULE_AUTO_MODE_SETUP, RULE_AUTOCOMPACT_OFFER, RULE_LIMIT_RESET, RULE_LIMIT_RETRY,
-    RULE_LIMIT_STOP, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG, decide,
-    keeps_trying_its_limit, limit_no_reset_reason, limit_stopped_reason, proof_would_lift,
-    unvoiced_tools,
+    AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_AUTO_MODE_SETUP,
+    RULE_AUTOCOMPACT_OFFER, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG,
+    decide, proof_would_lift, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
 use super::super::policy::login::PickerGate;
 use super::super::policy::question::{begun, fall_back_to, is_question_rule};
-use super::super::policy::turn_end::{Seat, reads_conversation, screen_alone};
 use super::*;
 use crate::harness::upgrade_drive::{LiveTab, roster_rows, unique_tab_for_group};
 use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
@@ -949,9 +946,17 @@ impl<C: Ctl> Session<'_, C> {
                     h.can_restart(),
                 )
             });
-        let gate = super::super::policy::login::picker_gate(typed, shared.as_ref(), renewed);
+        let roster = typed
+            && opts.policy.logins
+            && opts
+                .idle_host
+                .as_deref()
+                .is_some_and(|h| h.login_label().is_some());
+        let back = self.turn_end.login_back_from(shared.as_ref());
+        let gate = super::super::policy::login::picker_gate(typed, back, roster, renewed);
         let login_carry = gate == PickerGate::Carried;
         let login_back = gate == PickerGate::Back;
+        let login_roster = gate == PickerGate::Roster;
         let login_renewed = gate == PickerGate::Renewed;
         let own_rule = |limit_reset: bool| {
             aterm_phase::read(None, &screen.rows, None)
@@ -962,6 +967,7 @@ impl<C: Ctl> Session<'_, C> {
                         || p.kind == PromptKind::AutoModeSetup
                         || login_carry
                         || login_back
+                        || login_roster
                         || login_renewed
                         || p.kind == PromptKind::AutocompactOffer
                             && opts.policy.autocompact_offer.is_some()
@@ -1028,7 +1034,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd)
@@ -1041,12 +1046,8 @@ impl<C: Ctl> Session<'_, C> {
         facts.screen_rows = screen.pane_rows.unwrap_or(screen.first + screen.rows.len());
         facts.login_carry = login_carry;
         facts.login_back = login_back;
+        facts.login_roster = login_roster;
         facts.login_renewed = login_renewed;
-        facts.limit_retry = reading
-            .prompt
-            .as_ref()
-            .is_some_and(|p| p.kind == PromptKind::UsageLimit)
-            && self.limit_retry_due(rows, opts) == RetryDue::Due;
         if login_carry {
             facts.login_method = opts.idle_host.as_deref().and_then(|h| h.login_method());
         }
@@ -1184,6 +1185,7 @@ impl<C: Ctl> Session<'_, C> {
                 Decision::Approve { rule_id, .. }
                     if *rule_id == RULE_AUTOCOMPACT_OFFER
                         || *rule_id == super::super::policy::login::RULE_LOGIN_METHOD
+                        || *rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
             ) {
             Decision::Escalate {
                 reason: "the box's read carries no person count to fence its keys".to_string(),
@@ -1776,6 +1778,28 @@ impl<C: Ctl> Session<'_, C> {
             .filter(|until| *until > self.fx.mono())
     }
 
+    /// THE PICKER OF THE `/login` THIS LOOP BACKED OUT OF, STILL DRAWN WHILE ITS LAST ESC MAY
+    /// STILL BE CLOSING IT ([`crate::supervise::policy::turn_end::TurnEndState::login_closing`]):
+    /// held, the point handed over with no one asked, and decided again once that pause is over
+    /// (each pause twice the last, at most `BACK_OUT_PAUSE_MAX`), when the picker still drawn gets
+    /// the Esc again — never a second Esc inside the pause.
+    fn back_out_held(&mut self, seq: u64, review: &mut dyn Review) -> bool {
+        let Some(until) = self.turn_end.login_closing(self.fx.mono()) else {
+            return false;
+        };
+        let why = "the /login dialog aterm backed out of to close";
+        if self.turn_end_due.as_ref().is_none_or(|due| due.at != until) {
+            review.note(&format!(
+                "WAITING seq={seq} rule={} {why}: its Esc again at {}",
+                super::super::policy::login::RULE_LOGIN_BACK_OUT,
+                self.utc_at(until)
+            ));
+        }
+        self.set_due(until, why);
+        self.held = true;
+        true
+    }
+
     fn carry_unheld(&self) -> bool {
         self.turn_end
             .login_typed_at()
@@ -1856,9 +1880,6 @@ impl<C: Ctl> Session<'_, C> {
         if self.asked_again(&turn.screen, &p) {
             self.question_done(seq, review)?;
         }
-        if self.limit_retry_hold(&turn, &p, opts, review)? {
-            return Ok(Step::Review(turn));
-        }
         self.autopilot.begin();
         let decision = self.decide_box(&turn.screen, opts, allow)?;
         #[cfg(test)]
@@ -1883,10 +1904,19 @@ impl<C: Ctl> Session<'_, C> {
             self.park_while_off(seq, deadline, opts, review)?;
             return Ok(Step::Again { settle: false });
         }
+        if matches!(
+            &decision,
+            Decision::Approve { rule_id, .. }
+                if *rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
+        ) && self.back_out_held(seq, review)
+        {
+            return Ok(Step::Review(turn));
+        }
         let carried_pick = matches!(
             &decision,
             Decision::Approve { rule_id, .. }
                 if *rule_id == super::super::policy::login::RULE_LOGIN_METHOD
+                    || *rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
         ) && self.carry_unheld();
         let answers = matches!(
             decision,
@@ -2117,7 +2147,10 @@ impl<C: Ctl> Session<'_, C> {
                 let person = turn
                     .screen
                     .human_seq
-                    .filter(|_| p.kind == PromptKind::AutocompactOffer)
+                    .filter(|_| {
+                        p.kind == PromptKind::AutocompactOffer
+                            || rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
+                    })
                     .or(person);
                 self.press_focused(&p, *steps, label, key, guard, &turn.screen, person, None)?
             }
@@ -2318,8 +2351,9 @@ impl<C: Ctl> Session<'_, C> {
                 ) {
                     self.stepper_pressed();
                 }
-                if rule_id == RULE_LIMIT_RETRY {
-                    self.limit_retry_pressed();
+                if rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT {
+                    let now = self.fx.mono();
+                    self.turn_end.login_backed_out_at(now);
                 }
                 approved.push(this);
                 self.answered(&act, rule_id, &what, &over, (at, seq), review)?;
@@ -2336,6 +2370,15 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 let why = "the box did not change after the press";
                 let still = self.turn_of(screen);
+                if rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT {
+                    // Its pause, not the press retries' ladder, spaces the next Esc: one already
+                    // over by now is due at once.
+                    return Ok(if self.back_out_held(still.screen.seq, review) {
+                        Step::Review(still)
+                    } else {
+                        Step::Again { settle: false }
+                    });
+                }
                 if self.retries_presses(opts, review, rule_id) {
                     return self.press_missed(&still, &what, why, opts, review);
                 }
@@ -2393,79 +2436,6 @@ const PRESS_RETRY_MAX: Duration = Duration::from_secs(60);
 /// How long a box whose presses keep missing is tried before the session is badged.
 pub(super) const PRESS_BADGE_AFTER: Duration = Duration::from_secs(120);
 
-/// Gemini CLI usage-limit dialog retry state ([`RULE_LIMIT_RETRY`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LimitRetry {
-    program: Program,
-    reset: Option<aterm_phase::gemini::LimitReset>,
-    seen_unix: i64,
-    at_unix: Option<i64>,
-    zone_read: bool,
-    tries: u32,
-    looks: u32,
-    last_unix: Option<i64>,
-    resumed: bool,
-    badge: Option<String>,
-    model: Option<String>,
-    away: bool,
-    relaunch: Option<bool>,
-}
-
-/// Last observed Gemini CLI usage-limit dialog read ([`Session::note_limit_dialog`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LimitDialogRead {
-    program: Program,
-    reset: Option<aterm_phase::gemini::LimitReset>,
-    seen_unix: i64,
-    last_unix: i64,
-}
-
-#[cfg(test)]
-impl LimitRetry {
-    /// Returns the placed reset timestamp ([`Self::at_unix`]).
-    pub(super) fn placed_unix(&self) -> Option<i64> {
-        self.at_unix
-    }
-}
-
-/// Gemini CLI usage-limit dialog answered `Stop`, or its agent relaunched, while the loop waited on
-/// it ([`Session::limit_stopped`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct StoppedLimit {
-    pub(super) wall: aterm_phase::Wall,
-    pub(super) reset_unix: i64,
-}
-
-/// Initial back-off after a `Keep trying` when the dialog returns, doubled on each retry.
-pub(super) const LIMIT_RETRY_BACKOFF_S: i64 = 120;
-
-/// Maximum retry back-off ([`LimitRetry`]).
-pub(super) const LIMIT_RETRY_BACKOFF_MAX_S: i64 = 1800;
-
-/// Maximum wait before the first `Keep trying` or between looks in the machine's zone ([`LimitRetry`]).
-pub(super) const LIMIT_RETRY_RELOOK_S: i64 = LIMIT_RETRY_BACKOFF_MAX_S;
-
-/// Window after `Keep trying` during which a busy read counts as that try in flight ([`Session::limit_retry_busy`]).
-pub(super) const LIMIT_RETRY_ANSWER_S: i64 = 300;
-
-/// Window after the last usage-limit dialog read during which a busy frame may precede `Stop`'s error ([`Session::note_limit_dialog`]).
-pub(super) const LIMIT_DIALOG_FRAME_S: i64 = 10;
-
-const LIMIT_RETRY_AHEAD_MAX_S: i64 = 23 * 3600;
-
-const LIMIT_RETRY_MINUTE_S: i64 = 60;
-
-/// When Gemini CLI's usage-limit dialog is due its `Keep trying`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RetryDue {
-    Not,
-    Due,
-    Hold {
-        until_unix: i64,
-        reset: Option<String>,
-    },
-}
-
 /// A box whose press did not land, being tried again at full power.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PressRetry {
@@ -2481,12 +2451,11 @@ impl<C: Ctl> Session<'_, C> {
             && (opts.policy.approve == Approve::All
                 || is_question_rule(rule_id)
                 || rule_id == RULE_LIMIT_WAIT
-                || rule_id == RULE_LIMIT_RETRY
-                || rule_id == RULE_LIMIT_STOP
                 || rule_id == RULE_LIMIT_RESET
                 || rule_id == RULE_AUTOCOMPACT_OFFER
                 || rule_id == RULE_AUTO_MODE_SETUP
-                || rule_id == super::super::policy::login::RULE_LOGIN_METHOD)
+                || rule_id == super::super::policy::login::RULE_LOGIN_METHOD
+                || rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT)
     }
 
     fn press_missed(
@@ -2541,560 +2510,6 @@ impl<C: Ctl> Session<'_, C> {
         ));
         self.wait(&["seq", &seq.to_string()], pause)?;
         Ok(Step::Again { settle: false })
-    }
-
-    /// WHEN GEMINI CLI'S USAGE-LIMIT DIALOG ON `rows` IS DUE ITS `Keep trying` ([`RULE_LIMIT_RETRY`]).
-    pub(super) fn limit_retry_due(&mut self, rows: &[String], opts: &SuperviseOpts) -> RetryDue {
-        let program = self.reader(rows).program();
-        if !opts.policy.limit_wait || !keeps_trying_its_limit(program) {
-            self.limit_retry = None;
-            return RetryDue::Not;
-        }
-        let dialog = aterm_phase::gemini::prompt(rows)
-            .is_some_and(|p| p.kind == PromptKind::UsageLimit && !p.head_off_screen);
-        if !dialog {
-            self.limit_retry = None;
-            return RetryDue::Not;
-        }
-        let reset = aterm_phase::gemini::limit_reset(rows);
-        let now = self.now_unix();
-        if self
-            .limit_retry
-            .as_ref()
-            .is_none_or(|r| r.program != program || r.reset != reset)
-        {
-            let carried = self
-                .limit_retry
-                .take()
-                .filter(|r| r.program == program && r.tries > 0);
-            let mut retry = self.limit_retry_open(program, reset, now);
-            if let Some(r) = carried {
-                retry.tries = r.tries;
-                retry.looks = r.looks;
-                retry.last_unix = r.last_unix;
-                retry.resumed = r.resumed;
-                retry.badge = r.badge;
-                retry.model = r.model;
-            }
-            self.limit_retry = Some(retry);
-        }
-        let Some(retry) = self.limit_retry.as_ref() else {
-            return RetryDue::Not;
-        };
-        let Some(until_unix) = self.limit_retry_until(retry) else {
-            return RetryDue::Not;
-        };
-        if now >= until_unix {
-            RetryDue::Due
-        } else {
-            RetryDue::Hold {
-                until_unix,
-                reset: retry
-                    .at_unix
-                    .and(retry.reset.as_ref())
-                    .map(ToString::to_string),
-            }
-        }
-    }
-
-    fn limit_retry_open(
-        &mut self,
-        program: Program,
-        reset: Option<aterm_phase::gemini::LimitReset>,
-        seen_unix: i64,
-    ) -> LimitRetry {
-        let spec = reset
-            .as_ref()
-            .and_then(|r| Some((r.offset_s(), limit::parse_reset(&r.clock)?)));
-        let (at_unix, zone_read) = match spec {
-            Some((offset, spec)) => {
-                let zone = offset.map(i64::from);
-                let offset = zone.unwrap_or_else(|| self.local_offset_s());
-                let at = limit::reset_in_zone(&spec, seen_unix, LIMIT_RETRY_AHEAD_MAX_S, &|_| {
-                    Some(offset)
-                });
-                (at, zone.is_some())
-            }
-            None => (None, false),
-        };
-        LimitRetry {
-            program,
-            reset,
-            seen_unix,
-            at_unix,
-            zone_read,
-            tries: 0,
-            looks: 0,
-            last_unix: None,
-            resumed: false,
-            badge: None,
-            model: None,
-            away: false,
-            relaunch: None,
-        }
-    }
-
-    /// Records or clears the usage-limit dialog read on `rows` ([`LimitDialogRead`]).
-    pub(super) fn note_limit_dialog(&mut self, program: Program, rows: &[String], busy: bool) {
-        let now = self.now_unix();
-        let past_frame =
-            |d: &LimitDialogRead| now.saturating_sub(d.last_unix) > LIMIT_DIALOG_FRAME_S;
-        if !keeps_trying_its_limit(program)
-            || (busy && self.limit_dialog_read.as_ref().is_some_and(past_frame))
-        {
-            self.limit_dialog_read = None;
-            return;
-        }
-        let Some(p) = aterm_phase::gemini::prompt(rows) else {
-            return;
-        };
-        if p.kind != PromptKind::UsageLimit {
-            self.limit_dialog_read = None;
-            return;
-        }
-        let reset = aterm_phase::gemini::limit_reset(rows);
-        match self.limit_dialog_read.as_mut() {
-            Some(d) if d.program == program && d.reset == reset => d.last_unix = now,
-            _ => {
-                self.limit_dialog_read = Some(LimitDialogRead {
-                    program,
-                    reset,
-                    seen_unix: now,
-                    last_unix: now,
-                });
-            }
-        }
-    }
-
-    /// Opens a [`LimitRetry`] episode from [`Self::note_limit_dialog`] when `Stop`'s error is reached before any point decided the dialog.
-    pub(super) fn limit_stopped_adopt(
-        &mut self,
-        reading: &aterm_phase::Reading,
-        opts: &SuperviseOpts,
-    ) {
-        if self.limit_retry.is_some()
-            || !opts.policy.limit_wait
-            || !reading
-                .wall
-                .as_ref()
-                .is_some_and(aterm_phase::gemini::stopped_error)
-        {
-            return;
-        }
-        let Some(read) = self.limit_dialog_read.take() else {
-            return;
-        };
-        let retry = self.limit_retry_open(read.program, read.reset, read.seen_unix);
-        self.limit_retry = Some(retry);
-    }
-
-    fn limit_retry_until(&self, retry: &LimitRetry) -> Option<i64> {
-        let secs = |d: Duration| i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
-        let until_unix = match retry.at_unix {
-            Some(at_unix) => {
-                let past_reset = self.limit_retry_past_reset(at_unix);
-                let climbed = retry.tries.saturating_sub(retry.looks);
-                let backed_off = match (retry.last_unix, climbed) {
-                    (Some(last), 1..) => {
-                        last.saturating_add(secs(crate::supervise::ladder::doubling(
-                            Duration::from_secs(LIMIT_RETRY_BACKOFF_S.unsigned_abs()),
-                            climbed - 1,
-                            Duration::from_secs(LIMIT_RETRY_BACKOFF_MAX_S.unsigned_abs()),
-                        )))
-                    }
-                    _ => i64::MIN,
-                };
-                let look = (retry.tries == 0 || !retry.zone_read).then(|| {
-                    retry
-                        .last_unix
-                        .unwrap_or(retry.seen_unix)
-                        .saturating_add(LIMIT_RETRY_RELOOK_S)
-                });
-                look.map_or(past_reset, |look| past_reset.min(look))
-                    .max(backed_off)
-            }
-            None => {
-                let rung = usize::try_from(retry.tries).unwrap_or(usize::MAX);
-                let pause =
-                    crate::supervise::ladder::Ladder(&self.turn_end.timing.entitlement_backoff)
-                        .at(rung)?;
-                retry
-                    .last_unix
-                    .unwrap_or(retry.seen_unix)
-                    .saturating_add(secs(pause))
-            }
-        };
-        Some(until_unix)
-    }
-
-    /// Returns the [`StoppedLimit`] when Gemini CLI's usage-limit dialog was answered `Stop` or its agent relaunched while held.
-    pub(super) fn limit_stopped(
-        &self,
-        reading: &aterm_phase::Reading,
-        rows: &[String],
-    ) -> Option<StoppedLimit> {
-        let retry = self.limit_retry.as_ref()?;
-        if !keeps_trying_its_limit(retry.program) {
-            return None;
-        }
-        let stopped = reading
-            .wall
-            .as_ref()
-            .filter(|w| aterm_phase::gemini::stopped_error(w));
-        let relaunched = stopped.is_none()
-            && retry.away
-            && retry.relaunch.is_some()
-            && reading.program == retry.program
-            && reading.prompt.is_none()
-            && !matches!(reading.phase, Phase::Busy | Phase::Prompt);
-        if stopped.is_none() && !relaunched {
-            return None;
-        }
-        let moved = retry
-            .model
-            .as_ref()
-            .zip(aterm_phase::gemini::footer_model(rows))
-            .is_some_and(|(was, now)| *was != now)
-            || (relaunched && retry.relaunch == Some(false));
-        let due = if moved {
-            self.now_unix()
-        } else {
-            self.limit_retry_until(retry)?
-        };
-        let reset_unix = due.saturating_sub(self.limit_retry_grace_s());
-        let title = aterm_phase::anchor!("gemini.usage.title");
-        let how = if relaunched {
-            "the agent was relaunched while its dialog stood"
-        } else {
-            "its dialog was answered Stop"
-        };
-        let placed = retry.at_unix.and(retry.reset.as_ref());
-        let message = match (placed, retry.reset.as_ref()) {
-            (Some(reset), _) => format!(
-                "{title} the session's model; {how}. {}{reset}.",
-                aterm_phase::anchor!("gemini.usage.resets"),
-            ),
-            (None, Some(drawn)) => format!(
-                "{title} the session's model; {how}. It names a reset the loop cannot place ({}).",
-                crate::harness::one_line(&drawn.to_string(), 24)
-            ),
-            (None, None) => format!("{title} the session's model; {how}. It names no reset."),
-        };
-        let (row, placement) = match stopped {
-            Some(w) => (w.row, w.placement),
-            None => (
-                rows.iter()
-                    .rposition(|r| !r.trim().is_empty())
-                    .unwrap_or_default(),
-                aterm_phase::Placement::ErrorRow,
-            ),
-        };
-        Some(StoppedLimit {
-            wall: aterm_phase::Wall {
-                kind: aterm_phase::WallKind::UsageSession,
-                message,
-                reset: placed.map(ToString::to_string),
-                row,
-                placement,
-                under_call: false,
-            },
-            reset_unix,
-        })
-    }
-
-    /// Keeps the [`LimitRetry`] episode across the agent's absence and judges the relaunch's seat on its return.
-    pub(super) fn limit_retry_away(
-        &mut self,
-        program: Program,
-        rows: &[String],
-        opts: &SuperviseOpts,
-    ) -> bool {
-        let Some(retry) = self
-            .limit_retry
-            .as_ref()
-            .filter(|r| keeps_trying_its_limit(r.program))
-        else {
-            return false;
-        };
-        if !reads_conversation(program) && !screen_alone(program) {
-            if let Some(retry) = self.limit_retry.as_mut() {
-                retry.away = true;
-                retry.relaunch = None;
-            }
-            return true;
-        }
-        if !retry.away || program != retry.program {
-            return false;
-        }
-        if retry.relaunch.is_none() {
-            let here = Seat::of(program, rows);
-            let vouched = self.turn_end.seat_vouched(program, &here)
-                || opts.idle_host.as_ref().is_some_and(|h| h.relaunch_owed());
-            if let Some(retry) = self.limit_retry.as_mut() {
-                retry.relaunch = Some(vouched);
-            }
-        }
-        true
-    }
-
-    /// Returns whether the [`LimitRetry`] episode is currently marked away.
-    pub(super) fn limit_retry_is_away(&self) -> bool {
-        self.limit_retry.as_ref().is_some_and(|r| r.away)
-    }
-
-    /// Clears the away state once the turn-end policy's limit track takes over after a relaunch.
-    pub(super) fn limit_retry_back(&mut self) {
-        if self.limit_ladder_kept()
-            && let Some(retry) = self.limit_retry.as_mut()
-        {
-            retry.away = false;
-            retry.relaunch = None;
-        }
-    }
-
-    /// Records the footer model when `Stop`'s error is first read under a [`LimitRetry`] episode.
-    pub(super) fn limit_stopped_seat(&mut self, reading: &aterm_phase::Reading, rows: &[String]) {
-        let Some(retry) = self.limit_retry.as_mut().filter(|r| r.model.is_none()) else {
-            return;
-        };
-        if keeps_trying_its_limit(retry.program)
-            && reading
-                .wall
-                .as_ref()
-                .is_some_and(aterm_phase::gemini::stopped_error)
-        {
-            retry.model = aterm_phase::gemini::footer_model(rows);
-        }
-    }
-
-    /// Returns the badge reason at `Stop`'s error when the usage-limit dialog named no placeable reset and no badge is up yet.
-    pub(super) fn limit_stopped_badge(&self, point: &Turn, key: &str) -> Option<String> {
-        let retry = self.limit_retry.as_ref()?;
-        if retry.at_unix.is_some()
-            || !keeps_trying_its_limit(retry.program)
-            || self.box_ask.as_ref().is_some_and(|b| b.key == key)
-            || !aterm_phase::gemini::wall(&point.screen.rows)
-                .is_some_and(|w| aterm_phase::gemini::stopped_error(&w))
-        {
-            return None;
-        }
-        Some(limit_stopped_reason(
-            retry.reset.as_ref().map(ToString::to_string).as_deref(),
-        ))
-    }
-
-    /// Records that the episode's badge was raised at the point keyed `key`.
-    pub(super) fn limit_badge_raised(&mut self, key: &str) {
-        if let Some(retry) = self.limit_retry.as_mut() {
-            retry.badge = Some(key.to_string());
-        }
-    }
-
-    /// Carries the episode's badge to `turn` (keyed `key`) while the usage limit still stands.
-    pub(super) fn limit_badge_carry(&mut self, turn: &Turn, key: &str) -> bool {
-        let rows = &turn.screen.rows;
-        let program = self.reader(rows).program();
-        let (Some(retry), Some(ask)) = (self.limit_retry.as_mut(), self.box_ask.as_mut()) else {
-            return false;
-        };
-        if retry.badge.as_deref() != Some(ask.key.as_str())
-            || !keeps_trying_its_limit(retry.program)
-        {
-            return false;
-        }
-        let its_limit = aterm_phase::gemini::prompt(rows)
-            .is_some_and(|p| p.kind == PromptKind::UsageLimit)
-            || aterm_phase::gemini::wall(rows)
-                .is_some_and(|w| aterm_phase::gemini::stopped_error(&w));
-        let elsewhere =
-            program == retry.program || (!reads_conversation(program) && !screen_alone(program));
-        if !its_limit && !elsewhere {
-            return false;
-        }
-        ask.key = key.to_string();
-        retry.badge = Some(key.to_string());
-        self.limit_badge_away = (!its_limit).then(|| key.to_string());
-        true
-    }
-
-    /// Returns whether a badge carried off its limit screen should now be cleared because its episode ended.
-    pub(super) fn limit_badge_off_ended(&mut self) -> bool {
-        let Some(key) = self.limit_badge_away.as_deref() else {
-            return false;
-        };
-        let up = self.box_ask.as_ref().is_some_and(|b| b.key == key);
-        let stands = self
-            .limit_retry
-            .as_ref()
-            .is_some_and(|r| r.badge.as_deref() == Some(key));
-        if !up || !stands {
-            self.limit_badge_away = None;
-        }
-        up && !stands
-    }
-
-    /// Records a resume typed at `Stop`'s error or while the ladder is kept across a relaunch.
-    pub(super) fn limit_resume_typed(&mut self, rows: &[String]) {
-        if aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w))
-            || self.limit_ladder_kept()
-        {
-            self.limit_retry_pressed();
-            if let Some(retry) = self.limit_retry.as_mut() {
-                retry.resumed = true;
-            }
-        }
-    }
-
-    /// Returns whether the [`LimitRetry`] episode and the turn-end policy's limit track both stand for the same program.
-    pub(super) fn limit_ladder_kept(&self) -> bool {
-        self.limit_retry
-            .as_ref()
-            .is_some_and(|r| keeps_trying_its_limit(r.program))
-            && self.turn_end.has_limit_track()
-            && self
-                .limit_retry
-                .as_ref()
-                .is_some_and(|r| self.turn_end.limit_program() == Some(r.program))
-    }
-
-    fn limit_retry_past_reset(&self, at_unix: i64) -> i64 {
-        at_unix
-            .saturating_add(LIMIT_RETRY_MINUTE_S)
-            .saturating_add(self.limit_retry_grace_s())
-    }
-
-    fn limit_retry_grace_s(&self) -> i64 {
-        i64::try_from(self.turn_end.timing.grace_for(Program::Gemini).as_secs()).unwrap_or(i64::MAX)
-    }
-
-    fn limit_retry_hold(
-        &mut self,
-        turn: &Turn,
-        p: &aterm_phase::PromptV2,
-        opts: &SuperviseOpts,
-        review: &mut dyn Review,
-    ) -> Result<bool, Fail> {
-        if p.kind != PromptKind::UsageLimit || !review.unattended() {
-            return Ok(false);
-        }
-        let RetryDue::Hold { until_unix, reset } = self.limit_retry_due(&turn.screen.rows, opts)
-        else {
-            return Ok(false);
-        };
-        let now = self.now_unix();
-        let wait = Duration::from_secs(u64::try_from(until_unix - now).unwrap_or(0));
-        let until = self.fx.mono() + wait;
-        let (tries, resumed) = self
-            .limit_retry
-            .as_ref()
-            .map_or((0, false), |r| (r.tries, r.resumed));
-        let unplaced = self
-            .limit_retry
-            .as_ref()
-            .and_then(|r| r.at_unix.is_none().then_some(r.reset.as_ref()).flatten())
-            .map(ToString::to_string);
-        let retry = aterm_phase::anchor!("gemini.usage.retry");
-        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
-        let tries_by = LimitTry::of(&labels).unwrap_or(LimitTry::KeepTrying);
-        let pressed = tries_by.pressed();
-        let (why, how) = match (&reset, &unplaced) {
-            (Some(reset), _) => (
-                format!("Gemini CLI's usage limit resets at {reset}"),
-                format!("{pressed} past it"),
-            ),
-            (None, Some(drawn)) => (
-                format!(
-                    "Gemini CLI's usage limit names a reset the loop cannot place ({})",
-                    crate::harness::one_line(drawn, 24)
-                ),
-                format!("{pressed} on the back-off ladder"),
-            ),
-            (None, None) => (
-                "Gemini CLI's usage limit names no reset".to_string(),
-                format!("{pressed} on the back-off ladder"),
-            ),
-        };
-        let told = self
-            .turn_end_due
-            .as_ref()
-            .is_some_and(|d| d.why == why && (d.unix_ms.div_euclid(1000) - until_unix).abs() <= 1);
-        if !told {
-            let back = match (tries, resumed) {
-                (0, _) => String::new(),
-                (n, true) => format!(" (drawn again after its typed resume, try {n})"),
-                (n, false) => format!(" (drawn again after its {retry}, try {n})"),
-            };
-            let said = format!("{why}: {how}{back}");
-            let stamp = utc_stamp(u64::try_from(until_unix).unwrap_or(0));
-            let seq = turn.screen.seq;
-            review.note(&format!(
-                "WAITING seq={seq} until={stamp} rule={RULE_LIMIT_RETRY} {said}"
-            ));
-            self.ledger_row(
-                RULE_LIMIT_RETRY,
-                approvals::Outcome::Waiting,
-                &p.command,
-                &format!("until {stamp}: {said}"),
-                seq,
-            );
-        }
-        if reset.is_none() {
-            let key = self.review_key(turn);
-            if self.box_ask.as_ref().is_none_or(|b| b.key != key) {
-                let reason = limit_no_reset_reason(unplaced.as_deref(), tries_by);
-                self.ledger_row(
-                    "-",
-                    approvals::Outcome::Escalated,
-                    &p.command,
-                    &reason,
-                    turn.screen.seq,
-                );
-                self.escalate_point(turn, Some(&reason), review)?;
-            }
-            if let Some(retry) = self.limit_retry.as_mut() {
-                retry.badge = Some(key);
-            }
-        }
-        self.set_due(until, why);
-        self.held = true;
-        Ok(true)
-    }
-
-    /// A `Keep trying` of Gemini CLI's usage-limit dialog landed.
-    pub(super) fn limit_retry_pressed(&mut self) {
-        let now = self.now_unix();
-        let early = self
-            .limit_retry
-            .as_ref()
-            .and_then(|r| r.at_unix)
-            .is_some_and(|at| now < self.limit_retry_past_reset(at));
-        if let Some(retry) = self.limit_retry.as_mut() {
-            retry.tries = retry.tries.saturating_add(1);
-            retry.looks = retry.looks.saturating_add(u32::from(early));
-            retry.last_unix = Some(now);
-            retry.resumed = false;
-        }
-        self.limit_dialog_read = None;
-    }
-
-    /// Handles a busy read while a [`LimitRetry`] episode stands.
-    pub(super) fn limit_retry_busy(&mut self) -> bool {
-        let now = self.now_unix();
-        let Some(retry) = self.limit_retry.as_ref() else {
-            return false;
-        };
-        let in_flight = retry.away
-            || retry
-                .last_unix
-                .is_some_and(|last| now.saturating_sub(last) < LIMIT_RETRY_ANSWER_S);
-        if !in_flight {
-            self.limit_retry = None;
-            return false;
-        }
-        retry
-            .badge
-            .as_ref()
-            .is_some_and(|k| self.box_ask.as_ref().is_some_and(|b| b.key == *k))
     }
 
     fn box_back_off(
@@ -3493,7 +2908,6 @@ const fn is_muse(program: &Program) -> bool {
         | Program::Grok
         | Program::Kimi
         | Program::Agy
-        | Program::Gemini
         | Program::Generic => false,
     }
 }

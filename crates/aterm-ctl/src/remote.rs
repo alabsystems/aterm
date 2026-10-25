@@ -42,6 +42,9 @@ pub struct DriveRefused {
     pub again: bool,
     /// Why the dial reached no Mac this machine may hold a tab on, with this machine's node.
     pub left: Option<Left>,
+    /// The peer took the connection and sent no fleet handshake within the deadline, so the
+    /// request was not sent: exit 2, as for an instance that accepted and did not serve.
+    pub unserved: bool,
 }
 
 /// Why a drive's dial reaches no Mac a hold was taken on ([`DriveRefused::left`]), with this
@@ -63,6 +66,7 @@ impl DriveRefused {
             why,
             again: false,
             left: None,
+            unserved: false,
         }
     }
 }
@@ -90,6 +94,33 @@ impl From<&str> for DriveRefused {
 /// The deadline of one connection that waits for nothing (a read, a key, a
 /// spawn, a hold): under the peer's 30 s cut.
 const DRIVE_WITHIN: Duration = Duration::from_secs(28);
+
+/// A drive connection's deadline, its handshake's and its reply's, and whose it is, which a
+/// reply cut at it names ([`closed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Within {
+    /// The drive's own: [`DRIVE_WITHIN`], or an `await task` leg's wait and its slack.
+    Drive(Duration),
+    /// The caller's `--timeout`, shorter than [`DRIVE_WITHIN`].
+    Timeout(Duration),
+}
+
+impl Within {
+    const fn get(self) -> Duration {
+        match self {
+            Self::Drive(within) | Self::Timeout(within) => within,
+        }
+    }
+}
+
+/// A drive connection's deadline: [`DRIVE_WITHIN`], or a shorter `--timeout` (`total`, none for
+/// `--timeout 0`).
+fn drive_within(total: Option<Option<Duration>>) -> Within {
+    match total {
+        Some(Some(total)) if total < DRIVE_WITHIN => Within::Timeout(total),
+        _ => Within::Drive(DRIVE_WITHIN),
+    }
+}
 
 /// The `timeout=` a turn over a drive waits when it names none.
 const TURN_WAIT_MS: u64 = 20_000;
@@ -153,6 +184,7 @@ pub(crate) fn run(
     if await_task::is_await_task(parts) {
         return await_task::run_driven(parts, total, host, drive);
     }
+    let within = drive_within(total);
     if verb == "spawn" {
         if selector.is_some() {
             return Err(refused(
@@ -163,9 +195,10 @@ pub(crate) fn run(
         let head = spawn_head(args, worker_starter(env::var(SELF_SID_ENV).ok()).as_deref())?;
         let task = read_task_payload()?;
         return spawn_exchange(
-            drive(host, DRIVE_WITHIN).map_err(io::Error::other)?,
+            drive(host, within.get()).map_err(io::Error::other)?,
             &format!("{head} len={}", task.len()),
             &task,
+            within,
         );
     }
     if matches!(verb, "feed-bin" | "paste")
@@ -178,18 +211,18 @@ pub(crate) fn run(
     }
     let mut parts = parts.to_vec();
     if verb == "turn" {
-        turn_wait(&mut parts)?;
+        turn_wait(&mut parts, host)?;
     }
     let mut request = request_line(&parts)?;
     validate_request_line_len(&request, Some(verb))?;
     request.push('\n');
-    let link = drive(host, DRIVE_WITHIN).map_err(|refused| match (&refused.left, args) {
+    let link = drive(host, within.get()).map_err(|refused| match (&refused.left, args) {
         (Some(left), [sid, off, ..]) if verb == "hold" && off == "off" => {
             io::Error::other(left_holding(host, sid, left, &refused.why))
         }
         _ => io::Error::other(refused),
     })?;
-    exchange(link, &request, verb)
+    exchange(link, &request, verb, within)
 }
 
 /// Why a `hold <sid> off` cannot be sent to `host` by this machine, out of the fleet now or
@@ -255,9 +288,10 @@ fn is_sid(word: &str) -> bool {
 /// `if-supervisor=` fence and a leading `cause=`.
 const TURN_LEADING: &[&str] = &["id=", "if-supervisor=", "cause="];
 
-/// A turn's wait over a drive: its `timeout=`, at most [`TURN_MAX_MS`], or
-/// [`TURN_WAIT_MS`] added where it names none.
-fn turn_wait(parts: &mut Vec<String>) -> io::Result<()> {
+/// A turn's wait over a drive to `host`: its `timeout=`, at most [`TURN_MAX_MS`], or
+/// [`TURN_WAIT_MS`] added where it names none; a longer one is refused, naming the waits that work
+/// for a worker's turn and for any other session's.
+fn turn_wait(parts: &mut Vec<String>, host: &str) -> io::Result<()> {
     let at = parts
         .iter()
         .position(|p| p == "turn")
@@ -287,10 +321,20 @@ fn turn_wait(parts: &mut Vec<String>) -> io::Result<()> {
             Ok(())
         }
         Some(ms) if ms.parse::<u64>().is_ok_and(|ms| ms <= TURN_MAX_MS) => Ok(()),
-        Some(_) => Err(refused(format!(
-            "a turn over the fleet waits at most timeout={TURN_MAX_MS} (its connection lasts \
-             30 s): say settle=submitted and wait with `await task @<w>:<task_rev>`"
-        ))),
+        Some(_) => {
+            let host = aterm_codec::tty::one_line(host, 80);
+            let session = parts
+                .first()
+                .filter(|word| word.starts_with('@'))
+                .map_or("@<sid>", String::as_str);
+            Err(refused(format!(
+                "a turn over the fleet waits at most timeout={TURN_MAX_MS} (its connection lasts \
+                 30 s): give it a shorter timeout=, or say settle=submitted and then wait for a \
+                 worker with `aterm ctl --host {host} await task {session}:<task_rev>` (the rev \
+                 its turn prints), or read any other session with `aterm ctl --host {host} \
+                 {session} status` (or `text`)"
+            )))
+        }
     }
 }
 
@@ -343,12 +387,17 @@ fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
 
 /// A worker's spawn over `link`: the line `head`; then, once it is answered
 /// `GO <n>`, the `task`, and the answer printed as on one Mac (a second `GO`
-/// read past).
-fn spawn_exchange(link: DriveLink, head: &str, task: &[u8]) -> io::Result<ExitCode> {
+/// read past), all `within` the connection's deadline.
+fn spawn_exchange(
+    link: DriveLink,
+    head: &str,
+    task: &[u8],
+    within: Within,
+) -> io::Result<ExitCode> {
     let DriveLink { mut stream, label } = link;
     let go = aterm_types::control_verbs::task_frame_go(task.len());
     let go = go.trim_end_matches('\n');
-    let cut = |e| closed(&label, head, DRIVE_WITHIN, e);
+    let cut = |e| closed(&label, head, within, e);
     stream
         .write_all(format!("{head}\n").as_bytes())
         .and_then(|()| stream.flush())
@@ -369,38 +418,58 @@ fn spawn_exchange(link: DriveLink, head: &str, task: &[u8]) -> io::Result<ExitCo
 }
 
 /// A connection the peer closed, cut or left unanswered past `within` before it answered
-/// `request`, said as the peer's: what does that, and how to learn whether what it sent landed.
-pub(crate) fn closed(label: &str, request: &str, within: Duration, e: io::Error) -> io::Error {
+/// `request`, said as the peer's, or as the caller's `--timeout` where that cut it: what does
+/// that, and how to learn whether what it sent landed.
+pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -> io::Error {
     use io::ErrorKind::{
         BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut, UnexpectedEof, WouldBlock,
     };
     if super::is_stdout_closed(&e) {
         return e;
     }
-    let (cause, read_again) = match e.kind() {
-        UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe => (
-            format!(
-                "{label} cut the drive connection before it answered (its person took back \
-                 this Mac's grant, or its aterm stopped or restarted)"
-            ),
-            "again says which",
-        ),
-        WouldBlock | TimedOut => (
-            format!(
-                "{label} did not answer within {} s (its aterm is stopped, frozen or too busy \
-                 to answer, or the network between is down)",
-                within.as_secs()
-            ),
-            "again is safe: it changes nothing there",
-        ),
-        _ => return e,
-    };
     let mut words = request.split_whitespace();
     let (verb, session) = match (words.next(), words.next()) {
         (Some(sel), Some(verb)) if sel.starts_with('@') => (verb, Some(sel.to_owned())),
         (Some("hold"), sid) => ("hold", sid.map(|sid| format!("@{sid}"))),
         (Some(verb), _) => (verb, None),
         (None, _) => ("request", None),
+    };
+    let (cause, read_again) = match e.kind() {
+        UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe => (
+            format!(
+                "{label} cut the drive connection before it answered (its person took back \
+                 this Mac's grant or lowered its fleet level, its fleet key or listen place \
+                 changed, or its aterm stopped or restarted)"
+            ),
+            "again says which",
+        ),
+        WouldBlock | TimedOut => (
+            match within {
+                Within::Drive(within) => format!(
+                    "{label} did not answer within {} s (its aterm is stopped, frozen or too \
+                     busy to answer, or the network between is down)",
+                    within.as_secs()
+                ),
+                Within::Timeout(within) => {
+                    let turn = if verb == "turn" {
+                        format!(
+                            "a `turn` there answers once it settles or its timeout= runs out, \
+                             {TURN_WAIT_MS} ms where it names none; "
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "no answer came from {label} within this call's --timeout of {} s \
+                         ({turn}a longer --timeout, or 0, waits up to the drive's own {} s)",
+                        within.as_secs(),
+                        DRIVE_WITHIN.as_secs()
+                    )
+                }
+            },
+            "again is safe: it changes nothing there",
+        ),
+        _ => return e,
     };
     let landed = match (verb, session) {
         ("turn" | "key" | "send" | "hold" | "close", Some(session)) => format!(
@@ -422,10 +491,10 @@ pub(crate) fn closed(label: &str, request: &str, within: Duration, e: io::Error)
 /// One request over `link` and its answer, framed as on one Mac: an `ERR`
 /// on stderr (exit 1); a line-framed reply's rows on stdout, a turn's
 /// verdict and a result's header on stderr; a status line on stdout; a
-/// reported timeout exits 124.
-fn exchange(link: DriveLink, request: &str, verb: &str) -> io::Result<ExitCode> {
+/// reported timeout exits 124, as does an answer not come `within` the deadline.
+fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::Result<ExitCode> {
     let DriveLink { mut stream, label } = link;
-    let cut = |e| closed(&label, request, DRIVE_WITHIN, e);
+    let cut = |e| closed(&label, request, within, e);
     stream
         .write_all(request.as_bytes())
         .and_then(|()| stream.flush())

@@ -29,12 +29,16 @@ pub fn mark_ran(copy: &Path) {
 #[must_use]
 pub fn code_dir() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
-    home.is_absolute().then(|| {
-        home.join("Library")
-            .join("Application Support")
-            .join("aterm")
-            .join("keeper-code")
-    })
+    home.is_absolute().then(|| code_dir_in(&home))
+}
+
+/// [`code_dir`] for the absolute `home`.
+#[must_use]
+pub fn code_dir_in(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("aterm")
+        .join("keeper-code")
 }
 
 fn own_exe() -> Option<PathBuf> {
@@ -86,7 +90,10 @@ fn copy_name(pid: u32, birth: Birth) -> String {
     format!("{pid}-{}-{}", birth.seconds, birth.micros)
 }
 
-fn owner_of(name: &str) -> Option<(u32, Birth)> {
+/// The keeper (its pid and start) whose copy, or half-made `.partial` copy, `name` names: none
+/// for any other name.
+#[must_use]
+pub fn owner_of(name: &str) -> Option<(u32, Birth)> {
     let name = name.strip_suffix(".partial").unwrap_or(name);
     let mut parts = name.split('-');
     let pid = parts.next()?.parse().ok()?;

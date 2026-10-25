@@ -132,10 +132,35 @@ pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
     })
 }
 
-/// The design-space coords of the named instance whose subfamily name is
-/// "Regular", from the raw `fvar` table (bounds-checked; `None` on any
-/// structural inconsistency).
+/// The design-space coords of the face's regular-weight named instance from the raw
+/// `fvar` table (bounds-checked): "Regular", else the italic of Regular ("Regular
+/// Italic", "Italic", "Oblique"), as SF Mono's italic file names it.
 fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Option<Vec<f32>> {
+    instance_coords_named(face, axis_count, |name| {
+        name.eq_ignore_ascii_case("regular")
+    })
+    .or_else(|| instance_coords_named(face, axis_count, is_regular_weight_slant_name))
+}
+
+/// Whether a named instance's subfamily `name` is the italic (or oblique) of
+/// the regular weight: "Italic", "Regular Italic", "Oblique", "Regular
+/// Oblique".
+fn is_regular_weight_slant_name(name: &str) -> bool {
+    let name = name.trim();
+    let rest = name
+        .get(..8)
+        .filter(|head| head.eq_ignore_ascii_case("regular "))
+        .map_or(name, |_| name[8..].trim_start());
+    rest.eq_ignore_ascii_case("italic") || rest.eq_ignore_ascii_case("oblique")
+}
+
+/// The design-space coords of the first named instance whose subfamily name
+/// `wanted` accepts.
+fn instance_coords_named(
+    face: &aterm_font::Face<'_>,
+    axis_count: usize,
+    wanted: impl Fn(&str) -> bool,
+) -> Option<Vec<f32>> {
     let data = face
         .raw_face()
         .table(aterm_font::Tag::from_bytes(b"fvar"))?;
@@ -157,7 +182,7 @@ fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Op
     for i in 0..n_inst {
         let rec = inst_base.checked_add(i.checked_mul(inst_size)?)?;
         let name_id = u16_at(rec)?;
-        if !name_is_regular(face, name_id) {
+        if !name_is(face, name_id, &wanted) {
             continue;
         }
         let mut coords = Vec::with_capacity(n_axes);
@@ -176,15 +201,29 @@ fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Op
     None
 }
 
-/// Whether `name` record `name_id` decodes to "Regular" (case-insensitive,
-/// trimmed) in any Unicode-encoded entry.
-fn name_is_regular(face: &aterm_font::Face<'_>, name_id: u16) -> bool {
+/// Whether `name` record `name_id` decodes to a name `wanted` accepts
+/// (trimmed) in any Unicode-encoded entry.
+fn name_is(face: &aterm_font::Face<'_>, name_id: u16, wanted: impl Fn(&str) -> bool) -> bool {
     face.names().into_iter().any(|n| {
-        n.name_id == name_id
-            && n.is_unicode()
-            && n.to_string()
-                .is_some_and(|s| s.trim().eq_ignore_ascii_case("regular"))
+        n.name_id == name_id && n.is_unicode() && n.to_string().is_some_and(|s| wanted(s.trim()))
     })
+}
+
+/// The coords a face drawn in a bold role takes: `base` (its regular resolution
+/// under the user's requests) with `wght` at [`BOLD_WGHT`], or a weight class above
+/// `base` where that is heavier, clamped to the axis.
+#[must_use]
+pub fn bold_role_coords(axes: &[VfAxis], base: &[f32]) -> Vec<f32> {
+    axes.iter()
+        .zip(base)
+        .map(|(axis, &value)| {
+            if axis.tag == WGHT_TAG {
+                clamp_axis(axis, BOLD_WGHT.max(value + 100.0))
+            } else {
+                value
+            }
+        })
+        .collect()
 }
 
 /// Coordinate-applied face metrics in device px, through aterm-font with every coord set.

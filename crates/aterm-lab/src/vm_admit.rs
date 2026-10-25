@@ -215,8 +215,10 @@ pub fn admit_in(
             "{why}; the VM can never boot here"
         ))),
         Err(Error::Ledger(e)) => Ok(unclaimed(guest, &e.to_string())),
-        Err(Error::Stopped(short)) => Err(Fail {
-            stopped: stopped().err().map(|s| s.0),
+        Err(Error::Stopped { signal, short }) => Err(Fail {
+            stopped: signal
+                .inspect(|sig| crate::stop::note(*sig))
+                .or_else(|| stopped().err().map(|s| s.0)),
             ..crate::linux::not_run(format!(
                 "interrupted while waiting for capacity for {}{}; this run {}",
                 guest.vm,

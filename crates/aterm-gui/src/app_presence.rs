@@ -110,7 +110,7 @@ const fn reports_its_boxes(program: aterm_phase::Program) -> bool {
     use aterm_phase::Program as P;
     match program {
         P::Codex => true,
-        P::Claude | P::Agy | P::Muse | P::Gemini | P::Grok | P::Kimi | P::Generic => false,
+        P::Claude | P::Agy | P::Muse | P::Grok | P::Kimi | P::Generic => false,
     }
 }
 
@@ -2534,7 +2534,12 @@ mod tests {
             assert_eq!(app.focused_session_id(w1), Some(worker));
             if via_chip {
                 app.note_claude_team(w1, worker);
-                app.press_claude_chip(w1, worker, crate::claude_lights::Chip::Team);
+                app.press_claude_chip(
+                    w1,
+                    worker,
+                    crate::claude_lights::Chip::Team,
+                    std::time::Instant::now(),
+                );
             } else {
                 let _ = app.focus_session_window(manager);
             }
@@ -2747,12 +2752,14 @@ mod tests {
             app.presence_chrome_line()
         );
         app.note_claude_team(wid, sid);
-        app.with_gesture_source(true, |app| app.press_claude_chip(wid, sid, Chip::Team));
+        app.with_gesture_source(true, |app| {
+            app.press_claude_chip(wid, sid, Chip::Team, std::time::Instant::now());
+        });
         assert!(
             ctx.fabric.holds().person().is_some(),
             "a control client's press lifts nothing"
         );
-        app.press_claude_chip(wid, sid, Chip::Team);
+        app.press_claude_chip(wid, sid, Chip::Team, std::time::Instant::now());
         assert!(ctx.fabric.holds().person().is_none(), "handed back");
         assert_eq!(
             yours(&app),
@@ -2779,12 +2786,12 @@ mod tests {
         let _ = crate::app_tabs::take_raised_windows();
 
         app.note_claude_team(wid, stray);
-        app.press_claude_chip(wid, stray, Chip::Team);
+        app.press_claude_chip(wid, stray, Chip::Team, std::time::Instant::now());
         assert!(app.windows[&wid].overview().is_none(), "control: no card");
         assert_eq!(crate::app_tabs::take_raised_windows(), Vec::new());
 
         app.note_claude_team(wid, manager);
-        app.press_claude_chip(wid, manager, Chip::Team);
+        app.press_claude_chip(wid, manager, Chip::Team, std::time::Instant::now());
         assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
         assert_eq!(app.focused_session_id(wid), Some(stray), "no tab moved");
         let card = app
@@ -3072,10 +3079,10 @@ mod tests {
         let col = body(&app).expect("the pill's body is laid out");
         assert_eq!(app.windows[&wid].strip_pill_session, Some(first));
         app.windows.get_mut(&wid).unwrap().strip_pill_session = Some(second);
-        app.handle_tab_strip_click(wid, col);
+        app.handle_tab_strip_click(wid, col, std::time::Instant::now());
         assert_eq!(app.focused_session_id(wid), Some(second), "stale: nothing");
         app.windows.get_mut(&wid).unwrap().strip_pill_session = Some(first);
-        app.handle_tab_strip_click(wid, col);
+        app.handle_tab_strip_click(wid, col, std::time::Instant::now());
         assert_eq!(
             app.focused_session_id(wid),
             Some(first),
@@ -3153,7 +3160,12 @@ mod tests {
             "the tab's own name keeps no mark"
         );
         app.note_claude_team(wid, bench);
-        app.press_claude_chip(wid, bench, crate::claude_lights::Chip::Team);
+        app.press_claude_chip(
+            wid,
+            bench,
+            crate::claude_lights::Chip::Team,
+            std::time::Instant::now(),
+        );
         assert_eq!(app.focused_session_id(wid), Some(manager));
         assert!(app.detach_session_view(fmt), "the last view of it");
         assert!(matches!(

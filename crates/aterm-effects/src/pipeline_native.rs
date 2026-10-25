@@ -457,11 +457,20 @@ impl EffectsPipeline {
             }
             ContentScrollDelta::Bands { first_seq, count } => {
                 self.cursor.scroll_bands(&current, first_seq, count);
-                for i in 0..u64::from(count) {
-                    let m = current.band(first_seq + i);
-                    self.flying_sky_row = self
-                        .flying_sky_row
-                        .and_then(|r| crate::cursor_glow::band_row(r, m.top, m.bottom, m.delta));
+                if let Some(mut row) = self.flying_sky_row {
+                    let mut next = Some(row);
+                    for i in 0..u64::from(count) {
+                        let m = current.band(first_seq + i);
+                        match crate::cursor_glow::band_row(row, m.top, m.bottom, m.delta) {
+                            Some(r) => row = r,
+                            None => {
+                                next = None;
+                                break;
+                            }
+                        }
+                        next = Some(row);
+                    }
+                    self.flying_sky_row = next;
                 }
                 ScrollChange {
                     band_moves: count,
@@ -559,9 +568,10 @@ impl EffectsPipeline {
     /// baselines silently.
     #[inline]
     pub fn fence_owner(&mut self, current: (u64, bool), now: Instant) -> bool {
-        let changed = self
-            .cursor_owner_space
-            .is_some_and(|previous| previous != current);
+        let changed = matches!(
+            self.cursor_owner_space,
+            Some(previous) if previous != current
+        );
         self.cursor_owner_space = Some(current);
         if changed {
             self.resight_torn(now);
@@ -805,7 +815,7 @@ impl EffectsPipeline {
             if pane.focused {
                 self.forward_peek_cues(f.now, (geom.cell_w, geom.cell_h));
             } else {
-                self.decos.drain_peek_cues().for_each(drop);
+                let _ = self.decos.drain_peek_cues();
             }
             translate_decos_into_pane(&mut self.pane_deco, place);
             translate_ink_into_pane(&mut self.pane_ink, place);
@@ -883,13 +893,10 @@ impl EffectsPipeline {
             duty,
             body_claimed: false,
         });
-        let impulse = self
-            .cursor
-            .glow
-            .take_companion_impulse()
-            .map_or(BodyImpulse::Ignore, |impulse| {
-                companion::impulse_for(body, impulse)
-            });
+        let impulse = match self.cursor.glow.take_companion_impulse() {
+            Some(impulse) => companion::impulse_for(body, impulse),
+            None => BodyImpulse::Ignore,
+        };
         let cat = &mut self.companions.cursor_cat;
         match impulse {
             BodyImpulse::Fly(flight) if !flight.dir.is_vertical() => {
@@ -1352,7 +1359,7 @@ impl EffectsPipeline {
             NovaInto::Window => self.nova_scratch.extend_from_slice(&self.pane_nova),
             NovaInto::Staged(out) => out.extend_from_slice(&self.pane_nova),
         }
-        (frame.fp, frame.cue.filter(|_| pane.sound))
+        (frame.fp, if pane.sound { frame.cue } else { None })
     }
 }
 

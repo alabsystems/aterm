@@ -44,12 +44,25 @@ pub(crate) enum TabSpawnThen {
     Counts(Sender<Result<(usize, usize), String>>),
     /// Main-thread callback invoked with the registered `sid` or error reason.
     Run(SpawnDone),
+    /// Recheck a deferred request before installing a successful spawn or moving focus.
+    /// A refusal quietly drops the session and answers `then` with an error.
+    Before { check: SpawnCheck, then: SpawnDone },
 }
 
 /// Main-thread callback run once an off-loop spawn settles.
 pub(crate) type SpawnDone = Box<dyn FnOnce(&mut App, Result<String, String>)>;
 
+/// Main-thread check of the destination before a successful spawn is installed.
+type SpawnCheck = Box<dyn Fn(&mut App, WindowId) -> bool>;
+
 impl TabSpawnThen {
+    fn may_land(&self, app: &mut App, window: WindowId) -> bool {
+        match self {
+            Self::Before { check, .. } => check(app, window),
+            _ => true,
+        }
+    }
+
     /// Deliver `outcome` to the waiter, raising `window` first when requested.
     pub(crate) fn answer(self, app: &mut App, window: WindowId, outcome: Result<String, String>) {
         match self {
@@ -72,7 +85,7 @@ impl TabSpawnThen {
                 });
                 let _ = reply.send(counts);
             }
-            Self::Run(then) => then(app, outcome),
+            Self::Run(then) | Self::Before { then, .. } => then(app, outcome),
         }
     }
 }
@@ -185,6 +198,10 @@ pub(crate) enum SpawnAdmission {
 #[derive(Default)]
 pub(crate) struct SpawnAsk {
     pub(crate) admission: SpawnAdmission,
+    /// Program and argv to start without configured-shell integration or global `-e`.
+    /// This starts on the worker before landing: a caller deferring effects until admission
+    /// must start only an inert waiting shell here, then submit its work after landing.
+    pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     /// Explicit cwd (`None` inherits `folder_of` or the focused pane's folder).
     pub(crate) cwd: Option<String>,
     /// Origin pane folder to inherit before the focused pane's.
@@ -195,6 +212,10 @@ pub(crate) struct SpawnAsk {
     pub(crate) task: Option<crate::task_launch::TaskSeed>,
     /// Land a new tab behind the active tab without moving focus.
     pub(crate) background: bool,
+    /// A tab nobody asked for (System State's Command Line Tools install,
+    /// [`crate::clt_install`]): the window's input while it spawns stays where it was typed,
+    /// never held to replay into the new tab, as a person's own new tab's typing is.
+    pub(crate) unasked: bool,
     /// Explicit session theme (`None` inherits the divided pane's theme on a split).
     pub(crate) theme: Option<crate::session_theme::SessionTheme>,
 }
@@ -215,6 +236,19 @@ impl SpawnAsk {
             ..Self::default()
         }
     }
+}
+
+/// Capture this request's program without changing the factory other tabs inherit.
+fn tab_spawn_factory(
+    mut factory: crate::spawn::SessionFactory,
+    exec_command: Option<Vec<std::ffi::OsString>>,
+) -> crate::spawn::SessionFactory {
+    if let Some(command) = exec_command {
+        factory.exec_command = Some(command);
+        factory.integrate = false;
+    }
+    factory.reader_after_install = true;
+    factory
 }
 
 /// Result returned by the spawner thread ([`crate::Wake::TabSpawned`]).
@@ -333,6 +367,8 @@ struct InFlight {
     admission: SpawnAdmission,
     /// [`SpawnAsk::background`]: a tab lands behind the window's active one.
     background: bool,
+    /// [`SpawnAsk::unasked`]: the window holds no input for it.
+    unasked: bool,
     completion: Arc<TabSpawnCompletion>,
     /// The newborn's own theme, as asked ([`SpawnAsk::theme`]).
     theme: Option<crate::session_theme::SessionTheme>,
@@ -524,7 +560,8 @@ impl TabSpawns {
             .iter()
             .rev()
             .find(|t| {
-                t.place.asked_from(t.window) == Some(window)
+                !t.unasked
+                    && t.place.asked_from(t.window) == Some(window)
                     && now < self.hold_end(t, now)
                     && after.is_none_or(|first| t.alt_id.unwrap_or(t.id) >= first)
             })
@@ -1113,11 +1150,13 @@ impl App {
         };
         let SpawnAsk {
             admission,
+            exec_command,
             cwd,
             folder_of,
             observe,
             task,
             background,
+            unasked,
             theme,
         } = ask;
         let theme = theme.or(inherited);
@@ -1186,13 +1225,14 @@ impl App {
         } else {
             Vec::new()
         };
-        let mut factory = self.session_factory.clone();
-        factory.reader_after_install = true;
+        let factory = tab_spawn_factory(self.session_factory.clone(), exec_command);
         #[cfg(windows)]
-        {
+        let factory = {
+            let mut factory = factory;
             factory.shell_appearance =
                 self.spawn_shell_appearance(theme.as_ref().map(|theme| theme.selector.as_str()));
-        }
+            factory
+        };
         let completion = Arc::new(TabSpawnCompletion::default());
         self.tab_spawns.in_flight.push(InFlight {
             id: inflight_id,
@@ -1206,6 +1246,7 @@ impl App {
             then,
             admission,
             background,
+            unasked,
             completion: Arc::clone(&completion),
             theme,
         });
@@ -1517,6 +1558,9 @@ impl App {
         let outcome = match session {
             _ if os.exiting() => Err(QUITTING.to_string()),
             Err(e) => Err(place.failed(self, &e.to_string())),
+            Ok(_) if !then.may_land(self, window) => {
+                Err("the request is no longer ready to open its tab".to_string())
+            }
             Ok(_) if !new_window && !self.windows.contains_key(&window) => {
                 Err("the window closed before the session started".to_string())
             }
@@ -1923,6 +1967,7 @@ pub(crate) mod test_support {
             then,
             admission: SpawnAdmission::Plain,
             background: false,
+            unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });
@@ -1952,6 +1997,7 @@ pub(crate) mod test_support {
             then,
             admission,
             background: false,
+            unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });
@@ -1991,6 +2037,44 @@ pub(crate) mod tests {
     use aterm_window::event::Ime;
     use std::sync::Arc;
 
+    #[test]
+    fn a_tab_command_override_is_scoped_to_its_own_spawn_factory() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut app = App::headless_for_test();
+        let inherited = vec![
+            OsString::from("configured-program"),
+            OsString::from("configured arg"),
+        ];
+        app.session_factory.exec_command = Some(inherited.clone());
+        app.session_factory.reader_after_install = false;
+        app.session_factory.integrate = true;
+        let command = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("argument with spaces"),
+            OsString::from_vec(vec![b'a', 0xff]),
+        ];
+        let explicit = tab_spawn_factory(app.session_factory.clone(), Some(command.clone()));
+        assert_eq!(explicit.exec_command.as_ref(), Some(&command));
+        assert!(explicit.reader_after_install);
+        assert!(!explicit.integrate);
+        assert_eq!(app.session_factory.exec_command.as_ref(), Some(&inherited));
+        assert!(!app.session_factory.reader_after_install);
+        assert!(app.session_factory.integrate);
+
+        let ordinary = tab_spawn_factory(app.session_factory.clone(), None);
+        assert_eq!(ordinary.exec_command.as_ref(), Some(&inherited));
+        assert!(ordinary.reader_after_install);
+        assert!(ordinary.integrate);
+        app.session_factory.exec_command = None;
+        assert!(
+            tab_spawn_factory(app.session_factory.clone(), None)
+                .exec_command
+                .is_none()
+        );
+    }
+
     fn piped_session(id: u64) -> (Session, std::fs::File) {
         let mut fds = [0; 2];
         // SAFETY: `fds` is a two-int array, as `pipe` requires.
@@ -2004,7 +2088,7 @@ pub(crate) mod tests {
         (crate::stub_session_with_sink(id, sink), read)
     }
 
-    fn drain(read: &std::fs::File) -> Vec<u8> {
+    pub(crate) fn drain(read: &std::fs::File) -> Vec<u8> {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
         // SAFETY: `read` is an open descriptor this test owns.
@@ -2343,6 +2427,30 @@ pub(crate) mod tests {
         }
     }
 
+    /// A tab nobody asked for ([`SpawnAsk::unasked`]) holds none of its window's input: keys
+    /// typed while it spawns go where they were typed, never into the new tab's shell.
+    #[test]
+    fn an_unasked_tab_holds_none_of_its_windows_input_while_it_spawns() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        let (old, _old_pty) = piped_session(app.next_session_id);
+        app.push_stub_tab(wid, old);
+        book(&mut app, wid, TabSpawnThen::Nothing);
+        app.tab_spawns.in_flight.last_mut().unwrap().unasked = true;
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("x"))
+                .is_some(),
+            "an unasked tab's window keeps its keys"
+        );
+        app.tab_spawns.in_flight.last_mut().unwrap().unasked = false;
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("y"))
+                .is_none(),
+            "a person's own new tab holds them to replay"
+        );
+    }
+
     #[test]
     fn a_tab_spawned_off_the_loop_lands_registered_and_gets_what_was_typed_meanwhile() {
         let mut app = App::headless_for_test();
@@ -2509,6 +2617,7 @@ pub(crate) mod tests {
             },
             admission: SpawnAdmission::Plain,
             background: false,
+            unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
         });

@@ -56,16 +56,23 @@ impl EventCounts {
     /// The counts over `inputs`.
     #[inline]
     #[must_use]
-    pub fn of(inputs: &[MomentumEvent]) -> Self {
-        let mut c = EventCounts::default();
-        for input in inputs {
-            let slot = match input {
+    pub const fn of(inputs: &[MomentumEvent]) -> Self {
+        let mut c = EventCounts {
+            keys: 0,
+            resets: 0,
+            ticks: 0,
+            queries: 0,
+        };
+        let mut i = 0;
+        while i < inputs.len() {
+            let slot = match inputs[i] {
                 MomentumEvent::Key { .. } => &mut c.keys,
                 MomentumEvent::Reset => &mut c.resets,
                 MomentumEvent::Tick { .. } => &mut c.ticks,
                 MomentumEvent::Query { .. } => &mut c.queries,
             };
             *slot = slot.saturating_add(1);
+            i += 1;
         }
         c
     }
@@ -255,15 +262,14 @@ impl MomentumTrace {
         if magic[7] != TRACE_FILE_MAGIC[7] {
             return Err(TraceFault::Format { found: magic[7] });
         }
-        let body_len = bytes
-            .len()
-            .checked_sub(SEAL_LEN)
-            .filter(|&n| n >= TRACE_FILE_MAGIC.len())
-            .ok_or(TraceFault::Wire(WireFault::Truncated {
+        if bytes.len() < TRACE_FILE_MAGIC.len() + SEAL_LEN {
+            return Err(TraceFault::Wire(WireFault::Truncated {
                 field: "trace.seal",
                 need: SEAL_LEN,
                 have: bytes.len() - TRACE_FILE_MAGIC.len(),
-            }))?;
+            }));
+        }
+        let body_len = bytes.len() - SEAL_LEN;
         let (body, closing) = bytes.split_at(body_len);
         let mut sealed = [0u8; SEAL_LEN];
         sealed.copy_from_slice(closing);
@@ -272,23 +278,22 @@ impl MomentumTrace {
             return Err(TraceFault::Seal { sealed, found });
         }
         let mut d = Dec::new(&body[TRACE_FILE_MAGIC.len()..]);
-        let read = (|| {
-            let identity = d.identity()?;
-            let head_state = d.digest("trace.head_state")?;
-            let head_chain = d.digest("trace.head_chain")?;
-            let checkpoint = d.bytes("trace.checkpoint")?.to_vec();
-            let log = d.bytes("trace.log")?.to_vec();
-            Ok(MomentumTrace {
-                identity,
-                checkpoint,
-                log,
-                head_state,
-                head_chain,
-            })
-        })();
-        let trace = read.map_err(TraceFault::Wire)?;
+        let identity = d.identity().map_err(TraceFault::Wire)?;
+        let head_state = d.digest("trace.head_state").map_err(TraceFault::Wire)?;
+        let head_chain = d.digest("trace.head_chain").map_err(TraceFault::Wire)?;
+        let checkpoint = d
+            .bytes("trace.checkpoint")
+            .map_err(TraceFault::Wire)?
+            .to_vec();
+        let log = d.bytes("trace.log").map_err(TraceFault::Wire)?.to_vec();
         d.finish().map_err(TraceFault::Wire)?;
-        Ok(trace)
+        Ok(MomentumTrace {
+            identity,
+            checkpoint,
+            log,
+            head_state,
+            head_chain,
+        })
     }
 
     /// The checkpoint and the log decoded on the reader's recording `epoch`.
@@ -327,8 +332,10 @@ impl MomentumTrace {
     #[must_use]
     pub fn identity_mismatch(&self, build: &str) -> Option<IdentityMismatch> {
         let ours = |c: MomentumCode| momentum_identity(&PrebuiltMomentum::new(c, build));
-        if MomentumCode::ALL.iter().any(|&c| ours(c) == self.identity) {
-            return None;
+        for &c in MomentumCode::ALL {
+            if ours(c) == self.identity {
+                return None;
+            }
         }
         Some(
             IdentityMismatch::first(&self.identity, &ours(MomentumCode::Shipped))
@@ -370,14 +377,20 @@ impl MomentumTrace {
         if let Some(why) = read.log.broken() {
             return Err(TraceFault::Broken { why });
         }
-        let (named, code) = MomentumCode::ALL
-            .iter()
-            .map(|&c| (c, PrebuiltMomentum::new(c, build)))
-            .find(|(_, p)| p.id == self.identity.code)
-            .ok_or_else(|| TraceFault::UnknownCode {
+        let mut found = None;
+        for &c in MomentumCode::ALL {
+            let p = PrebuiltMomentum::new(c, build);
+            if p.id == self.identity.code {
+                found = Some((c, p));
+                break;
+            }
+        }
+        let Some((named, code)) = found else {
+            return Err(TraceFault::UnknownCode {
                 name: self.identity.code.name.clone(),
                 build: build.to_owned(),
-            })?;
+            });
+        };
         let start = read
             .checkpoint
             .restore(&read.schema, &self.identity)

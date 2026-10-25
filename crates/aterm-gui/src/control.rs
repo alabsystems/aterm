@@ -5584,9 +5584,37 @@ impl Drop for DirectPeer {
     }
 }
 
-/// A set's PROOF ([`crate::self_claim`]).
+/// A set's PROOF: codex-alab's self-claim ([`crate::self_claim`]), or a rostered harness's
+/// contract 3 claim ([`crate::harness_claim`]) by its row's image rule.
 pub(crate) fn prove_self_claim(holder: &str, master: i32) -> Option<crate::self_claim::Proven> {
+    if let Some((row, _)) = aterm_agent::harness::contract::holder(holder) {
+        return prove_harness_claim_by(holder, master, &|pid| {
+            crate::harness_claim::runs_harness_build(row, pid)
+        });
+    }
     prove_self_claim_by(holder, master, &crate::self_claim::runs_alab_build)
+}
+
+/// A rostered harness's contract 3 PROOF ([`crate::harness_claim::prove`]): the kernel facts read
+/// as for a self-claim, the image fact read by `image` once the peer and the foreground facts
+/// hold.
+pub(crate) fn prove_harness_claim_by(
+    holder: &str,
+    master: i32,
+    image: &dyn Fn(u32) -> bool,
+) -> Option<crate::self_claim::Proven> {
+    let (_, pid) = aterm_agent::harness::contract::holder(holder)?;
+    let peer = serving_peer_pid();
+    let foreground = crate::quit_safety::foreground_pgrp(master);
+    let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
+    crate::harness_claim::prove(
+        holder,
+        crate::self_claim::Facts {
+            peer,
+            foreground,
+            alab_image: named && image(pid),
+        },
+    )
 }
 
 /// [`prove_self_claim`] with the image fact read by `alab_image`, which is asked only once the peer and the foreground facts hold.
@@ -6236,8 +6264,9 @@ fn drive_turn(rest: &str) -> Result<(), String> {
     match control_session::turn_options(rest) {
         Ok(turn) if turn.timeout_ms > DRIVE_TURN_MAX_MS => Err(format!(
             "a drive's turn names a timeout= of at most {DRIVE_TURN_MAX_MS} ms (its \
-             connection lasts 30 s): say settle=submitted and wait with `await task \
-             @<w>:<task_rev>`"
+             connection lasts 30 s): give it a shorter timeout=, or say settle=submitted and \
+             then wait for a worker with `await task @<sid>:<task_rev>` (the rev its turn \
+             prints), or read any other session with `@<sid> status` (or `text`)"
         )),
         _ => Ok(()),
     }
@@ -6249,7 +6278,7 @@ fn drive_spawn(
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
 ) -> Result<String, String> {
-    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|codex|gemini|agy|muse> \
+    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|codex|agy|muse> \
                          [model=<m>] [cwd=<absolute>] [from=<sid>] [raise=false] len=<n>";
     let tokens = control_media::split_quoted_tokens(rest).ok_or(USAGE)?;
     let (mut agent, mut framed, mut raise) = (false, false, false);
@@ -6262,6 +6291,12 @@ fn drive_spawn(
                     .any(|w| w.word == value) =>
             {
                 agent = true;
+            }
+            "agent" if crate::task_launch::retired_worker(Some(value)).is_some() => {
+                return Err(format!(
+                    "spawn agent={value}: {}",
+                    aterm_phase::RETIRED_AGENT
+                ));
             }
             "len" => framed = true,
             "model" => {}
@@ -7204,12 +7239,13 @@ fn spawn_frame_len(head: &Head<'_>) -> Option<Result<usize, String>> {
     let rest = head.rest;
     let tokens = control_media::split_quoted_tokens(rest)
         .unwrap_or_else(|| rest.split_whitespace().map(str::to_string).collect());
-    let agent =
-        crate::task_launch::worker_word(tokens.iter().find_map(|tok| tok.strip_prefix("agent=")));
-    tokens
-        .iter()
-        .find_map(|tok| tok.strip_prefix("len="))
-        .map(|len| crate::task_launch::frame_len(len, agent))
+    let named = tokens.iter().find_map(|tok| tok.strip_prefix("agent="));
+    let agent = crate::task_launch::worker_word(named);
+    let len = tokens.iter().find_map(|tok| tok.strip_prefix("len="))?;
+    if let Some(refusal) = crate::task_launch::retired_worker(named) {
+        return Some(Err(refusal));
+    }
+    Some(crate::task_launch::frame_len(len, agent))
 }
 
 fn read_worker_task(

@@ -415,15 +415,29 @@ impl ToneModel {
     pub fn from_bytes(bytes: &[u8]) -> Result<ToneModel, ToneModelError> {
         let raw = raw(bytes)?;
         let deq_row = |scale: f32, byte: u8| f32::from(byte as i8) * scale;
+        let mut emb = Vec::with_capacity(raw.emb.len());
+        for &b in raw.emb {
+            emb.push(deq_row(raw.emb_scale, b));
+        }
+        let mut w1 = [[0.0f32; HIDDEN]; EMBED];
+        for (r, row) in w1.iter_mut().enumerate() {
+            let base = r * HIDDEN;
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = deq_row(raw.w1_scale, raw.w1[base + c]);
+            }
+        }
+        let mut w2 = [[0.0f32; TONE_COUNT]; HIDDEN];
+        for (r, row) in w2.iter_mut().enumerate() {
+            let base = r * TONE_COUNT;
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = deq_row(raw.w2_scale, raw.w2[base + c]);
+            }
+        }
         Ok(ToneModel {
-            emb: raw.emb.iter().map(|&b| deq_row(raw.emb_scale, b)).collect(),
-            w1: std::array::from_fn(|r| {
-                std::array::from_fn(|c| deq_row(raw.w1_scale, raw.w1[r * HIDDEN + c]))
-            }),
+            emb,
+            w1,
             b1: raw.b1,
-            w2: std::array::from_fn(|r| {
-                std::array::from_fn(|c| deq_row(raw.w2_scale, raw.w2[r * TONE_COUNT + c]))
-            }),
+            w2,
             b2: raw.b2,
         })
     }
@@ -517,7 +531,7 @@ impl ToneModel {
         let mut out = [0.0f32; TONE_COUNT];
         let mut z = 0.0f32;
         for (o, &l) in out.iter_mut().zip(&s.logits) {
-            *o = (l - mx).exp();
+            *o = crate::color_math::exp_f32(l - mx);
             z += *o;
         }
         if z > 0.0 {
@@ -571,9 +585,17 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
     assert_eq!(b1.len(), HIDDEN);
     assert_eq!(w2.len(), W2_LEN);
     assert_eq!(b2.len(), TONE_COUNT);
-    fn scale_of(t: &[f32]) -> f32 {
+    const fn scale_of(t: &[f32]) -> f32 {
         const INV_127: f32 = 1.0 / 127.0;
-        let mx = t.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let mut mx = 0.0f32;
+        let mut i = 0;
+        while i < t.len() {
+            let a = t[i].abs();
+            if a > mx {
+                mx = a;
+            }
+            i += 1;
+        }
         if mx > 0.0 { mx * INV_127 } else { INV_127 }
     }
     fn quant(out: &mut Vec<u8>, t: &[f32], scale: f32) {

@@ -695,7 +695,10 @@ pub enum RetryCause {
     /// dropped (…)`, `No internet route — …` (Claude Code 2.1.310's connection-error texts for
     /// a name that does not resolve, a socket the network dropped, and no route).
     Unreachable,
-    /// The try in flight has had no first byte: `No response from the API after …`.
+    /// The last try had no response headers within its first-byte window, and a retry is in
+    /// flight: `No response from the API after 3m · retrying once, waiting up to 10m`. The row
+    /// names the failed try's window and the retry's ([`ApiRetryRow::failed_wait_s`]), and never
+    /// when the retry went out; it stands unchanged while that retry waits.
     NoResponse,
     /// The stream went quiet: `Waiting for API response · will retry in … · check your network`.
     Stalled,
@@ -722,14 +725,19 @@ pub struct ApiRetryRow {
     /// The countdown to the next try, in seconds (`Retrying in 32s`, `will retry in 5s`);
     /// `None` where the row counts the try in flight instead (`retrying, waiting up to 1m`).
     pub next_try_s: Option<u64>,
-    /// How long the try in flight has had no response (`No response from the API after 1m 5s`),
-    /// where the row says it whole.
-    pub waited_s: Option<u64>,
+    /// How long the try that failed waited for response headers, in seconds (`No response from
+    /// the API after 3m`): the first-byte window Claude Code gave it, 10 s at the least (measured
+    /// on 2.1.310: `after 13s` under `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=10000`). The try in
+    /// flight is the retry after it, which the row does not time. `None` where the row cut the
+    /// count, and for every other class.
+    pub failed_wait_s: Option<u64>,
     /// The row's text past its spinner glyph.
     pub text: String,
-    /// A `key if=` guard that matches this row while it stands, whatever glyph its spinner shows
-    /// and whatever its countdown and attempt read: the glyph's column, then the lead and the
-    /// retry clause's words as literals, nothing after them.
+    /// A `key if=` guard that matches this row while it stands, whatever glyph its spinner shows:
+    /// the glyph's column, then, where the row counts down, the lead and the retry clause's words
+    /// as literals and nothing after them (the countdown and the attempt move), and for a
+    /// no-response row, which does not move while its retry waits, its whole text to the end, so
+    /// a press never lands on the row of a later try.
     pub guard: String,
 }
 
@@ -776,17 +784,17 @@ pub fn api_retry_row(rows: &[String]) -> Option<ApiRetryRow> {
                     .map(|c| (*c, None))
             })
     })?;
-    let waited_s = match cause {
+    let failed_wait_s = match cause {
         RetryCause::NoResponse => lead
             .strip_prefix("No response from the API after ")
             .and_then(wait_secs),
         RetryCause::Unreachable | RetryCause::Stalled => None,
     };
-    // The lead as the screen shows it, but where it counts the try's own wait (`after 31s`),
-    // which moves every second: its words up to the count.
-    let fixed = match cause {
-        RetryCause::NoResponse => "No response from the API after ".to_string(),
-        RetryCause::Unreachable | RetryCause::Stalled => format!("{lead} · {clause}"),
+    // A countdown row moves every second past its retry clause's words; a no-response row
+    // stands as drawn while its retry waits, so the guard holds all of it.
+    let (fixed, end) = match cause {
+        RetryCause::NoResponse => (text.to_string(), "\\s*$"),
+        RetryCause::Unreachable | RetryCause::Stalled => (format!("{lead} · {clause}"), ""),
     };
     let literal: String = fixed
         .chars()
@@ -797,10 +805,10 @@ pub fn api_retry_row(rows: &[String]) -> Option<ApiRetryRow> {
         row: at,
         cause,
         next_try_s,
-        waited_s,
+        failed_wait_s,
         text: text.to_string(),
         guard: format!(
-            "^\\s*[^\\s{glyph}]\\s+{}",
+            "^\\s*[^\\s{glyph}]\\s+{}{end}",
             crate::anchors::guard_regex(&literal)
         ),
     })
@@ -4282,7 +4290,7 @@ mod tests {
         let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
         let read =
             |row: &str| api_retry_row(&screen(&["⏺ Reading the parser.", "", row, ""], footer));
-        for (row, cause, next, waited) in [
+        for (row, cause, next, failed_wait) in [
             (
                 "✻ Waiting for API response · will retry in 5s · check your network",
                 RetryCause::Stalled,
@@ -4290,16 +4298,16 @@ mod tests {
                 None,
             ),
             (
-                "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+                "✻ No response from the API after 30s · retrying, waiting up to 10m · attempt 1/2",
                 RetryCause::NoResponse,
                 None,
                 Some(30),
             ),
             (
-                "✶ No response from the API after 1m 5s · retrying once, waiting up to 1m",
+                "✶ No response from the API after 3m · retrying once, waiting up to 10m",
                 RetryCause::NoResponse,
                 None,
-                Some(65),
+                Some(180),
             ),
             (
                 "✻ Connection dropped (ECONNRESET) · Retrying in 1m 4s · attempt 8/10",
@@ -4317,8 +4325,8 @@ mod tests {
         ] {
             let r = read(row).unwrap_or_else(|| panic!("read: {row}"));
             assert_eq!(
-                (r.row, r.cause, r.next_try_s, r.waited_s),
-                (2, cause, next, waited),
+                (r.row, r.cause, r.next_try_s, r.failed_wait_s),
+                (2, cause, next, failed_wait),
                 "{row}"
             );
         }
@@ -4378,15 +4386,111 @@ mod tests {
              \\(ENOTFOUND\\).·.Retrying.in."
         );
         let r = read(
-            "✻ No response from the API after 30s · retrying, waiting up to 1m · attempt 2/10",
+            "✻ No response from the API after 30s · retrying, waiting up to 10m · attempt 1/2",
         )
         .expect("read");
         assert_eq!(
-            r.guard, "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+No.response.from.the.API.after.",
-            "the try's own count moves: the guard stops before it"
+            r.guard,
+            "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+No.response.from.the.API.after.30s.·.retrying,.waiting.up.to.\
+             10m.·.attempt.1/2\\s*$",
+            "a no-response row stands as drawn while its retry waits: the guard holds all of it"
         );
         assert_eq!(wait_secs("1m…"), None, "a cut wait");
         assert_eq!(wait_secs("2d 3h"), Some(2 * 86_400 + 3 * 3600));
+    }
+
+    /// Claude Code 2.1.310's retry rows as the lab measured them (2026-10-24, the real binary on a
+    /// local stub of the API, and for no route on an address the kernel refuses): each lead
+    /// reads as its class with its countdown or the failed try's window, the no-response row with
+    /// the hint the vendor wraps under it, and a no-response row's guard holds its whole text. A
+    /// lead the vendor cut at a narrow width names no class, and reads as none.
+    #[test]
+    fn claude_code_2_1_310s_measured_retry_rows_read_by_class() {
+        use crate::prompt::fixtures::{
+            API_DROPPED_QUEUED_2_1_310, API_NO_RESPONSE_2_1_310, API_NO_RESPONSE_QUEUED_2_1_310,
+            API_NO_RESPONSE_QUEUED_60_2_1_310, API_ROUTE_QUEUED_2_1_310,
+            API_STALLED_QUEUED_2_1_310, API_UNREACHABLE_QUEUED_2_1_310, screen as measured,
+        };
+        for (name, text, cause, next, failed_wait, lead) in [
+            (
+                "no response",
+                API_NO_RESPONSE_2_1_310,
+                RetryCause::NoResponse,
+                None,
+                Some(13),
+                "No response from the API after 13s · retrying once, waiting up to 10m",
+            ),
+            (
+                "no response, queued",
+                API_NO_RESPONSE_QUEUED_2_1_310,
+                RetryCause::NoResponse,
+                None,
+                Some(13),
+                "No response from the API after 13s · retrying once, waiting up to 10m",
+            ),
+            (
+                "unreachable",
+                API_UNREACHABLE_QUEUED_2_1_310,
+                RetryCause::Unreachable,
+                Some(19),
+                None,
+                "Can't reach the API server — check your internet or DNS (ENOTFOUND) · ",
+            ),
+            (
+                "dropped",
+                API_DROPPED_QUEUED_2_1_310,
+                RetryCause::Unreachable,
+                Some(17),
+                None,
+                "Connection dropped (ECONNRESET) · ",
+            ),
+            (
+                "no route",
+                API_ROUTE_QUEUED_2_1_310,
+                RetryCause::Unreachable,
+                Some(9),
+                None,
+                "No internet route — check your connection or VPN (EHOSTUNREACH) · ",
+            ),
+            (
+                "stalled",
+                API_STALLED_QUEUED_2_1_310,
+                RetryCause::Stalled,
+                Some(153),
+                None,
+                "Waiting for API response · will retry in ",
+            ),
+        ] {
+            let rows = measured(text);
+            assert_eq!(worker_phase(&rows), Phase::Busy, "{name}");
+            let r = api_retry_row(&rows).unwrap_or_else(|| panic!("{name}: the retry row"));
+            assert_eq!(
+                (r.cause, r.next_try_s, r.failed_wait_s),
+                (cause, next, failed_wait),
+                "{name}"
+            );
+            assert!(rows[r.row].contains(&r.text), "{name}: {:?}", r.text);
+            assert!(r.text.starts_with(lead), "{name}: {:?}", r.text);
+        }
+        let r = api_retry_row(&measured(API_NO_RESPONSE_QUEUED_2_1_310)).expect("read");
+        assert_eq!(
+            r.guard,
+            "^\\s*[^\\s⏺●⎿❯⏵◯]\\s+No.response.from.the.API.after.13s.·.retrying.once,.waiting.up.\
+             to.10m\\s*$"
+        );
+        let narrow = measured(API_NO_RESPONSE_QUEUED_60_2_1_310);
+        assert_eq!(
+            worker_phase(&narrow),
+            Phase::Busy,
+            "PRECONDITION: a busy read"
+        );
+        assert!(
+            narrow
+                .iter()
+                .any(|row| row.contains("No response from the… · retrying once")),
+            "PRECONDITION: the lead cut"
+        );
+        assert_eq!(api_retry_row(&narrow), None, "a cut lead names no class");
     }
 
     #[test]

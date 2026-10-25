@@ -302,15 +302,14 @@ pub struct PoolId {
 }
 
 impl PoolId {
-    fn parts(&self) -> [[u8; 4]; 2] {
+    const fn parts(&self) -> [[u8; 4]; 2] {
         [self.set.index.to_le_bytes(), self.pool.to_le_bytes()]
     }
 }
 
-fn first_u64(d: &Digest) -> u64 {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&d.0[..8]);
-    u64::from_le_bytes(b)
+const fn first_u64(d: &Digest) -> u64 {
+    let b = d.0;
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
 fn keyed(domain: &[u8], pool: &PoolId, plan: &SchedulePlan) -> u64 {
@@ -394,7 +393,7 @@ pub fn base_digest() -> Digest {
 
 /// The three distinct active features of `plan`, in `0..FEATURES`.
 #[must_use]
-pub fn features(plan: &SchedulePlan) -> [usize; 3] {
+pub const fn features(plan: &SchedulePlan) -> [usize; 3] {
     let s = match plan.split() {
         Split::Shipped => 0,
         Split::SettleAtStep { gap_us: 0 } => 1,
@@ -496,8 +495,10 @@ pub(super) fn draw_with(choose: &mut impl FnMut(u64) -> u64) -> Result<ScheduleP
 
 /// `1 / p`, where `p` is the idealised probability that one draw of `m6-pools v1` yields `plan`, each `below(m)` taken as exactly `1 / m` (its modulo bias is under `3e-14` relative).
 #[must_use]
-pub fn one_in(plan: &SchedulePlan) -> u64 {
-    let width = |(lo, hi): (u32, u32)| u64::from(hi - lo) + 1;
+pub const fn one_in(plan: &SchedulePlan) -> u64 {
+    const fn width((lo, hi): (u32, u32)) -> u64 {
+        (hi - lo) as u64 + 1
+    }
     let split = match plan.split() {
         Split::Shipped => SPLITS,
         Split::SettleAtStep { gap_us: 0 } => SPLITS * GAP_BUCKETS,
@@ -516,14 +517,39 @@ pub fn one_in(plan: &SchedulePlan) -> u64 {
 
 /// Whether one draw yields `plan` with probability above `2^-MASS_CAP_LOG2`.
 #[must_use]
-pub fn high_mass(plan: &SchedulePlan) -> bool {
+pub const fn high_mass(plan: &SchedulePlan) -> bool {
     one_in(plan) < 1 << MASS_CAP_LOG2
 }
 
-fn in_table(plan: &SchedulePlan, table: &[(Split, Wake)]) -> bool {
-    table
-        .iter()
-        .any(|&(split, wake)| plan.split() == split && plan.wake() == wake)
+const fn split_eq(a: Split, b: Split) -> bool {
+    match (a, b) {
+        (Split::Shipped, Split::Shipped) => true,
+        (Split::SettleAtStep { gap_us: a }, Split::SettleAtStep { gap_us: b }) => a == b,
+        _ => false,
+    }
+}
+
+const fn wake_eq(a: Wake, b: Wake) -> bool {
+    match (a, b) {
+        (Wake::NextStep, Wake::NextStep)
+        | (Wake::ColdOnly, Wake::ColdOnly)
+        | (Wake::Cadence, Wake::Cadence)
+        | (Wake::Never, Wake::Never) => true,
+        (Wake::Poll { period_us: a }, Wake::Poll { period_us: b }) => a == b,
+        _ => false,
+    }
+}
+
+const fn in_table(plan: &SchedulePlan, table: &[(Split, Wake)]) -> bool {
+    let mut i = 0;
+    while i < table.len() {
+        let (split, wake) = table[i];
+        if split_eq(plan.split(), split) && wake_eq(plan.wake(), wake) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Why a pool was not drawn.
@@ -616,7 +642,7 @@ fn fill_at(
 
 /// Whether a held-out, report or practice set skips `plan`: a grid plan, a plans-file plan or a high-mass plan.
 #[must_use]
-pub fn skipped(plan: &SchedulePlan) -> bool {
+pub const fn skipped(plan: &SchedulePlan) -> bool {
     in_table(plan, &GRID_V1) || in_table(plan, &PLANS_FILE_V1) || high_mass(plan)
 }
 
@@ -642,19 +668,20 @@ pub(super) fn set_pools_at(
     set: SetId,
 ) -> Result<Vec<Vec<SchedulePlan>>, PoolRefusal> {
     let pools = |set: SetId, also: &dyn Fn(&SchedulePlan) -> bool| {
-        (0..pools_in(set))
-            .map(|p| {
-                let id = PoolId {
-                    set,
-                    pool: u32::try_from(p).unwrap_or(u32::MAX),
-                };
-                fill_at(version, &id, |plan| {
-                    side(plan) == set.tag.side()
-                        && (set.tag == SetTag::Train || !skipped(plan))
-                        && also(plan)
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
+        let count = pools_in(set);
+        let mut out = Vec::with_capacity(count);
+        for p in 0..count {
+            let id = PoolId {
+                set,
+                pool: u32::try_from(p).unwrap_or(u32::MAX),
+            };
+            out.push(fill_at(version, &id, |plan| {
+                side(plan) == set.tag.side()
+                    && (set.tag == SetTag::Train || !skipped(plan))
+                    && also(plan)
+            })?);
+        }
+        Ok(out)
     };
     match set.tag {
         SetTag::PracticeReport => {
@@ -665,7 +692,16 @@ pub(super) fn set_pools_at(
                 },
                 &|_| true,
             )?;
-            pools(set, &|plan| !looks.iter().flatten().any(|p| p == plan))
+            pools(set, &|plan| {
+                for pool in &looks {
+                    for p in pool {
+                        if p == plan {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
         }
         _ => pools(set, &|_| true),
     }
@@ -799,12 +835,18 @@ struct Terms {
 }
 
 #[inline]
-fn wide(n: usize) -> u64 {
-    u64::try_from(n).unwrap_or(u64::MAX)
+const fn wide(n: usize) -> u64 {
+    n as u64
 }
 
 impl Terms {
     fn v1() -> Terms {
+        let mut plans_file = Vec::with_capacity(PLANS_FILE_V1.len());
+        for &(split, wake) in &PLANS_FILE_V1 {
+            if let Ok(plan) = SchedulePlan::new(split, wake) {
+                plans_file.push(plan);
+            }
+        }
         Terms {
             acceptance: M4_POLICY_V1_DIGEST,
             features: FEATURES,
@@ -835,10 +877,7 @@ impl Terms {
             ],
             deadline_s: CHILD_DEADLINE_S,
             footprint: MAX_FOOTPRINT,
-            plans_file: PLANS_FILE_V1
-                .iter()
-                .filter_map(|&(split, wake)| SchedulePlan::new(split, wake).ok())
-                .collect(),
+            plans_file,
             base: base_digest(),
             rules: [
                 FEATURES_RULE,

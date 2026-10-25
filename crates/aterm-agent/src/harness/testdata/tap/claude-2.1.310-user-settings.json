@@ -1,0 +1,6 @@
+{
+  "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"},
+  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/bin/sh /Users//example/.orca/agent-hooks/claude-hook.sh"}]}]},
+  "statusLine": {"type": "command", "command": "if [ -f '/Users//example/.orca/agent-hooks/claude-statusline.sh' ] && [ -r '/Users//example/.orca/agent-hooks/claude-statusline.sh' ] && [ -x '/Users//example/.orca/agent-hooks/claude-statusline.sh' ]; then /bin/sh '/Users//example/.orca/agent-hooks/claude-statusline.sh'; else { command -p cat 2>/dev/null || cat; } >/dev/null 2>&1 || :; fi"},
+  "theme": "dark"
+}

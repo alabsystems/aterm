@@ -4,9 +4,10 @@
 //! ADMISSION: a [`Waiter`] enters the ledger, and each [`Waiter::poll`] reads the machine and
 //! the claims ahead of it and either admits it (a [`Claim`]) or names what it is short of
 //! ([`Shortfall`]). [`admit_with`] polls until it is admitted, saying once a minute what it
-//! waits for; it never gives up, because the need fits once the holders end, though its caller
-//! can stop it ([`admit_until`]). A need that can never fit ([`never`]) is refused before it
-//! enters.
+//! waits for; it never gives up, because the need fits once the holders end. SIGINT, SIGTERM or
+//! SIGHUP ends the wait within a nap ([`aterm_toolchain::interrupt`]), as its caller can
+//! ([`admit_until`]): the claim leaves the queue and [`Error::Stopped`] names what it was short
+//! of. A need that can never fit ([`never`]) is refused before it enters.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -593,7 +594,9 @@ pub enum Polled {
     Waiting(Waiter, Shortfall),
 }
 
-/// A claim in the queue, not yet admitted. It leaves the ledger when dropped.
+/// A claim in the queue, not yet admitted. It leaves the ledger when dropped. Until it is
+/// admitted its wait is marked where a ceiling over this process's tree reads it
+/// ([`aterm_toolchain::waits`]), saying at each look what it is short of and who holds that.
 #[derive(Debug)]
 pub struct Waiter {
     ledger: Ledger,
@@ -602,6 +605,7 @@ pub struct Waiter {
     /// The path whose volume the reading is taken for.
     at: Option<PathBuf>,
     since: Instant,
+    mark: Option<aterm_toolchain::waits::Mark>,
 }
 
 impl Waiter {
@@ -614,6 +618,7 @@ impl Waiter {
         need.path = (need.disk > 0)
             .then(|| machine.read(at.as_deref()).volume.map(|v| v.mount))
             .flatten();
+        let mark = aterm_toolchain::waits::Mark::begin(&format!("capacity: {} waits", need.what));
         let (record, laid) = ledger.lay(&need, now_ms())?;
         Ok(Waiter {
             ledger: ledger.clone(),
@@ -621,6 +626,7 @@ impl Waiter {
             laid,
             at,
             since: Instant::now(),
+            mark,
         })
     }
 
@@ -646,7 +652,14 @@ impl Waiter {
         };
         let polled = match found {
             Ok(cores) => self.grant(cores),
-            Err(short) => Polled::Waiting(self, short),
+            Err(short) => {
+                let mut waiter = self;
+                let line = waiter.line(&short);
+                if let Some(mark) = &mut waiter.mark {
+                    mark.say(&line);
+                }
+                Polled::Waiting(waiter, short)
+            }
         };
         drop(turn);
         polled
@@ -703,6 +716,7 @@ impl Waiter {
             mut laid,
             at,
             since,
+            mark,
         } = self;
         let held = Held {
             admitted_ms: now_ms(),
@@ -722,6 +736,7 @@ impl Waiter {
                     laid,
                     at,
                     since,
+                    mark,
                 },
                 Shortfall::only(Short::Ledger(e.to_string())),
             ),
@@ -767,9 +782,14 @@ pub enum Error {
     Never(String),
     /// The ledger could not be used.
     Ledger(io::Error),
-    /// The caller stopped the wait ([`admit_until`]), short at its last look of what this names
-    /// (`None`: it never looked). The claim has left the queue.
-    Stopped(Option<Shortfall>),
+    /// An interrupt, or the caller ([`admit_until`]), ended the wait. The claim has left the
+    /// queue.
+    Stopped {
+        /// The interrupt ([`aterm_toolchain::interrupt`]); `None` when the caller stopped it.
+        signal: Option<i32>,
+        /// What it was short of at its last look; `None` when it never looked.
+        short: Option<Shortfall>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -777,8 +797,20 @@ impl fmt::Display for Error {
         match self {
             Error::Never(why) => write!(f, "{why}; it can never be admitted here"),
             Error::Ledger(e) => write!(f, "the capacity ledger could not be used: {e}"),
-            Error::Stopped(Some(short)) => write!(f, "stopped while it waited: {short}"),
-            Error::Stopped(None) => f.write_str("stopped before it was admitted"),
+            Error::Stopped { signal, short } => {
+                match signal {
+                    Some(sig) => write!(
+                        f,
+                        "interrupted ({}) while it waited",
+                        aterm_toolchain::interrupt::name(*sig)
+                    )?,
+                    None => f.write_str("stopped while it waited")?,
+                }
+                match short {
+                    Some(short) => write!(f, ": {short}"),
+                    None => f.write_str(", before its first look"),
+                }
+            }
         }
     }
 }
@@ -817,24 +849,31 @@ pub fn admit(need: Need, mode: Admit) -> Result<Claim, Error> {
 
 /// What a waiter can do about a shortfall besides wait: free what it can before it says it waits
 /// ([`Self::relieve`]), and name what holds the rest beyond the claims a wait line names
-/// ([`Self::holders`]). [`admit_relieved`] calls it; [`admit_with`] has none.
+/// ([`Self::holders`]). [`admit_relieved`] calls it; [`admit_with`] has none. Each is part of the
+/// wait, so each gives up what is left of its work once `stopped` says an interrupt came.
 pub trait Relief {
     /// Called once, at the first look that finds the need short of something a claim can hold,
     /// before any wait line: free what can be freed toward it, saying through `say` what was
     /// done. The next look follows at once, so a need the relief met is admitted with no wait.
-    fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str));
+    fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: &dyn Fn() -> bool);
 
     /// Words a wait line ends with: what holds the rest (the largest users of a short volume).
-    fn holders(&mut self, short: &Shortfall) -> Option<String>;
+    fn holders(&mut self, short: &Shortfall, stopped: &dyn Fn() -> bool) -> Option<String>;
 }
 
 /// [`admit_with`]'s relief: none.
 struct NoRelief;
 
 impl Relief for NoRelief {
-    fn relieve(&mut self, _short: &Shortfall, _say: &mut dyn FnMut(&str)) {}
+    fn relieve(
+        &mut self,
+        _short: &Shortfall,
+        _say: &mut dyn FnMut(&str),
+        _stopped: &dyn Fn() -> bool,
+    ) {
+    }
 
-    fn holders(&mut self, _short: &Shortfall) -> Option<String> {
+    fn holders(&mut self, _short: &Shortfall, _stopped: &dyn Fn() -> bool) -> Option<String> {
         None
     }
 }
@@ -880,9 +919,9 @@ pub fn admit_relieved(
     admit_waiting(ledger, machine, need, mode, pace, relief, say, &|| false)
 }
 
-/// [`admit_with`], its wait ended by `stopped` (an interrupt its caller caught), which it asks
-/// before each look: the claim then leaves the queue, and [`Error::Stopped`] names what it was
-/// short of.
+/// [`admit_with`], its wait ended by `stopped` too (an interrupt its caller caught before the
+/// wait began), which it asks before each look and through each nap: the claim then leaves the
+/// queue, and [`Error::Stopped`] names what it was short of.
 ///
 /// # Errors
 /// As [`admit`], and [`Error::Stopped`].
@@ -908,7 +947,9 @@ pub fn admit_until(
 }
 
 /// The one admission [`admit_with`], [`admit_relieved`] and [`admit_until`] run: `relief` asked
-/// at the first look that waits, and `stopped` before each look.
+/// at the first look that waits, and an interrupt or `stopped` looked for through every nap
+/// ([`aterm_toolchain::interrupt::Watch`]): the wait ends within [`aterm_toolchain::interrupt::NAP`]
+/// of one, and one that came during the look that admitted it ends it all the same.
 #[expect(
     clippy::too_many_arguments,
     reason = "admission's six, the relief that frees room and the interrupt that ends its wait"
@@ -923,6 +964,21 @@ fn admit_waiting(
     say: &mut dyn FnMut(&str),
     stopped: &dyn Fn() -> bool,
 ) -> Result<Claim, Error> {
+    let watch = (mode == Admit::Wait).then(aterm_toolchain::interrupt::Watch::enter);
+    let ended = || match watch
+        .as_ref()
+        .and_then(aterm_toolchain::interrupt::Watch::take)
+    {
+        Some(sig) => Some(Some(sig)),
+        None => stopped().then_some(None),
+    };
+    let interrupted = || watch.as_ref().is_some_and(|w| w.caught().is_some()) || stopped();
+    let nap = |d: Duration| match &watch {
+        Some(w) => {
+            w.nap(d, stopped);
+        }
+        None => std::thread::sleep(d),
+    };
     let at = need.path.clone().or_else(|| std::env::current_dir().ok());
     let reading = machine.read(at.as_deref());
     let refused = never(&need, &reading);
@@ -955,12 +1011,22 @@ fn admit_waiting(
     let mut last: Option<Shortfall> = None;
     let mut relieved = false;
     loop {
-        if stopped() {
+        if let Some(signal) = ended() {
             drop(waiter);
-            return Err(Error::Stopped(last));
+            return Err(Error::Stopped {
+                signal,
+                short: last,
+            });
         }
         match waiter.poll(machine) {
             Polled::Admitted(claim) => {
+                if let Some(signal) = ended() {
+                    drop(claim);
+                    return Err(Error::Stopped {
+                        signal,
+                        short: last,
+                    });
+                }
                 if said.is_some() {
                     say(&format!(
                         "capacity: {what} admitted after {}",
@@ -985,13 +1051,13 @@ fn admit_waiting(
                 if last.is_none() {
                     last = Some(short);
                 }
-                std::thread::sleep(pace.poll.min(TURN_GAP));
+                nap(pace.poll.min(TURN_GAP));
             }
             Polled::Waiting(w, short)
                 if !relieved && short.shorts.iter().any(Short::held_by_claims) =>
             {
                 relieved = true;
-                relief.relieve(&short, say);
+                relief.relieve(&short, say, &interrupted);
                 waiter = w;
                 last = Some(short);
             }
@@ -999,7 +1065,7 @@ fn admit_waiting(
                 turn_since = None;
                 if said.is_none_or(|t| t.elapsed() >= pace.line_every) {
                     let line = w.line(&short);
-                    match relief.holders(&short) {
+                    match relief.holders(&short, &interrupted) {
                         Some(more) => say(&format!("{line}; {more}")),
                         None => say(&line),
                     }
@@ -1007,7 +1073,7 @@ fn admit_waiting(
                 }
                 waiter = w;
                 last = Some(short);
-                std::thread::sleep(pace.poll);
+                nap(pace.poll);
             }
         }
     }

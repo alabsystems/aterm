@@ -28,6 +28,11 @@ pub const DOWN_CADENCE: [Duration; 3] = [
 ];
 /// The pause after an Up or an Unknown.
 pub const STEADY_CADENCE: Duration = Duration::from_secs(60);
+/// The pause after a measure that ended a gap and did not say Up: the first measure with no fresh
+/// one before it, at a loop's first ask or once a sleep made the last one stale. A network coming
+/// back from a wake reassociates within seconds of it, so one more probe follows soon, and the
+/// [`DOWN_CADENCE`] ladder starts after that one.
+pub const GAP_CADENCE: Duration = Duration::from_secs(3);
 /// A wall clock that steps back this little (a time sync) is not a sleep.
 const CLOCK_SLACK: Duration = Duration::from_secs(5);
 
@@ -241,6 +246,8 @@ struct Measure {
     at_wall: SystemTime,
     /// When its run began: the first of the measures in a row that say it.
     since: Instant,
+    /// No fresh measure stood before it ([`GAP_CADENCE`]).
+    after_gap: bool,
 }
 
 /// The one instance's measure and its schedule ([`Self::next_probe`]), shared by every session
@@ -324,7 +331,7 @@ impl NetState {
         self.waiters.len()
     }
 
-    /// Next probe deadline ([`DOWN_CADENCE`], [`STEADY_CADENCE`]).
+    /// Next probe deadline ([`GAP_CADENCE`], [`DOWN_CADENCE`], [`STEADY_CADENCE`]).
     pub fn next_probe(&mut self, now: Instant, wall: SystemTime) -> Option<Instant> {
         if self.waiting(now) == 0 || self.flight.is_some() {
             return None;
@@ -333,6 +340,7 @@ impl NetState {
             return Some(now);
         };
         let pause = match m.outcome {
+            Outcome::Down | Outcome::Unknown if m.after_gap => GAP_CADENCE,
             Outcome::Down => {
                 let n = usize::try_from(self.downs.max(1) - 1).unwrap_or(usize::MAX);
                 DOWN_CADENCE[n.min(DOWN_CADENCE.len() - 1)]
@@ -358,11 +366,14 @@ impl NetState {
             .take()
             .is_some_and(|began| now.saturating_duration_since(began) > self.budget);
         let outcome = if overran { Outcome::Unknown } else { outcome };
-        let since = match self.fresh(now, wall) {
-            Some(prev) if prev.outcome == outcome => prev.since,
+        let prev = self.fresh(now, wall).map(|m| (m.outcome, m.since));
+        let since = match prev {
+            Some((was, since)) if was == outcome => since,
             _ => now,
         };
-        self.downs = if outcome == Outcome::Down {
+        let after_gap = prev.is_none();
+        // A Down that ended a gap is followed by GAP_CADENCE and is not a rung of the ladder.
+        self.downs = if outcome == Outcome::Down && !after_gap {
             self.downs.saturating_add(1)
         } else {
             0
@@ -372,6 +383,7 @@ impl NetState {
             at: now,
             at_wall: wall,
             since,
+            after_gap,
         });
     }
 }
@@ -428,9 +440,11 @@ mod tests {
     }
 
     /// The schedule: parked while nobody waits, a probe at once for the first
-    /// waiter, then the Down and steady cadences, one in flight at a time.
+    /// waiter, then the gap's one quick probe, the Down and steady cadences, one in
+    /// flight at a time.
     #[test]
-    fn the_schedule_probes_at_once_then_15_30_60_while_someone_waits_and_parks_when_nobody_does() {
+    fn the_schedule_probes_at_once_then_3_15_30_60_while_someone_waits_and_parks_when_nobody_does()
+    {
         let (t, w) = t0();
         let mut st = NetState::default();
         assert_eq!(st.next_probe(t, w), None, "nobody waits: parked");
@@ -441,7 +455,7 @@ mod tests {
         assert_eq!(st.next_probe(t, w), None, "none while one flies");
         st.finish(Outcome::Down, t, w);
         let mut at = t;
-        for pause in [15, 30, 60, 60] {
+        for pause in [3, 15, 30, 60, 60] {
             let due = st.next_probe(at, w).expect("a waiter");
             assert_eq!(due, at + pause * S, "after a Down: {pause} s");
             at = due;
@@ -454,6 +468,78 @@ mod tests {
         assert_eq!(st.waiting(at + 61 * S), 0);
         st.ask("s-1", at + 50 * S, w);
         assert!(st.next_probe(at + 61 * S, w).is_some());
+    }
+
+    /// A measure that ended a gap and did not say Up is followed by one probe in
+    /// [`GAP_CADENCE`], whether the gap was the first ask or a sleep that made the last
+    /// measure stale; the Down ladder starts after it, and a Down after a fresh measure
+    /// climbs the ladder as before.
+    #[test]
+    fn a_failed_measure_after_a_gap_is_probed_again_within_seconds() {
+        let (t, w) = t0();
+        let mut st = NetState::default();
+        st.ask("s-1", t, w);
+        measured(&mut st, Outcome::Up, t, w);
+        assert_eq!(
+            st.next_probe(t, w),
+            Some(t + 60 * S),
+            "the gap's Up: steady"
+        );
+        let at = t + 60 * S;
+        st.ask("s-1", at, w + 60 * S);
+        measured(&mut st, Outcome::Down, at, w + 60 * S);
+        assert_eq!(
+            st.next_probe(at, w + 60 * S),
+            Some(at + 15 * S),
+            "a Down after a fresh Up: the ladder's first rung"
+        );
+        // The Mac sleeps an hour: the wall clock moves, the monotonic one does not.
+        let (woke, woke_wall) = (at + S, w + 3660 * S);
+        st.ask("s-1", woke, woke_wall);
+        assert_eq!(
+            st.reach(woke, woke_wall),
+            Reach::Unknown,
+            "PRECONDITION: stale"
+        );
+        assert_eq!(
+            st.next_probe(woke, woke_wall),
+            Some(woke),
+            "at once after the sleep"
+        );
+        measured(&mut st, Outcome::Down, woke, woke_wall);
+        assert_eq!(
+            st.next_probe(woke, woke_wall),
+            Some(woke + 3 * S),
+            "the Down that ended the gap: once more within seconds"
+        );
+        let again = woke + 3 * S;
+        st.ask("s-1", again, woke_wall + 3 * S);
+        measured(&mut st, Outcome::Down, again, woke_wall + 3 * S);
+        assert_eq!(
+            st.next_probe(again, woke_wall + 3 * S),
+            Some(again + 15 * S),
+            "then the ladder from its first rung"
+        );
+        assert_eq!(
+            st.reach(again, woke_wall + 3 * S),
+            Reach::Down { since: woke },
+            "one run of Downs since the gap"
+        );
+        let mut first = NetState::default();
+        first.ask("s-1", t, w);
+        assert!(first.begin(t));
+        first.finish(Outcome::Unknown, t, w);
+        assert_eq!(
+            first.next_probe(t, w),
+            Some(t + 3 * S),
+            "an Unknown that ended the gap too"
+        );
+        measured(&mut first, Outcome::Unknown, t + 3 * S, w + 3 * S);
+        assert_eq!(
+            first.next_probe(t + 3 * S, w + 3 * S),
+            Some(t + 63 * S),
+            "then the steady cadence"
+        );
     }
 
     /// A measure older than [`FRESH`] on either clock says nothing (the

@@ -87,6 +87,14 @@ impl SetupStartup for Startup<'_> {
             .expect("a confirmed run needs no new offer")
     }
 
+    fn cancel(&mut self) -> Result<bool, String> {
+        self.setup.cancel()
+    }
+
+    fn closed(&mut self) {
+        note_review_closed(Some(self.setup.plan()));
+    }
+
     fn authorize(&mut self, plan: &Plan) -> Result<Option<u64>, String> {
         self.saves += 1;
         assert_eq!(plan, &self.setup.plan());
@@ -127,6 +135,10 @@ impl AlabWatch for LateSignal<'_> {
     }
 
     fn wait(&mut self, _: Duration, _: Duration) {}
+
+    fn review(&mut self) -> Result<WidenReview, String> {
+        Ok(WidenReview::Applied)
+    }
 
     fn look(&mut self) -> Result<Option<u64>, String> {
         self.looks.set(self.looks.get() + 1);
@@ -198,11 +210,14 @@ fn startup_cancel_watch_a_cancelled_staged_offer_cannot_run_on_a_late_signal() {
     let prepared = prepare_setup(&mut host).unwrap();
     assert!(matches!(prepared, PreparedSetup::Cancelled));
     assert_eq!((host.offers, host.saves), (1, 0));
+    let cancelled = records(root.path());
+    let [plan_record, progress_record, decision, revision_record] = &cancelled;
     assert_eq!(
-        records(root.path()),
-        before,
-        "Cancel writes no setup record"
+        [plan_record, progress_record, revision_record],
+        [&before[0], &before[1], &before[3]],
+        "Cancel writes its decision alone"
     );
+    assert_ne!(decision, &before[2], "the Cancel is recorded for good");
     let looks = Cell::new(0);
     run_prepared_startup_with(prepared, None, std::mem::take(&mut host.sent), |how| {
         maintain(root.path(), &looks, how);
@@ -212,7 +227,11 @@ fn startup_cancel_watch_a_cancelled_staged_offer_cannot_run_on_a_late_signal() {
         "a late ALab signal must not dispatch the setup whose review was cancelled"
     );
     assert_eq!(looks.get(), 0);
-    assert_eq!(records(root.path()), before);
+    assert_eq!(records(root.path()), cancelled);
+    assert!(
+        !ProvisionalSetupWatchTest::at(root.path()).widens().unwrap(),
+        "nothing widens a cancelled setup"
+    );
 
     // A later explicit choice is a new authority, not this cancelled offer.
     let chosen = InitialSetupAdmissionStopTest::restart(root.path()).unwrap();
@@ -231,6 +250,139 @@ fn startup_cancel_watch_a_cancelled_staged_offer_cannot_run_on_a_late_signal() {
     assert_eq!(chosen.snapshot().unwrap().plan, plan);
     assert_eq!(looks.get(), 0, "a person's chosen plan is never widened");
     clear_setup_run(revision);
+}
+
+/// The person presses Cancel on the first-launch review and asks for nothing since. The next
+/// launch offers no review and admits nothing: aterm's permission steps stay held, and every
+/// group reads Leave as is (design §3.3).
+#[test]
+fn startup_cancel_watch_a_cancelled_review_is_not_offered_again_at_the_next_launch() {
+    let _globals = globals();
+    let _io = TestIo::install();
+    let root = aterm_tempfile::tempdir().unwrap();
+    *CLAIM_ROOT.lock().unwrap() = Some(root.path().to_owned());
+    let mut first = Startup::new(root.path(), Some(WorkstationSetupDecision::Cancelled));
+    assert!(matches!(
+        prepare_setup(&mut first).unwrap(),
+        PreparedSetup::Cancelled
+    ));
+    assert_eq!((first.offers, first.saves), (1, 0));
+    drop(first);
+    // The next launch: an offer would panic, since nobody scripted an answer for it.
+    let mut next = Startup::new(root.path(), None);
+    let prepared = prepare_setup(&mut next).unwrap();
+    let finished = matches!(prepared, PreparedSetup::Finished);
+    drop(prepared);
+    let snapshot = next.setup.snapshot().unwrap();
+    assert_eq!(
+        (next.offers, finished, snapshot.permissions_allowed),
+        (0, true, false),
+        "the person's Cancel holds past its launch: no review, no admission"
+    );
+    assert!(snapshot.cancelled && snapshot.plan.selection.is_empty());
+}
+
+#[test]
+fn startup_closed_projection_a_staged_review_stays_unanswered_until_a_later_admission() {
+    let _globals = globals();
+    let _io = TestIo::install();
+    let root = aterm_tempfile::tempdir().unwrap();
+    *CLAIM_ROOT.lock().unwrap() = Some(root.path().to_owned());
+    let plan = staged(root.path());
+    let before = records(root.path());
+    let mut host = Startup::new(root.path(), Some(WorkstationSetupDecision::Closed));
+    let prepared = prepare_setup(&mut host).unwrap();
+    assert!(matches!(prepared, PreparedSetup::Closed));
+    drop(prepared);
+    assert_eq!((host.offers, host.saves), (1, 0));
+    assert_eq!(closed_review(), Some(plan.clone()));
+    assert_eq!(
+        records(root.path()),
+        before,
+        "closing publishes no decision or admission"
+    );
+    assert!(
+        StartupClaim::claim().unwrap().is_some(),
+        "the closed review gave its claim back"
+    );
+    let snapshot = host.setup.snapshot().unwrap();
+    let staged_revision = snapshot.revision;
+    assert!(staged_revision > 0);
+    assert!(!snapshot.run_allowed && !snapshot.finished && !snapshot.cancelled);
+    let status = setup_status_after_review(
+        Ok(snapshot),
+        false,
+        &InitialSetupRows::default(),
+        closed_review().as_ref(),
+    );
+    assert!(
+        status.unanswered,
+        "staged progress is no approval of the closed review's permission steps"
+    );
+    assert_eq!(status.plan, Some(plan.clone()));
+    assert!(!status.permissions.unwrap().allowed);
+    assert!(script().runs.is_empty());
+
+    let revision = host.setup.choose().unwrap();
+    assert!(revision > staged_revision);
+    let admitted = host.setup.snapshot().unwrap();
+    assert!(admitted.run_allowed && admitted.permissions_allowed && !admitted.finished);
+    let status = setup_status_after_review(
+        Ok(admitted),
+        false,
+        &InitialSetupRows::default(),
+        closed_review().as_ref(),
+    );
+    assert!(
+        !status.unanswered,
+        "a real later admission supersedes the unanswered review"
+    );
+    assert_eq!(status.plan, Some(plan));
+    assert_eq!(status.run.unwrap().revision, revision);
+    assert!(status.permissions.unwrap().allowed);
+    assert!(
+        script().runs.is_empty(),
+        "only the inert admission writer ran"
+    );
+}
+
+/// After a Cancel, Set up now applies the plan the review showed, and a group press sets up that
+/// group alone (design §3.3).
+#[test]
+fn startup_cancel_watch_set_up_now_after_a_cancel_applies_the_plan_the_review_showed() {
+    let _globals = globals();
+    let _io = TestIo::install();
+    for group in [None, Some(aterm_types::macos_setup::Setting::CapsLock)] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        *CLAIM_ROOT.lock().unwrap() = Some(root.path().to_owned());
+        let mut first = Startup::new(root.path(), Some(WorkstationSetupDecision::Cancelled));
+        assert!(matches!(
+            prepare_setup(&mut first).unwrap(),
+            PreparedSetup::Cancelled
+        ));
+        let reviewed = first.setup.plan();
+        let admitted = match group {
+            None => first.setup.set_up_now(),
+            Some(setting) => first.setup.choose_group(&[setting]),
+        };
+        assert!(admitted.unwrap().is_some(), "{group:?}: admitted");
+        let saved = first.setup.saved_plan().unwrap().unwrap();
+        match group {
+            None => assert_eq!(saved, reviewed, "Set up now: the plan the review showed"),
+            Some(setting) => {
+                let mut alone = Selection::none();
+                alone.set(setting, true);
+                assert_eq!(saved.selection, alone, "a group press: that group alone");
+            }
+        }
+        let snapshot = first.setup.snapshot().unwrap();
+        assert!(!snapshot.cancelled, "{group:?}: the Cancel gave way");
+        assert_eq!(
+            snapshot.permissions_allowed,
+            group.is_none(),
+            "{group:?}: aterm's permission steps run only where the plan asks for them"
+        );
+    }
 }
 
 #[test]

@@ -24,8 +24,8 @@ mod scope;
 #[cfg(any(test, debug_assertions))]
 pub use scope::ProvisionalSetupWatchTest;
 pub use scope::{
-    InitialSetupUpgrade, SetupUpgrade, alab_mac, provisional_setup_widens,
-    put_back_held_initial_setup, upgrade_provisional_setup,
+    InitialSetupUpgrade, SetupUpgrade, alab_mac, decline_provisional_setup_widen,
+    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
 };
 mod secrets_retry;
 use secrets_retry::Pace;
@@ -1495,16 +1495,12 @@ impl InitialSetupRestart {
             }
             // The plan in force as every reader presents it: a Restore cut short before its
             // plan landed is the plan its record names ([`Records::restore_presentation`]).
-            let in_force = observation_at(root)
+            let records = observation_at(root)
                 .map_err(|error| error.to_string())?
-                .records
-                .presented_plan_record();
-            let chosen = onto_plan_in_force(
-                in_force.as_ref().map(|(in_force, _)| in_force),
-                plan,
-                self.changed,
-                vault_typed,
-            );
+                .records;
+            let in_force = cancelled_in_force(&records, self.changed)
+                .or_else(|| records.presented_plan_record().map(|(plan, _)| plan));
+            let chosen = onto_plan_in_force(in_force.as_ref(), plan, self.changed, vault_typed);
             // A vault configuration aterm cannot read (a root-owned or newer-format
             // `source.toml`) never refuses a group choice: it reads as no vault, as the startup's
             // offer reads it ([`InitialSetupAuthorization::offer_reading`]). The admission then
@@ -1625,6 +1621,25 @@ impl InitialSetupRestart {
 /// each setting `changed` names as `plan` has it, every other as the plan in force has it, and
 /// the in-force vault unless Join explicitly typed another ([`InitialSetupRestart::changing`]).
 /// With no plan in force, or no `changed`, `plan` as it is.
+/// While a person's Cancel of the first-launch review stands ([`Records::cancelled`]), the plan a
+/// press is taken onto: the plan the review showed for Set up now (no group `changed`), which
+/// is how a person who cancelled sets up after all (design §3.3); every group at Leave as is for
+/// a group choice or a Join, so it sets up the groups pressed and nothing else, saved plan or
+/// none. `None` with no such Cancel.
+fn cancelled_in_force(records: &Records, changed: Option<Selection>) -> Option<Plan> {
+    let reviewed = records.cancelled.as_ref()?;
+    if changed.is_some_and(|changed| changed.is_empty()) {
+        return Some(reviewed.clone());
+    }
+    Some(Plan {
+        selection: Selection::none(),
+        vault_url: records.plan.as_ref().map_or_else(
+            || reviewed.vault_url.clone(),
+            |(plan, _)| plan.vault_url.clone(),
+        ),
+    })
+}
+
 fn onto_plan_in_force(
     in_force: Option<&Plan>,
     plan: &Plan,
@@ -2041,11 +2056,11 @@ pub(super) fn save_restore(root: &Path) -> Result<(), String> {
 }
 
 /// Whether the Restore's decision in force holds aterm's own permissions ([`Restored::held`]),
-/// which a Restore pressed again keeps.
+/// which a Restore pressed again keeps, as it keeps a person's Cancel of the first-launch review
+/// ([`Records::cancelled`]): a Restore after it never brings the review back.
 fn held_restore(root: &Path) -> Result<bool, String> {
-    Ok(decision_record(root)?
-        .1
-        .is_some_and(|restored| restored.held))
+    let (_, restored, cancelled) = decision_record_reviewed(root)?;
+    Ok(restored.is_some_and(|restored| restored.held) || cancelled.is_some())
 }
 
 /// Before a Restore's first write, under profile.lock: an older aterm's verified setup keeps no
@@ -3057,6 +3072,9 @@ pub struct InitialSetupSnapshot {
     pub finished: bool,
     pub rows: Vec<Row>,
     pub revision: u64,
+    /// This exact saved plan has matching admitted progress and has not been stopped.
+    /// Independent of the carried Permissions approval and whether Permissions is selected.
+    pub run_allowed: bool,
     /// The revision whose admission of the Permissions group this run continues:
     /// the window's access lanes key their once-per-approval steps on it, so a
     /// change to another group hands nothing to macOS again (design §6).
@@ -3066,6 +3084,10 @@ pub struct InitialSetupSnapshot {
     /// the ALab signal widens: System State then sends every group press, even one that
     /// leaves the plan as it is, so the plan becomes the person's and is never widened.
     pub provisional: bool,
+    /// A person's Cancel of the first-launch review stands ([`save_cancelled_decision`]): every
+    /// group reads Leave as is and nothing runs, and System State says so in one calm line
+    /// beside Set up now, which applies the plan the review showed (design §3.3).
+    pub cancelled: bool,
     /// The plan in force is the one aterm set up afresh after it set aside a saved setup it
     /// could not read ([`set_aside_unreadable_setup`]), and no person has chosen since: System
     /// State says so in one calm note (design §3.5).
@@ -3278,17 +3300,30 @@ pub fn setup_records_held() -> bool {
 }
 
 pub fn initial_setup_snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
+    initial_setup_snapshot_offering(None)
+}
+
+/// [`initial_setup_snapshot`], presenting `offered`, the plan this launch's review showed
+/// before a person closed it unanswered, while no plan is saved: System State then shows the
+/// plan the review showed, never the whole profile (design §3.3).
+pub fn initial_setup_snapshot_offering(
+    offered: Option<&Plan>,
+) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let root = state_root().map_err(InitialSetupSnapshotError::read)?;
-    snapshot_in_vault(&root, live_configured_vault())
+    snapshot_in_vault(&root, live_configured_vault(), offered)
 }
 
 fn snapshot_in_vault(
     root: &Path,
     configured: Result<Option<ConfiguredVault>, String>,
+    offered: Option<&Plan>,
 ) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let saved =
         saved_plan_record(root).map_err(|why| InitialSetupSnapshotError::read_at(root, why))?;
-    let fallback = offered_plan(saved, configured.clone());
+    let fallback = match (saved, offered) {
+        (None, Some(offered)) => offered_plan(Some((offered.clone(), true)), configured.clone()),
+        (saved, _) => offered_plan(saved, configured.clone()),
+    };
     let mut snapshot = snapshot_at(root, fallback)?;
     if let Ok(Some(vault)) = configured {
         snapshot.plan = shown_in_vault(snapshot.plan, &snapshot.observation.records, &vault);
@@ -3452,21 +3487,37 @@ fn record_pending_with(
 /// restored ([`Restored`]): a Restore, or a choice since that has not had a pass set
 /// them all again.
 fn decision_record(root: &Path) -> Result<(Decision, Option<Restored>), String> {
+    decision_record_reviewed(root).map(|(decision, restored, _)| (decision, restored))
+}
+
+/// [`decision_record`], with the plan the first-launch review showed when a person's Cancel of
+/// it is the decision ([`Records::cancelled`]).
+fn decision_record_reviewed(root: &Path) -> Result<DecisionRecord, String> {
     let path = root.join("first-run.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Decision::Missing, None));
+            return Ok((Decision::Missing, None, None));
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let decision = parse_decision(&bytes)?;
+    let decision = parse_decision_reviewed(&bytes)?;
     flush_record_with(&path, durable_name)?;
     Ok(decision)
 }
 
+/// The first-run decision, what of a Restore it keeps, and the plan a cancelled review showed.
+type DecisionRecord = (Decision, Option<Restored>, Option<Plan>);
+
 /// The first-run decision in `bytes`, as [`decision_record`] reads it from its file.
 fn parse_decision(bytes: &[u8]) -> Result<(Decision, Option<Restored>), String> {
+    parse_decision_reviewed(bytes).map(|(decision, restored, _)| (decision, restored))
+}
+
+/// [`parse_decision`], with the plan a cancelled review showed ([`decision_record_reviewed`]).
+/// A Cancel an older aterm saved names none: it keeps its older meaning, the saved plan as it
+/// stands with aterm's own permissions held.
+fn parse_decision_reviewed(bytes: &[u8]) -> Result<DecisionRecord, String> {
     let value: Value = aterm_json::from_slice(bytes).map_err(|_| "invalid first-run decision")?;
     if value["profile"].as_str() != Some(PROFILE) {
         return Err("unrecognized first-run profile".into());
@@ -3490,7 +3541,31 @@ fn parse_decision(bytes: &[u8]) -> Result<(Decision, Option<Restored>), String> 
         }
         _ => None,
     };
-    Ok((decision, restored))
+    let reviewed = match (decision, value.get("reviewed")) {
+        (Decision::Stopped(Stop::Cancelled), Some(reviewed)) => {
+            Some(parse_plan_record(reviewed)?.0)
+        }
+        _ => None,
+    };
+    Ok((decision, restored, reviewed))
+}
+
+/// A person's Cancel of the first-launch review (System State design §3.3): the first-run
+/// decision, cancelled, naming the plan the review showed (`reviewed`). One write, so the
+/// records are whole whenever a process ends. While it stands every group reads Leave as is,
+/// aterm's own permissions with them, nothing runs and no launch offers the review again; Set
+/// up now applies the plan it names, and a group choice, a Join or `aterm doctor --apply`
+/// replaces it ([`Records::cancelled`]).
+pub(super) fn save_cancelled_decision(root: &Path, reviewed: &Plan) -> Result<(), String> {
+    validate_plan(reviewed)?;
+    write_json(
+        &root.join("first-run.json"),
+        &stamped(json!({
+            "profile": PROFILE,
+            "state": "cancelled",
+            "reviewed": plan_record(reviewed, false),
+        })),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3505,11 +3580,15 @@ struct Records {
     provisional: bool,
     /// A person's Stop no pass has folded in yet ([`request_stop_at`]).
     stop_request: Option<StopRequest>,
+    /// The plan the first-launch review showed, when a person's Cancel of it is the decision
+    /// ([`save_cancelled_decision`]): every reader presents every group at Leave as is while it
+    /// stands ([`Self::present`]), and Set up now applies this plan.
+    cancelled: Option<Plan>,
 }
 
 impl Records {
     fn read(root: &Path) -> Result<Self, String> {
-        let (decision, restored) = decision_record(root)?;
+        let (decision, restored, cancelled) = decision_record_reviewed(root)?;
         Ok(Self {
             plan: saved_plan_record(root)?,
             progress: progress(root)?,
@@ -3517,6 +3596,7 @@ impl Records {
             restored,
             provisional: saved_plan_provisional(root)?,
             stop_request: stop_request_at(root),
+            cancelled,
         })
     }
 
@@ -3530,8 +3610,20 @@ impl Records {
     /// names ([`Self::restore_presentation`]), with aterm's own permissions in a plan an older
     /// aterm saved. That plan predates the Permissions group, so nobody turned it off: they are
     /// approved by default as on every Mac (System State design §3.5, §6), and a choice of another
-    /// group keeps them. Only an older aterm's Cancel holds them.
+    /// group keeps them. Only an older aterm's Cancel holds them. A person's Cancel of the
+    /// first-launch review leaves every group as it is, aterm's own permissions with them
+    /// ([`Self::cancelled`]): nobody approved any of it.
     fn present(&self, plan: Plan) -> Plan {
+        // A Restore's decision held by a person's Cancel (one pressed after it, or a Cancel of
+        // the review a Restore brought forward) holds every group as it is too.
+        let held = self.decision == Decision::Stopped(Stop::Restored)
+            && self.restored.is_some_and(|restored| restored.held);
+        if self.cancelled.is_some() || held {
+            return Plan {
+                selection: Selection::none(),
+                ..plan
+            };
+        }
         let mut plan = self.restore_presentation(plan);
         if self.plan.as_ref().is_some_and(|(_, modern)| !modern)
             && self.decision != Decision::Stopped(Stop::Cancelled)
@@ -3725,6 +3817,13 @@ fn snapshot_from_observation(
     // from the moment it is asked for.
     let run_stopped = progress.is_some_and(|progress| progress.stopped_by(records.stop_request));
     let finished = stopped.is_some() || completed || run_stopped;
+    let run_allowed = records.plan.is_some()
+        && progress.is_some_and(|progress| progress.admitted)
+        && !run_stopped
+        && matches!(
+            records.decision,
+            Decision::Pending | Decision::Applied(true) | Decision::Stopped(Stop::Restored)
+        );
     // A Restore puts back Mac preferences and never withdraws aterm's own permissions: the
     // run it ends stays admitted ([`leave_restored_as_is`]), so the access steps go on by
     // themselves. Only a person's Cancel or Stop holds them.
@@ -3793,9 +3892,11 @@ fn snapshot_from_observation(
         finished,
         rows,
         revision: progress.map_or(0, |progress| progress.revision),
+        run_allowed,
         access_revision: progress.map_or(0, Progress::access_revision),
         permissions_allowed,
-        provisional: records.plan.is_some() && records.provisional,
+        provisional: records.plan.is_some() && records.provisional && records.cancelled.is_none(),
+        cancelled: records.cancelled.is_some(),
         recovered: false,
         observation,
     }
@@ -3831,6 +3932,12 @@ trait InitialHost {
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String>;
+    /// Whether the Repositories stage, as [`Self::repositories`] last ran it, stopped for want
+    /// of Apple's Command Line Tools ([`aterm_machines::init_observe::Wait::CommandLineTools`]):
+    /// the pass then asks the window to install them ([`SetupHooks::developer_tools`]).
+    fn repositories_want_developer_tools(&mut self) -> bool {
+        false
+    }
     /// The Messages and FaceTime sign-outs, with the Accessibility they need.
     /// `on_screen` is whether System State is the visible view of a focused window
     /// ([`SetupHooks::on_screen`]): without it a sign-out that still has work waits.
@@ -3869,15 +3976,28 @@ pub struct SetupHooks {
     /// Accessibility and Automation prompts, so it runs only then (design §6); otherwise it
     /// parks, and the window wakes the run when the page comes to the front.
     pub on_screen: fn() -> bool,
+    /// The exact run revision and whether its Repositories stage waits on Apple's Command Line
+    /// Tools, which only a root install with the person's password adds: `true`, at the end of
+    /// an unstopped pass whose stage waits on them, and the window starts that install in a
+    /// terminal tab of its own (`aterm init --only base.clt`), once per launch, never in the
+    /// middle of a pass; `false` withdraws a want the window still holds, said as soon as the
+    /// stage ends without waiting on them (so a pass that fails after it leaves no want), or
+    /// when a Stop ends a pass whose stage waits on them. Once a pass that ran the stage, unless
+    /// it fails after asking. The run's park wakes once the tools are there:
+    /// a park's later sample differs from its first, and an install that finished during the
+    /// pass is a fact [`InitialSetupParkMark::facts_changed_since`] reads.
+    pub developer_tools: fn(u64, bool),
 }
 
 impl SetupHooks {
     /// A pass nobody stops or watches, started by a person where they are (a
-    /// terminal), so nothing in it waits for a page.
+    /// terminal), so nothing in it waits for a page. Its person installs the Command Line
+    /// Tools by `aterm init`, which its row's remedy names.
     pub const NONE: Self = Self {
         stop: |_| false,
         stage: |_| {},
         on_screen: || true,
+        developer_tools: |_, _| {},
     };
 }
 
@@ -3904,20 +4024,15 @@ impl SetupNext {
     }
 
     /// What one stage's rows leave: done when all are in place, a park when every
-    /// row left waits on a person or an absent vault ([`WAITING`]), on a vault
-    /// that did not answer ([`UNREACHED`]), or failed for good, which no retry changes
-    /// ([`aterm_types::macos_setup::FAILED_FOR_GOOD`], System State design §3.6).
+    /// row left waits on a person or an absent vault ([`WAITING`]) or on a vault
+    /// that did not answer ([`UNREACHED`]).
     fn of(rows: &[Row]) -> Self {
         if rows_ready(rows) {
             Self::Done
         } else if !rows.is_empty()
-            && rows.iter().all(|row| {
-                row_ready(row)
-                    || matches!(
-                        row.status.as_str(),
-                        WAITING | UNREACHED | aterm_types::macos_setup::FAILED_FOR_GOOD
-                    )
-            })
+            && rows
+                .iter()
+                .all(|row| row_ready(row) || matches!(row.status.as_str(), WAITING | UNREACHED))
         {
             Self::Park
         } else {
@@ -3947,8 +4062,17 @@ pub struct InitialSetupParkMark {
     subscriber_run: Option<u64>,
     subscriber: Option<bool>,
     interfaces: Option<Vec<aterm_secrets::network::InterfaceAddress>>,
+    /// The run whose Repositories stage is unfinished: the Command Line Tools arriving may end
+    /// its wait ([`InitialSetupParkMark::facts_changed_since`]).
+    developer_tools_run: Option<u64>,
+    /// Whether Command Line Tools git is installed, read for [`Self::developer_tools_run`]
+    /// ([`InitialSetupParkMark::with_developer_tools`]).
+    developer_tools: Option<bool>,
     retry_due: Option<u64>,
     mac_settings_retry_due: Option<u64>,
+    /// An admitted, unfinished Accounts or Permissions stage
+    /// ([`InitialSetupParkMark::waits_on_settings`]).
+    in_settings: bool,
 }
 
 impl std::fmt::Debug for InitialSetupParkMark {
@@ -3980,6 +4104,19 @@ impl InitialSetupParkMark {
             || (self.subscriber_run.is_some()
                 && self.subscriber_run == before.subscriber_run
                 && changed(&self.subscriber, &before.subscriber))
+            // The tools' install (the tab the window opened, or a person's own `aterm init`)
+            // finishing during the pass ends the Repositories stage's wait on them.
+            || (self.developer_tools_run.is_some()
+                && self.developer_tools_run == before.developer_tools_run
+                && self.developer_tools == Some(true)
+                && before.developer_tools == Some(false))
+    }
+
+    /// The mark with whether the Command Line Tools are installed (`installed`), read only
+    /// for a run whose Repositories stage is unfinished.
+    fn with_developer_tools(mut self, installed: impl FnOnce() -> Option<bool>) -> Self {
+        self.developer_tools = self.developer_tools_run.and_then(|_| installed());
+        self
     }
 
     /// A contended or unreadable local state gives no new fact. Keep the
@@ -4010,13 +4147,22 @@ impl InitialSetupParkMark {
     pub fn mac_settings_retry_due(&self) -> Option<u64> {
         self.mac_settings_retry_due
     }
+
+    /// Whether the run waits on an admitted, unfinished Accounts or Permissions stage: what moves
+    /// it is something a person does in System Settings or macOS, so one of aterm's windows
+    /// gaining focus ends its park. No other park listens for focus (System State design §3.5).
+    pub fn waits_on_settings(&self) -> bool {
+        self.in_settings
+    }
 }
 
 /// What a parked run waits on that moves without the window: this login's vault
 /// state and, for admitted unfinished Secrets or Repositories, local interfaces.
 /// Unfinished Secrets also observes subscriber state and an existing retry
 /// deadline. A selected, unfinished Mac settings stage wakes for its second
-/// automatic try. No network request or permission prompt is made here.
+/// automatic try. It also says whether an Accounts or Permissions stage is left,
+/// which a person moves in System Settings or macOS. No network request or
+/// permission prompt is made here.
 pub fn initial_setup_park_mark() -> InitialSetupParkMark {
     initial_setup_park_mark_at(
         state_root().ok().as_deref(),
@@ -4024,6 +4170,11 @@ pub fn initial_setup_park_mark() -> InitialSetupParkMark {
         secrets_retry::Reads::now(&secrets_retry::Live),
         || aterm_secrets::network::interfaces().ok(),
     )
+    .with_developer_tools(|| {
+        Some(aterm_machines::init_github::git_installed(
+            &aterm_machines::port::Live::new(),
+        ))
+    })
 }
 
 fn initial_setup_park_mark_at(
@@ -4107,36 +4258,45 @@ fn initial_setup_park_mark_reading(
                         && progress.only.is_none_or(|only| only.contains(*setting))
                 }))
                 || (Stage::Accounts.selected(plan) && progress.done & Stage::Accounts.bit() == 0),
+            [Stage::Accounts, Stage::Permissions]
+                .iter()
+                .any(|stage| stage.selected(plan) && progress.done & stage.bit() == 0),
         ))
     });
-    let unfinished_secrets = pending.filter(|(_, progress, secrets, _, _)| {
+    let unfinished_secrets = pending.filter(|(_, progress, secrets, _, _, _)| {
         *secrets && progress.done & Stage::Secrets.bit() == 0
     });
-    let unfinished_network = pending.filter(|(_, progress, secrets, repositories, _)| {
+    let unfinished_network = pending.filter(|(_, progress, secrets, repositories, _, _)| {
         (*secrets && progress.done & Stage::Secrets.bit() == 0)
             || (*repositories && progress.done & Stage::Repositories.bit() == 0)
     });
     let materialization_run = pending
-        .filter(|(_, progress, secrets, repositories, _)| {
+        .filter(|(_, progress, secrets, repositories, _, _)| {
             *secrets
                 && (progress.done & Stage::Secrets.bit() == 0
                     || (*repositories && progress.done & Stage::Repositories.bit() == 0))
         })
-        .map(|(_, progress, _, _, _)| progress.revision);
+        .map(|(_, progress, _, _, _, _)| progress.revision);
     InitialSetupParkMark {
         vault,
-        network_run: unfinished_network.map(|(_, progress, _, _, _)| progress.revision),
+        network_run: unfinished_network.map(|(_, progress, _, _, _, _)| progress.revision),
         materialization_run,
         materialization: materialization_run.and_then(|_| materialization()),
-        subscriber_run: unfinished_secrets.map(|(_, progress, _, _, _)| progress.revision),
+        subscriber_run: unfinished_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
         subscriber: unfinished_secrets.and_then(|_| subscriber()),
         interfaces: unfinished_network.and_then(|_| interfaces()),
-        retry_due: unfinished_secrets.and_then(|(root, progress, _, _, _)| {
+        developer_tools_run: pending
+            .filter(|(_, progress, _, repositories, _, _)| {
+                *repositories && progress.done & Stage::Repositories.bit() == 0
+            })
+            .map(|(_, progress, _, _, _, _)| progress.revision),
+        developer_tools: None,
+        retry_due: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
             secrets_retry::retry_due(root, progress.revision, now)
         }),
         mac_settings_retry_due: pending
-            .filter(|(_, _, _, _, mac_settings)| *mac_settings)
-            .and_then(|(root, progress, _, _, _)| {
+            .filter(|(_, _, _, _, mac_settings, _)| *mac_settings)
+            .and_then(|(root, progress, _, _, _, _)| {
                 super::mac_settings_retry_due(
                     root,
                     progress.revision,
@@ -4146,6 +4306,7 @@ fn initial_setup_park_mark_reading(
                 .ok()
                 .flatten()
             }),
+        in_settings: pending.is_some_and(|(_, _, _, _, _, in_settings)| in_settings),
     }
 }
 
@@ -4224,6 +4385,42 @@ mod parked_secrets_route_tests {
             .pass_at(root.path(), plan.selection, started + 1_200)
             .unwrap();
         assert_eq!(doctor.relaunches(), 2, "the per-build cap stays spent");
+    }
+
+    /// A park waits on what a person does in System Settings or macOS only while an admitted
+    /// Accounts or Permissions stage is left: only such a park ends when one of aterm's windows
+    /// gains focus. A Mac settings stage, or one of those two finished, does not listen.
+    #[test]
+    fn only_a_left_accounts_or_permissions_stage_waits_on_settings() {
+        for (setting, waits) in [
+            (Setting::Permissions, true),
+            (Setting::Messages, true),
+            (Setting::Dock, false),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_at(root.path(), &plan(setting)).unwrap().unwrap();
+            let read = || {
+                initial_setup_park_mark_with(Some(root.path()), None, 1_000, || None)
+                    .waits_on_settings()
+            };
+            assert_eq!(read(), waits, "{setting:?}");
+            let pending = progress(root.path()).unwrap().unwrap();
+            let stage = match setting {
+                Setting::Permissions => Stage::Permissions,
+                Setting::Messages => Stage::Accounts,
+                _ => Stage::Workstation,
+            };
+            save_progress(
+                root.path(),
+                Progress {
+                    done: stage.bit(),
+                    ..pending
+                },
+            )
+            .unwrap();
+            assert!(!read(), "{setting:?}: finished");
+        }
+        assert!(!initial_setup_park_mark_with(None, None, 1_000, || None).waits_on_settings());
     }
 
     #[test]
@@ -4428,6 +4625,75 @@ mod parked_secrets_route_tests {
         );
     }
 
+    /// The Command Line Tools arriving during a pass is a fact that wakes the run's park on
+    /// its Repositories stage (the tab the window opened for their install, or a person's own
+    /// `aterm init`), whatever else the mark reads, and a park already sampling sees them
+    /// change the mark. Their going away, a reading taken for no unfinished Repositories stage,
+    /// and a finished stage are no such fact.
+    #[test]
+    fn the_command_line_tools_arriving_wakes_a_run_parked_on_its_repositories() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut selected = plan(Setting::Secrets);
+        selected.selection.set(Setting::Repositories, true);
+        authorize_at(root.path(), &selected).unwrap();
+        let read = |installed: Option<bool>| {
+            initial_setup_park_mark_reading(
+                Some(root.path()),
+                vault(Membership::Pending),
+                1_000,
+                || routes(1),
+                || None,
+                || Some(false),
+            )
+            .with_developer_tools(|| installed)
+        };
+        let missing = read(Some(false));
+        assert!(!read(Some(false)).facts_changed_since(&missing));
+        assert!(
+            read(Some(true)).facts_changed_since(&missing),
+            "the tools' install ends the wait"
+        );
+        // A park already sampling ends on any later sample that differs from its first.
+        assert_ne!(
+            read(Some(true)),
+            missing,
+            "the tools' install changes the sample"
+        );
+        assert!(
+            !missing.facts_changed_since(&read(Some(true))),
+            "the tools going away is no fact"
+        );
+        assert!(!read(None).facts_changed_since(&missing));
+        assert!(!read(Some(true)).facts_changed_since(&read(None)));
+
+        let mut saved = progress(root.path()).unwrap().unwrap();
+        saved.done |= Stage::Secrets.bit() | Stage::Repositories.bit();
+        save_progress(root.path(), saved).unwrap();
+        let finished = read(Some(true));
+        assert_eq!(
+            finished.developer_tools, None,
+            "read for no unfinished stage"
+        );
+        assert!(!finished.facts_changed_since(&missing));
+
+        // A plan without the repositories never reads the tools.
+        let other = aterm_tempfile::tempdir().unwrap();
+        authorize_at(other.path(), &plan(Setting::Secrets)).unwrap();
+        let unselected = |installed: Option<bool>| {
+            initial_setup_park_mark_reading(
+                Some(other.path()),
+                vault(Membership::Pending),
+                1_000,
+                || routes(1),
+                || None,
+                || Some(false),
+            )
+            .with_developer_tools(|| installed)
+        };
+        assert_eq!(unselected(Some(true)).developer_tools, None);
+        assert!(!unselected(Some(true)).facts_changed_since(&unselected(Some(false))));
+    }
+
     #[test]
     fn late_pass_facts_compare_only_known_inputs_still_owed_by_the_same_run() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -4589,12 +4855,16 @@ mod parked_secrets_route_tests {
 
 struct LiveInitial<R> {
     reads: R,
+    /// Whether the last Repositories stage stopped for want of the Command Line Tools
+    /// ([`InitialHost::repositories_want_developer_tools`]).
+    developer_tools_wanted: bool,
 }
 
 impl LiveInitial<secrets_retry::Live> {
     const fn live() -> Self {
         Self {
             reads: secrets_retry::Live,
+            developer_tools_wanted: false,
         }
     }
 }
@@ -4756,12 +5026,19 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
 
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         let sys = aterm_machines::port::Live::new();
-        repositories::run(
+        self.developer_tools_wanted = false;
+        let (rows, wanted) = repositories::run_reading(
             &sys,
             &self.context()?,
             vault,
             aterm_machines::model::Mode::Apply,
-        )
+        )?;
+        self.developer_tools_wanted = wanted;
+        Ok(rows)
+    }
+
+    fn repositories_want_developer_tools(&mut self) -> bool {
+        self.developer_tools_wanted
     }
 
     fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
@@ -4901,6 +5178,10 @@ fn execute_pass(
     let mut vault = SetupNext::Retry;
     // The rows of `report` a stage's own page stands for (`Report::page`).
     let mut pages: Vec<(std::ops::Range<usize>, PassPage)> = Vec::new();
+    // Whether this pass's Repositories stage, if it ran, waits on the Command Line Tools: the
+    // window hears an ask once the pass is over, a withdrawal at once
+    // ([`SetupHooks::developer_tools`]).
+    let mut developer_tools = None;
     for stage in Stage::ALL {
         if !stage.selected(&plan) || progress.done & stage.bit() != 0 {
             continue;
@@ -4911,6 +5192,9 @@ fn execute_pass(
                 status: "stopped".into(),
                 detail: "stopped before this step; nothing more runs until the plan changes".into(),
             });
+            if developer_tools == Some(true) {
+                (hooks.developer_tools)(progress.revision, false);
+            }
             return Ok(Some((paged(report, pages), SetupNext::Done)));
         }
         let mut repository_vault = None;
@@ -5076,6 +5360,15 @@ fn execute_pass(
                 (false, vec![row])
             }
         };
+        if stage == Stage::Repositories {
+            let wanted = host.repositories_want_developer_tools();
+            // A stage that no longer waits on the tools withdraws at once, so a pass that fails
+            // after it leaves no want standing; an ask waits for the pass's end.
+            if !wanted {
+                (hooks.developer_tools)(progress.revision, false);
+            }
+            developer_tools = Some(wanted);
+        }
         let left = SetupNext::of(&rows);
         if ready {
             progress.done |= stage.bit();
@@ -5119,6 +5412,9 @@ fn execute_pass(
             detail: "stopped before deferred settings; nothing more runs until the plan changes"
                 .into(),
         });
+        if developer_tools == Some(true) {
+            (hooks.developer_tools)(progress.revision, false);
+        }
         return Ok(Some((paged(report, pages), SetupNext::Done)));
     }
     // The follow-up changes its rows as a stage does: fenced from readings the same way.
@@ -5166,13 +5462,19 @@ fn execute_pass(
     }
     // The pass's end is a boundary too: a Stop asked for during the last stage of a run that
     // finished is spent, and one asked for while work is left stops the run here.
-    if stop_at_boundary(root, &mut progress, hooks)? {
+    let stopped = stop_at_boundary(root, &mut progress, hooks)?;
+    if stopped {
         report.rows.push(Row {
             name: "System State".into(),
             status: "stopped".into(),
             detail: "stopped after this pass; nothing more runs until the plan changes".into(),
         });
         next = SetupNext::Done;
+    }
+    // Only now, with nothing of this pass left to run (no sign-out to drive Messages over the
+    // password prompt), and never for a stopped run.
+    if developer_tools == Some(true) {
+        (hooks.developer_tools)(progress.revision, !stopped);
     }
     Ok(Some((paged(report, pages), next)))
 }
@@ -5223,8 +5525,7 @@ fn items_page(stage: Stage, rows: &[Row]) -> Option<PassPage> {
         match how {
             // A stage's own line (`Spotlight and Rust documentation`) is said under the page's
             // row (`Rust in Spotlight`); a step that failed or could not be confirmed the page
-            // says in its own words, and `aterm doctor` keeps the stage's. One that failed for
-            // good carries the page's words already (`repositories::run`).
+            // says in its own words, and `aterm doctor` keeps the stage's.
             _ if row.name == stage.name() => page.rows.push(Row {
                 name: setting.name().into(),
                 detail: if how.is_some() {
@@ -5350,6 +5651,9 @@ mod tests {
         configured_unreadable: bool,
         checked_url: Option<String>,
         native_repositories: Option<(aterm_machines::port::Fake, aterm_machines::items::Ctx)>,
+        /// Whether the last native Repositories stage stopped for want of the Command Line
+        /// Tools, read as the live host reads it ([`repositories::want_developer_tools`]).
+        developer_tools_wanted: bool,
         /// What each Workstation stage was given to set ([`Progress::only`]).
         only: Vec<Option<Selection>>,
     }
@@ -5498,14 +5802,19 @@ mod tests {
         fn repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
             if let Some((sys, ctx)) = &self.native_repositories {
                 self.calls.push(Stage::Repositories);
-                return aterm_machines::init_github::run_initial_repositories(
+                let rows = aterm_machines::init_github::run_initial_repositories(
                     sys,
                     ctx,
                     aterm_machines::model::Mode::Apply,
-                )
-                .map(item_rows);
+                )?;
+                self.developer_tools_wanted = repositories::want_developer_tools(&rows);
+                return Ok(item_rows(rows));
             }
             self.stage(Stage::Repositories)
+        }
+
+        fn repositories_want_developer_tools(&mut self) -> bool {
+            self.developer_tools_wanted
         }
 
         fn withheld(&mut self, _root: &Path) -> Result<Option<Report>, String> {
@@ -6731,6 +7040,85 @@ mod tests {
         startup.persist_at(root, &offered).result.unwrap()
     }
 
+    /// A person's Cancel of the first-launch review holds until they ask again (System State
+    /// design §3.3): every group reads Leave as is, aterm's own permissions with them, no launch
+    /// offers the review again, and a Restore after it never brings the review back. Set up now
+    /// applies the plan the review showed; a group choice sets up that group alone.
+    #[test]
+    fn a_cancelled_review_holds_until_a_person_asks_again() {
+        use aterm_types::macos_setup::Group;
+        let reviewed = Plan::default();
+        let cancelled = || {
+            let root = aterm_tempfile::tempdir().unwrap();
+            save_cancelled_decision(root.path(), &reviewed).unwrap();
+            root
+        };
+        let restart = |root: &Path, mut restart: InitialSetupRestart, plan: &Plan| {
+            observe_mutation_at(root, None, Err("busy".into()), |root| {
+                restart.persist_with(
+                    root,
+                    plan,
+                    false,
+                    || Ok(None),
+                    save_progress,
+                    observe_restart,
+                )
+            })
+            .result
+            .unwrap()
+            .expect("admitted")
+        };
+
+        let root = cancelled();
+        let page = snapshot_at(root.path(), reviewed.clone()).unwrap();
+        assert!(page.cancelled && page.finished && !page.permissions_allowed);
+        assert!(page.plan.selection.is_empty(), "every group at Leave as is");
+        assert_eq!(
+            launch_startup(root.path()),
+            None,
+            "no launch offers it again"
+        );
+        save_restore(root.path()).unwrap();
+        leave_restored_as_is(root.path()).unwrap();
+        assert_eq!(bring_forward_restored_at(root.path()).unwrap(), None);
+        assert_eq!(
+            launch_startup(root.path()),
+            None,
+            "a Restore after a Cancel never brings the review back"
+        );
+        let page = snapshot_at(root.path(), reviewed.clone()).unwrap();
+        assert!(!page.permissions_allowed && page.plan.selection.is_empty());
+
+        // Set up now, as System State sends it: the plan the review showed.
+        let root = cancelled();
+        restart(
+            root.path(),
+            InitialSetupRestart::default().changing(Some(Selection::none())),
+            &Plan::from(Selection::none()),
+        );
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(reviewed.clone()));
+        let page = snapshot_at(root.path(), reviewed.clone()).unwrap();
+        assert!(!page.cancelled && page.permissions_allowed);
+
+        // A group press, from a page that still sends every group at Set up: that group alone.
+        let root = cancelled();
+        let desktop = group_selection(Group::Desktop);
+        restart(
+            root.path(),
+            InitialSetupRestart::chosen().changing(Some(desktop)),
+            &reviewed,
+        );
+        assert_eq!(
+            saved_plan(root.path()).unwrap().map(|plan| plan.selection),
+            Some(desktop)
+        );
+        assert!(
+            !snapshot_at(root.path(), reviewed.clone())
+                .unwrap()
+                .cancelled
+        );
+    }
+
     /// An older aterm's setup gets aterm's own permissions at the next launch unless a person
     /// cancelled it: a verified completion at once, as before; a pending or unverified one through
     /// the launch's offer, which adds them to the plan that aterm saved; a restored one brought
@@ -7523,6 +7911,187 @@ mod tests {
             assert_eq!(host.calls, [Stage::Secrets, Stage::Repositories]);
             assert_eq!(host.vault_checks, 3);
             assert!(finished_at(root.path()).unwrap());
+        }
+    }
+
+    /// At the end of a pass, a Repositories stage that stops for want of Apple's Command Line
+    /// Tools asks the window to install them ([`SetupHooks::developer_tools`] `true`), as the
+    /// live host reads the stop; one that stops on anything else (GitHub unreached, a person's
+    /// missing token) withdraws the ask (`false`) at once, before the pass's next stop boundary,
+    /// so a pass that fails after it leaves no want; and a pass a Stop ended at any boundary
+    /// after the stage withdraws there: before the deferred settings, at the pass's end, or
+    /// before a later stage.
+    #[test]
+    fn a_repositories_stage_without_the_command_line_tools_asks_the_window_to_install_them() {
+        use aterm_machines::items::Ctx;
+        use aterm_machines::model::{HostFacts, User};
+        use aterm_machines::port::{Fake as Native, GithubFailure, Ran, Stat};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Each call: the revision, the want, and how many stop boundaries the pass had asked.
+        static TOLD: Mutex<Vec<(u64, bool, usize)>> = Mutex::new(Vec::new());
+        // The pass's stop boundaries asked so far, and the one a Stop arrives at (0 is the
+        // first stage's).
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        static STOP_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let told = || std::mem::take(&mut *TOLD.lock().unwrap());
+        let hooks = SetupHooks {
+            developer_tools: |revision, wanted| {
+                TOLD.lock()
+                    .unwrap()
+                    .push((revision, wanted, ASKED.load(Ordering::SeqCst)));
+            },
+            stop: |_| ASKED.fetch_add(1, Ordering::SeqCst) >= STOP_AT.load(Ordering::SeqCst),
+            ..SetupHooks::NONE
+        };
+        let host = |tools: bool, token: bool| {
+            let user = User {
+                name: "tester".into(),
+                uid: 501,
+                gid: 20,
+                home: "/test-repository-home".into(),
+                shell: "/bin/zsh".into(),
+                admin: false,
+            };
+            let mut sys = Native::root();
+            sys.euid = user.uid;
+            let stat = |dir, len| Stat {
+                uid: user.uid,
+                gid: user.gid,
+                mode: if dir { 0o700 } else { 0o600 },
+                dir,
+                symlink: false,
+                len,
+            };
+            const TOKEN: &str = "inert_repository_tools_token";
+            sys.stat_of(&user.home, stat(true, 0));
+            if tools {
+                sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
+            }
+            if token {
+                let token = format!("{}/.secrets/gh_access_token", user.home);
+                sys.file(&token, TOKEN.as_bytes())
+                    .stat_of(&token, stat(false, TOKEN.len() as u64));
+            }
+            for _ in 1..=2 {
+                sys.fail_github_api(&user, "/user", GithubFailure::Unreached);
+            }
+            sys.simulate(|_, command| {
+                let command = command.display();
+                if command.contains(" config --null --show-origin --get-regexp ") {
+                    Some(Ran::ok(""))
+                } else {
+                    panic!("unexpected repository effect: {command}");
+                }
+            });
+            let ctx = Ctx {
+                facts: HostFacts::default(),
+                users: vec![user.clone()],
+                console: Some(user),
+                host_name: "fixture".into(),
+                cache_dir: PathBuf::from("/test-cache"),
+                disrupt: false,
+            };
+            Fake {
+                native_repositories: Some((sys, ctx)),
+                ..Fake::default()
+            }
+        };
+        let repositories: &[Setting] = &[Setting::Repositories];
+        let then_accounts: &[Setting] = &[Setting::Repositories, Setting::Messages];
+        let never = usize::MAX;
+        // `at`: the stop boundaries asked when the window hears: an ask after the pass's last
+        // (2), a withdrawal right after the stage (before the next) or at the Stop's own.
+        for (case, settings, tools, token, stop_at, waits, wanted, at) in [
+            (
+                "no tools",
+                repositories,
+                false,
+                true,
+                never,
+                SetupNext::Park,
+                true,
+                3,
+            ),
+            (
+                "GitHub unreached",
+                repositories,
+                true,
+                true,
+                never,
+                SetupNext::Retry,
+                false,
+                1,
+            ),
+            (
+                "no token",
+                repositories,
+                true,
+                false,
+                never,
+                SetupNext::Park,
+                false,
+                1,
+            ),
+            (
+                "stopped before deferred settings",
+                repositories,
+                false,
+                true,
+                1,
+                SetupNext::Done,
+                false,
+                2,
+            ),
+            (
+                "stopped at the pass's end",
+                repositories,
+                false,
+                true,
+                2,
+                SetupNext::Done,
+                false,
+                3,
+            ),
+            (
+                "stopped before the Accounts stage",
+                then_accounts,
+                false,
+                true,
+                1,
+                SetupNext::Done,
+                false,
+                2,
+            ),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let revision = authorize_at(root.path(), &selected(settings))
+                .unwrap()
+                .unwrap();
+            let mut host = host(tools, token);
+            told();
+            STOP_AT.store(stop_at, Ordering::SeqCst);
+            // A stopped run runs no second pass.
+            let passes = if stop_at == never { 2 } else { 1 };
+            for pass in 1..=passes {
+                ASKED.store(0, Ordering::SeqCst);
+                let (_, next) = execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    hooks,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(next, waits, "{case}, pass {pass}");
+                assert_eq!(
+                    told(),
+                    [(revision, wanted, at)],
+                    "{case}, pass {pass}: told once, at that boundary"
+                );
+            }
         }
     }
 
@@ -9237,12 +9806,12 @@ mod tests {
         execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
         assert!(finished_at(root.path()).unwrap());
         assert_eq!(ConfiguredVault::read(&paths).unwrap(), None);
-        let unconfigured = snapshot_in_vault(root.path(), Ok(None)).unwrap();
+        let unconfigured = snapshot_in_vault(root.path(), Ok(None), None).unwrap();
         assert_eq!(unconfigured.plan, Plan::default());
 
         let vault = configure_vault(&paths, team);
         let configured = Some(vault.clone());
-        let snapshot = snapshot_in_vault(root.path(), Ok(configured.clone())).unwrap();
+        let snapshot = snapshot_in_vault(root.path(), Ok(configured.clone()), None).unwrap();
         assert_eq!(snapshot.plan.vault_url, team);
         assert_eq!(snapshot.plan.selection, Plan::default().selection);
         assert_eq!(
@@ -9334,7 +9903,7 @@ mod tests {
         let team = "http://vault.example:7484/v1/team";
         let other = "http://other.example:7484/v1/other";
         let configured = Some(configure_vault(&paths, team));
-        let shown = || snapshot_in_vault(root.path(), Ok(configured.clone())).unwrap();
+        let shown = || snapshot_in_vault(root.path(), Ok(configured.clone()), None).unwrap();
         let apply = |plan: &Plan| {
             let typed = plan.vault_url != shown().plan.vault_url;
             system_state_apply(root.path(), plan, typed, || Ok(configured.clone()))
@@ -9535,6 +10104,7 @@ mod tests {
             stop,
             stage,
             on_screen: || true,
+            developer_tools: |_, _| {},
         };
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Widgets, Setting::Secrets]);
@@ -9588,13 +10158,6 @@ mod tests {
         assert_eq!(SetupNext::of(&[row("ok"), row("applied")]), SetupNext::Done);
         assert_eq!(SetupNext::of(&[row("ok"), row(WAITING)]), SetupNext::Park);
         assert_eq!(SetupNext::of(&[row("ok"), row(UNREACHED)]), SetupNext::Park);
-        // A step that failed for good is no retry's to change (design §3.6).
-        let for_good = row(aterm_types::macos_setup::FAILED_FOR_GOOD);
-        assert_eq!(
-            SetupNext::of(&[row("ok"), for_good.clone()]),
-            SetupNext::Park
-        );
-        assert_eq!(SetupNext::of(&[for_good, row("error")]), SetupNext::Retry);
         assert_eq!(
             SetupNext::of(&[row(WAITING), row("blocked")]),
             SetupNext::Retry
@@ -11898,7 +12461,10 @@ mod tests {
             build: "1.0.0+gtest".into(),
             now: vault::START,
         };
-        let mut host = LiveInitial { reads: reads(true) };
+        let mut host = LiveInitial {
+            reads: reads(true),
+            developer_tools_wanted: false,
+        };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));
         assert_eq!(first.build, "1.0.0+gtest");
@@ -12198,7 +12764,7 @@ mod tests {
 
         lan.in_vault(JOINED_SINCE, START);
         let joined = lan.status_now();
-        let shown = snapshot_in_vault(root.path(), host.configured_vault()).unwrap();
+        let shown = snapshot_in_vault(root.path(), host.configured_vault(), None).unwrap();
         assert!(!shown.finished);
         assert_eq!(shown.plan.vault_url, JOINED_SINCE);
 
@@ -12349,7 +12915,7 @@ mod tests {
         authorize_reading(root.path(), &selected(&[Setting::Secrets]), read).unwrap();
         execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
         assert!(finished_at(root.path()).unwrap());
-        let shown = snapshot_in_vault(root.path(), read()).unwrap().plan;
+        let shown = snapshot_in_vault(root.path(), read(), None).unwrap().plan;
         assert_eq!(shown.vault_url, alab);
 
         let team = "http://vault.example:7484/v1/team";
@@ -12464,11 +13030,12 @@ mod tests {
     #[test]
     fn a_snapshot_reads_an_unreadable_vault_config_as_no_vault() {
         let root = aterm_tempfile::tempdir().unwrap();
-        let shown = snapshot_in_vault(root.path(), Err("source.toml: no name".into()))
+        let shown = snapshot_in_vault(root.path(), Err("source.toml: no name".into()), None)
             .expect("an unreadable vault config is no unread saved setup");
         assert_eq!(shown.plan, Plan::default());
         authorize_at(root.path(), &selected(&[Setting::Permissions])).unwrap();
-        let shown = snapshot_in_vault(root.path(), Err("source.toml: no name".into())).unwrap();
+        let shown =
+            snapshot_in_vault(root.path(), Err("source.toml: no name".into()), None).unwrap();
         assert_eq!(shown.plan, selected(&[Setting::Permissions]));
     }
 
@@ -15718,7 +16285,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    snapshot_in_vault(root, Ok(None)),
+                    snapshot_in_vault(root, Ok(None), None),
                     Err(InitialSetupSnapshotError::Newer)
                 ),
                 "{damaged}"

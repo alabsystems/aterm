@@ -35,7 +35,6 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Kimi
             | Program::Agy
             | Program::Muse
-            | Program::Gemini
             | Program::Generic => false,
         };
         if !claude || screen.first != 0 || screen.generation.is_none() || self.alt_screen_now()? {

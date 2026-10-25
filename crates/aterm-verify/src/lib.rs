@@ -209,6 +209,11 @@ fn writable_dir(_dir: &Path) -> Option<bool> {
 pub struct MeasureArtifact {
     /// The bundle, canonical.
     pub app: PathBuf,
+    /// Its `CFBundleShortVersionString`, when its `Info.plist` names one.
+    pub version: Option<String>,
+    /// The commit it was built from (`ATermGitCommit`: 12 hex digits, `-dirty` when that tree had
+    /// changes), when its `Info.plist` names one.
+    pub commit: Option<String>,
 }
 
 impl MeasureArtifact {
@@ -225,7 +230,24 @@ impl MeasureArtifact {
                 app.display()
             ));
         }
-        Ok(Self { app })
+        let plist = std::fs::read_to_string(app.join("Contents/Info.plist")).unwrap_or_default();
+        let read = |key| plist_string(&plist, key).map(str::to_string);
+        Ok(Self {
+            version: read("CFBundleShortVersionString"),
+            commit: read("ATermGitCommit"),
+            app,
+        })
+    }
+
+    /// The bundle at `app`, naming neither a version nor a commit.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn unnamed(app: impl Into<PathBuf>) -> Self {
+        Self {
+            app: app.into(),
+            version: None,
+            commit: None,
+        }
     }
 
     /// `<app>/Contents/MacOS/<name>`.
@@ -233,6 +255,39 @@ impl MeasureArtifact {
     pub fn bin(&self, name: &str) -> PathBuf {
         self.app.join("Contents/MacOS").join(name)
     }
+
+    /// Whether `head` (a full commit id) built it: its commit, less `-dirty`, begins `head`.
+    #[must_use]
+    pub fn built_from(&self, head: &str) -> bool {
+        self.commit.as_deref().is_some_and(|c| {
+            let c = c.strip_suffix("-dirty").unwrap_or(c);
+            !c.is_empty() && head.starts_with(c)
+        })
+    }
+
+    /// `aterm <version> (<commit>)` as far as its `Info.plist` says, then where it is.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut name = String::from("aterm");
+        if let Some(v) = &self.version {
+            name.push(' ');
+            name.push_str(v);
+        }
+        if let Some(c) = &self.commit {
+            name.push_str(&format!(" ({c})"));
+        }
+        format!("{name} at {}", self.app.display())
+    }
+}
+
+/// The `<string>` after `<key>key</key>` in an XML property list.
+fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let key = format!("<key>{key}</key>");
+    let tail = text[text.find(&key)? + key.len()..]
+        .trim_start()
+        .strip_prefix("<string>")?;
+    let value = tail[..tail.find("</string>")?].trim();
+    (!value.is_empty()).then_some(value)
 }
 
 /// Everything a stage needs, immutable for the whole run so stages share it across threads without a lock.
@@ -264,7 +319,7 @@ pub struct Ctx {
     pub main_build_dir: Option<String>,
     /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
     pub toolchain_lease: Option<String>,
-    /// The wall-clock ceiling on one stage child.
+    /// The ceiling on one stage child's work, its waits for admission or a lock left out ([`exec::ExecEnv::child_ceiling`]).
     pub child_ceiling: Option<Duration>,
     /// `--no-windows`.
     pub no_windows: bool,
@@ -573,6 +628,26 @@ impl Ctx {
     }
 }
 
+/// How a timed stage's quiet claim is admitted: [`aterm_capacity::admit`], or a test's.
+type AdmitQuiet = fn(
+    aterm_capacity::Need,
+    aterm_capacity::Admit,
+) -> Result<aterm_capacity::Claim, aterm_capacity::Error>;
+
+/// What runs a stage and admits the run's quiet machine: the live ones ([`LIVE`]), or a test's
+/// stand-ins.
+#[derive(Clone, Copy)]
+struct Seams {
+    stage: fn(&Ctx, &plan::StageSpec) -> Report,
+    admit_quiet: AdmitQuiet,
+}
+
+/// The stages themselves, and the per-user capacity ledger on the live machine.
+const LIVE: Seams = Seams {
+    stage: stages::run_stage,
+    admit_quiet: aterm_capacity::admit,
+};
+
 /// The run's quiet machine ([`Ctx::quiet`]): one claim, admitted before the run's first timed
 /// stage and let go when its last ends, so another run's timed stages wait for all of this run's
 /// rather than taking turns with them.
@@ -581,17 +656,44 @@ struct Quiet {
     claim: Option<aterm_capacity::Claim>,
     /// The run's timed stages still to end ([`takes_quiet`]).
     left: usize,
+    /// How the claim is admitted.
+    admit: AdmitQuiet,
 }
 
 impl Quiet {
-    /// Room for the timed stages of `stages` that `ctx` runs.
-    fn of(ctx: &Ctx, stages: &[plan::StageSpec]) -> Mutex<Quiet> {
+    /// Room for the timed stages of `stages` that `ctx` runs, admitted by `admit`.
+    fn of(ctx: &Ctx, stages: &[plan::StageSpec], admit: AdmitQuiet) -> Mutex<Quiet> {
         Mutex::new(Quiet {
             claim: None,
             left: stages.iter().filter(|s| takes_quiet(ctx, s.id)).count(),
+            admit,
         })
     }
+
+    /// One timed stage ended, or never ran: the claim goes with the last.
+    fn passed(&mut self) {
+        self.left = self.left.saturating_sub(1);
+        if self.left == 0 {
+            self.claim = None;
+        }
+    }
 }
+
+/// Whether the run is ending on an interrupt (`exec::group::stopping`): its own handler's, or
+/// one that ended a wait for capacity (`exec::group::stop_run`). No stage starts after it.
+#[cfg(unix)]
+fn stopping() -> bool {
+    exec::group::stopping()
+}
+
+/// Whether the run is ending on an interrupt: never off Unix, where no handler ends it.
+#[cfg(not(unix))]
+const fn stopping() -> bool {
+    false
+}
+
+/// Why a stage the run's end kept from starting did not run.
+const ENDING: &str = "the run was interrupted before this stage started, so it decided nothing";
 
 /// What the run's quiet claim did for a timed stage, for its time line: `first` when the stage's
 /// admission made it.
@@ -616,42 +718,74 @@ fn admission(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit, first: 
 /// before it starts, waiting with no deadline and saying once a minute what it waits for, and let
 /// go when the last one's `f` returns. A ledger that cannot be used is said, and the stage runs
 /// unadmitted, as a run with no claim does. Also what the claim did, for the stage's time line.
+///
+/// # Errors
+/// Why `f` never ran: an interrupt ended the wait, which ends the run
+/// (`exec::group::stop_run`: no stage child starts after it, and each live one is ended, so the
+/// stages it cut short or kept from starting are COULD NOT RUN); or the run was already ending
+/// ([`stopping`]), and no wait begins.
 fn quietly<T>(
     ctx: &Ctx,
     quiet: &Mutex<Quiet>,
     title: &str,
     f: impl FnOnce() -> T,
-) -> (T, Option<String>) {
+) -> Result<(T, Option<String>), String> {
     let Some(mode) = ctx.quiet else {
-        return (f(), None);
+        return if stopping() {
+            Err(ENDING.to_owned())
+        } else {
+            Ok((f(), None))
+        };
     };
-    let said = {
-        let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
+    let said = if stopping() {
+        Err(None)
+    } else {
         match &q.claim {
-            Some(claim) => admission(claim, mode, false),
-            None => match aterm_capacity::admit(
+            Some(claim) => Ok(admission(claim, mode, false)),
+            None => match (q.admit)(
                 aterm_capacity::Need::timing(format!("verify {title}")),
                 mode,
             ) {
                 Ok(claim) => {
                     let said = admission(&claim, mode, true);
                     q.claim = Some(claim);
-                    said
+                    Ok(said)
                 }
+                Err(e @ aterm_capacity::Error::Stopped { .. }) => Err(Some(e)),
                 Err(e) => {
                     eprintln!("verify: {e}; {title} runs unadmitted");
-                    format!("unadmitted: {e}")
+                    Ok(format!("unadmitted: {e}"))
                 }
             },
         }
     };
+    let said = match said {
+        Ok(said) => said,
+        Err(stopped) => {
+            q.passed();
+            drop(q);
+            let Some(e) = stopped else {
+                return Err(ENDING.to_owned());
+            };
+            eprintln!(
+                "verify: {title}: the run's quiet claim was {e}; the run ends, and what it did \
+                 not decide COULD NOT RUN"
+            );
+            #[cfg(unix)]
+            exec::group::stop_run();
+            return Err(format!(
+                "its quiet claim was {e}; it started nothing, and the run ends"
+            ));
+        }
+    };
+    drop(q);
     let out = f();
-    let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
-    q.left = q.left.saturating_sub(1);
-    if q.left == 0 {
-        q.claim = None;
-    }
-    (out, Some(said))
+    quiet
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .passed();
+    Ok((out, Some(said)))
 }
 
 /// The ` time ` line under a stage in the log: how long it ran, when it started, and `machine`,
@@ -681,21 +815,37 @@ fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
         && !(needs_app && ctx.measure_artifact.is_none())
 }
 
-/// One stage, run on the run's quiet machine when it is timed ([`quietly`]), with the machine
-/// read as it starts and as it ends: the report, when it started (after any admission wait) and
-/// what the machine did meanwhile.
-fn staged(ctx: &Ctx, quiet: &Mutex<Quiet>, spec: &plan::StageSpec) -> (Report, Instant, String) {
+/// One stage, run by `stage` on the run's quiet machine when it is timed ([`quietly`]), with the
+/// machine read as it starts and as it ends: the report, when it started (after any admission
+/// wait) and what the machine did meanwhile. A stage the run's end keeps from starting
+/// ([`stopping`]), or whose quiet claim an interrupt ended, is COULD NOT RUN.
+fn staged(
+    ctx: &Ctx,
+    quiet: &Mutex<Quiet>,
+    spec: &plan::StageSpec,
+    stage: fn(&Ctx, &plan::StageSpec) -> Report,
+) -> (Report, Instant, String) {
     let run = || {
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
-        let report = stages::run_stage(ctx, spec);
+        let report = stage(ctx, spec);
         let to = aterm_capacity::Live.read(None);
         (report, begun, aterm_capacity::between(&from, &to))
     };
-    let ((report, begun, mut machine), admitted) = if takes_quiet(ctx, spec.id) {
+    let ran = if takes_quiet(ctx, spec.id) {
         quietly(ctx, quiet, &spec.title, run)
+    } else if stopping() {
+        Err(ENDING.to_owned())
     } else {
-        (run(), None)
+        Ok((run(), None))
+    };
+    let ((report, begun, mut machine), admitted) = match ran {
+        Ok(ran) => ran,
+        Err(why) => {
+            let mut report = Report::new(spec.title.clone());
+            report.cannot_run(format!("{} — {why}", spec.title));
+            return (report, Instant::now(), String::new());
+        }
     };
     if let Some(said) = admitted {
         machine.push_str("; ");
@@ -771,6 +921,17 @@ pub fn run(
     log: &mut (dyn Write + Send),
     show: &Show<'_>,
 ) -> std::io::Result<i32> {
+    run_with(ctx, out, log, show, LIVE)
+}
+
+/// [`run`], its stages run and its quiet machine admitted by `seams`.
+fn run_with(
+    ctx: &Ctx,
+    out: &mut (dyn Write + Send),
+    log: &mut (dyn Write + Send),
+    show: &Show<'_>,
+    seams: Seams,
+) -> std::io::Result<i32> {
     let cone = show.cone;
     let started = Instant::now();
     let head = header(ctx, cone);
@@ -801,7 +962,7 @@ pub fn run(
     let out = Mutex::new(out);
     let t0 = Instant::now();
     let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; stages.len()]);
-    let quiet = Quiet::of(ctx, &stages);
+    let quiet = Quiet::of(ctx, &stages, seams.admit_quiet);
     let mut log_err = None;
 
     sched::run_stages(
@@ -812,7 +973,7 @@ pub fn run(
                 .position(|s| std::ptr::eq(s, spec))
                 .unwrap_or_default();
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
-            let (report, begun_at, machine) = staged(ctx, &quiet, spec);
+            let (report, begun_at, machine) = staged(ctx, &quiet, spec, seams.stage);
             if let Some(k) = owner
                 && let Ok(mut p) = progress[k].lock()
             {
@@ -1043,6 +1204,18 @@ pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
     (out.status.success() && !top.is_empty()).then(|| PathBuf::from(top))
 }
 
+/// The commit the checkout at `root` has checked out, in full.
+#[must_use]
+pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
+    let out = changed::git(root, path_env)
+        .args(["rev-parse", "HEAD"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !head.is_empty()).then_some(head)
+}
+
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
@@ -1191,7 +1364,13 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     #[cfg(unix)]
     let disk = match disk::admit(&ctx, parsed.admit) {
         Ok(held) => held,
-        Err(why) => return could_not_run(why),
+        Err(why) => {
+            if let Some(record) = &ctx.runs {
+                record.finish(&runs::LiveKernel);
+            }
+            std::fs::remove_dir_all(&scratch).ok();
+            return could_not_run(why);
+        }
     };
     let log = open_log(parsed.log.as_deref(), cwd, &ctx);
     let log_shown = log
@@ -1338,6 +1517,9 @@ pub fn find_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
 
 /// aterm's directories in this user's cache ([`aterm_uds::host::user_cache`]) on [`host_user_cache`].
 pub use aterm_uds::host::{host_user_cache, user_cache};
+
+#[cfg(all(test, unix))]
+mod quiet_interrupt_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1629,6 +1811,51 @@ mod tests {
             assert!(!plain.rerun(check).contains("--no-windows"), "{check:?}");
         }
         assert!(!quiet.rerun(Check::Fmt).contains("--no-windows"));
+    }
+
+    /// A bundle names its version and commit from its `Info.plist`, and HEAD built it only when
+    /// that commit, less `-dirty`, begins HEAD.
+    #[cfg(unix)]
+    #[test]
+    fn a_measured_bundle_names_the_commit_that_built_it() {
+        let tmp = mktemp_dir("atv-app").expect("mktemp");
+        let app = tmp.join("aterm.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).expect("mkdir");
+        let bin = app.join("Contents/MacOS/aterm");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let unnamed = MeasureArtifact::at(&app).expect("a bundle");
+        assert_eq!(
+            (unnamed.version.as_deref(), unnamed.commit.as_deref()),
+            (None, None)
+        );
+        assert!(
+            !unnamed.built_from("22cb722a2ec9ab"),
+            "no commit is no build of HEAD"
+        );
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            "<dict>\n\t<key>ATermGitCommit</key>\n\t<string>22cb722a2ec9</string>\n\
+             \t<key>CFBundleShortVersionString</key>\n\t<string>0.137.0</string>\n</dict>\n",
+        )
+        .expect("write");
+        let named = MeasureArtifact::at(&app).expect("a bundle");
+        assert_eq!(named.version.as_deref(), Some("0.137.0"));
+        assert_eq!(named.commit.as_deref(), Some("22cb722a2ec9"));
+        assert!(
+            named
+                .describe()
+                .starts_with("aterm 0.137.0 (22cb722a2ec9) at ")
+        );
+        assert!(named.built_from("22cb722a2ec9abcdef0123456789abcdef012345"));
+        assert!(!named.built_from("215fb53331abd9acb2a33e7d7a21d1fa3c2bd8f2"));
+        let dirty = MeasureArtifact {
+            commit: Some("22cb722a2ec9-dirty".into()),
+            ..named
+        };
+        assert!(dirty.built_from("22cb722a2ec9abcdef0123456789abcdef012345"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A usage error is 2; no checkout or no pin is 3 with its fix, before anything runs.

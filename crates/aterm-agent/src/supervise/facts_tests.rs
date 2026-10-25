@@ -192,3 +192,102 @@ fn a_seed_holds_a_told_call_by_its_own_key_alone() {
     let r = reading(T0, vec![call(27090, Some(1), 40), call(27090, Some(2), 5)]);
     assert_eq!(s.pending(Some(&r), T0).map(|f| f.key), Some(born_since));
 }
+
+/// TWO WAKES, THE FIRST TYPED (the slice-2 plan's S3): a successor seeded from the ledger's rows
+/// holds wake #1's episode told and no other, so #2, ready, is its break's due line; and a wake
+/// its await answered and the loop heard is told too. NEGATIVE CONTROL: `KindWideWakeSeed`, the
+/// hold's kind-wide seed, holds #2 told as well.
+#[test]
+fn a_seed_holds_a_typed_wake_by_its_own_episode() {
+    use crate::supervise::Autopilot;
+    use crate::supervise::occupancy::OccupancyReading;
+    use crate::supervise::occupancy::door;
+    use crate::supervise::occupancy::fault::{self, Fault};
+    use crate::supervise::occupancy::rules::{
+        Books, Guards, HoldSeen, RuleId, Verdict, WAIT_NUDGE_AFTER_MS, WakeSight, decide,
+    };
+    use crate::supervise::occupancy::wakes_seen::{
+        AtomKind, Declarer, Prio, WakeSeen, WakeState, WakesSeen, wake_episode,
+    };
+    let wake = |ord: u16| WakeSeen {
+        ord,
+        class: Declarer::Agent,
+        prio: Prio::Normal,
+        state: WakeState::Ready,
+        declared_ms: T0 + i64::from(ord),
+        ready_since_ms: Some(T0 + 10),
+        kinds: vec![AtomKind::File],
+        need: None,
+        need_slots: false,
+        need_met: true,
+        await_only: false,
+    };
+    let row = |ts: i64, decision: &str, reason: &str| {
+        format!(
+            r#"{{"ts":{ts},"sid":"s-1","rule_id":"fact-wake@v1","decision":"{decision}","reason":"{reason}"}}"#
+        )
+    };
+    let typed = format!(
+        "rule=wake@v1 episode={:016x} held_ms=0",
+        wake_episode(T0 + 1, 1)
+    );
+    let body = [
+        row(T0 + 20, "typed", &typed),
+        row(
+            T0 + 30,
+            "waiting",
+            &door::wake_heard_reason(3, wake_episode(T0 + 3, 3)),
+        ),
+    ]
+    .join("\n");
+    let rows = door::seed_rows_in(&body, Some("@s-1"));
+    assert_eq!(
+        rows.iter().map(|(_, _, o)| *o).collect::<Vec<_>>(),
+        [SeedOutcome::Typed, SeedOutcome::Answered]
+    );
+    let book = WakesSeen {
+        wakes: vec![wake(2)],
+    };
+    let next = |kind_wide: bool| {
+        let mut facts = FactsState::default();
+        if kind_wide {
+            fault::with(Fault::KindWideWakeSeed, || facts.seed(&rows, T0 + 60_000));
+        } else {
+            facts.seed(&rows, T0 + 60_000);
+        }
+        let key = |id| EpisodeKey {
+            kind: FactKind::Wake,
+            id,
+        };
+        assert!(facts.is_told(key(wake_episode(T0 + 1, 1))), "#1 typed");
+        assert!(facts.is_told(key(wake_episode(T0 + 3, 3))), "#3 heard");
+        let told = |id| facts.is_told(key(id));
+        let sight = WakeSight {
+            seen: &book,
+            wall_ms: T0 + 60_000,
+            told: &told,
+            ranked: true,
+        };
+        let hold = HoldSeen {
+            since_ms: 0,
+            declared: true,
+        };
+        decide(
+            &OccupancyReading::default(),
+            Some(hold),
+            &Books::default(),
+            &Guards::clear(Autopilot::Cruise),
+            WAIT_NUDGE_AFTER_MS,
+            60_000,
+            &sight,
+        )[RuleId::Wake.index()]
+        .1
+        .clone()
+    };
+    assert!(
+        matches!(next(false), Verdict::Due(line) if line.fact().starts_with("wake #2 ")),
+        "{:?}",
+        next(false)
+    );
+    assert_eq!(next(true), Verdict::Quiet, "a kind-wide seed holds #2 told");
+}

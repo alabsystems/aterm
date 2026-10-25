@@ -13,7 +13,13 @@
 //!   [`COOLDOWN_MS`] of the volume's last line;
 //! - it gathers one nominee from each host for [`NOMINATE_MS`] and elects the session whose
 //!   checkout holds the most of what the pass left, one at a turn break before one mid-turn
-//!   ([`rank`]);
+//!   ([`rank`]); a session held where it cannot take a line now (an unspent usage-limit wall, a
+//!   box only its owner can answer, the owner's hold or a person's take-over, a draft left in its
+//!   prompt: [`Look::held`], [`HeldBy`]) is never nominated, an elected one its host holds so goes
+//!   back to the episode once ([`Said::Returned`], [`Entry::returned`]), and a round with nobody
+//!   else to elect waits for one to be past ([`Said::Waiting`]) instead of running out; a nominee
+//!   whose host ended stands [`ADOPT_MS`] from the first look that read it ended, so a seamless
+//!   update's successor nominates it again before another host's look elects without it;
 //! - only the elected session's own host types, and only while the lease still names it
 //!   ([`claim`], then [`typed`]);
 //! - a session that frees nothing within [`ANSWER_MS`] of its line or ends hands the ask to one
@@ -21,8 +27,8 @@
 //!   be asked ([`release`]); after [`MAX_ASKS`] lines or [`MAX_PICKS`] elections the episode is
 //!   out ([`Said::Out`]) and the owner's disk line says so;
 //! - a pick whose host ended is adopted by the host that took over its session (a seamless
-//!   update's successor, a new [`HostId`]), and other hosts give it [`ADOPT_MS`] to do so, so an
-//!   update hands nothing off;
+//!   update's successor, a new [`HostId`]), before its look's pass ([`take_over`]), and other
+//!   hosts give it [`ADOPT_MS`] to do so, so an update hands nothing off;
 //! - the episode ends only when a look reads the volume back past the floor it is held to by
 //!   [`END_MARGIN`] (and its free inodes past their line by [`END_FILES_MARGIN`]): the opening
 //!   host's floor, raised by any later look of a host whose floor is higher ([`Entry::floor`]),
@@ -84,9 +90,10 @@ pub const TYPE_GRACE_MS: i64 = 10 * 60_000;
 /// supervise its session, from the first such look that read its host ended
 /// ([`Phase::Owed`]'s `orphan_ms`), before one of them hands it on as undelivered: a seamless
 /// update's successor, which supervises the session, looks first two minutes after it starts and
-/// then once a minute (the window's `DISK_FIRST_LOOK` and `DISK_TICK`, held to this there), so it
-/// adopts the pick before another host's look gives it away. A host that ended with no successor
-/// hands the ask on this much later.
+/// then once a minute (the window's `DISK_FIRST_LOOK` and `DISK_TICK`, held to this there), and
+/// takes the pick over as its look begins, before its pass ([`take_over`]), so it adopts the pick
+/// before another host's look gives it away however long that pass runs. A host that ended with
+/// no successor hands the ask on this much later.
 pub const ADOPT_MS: i64 = 3 * 60_000;
 
 /// A rise in free space of at least this, read since the line, is space the asked session freed.
@@ -111,8 +118,10 @@ pub const END_FILES_MARGIN: u64 = super::EMERGENCY_FILES_FREE;
 pub const MAX_ASKS: u32 = 2;
 
 /// Elections an episode, lines or not: a session that never takes its line still costs one, but
-/// one its host released ([`Miss::Released`]: it may not be asked) costs none, as no session is
-/// elected twice.
+/// one its host released ([`Miss::Released`]: it may not be asked) costs none, as it is not
+/// elected again this episode, and neither does one its host held where it could not take a line
+/// before its line ([`Said::Returned`]), as a session goes back to the episode so only once
+/// ([`Entry::returned`]): a session is elected at most twice an episode.
 pub const MAX_PICKS: u32 = 4;
 
 /// Volumes the lease keeps.
@@ -299,6 +308,14 @@ pub struct Look<'a> {
     pub barred: &'a [String],
     /// Every live session of this host: an asked one that leaves them hands the ask on.
     pub live: &'a [String],
+    /// This host's sessions the seat rule would seat but for what holds them now and passes, each
+    /// with what holds it ([`HeldBy`]): an unspent usage-limit wall, a box escalated to their
+    /// owner, the owner's hold or a person's take-over, or a draft left standing in the composer.
+    /// None of them is in [`Self::seats`]; an elected one among them goes back to the episode at
+    /// no election's cost ([`Said::Returned`]), as it could not take its line before its
+    /// deadline, and is nominated again once past; a round with nobody else to elect waits for one
+    /// of them to be past ([`Said::Waiting`], [`Entry::held`]) instead of running out.
+    pub held: &'a [(String, HeldBy)],
     /// Whether another host's process still runs ([`HostId::alive`]).
     pub alive: &'a dyn Fn(&HostId) -> bool,
 }
@@ -319,6 +336,147 @@ pub struct Nominee {
     pub at_break: bool,
     /// Unix ms.
     pub seen_ms: i64,
+    /// When a look of another host that does not run this session first read its host ended
+    /// ([`stands`]): the nominee stands [`ADOPT_MS`] from then, so a seamless update's
+    /// successor nominates the session again before the round elects without it. `None` while
+    /// its host runs, and in a lease an older build wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_ms: Option<i64>,
+}
+
+/// What holds a session where it cannot take a line now ([`Look::held`], [`Held::why`]): each
+/// passes, so the session is held, not barred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum HeldBy {
+    /// An unspent usage-limit wall: it passes at the limit's reset.
+    #[serde(rename = "limited")]
+    Limit,
+    /// A box its loop escalated to its owner: it passes once the owner answers it.
+    #[serde(rename = "box")]
+    Box,
+    /// The owner's hold or a person's take-over (`status hold=1`): it passes once lifted.
+    #[serde(rename = "hold")]
+    Hold,
+    /// A draft left standing in its composer: it passes once the draft is sent or cleared.
+    #[serde(rename = "draft")]
+    Draft,
+}
+
+impl HeldBy {
+    /// Every hold, in order.
+    pub const ALL: [HeldBy; 4] = [HeldBy::Limit, HeldBy::Box, HeldBy::Hold, HeldBy::Draft];
+
+    /// The word a look, the lease's record and a turn break's `wait:<why>` say.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            HeldBy::Limit => "limited",
+            HeldBy::Box => "box",
+            HeldBy::Hold => "hold",
+            HeldBy::Draft => "draft",
+        }
+    }
+
+    /// The hold `word` names ([`Self::word`]); `None` for any other word.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<HeldBy> {
+        HeldBy::ALL.into_iter().find(|h| h.word() == word)
+    }
+
+    /// Where it holds a session, as the owner reads it on their own line (`you`) or anyone reads
+    /// it elsewhere.
+    const fn at(self, you: bool) -> &'static str {
+        match (self, you) {
+            (HeldBy::Limit, _) => "at a usage limit",
+            (HeldBy::Box, true) => "at a box only you can answer",
+            (HeldBy::Box, false) => "at a box only its owner can answer",
+            (HeldBy::Hold, true) => "on hold (yours, or a person's take-over)",
+            (HeldBy::Hold, false) => "on hold (its owner's, or a person's take-over)",
+            (HeldBy::Draft, _) => "with a draft left in its prompt",
+        }
+    }
+
+    /// What ends it.
+    const fn past(self) -> &'static str {
+        match self {
+            HeldBy::Limit | HeldBy::Box => "it is past",
+            HeldBy::Hold => "its hold is lifted",
+            HeldBy::Draft => "its draft is sent or cleared",
+        }
+    }
+}
+
+/// `phrases`, each said once, joined as a person reads a choice: `a`, `a or b`, `a, b or c`.
+fn either(phrases: impl IntoIterator<Item = &'static str>) -> String {
+    let mut said: Vec<&str> = Vec::new();
+    for p in phrases {
+        if !said.contains(&p) {
+            said.push(p);
+        }
+    }
+    match said.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// Where `why` holds a session ([`HeldBy::at`]), every hold said once: `you`, as the owner reads
+/// it on their own line.
+fn held_at(why: &[HeldBy], you: bool) -> String {
+    either(why.iter().map(|h| h.at(you)))
+}
+
+/// What ends the holds `why` ([`HeldBy::past`]), each said once.
+fn held_past(why: &[HeldBy]) -> String {
+    either(why.iter().map(|h| h.past()))
+}
+
+/// The hold a lease records ([`Held::why`]): a word this build does not know reads as none.
+fn held_by_word<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<HeldBy>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?
+        .as_deref()
+        .and_then(HeldBy::from_word))
+}
+
+/// One of a host's sessions held where it cannot take a line now ([`Look::held`]), as that host's
+/// last look read it ([`Entry::held`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    pub host: HostId,
+    pub sid: String,
+    /// What holds it, as its host read it; `None` in a lease an older build wrote, which a reader
+    /// says as a usage limit or a box ([`HeldBy::Limit`], [`HeldBy::Box`]), the holds that build
+    /// knew.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "held_by_word"
+    )]
+    pub why: Option<HeldBy>,
+    /// When a look of another host that does not run this session first read its host ended
+    /// ([`stands`]), as for a [`Nominee`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_ms: Option<i64>,
+}
+
+impl Held {
+    /// What holds it, as a reader says it: a record an older build wrote, with no hold, is said as
+    /// either hold that build knew.
+    fn holds(&self) -> &'static [HeldBy] {
+        match self.why {
+            Some(HeldBy::Limit) => &[HeldBy::Limit],
+            Some(HeldBy::Box) => &[HeldBy::Box],
+            Some(HeldBy::Hold) => &[HeldBy::Hold],
+            Some(HeldBy::Draft) => &[HeldBy::Draft],
+            None => &[HeldBy::Limit, HeldBy::Box],
+        }
+    }
+}
+
+/// What `held` (a look's [`Look::held`]) says holds session `sid`; `None`: it is not held there.
+fn holds(held: &[(String, HeldBy)], sid: &str) -> Option<HeldBy> {
+    held.iter().find(|(s, _)| s == sid).map(|(_, why)| *why)
 }
 
 /// Why a pick did not free the volume: what hands the ask on.
@@ -329,8 +487,11 @@ pub enum Miss {
     /// ended and no host adopted it within [`ADOPT_MS`], before its line.
     Undelivered,
     /// Its host found it may not be asked ([`Look::barred`], or at its turn break its worker's
-    /// finding: its task finished, landed or exited, no task yet, its Autopilot Off), before its
-    /// line.
+    /// finding: its task finished, landed or exited, no task yet, its Autopilot Off), or held it
+    /// where it cannot take a line now ([`Look::held`]: an unspent usage-limit wall, a box only
+    /// its owner can answer, the owner's hold or a person's take-over, a draft left in its prompt)
+    /// after it went back to the episode once ([`Entry::returned`]), before its line. A first
+    /// such hold returns it instead ([`Said::Returned`]).
     Released,
     /// Its session ended after its line.
     Ended,
@@ -385,7 +546,8 @@ pub enum Phase {
     },
     /// The asked session freed `freed` bytes: nobody else is asked this episode.
     Settled { at_ms: i64, sid: String, freed: u64 },
-    /// No more asks this episode; `last`: why the last pick missed (`None`: nobody was nominated).
+    /// No more asks this episode; `last`: why the last pick missed (`None`: nobody was nominated,
+    /// and nobody was held: [`Said::Waiting`]).
     Out { at_ms: i64, last: Option<Miss> },
 }
 
@@ -422,16 +584,40 @@ pub struct Entry {
     /// and records it.
     pub floor: Option<Floor>,
     pub phase: Phase,
-    /// The sessions elected this episode, in order: none is elected twice.
+    /// The sessions elected this episode, in order: none is elected again while it is here, and
+    /// one leaves it only as it goes back to the episode ([`Self::returned`]).
     pub picks: Vec<Pick>,
     /// Of [`Self::picks`], those their hosts released ([`Miss::Released`]).
     pub released: u32,
+    /// The sessions elected this episode that their hosts held where they could not take a line
+    /// before their line ([`Look::held`]: a usage-limit wall, a box only their owner can answer,
+    /// the owner's hold or a person's take-over, a draft left in their prompt), in order: each
+    /// went back to the episode ([`Said::Returned`]), leaving [`Self::picks`] at no election's
+    /// cost, so it is nominated again once past and a round with nobody else to elect waits for
+    /// it. A session goes back so once an episode: held again after its next election, it is
+    /// released ([`Miss::Released`]) and stays a pick, so a session whose turns keep stopping at
+    /// boxes does not keep the ask from every other session. None took a line: a host records a line
+    /// whose record was lost before its look steps the lease ([`typed_unrecorded`]), so a pick
+    /// goes back only while it is owed its line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub returned: Vec<String>,
     /// Lines typed this episode.
     pub asks: u32,
     /// The sessions that took a line this episode, in order.
     pub asked: Vec<String>,
     /// The volume's last line (unix ms), across episodes ([`COOLDOWN_MS`]).
     pub last_ask_ms: Option<i64>,
+    /// Every host's sessions held where they cannot take a line now ([`Look::held`]), as each
+    /// host's last look that stepped this volume's open episode read them: what a round with
+    /// nobody else to elect waits on ([`Said::Waiting`]). A host's are replaced at each of its
+    /// looks; another host's stand while it runs, and for [`ADOPT_MS`] after a look first read it
+    /// ended ([`stands`]), unless a host that runs the session took the record over as its look
+    /// began ([`take_over`]). They are kept only while an episode is open: no look steps a volume
+    /// read clear with none open, so a record kept past its episode would go stale there. An
+    /// episode starts with the opening look's alone, and every live host's look records its own
+    /// within the round's [`NOMINATE_MS`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<Held>,
 }
 
 impl Entry {
@@ -554,9 +740,26 @@ pub enum Said {
         from: Pick,
         why: Miss,
     },
-    /// No more asks this episode: the owner's line says so.
+    /// Its host held the pick where it cannot take a line before its line ([`Look::held`]: a
+    /// usage-limit wall, a box only its owner can answer, the owner's hold or a person's
+    /// take-over, a draft left in its prompt), `why` saying which: it goes back to the episode at
+    /// no election's cost ([`Entry::returned`]), and a new round elects another session, or it
+    /// once past.
+    Returned {
+        from: Pick,
+        why: HeldBy,
+    },
+    /// The round's time is over, but every session it could elect is held where it cannot take a
+    /// line now ([`Look::held`]), `why` saying by what, each hold once: it waits for one to be
+    /// past, and elects at the first look after.
+    Waiting {
+        held: Vec<String>,
+        why: Vec<HeldBy>,
+    },
+    /// No more asks this episode: the owner's line says so. `asked`: a line went this episode.
     Out {
         last: Option<Miss>,
+        asked: bool,
     },
     /// The episode was settled by a session that freed space.
     Settled,
@@ -583,6 +786,8 @@ impl Said {
             Said::Asked { .. } => "asked",
             Said::Freed { .. } => "freed",
             Said::Handoff { .. } => "handoff",
+            Said::Returned { .. } => "returned",
+            Said::Waiting { .. } => "waiting",
             Said::Out { .. } => "out",
             Said::Settled => "settled",
             Said::Spent => "spent",
@@ -600,6 +805,7 @@ impl Said {
                 | Said::Elected { .. }
                 | Said::Freed { .. }
                 | Said::Handoff { .. }
+                | Said::Returned { .. }
                 | Said::Out { .. }
                 | Said::Ended { .. }
         )
@@ -612,7 +818,7 @@ impl Said {
             Said::Elected { pick, .. } | Said::Owed { pick, .. } | Said::Asked { pick, .. } => {
                 &pick.sid
             }
-            Said::Handoff { from, .. } => &from.sid,
+            Said::Handoff { from, .. } | Said::Returned { from, .. } => &from.sid,
             Said::Freed { sid, .. } => sid,
             Said::Nominating {
                 seat: Some(sid), ..
@@ -677,12 +883,39 @@ impl Said {
                 from.sid,
                 why.word()
             ),
-            Said::Out { last: None } => {
+            Said::Returned { from, why } => format!(
+                "@{} is {} before its line: it costs no election, and a new round asks another \
+                 session, or it once {}",
+                from.sid,
+                why.at(false),
+                why.past()
+            ),
+            Said::Waiting { held, why } => format!(
+                "every session that could be asked is {} ({}): one is asked once {}",
+                held_at(why, false),
+                held.iter()
+                    .map(|s| format!("@{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                held_past(why)
+            ),
+            Said::Out { last: None, .. } => {
                 "no host had a session to ask: the owner's disk line says so".to_owned()
             }
-            Said::Out { last: Some(why) } => format!(
+            Said::Out {
+                last: Some(why),
+                asked: true,
+            } => format!(
                 "the agents asked did not free it (last: {}): no more are asked; the owner's disk \
                  line says so",
+                why.word()
+            ),
+            Said::Out {
+                last: Some(why),
+                asked: false,
+            } => format!(
+                "no session took its line (last: {}): no more are asked; the owner's disk line \
+                 says so",
                 why.word()
             ),
             Said::Settled => "an agent freed space this episode: nobody else is asked".to_owned(),
@@ -735,6 +968,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     };
     if entry.episode_ms.is_some() {
         hold(entry, look);
+        note_held(entry, look);
     }
     let now = look.now_ms;
     match entry.phase.clone() {
@@ -765,18 +999,27 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             // Adopted where this host supervises the session or its seat rule bars it: a pick
             // whose agent exited around a seamless update has left the successor's supervised
             // roster, and the successor releases it below at no election's cost.
-            let held: &[&[String]] = &[look.supervised, look.barred];
-            #[cfg(any(test, debug_assertions))]
-            let held = if fault::armed(fault::Fault::AdoptSupervisedOnly) {
-                &held[..1]
-            } else {
-                held
-            };
-            let pick = adopt(entry, pick, look, held);
+            let pick = adopt(
+                entry,
+                pick,
+                look.host,
+                look.alive,
+                &owed_adopters(look.supervised, look.barred),
+            );
             let here = pick.host == *look.host;
             let barred = here && look.barred.contains(&pick.sid);
             #[cfg(any(test, debug_assertions))]
             let barred = barred && !fault::armed(fault::Fault::KeepBarred);
+            // A pick its host holds where it cannot take a line (`Look::held`: a wall, a box, a
+            // hold, a draft) could not take its line before its deadline: it goes back to the
+            // episode at no election's cost, as it is fit again once past ([`give_back`]).
+            let walled = if here {
+                holds(look.held, &pick.sid)
+            } else {
+                None
+            };
+            #[cfg(any(test, debug_assertions))]
+            let walled = walled.filter(|_| !fault::armed(fault::Fault::KeepHeld));
             // A pick whose host ended, at the look of a host that does not supervise its session:
             // owed on for [`ADOPT_MS`] from the first such look, so a successor adopts it first.
             let orphan = (!here && !(look.alive)(&pick.host)).then(|| orphan_ms.unwrap_or(now));
@@ -798,6 +1041,8 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             // that exited leaves the supervised roster, and its task record says why.
             if barred {
                 hand_off(entry, now, pick, Miss::Released)
+            } else if let Some(why) = walled {
+                give_back(entry, now, pick, why)
             } else if gone || now >= until_ms {
                 hand_off(entry, now, pick, Miss::Undelivered)
             } else {
@@ -814,7 +1059,7 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
             free_at,
             best_free,
         } => {
-            let pick = adopt(entry, pick, look, &[look.live]);
+            let pick = adopt(entry, pick, look.host, look.alive, &[look.live]);
             let best = best_free.max(look.free);
             let rose = best.saturating_sub(free_at);
             if rose >= FREED_MIN {
@@ -858,16 +1103,30 @@ pub fn step(lease: &mut Lease, look: &Look<'_>) -> Said {
     }
 }
 
-/// `pick`, moved to this look's host when its own host ended and this host has its session among
-/// `held` (its supervised sessions and those its seat rule bars while the line is owed, its live
-/// ones once it went): a seamless update's successor adopts its sessions under the same sids as a
-/// new [`HostId`], so the pick moves to it, in the phase and in [`Entry::picks`], and its line is
-/// typed, its release made or its answer judged there, instead of the ask being handed on as
-/// though its session had gone and the session kept out of the episode.
-fn adopt(entry: &mut Entry, pick: Pick, look: &Look<'_>, held: &[&[String]]) -> Pick {
-    if pick.host == *look.host
-        || !held.iter().any(|sids| sids.contains(&pick.sid))
-        || (look.alive)(&pick.host)
+/// The rosters among which a host adopts an owed pick whose host ended ([`adopt`]): its
+/// supervised sessions and those its seat rule bars.
+fn owed_adopters<'a>(supervised: &'a [String], barred: &'a [String]) -> Vec<&'a [String]> {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::AdoptSupervisedOnly) {
+        return vec![supervised];
+    }
+    vec![supervised, barred]
+}
+
+/// `pick`, moved to host `host` when its own host ended (`alive` says not) and `host` has its
+/// session among `held` (its supervised sessions and those its seat rule bars while the line is
+/// owed, its live ones once it went): a seamless update's successor adopts its sessions under the
+/// same sids as a new [`HostId`], so the pick moves to it, in the phase and in [`Entry::picks`],
+/// and its line is typed, its release made or its answer judged there, instead of the ask being
+/// handed on as though its session had gone and the session kept out of the episode.
+fn adopt(
+    entry: &mut Entry,
+    pick: Pick,
+    host: &HostId,
+    alive: &dyn Fn(&HostId) -> bool,
+    held: &[&[String]],
+) -> Pick {
+    if pick.host == *host || !held.iter().any(|sids| sids.contains(&pick.sid)) || alive(&pick.host)
     {
         return pick;
     }
@@ -876,7 +1135,7 @@ fn adopt(entry: &mut Entry, pick: Pick, look: &Look<'_>, held: &[&[String]]) -> 
         return pick;
     }
     let moved = Pick {
-        host: look.host.clone(),
+        host: host.clone(),
         sid: pick.sid.clone(),
     };
     for p in &mut entry.picks {
@@ -888,6 +1147,152 @@ fn adopt(entry: &mut Entry, pick: Pick, look: &Look<'_>, held: &[&[String]]) -> 
         p.clone_from(&moved);
     }
     moved
+}
+
+/// What a host reads of its own sessions before its look's pass ([`take_over`]): only what the
+/// pass does not change. Its fields are [`Look`]'s.
+pub struct Roster<'a> {
+    pub host: &'a HostId,
+    /// The volume ([`aterm_sysprobe::volumes::VolumeKey::spelled`]).
+    pub key: &'a str,
+    /// [`Look::supervised`].
+    pub supervised: &'a [String],
+    /// [`Look::barred`].
+    pub barred: &'a [String],
+    /// [`Look::live`].
+    pub live: &'a [String],
+    /// [`Look::held`].
+    pub held: &'a [(String, HeldBy)],
+    /// Whether another host's process still runs ([`HostId::alive`]).
+    pub alive: &'a dyn Fn(&HostId) -> bool,
+}
+
+/// Before host `r.host`'s look's pass, take over what a host that ended left in volume `r.key`'s
+/// open episode of the sessions `r.host` runs: a seamless update's successor runs them under the
+/// same sids, so they move to it, and every other host's look then reads their host running. That
+/// is the owed pick of a session it supervises or bars, and the asked pick of a live one
+/// ([`adopt`]); the nominee of a session it supervises and bars by no lasting fact, with its
+/// figures kept until its own nomination replaces it, or, where it holds that session
+/// ([`Roster::held`]), a record of it held instead; and the record of a held session
+/// ([`Entry::held`]), whatever this host's seat rule reads of that session before its pass. An
+/// ended host's nominee of a session this host bars or does not supervise is dropped, as the step
+/// after the pass would drop it: that step reads the same roster. Nothing else moves: no round
+/// elects, no pick is handed on, released or given back, no floor is recorded, so the step after
+/// the pass ([`step`]) judges all of that as before, and replaces what was taken over with what
+/// its own reading nominates and holds, under one lock.
+///
+/// A look's pass can run for a minute or more (discovery up to 20 s, each profile walk up to
+/// 10 s), and the step after it was a successor's first chance to adopt: another host's look
+/// between the two, [`ADOPT_MS`] after it first read the ended host, handed the pick off as
+/// undelivered, spending an election on the session the successor runs, or dropped its nominee
+/// and elected a weaker seat. A held record is moved whatever this host reads of the session
+/// before its pass, as that reading can lack what holds it: before its first pass a process
+/// places no session on the volume, so it holds none, and it reads no draft as standing, and the
+/// board's walls are each process's own. Dropped there, another host's look while the pass ran
+/// found the round with nobody to elect or wait for and ran the episode out. Returns the sids
+/// taken over.
+pub fn take_over(lease: &mut Lease, r: &Roster<'_>) -> Vec<String> {
+    let Some(entry) = lease.entry_at(r.key) else {
+        return Vec::new();
+    };
+    if entry.episode_ms.is_none() {
+        return Vec::new();
+    }
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::NoTakeOver) {
+        return Vec::new();
+    }
+    // A record of a session this host runs is moved whatever its seat rule reads before the pass.
+    let unread = true;
+    #[cfg(any(test, debug_assertions))]
+    let unread = unread && !fault::armed(fault::Fault::TakeOverByRule);
+    let ended = |h: &HostId| *h != *r.host && !(r.alive)(h);
+    let mut took = Vec::new();
+    match entry.phase.clone() {
+        Phase::Owed { pick, .. } => {
+            let moved = adopt(
+                entry,
+                pick.clone(),
+                r.host,
+                r.alive,
+                &owed_adopters(r.supervised, r.barred),
+            );
+            if moved != pick {
+                if let Phase::Owed { orphan_ms, .. } = &mut entry.phase {
+                    *orphan_ms = None;
+                }
+                took.push(moved.sid);
+            }
+        }
+        Phase::Asked { pick, .. } => {
+            let moved = adopt(entry, pick.clone(), r.host, r.alive, &[r.live]);
+            if moved != pick {
+                took.push(moved.sid);
+            }
+        }
+        Phase::Idle | Phase::Nominating { .. } | Phase::Settled { .. } | Phase::Out { .. } => {}
+    }
+    let mut now_held: Vec<Held> = Vec::new();
+    if let Phase::Nominating { nominees, .. } = &mut entry.phase {
+        nominees.retain_mut(|n| {
+            if !ended(&n.host) || !r.live.contains(&n.sid) {
+                return true;
+            }
+            if !r.supervised.contains(&n.sid) || r.barred.contains(&n.sid) {
+                return false;
+            }
+            if let Some(why) = holds(r.held, &n.sid) {
+                if unread {
+                    now_held.push(Held {
+                        host: r.host.clone(),
+                        sid: n.sid.clone(),
+                        why: Some(why),
+                        orphan_ms: None,
+                    });
+                    took.push(n.sid.clone());
+                }
+                return false;
+            }
+            n.host = r.host.clone();
+            n.orphan_ms = None;
+            took.push(n.sid.clone());
+            true
+        });
+        // One nominee a host: the best of what it took over and its own.
+        let best = nominees
+            .iter()
+            .filter(|n| n.host == *r.host)
+            .max_by(|a, b| rank((a.held, a.at_break, &a.sid), (b.held, b.at_break, &b.sid)))
+            .map(|n| n.sid.clone());
+        nominees.retain(|n| n.host != *r.host || best.as_ref() == Some(&n.sid));
+    }
+    entry.held.retain_mut(|h| {
+        if !ended(&h.host) || !r.live.contains(&h.sid) {
+            return true;
+        }
+        let now = holds(r.held, &h.sid);
+        if now.is_none() && !unread {
+            return false;
+        }
+        h.host = r.host.clone();
+        h.why = now.or(h.why);
+        h.orphan_ms = None;
+        took.push(h.sid.clone());
+        true
+    });
+    entry.held.extend(now_held);
+    let mut seen: Vec<(HostId, String)> = Vec::new();
+    entry.held.retain(|h| {
+        let key = (h.host.clone(), h.sid.clone());
+        let first = !seen.contains(&key);
+        seen.push(key);
+        first
+    });
+    let over = entry.held.len().saturating_sub(MAX_NOMINEES);
+    entry.held.drain(..over);
+    took.sort();
+    took.dedup();
+    took
 }
 
 /// Whether `look` reads `entry`'s open episode clear of what it is held to: free space at or
@@ -946,8 +1351,11 @@ fn open(entry: &mut Entry, look: &Look<'_>) -> Said {
     });
     entry.picks.clear();
     entry.released = 0;
+    entry.returned.clear();
     entry.asks = 0;
     entry.asked.clear();
+    entry.held.clear();
+    note_held(entry, look);
     entry.phase = Phase::Nominating {
         until_ms: look.now_ms.saturating_add(NOMINATE_MS),
         nominees: Vec::new(),
@@ -986,7 +1394,8 @@ fn hold(entry: &mut Entry, look: &Look<'_>) {
     }
 }
 
-/// This host's best seat not yet picked this episode, in place of its last nominee.
+/// This host's best seat not yet picked this episode, in place of its last nominee; another
+/// host's nominee is kept while it stands ([`stands`]).
 fn nominate(entry: &mut Entry, look: &Look<'_>) {
     let best = look
         .seats
@@ -997,7 +1406,12 @@ fn nominate(entry: &mut Entry, look: &Look<'_>) {
     let Phase::Nominating { nominees, .. } = &mut entry.phase else {
         return;
     };
-    nominees.retain(|n| n.host != *look.host);
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::DropEndedNominee) {
+        nominees.retain(|n| n.host == *look.host || (look.alive)(&n.host));
+    }
+    nominees
+        .retain_mut(|n| n.host != *look.host && stands(&n.host, &n.sid, &mut n.orphan_ms, look));
     if let Some(s) = best {
         nominees.push(Nominee {
             host: look.host.clone(),
@@ -1005,6 +1419,7 @@ fn nominate(entry: &mut Entry, look: &Look<'_>) {
             held: s.held,
             at_break: s.at_break,
             seen_ms: look.now_ms,
+            orphan_ms: None,
         });
     }
     if nominees.len() > MAX_NOMINEES {
@@ -1013,26 +1428,119 @@ fn nominate(entry: &mut Entry, look: &Look<'_>) {
     }
 }
 
+/// Whether a record another host `host` made of its session `sid` (a nominee, a held session)
+/// still stands at `look`: its host runs, or ended less than [`ADOPT_MS`] after a look first read
+/// it ended (`orphan_ms`, stamped here), so a seamless update's successor, which takes the session
+/// over under a new [`HostId`] and looks first two minutes after it starts, makes its own record
+/// of it before the record is dropped. A session this look's host runs is its own to record, so
+/// the other host's record of it stands no more.
+fn stands(host: &HostId, sid: &str, orphan_ms: &mut Option<i64>, look: &Look<'_>) -> bool {
+    if look.live.iter().any(|s| s == sid) {
+        return false;
+    }
+    if (look.alive)(host) {
+        *orphan_ms = None;
+        return true;
+    }
+    let at = *orphan_ms.get_or_insert(look.now_ms);
+    look.now_ms.saturating_sub(at) < ADOPT_MS
+}
+
+/// Record this look's held sessions ([`Look::held`]) in place of its host's last, and keep
+/// another host's while they stand ([`stands`]); at most [`MAX_NOMINEES`], this look's last.
+fn note_held(entry: &mut Entry, look: &Look<'_>) {
+    entry
+        .held
+        .retain_mut(|h| h.host != *look.host && stands(&h.host, &h.sid, &mut h.orphan_ms, look));
+    entry.held.extend(look.held.iter().map(|(sid, why)| Held {
+        host: look.host.clone(),
+        sid: sid.clone(),
+        why: Some(*why),
+        orphan_ms: None,
+    }));
+    let over = entry.held.len().saturating_sub(MAX_NOMINEES);
+    entry.held.drain(..over);
+}
+
+/// The held sessions ([`Entry::held`]) not picked this episode, or gone back to it
+/// ([`Entry::returned`]) since they were: what a round with nobody else to elect waits on.
+fn held_unpicked(entry: &Entry) -> Vec<String> {
+    let mut held: Vec<String> = unpicked_held(entry).map(|h| h.sid.clone()).collect();
+    held.sort();
+    held.dedup();
+    held
+}
+
+/// The records of [`held_unpicked`].
+fn unpicked_held(entry: &Entry) -> impl Iterator<Item = &Held> {
+    entry
+        .held
+        .iter()
+        .filter(|h| !entry.picks.iter().any(|p| p.sid == h.sid))
+}
+
+/// What holds the sessions a round waits on ([`held_unpicked`]), each hold once, in order.
+fn held_why(entry: &Entry) -> Vec<HeldBy> {
+    let mut why: Vec<HeldBy> = unpicked_held(entry)
+        .flat_map(|h| h.holds().iter().copied())
+        .collect();
+    why.sort();
+    why.dedup();
+    why
+}
+
+/// At a look past the round's time: elect the best nominee not yet picked; wait where that is
+/// an ended host's that still stands ([`stands`]: its successor may yet nominate it), or where
+/// there is none and a session not yet picked is held ([`Said::Waiting`]); otherwise run out.
 fn elect(entry: &mut Entry, look: &Look<'_>, after: Option<Miss>) -> Said {
     let now = look.now_ms;
-    let best = match &entry.phase {
-        Phase::Nominating { nominees, .. } => nominees
-            .iter()
-            .filter(|n| !entry.picks.iter().any(|p| p.sid == n.sid))
-            .filter(|n| n.host == *look.host || (look.alive)(&n.host))
-            .max_by(|a, b| {
-                rank((a.held, a.at_break, &a.sid), (b.held, b.at_break, &b.sid))
-                    .then_with(|| b.host.cmp(&a.host))
-            })
-            .cloned(),
-        _ => None,
+    let (best, seat) = match &entry.phase {
+        Phase::Nominating { nominees, .. } => (
+            nominees
+                .iter()
+                .filter(|n| !entry.picks.iter().any(|p| p.sid == n.sid))
+                .max_by(|a, b| {
+                    rank((a.held, a.at_break, &a.sid), (b.held, b.at_break, &b.sid))
+                        .then_with(|| b.host.cmp(&a.host))
+                })
+                .cloned(),
+            nominees
+                .iter()
+                .find(|n| n.host == *look.host)
+                .map(|n| n.sid.clone()),
+        ),
+        _ => (None, None),
     };
+    if let Some(at) = best.as_ref().and_then(|n| n.orphan_ms) {
+        // The best nominee's host ended: the round waits for its successor's look, which
+        // nominates the session again, or for the nominee to stand no more.
+        return Said::Nominating {
+            until_ms: at.saturating_add(ADOPT_MS),
+            seat,
+        };
+    }
     let Some(n) = best else {
+        let held = held_unpicked(entry);
+        #[cfg(any(test, debug_assertions))]
+        let held = if fault::armed(fault::Fault::OutWhileHeld) {
+            Vec::new()
+        } else {
+            held
+        };
+        if !held.is_empty() {
+            return Said::Waiting {
+                held,
+                why: held_why(entry),
+            };
+        }
         entry.phase = Phase::Out {
             at_ms: now,
             last: after,
         };
-        return Said::Out { last: after };
+        return Said::Out {
+            last: after,
+            asked: asked_any(entry),
+        };
     };
     let pick = Pick {
         host: n.host,
@@ -1048,26 +1556,75 @@ fn elect(entry: &mut Entry, look: &Look<'_>, after: Option<Miss>) -> Said {
     Said::Elected { pick, held: n.held }
 }
 
+/// Whether a line went this episode: one counted, or a session recorded as asked.
+fn asked_any(entry: &Entry) -> bool {
+    entry.asks > 0 || !entry.asked.is_empty()
+}
+
 fn hand_off(entry: &mut Entry, now: i64, from: Pick, why: Miss) -> Said {
     if why == Miss::Released {
         entry.released = entry.released.saturating_add(1);
     }
+    if spent(entry) {
+        return run_out(entry, now, why);
+    }
+    next_round(entry, now, why);
+    Said::Handoff { from, why }
+}
+
+/// Owed pick `from`, which its host holds where it cannot take a line (`why`, [`Look::held`]),
+/// goes back to the episode: it leaves [`Entry::picks`], so it costs no election, is nominated
+/// again once past, and a round with nobody else to elect waits for it ([`held_unpicked`]). A
+/// session goes back so once an episode ([`Entry::returned`]): held again after its next
+/// election, it is released ([`Miss::Released`]) and stays a pick, so a session whose turns keep
+/// stopping at boxes does not keep the ask from every other session.
+fn give_back(entry: &mut Entry, now: i64, from: Pick, why: HeldBy) -> Said {
+    #[cfg(any(test, debug_assertions))]
+    if fault::armed(fault::Fault::HoldKeepsPick) {
+        return hand_off(entry, now, from, Miss::Released);
+    }
+    if entry.returned.contains(&from.sid) {
+        return hand_off(entry, now, from, Miss::Released);
+    }
+    if let Some(at) = entry.picks.iter().rposition(|p| *p == from) {
+        entry.picks.remove(at);
+    }
+    entry.returned.push(from.sid.clone());
+    if spent(entry) {
+        return run_out(entry, now, Miss::Released);
+    }
+    next_round(entry, now, Miss::Released);
+    Said::Returned { from, why }
+}
+
+/// Whether the episode's lines ([`MAX_ASKS`]) or elections ([`MAX_PICKS`], those released not
+/// counted) are spent.
+fn spent(entry: &Entry) -> bool {
     let picks = u32::try_from(entry.picks.len())
         .unwrap_or(u32::MAX)
         .saturating_sub(entry.released);
-    if entry.asks >= MAX_ASKS || picks >= MAX_PICKS {
-        entry.phase = Phase::Out {
-            at_ms: now,
-            last: Some(why),
-        };
-        return Said::Out { last: Some(why) };
+    entry.asks >= MAX_ASKS || picks >= MAX_PICKS
+}
+
+/// The episode runs out ([`Said::Out`]) after a pick missed for `why`.
+fn run_out(entry: &mut Entry, now: i64, why: Miss) -> Said {
+    entry.phase = Phase::Out {
+        at_ms: now,
+        last: Some(why),
+    };
+    Said::Out {
+        last: Some(why),
+        asked: asked_any(entry),
     }
+}
+
+/// A new round gathers nominees after a pick missed for `why`.
+fn next_round(entry: &mut Entry, now: i64, why: Miss) {
     entry.phase = Phase::Nominating {
         until_ms: now.saturating_add(NOMINATE_MS),
         nominees: Vec::new(),
         after: Some(why),
     };
-    Said::Handoff { from, why }
 }
 
 /// What a host's [`claim`] found for its session's line.
@@ -1312,10 +1869,40 @@ pub fn at_break(
     }
 }
 
-/// What the owner's disk line says of volume `entry`'s ask: who was asked and what came of it.
-/// `None` before any line of the episode, unless it ran out with nobody to ask.
+/// Whether `entry`'s round waits at `now_ms` on sessions held where they cannot take a line now
+/// ([`Said::Waiting`], as [`elect`] decides it): its time is over, it holds no nominee not yet
+/// picked, and a session not yet picked, or gone back to the episode, is held
+/// ([`held_unpicked`]).
+fn waits(entry: &Entry, now_ms: i64) -> bool {
+    match &entry.phase {
+        Phase::Nominating {
+            until_ms, nominees, ..
+        } => {
+            now_ms >= *until_ms
+                && !nominees
+                    .iter()
+                    .any(|n| !entry.picks.iter().any(|p| p.sid == n.sid))
+                && !held_unpicked(entry).is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// What the owner's disk line says of volume `entry`'s ask at `now_ms`: who was asked and what
+/// came of it. A round that waits on held sessions ([`Said::Waiting`]) says so, after a line went
+/// too, and what holds them and ends the wait ([`HeldBy`]): such a round can last days (a weekly
+/// usage limit, a hold or a draft nobody comes back to), and nobody else is asked meanwhile.
+/// `None` before any line of the episode, unless it ran out with nobody to ask or waits.
 #[must_use]
-pub fn owner_line(entry: &Entry) -> Option<String> {
+pub fn owner_line(entry: &Entry, now_ms: i64) -> Option<String> {
+    let waiting = || {
+        let why = held_why(entry);
+        format!(
+            "{}: aterm asks one once {} (`aterm harness disk why`)",
+            held_at(&why, true),
+            held_past(&why)
+        )
+    };
     let named = |sids: &[String]| {
         sids.iter()
             .map(|s| format!("@{s}"))
@@ -1343,6 +1930,15 @@ pub fn owner_line(entry: &Entry) -> Option<String> {
             "aterm asked @{} at {} to free space (one agent; `aterm harness disk why`)",
             pick.sid,
             rfc3339_utc(typed_ms / 1000)
+        )),
+        Phase::Nominating { .. } if waits(entry, now_ms) && entry.asked.is_empty() => Some(
+            format!("Every agent session that could free space is {}", waiting()),
+        ),
+        Phase::Nominating { .. } if waits(entry, now_ms) => Some(format!(
+            "aterm asked {asked}; {they} freed under {}, and every other agent session that \
+             could free space is {}",
+            human_bytes(FREED_MIN),
+            waiting()
         )),
         Phase::Nominating { .. } | Phase::Owed { .. } if !entry.asked.is_empty() => Some(format!(
             "aterm asked {asked}; {they} freed under {}, so one other session is asked",
@@ -1604,11 +2200,25 @@ pub fn row(now_s: i64, key: &str, said: &Said, level: Level, free: u64, host: &H
         Said::Freed { freed, .. } => {
             o.insert("freed_bytes".to_owned(), Value::from(*freed));
         }
-        Said::Handoff { why, .. } | Said::Out { last: Some(why) } => {
+        Said::Handoff { why, .. } => {
             o.insert("why".to_owned(), Value::from(why.word().to_owned()));
         }
-        Said::Out { last: None } => {
-            o.insert("why".to_owned(), Value::from("no-agent".to_owned()));
+        Said::Out { last, asked } => {
+            o.insert(
+                "why".to_owned(),
+                Value::from(last.map_or("no-agent", Miss::word).to_owned()),
+            );
+            o.insert("asked".to_owned(), Value::from(*asked));
+        }
+        Said::Waiting { held, why } => {
+            o.insert("held".to_owned(), Value::from(held.join(",")));
+            o.insert(
+                "why".to_owned(),
+                Value::from(why.iter().map(|h| h.word()).collect::<Vec<_>>().join(",")),
+            );
+        }
+        Said::Returned { why, .. } => {
+            o.insert("why".to_owned(), Value::from(why.word().to_owned()));
         }
         Said::Ended { asks } => {
             o.insert("asks".to_owned(), Value::from(*asks));
@@ -1723,11 +2333,18 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                         .iter()
                         .map(|n| {
                             format!(
-                                "@{} held={} at_break={} (host pid {})",
+                                "@{} held={} at_break={} (host pid {}{})",
                                 n.sid,
                                 human_bytes(n.held),
                                 u8::from(n.at_break),
-                                n.host.pid
+                                n.host.pid,
+                                n.orphan_ms
+                                    .map(|ms| format!(
+                                        ", read ended at {}: stands until {} for its successor",
+                                        at(ms),
+                                        at(ms.saturating_add(ADOPT_MS))
+                                    ))
+                                    .unwrap_or_default()
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1809,8 +2426,39 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                 }
             )
         };
+        let returned = if e.returned.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; back in the episode, held where they could not take their line: {}",
+                e.returned
+                    .iter()
+                    .map(|s| format!("@{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         out.push(format!("{RULE_DISK_FREE} volume={} {open}: {state}", e.key));
-        out.push(format!("  lines {}/{MAX_ASKS}{picks}; {cool}", e.asks));
+        out.push(format!(
+            "  lines {}/{MAX_ASKS}{picks}{returned}; {cool}",
+            e.asks
+        ));
+        if e.episode_ms.is_some() && !e.held.is_empty() {
+            out.push(format!(
+                "  held where they cannot take a line now, so not nominated until that passes: \
+                 {}",
+                e.held
+                    .iter()
+                    .map(|h| format!(
+                        "@{} (host pid {}) {}",
+                        h.sid,
+                        h.host.pid,
+                        held_at(h.holds(), false)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     if rows.is_empty() {
         out.push("no free-ask rows in the disk ledger yet".to_owned());
@@ -1884,6 +2532,36 @@ pub mod fault {
         /// agent exited around a seamless update was left owed by its successor, which bars it,
         /// and handed off as undelivered once [`super::ADOPT_MS`] was over, spending an election.
         AdoptSupervisedOnly,
+        /// [`super::step`] keeps an owed pick its host holds at a usage-limit wall or a box only
+        /// its owner can answer ([`super::Look::held`]) owed, as the look did before such picks
+        /// were released: the pick waited out its delivery window and was handed off as
+        /// undelivered, spending an election, with no line typed.
+        KeepHeld,
+        /// [`super::step`] runs a round out when nobody but held sessions is left to elect, as
+        /// before such rounds waited ([`super::Said::Waiting`]): the episode parked for its
+        /// cooldown while a session that could free space was a usage limit's reset away.
+        OutWhileHeld,
+        /// [`super::step`] drops the nominee of a host read ended at once, as before such
+        /// nominees stood [`super::ADOPT_MS`]: a seamless update mid-round left the other host's
+        /// look to elect a weaker seat, or nobody, before the successor nominated the session.
+        DropEndedNominee,
+        /// [`super::step`] releases an owed pick its host holds at a wall or a box and keeps it a
+        /// pick, as before such picks went back to the episode ([`super::Said::Returned`]): the
+        /// session was never nominated or waited for again that episode, so a round whose only
+        /// seat it was ran out, and parked for its cooldown, though it was past minutes later.
+        HoldKeepsPick,
+        /// [`super::take_over`] takes nothing over, as before a look took over its sessions
+        /// before its pass: a seamless update's successor first adopted its session's pick at the
+        /// step after its first look's pass, and another host's look while that pass ran, past
+        /// [`super::ADOPT_MS`], handed the pick off as undelivered, or dropped its nominee and
+        /// elected a weaker seat.
+        NoTakeOver,
+        /// [`super::take_over`] drops an ended host's record of a held session that the
+        /// successor's seat rule does not read held before its pass, and its nominee of a session
+        /// that rule holds, as the first take-over did: a round that waited on that record alone
+        /// found nobody to elect or wait for at another host's look while the successor's pass
+        /// ran, and ran the episode out.
+        TakeOverByRule,
     }
 
     thread_local! {

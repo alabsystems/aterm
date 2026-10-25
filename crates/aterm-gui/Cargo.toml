@@ -408,6 +408,11 @@ aterm-grid = { workspace = true }
 # The keeper's handlers, named by tests on every target (the normal edge is unix-only).
 aterm-keeper = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Run the Linux notification queue's Unix wire/client seam against a private
+# Rust socket-pair endpoint; this adds no D-Bus edge to shipped macOS builds.
+aterm-dbus = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # aterm's Win32 declarations (WB.2 of docs/AUDIT-third-party-2026-10-15.md; no
 # `windows` crate here): the COM vocabulary behind the file picker, the imaging

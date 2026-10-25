@@ -123,17 +123,18 @@ const fn pet_contrast_cursor(input_cursor_color: u32, term_cursor_color: u32) ->
 #[inline]
 #[must_use]
 fn terminal_cursor_color(term: &Terminal) -> u32 {
-    let c = term
-        .cursor_color()
-        .unwrap_or_else(|| term.default_foreground());
+    let c = match term.cursor_color() {
+        Some(c) => c,
+        None => term.default_foreground(),
+    };
     aterm_render::rgb_to_u32([c.r, c.g, c.b])
 }
 
 /// The most recent completed command as the rain driver reads it.
 #[inline]
 fn term_cmd_done(term: &Terminal) -> Option<(u64, i32)> {
-    term.last_completed_command()
-        .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)))
+    let m = term.last_completed_command()?;
+    Some((term.completed_command_seq(), m.exit_code?))
 }
 
 /// Close the terminal's damage session if it is still open.
@@ -505,8 +506,8 @@ impl EffectsPipeline {
             || self.decos.is_active(now)
             || self.companion.needs_frames()
             || self.companion.next_change_deadline(now).is_some()
-            || self.rain.as_ref().is_some_and(|r| r.is_active())
-            || self.streak.as_ref().is_some_and(|s| s.is_active())
+            || matches!(self.rain.as_ref(), Some(r) if r.is_active())
+            || matches!(self.streak.as_ref(), Some(s) if s.is_active())
     }
 
     /// Milliseconds until the next scheduled engine wake.
@@ -558,10 +559,19 @@ impl EffectsPipeline {
         } else {
             None
         };
-        [glow_ms, pet_ms, rain_ms, streak_ms, body_ms]
-            .into_iter()
-            .flatten()
-            .reduce(f64::min)
+        let cands = [glow_ms, pet_ms, rain_ms, streak_ms, body_ms];
+        let mut best: Option<f64> = None;
+        let mut i = 0;
+        while i < cands.len() {
+            if let Some(ms) = cands[i] {
+                best = Some(match best {
+                    Some(prev) => prev.min(ms),
+                    None => ms,
+                });
+            }
+            i += 1;
+        }
+        best
     }
 
     /// One scheduling verdict ([`Wake`]).
@@ -1368,7 +1378,10 @@ impl EffectsPipeline {
             hue: if hue.eq_ignore_ascii_case("theme") {
                 RainHue::Theme
             } else if hue.eq_ignore_ascii_case("custom") {
-                hue_color.map_or(RainHue::Matrix, |c| RainHue::Custom(c & 0x00FF_FFFF))
+                match hue_color {
+                    Some(c) => RainHue::Custom(c & 0x00FF_FFFF),
+                    None => RainHue::Matrix,
+                }
             } else {
                 RainHue::Matrix
             },
@@ -1423,9 +1436,10 @@ impl EffectsPipeline {
         current: CursorCoordinateSpace,
         scroll: ContentScrollState,
     ) -> bool {
-        let changed = self
-            .cursor_coordinate_space
-            .is_some_and(|previous| previous != current);
+        let changed = matches!(
+            self.cursor_coordinate_space,
+            Some(previous) if previous != current
+        );
         self.cursor_coordinate_space = Some(current);
         if changed {
             self.cursor.retire_body_geometry();
@@ -1535,21 +1549,21 @@ impl EffectsPipeline {
             );
         }
 
-        let probe_row = cur.filter(|&(row, _)| {
-            let Some(render_row) = input.cells.get(usize::from(row)) else {
-                return false;
-            };
+        let probe_row = if let Some((row, caret)) = cur
+            && let Some(render_row) = input.cells.get(usize::from(row))
+        {
             let slice = &render_row[..render_row.len().min(input.cols)];
             self.row_probe_scratch.clear();
             self.row_probe_scratch.reserve(input.cols);
-            self.row_probe_scratch.extend(
-                slice
-                    .iter()
-                    .map(|cell| if cell.wide { '\0' } else { cell.ch }),
-            );
+            for cell in slice {
+                self.row_probe_scratch
+                    .push(if cell.wide { '\0' } else { cell.ch });
+            }
             self.row_probe_scratch.resize(input.cols, ' ');
-            true
-        });
+            Some((row, caret))
+        } else {
+            None
+        };
 
         let mut trail_cfg = self.trail_cfg;
         trail_cfg.enabled &= animate;
@@ -1812,24 +1826,21 @@ impl EffectsPipeline {
             .publish(&self.free_scratch, &mut input.fx_layers);
         self.shade_word_icons(input);
         self.veil_pet_letters(input);
-        let streak = self.streak.is_some().then(|| {
+        let streak_fp = if let Some(streak) = self.streak.as_deref_mut() {
             let mut cfg = self.streak_cfg;
             cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);
-            StreakGrid {
+            streak.note_output_cells(
+                &input.cells,
+                (input.cursor_row, input.cursor_col),
+                (rows, cols),
+                term.content_seq(),
                 now,
-                cfg,
-                seed: self.streak_seed,
-                echo: StreakEcho::default(),
-                cells: &input.cells,
-                cursor: (input.cursor_row, input.cursor_col),
-                viewport: (rows, cols),
-                content_seq: term.content_seq(),
-                geom: glow_geom,
-            }
-        });
-        let streak_fp = self
-            .streak_grid(streak.as_ref())
-            .map_or(0, |(frame, _)| frame.fp);
+                false,
+            );
+            streak.tick(now, glow_geom, &cfg, &mut self.nova_scratch).fp
+        } else {
+            0
+        };
         std::mem::swap(&mut input.nova_add, &mut self.nova_scratch);
 
         let rain_session = term.render_identity();

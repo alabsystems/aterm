@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Judges for `lab forever` usage-wall modes (`wall-shift`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-day-stop`, `wall-cruise`, `wall-relaunch`, `wall-bucket`).
+//! Judges for `lab forever` usage-wall modes (`wall-redraw`, `wall-switch`, `wall-unread`, `wall-cruise`, `wall-relaunch`).
 
 use super::*;
-use aterm_agent::supervise::policy::approval::RULE_LIMIT_RETRY;
 
 const RESET_MINUTE_MS: i64 = 60_000;
 
@@ -21,12 +20,6 @@ fn goings_on(seen: &Seen, t1: i64) -> Vec<(i64, String)> {
         .filter(|(t, _)| *t > t1)
         .map(|(t, l)| (*t, act_rule(l).unwrap_or("?").to_string()))
         .collect();
-    v.extend(
-        seen.ledger
-            .iter()
-            .filter(|r| r.ts > t1 && r.rule == RULE_LIMIT_RETRY && r.decision == "approved")
-            .map(|r| (r.ts, r.rule.clone())),
-    );
     v.sort_by_key(|(t, _)| *t);
     v
 }
@@ -38,7 +31,8 @@ fn going_in(on: &[(i64, String)], from: i64, until: i64, t0: i64) -> Option<Stri
 }
 
 fn unledgered(seen: &Seen, rule: &str, t: i64, t0: i64) -> Option<String> {
-    (rule != RULE_LIMIT_RETRY && seen.typed_row(rule, t).is_none())
+    seen.typed_row(rule, t)
+        .is_none()
         .then(|| format!("{rule} journaled at +{} but NO ledger row typed", at(t0, t)))
 }
 
@@ -106,198 +100,6 @@ fn landed(seen: &Seen, done: &(i64, String), mut bad: Vec<String>, said: &str, t
         ));
     }
     landed_verdict(bad, format!("{said}; {quiet}"), seen, done.0, window)
-}
-
-/// Judges `--mode wall-shift`: climbing across a changed reset in Gemini CLI's usage-limit dialog.
-pub(super) fn judge_wall_shift(
-    seen: &Seen,
-    land: Option<&(i64, String)>,
-    program: &str,
-    t0: i64,
-) -> Verdict {
-    let (raised, first, t1) = match met(seen, land, t0) {
-        Ok(m) => m,
-        Err(v) => return v,
-    };
-    let shifts = Chain::ShiftWall.shifts();
-    let grace = wall_grace_ms(program);
-    let mut presses: Vec<&Row> = seen
-        .ledger
-        .iter()
-        .filter(|r| r.ts > t1 && r.rule == RULE_LIMIT_RETRY && r.decision == "approved")
-        .collect();
-    presses.sort_by_key(|r| r.ts);
-    let done = seen.first_after("DONE ", t1);
-    let mut said = vec![format!(
-        "the dialog's wall raised at +{} (resets +{}, raised again {} time(s): {}); land@v1 typed at +{} met it",
-        at(t0, raised),
-        at(t0, first * 1000),
-        seen.cover.shifted.len(),
-        seen.cover
-            .shifted
-            .iter()
-            .map(|(t, r)| format!("at +{} to +{}", at(t0, *t), at(t0, r * 1000)))
-            .collect::<Vec<_>>()
-            .join(", "),
-        at(t0, t1)
-    )];
-    let mut bad = forever_faults(seen, t1, done.map_or(seen.end_ms, |(d, _)| *d), t0);
-    let until_done = done.map_or(seen.end_ms + 1, |(d, _)| *d);
-    if let Some((t, l)) = seen
-        .all_acts()
-        .into_iter()
-        .find(|(t, _)| *t > t1 + AT_DONE_MS && *t < until_done)
-    {
-        bad.push(format!(
-            "TYPED into the dialog: {} at +{}",
-            act_rule(l).unwrap_or("?"),
-            at(t0, *t)
-        ));
-    }
-    let mut prev = t1;
-    let mut in_wall = 0;
-    let mut through = None;
-    let mut pending = None;
-    for (k, r) in presses.iter().enumerate() {
-        if let Some(tg) = through {
-            bad.push(format!(
-                "a press at +{} after the try that got through at +{}",
-                at(t0, r.ts),
-                at(t0, tg)
-            ));
-            break;
-        }
-        let Some(named) = seen.cover.reset_at(prev) else {
-            bad.push(format!(
-                "a press at +{} with no wall standing when the request before it was answered",
-                at(t0, r.ts)
-            ));
-            break;
-        };
-        let named_ms = named * 1000;
-        if r.ts < named_ms {
-            bad.push(format!(
-                "PRESSED BEFORE THE RESET: try {} at +{}, {} before the reset its dialog named (+{})",
-                k + 1,
-                at(t0, r.ts),
-                at(0, named_ms - r.ts),
-                at(t0, named_ms)
-            ));
-            break;
-        }
-        let lost = named_ms + RESET_MINUTE_MS + grace + WALL_LOST_MS;
-        if r.ts > lost {
-            bad.push(format!(
-                "PERSISTENCE LOST: try {} at +{}, {} past the reset its dialog named (+{}), past the {} deadline",
-                k + 1,
-                at(t0, r.ts),
-                at(0, r.ts - named_ms),
-                at(t0, named_ms),
-                at(0, lost - named_ms)
-            ));
-            break;
-        }
-        match seen.cover.reset_at(r.ts) {
-            Some(next) => {
-                in_wall += 1;
-                let next_ms = next * 1000;
-                let until = presses.get(k + 1).map_or(seen.end_ms + 1, |n| n.ts);
-                let rule = format!("rule={RULE_LIMIT_RETRY} ");
-                let waited = seen.journal.iter().find(|(t, l)| {
-                    *t > r.ts
-                        && *t < until
-                        && l.starts_with("WAITING ")
-                        && l.contains(&rule)
-                        && l.split_once(" until=")
-                            .and_then(|(_, rest)| {
-                                crate::workers::iso_ms(rest.split_whitespace().next()?)
-                            })
-                            .is_some_and(|u| u >= next_ms)
-                });
-                match waited {
-                    Some((tw, _)) => said.push(format!(
-                        "try {} at +{} ({} past the reset +{}) met the wall again, its dialog's new reset +{} waited on from +{}",
-                        k + 1,
-                        at(t0, r.ts),
-                        at(0, r.ts - named_ms),
-                        at(t0, named_ms),
-                        at(t0, next_ms),
-                        at(t0, *tw)
-                    )),
-                    None if presses.get(k + 1).is_some() => {
-                        bad.push(format!(
-                            "try {} at +{} met the wall again (its new reset +{}), but no wait on that reset came before the next press",
-                            k + 1,
-                            at(t0, r.ts),
-                            at(t0, next_ms)
-                        ));
-                        break;
-                    }
-                    None => pending = Some(next_ms),
-                }
-            }
-            None => {
-                through = Some(r.ts);
-                said.push(format!(
-                    "try {} at +{} ({} past the reset +{}) got through",
-                    k + 1,
-                    at(t0, r.ts),
-                    at(0, r.ts - named_ms),
-                    at(t0, named_ms)
-                ));
-            }
-        }
-        prev = r.ts;
-    }
-    let said = said.join("; ");
-    if !bad.is_empty() {
-        return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
-    }
-    let Some(tg) = through else {
-        let named = pending
-            .or_else(|| seen.cover.reset_at(prev).map(|r| r * 1000))
-            .unwrap_or(first * 1000);
-        let lost = named + RESET_MINUTE_MS + grace + WALL_LOST_MS;
-        if seen.end_ms >= lost {
-            return Verdict::Fail(format!(
-                "{said}; PERSISTENCE LOST: no try got through by +{}, {} past the reset +{}",
-                at(t0, seen.end_ms),
-                at(0, seen.end_ms - named),
-                at(t0, named)
-            ));
-        }
-        return Verdict::Unobserved(format!(
-            "{said}; watched to +{}, before a try got through",
-            at(t0, seen.end_ms)
-        ));
-    };
-    if in_wall < shifts {
-        return Verdict::Unobserved(format!(
-            "{said}; only {in_wall} of {shifts} tries met the wall again: the climb across a changed reset was not driven"
-        ));
-    }
-    let Some(done) = done else {
-        if seen.end_ms >= tg + WALL_LOST_MS {
-            return Verdict::Fail(format!(
-                "{said}; but NO landing in the {} after the try that got through",
-                at(0, seen.end_ms - tg)
-            ));
-        }
-        return Verdict::Unobserved(format!("{said}; not landed by +{}", at(t0, seen.end_ms)));
-    };
-    if done.0 < tg {
-        return Verdict::Fail(format!(
-            "{said}; LANDED at +{} while the dialog stood",
-            at(t0, done.0)
-        ));
-    }
-    if done.0 > tg + WALL_LOST_MS {
-        return Verdict::Fail(format!(
-            "{said}; PERSISTENCE LOST: the landing came {} after the try that got through",
-            at(0, done.0 - tg)
-        ));
-    }
-    landed(seen, done, Vec::new(), &said, t0)
 }
 
 /// Judges `--mode wall-redraw`: a usage wall redrawn under a new reset after a typed resume.
@@ -897,107 +699,6 @@ fn gone_past(
     }
 }
 
-/// Judges `--mode wall-day-stop`: continuing on the back-off ladder after Gemini CLI's per-day dialog is answered `Stop`.
-pub(super) fn judge_wall_day_stopped(
-    seen: &Seen,
-    land: Option<&(i64, String)>,
-    program: &str,
-    t0: i64,
-) -> Verdict {
-    let w = match cover::judge_wall_hidden(seen, land, program, t0) {
-        Verdict::Pass(w) => w,
-        v => return v,
-    };
-    let (Some(h), Some(&(t1, _))) = (seen.cover.hidden.as_ref(), land) else {
-        return Verdict::Unobserved(format!("{w}: no hide or no land act on the record"));
-    };
-    if !h.stopped {
-        return Verdict::Unobserved(format!(
-            "{w}: the notice was taken by {}, not the dialog's Stop",
-            h.command
-        ));
-    }
-    let Some(&(read, due, _)) = cover::ladder_waits(seen, t1).first() else {
-        return Verdict::Fail(format!(
-            "{w}: NO LADDER: no wait on the per-day dialog's back-off ladder before its Stop"
-        ));
-    };
-    let Some((tr, lr)) = seen
-        .all_acts()
-        .into_iter()
-        .find(|(t, _)| *t > h.enter_ms)
-        .map(|(t, l)| (*t, l.as_str()))
-    else {
-        return Verdict::Unobserved(format!("{w}: nothing typed after the Stop"));
-    };
-    let rule = act_rule(lr).unwrap_or("?");
-    let mut said = format!(
-        "{w}; the ladder's first wait at +{} due +{}; the Stop at +{}",
-        at(t0, read),
-        at(t0, due),
-        at(t0, h.enter_ms)
-    );
-    if rule != turn_end::RULE_LIMIT_RESUME {
-        return Verdict::Fail(format!(
-            "{said}; the first act after the Stop was {rule} at +{}, not the resume",
-            at(t0, tr)
-        ));
-    }
-    if tr + cover::LADDER_DUE_SLACK_MS < due {
-        return Verdict::Fail(format!(
-            "{said}; RESUMED BEFORE ITS RUNG: {rule} at +{}, {} before the ladder's first due",
-            at(t0, tr),
-            at(tr, due)
-        ));
-    }
-    said.push_str(&format!(
-        "; kept trying: {rule} at +{} ({} after the ladder's first due)",
-        at(t0, tr),
-        at(due, tr)
-    ));
-    if let Some((t, l)) = seen
-        .journal
-        .iter()
-        .find(|(t, l)| *t > h.enter_ms && *t < tr && l.starts_with("CLEARED "))
-    {
-        return Verdict::Fail(format!(
-            "{said}; NEEDS YOU came down at +{} while the limit stood: {}",
-            at(t0, *t),
-            crate::util::one_line(l, 80)
-        ));
-    }
-    let reads = super::surfaces::observed(&seen.status, &seen.status_reads, h.enter_ms, tr);
-    if reads.is_empty() {
-        return Verdict::Unobserved(format!(
-            "{said}; no status read between the Stop and the resume"
-        ));
-    }
-    if let Some((t, st)) = reads
-        .iter()
-        .find(|(_, st)| word(st, "needs").as_deref() != Some("ask"))
-    {
-        return Verdict::Fail(format!(
-            "{said}; NEEDS YOU not standing at the status read at +{} while the limit stood: {}",
-            at(t0, *t),
-            crate::util::one_line(st, 80)
-        ));
-    }
-    said.push_str(&format!(
-        "; needs=ask at {} status read(s) from the Stop to it",
-        reads.len()
-    ));
-    let Some((d, _)) = seen.first_after("DONE ", tr) else {
-        return Verdict::Fail(format!("{said}; but NO landing after it"));
-    };
-    match cover::ladder_cleared(seen, tr, *d) {
-        Some(down) => Verdict::Pass(format!("{said}; NEEDS YOU down at +{}", at(t0, down))),
-        None => Verdict::Fail(format!(
-            "{said}; NEEDS YOU STOOD after the resume that got through at +{}",
-            at(t0, tr)
-        )),
-    }
-}
-
 const CRUISE_AFTER_WALL_MS: i64 = 4 * 60_000 + PERSISTENCE_GRACE_MS + 60_000;
 
 fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
@@ -1096,7 +797,6 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
     ));
     if let Some(&(ta, ref rule)) = on.iter().find(|(t, _)| *t >= r_ms)
         && rule != turn_end::RULE_LIMIT_RESUME
-        && rule != RULE_LIMIT_RETRY
         && seen.cover.went_on_ms.is_none_or(|tv| tv > ta)
     {
         return Verdict::Fail(format!(
@@ -1281,66 +981,4 @@ pub(super) fn judge_wall_relaunch(
         ));
     }
     landed(seen, done, Vec::new(), &said, t0)
-}
-
-/// Judges `--mode wall-bucket`: answering Gemini CLI's per-model fallback dialog with `Stop` and resuming without switching models.
-pub(super) fn judge_wall_bucket(
-    seen: &Seen,
-    land: Option<&(i64, String)>,
-    program: &str,
-    t0: i64,
-) -> Verdict {
-    use aterm_agent::supervise::policy::approval::RULE_LIMIT_STOP;
-    if let Some(r) = seen.ledger.iter().find(|r| {
-        r.decision == "approved"
-            && (r.command.contains("Switch to") || r.reason.contains("Switch to"))
-    }) {
-        return Verdict::Fail(format!(
-            "SWITCHED the model at +{}: {} {}",
-            at(t0, r.ts),
-            r.rule,
-            crate::util::one_line(&r.command, 80)
-        ));
-    }
-    let w = match cover::judge_wall(seen, land, program, t0) {
-        Verdict::Fail(w) => return Verdict::Fail(w),
-        Verdict::Unobserved(w) => return Verdict::Unobserved(w),
-        Verdict::Pass(w) => w,
-    };
-    let Some(&(t1, _)) = land else {
-        return Verdict::Unobserved(format!("{w}: no land act on the record"));
-    };
-    let Some(stop) = seen
-        .ledger
-        .iter()
-        .find(|r| r.ts > t1 && r.rule == RULE_LIMIT_STOP && r.decision == "approved")
-    else {
-        return Verdict::Unobserved(format!(
-            "{w}: no {RULE_LIMIT_STOP} pressed: the dialog drawn was not the bucket's (no `Switch to` on offer)"
-        ));
-    };
-    let mut said = format!("{w}; the bucket's Stop at +{}", at(t0, stop.ts));
-    if let Some(d) =
-        cover::press_due(seen, t1, stop.ts).filter(|d| stop.ts + cover::LADDER_DUE_SLACK_MS < *d)
-    {
-        return Verdict::Fail(format!(
-            "{said}: STOPPED BEFORE ITS DUE, {} before the until= its wait named (+{})",
-            at(stop.ts, d),
-            at(t0, d)
-        ));
-    }
-    let Some((tr, _)) = seen
-        .acts(turn_end::RULE_LIMIT_RESUME)
-        .into_iter()
-        .find(|(t, _)| *t > stop.ts)
-    else {
-        return Verdict::Fail(format!("{said}: NO RESUME typed after the Stop"));
-    };
-    said.push_str(&format!(
-        ", {} at +{} ({} after it); never the switch",
-        turn_end::RULE_LIMIT_RESUME,
-        at(t0, *tr),
-        at(stop.ts, *tr)
-    ));
-    Verdict::Pass(said)
 }

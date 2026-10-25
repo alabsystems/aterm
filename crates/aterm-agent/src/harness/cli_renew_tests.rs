@@ -63,6 +63,8 @@ struct RenewHost {
     flow_after_first: Option<i32>,
     signs_in_as: Option<&'static str>,
     obstruct_checkpoint: bool,
+    during_flow: Option<Box<dyn Fn()>>,
+    during_status: Option<Box<dyn Fn()>>,
     ssh_exit: i32,
     flows: RefCell<Vec<(String, String, RenewBrowser)>>,
     checked: RefCell<Vec<String>>,
@@ -79,6 +81,8 @@ impl RenewHost {
             flow_after_first: None,
             signs_in_as: None,
             obstruct_checkpoint: false,
+            during_flow: None,
+            during_status: None,
             ssh_exit: 0,
             flows: RefCell::new(Vec::new()),
             checked: RefCell::new(Vec::new()),
@@ -141,6 +145,9 @@ impl AccountsHost for RenewHost {
             )
             .unwrap();
         }
+        if let Some(change) = &self.during_flow {
+            change();
+        }
         Ok(if self.flows.borrow().len() > 1 {
             self.flow_after_first.unwrap_or(self.flow)
         } else {
@@ -149,6 +156,9 @@ impl AccountsHost for RenewHost {
     }
 
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+        if let Some(change) = &self.during_status {
+            change();
+        }
         self.checked.borrow_mut().push(home.to_string());
         let text = std::fs::read_to_string(Path::new(home).join(".claude.json")).ok();
         let email = text.as_deref().and_then(|t| {
@@ -266,9 +276,129 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
 }
 
 #[test]
+fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkpoint() {
+    for change in ["identity", "removed", "unreadable", "missing", "binding"] {
+        let (_tmp, env) = renew_env("renew-changed-policy");
+        let roster_path = env.accounts_roster().unwrap();
+        let store = env.accounts_store();
+        let original = std::fs::read_to_string(&roster_path).unwrap();
+        let after_change = std::rc::Rc::new(RefCell::new(None));
+        let keep = after_change.clone();
+        let changed_store = store.clone();
+        let snapshot = |store: &accounts::Store| {
+            [
+                store.state_file(),
+                store.logins_file(),
+                store.ledger_path(),
+                store.wake_path(),
+            ]
+            .map(|path| std::fs::read(path).ok())
+        };
+        let mut host = RenewHost::new();
+        host.during_status = Some(Box::new(move || {
+            match change {
+                "identity" => std::fs::write(
+                    &roster_path,
+                    original.replace(OWNER, "changed@example.test"),
+                )
+                .unwrap(),
+                "removed" => std::fs::write(&roster_path, "").unwrap(),
+                "unreadable" => std::fs::write(&roster_path, "[[broken").unwrap(),
+                "missing" => {
+                    std::fs::rename(&roster_path, roster_path.with_extension("kept")).unwrap()
+                }
+                "binding" => {
+                    changed_store
+                        .transact_logins(1, &mut None, |state, logins| {
+                            Ok(accounts::note_renewed(
+                                state,
+                                logins,
+                                "main",
+                                None,
+                                "/another-login",
+                                None,
+                                1,
+                            ))
+                        })
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            *keep.borrow_mut() = Some(snapshot(&changed_store));
+        }));
+        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        assert_eq!(code, exit(1), "{change}: {out}{err}");
+        assert_eq!(
+            host.flows.borrow().len(),
+            1,
+            "a policy refusal cannot retry stale policy"
+        );
+        let staging = PathBuf::from(&host.flows.borrow()[0].0);
+        assert!(
+            staging.join(".claude.json").is_file(),
+            "{change}: keep the completed login"
+        );
+        assert!(
+            !staging.join(accounts::RENEWAL_CHECKPOINT_FILE).exists(),
+            "{change}"
+        );
+        assert_eq!(
+            snapshot(&store),
+            after_change.borrow().clone().unwrap(),
+            "{change}: no record after policy changed"
+        );
+    }
+}
+
+#[test]
+fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity() {
+    for reported in ["canonical@example.test", "alias@example.test"] {
+        let (_tmp, env) = renew_env("renew-identity-alias");
+        let (code, _, err) = run_line(
+            "accounts add alias --email alias@example.test --identity-email canonical@example.test --browser Fixture",
+            &env,
+        );
+        assert_eq!(code, exit(0), "{err}");
+        let roster = Roster::load(&env.accounts_roster().unwrap()).unwrap();
+        let row = roster.row("alias").unwrap();
+        assert_eq!(row.email.as_deref(), Some("alias@example.test"));
+        assert_eq!(
+            row.expected_identity_email(),
+            Some("canonical@example.test")
+        );
+        let mut host = RenewHost::new();
+        host.signs_in_as = Some(reported);
+        let (code, out, err) = acc(renew(&["alias"], false, None), &env, &host);
+        assert_eq!(host.flows.borrow()[0].1, "alias@example.test");
+        let logins = logins_of(&env);
+        if reported == "canonical@example.test" {
+            assert_eq!(code, exit(0), "{out}{err}");
+            let binding = logins.get("alias").unwrap();
+            let staging = Path::new(binding.dir.as_deref().unwrap());
+            let proof = accounts::read_renewal_checkpoint(
+                staging,
+                &std::fs::canonicalize(staging).unwrap(),
+                env.now,
+            )
+            .unwrap();
+            assert_eq!(proof.email, reported);
+        } else {
+            assert_eq!(code, exit(1), "{out}{err}");
+            assert!(
+                logins
+                    .get("alias")
+                    .is_some_and(|binding| binding.dir.is_none())
+            );
+            assert!(out.contains("REFUSED: wrong account"), "{out}");
+        }
+    }
+}
+
+#[test]
 fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding() {
     let (_tmp, env) = renew_env("renew-happy");
     let host = RenewHost::new();
+    let parent = logins_of(&env);
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let store = env.accounts_store();
@@ -311,6 +441,8 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     assert_eq!(proof.label, "main");
     assert_eq!(proof.email, OWNER);
     assert_eq!(proof.checked_at, main.renewed_at.unwrap());
+    assert!(proof.parent.matches(&parent, "main"));
+    assert!(!proof.parent.matches(&logins, "main"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -528,6 +660,62 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
         assert!(!store.logins_file().exists() && !store.state_file().exists());
         assert!(store.tail(10).expect("ledger").is_empty());
     }
+}
+
+#[test]
+fn a_replacement_login_stops_a_stale_manual_authentication_fallback() {
+    let (_tmp, env) = renew_env("renew-stale-fallback");
+    cached_profile_only(&env);
+    let store = env.accounts_store();
+    let old = store.login_dir("main").unwrap();
+    let old_text = old.to_str().unwrap().to_owned();
+    store
+        .transact_logins(env.now, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state, logins, "main", None, &old_text, None, env.now,
+            ))
+        })
+        .unwrap();
+    let after = std::rc::Rc::new(RefCell::new(None));
+    let changed_after = std::rc::Rc::clone(&after);
+    let changed_store = store.clone();
+    let now = env.now;
+    let mut host = RenewHost::new();
+    host.flow = 1;
+    host.flow_after_first = Some(0);
+    host.during_flow = Some(Box::new(move || {
+        changed_store
+            .transact_logins(now, &mut None, |state, logins| {
+                let was = logins.get("main").unwrap().was.clone();
+                let events =
+                    accounts::note_renewed(state, logins, "main", None, &old_text, None, now);
+                logins.labels.get_mut("main").unwrap().was = was;
+                Ok(events)
+            })
+            .unwrap();
+        *changed_after.borrow_mut() = Some(
+            [
+                changed_store.state_file(),
+                changed_store.logins_file(),
+                changed_store.ledger_path(),
+                changed_store.wake_path(),
+            ]
+            .map(|path| std::fs::read(path).ok()),
+        );
+    }));
+    let (code, _, err) = acc(renew(&["main"], false, None), &env, &host);
+    assert_eq!(code, exit(1), "{err}");
+    assert_eq!(host.flows.borrow().len(), 1, "no stale fallback");
+    assert_eq!(
+        [
+            store.state_file(),
+            store.logins_file(),
+            store.ledger_path(),
+            store.wake_path(),
+        ]
+        .map(|path| std::fs::read(path).ok()),
+        after.borrow().clone().unwrap()
+    );
 }
 
 #[test]

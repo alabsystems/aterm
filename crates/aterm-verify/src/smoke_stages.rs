@@ -295,11 +295,26 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
         return;
     };
     if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, bundle) {
+        let subject = crate::stages::Subject::of(ctx, bundle);
         typing_burst(ctx, r, &mut sb, &ctl_bin);
-        aos_release_step(ctx, r, &mut sb, &ctl_bin);
-        settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin);
+        aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
+        settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
     }
     sb.teardown(r);
+}
+
+/// The server's answer in what the bundle's `aterm-ctl` printed: a refusal goes to stderr
+/// behind [`CTL_STDERR`].
+fn server_reply(printed: &str) -> &str {
+    let printed = printed.trim_end();
+    printed.strip_prefix(CTL_STDERR).unwrap_or(printed)
+}
+
+/// Whether `reply` refuses `verb` itself: the subject does not know it, or predates its release
+/// form and answers it only in a debug build.
+fn refuses_verb(reply: &str, verb: &str) -> bool {
+    let reply = server_reply(reply);
+    reply.starts_with("ERR unknown verb") || reply == format!("ERR {verb} needs a debug build")
 }
 
 /// What a release build answers `aos bundle` with.
@@ -309,7 +324,13 @@ pub const AOS_BUNDLE_REFUSAL: &str = "ERR aos bundle needs a debug build";
 const CTL_STDERR: &str = "aterm-ctl: ";
 
 /// The bundle's `aos` verb attaches and detaches the front window's glow, and refuses only the debug forms (design §14.5 R0 exit item 8).
-fn aos_release_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
+fn aos_release_step(
+    ctx: &Ctx,
+    r: &mut Report,
+    sb: &mut Sandbox,
+    ctl_bin: &Path,
+    subject: &crate::stages::Subject,
+) {
     let tag = "gui smoke: release aos";
     let Some(pid) = sb.child.as_ref().map(Child::id) else {
         r.cannot_run(format!("{tag}: no child to drive"));
@@ -324,6 +345,15 @@ fn aos_release_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path)
         let status = ctl(ctx, sb, ctl_bin, &["aos", "status"]);
         if ok_reply(&status) {
             break;
+        }
+        if refuses_verb(&status, "aos") {
+            subject.unanswered(
+                r,
+                None,
+                tag,
+                &[format!("aos status ({})", status.trim_end())],
+            );
+            return;
         }
         if std::time::Instant::now() >= deadline || child_exited(sb) {
             r.fail(format!(
@@ -355,8 +385,7 @@ pub fn aos_release_verdict(attach: &str, detach: &str, bundle: &str) -> Result<S
     if !ok_reply(detach) {
         return Err(format!("gui smoke: aos detach -> {}", or_no_reply(detach)));
     }
-    let refusal = bundle.trim_end();
-    if refusal.strip_prefix(CTL_STDERR).unwrap_or(refusal) != AOS_BUNDLE_REFUSAL {
+    if server_reply(bundle) != AOS_BUNDLE_REFUSAL {
         return Err(format!(
             "gui smoke: aos bundle -> {} (a release build answers {AOS_BUNDLE_REFUSAL:?})",
             or_no_reply(bundle)
@@ -434,7 +463,13 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
     }
 }
 
-fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
+fn settings_hardware_key_step(
+    ctx: &Ctx,
+    r: &mut Report,
+    sb: &mut Sandbox,
+    ctl_bin: &Path,
+    subject: &crate::stages::Subject,
+) {
     let tag = "gui smoke: settings key path";
     let Some(pid) = sb.child.as_ref().map(Child::id) else {
         r.cannot_run(format!("{tag}: no child to drive"));
@@ -446,6 +481,15 @@ fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_b
         ctl_bin,
         &["open", "app", "settings", "/appearance"],
     );
+    if refuses_verb(&got, "open") {
+        subject.unanswered(
+            r,
+            None,
+            tag,
+            &[format!("open app settings ({})", got.trim_end())],
+        );
+        return;
+    }
     if !ok_reply(&got) {
         r.fail(format!("{tag}: open app settings -> {}", or_no_reply(&got)));
         return;
@@ -477,6 +521,10 @@ fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_b
     };
     let before = focused(sb);
     let got = ctl(ctx, sb, ctl_bin, &["hwkey", "tab"]);
+    if refuses_verb(&got, "hwkey") {
+        subject.unanswered(r, None, tag, &[format!("hwkey tab ({})", got.trim_end())]);
+        return;
+    }
     if !ok_reply(&got) || metric_u64(&got, "posted") != Some(1) {
         r.fail(format!("{tag}: hwkey tab -> {}", or_no_reply(&got)));
         return;
@@ -906,6 +954,24 @@ mod tests {
         assert!(hv(&held).is_err());
         assert!(hv(&with_glass(31, "56.00")).is_ok());
         assert!(hv(&with_glass(0, "900.00")).is_ok());
+    }
+
+    #[test]
+    fn a_verb_the_subject_lacks_is_told_from_its_answer() {
+        assert!(refuses_verb("ERR unknown verb (try: help)\n", "aos"));
+        assert!(refuses_verb(
+            "aterm-ctl: ERR unknown verb (try: help)\n",
+            "hwkey"
+        ));
+        assert!(refuses_verb("ERR aos needs a debug build\n", "aos"));
+        assert!(!refuses_verb(AOS_BUNDLE_REFUSAL, "aos"));
+        assert!(!refuses_verb(
+            "aterm-ctl: ERR aos bundle needs a debug build",
+            "aos"
+        ));
+        assert!(!refuses_verb("ERR aos attach refused: no window", "aos"));
+        assert!(!refuses_verb("OK window=0 attached=false", "aos"));
+        assert!(!refuses_verb("", "aos"));
     }
 
     #[test]

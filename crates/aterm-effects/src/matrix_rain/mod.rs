@@ -899,10 +899,7 @@ impl MatrixRain {
         ];
         let last_col = cols.saturating_sub(1);
         for r in 0..rows {
-            if line_sizes
-                .get(r)
-                .is_none_or(|ls| *ls != LineSize::SingleWidth)
-            {
+            if line_sizes.get(r) != Some(&LineSize::SingleWidth) {
                 self.clear_occ_span(r, 0, last_col);
             }
         }
@@ -1157,7 +1154,7 @@ impl MatrixRain {
     /// `glyph`'s baked tile, the art a [`RainCell`] of that glyph draws (`None` until baked).
     #[must_use]
     #[inline]
-    pub fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
+    pub const fn tile(&self, glyph: u8) -> Option<&Arc<FxArt>> {
         self.baker.tile(glyph)
     }
 
@@ -1606,9 +1603,18 @@ impl MatrixRain {
                     return false;
                 }
                 let head_flash = is_head && lvl == 15;
-                let ms = *material_start.get_or_insert_with(|| {
-                    (!self.material.is_empty()).then(|| self.material_start(col))
-                });
+                let ms = match material_start {
+                    Some(ms) => ms,
+                    None => {
+                        let ms = if self.material.is_empty() {
+                            None
+                        } else {
+                            Some(self.material_start(col))
+                        };
+                        material_start = Some(ms);
+                        ms
+                    }
+                };
                 quads.push(self.cell_quad(ctx, col, r, lvl, head_flash, ms));
                 if head_flash && cv.bright {
                     self.halo_cands.push((r as u16, col));
@@ -1624,9 +1630,11 @@ impl MatrixRain {
             if quads.len() >= ctx.cap {
                 return false;
             }
-            let ms = *material_start.get_or_insert_with(|| {
-                (!self.material.is_empty()).then(|| self.material_start(col))
-            });
+            let ms = match material_start {
+                Some(ms) => ms,
+                None if self.material.is_empty() => None,
+                None => Some(self.material_start(col)),
+            };
             quads.push(self.cell_quad(ctx, col, wr, lvl, true, ms));
         }
         true
@@ -1767,19 +1775,27 @@ impl MatrixRain {
     }
 
     fn mask_framed_regions(&mut self, cells: &[Vec<RenderCell>], rows: usize, cols: usize) {
+        #[inline]
+        const fn cell_ch_at(row: &[RenderCell], col: usize) -> char {
+            if col < row.len() { row[col].ch } else { ' ' }
+        }
+
         self.frame_candidates.clear();
         self.frame_regions.clear();
 
         for r in 0..rows {
-            let row = cells.get(r).map(Vec::as_slice).unwrap_or(&[]);
-            let ch_at = |col: usize| row.get(col).map_or(' ', |cell| cell.ch);
+            let row = if r < cells.len() {
+                cells[r].as_slice()
+            } else {
+                &[]
+            };
 
             let mut prefix_built = false;
             let mut write = 0usize;
             for i in 0..self.frame_candidates.len() {
                 let mut candidate = self.frame_candidates[i];
-                let left = ch_at(candidate.left);
-                let right = ch_at(candidate.right);
+                let left = cell_ch_at(row, candidate.left);
+                let right = cell_ch_at(row, candidate.right);
                 if frame_bottom_left(left) && frame_bottom_right(right) && r > candidate.top + 1 {
                     if !prefix_built {
                         self.frame_horizontal_prefix.resize(cols + 1, 0);
@@ -1787,7 +1803,7 @@ impl MatrixRain {
                         for col in 0..cols {
                             self.frame_horizontal_prefix[col + 1] = self.frame_horizontal_prefix
                                 [col]
-                                + usize::from(frame_horizontal(ch_at(col)));
+                                + usize::from(frame_horizontal(cell_ch_at(row, col)));
                         }
                         prefix_built = true;
                     }
@@ -1946,10 +1962,12 @@ impl MatrixRain {
         if Self::row_banded(row as usize, self.occ_rows, input.cursor, input.hidden_band) {
             return false;
         }
-        !input.sel.as_ref().is_some_and(|sv| {
-            sv.sel
-                .contains(i64::from(row) as i32 - sv.display_offset, col)
-        })
+        match input.sel.as_ref() {
+            Some(sv) => !sv
+                .sel
+                .contains(i64::from(row) as i32 - sv.display_offset, col),
+            None => true,
+        }
     }
 
     /// The typing-surface band: visible cursor row ± [`CURSOR_BAND_ROWS`]; the
@@ -2195,12 +2213,10 @@ const fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
 }
 
 fn faint_ink(fg: u32, bg: u32) -> u32 {
-    let rgb = |c: u32| aterm_types::Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8);
-    let dim = aterm_core::terminal::color_resolve::dim_toward_bg(
-        rgb(fg),
-        rgb(bg),
-        aterm_types::DIM_FACTOR,
-    );
+    let fg_rgb = aterm_types::Rgb::new((fg >> 16) as u8, (fg >> 8) as u8, fg as u8);
+    let bg_rgb = aterm_types::Rgb::new((bg >> 16) as u8, (bg >> 8) as u8, bg as u8);
+    let dim =
+        aterm_core::terminal::color_resolve::dim_toward_bg(fg_rgb, bg_rgb, aterm_types::DIM_FACTOR);
     (u32::from(dim.r) << 16) | (u32::from(dim.g) << 8) | u32::from(dim.b)
 }
 

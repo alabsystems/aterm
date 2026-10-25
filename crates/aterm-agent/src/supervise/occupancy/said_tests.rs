@@ -37,11 +37,8 @@ fn holding(held: &[Guard]) -> Guards {
     }
 }
 
-fn said(
-    mode: Occupancy,
-    verdicts: [SaidVerdict; RuleId::COUNT],
-    guards: Option<Guards>,
-) -> OccupancySaid {
+/// A told word of slice 1's two rules (a recording without slice 2's doors carries those alone).
+fn said(mode: Occupancy, verdicts: [SaidVerdict; 2], guards: Option<Guards>) -> OccupancySaid {
     let at_ms = SINCE + 5 * HOUR + 25 * MIN;
     OccupancySaid {
         mode,
@@ -66,7 +63,27 @@ fn said(
         at_ms,
         reading: reading(at_ms),
         ready_idle: None,
+        wake: None,
     }
+}
+
+/// [`said`] with slice 2's wake rule after them, saying `verdict` of wake #2.
+fn said_wake(verdict: SaidVerdict, guards: Option<Guards>) -> OccupancySaid {
+    let mut s = said(
+        Occupancy::Observe,
+        [SaidVerdict::Outranked, SaidVerdict::Quiet],
+        guards,
+    );
+    s.rules.push(SaidRule {
+        rule: RuleId::Wake,
+        verdict,
+        at_ms: SINCE + HOUR,
+    });
+    s.wake = Some(SaidWake {
+        ord: 2,
+        since_ms: SINCE,
+    });
+    s
 }
 
 /// The change is the mode, the hold, the ready proxy, the guard and each rule's word; the stamp and the reading alone are not.
@@ -246,8 +263,9 @@ fn spans_and_clocks_are_spelled_plainly() {
 
 /// THE TOLD WORD'S RULES PRINT AS SLICE 1'S ARRAY DID (the slice-2 plan's D7): a tape compares the
 /// word's `Debug`, and the list's is the two-rule array's byte for byte, in both forms, so a
-/// slice-1 tape's tells replay unchanged. Every rule is slice 1's, so a recording with or without
-/// slice 2's doors carries every rule. NEGATIVE CONTROL: a list of one rule prints otherwise.
+/// slice-1 tape's tells replay unchanged. A recording without slice 2's doors carries slice 1's
+/// rules alone, and one with them `wake@v1` too. NEGATIVE CONTROL: a list of one rule prints
+/// otherwise.
 #[test]
 fn the_told_rules_print_as_slice_ones_array() {
     let s = said(
@@ -259,10 +277,16 @@ fn the_told_rules_print_as_slice_ones_array() {
     assert_eq!(format!("{:?}", s.rules), format!("{slice1:?}"));
     assert_eq!(format!("{:#?}", s.rules), format!("{slice1:#?}"));
     let told: Vec<RuleId> = s.rules.iter().map(|r| r.rule).collect();
-    assert_eq!(told, RuleId::ALL);
+    assert_eq!(told_rules(false), told);
+    assert_eq!(told, [RuleId::WaitNudge, RuleId::HoldRoom]);
     assert_eq!(told_rules(true), RuleId::ALL);
-    assert_eq!(told_rules(false), RuleId::ALL);
-    assert!(RuleId::ALL.into_iter().all(RuleId::slice1));
+    assert_eq!(
+        RuleId::ALL
+            .into_iter()
+            .filter(|r| !r.slice1())
+            .collect::<Vec<_>>(),
+        [RuleId::Wake]
+    );
     let one = vec![s.rules[0]];
     assert_ne!(format!("{one:?}"), format!("{slice1:?}"));
 }
@@ -352,4 +376,58 @@ fn a_word_with_no_ready_idle_line_prints_as_slice_ones() {
         text.ends_with(&format!(", ready_idle: {:?} }}", raised())),
         "{text}"
     );
+}
+
+/// F14'S WAKE LINE: a wake a guard holds says `wake #<n> held: <guard> (since …; K at …)`, K the
+/// window's K looks past its condition holding; one that would go names its ordinal and since; and
+/// an outranked rule says so. NEGATIVE CONTROL: with no wake judged the wake rule says none ready.
+#[test]
+fn why_says_the_wake_held_and_since_when() {
+    let held = said_wake(
+        SaidVerdict::Held(Guard::Draft),
+        Some(holding(&[Guard::Draft])),
+    );
+    let lines = why_lines(&held, held.at_ms, 0);
+    assert_eq!(lines.len(), 5, "{lines:#?}");
+    let k_at = clock_words(SINCE + K_LOOKS * LOOK_EVERY_MS, 0);
+    assert_eq!(
+        lines[3],
+        format!("wake #2 held: draft (since 18:52; K at {k_at})"),
+        "{lines:#?}"
+    );
+    assert!(lines[1].contains(" outranked "), "{lines:#?}");
+    let would = said_wake(SaidVerdict::Would, None);
+    let lines = why_lines(&would, would.at_ms, 0);
+    assert!(
+        lines[3].starts_with("wake@v1 rev=builtin would ")
+            && lines[3].ends_with(": wake #2 since 18:52"),
+        "{lines:#?}"
+    );
+    let mut none = would.clone();
+    none.wake = None;
+    let lines = why_lines(&none, none.at_ms, 0);
+    assert!(lines[3].ends_with(": no wake ready"), "{lines:#?}");
+}
+
+/// THE WAKE IS PART OF THE CHANGE and prints only when judged: a word without it prints as one
+/// before slice 2 did. NEGATIVE CONTROL: a judged wake prints its field last.
+#[test]
+fn a_judged_wake_is_a_change_and_prints_last() {
+    let s = said_wake(SaidVerdict::Would, None);
+    let mut other = s.clone();
+    other.wake = Some(SaidWake {
+        ord: 3,
+        since_ms: SINCE,
+    });
+    assert!(!s.same_change(&other));
+    let text = format!("{s:?}");
+    assert!(
+        text.ends_with(&format!(", wake: {:?} }}", s.wake.expect("judged"))),
+        "{text}"
+    );
+    let mut bare = s.clone();
+    bare.wake = None;
+    assert!(!format!("{bare:?}").contains("wake: "), "{bare:?}");
+    assert_eq!(SaidVerdict::Outranked.words(), "outranked");
+    assert_eq!(cap_words(RuleId::Wake), "1 line a wake");
 }

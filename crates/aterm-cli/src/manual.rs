@@ -97,16 +97,20 @@ The first Mac window opens System State. aterm's own permissions are set up on e
 Mac; the rest of the profile is set up by itself only on an ALab Mac (a vault member, a
 fleet member, or one where the ALab vault answers). Elsewhere those groups start at
 Leave as is, and their rows still show the value now and the value setup wants. Once
-aterm finds the ALab signal, in the same launch or a later one, it widens the plan it
-chose by itself and says so on the page, and a Stop while it widens puts that plan
+aterm finds the ALab signal while the first-launch review is up, an untouched review
+shows the whole profile and counts 30 seconds again; once its own plan has run, System
+State offers the added groups as a review of their own, in its tab without taking
+yours, and Cancel there keeps the plan as yours. A Stop while it widens puts that plan
 back as yours, never widened again; a plan you shaped, or a Restore left, is never
 changed, and pressing any group,
-even to what it already is, makes the plan yours. The first launch shows Apply and
-Cancel: setup applies after 30 seconds while the tab is active and visible, but
-interaction stops that countdown, group and vault edits wait for Apply, and Cancel
-ends the offer without applying. Outside that review, a group's Set up / Leave as is
-takes effect at once. Stop, beside the headline while a run is going, ends that run
-between steps. Closing the tab never cancels accepted setup. System State remains
+even to what it already is, makes the plan yours. The first launch shows what setup
+will do, with Apply (30) and Cancel: left untouched while the tab is active and
+visible, it applies after 30 seconds; a click, key or scroll stops the countdown, and
+group and vault changes then wait for Apply. Cancel leaves every group as is until you
+press Set up now (which applies the setup the review showed) or a group; closing the
+review unanswered leaves it for the next launch. After that first launch, a group's
+Set up / Leave as is takes effect at once. Stop, beside the headline while a run is
+going, ends that run between steps. Closing the tab never cancels accepted setup. System State remains
 available to rerun setup or to press
 Restore previous settings. Terminal and ssh sessions, -e commands, headless runs,
 private lab homes and utilities never start setup.
@@ -132,16 +136,19 @@ replaces it until it starts writing, and the page says it waits, with no failure
 cannot be parsed twice in a row is kept beside itself as <name>.unreadable, and setup
 goes on as from a fresh one: your Mac settings left as they are, aterm's permissions
 set up, and on an ALab Mac the vault and repositories too, unless your Stop or Cancel
-holds them. Setup a newer aterm saved is left as it is, a damaged record beside it too,
-and System State says so in one line. A row that waits for you is not retried until you act, press Check again, or
-launch aterm again; a vault approval waits the same way, and the run goes on once an
+holds them. Setup a newer aterm saved is left as it is, a damaged record beside it too:
+System State says so in its headline, reads the rows as they are, and reads them again
+on Check again. A row that waits for you is not retried until you act, press Check
+again, or launch aterm again; a vault approval waits the same way, and the run goes on once an
 admin Mac approves. A step that fails for a passing reason (GitHub or the vault not
-answering, a change that did not take) is tried again by itself, and System State shows
-it waiting meanwhile, saying Failed only once those tries are spent. One only you can
-fix (a GitHub token to renew in the vault, Apple's Command Line Tools to install) reads
-Needs you with what to do, and System State reads it again every minute while shown and
-whenever you return to it. One no retry changes (GitHub repositories on a Mac with more
-than one user account) reads Failed at once; aterm doctor says why. A join turns sync on; with sync turned off since, the join lands
+answering, a change that did not take) is tried again by itself a minute later, up to ten
+times, and System State shows it waiting meanwhile, saying Failed only once those tries
+are spent. It then stays Failed until something it waits on changes, you press Check
+again or Set up now or make a choice, or aterm launches again; switching windows does not
+try it again. One only you can fix (a GitHub token to renew in the vault, Apple's Command
+Line Tools to install) reads Needs you with what to do; System State reads GitHub
+repositories again whenever you return to it, and by itself only once a renewed token
+reaches this Mac through the vault. A join turns sync on; with sync turned off since, the join lands
 once you turn it on again (`aterm secrets agent on`), and the run does not wait for it.
 While aterm cannot read this Mac's vault settings (`aterm secrets status` says why), Join
 joins nothing and System State says so calmly: the first launch's answer goes ahead
@@ -399,12 +406,12 @@ KEY USAGE (`aterm conn help` has every flag)
 
 WHAT IT IS
   Keeps a marked `<!-- aterm primer ... -->` block in each detected coding agent's
-  global context file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
+  global context file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, agy's
   `~/.gemini/GEMINI.md`, `~/.config/opencode/AGENTS.md`, `~/.config/muse/AGENTS.md`)
   and its skill files (marked `<!-- aterm skill ... -->`):
   * Claude Code (`~/.claude/skills/<name>/SKILL.md`): `drive-aterm`, `supervise-agent`,
     `rust-in-aterm`, `aterm-themes`, `aterm-fabric`, `system-state`.
-  * Codex, Gemini CLI, OpenCode and Muse Code: `aterm-fabric`.
+  * Codex, OpenCode and Muse Code: `aterm-fabric`.
   It removes aterm hooks from `~/.claude/settings.json` (keeping a `.bak-<unix>`
   copy) and sets the Claude Code defaults the user has not set: top-effort mode on,
   `effortLevel` xhigh, rating surveys off, `feedbackDrafts` quiet, `autoCompactWindow`
@@ -757,8 +764,8 @@ VERBS
   aterm harness usage | limits | disk | ledger | accounts | upgrade | tap
 
 WHAT IT IS
-  An aterm window (and `--headless`) supervises every Claude Code, agy, Muse Code
-  and Gemini CLI session by default (`codex-alab` supervises itself while the window
+  An aterm window (and `--headless`) supervises every Claude Code, agy and Muse Code
+  session by default (`codex-alab` supervises itself while the window
   watches; vendor `codex` is shown, never supervised). It injects no hooks: it reads
   the terminal screen and acts for the session:
   * Permission boxes: answered per `approve` (`"all"` allows once, `"safe"` only boxes
@@ -889,7 +896,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   Land, with `facts` on)
 
   Per-agent switch: `[harness.<agent>] enabled = false` (`claude`, `codex`, `agy`,
-  `muse`, `gemini`) stops supervising that agent alone.
+  `muse`) stops supervising that agent alone. A `[harness.gemini]` table, the retired
+  Gemini CLI's, switches nothing: its note says agy replaces it.
 
 THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
   usage      this session's tokens per model, subagents folded in (Codex at list price,
@@ -2325,8 +2333,8 @@ CLOSING A TAB
 const WORKERS_PAGE: &str = r#"workers — coding agents in other tabs on tasks you give them, and the survey
 
 WHAT IT IS
-  A WORKER is another aterm tab running a coding agent (`claude`, `codex`, `gemini`,
-  `agy` or `muse`) on a task, with its own context, tools and login. The window harness
+  A WORKER is another aterm tab running a coding agent (`claude`, `codex`, `agy` or
+  `muse`) on a task, with its own context, tools and login. The window harness
   carries it (codex-alab carries itself) under Autopilot Land (`autopilot=land`, the
   default, or `autopilot=cruise`) until all of its work is on the remote main branch.
 
@@ -2355,10 +2363,11 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
 AGENTS
   Each agent starts interactive with the task as its first prompt, and trusts the
   spawned `cwd=` for that worker alone: `agent=claude` (Claude Code; `result` reads its
-  transcript), `agent=gemini` (Gemini CLI), `agent=agy` (Antigravity CLI, on the model its
-  quota rotation picks: `aterm harness agy pick`), `agent=muse` (Muse Code). `agent=codex`
-  is codex-alab, which carries itself: it trusts its folder by its own rule (`harness
-  policy`'s approve level and trust roots), and `result` reads its rollout.
+  transcript), `agent=agy` (Antigravity CLI, on the model its quota rotation picks:
+  `aterm harness agy pick`), `agent=muse` (Muse Code). `agent=codex` is codex-alab,
+  which carries itself: it trusts its folder by its own rule (`harness policy`'s
+  approve level and trust roots), and `result` reads its rollout. `agent=gemini`, the
+  retired Gemini CLI, is refused by name: agy replaces it.
 
 ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>` on `<h>`)
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<abs-path>] - < task
@@ -2590,9 +2599,9 @@ const FLEET_PAGE: &str = r#"fleet — the aterms of one LAN, reading each other 
 WHAT IT IS
   A FLEET links the aterms on a LAN that share a fleet secret and prove per-machine
   Ed25519 node keys (`<state>/fleet-node-key`). Members reach each other on loopback,
-  private (10/8, 172.16/12, 192.168/16, fc00::/7) or link-local addresses only, never
-  public or CGNAT (100.64/10) ones. The issuer keeps the book of members and shares it
-  with members on every read.
+  private (10/8, 172.16/12, 192.168/16) or link-local (169.254/16) IPv4 addresses only,
+  as a fleet listener answers IPv4 alone, never public or CGNAT (100.64/10) ones. The
+  issuer keeps the book of members and shares it with members on every read.
 
 MEMBERSHIP
   `aterm fleet init` on the first machine (the issuer) mints the secret, writes the
@@ -2601,8 +2610,8 @@ MEMBERSHIP
   stdin, `--code-file F` or a hidden prompt, never an argument. `init --rotate` mints
   a new secret, which every member joins again with and which keeps no drive grant on
   either side; `peers` checks every known peer (3 s) and `peers add|rm` edits the
-  book of peers (`add` refuses an address past the LAN, and this machine's own
-  listener, writing nothing); `leave` removes the fleet secret, the join code, both
+  book of peers (`add` refuses an address past the LAN, an IPv6 one but ::1, and
+  this machine's own listener, writing nothing); `leave` removes the fleet secret, the join code, both
   books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
 
 READING & DRIVING ACROSS THE FLEET
@@ -2617,7 +2626,9 @@ READING & DRIVING ACROSS THE FLEET
     node key) may run `aterm ctl --host <h> spawn agent=<word>` here, with `await task`,
     `result`, `status`, `text`, `screen`, `turn`, `key`, `send`, `hold` and `close`
     (`aterm help workers`). A local Take Over always wins and lifts remote holds.
-    Every write that leaves the level below drive removes every grant and says so.
+    Every member reads a Mac at drive as at content: a grant at `facts` raises them,
+    and `aterm fleet allow facts` lowers them again. Every write that leaves the
+    level below drive removes every grant and says so.
 
 FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `fleet.key`, `fleet-join-code`, `fleet-node`, `fleet-node-key`, `fleet-peers`,
@@ -3964,7 +3975,7 @@ fn agent_page(sid: Option<&str>) -> String {
          Place work: `spawn window=<id>` opens a tab behind that window's active one, never\n  \
          raising it (ids from `windows`); `@<sid> spawn`, in <sid>'s window.\n  \
          WORKERS: `@self spawn agent=claude -` starts Claude Code behind your tab on the task on\n  \
-         stdin (agent=codex|gemini|agy|muse for those), under Autopilot Land; `await task @<sid>,…\n  \
+         stdin (agent=codex|agy|muse for those), under Autopilot Land; `await task @<sid>,…\n  \
          since=0` in the background wakes you when one is done (its work landed) or needs a\n  \
          person, and a later wait names the rev its row printed (`@<sid>:<rev>`). Its report is\n  \
          `@<sid> result`; a follow-up is `@<sid> turn typed=1 settle=submitted '<line>'`, then\n  \
@@ -3976,7 +3987,7 @@ fn agent_page(sid: Option<&str>) -> String {
          unreadable token): act on the reason; it never means \"empty\" unless it says so.\n",
     );
     s.push_str(
-        "\nAUTOPILOT AND NEEDS (Claude Code, agy, Muse Code and Gemini CLI alike)\n  \
+        "\nAUTOPILOT AND NEEDS (Claude Code, agy and Muse Code alike)\n  \
          AUTOPILOT: the window's harness carries an agent session under its Autopilot\n  \
          (`autopilot=` in `aterm ctl @self status`): cruise continues every turn end and takes\n  \
          no report as the end; land continues every turn end until all of the work is on the\n  \

@@ -417,7 +417,7 @@ fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
 fn codex_answers(codex: Option<Due>) -> impl Fn(upgrade::Agent) -> Option<Due> {
     move |agent| match agent {
         upgrade::Agent::Codex => codex,
-        upgrade::Agent::Agy | upgrade::Agent::Muse | upgrade::Agent::Gemini => None,
+        upgrade::Agent::Agy | upgrade::Agent::Muse => None,
         upgrade::Agent::Claude => panic!("Claude Code's half is not asked as another lane"),
     }
 }
@@ -447,7 +447,7 @@ fn a_tab_another_lane_noted_is_never_read_as_claude_codes() {
         SESSION_FILE_SCANS.with(|count| count.set(0));
         let lane_noted = move |agent| match agent {
             upgrade::Agent::Codex => codex,
-            upgrade::Agent::Agy | upgrade::Agent::Muse | upgrade::Agent::Gemini => None,
+            upgrade::Agent::Agy | upgrade::Agent::Muse => None,
             upgrade::Agent::Claude => panic!("Claude Code's half is not asked as another lane"),
         };
         let behind = behind_after_lanes(&opts, TAB, &tabs, now_s(), &lane_noted);
@@ -534,7 +534,7 @@ fn a_tab_whose_agents_switch_is_off_is_never_due() {
 #[test]
 fn a_relaunch_only_lanes_record_is_its_lanes_never_the_upgrades() {
     use super::super::relaunch::restarted;
-    use upgrade::Agent::{Agy, Claude, Codex, Gemini, Muse};
+    use upgrade::Agent::{Agy, Claude, Codex, Muse};
     let dir = scratch("no-lane-record");
     let base = Opts {
         only_sid: Some(TAB.to_string()),
@@ -596,20 +596,24 @@ fn a_relaunch_only_lanes_record_is_its_lanes_never_the_upgrades() {
         );
         std::fs::remove_file(state_path(&base, &name)).expect("rm");
     }
-    let lane = Gemini;
-    let name = format!("{}-{TAB}", lane.word());
+    let name = format!("gemini-{TAB}");
     let path = state_path(&base, &name);
-    std::fs::write(&path, record(lane).to_json()).expect("write");
-    assert!(!lane_on(&base, lane), "{lane:?}: no upgrade lane");
-    assert_eq!(load(&base, &name).map(|st| st.agent), Some(lane));
+    let muse = record(Muse).to_json();
+    let retired = muse.replace(r#""agent":"muse""#, r#""agent":"gemini""#);
+    assert_ne!(retired, muse, "PRECONDITION: the record names its agent");
+    std::fs::write(&path, retired).expect("write");
+    assert!(
+        load(&base, &name).is_none(),
+        "a retired agent's record is no record"
+    );
     assert!(
         in_flight(&base).is_empty(),
-        "{lane:?}: the relaunch's, not the upgrade's"
+        "the retired record is in no lane"
     );
-    assert_eq!(due(&base), Due::Unread(UNREAD_SOCKET), "{lane:?}");
+    assert_eq!(due(&base), Due::Unread(UNREAD_SOCKET), "the retired record");
     assert!(
-        !restarted(&base, lane, Some(pid)) && !restarted(&base, Claude, Some(pid)),
-        "{lane:?}"
+        !restarted(&base, Muse, Some(pid)) && !restarted(&base, Claude, Some(pid)),
+        "the retired record is no lane's restart"
     );
     std::fs::remove_file(&path).expect("rm");
     std::fs::write(state_path(&base, SESSION), record(Claude).to_json()).expect("write");
@@ -745,7 +749,7 @@ fn a_record_names_its_agent_or_is_no_record() {
     assert_eq!(agent(r#","agent":"""#), Some(upgrade::Agent::Claude));
     assert_eq!(agent(r#","agent":"claude""#), Some(upgrade::Agent::Claude));
     assert_eq!(agent(r#","agent":"codex""#), Some(upgrade::Agent::Codex));
-    assert_eq!(agent(r#","agent":"gemini""#), Some(upgrade::Agent::Gemini));
+    assert_eq!(agent(r#","agent":"gemini""#), None, "a retired agent");
     assert_eq!(agent(r#","agent":"opencode""#), None);
     assert_eq!(agent(r#","agent":"Codex""#), None);
     assert_eq!(agent(r#","agent":7"#), None);
@@ -1236,7 +1240,6 @@ fn a_tab_another_lane_reports_is_that_lanes_alone() {
                 Codex => vec![report(codex_tab, Codex)],
                 Claude => vec![report("-", Claude)],
                 Muse | Agy => Vec::new(),
-                upgrade::Agent::Gemini => panic!("{agent:?} has no upgrade lane"),
             }
         };
         let said: Vec<String> = lanes(&opts, live_tabs, &pass)
@@ -1596,6 +1599,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             shell: 1,
             dialect: Dialect::Zsh,
             line,
+            tap_dropped: None,
         })
     };
     let report = || Report {
@@ -10489,8 +10493,9 @@ fn a_restart_in_place_types_back_the_login_its_process_had() {
     let launch = "claude-fable-5-1";
     let line = |env: &str| {
         format!(
-            " ( cd -- '/' && {env}CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 exec \
-             '/opt/claude/bin/claude' '--model' '{launch}' '--resume' '{SESSION}' )"
+            " {}( cd -- '/' && {env}CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 exec \
+             '/opt/claude/bin/claude' '--model' '{launch}' '--resume' '{SESSION}' )",
+            crate::harness::upgrade::BASH_LINE_OPENS
         )
     };
     for (name, login, want) in [
@@ -14103,6 +14108,83 @@ fn a_barred_ride_is_dropped_once_and_the_round_goes_on_without_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A RELAUNCH INTO THE SHELL'S OWN DIRECTORY, SPELLED ANOTHER WAY, NEEDS NO `cd`; ONE THAT DOES
+/// NEED IT, IN BASH, OPENS WITH A SIMPLE COMMAND. The session file records the agent's logical
+/// `$PWD` (here a symlink to the directory the shell is in) while the kernel names the shell's
+/// directory by its real path: one directory, so the line has no `cd`. A directory that really
+/// differs gets the `cd` form, and in bash it opens with [`super::super::upgrade::BASH_LINE_OPENS`]
+/// so bash's DEBUG trap (bash 3.2 has no PS0 hook) reports the line as a command.
+#[test]
+fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
+    let dir = scratch("line-same-dir");
+    let opts = drive(&dir);
+    let real = dir.join("work");
+    let other = dir.join("other");
+    for d in [&real, &other] {
+        std::fs::create_dir_all(d).expect("a directory");
+    }
+    let spelled = dir.join("spelled");
+    std::os::unix::fs::symlink(&real, &spelled).expect("a second spelling");
+    // A bash the plan reads as one (its own exec path), standing in its directory.
+    let mut shell = Command::new("/bin/bash")
+        .args(["-c", "sleep 60; :"])
+        .current_dir(&real)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("a bash");
+    let pid = shell.id();
+    let line_in = |cwd: &Path| {
+        let cwd = cwd.to_str().expect("utf-8").to_owned();
+        let argv = vec!["claude".to_string()];
+        let launch = crate::harness::relaunch::Launch {
+            stored_login: false,
+            billing: crate::harness::relaunch::ModelBilling::Keep,
+            session: SESSION,
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: Path::new("/opt/claude"),
+            model: None,
+            mode: None,
+            login: None,
+            home: None,
+            homedir: None,
+        };
+        let table = [(pid, 1, "bash".into())];
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(20),
+            || aterm_sysprobe::process_cwd(pid).filter(|c| super::same_dir(c, &real)),
+        )
+        .expect("the stand-in's directory");
+        match crate::harness::relaunch::plan(&opts, &launch, pid, &table) {
+            Ok(plan) => plan.line,
+            Err(crate::harness::relaunch::NoPlan::Wait(what)) => panic!("no plan: wait {what}"),
+            Err(crate::harness::relaunch::NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
+        }
+    };
+    let same = line_in(&spelled);
+    assert!(
+        !same.contains("cd --") && !same.contains("builtin"),
+        "one directory, two spellings: {same}"
+    );
+    assert!(same.ends_with(&format!("'--resume' '{SESSION}'")), "{same}");
+    let moved = line_in(&other);
+    assert!(
+        moved.starts_with(&format!(
+            " {}( cd -- '{}' && ",
+            super::super::upgrade::BASH_LINE_OPENS,
+            other.display()
+        )) && moved.ends_with(&format!("exec '/opt/claude' '--resume' '{SESSION}' )")),
+        "{moved}"
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
 /// The planned line carries the usage tap where its gate holds.
 #[test]
 fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
@@ -14239,8 +14321,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
         for text in [status, helper, credential] {
             std::fs::write(&file, text).expect("write");
             if file == opts.home.join(".claude/settings.json") && text == status {
-                let carried =
-                    tap::settings_value_chained(exe, Some("echo mine")).expect("a carried value");
+                let carried = tap::settings_value_carrying(exe, true).expect("a carried value");
                 assert_eq!(
                     planned(&opts, &argv, true),
                     tapped.replacen(&value, &carried, 1),

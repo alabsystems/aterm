@@ -1,0 +1,16 @@
+# claude-code 2.1.310 · MEASURED 2026-10-24, `aterm ctl text` of a private headless aterm (120x40, aterm 0.135.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · Claude Code's no-response retry row with its hint wrapped under it, a retry waiting on a stub that never answers (custom mode delay_ms 900000), CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=10000 and _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 so the first-byte watchdog arms against the stub, 120 columns
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.RFn3/proj
+
+
+❯ say hi
+
+✻ No response from the API after 13s · retrying once, waiting up to 10m
+  A proxy or gateway that buffers streaming responses can cause this · set CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to change
+  the first wait
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt

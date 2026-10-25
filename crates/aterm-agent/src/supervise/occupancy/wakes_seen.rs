@@ -368,6 +368,9 @@ pub struct WakeSeen {
     pub need: Option<String>,
     /// Whether its need names build slots (the line reserves one).
     pub need_slots: bool,
+    /// Its need held at the book's last look (true with no need): the host judges it on its own
+    /// machine figures and latches, which the loop does not read.
+    pub need_met: bool,
     /// Its condition is time alone: only an `await wake` answers it, and no line is typed.
     pub await_only: bool,
 }

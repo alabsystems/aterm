@@ -29,7 +29,7 @@
 //! episode, before the reader resumes. A spent need alone carries no banner receipt.
 
 use aterm_core::terminal::program_state::{
-    ProgramBlockedKind, ProgramState, ProgramStateReport, ProgramStateWord,
+    ProgramBlockedKind, ProgramStateReport, ProgramStateWord,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -118,11 +118,9 @@ impl BoxBanner {
     pub(crate) fn adopt(&self, receipt: Option<Receipt>, report: ProgramStateReport) {
         let Some(receipt) = receipt else { return };
         if report.restored_from != Some(receipt.began)
-            || report.state
-                != Some(ProgramState {
-                    state: ProgramStateWord::Blocked,
-                    kind: receipt.kind,
-                })
+            || !report
+                .state
+                .is_some_and(|s| s.state == ProgramStateWord::Blocked && s.kind == receipt.kind)
         {
             return;
         }

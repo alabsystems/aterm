@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use aterm_core::terminal::program_state::{ProgramState, ProgramStateReport};
+use aterm_core::terminal::program_state::{ProgramApp, ProgramState, ProgramStateReport};
 
 /// One session's gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -153,24 +153,32 @@ fn starts_a_turn(before: Option<ProgramState>, after: Option<ProgramState>) -> b
     in_turn(after) && !in_turn(before)
 }
 
-/// Whether a report is honoured under the program in front, its published name (`program=`).
-pub(crate) fn honoured_for(program: Option<&str>) -> bool {
+/// Whether a report naming `app` is honoured under the program in front, its published name
+/// (`program=`): a `codex` report under a codex (or a script runtime one runs under, as an npm
+/// install does), a `grok-build` report under a Grok Build, and nothing else. A report is the
+/// claim of the program it names, so one never stands for another program in front.
+pub(crate) fn honoured_for(program: Option<&str>, app: Option<ProgramApp>) -> bool {
     use aterm_phase::Program;
-    let Some(name) = program else {
+    let (Some(name), Some(app)) = (program, app) else {
         return false;
     };
-    match aterm_phase::program_of(name) {
-        Some(Program::Codex) => true,
-        Some(
-            Program::Claude
-            | Program::Grok
-            | Program::Kimi
-            | Program::Generic
-            | Program::Agy
-            | Program::Muse
-            | Program::Gemini,
+    match (aterm_phase::program_of(name), app) {
+        (Some(Program::Codex), ProgramApp::Codex)
+        | (Some(Program::Grok), ProgramApp::GrokBuild) => true,
+        (None, ProgramApp::Codex) => aterm_phase::may_host_agent(name),
+        (
+            Some(
+                Program::Claude
+                | Program::Codex
+                | Program::Grok
+                | Program::Kimi
+                | Program::Generic
+                | Program::Agy
+                | Program::Muse,
+            )
+            | None,
+            ProgramApp::Codex | ProgramApp::GrokBuild,
         ) => false,
-        None => aterm_phase::may_host_agent(name),
     }
 }
 
@@ -197,15 +205,21 @@ pub(crate) fn column(shown: Option<crate::session_timeline::ShownProgram>) -> St
     shown.map_or_else(|| "-".to_string(), |shown| shown.state.wire())
 }
 
-/// The hover's word for a shown report (`presence::state_line`), when the screen's reader names no phase.
+/// The hover's word for a shown report (`presence::state_line`), when the screen's reader names no
+/// phase: the program the report names, then its state.
 pub(crate) const fn row_word(state: ProgramState) -> &'static str {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
-    match state.state {
-        W::Idle => "codex idle",
-        W::Working => "codex working",
-        W::Blocked => "codex blocked",
-        W::Done => "codex done",
-        W::Error => "codex error",
+    match (state.app, state.state) {
+        (ProgramApp::Codex, W::Idle) => "codex idle",
+        (ProgramApp::Codex, W::Working) => "codex working",
+        (ProgramApp::Codex, W::Blocked) => "codex blocked",
+        (ProgramApp::Codex, W::Done) => "codex done",
+        (ProgramApp::Codex, W::Error) => "codex error",
+        (ProgramApp::GrokBuild, W::Idle) => "grok idle",
+        (ProgramApp::GrokBuild, W::Working) => "grok working",
+        (ProgramApp::GrokBuild, W::Blocked) => "grok blocked",
+        (ProgramApp::GrokBuild, W::Done) => "grok done",
+        (ProgramApp::GrokBuild, W::Error) => "grok error",
     }
 }
 
@@ -407,6 +421,90 @@ mod tests {
         assert_eq!(other.turn_starts(), 0);
     }
 
+    /// GROK BUILD'S OWN REPORT THROUGH THE REAL SWEEP (`App::observe_session_statuses`): a real
+    /// engine fed the bytes Grok Build 1.0.70 writes (its root record, a subagent's child record
+    /// beside it, and its exit's `clear`) under a published `grok` is `status program_state=` and
+    /// the hover's `grok …` word; a child record moves neither.
+    /// NEGATIVE CONTROLS: the same bytes under a published `codex` show nothing (a report never
+    /// stands for another program), and so do codex's own bytes under a published `grok`.
+    #[test]
+    fn grok_builds_own_report_is_shown_only_under_a_grok_in_front() {
+        const G_WORKING: &[u8] = b"\x1b]7501;state=working:app=grok-build:title=cGFyc2Vy\x1b\\";
+        const G_BLOCKED: &[u8] =
+            b"\x1b]7501;state=blocked:kind=permission:app=grok-build:title=cGFyc2Vy\x1b\\";
+        const G_CHILD_DONE: &[u8] = b"\x1b]7501;state=done:app=grok-build:id=sub_1\x1b\\";
+        const G_CHILD_CLEAR: &[u8] = b"\x1b]7501;state=clear:id=sub_1\x1b\\";
+        const G_DONE: &[u8] = b"\x1b]7501;state=done:app=grok-build:title=cGFyc2Vy\x1b\\";
+        let shown_through = |program: &str, stream: &[&[u8]]| -> Vec<String> {
+            let mut app = crate::App::headless_for_test();
+            let sid = app.next_session_id;
+            app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+            let (term, timeline) = {
+                let pooled = app.pool.get(sid).expect("pooled");
+                (
+                    std::sync::Arc::clone(&pooled.term),
+                    std::sync::Arc::clone(&pooled.ctx.timeline),
+                )
+            };
+            {
+                let mut tl = timeline.lock().unwrap();
+                tl.note_foreground_group(4242);
+                tl.set_program(4242, Some(program.into()));
+            }
+            let step = std::time::Duration::from_secs(1);
+            let mut t = Instant::now();
+            let mut seen = Vec::new();
+            for bytes in stream {
+                crate::term_lock(&term).process(bytes);
+                let _ = app.observe_session_statuses(t);
+                t += step;
+                let shown = app.session_status.program_state(sid);
+                seen.push(format!(
+                    "{} {}",
+                    wire(shown),
+                    shown.map_or("-", |(state, _)| row_word(state))
+                ));
+            }
+            seen
+        };
+        let grok = [
+            G_WORKING,
+            G_CHILD_DONE,
+            G_BLOCKED,
+            G_CHILD_CLEAR,
+            G_WORKING,
+            G_DONE,
+            CLEAR,
+        ];
+        assert_eq!(
+            shown_through("grok", &grok),
+            [
+                "working grok working",
+                "working grok working",
+                "blocked:permission grok blocked",
+                "blocked:permission grok blocked",
+                "working grok working",
+                "done grok done",
+                "- -",
+            ]
+        );
+        assert!(
+            shown_through("codex", &grok).iter().all(|s| s == "- -"),
+            "control: Grok Build's report under a codex"
+        );
+        assert!(
+            shown_through("grok", &[WORKING, BLOCKED_PERMISSION, CLEAR])
+                .iter()
+                .all(|s| s == "- -"),
+            "control: codex's report under a Grok Build"
+        );
+        assert_eq!(
+            shown_through("codex", &[WORKING, CLEAR]),
+            ["working codex working", "- -"],
+            "control: codex's under a codex still shows"
+        );
+    }
+
     /// THE TURN LEDGER AND THE `done` EDGE THROUGH THE REAL SWEEP
     /// (`App::observe_session_statuses`), a real engine fed the bytes codex
     /// writes under a published `codex`: each honoured move is one
@@ -524,27 +622,51 @@ mod tests {
         assert_eq!(shown(&gate), None);
     }
 
+    /// A REPORT IS HONOURED ONLY UNDER THE PROGRAM IT NAMES: a `codex` report under a codex or a
+    /// runtime one runs under, a `grok-build` report under a Grok Build. NEGATIVE CONTROLS: each
+    /// app's report under the other program, under a runtime (no Grok Build runs under one), under
+    /// a shell or a supervised agent, and under no program.
     #[test]
-    fn only_a_codex_in_front_is_honoured() {
-        assert!(honoured_for(Some("codex")));
-        assert!(honoured_for(Some("/opt/x/bin/codex")));
-        assert!(honoured_for(Some("node")));
-        assert!(honoured_for(Some("/usr/local/bin/node")));
-        assert!(honoured_for(Some("bun")));
-        assert!(!honoured_for(Some("claude")));
-        assert!(!honoured_for(Some("zsh")));
-        assert!(!honoured_for(Some("-zsh")));
-        assert!(!honoured_for(Some("vim")));
-        assert!(!honoured_for(None));
+    fn a_report_is_honoured_only_under_the_program_it_names() {
+        let (codex, grok) = (Some(ProgramApp::Codex), Some(ProgramApp::GrokBuild));
+        for program in [
+            "codex",
+            "/opt/x/bin/codex",
+            "node",
+            "/usr/local/bin/node",
+            "bun",
+        ] {
+            assert!(honoured_for(Some(program), codex), "{program}");
+            assert!(!honoured_for(Some(program), grok), "{program}: not Grok's");
+        }
+        for program in ["grok", "/Users//x/.local/share/aterm/agents/grok"] {
+            assert!(honoured_for(Some(program), grok), "{program}");
+            assert!(
+                !honoured_for(Some(program), codex),
+                "{program}: not codex's"
+            );
+        }
+        for program in ["claude", "muse", "agy", "kimi", "zsh", "-zsh", "vim"] {
+            assert!(!honoured_for(Some(program), codex), "{program}");
+            assert!(!honoured_for(Some(program), grok), "{program}");
+        }
+        assert!(!honoured_for(None, codex));
+        assert!(!honoured_for(None, grok));
+        assert!(
+            !honoured_for(Some("codex"), None),
+            "no report names no program"
+        );
     }
 
     #[test]
-    fn the_row_word_names_codex_and_its_state() {
-        let blocked = ProgramState {
+    fn the_row_word_names_the_reports_program_and_its_state() {
+        let blocked = |app| ProgramState {
             state: ProgramStateWord::Blocked,
             kind: Some(ProgramBlockedKind::Question),
+            app,
         };
-        assert_eq!(row_word(blocked), "codex blocked");
+        assert_eq!(row_word(blocked(ProgramApp::Codex)), "codex blocked");
+        assert_eq!(row_word(blocked(ProgramApp::GrokBuild)), "grok blocked");
     }
 
     /// THE REAL `status` RECORD AND PRESENCE FACTS of a real session, its real

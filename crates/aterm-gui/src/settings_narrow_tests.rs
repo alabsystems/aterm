@@ -1510,10 +1510,9 @@ fn the_fleet_fields_words_keep_it_a_field() {
                         seen = true;
                         whole |= node.clip.height >= node.rect.height - 0.5;
                         let painted = painted_text(node).unwrap_or_default();
-                        let read = painted_words(&painted).replace(['\n', ' '], "");
                         assert!(
                             !painted.contains('\u{2026}')
-                                && read == "ai-fleet.tomlbesideaterm.toml",
+                                && reads_as(&painted, "ai-fleet.toml beside aterm.toml"),
                             "{context}: the fleet field paints {painted:?}"
                         );
                     },
@@ -2357,6 +2356,26 @@ fn painted_text(node: &crate::native_ui::PaintNode) -> Option<String> {
     }
 }
 
+/// Whether lines `painted` say `words`: a line ending in a hyphen is either a word's own
+/// hyphen (a name breaks after its hyphens) or the mark a break inside a word puts there.
+fn reads_as(painted: &str, words: &str) -> bool {
+    fn says(painted: &[char], words: &[char]) -> bool {
+        match (painted, words) {
+            ([], []) => true,
+            (['-', '\n', rest @ ..], _) => {
+                says(rest, words) || words.first() == Some(&'-') && says(rest, &words[1..])
+            }
+            ([c, rest @ ..], _) if c.is_whitespace() => says(rest, words),
+            (_, [c, rest @ ..]) if c.is_whitespace() => says(painted, rest),
+            ([p, painted @ ..], [w, words @ ..]) => p == w && says(painted, words),
+            _ => false,
+        }
+    }
+    let painted: Vec<char> = painted.chars().collect();
+    let words: Vec<char> = words.chars().collect();
+    says(&painted, &words)
+}
+
 /// `painted` cut inside a word of `whole` (what the same node says where nothing cuts it).
 fn cut_inside_a_word(painted: &str, whole: &str) -> bool {
     let line = painted.rsplit('\n').next().unwrap_or(painted);
@@ -2846,8 +2865,8 @@ fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
                         "{context}: {line:?} is wider than its column"
                     );
                     assert!(
-                        !line.ends_with('-'),
-                        "{context}: {line:?} ends in a hyphen: {lines:?}"
+                        !line.starts_with('-'),
+                        "{context}: {line:?} starts with a hyphen, which ends its line: {lines:?}"
                     );
                 }
             }

@@ -1034,7 +1034,7 @@ fn the_sidecar_line_reads_back_and_a_stem_is_one_name() {
             turn: Some("u-task 1".to_string()),
         },
         Source::Screen {
-            program: "gemini".to_string(),
+            program: "agy".to_string(),
         },
     ] {
         assert_eq!(Source::parse(&source.line()), Some(source.clone()));
@@ -1083,7 +1083,7 @@ fn a_screens_result_is_the_landings_words() {
         "Merged the parser.\n\nNothing left: all of it is merged into the remote main branch."
     );
     assert_eq!(screen_said(None, " last "), "last");
-    for program in ["gemini", "agy", "muse"] {
+    for program in ["agy", "muse"] {
         let stem = format!("s-{program}-2");
         let snap = snapshot_screen(&tasks, &stem, program, &said, DoneBy::Turn).expect("written");
         assert_eq!(snap.bytes, said.len() as u64);
@@ -1137,7 +1137,6 @@ fn each_screen_harnesss_landing_words_are_read_off_its_screen() {
     use aterm_phase::Program;
     let shell = aterm_phase::prompt::fixtures::rows(&["% "]);
     for (program, text) in [
-        (Program::Gemini, aterm_phase::gemini::fixtures::END_OF_TURN),
         (Program::Agy, aterm_phase::agy::fixtures::lab::END_OF_TURN),
         (Program::Muse, aterm_phase::muse::fixtures::END_OF_TURN),
     ] {

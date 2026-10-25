@@ -285,7 +285,13 @@ pub struct Spec<'a> {
 
 /// Write `spec` as a params blob, the header (QMAX computed from MULT) then each tensor at the next 16-byte-aligned offset, checking nothing: [`check`] refuses what it must.
 pub fn build(spec: &Spec<'_>) -> Vec<u8> {
-    let word = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    const fn word(n: usize) -> u32 {
+        if n > u32::MAX as usize {
+            u32::MAX
+        } else {
+            n as u32
+        }
+    }
     let mut h = [0u32; PARAMS_WORDS];
     h[params::MAGIC] = PARAMS_MAGIC_VALUE;
     h[params::LAYOUT_VERSION] = LAYOUT_VERSION;
@@ -298,23 +304,50 @@ pub fn build(spec: &Spec<'_>) -> Vec<u8> {
     h[params::QMAX] = qmax(spec.mult);
     h[params::G] = spec.g;
     h[params::T] = spec.t as u32;
-    let bytes = |v: &[i8]| v.iter().map(|&x| x as u8).collect::<Vec<u8>>();
-    let words = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let push_bytes = |out: &mut Vec<u8>, v: &[i8]| {
+        out.reserve(v.len());
+        for &x in v {
+            out.push(x as u8);
+        }
+    };
+    let push_words = |out: &mut Vec<u8>, v: &[i32]| {
+        out.reserve(v.len() * 4);
+        for &x in v {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    };
     let mut out = vec![0u8; PARAMS_WORDS * 4];
     for t in Tensor::ALL {
         out.resize(out.len().next_multiple_of(TENSOR_ALIGN as usize), 0);
         let (off, len) = t.fields();
         h[off] = word(out.len());
-        let (count, body) = match t {
-            Tensor::Emb => (spec.emb.len(), bytes(spec.emb)),
-            Tensor::W1 => (spec.w1.len(), bytes(spec.w1)),
-            Tensor::W2 => (spec.w2.len(), bytes(spec.w2)),
-            Tensor::Lut => (spec.lut.len(), bytes(spec.lut)),
-            Tensor::B1 => (spec.b1.len(), words(spec.b1)),
-            Tensor::B2 => (spec.b2.len(), words(spec.b2)),
+        let count = match t {
+            Tensor::Emb => {
+                push_bytes(&mut out, spec.emb);
+                spec.emb.len()
+            }
+            Tensor::W1 => {
+                push_bytes(&mut out, spec.w1);
+                spec.w1.len()
+            }
+            Tensor::W2 => {
+                push_bytes(&mut out, spec.w2);
+                spec.w2.len()
+            }
+            Tensor::Lut => {
+                push_bytes(&mut out, spec.lut);
+                spec.lut.len()
+            }
+            Tensor::B1 => {
+                push_words(&mut out, spec.b1);
+                spec.b1.len()
+            }
+            Tensor::B2 => {
+                push_words(&mut out, spec.b2);
+                spec.b2.len()
+            }
         };
         h[len] = word(count);
-        out.extend_from_slice(&body);
     }
     for (slot, w) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
         *slot = w.to_le_bytes();
@@ -958,16 +991,15 @@ impl Batch {
                 return Err(BatchError::RowTooLong { row, len });
             }
         }
-        if let Some((at, &id)) = ids
-            .iter()
-            .enumerate()
-            .find(|&(_, &id)| u32::from(id) >= p.dims.buckets)
-        {
-            return Err(BatchError::IdOutOfRange {
-                at: at as u32,
-                id,
-                buckets: p.dims.buckets,
-            });
+        let buckets = p.dims.buckets;
+        for (at, &id) in ids.iter().enumerate() {
+            if u32::from(id) >= buckets {
+                return Err(BatchError::IdOutOfRange {
+                    at: at as u32,
+                    id,
+                    buckets,
+                });
+            }
         }
         Ok(Batch {
             dims: p.dims,
@@ -1359,7 +1391,12 @@ pub fn trace(p: &ParamsView<'_>, b: &Batch, row: u32) -> Result<Option<RowTrace>
     let (mut pre, mut interior) = ([0i32; H_CAP], 0);
     let clamped = pre_activations::<Checked>(p, ids, &mut pre, Some(&mut interior));
     let pre = pre[..p.dims.hidden as usize].to_vec();
-    let saturated = pre.iter().filter(|&&x| x < -p.t || x > p.t).count() as u32;
+    let mut saturated = 0u32;
+    for &x in &pre {
+        if x < -p.t || x > p.t {
+            saturated += 1;
+        }
+    }
     Ok(Some(RowTrace {
         pre,
         clamped,
@@ -1370,7 +1407,10 @@ pub fn trace(p: &ParamsView<'_>, b: &Batch, row: u32) -> Result<Option<RowTrace>
 
 /// `Digest::of(OUT_DOMAIN, [the words, little-endian])`.
 pub fn out_digest(words: &[u32]) -> Digest {
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for &w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
     Digest::of(OUT_DOMAIN, &[&bytes])
 }
 
@@ -1405,41 +1445,52 @@ pub fn extreme_params_for(dims: Dims, min_ids: u32) -> Vec<u8> {
         dims.classes as usize,
     );
     let last = dims.buckets.saturating_sub(1);
-    let sign = |bit: bool| if bit { 127i8 } else { -127 };
-    let emb: Vec<i8> = (0..dims.buckets as usize * e)
-        .map(|i| {
-            let (id, j) = ((i / e) as u32, (i % e) as u32);
-            match id {
-                0 => 127,
-                id if id == last => -127,
-                id => sign(mix(id, j) & 1 == 0),
-            }
-        })
-        .collect();
-    let w1: Vec<i8> = (0..e * h)
-        .map(|i| match (i / h, i % h) {
+    const fn sign(bit: bool) -> i8 {
+        if bit { 127i8 } else { -127 }
+    }
+    let emb_len = dims.buckets as usize * e;
+    let mut emb = Vec::with_capacity(emb_len);
+    for i in 0..emb_len {
+        let (id, j) = ((i / e) as u32, (i % e) as u32);
+        let v = match id {
+            0 => 127,
+            id if id == last => -127,
+            id => sign(mix(id, j) & 1 == 0),
+        };
+        emb.push(v);
+    }
+    let mut w1 = Vec::with_capacity(e * h);
+    for i in 0..e * h {
+        let v = match (i / h, i % h) {
             (_, 0) => 127,
             (j, k) => sign(mix(j as u32 + 1, k as u32 + 7) & 2 == 0),
-        })
-        .collect();
-    let w2: Vec<i8> = (0..h * c)
-        .map(|i| sign(mix((i / c) as u32 + 3, (i % c / 2) as u32 + 11) & 4 == 0))
-        .collect();
+        };
+        w1.push(v);
+    }
+    let mut w2 = Vec::with_capacity(h * c);
+    for i in 0..h * c {
+        w2.push(sign(
+            mix((i / c) as u32 + 3, (i % c / 2) as u32 + 11) & 4 == 0,
+        ));
+    }
     let (mult, g, t) = (79_474u32, 20u32, 1_024i32);
     let m = ((u64::from(qmax(mult)) * u64::from(mult)) >> g) as i32;
-    let lut: Vec<i8> = (-t..=t).map(|i| (i.signum() * 127) as i8).collect();
-    let b1: Vec<i32> = (0..h as u32)
-        .map(|k| if mix(k, 5) & 1 == 0 { m - t } else { t - m })
-        .collect();
-    let b2: Vec<i32> = (0..c)
-        .map(|class| {
-            if (class / 2) % 2 == 0 {
-                B2_LIMIT - 1
-            } else {
-                1 - B2_LIMIT
-            }
-        })
-        .collect();
+    let mut lut = Vec::with_capacity((2 * t + 1) as usize);
+    for i in -t..=t {
+        lut.push((i.signum() * 127) as i8);
+    }
+    let mut b1 = Vec::with_capacity(h);
+    for k in 0..h as u32 {
+        b1.push(if mix(k, 5) & 1 == 0 { m - t } else { t - m });
+    }
+    let mut b2 = Vec::with_capacity(c);
+    for class in 0..c {
+        b2.push(if (class / 2) % 2 == 0 {
+            B2_LIMIT - 1
+        } else {
+            1 - B2_LIMIT
+        });
+    }
     build(&Spec {
         dims,
         min_ids,
@@ -1491,33 +1542,40 @@ pub fn interior_params_for(dims: Dims, min_ids: u32) -> Vec<u8> {
         dims.classes as usize,
     );
     let half = (dims.buckets / 2).max(1);
-    let small = |a: u32, b: u32| [-2i8, -1, 1, 2][(mix(a, b) % 4) as usize];
-    let emb: Vec<i8> = (0..dims.buckets as usize * e)
-        .map(|i| {
-            let (id, j) = ((i / e) as u32, (i % e) as u32);
-            let mag = small(id + 1, j + 29).abs();
-            let lean = small(j + 1, 67).signum();
-            if id < half { lean * mag } else { -lean * mag }
-        })
-        .collect();
-    let w1: Vec<i8> = (0..e * h)
-        .map(|i| small((i / h) as u32 + 31, (i % h) as u32 + 37))
-        .collect();
-    let w2: Vec<i8> = (0..h * c)
-        .map(|i| {
-            let x = mix((i / c) as u32 + 41, (i % c) as u32 + 43);
-            let mag = (x % 127) as i8 + 1;
-            if x & 0x100 == 0 { mag } else { -mag }
-        })
-        .collect();
+    const fn small(a: u32, b: u32) -> i8 {
+        [-2i8, -1, 1, 2][(mix(a, b) % 4) as usize]
+    }
+    let emb_len = dims.buckets as usize * e;
+    let mut emb = Vec::with_capacity(emb_len);
+    for i in 0..emb_len {
+        let (id, j) = ((i / e) as u32, (i % e) as u32);
+        let mag = small(id + 1, j + 29).abs();
+        let lean = small(j + 1, 67).signum();
+        emb.push(if id < half { lean * mag } else { -lean * mag });
+    }
+    let mut w1 = Vec::with_capacity(e * h);
+    for i in 0..e * h {
+        w1.push(small((i / h) as u32 + 31, (i % h) as u32 + 37));
+    }
+    let mut w2 = Vec::with_capacity(h * c);
+    for i in 0..h * c {
+        let x = mix((i / c) as u32 + 41, (i % c) as u32 + 43);
+        let mag = (x % 127) as i8 + 1;
+        w2.push(if x & 0x100 == 0 { mag } else { -mag });
+    }
     let t = 127i32;
-    let lut: Vec<i8> = (-t..=t).map(|i| i as i8).collect();
-    let b1: Vec<i32> = (0..h as u32)
-        .map(|k| (mix(k, 47) % 61) as i32 - 30)
-        .collect();
-    let b2: Vec<i32> = (0..c as u32)
-        .map(|class| (mix(class, 53) % 2_001) as i32 - 1_000)
-        .collect();
+    let mut lut = Vec::with_capacity((2 * t + 1) as usize);
+    for i in -t..=t {
+        lut.push(i as i8);
+    }
+    let mut b1 = Vec::with_capacity(h);
+    for k in 0..h as u32 {
+        b1.push((mix(k, 47) % 61) as i32 - 30);
+    }
+    let mut b2 = Vec::with_capacity(c);
+    for class in 0..c as u32 {
+        b2.push((mix(class, 53) % 2_001) as i32 - 1_000);
+    }
     build(&Spec {
         dims,
         min_ids,
@@ -1594,12 +1652,31 @@ pub fn seeded(seed: u64) -> (Vec<u8>, Vec<u32>, Vec<u16>) {
         dims.classes as usize,
     );
     let min_ids = 1 + r.below(8) as u32;
-    let emb: Vec<i8> = (0..b * e).map(|_| r.weight()).collect();
-    let w1: Vec<i8> = (0..e * h).map(|_| r.weight()).collect();
-    let w2: Vec<i8> = (0..h * c).map(|_| r.weight()).collect();
-    let lut: Vec<i8> = (0..2 * t + 1).map(|_| r.weight()).collect();
-    let b1: Vec<i32> = (0..h).map(|_| r.signed(b1_bound) as i32).collect();
-    let b2: Vec<i32> = (0..c).map(|_| r.signed(b2_bound) as i32).collect();
+    let mut emb = Vec::with_capacity(b * e);
+    for _ in 0..b * e {
+        emb.push(r.weight());
+    }
+    let mut w1 = Vec::with_capacity(e * h);
+    for _ in 0..e * h {
+        w1.push(r.weight());
+    }
+    let mut w2 = Vec::with_capacity(h * c);
+    for _ in 0..h * c {
+        w2.push(r.weight());
+    }
+    let lut_len = (2 * t + 1) as usize;
+    let mut lut = Vec::with_capacity(lut_len);
+    for _ in 0..lut_len {
+        lut.push(r.weight());
+    }
+    let mut b1 = Vec::with_capacity(h);
+    for _ in 0..h {
+        b1.push(r.signed(b1_bound) as i32);
+    }
+    let mut b2 = Vec::with_capacity(c);
+    for _ in 0..c {
+        b2.push(r.signed(b2_bound) as i32);
+    }
     let bytes = build(&Spec {
         dims,
         min_ids,

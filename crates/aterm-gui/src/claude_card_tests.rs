@@ -6068,25 +6068,51 @@ fn click(
     at: (usize, usize),
     mods: aterm_window::keyboard::ModifiersState,
 ) {
+    click_when(app, wid, at, mods, Instant::now());
+}
+
+/// A click on `at` with `mods` held whose button went down and up at `when`.
+#[cfg(unix)]
+fn click_when(
+    app: &mut App,
+    wid: WindowId,
+    at: (usize, usize),
+    mods: aterm_window::keyboard::ModifiersState,
+    when: Instant,
+) {
     use aterm_window::event::{ElementState, MouseButton};
     let (x, y) = cell_px(app, wid, at);
     app.windows.get_mut(&wid).expect("window").mods = mods;
     app.on_cursor_moved(wid, x, y);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, when);
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, when);
     app.windows.get_mut(&wid).expect("window").mods =
         aterm_window::keyboard::ModifiersState::empty();
 }
 
-/// Let a double click's interval pass since the banner link's last press, as a person's next,
-/// separate click would.
+/// A double click's interval, whose last instant still continues a run of presses.
 #[cfg(unix)]
-fn later_link(app: &mut App, wid: WindowId) {
-    app.windows
-        .get_mut(&wid)
-        .expect("window")
-        .claude_card
-        .age_link_press();
+fn interval() -> Duration {
+    Duration::from_millis(
+        u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
+    )
+}
+
+/// Where a test's stated presses start: a minute ago, far enough from the clock that a press or
+/// a stamp that read the clock instead of its stated time lands on the wrong side of a double
+/// click's interval.
+#[cfg(unix)]
+fn a_minute_ago() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("a minute of uptime")
+}
+
+/// How long after a press a person's next, separate click comes: a millisecond past a double
+/// click's interval.
+#[cfg(unix)]
+fn apart() -> Duration {
+    interval() + Duration::from_millis(1)
 }
 
 #[cfg(unix)]
@@ -6223,50 +6249,60 @@ fn a_press_on_the_notice_never_reaches_the_vendors_link() {
     );
     app.windows.get_mut(&wid).unwrap().mods = aterm_window::keyboard::ModifiersState::empty();
     let _ = crate::platform::take_opened_urls();
-    click(&mut app, wid, words, link_modifier());
+    // Each press states when it happened, so how long the work between presses takes never
+    // moves one across a double click's interval.
+    let mut when = a_minute_ago();
+    click_when(&mut app, wid, words, link_modifier(), when);
     assert_eq!(
         crate::platform::take_opened_urls(),
         vec![NOTICE.url.to_string()],
         "a modifier press on the words opens the banner's link"
     );
-    click(&mut app, wid, hidden, link_modifier());
+    when += apart();
+    click_when(&mut app, wid, hidden, link_modifier(), when);
     assert!(
         crate::platform::take_opened_urls().is_empty(),
         "a modifier press on the hidden row opens nothing"
     );
-    later_link(&mut app, wid);
+    when += apart();
     for (k, opens) in [1, 0, 0].into_iter().enumerate() {
-        click(
+        if k > 0 {
+            when += interval();
+        }
+        click_when(
             &mut app,
             wid,
             words,
             aterm_window::keyboard::ModifiersState::empty(),
+            when,
         );
         assert_eq!(
             crate::platform::take_opened_urls().len(),
             opens,
-            "press {k} of a triple click: a plain press on the words opens the banner's link once"
+            "press {k} of a triple click, each at the interval's last instant after the one \
+             before: a plain press on the words opens the banner's link once"
         );
     }
-    later_link(&mut app, wid);
-    click(
+    when += apart();
+    click_when(
         &mut app,
         wid,
         words,
         aterm_window::keyboard::ModifiersState::empty(),
+        when,
     );
     assert_eq!(
         crate::platform::take_opened_urls(),
         vec![NOTICE.url.to_string()],
-        "CONTROL: a separate click opens it again"
+        "CONTROL: a click a millisecond after the interval opens it again"
     );
     for other in [
         aterm_window::keyboard::ModifiersState::SHIFT,
         aterm_window::keyboard::ModifiersState::ALT,
     ] {
-        later_link(&mut app, wid);
+        when += apart();
         app.windows.get_mut(&wid).unwrap().last_press = None;
-        click(&mut app, wid, words, other);
+        click_when(&mut app, wid, words, other, when);
         assert!(
             crate::platform::take_opened_urls().is_empty(),
             "{other:?}: a press with another modifier opens nothing"
@@ -6277,11 +6313,13 @@ fn a_press_on_the_notice_never_reaches_the_vendors_link() {
         );
     }
     let _ = pty(&mut reader, 0);
-    click(
+    when += apart();
+    click_when(
         &mut app,
         wid,
         hidden,
         aterm_window::keyboard::ModifiersState::empty(),
+        when,
     );
     assert!(pty(&mut reader, 0).is_empty(), "nothing tracks the mouse");
     assert!(
@@ -6310,12 +6348,13 @@ fn a_press_on_the_notice_never_reaches_the_vendors_link() {
         } else {
             Vec::new()
         };
-        later_link(&mut app, wid);
-        click(
+        when += apart();
+        click_when(
             &mut app,
             wid,
             at,
             aterm_window::keyboard::ModifiersState::empty(),
+            when,
         );
         assert!(
             pty(&mut reader, 0).is_empty(),
@@ -6326,21 +6365,22 @@ fn a_press_on_the_notice_never_reaches_the_vendors_link() {
             opens,
             "{at:?}: under tracking a plain press opens the link alone"
         );
-        later_link(&mut app, wid);
-        click(&mut app, wid, at, link_modifier());
+        when += apart();
+        click_when(&mut app, wid, at, link_modifier(), when);
         assert!(
             pty(&mut reader, 0).is_empty(),
             "{at:?}: nor does a modifier press"
         );
         assert_eq!(crate::platform::take_opened_urls(), opens, "{at:?}");
     }
-    later_link(&mut app, wid);
+    when += apart();
     app.windows.get_mut(&wid).unwrap().last_press = None;
-    click(
+    click_when(
         &mut app,
         wid,
         words,
         aterm_window::keyboard::ModifiersState::ALT,
+        when,
     );
     assert!(
         pty(&mut reader, 0).is_empty() && crate::platform::take_opened_urls().is_empty(),
@@ -6350,11 +6390,13 @@ fn a_press_on_the_notice_never_reaches_the_vendors_link() {
         app.windows[&wid].last_press.is_some(),
         "it takes a local selection, as on the hidden row"
     );
-    click(
+    when += apart();
+    click_when(
         &mut app,
         wid,
         (strip + 10, 40),
         aterm_window::keyboard::ModifiersState::empty(),
+        when,
     );
     let report = pty(&mut reader, 6);
     assert!(
@@ -6439,14 +6481,16 @@ fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
         "CONTROL: no hand on the hidden row"
     );
     let _ = crate::platform::take_opened_urls();
-    click(&mut app, wid, words, link_modifier());
+    let mut when = a_minute_ago();
+    click_when(&mut app, wid, words, link_modifier(), when);
     assert_eq!(
         crate::platform::take_opened_urls(),
         vec![NOTICE.url.to_string()],
         "the banner's link"
     );
     mixed_frame(&mut app);
-    click(&mut app, wid, hidden, link_modifier());
+    when += apart();
+    click_when(&mut app, wid, hidden, link_modifier(), when);
     assert!(
         crate::platform::take_opened_urls().is_empty(),
         "nothing from the hidden row"
@@ -6458,8 +6502,8 @@ fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
     mixed_frame(&mut app);
     let _ = pty(&mut reader, 0);
     for at in [words, hidden] {
-        later_link(&mut app, wid);
-        click(&mut app, wid, at, ModifiersState::empty());
+        when += apart();
+        click_when(&mut app, wid, at, ModifiersState::empty(), when);
         assert!(
             pty(&mut reader, 0).is_empty(),
             "{at:?}: a plain press on the banner reaches no PTY"
@@ -6475,11 +6519,13 @@ fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
             "{at:?}: a plain press opens the banner's link, and nothing from the hidden row"
         );
     }
-    click(
+    when += apart();
+    click_when(
         &mut app,
         wid,
         (words.0 + 6, words.1),
         ModifiersState::empty(),
+        when,
     );
     let report = pty(&mut reader, 6);
     assert!(

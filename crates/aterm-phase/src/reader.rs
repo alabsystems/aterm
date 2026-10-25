@@ -12,7 +12,7 @@ use crate::phase::{
 use crate::prompt::{CancelEffect, PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
 use crate::wall::{Wall, memory_wall, wall};
-use crate::{agy, gemini, grok, kimi, muse};
+use crate::{agy, grok, kimi, muse};
 
 /// Program identified for a terminal screen. Every variant is in [`Program::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,8 +23,6 @@ pub enum Program {
     Agy,
     /// Meta's Muse Code.
     Muse,
-    /// Google's Gemini CLI.
-    Gemini,
     /// xAI's Grok Build.
     Grok,
     /// Moonshot AI's Kimi Code.
@@ -42,8 +40,7 @@ const fn next_program(p: Program) -> Option<Program> {
         Program::Claude => Some(Program::Codex),
         Program::Codex => Some(Program::Agy),
         Program::Agy => Some(Program::Muse),
-        Program::Muse => Some(Program::Gemini),
-        Program::Gemini => Some(Program::Grok),
+        Program::Muse => Some(Program::Grok),
         Program::Grok => Some(Program::Kimi),
         Program::Kimi => Some(Program::Generic),
         Program::Generic => None,
@@ -65,12 +62,11 @@ impl Program {
     /// Every program, in declaration order: what must cover each one (the
     /// panic sweeps, the host's admission, a settings row per supervisable
     /// agent) iterates this, never a list of its own.
-    pub const ALL: [Program; 8] = [
+    pub const ALL: [Program; 7] = [
         Program::Claude,
         Program::Codex,
         Program::Agy,
         Program::Muse,
-        Program::Gemini,
         Program::Grok,
         Program::Kimi,
         Program::Generic,
@@ -85,7 +81,6 @@ impl Program {
             Program::Codex => "codex",
             Program::Agy => "agy",
             Program::Muse => "muse",
-            Program::Gemini => "gemini",
             Program::Grok => "grok",
             Program::Kimi => "kimi",
             Program::Generic => "generic",
@@ -101,7 +96,6 @@ impl Program {
             Program::Codex => "Codex",
             Program::Agy => "Antigravity CLI",
             Program::Muse => "Muse Code",
-            Program::Gemini => "Gemini CLI",
             Program::Grok => "Grok Build",
             Program::Kimi => "Kimi Code",
             Program::Generic => "the program",
@@ -115,7 +109,7 @@ impl Program {
     #[must_use]
     pub const fn supervisable(self) -> bool {
         match self {
-            Program::Claude | Program::Agy | Program::Muse | Program::Gemini => true,
+            Program::Claude | Program::Agy | Program::Muse => true,
             Program::Codex | Program::Grok | Program::Kimi | Program::Generic => false,
         }
     }
@@ -125,9 +119,7 @@ impl Program {
     #[must_use]
     pub const fn harness_table(self) -> bool {
         match self {
-            Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
-                true
-            }
+            Program::Claude | Program::Codex | Program::Agy | Program::Muse => true,
             Program::Grok | Program::Kimi | Program::Generic => false,
         }
     }
@@ -141,7 +133,6 @@ impl Program {
             Program::Codex => Some(crate::CliHarness::CodexAlab),
             Program::Agy => Some(crate::CliHarness::Agy),
             Program::Muse => Some(crate::CliHarness::Muse),
-            Program::Gemini => Some(crate::CliHarness::Gemini),
             Program::Grok => Some(crate::CliHarness::Grok),
             Program::Kimi => Some(crate::CliHarness::Kimi),
             Program::Generic => None,
@@ -177,7 +168,6 @@ impl Program {
             Program::Codex => &CodexReader,
             Program::Agy => &AgyReader,
             Program::Muse => &MuseReader,
-            Program::Gemini => &GeminiReader,
             Program::Grok => &GrokReader,
             Program::Kimi => &KimiReader,
             Program::Generic => &GenericReader,
@@ -867,96 +857,6 @@ impl ScreenReader for MuseReader {
     }
 }
 
-/// Screen reader for Gemini CLI.
-#[derive(Debug, Clone, Copy)]
-pub struct GeminiReader;
-
-impl ScreenReader for GeminiReader {
-    fn program(&self) -> Program {
-        Program::Gemini
-    }
-    fn phase(&self, rows: &[String]) -> Phase {
-        gemini::phase(rows).0
-    }
-    fn prompt(&self, rows: &[String]) -> Option<PromptV2> {
-        gemini::prompt(rows)
-    }
-    fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
-        gemini::esc(prompt)
-    }
-    fn wall(&self, rows: &[String]) -> Option<Wall> {
-        gemini::wall(rows)
-    }
-    fn said_tail(&self, rows: &[String]) -> Option<String> {
-        gemini::said_tail(rows)
-    }
-    fn said_whole(&self, rows: &[String]) -> bool {
-        gemini::said_whole(rows)
-    }
-    fn turn_said_before(&self, rows: &[String]) -> Option<String> {
-        gemini::turn_said_before(rows)
-    }
-    fn turn_whole(&self, rows: &[String]) -> bool {
-        gemini::turn_whole(rows)
-    }
-    fn turn_ran_tools(&self, rows: &[String]) -> bool {
-        gemini::turn_ran_tools(rows)
-    }
-    fn reads_tool_rows(&self) -> bool {
-        true
-    }
-    fn turn_opens_above(&self, rows: &[String]) -> bool {
-        gemini::turn_opens_above(rows)
-    }
-    fn turn_history_stop(&self, row: &str) -> bool {
-        gemini::turn_history_stop(row)
-    }
-    fn turn_opened_by(&self, rows: &[String]) -> Option<String> {
-        gemini::turn_opened_by(rows)
-    }
-    fn interrupted(&self, rows: &[String]) -> bool {
-        gemini::interrupted(rows)
-    }
-    fn fresh(&self, rows: &[String]) -> bool {
-        gemini::fresh(rows)
-    }
-    fn message_drawn(&self, rows: &[String]) -> bool {
-        gemini::message_drawn(rows)
-    }
-    fn program_drawn(&self, rows: &[String]) -> bool {
-        gemini::program_drawn(rows)
-    }
-    /// Its placeholder read as an empty draft ([`gemini::composer_draft`]).
-    fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
-        gemini::composer_draft(rows)
-    }
-    fn caret(&self) -> Option<char> {
-        Some('>')
-    }
-    /// `*` while YOLO is on; nothing in shell mode ([`gemini::caret_on`]).
-    fn caret_on(&self, rows: &[String]) -> Option<char> {
-        gemini::caret_on(rows)
-    }
-    fn caret_column(&self) -> usize {
-        1
-    }
-    /// An Enter within 30 ms of a typed key is a newline (read in the 0.46.0 bundle).
-    fn paste_guard(&self) -> bool {
-        true
-    }
-    fn folded_paste(&self, text: &str) -> Option<String> {
-        gemini::folded_paste(text)
-    }
-    /// The spinner on the status row: `esc to cancel` is drawn there only
-    /// beside it, and the row's `? for shortcuts` stays while a turn runs.
-    fn busy_guard(&self) -> Option<String> {
-        Some(gemini::busy_guard())
-    }
-    fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
-        gemini::phase(rows).1
-    }
-}
-
 /// Screen reader for Grok Build ([`crate::grok`]): its walls, and no phase as evidence.
 #[derive(Debug, Clone, Copy)]
 pub struct GrokReader;
@@ -1024,16 +924,36 @@ const NOT_AGENTS: &[&str] = &[
     "bat", "watch",
 ];
 
+/// The names of Google's Gemini CLI, which aterm no longer supports: agy replaces it. A program
+/// so named is no agent to any reader ([`identify`]) and no lane's ([`program_of`] names none),
+/// and a spawn, config table or record naming it is refused with [`RETIRED_AGENT`].
+pub const RETIRED_AGENTS: &[&str] = &["gemini", "gemini-cli"];
+
+/// Why a name in [`RETIRED_AGENTS`] is refused, for the refusal a person reads.
+pub const RETIRED_AGENT: &str = "Gemini CLI is no longer supported: agy replaces it (agent=agy)";
+
+/// Whether `program` (a command line, a path or a bare word) names a retired agent
+/// ([`RETIRED_AGENTS`]).
+#[must_use]
+pub fn retired_agent(program: &str) -> bool {
+    let word = program_word(program);
+    RETIRED_AGENTS
+        .iter()
+        .any(|retired| word.eq_ignore_ascii_case(retired))
+}
+
 /// Select the [`ScreenReader`] for `program` and `rows`.
 #[must_use]
 pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenReader {
     if let Some(named) = program.and_then(program_of) {
         return named.reader();
     }
-    if program
-        .map(program_word)
-        .is_some_and(|name| NOT_AGENTS.iter().any(|not| name.eq_ignore_ascii_case(not)))
-    {
+    if program.is_some_and(|p| {
+        retired_agent(p)
+            || NOT_AGENTS
+                .iter()
+                .any(|not| program_word(p).eq_ignore_ascii_case(not))
+    }) {
         return &GenericReader;
     }
     let names_claude = |p: PromptV2| p.kind != PromptKind::Other || p.footer.is_some();
@@ -1045,8 +965,6 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
         &MuseReader
     } else if agy::is_agy_screen(rows) {
         &AgyReader
-    } else if gemini::is_gemini_screen(rows) {
-        &GeminiReader
     } else if has_composer_frame(rows)
         || parse_prompt_v2(rows).is_some_and(names_claude)
         || names_login(rows)
@@ -1147,9 +1065,10 @@ pub fn program_of(program: &str) -> Option<Program> {
         Some(Program::Agy)
     } else if is("muse") || is_muse_build(word) {
         Some(Program::Muse)
-    } else if is("gemini") {
-        Some(Program::Gemini)
-    } else if is("grok") {
+    } else if is("grok") || is("grok-alab") {
+        // grok-alab, the Grok Build harness, leads the session's foreground group and runs the
+        // vendor's grok as its child on the same terminal: the screen is Grok's
+        // (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 5).
         Some(Program::Grok)
     } else if is("kimi") || is("kimi-code") {
         Some(Program::Kimi)
@@ -1167,7 +1086,7 @@ fn is_muse_build(word: &str) -> bool {
 }
 
 /// The script runtimes an agent runs under without renaming itself (an npm or bun install of
-/// Claude Code starts as `node` or `bun`, and Gemini CLI always runs under one): a program so
+/// Claude Code starts as `node` or `bun`): a program so
 /// named may be identified as an agent by its screen ([`identify`]).
 pub const AGENT_RUNTIMES: &[&str] = &["node", "bun", "deno"];
 
@@ -1220,20 +1139,6 @@ mod tests {
         const END_OF_TURN_ANY: &str = "$ make\nok\n$ ";
         let drawn = |p: Program, rows: &[String]| p.reader().message_drawn(rows);
         {
-            use crate::gemini::fixtures::{END_OF_TURN, IDLE, PRE_BANNER, YOLO_TOOL_RAN};
-            assert!(!drawn(Program::Gemini, &screen(PRE_BANNER)));
-            assert!(!drawn(Program::Gemini, &screen(IDLE)));
-            assert!(drawn(Program::Gemini, &screen(END_OF_TURN)));
-            let mut tool_last = screen(YOLO_TOOL_RAN);
-            let at = tool_last
-                .iter()
-                .rposition(|r| r.starts_with("✦ Tool call done."))
-                .expect("the reply");
-            tool_last[at] = String::new();
-            assert_eq!(crate::gemini::said_tail(&tool_last), None);
-            assert!(drawn(Program::Gemini, &tool_last));
-        }
-        {
             use crate::agy::fixtures::{END_OF_TURN, IDLE};
             assert!(crate::agy::fresh(&screen(IDLE)));
             assert!(!drawn(Program::Agy, &screen(IDLE)));
@@ -1272,12 +1177,7 @@ mod tests {
         let agy_launch = screen(crate::agy::fixtures::LAUNCH_LINE);
         let mut card = launch.clone();
         card.extend(["", "  Muse Code 1.4.12"].map(str::to_string));
-        for p in [
-            Program::Claude,
-            Program::Agy,
-            Program::Muse,
-            Program::Gemini,
-        ] {
+        for p in [Program::Claude, Program::Agy, Program::Muse] {
             assert!(!drawn(p, &blank), "{p:?}: a blank screen");
             assert!(!drawn(p, &launch), "{p:?}: Muse Code's launch line");
             assert!(!drawn(p, &agy_launch), "{p:?}: agy's launch line");
@@ -1316,12 +1216,6 @@ mod tests {
                 !drawn(Program::Agy, &queried),
                 "the launch line and the shell's echo of agy's queries: {queried:#?}"
             );
-        }
-        {
-            use crate::gemini::fixtures::{BOX_SHELL, END_OF_TURN, IDLE, PRE_BANNER, TRUST};
-            for rows in [PRE_BANNER, IDLE, END_OF_TURN, BOX_SHELL, TRUST].map(screen) {
-                assert!(drawn(Program::Gemini, &rows), "gemini: {rows:#?}");
-            }
         }
         {
             use crate::prompt::fixtures::{first_turn_under_a_table, launch_under_a_table};
@@ -1413,6 +1307,16 @@ mod tests {
             ("codex-older", None),
             ("xcodex-old", None),
             ("codex-", None),
+            ("grok", Some(Program::Grok)),
+            ("grok-alab", Some(Program::Grok)),
+            (
+                "/opt/pkg/bin/grok-alab run -- --resume x",
+                Some(Program::Grok),
+            ),
+            ("Grok-Alab", Some(Program::Grok)),
+            ("grok-alabs", None),
+            ("grok-", None),
+            ("kimi-alab", None),
             ("claude-codes", None),
             ("node", None),
             ("", None),
@@ -1464,10 +1368,22 @@ mod tests {
             Program::Codex
         );
         assert_eq!(p(Some("agy"), &framed), Program::Agy);
-        assert_eq!(
-            p(Some("/opt/homebrew/bin/gemini --resume x"), &framed),
-            Program::Gemini
-        );
+        for retired in [
+            "/opt/homebrew/bin/gemini --resume x",
+            "gemini-cli",
+            "-GEMINI",
+        ] {
+            assert!(retired_agent(retired), "{retired}");
+            assert_eq!(program_of(retired), None, "{retired}");
+            assert_eq!(
+                p(Some(retired), &framed),
+                Program::Generic,
+                "Gemini CLI is retired: its frame is read as no agent's, never Claude Code's"
+            );
+        }
+        for live in ["agy", "/usr/local/bin/geminis", "node", "claude"] {
+            assert!(!retired_agent(live), "{live}");
+        }
         assert_eq!(
             p(Some("/usr/local/bin/muse resume x"), &framed),
             Program::Muse
@@ -1524,7 +1440,6 @@ mod tests {
             let want = match name.split('-').next() {
                 Some("agy") => Program::Agy,
                 Some("muse") => Program::Muse,
-                Some("gemini") => Program::Gemini,
                 Some("grok") => Program::Grok,
                 Some("kimi") => Program::Kimi,
                 _ => Program::Claude,
@@ -1540,7 +1455,6 @@ mod tests {
             Program::Claude,
             Program::Agy,
             Program::Muse,
-            Program::Gemini,
             Program::Grok,
             Program::Kimi,
         ] {
@@ -2448,12 +2362,6 @@ mod tests {
         let cases = [
             (Program::Claude, claude, "❯ ", "  "),
             (
-                Program::Gemini,
-                screen(crate::gemini::fixtures::END_OF_TURN),
-                " > ",
-                "   ",
-            ),
-            (
                 Program::Muse,
                 screen(crate::muse::fixtures::END_OF_TURN),
                 "❯ ",
@@ -2496,7 +2404,6 @@ mod tests {
         assert_eq!(crate::grok::HARNESS_VERSION, "0.1");
         assert_eq!(crate::kimi::HARNESS_VERSION, "0.1");
         assert_eq!(crate::muse::HARNESS_VERSION, "0.1");
-        assert_eq!(crate::gemini::HARNESS_VERSION, "0.1");
         for prog in Program::ALL {
             // Every named program's harness has a version; a `[harness.<agent>]` table only
             // where its supervision has keys (Grok Build's and Kimi Code's has none yet).

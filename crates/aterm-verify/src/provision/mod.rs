@@ -19,7 +19,7 @@ use aterm_uds::host::When;
 
 pub use place::SCRATCH_PREFIX;
 pub use rows::{Anchor, Archive, Engine, Holds, Install, MICROSOFT_TEAM, ROWS, Row, row};
-pub use stable::{FOREIGN_CELL_TARGETS, LINUX_LANE_TARGETS, WasmClause, wasm_clause};
+pub use stable::{CELL_TARGETS, LINUX_LANE_TARGETS, WasmClause, wasm_clause};
 
 /// System `curl` binary path.
 pub(crate) const CURL: &str = "/usr/bin/curl";

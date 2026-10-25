@@ -396,7 +396,7 @@ impl Ledger {
 
     /// Where the work stands.
     #[must_use]
-    pub fn outcome(&self) -> Outcome {
+    pub const fn outcome(&self) -> Outcome {
         match self.void {
             Some(by) => Outcome::Void(by),
             None if self.open => Outcome::Open,
@@ -407,8 +407,14 @@ impl Ledger {
 
     /// Worker `w`'s state.
     #[must_use]
-    pub fn worker(&self, w: WorkerId) -> Option<WorkerState> {
-        self.workers.get(index(w.0)).copied()
+    pub const fn worker(&self, w: WorkerId) -> Option<WorkerState> {
+        let workers = self.workers.as_slice();
+        let idx = index(w.0);
+        if idx < workers.len() {
+            Some(workers[idx])
+        } else {
+            None
+        }
     }
 
     /// Every worker's state, by id.
@@ -419,8 +425,14 @@ impl Ledger {
 
     /// The current search's job `slot`.
     #[must_use]
-    pub fn job(&self, slot: u32) -> Option<JobState> {
-        self.jobs.get(index(slot)).copied()
+    pub const fn job(&self, slot: u32) -> Option<JobState> {
+        let jobs = self.jobs.as_slice();
+        let idx = index(slot);
+        if idx < jobs.len() {
+            Some(jobs[idx])
+        } else {
+            None
+        }
     }
 
     /// The current search's jobs, by slot.
@@ -439,27 +451,45 @@ impl Ledger {
     /// Whether no worker holds or is draining a lease.
     #[must_use]
     pub fn quiescent(&self) -> bool {
-        !self
-            .workers
-            .iter()
-            .any(|s| matches!(s, WorkerState::Busy { .. } | WorkerState::Draining { .. }))
+        let workers = self.workers.as_slice();
+        let mut i = 0;
+        while i < workers.len() {
+            if matches!(
+                workers[i],
+                WorkerState::Busy { .. } | WorkerState::Draining { .. }
+            ) {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// The earliest time a [`Self::tick`] can change anything.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Nanos> {
-        self.workers
-            .iter()
-            .filter_map(|s| match *s {
+        let workers = self.workers.as_slice();
+        let mut best: Option<Nanos> = None;
+        let mut i = 0;
+        while i < workers.len() {
+            let cand = match workers[i] {
                 WorkerState::Joining { since } => Some(since.saturating_add(self.limits.hello_ns)),
                 WorkerState::Busy { deadline, .. } => Some(deadline),
                 WorkerState::Draining { until, .. } => Some(until),
                 WorkerState::Idle | WorkerState::Gone(_) => None,
-            })
-            .min()
+            };
+            if let Some(d) = cand {
+                best = Some(match best {
+                    Some(prev) if prev <= d => prev,
+                    _ => d,
+                });
+            }
+            i += 1;
+        }
+        best
     }
 
-    fn clock(&mut self, now: Nanos) -> Result<(), ClockBackwards> {
+    const fn clock(&mut self, now: Nanos) -> Result<(), ClockBackwards> {
         if now < self.latest {
             return Err(ClockBackwards {
                 latest: self.latest,
@@ -545,31 +575,37 @@ impl Ledger {
         if !self.open || self.void.is_some() {
             return;
         }
-        if let Some(slot) = self
-            .jobs
-            .iter()
-            .position(|j| matches!(j, JobState::Exhausted))
-        {
-            let refusal = LeaseRefusal::Exhausted { slot: wid(slot) };
-            self.void_with(VoidBy::Ledger(refusal), now, out);
-            return;
+        let mut pending = 0usize;
+        for (slot, j) in self.jobs.iter().enumerate() {
+            match j {
+                JobState::Exhausted => {
+                    let refusal = LeaseRefusal::Exhausted { slot: wid(slot) };
+                    self.void_with(VoidBy::Ledger(refusal), now, out);
+                    return;
+                }
+                JobState::Pending { .. } | JobState::Leased { .. } => {
+                    pending += 1;
+                }
+                JobState::Claimed { .. } | JobState::Cancelled => {}
+            }
         }
-        let pending = self
-            .jobs
-            .iter()
-            .filter(|j| matches!(j, JobState::Pending { .. } | JobState::Leased { .. }))
-            .count();
-        let able = self.workers.iter().any(|s| {
-            matches!(
-                s,
-                WorkerState::Joining { .. } | WorkerState::Idle | WorkerState::Busy { .. }
-            )
-        });
-        if pending > 0 && !able {
-            let refusal = LeaseRefusal::NoWorkers {
-                pending: wid(pending),
-            };
-            self.void_with(VoidBy::Ledger(refusal), now, out);
+        if pending > 0 {
+            let mut able = false;
+            for s in &self.workers {
+                if matches!(
+                    s,
+                    WorkerState::Joining { .. } | WorkerState::Idle | WorkerState::Busy { .. }
+                ) {
+                    able = true;
+                    break;
+                }
+            }
+            if !able {
+                let refusal = LeaseRefusal::NoWorkers {
+                    pending: wid(pending),
+                };
+                self.void_with(VoidBy::Ledger(refusal), now, out);
+            }
         }
     }
 
@@ -579,23 +615,26 @@ impl Ledger {
     /// [`ClockBackwards`].
     pub fn finish(&mut self, now: Nanos) -> Result<(), ClockBackwards> {
         self.clock(now)?;
-        let claimed = self
-            .jobs
-            .iter()
-            .all(|j| matches!(j, JobState::Claimed { .. }));
-        let draining = self
-            .workers
-            .iter()
-            .any(|s| matches!(s, WorkerState::Draining { .. }));
-        if self.open && self.void.is_none() && claimed && !draining {
-            self.open = false;
-            for j in &self.jobs {
-                if let JobState::Claimed { lease, digest } = *j {
-                    self.finished.insert(lease, digest);
-                }
-            }
-            self.stale.clear();
+        if !self.open || self.void.is_some() {
+            return Ok(());
         }
+        for j in &self.jobs {
+            if !matches!(j, JobState::Claimed { .. }) {
+                return Ok(());
+            }
+        }
+        for s in &self.workers {
+            if matches!(s, WorkerState::Draining { .. }) {
+                return Ok(());
+            }
+        }
+        self.open = false;
+        for j in &self.jobs {
+            if let JobState::Claimed { lease, digest } = *j {
+                self.finished.insert(lease, digest);
+            }
+        }
+        self.stale.clear();
         Ok(())
     }
 
@@ -698,10 +737,14 @@ impl Ledger {
         if !self.open || self.void.is_some() || self.worker(w) != Some(WorkerState::Idle) {
             return;
         }
-        let Some((slot, attempts)) = self.jobs.iter().enumerate().find_map(|(i, j)| match j {
-            JobState::Pending { attempts } => Some((i, *attempts)),
-            _ => None,
-        }) else {
+        let mut found = None;
+        for (i, j) in self.jobs.iter().enumerate() {
+            if let JobState::Pending { attempts } = *j {
+                found = Some((i, attempts));
+                break;
+            }
+        }
+        let Some((slot, attempts)) = found else {
             return;
         };
         let lease = Token {
@@ -1043,11 +1086,15 @@ impl Ledger {
 }
 
 #[inline]
-fn index(n: u32) -> usize {
-    usize::try_from(n).unwrap_or(usize::MAX)
+const fn index(n: u32) -> usize {
+    n as usize
 }
 
 #[inline]
-fn wid(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
+const fn wid(n: usize) -> u32 {
+    if n <= u32::MAX as usize {
+        n as u32
+    } else {
+        u32::MAX
+    }
 }

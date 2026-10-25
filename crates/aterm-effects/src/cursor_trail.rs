@@ -445,10 +445,11 @@ impl CursorTrail {
     #[inline]
     pub fn revoke_input_hints_at(&mut self, at: Instant) {
         self.type_hint.revoke_at(at);
-        for hint in [&mut self.nav_hint, &mut self.move_hint] {
-            if *hint == Some(at) {
-                *hint = None;
-            }
+        if self.nav_hint == Some(at) {
+            self.nav_hint = None;
+        }
+        if self.move_hint == Some(at) {
+            self.move_hint = None;
         }
     }
 
@@ -472,12 +473,18 @@ impl CursorTrail {
 
     #[inline]
     fn remap_rows(&mut self, map: impl Fn(u16) -> Option<u16>) {
-        self.last = self
-            .last
-            .and_then(|(row, col)| map(row).map(|row| (row, col)));
-        self.last_visible = self
-            .last_visible
-            .and_then(|((row, col), at)| map(row).map(|row| ((row, col), at)));
+        if let Some((row, _)) = &mut self.last {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.last = None,
+            }
+        }
+        if let Some(((row, _), _)) = &mut self.last_visible {
+            match map(*row) {
+                Some(r) => *row = r,
+                None => self.last_visible = None,
+            }
+        }
         self.sparks.retain_mut(|spark| match map(spark.row) {
             Some(row) => {
                 spark.row = row;
@@ -525,22 +532,37 @@ impl CursorTrail {
             return 0;
         }
 
-        let spawn_from = self.last.or_else(|| {
-            let ((r, c), seen) = self.last_visible?;
-            let fresh = now.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS;
-            let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH_DUR);
-            let nav_bridge = hint_fresh_dur(self.nav_hint, now, Self::NAV_HINT_FRESH_DUR)
-                && self
-                    .nav_hint
-                    .is_some_and(|key| nav_bridge_admits(key, seen, now));
-            let reach = hide_bridge_reach(typed_fresh, nav_bridge, self.pane_columns);
-            let plausible = cur.is_some_and(|to| reach.admits((r, c), to));
-            ((fresh || nav_bridge) && plausible).then_some((r, c))
-        });
+        let spawn_from = match self.last {
+            Some(c) => Some(c),
+            None => match self.last_visible {
+                Some(((r, c), seen)) => {
+                    let fresh =
+                        now.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS;
+                    let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH_DUR);
+                    let nav_bridge = hint_fresh_dur(self.nav_hint, now, Self::NAV_HINT_FRESH_DUR)
+                        && match self.nav_hint {
+                            Some(key) => nav_bridge_admits(key, seen, now),
+                            None => false,
+                        };
+                    let reach = hide_bridge_reach(typed_fresh, nav_bridge, self.pane_columns);
+                    let plausible = match cur {
+                        Some(to) => reach.admits((r, c), to),
+                        None => false,
+                    };
+                    if (fresh || nav_bridge) && plausible {
+                        Some((r, c))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            },
+        };
         let hidden_relocation = self.last.is_none()
-            && cur
-                .zip(self.last_visible.map(|(cell, _)| cell))
-                .is_some_and(|(current, previous)| current != previous);
+            && matches!(
+                (cur, self.last_visible),
+                (Some(current), Some((previous, _))) if current != previous
+            );
         let declined_hidden_relocation = spawn_from.is_none() && hidden_relocation;
         if hidden_relocation {
             if spawn_from.is_some() {
@@ -588,8 +610,11 @@ impl CursorTrail {
                     Some((prev_key, cached)) if prev_key == cohort_key => cached,
                     _ => {
                         let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
-                        let cached = (age_ms < s.life_ms)
-                            .then(|| ((s.life_ms - age_ms) * 255 / s.life_ms) as u32);
+                        let cached = if age_ms < s.life_ms {
+                            Some(((s.life_ms - age_ms) * 255 / s.life_ms) as u32)
+                        } else {
+                            None
+                        };
                         last_cohort = Some((cohort_key, cached));
                         cached
                     }
@@ -668,9 +693,10 @@ impl CursorTrail {
         }
         let dr_abs = (cr as i32 - pr as i32).abs();
         let raw_dist = dr_abs.max((cc as i32 - pc as i32).abs());
-        let physical_fold = self.pane_columns.is_some_and(|(col0, cols)| {
-            crate::trail_sweep::physical_margin_fold((pr, pc), (cr, cc), col0, cols)
-        });
+        let physical_fold = matches!(
+            self.pane_columns,
+            Some((col0, cols)) if crate::trail_sweep::physical_margin_fold((pr, pc), (cr, cc), col0, cols)
+        );
         if paired
             && !physical_fold
             && dr_abs <= 1

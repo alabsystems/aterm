@@ -474,7 +474,9 @@ pub fn binary_cmd(b: &Binary, threads: u32) -> Cmd {
         .cloned()
         .collect();
     env.push(("RUST_TEST_THREADS".into(), threads.to_string().into()));
-    Cmd::replayed(&b.record.argv, &b.record.cwd, env).preamble(format!("{}\n", b.header))
+    Cmd::replayed(&b.record.argv, &b.record.cwd, env)
+        .preamble(format!("{}\n", b.header))
+        .counting_waits()
 }
 
 /// The one log cargo would have written for these runs, in declared order.

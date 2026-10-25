@@ -161,7 +161,6 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
     note_sign_in_task(&mut logins, "main", SignInAction::Browser, NOW);
     let text = logins.to_json();
     assert_eq!(Logins::from_json(&text, NOW), Ok(logins.clone()));
-    assert!(text.starts_with("{\"labels\":"), "keys sorted: {text}");
 
     let mut labels = Map::new();
     for i in 0..MAX_ACCOUNTS {

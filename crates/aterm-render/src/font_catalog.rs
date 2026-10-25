@@ -815,14 +815,16 @@ fn monospace_families_with_bundled(
             };
             let key = normalize_family(&family);
             if face_is_terminal_text(&face) {
-                let italic = face.is_italic() || face.is_oblique();
-                let bold = face.is_bold() || face.weight().to_number() >= 600;
+                let (bold, italic) = listed_style(&face);
                 if !bold && !italic {
                     ligatures.entry(key.clone()).or_insert_with(|| {
                         crate::ligature_shaping::face_has_ligature_features(&face)
                     });
                     installed.insert(key, family);
-                } else if let Some(full) = face_full_name(&face) {
+                } else if let Some(full) = variable_role_words(&face)
+                    .map(|words| format!("{family} {words}"))
+                    .or_else(|| face_full_name(&face))
+                {
                     let slot = match (bold, italic) {
                         (true, false) => 0,
                         (false, true) => 1,
@@ -885,6 +887,29 @@ fn automatic_face(candidate: &str) -> Option<(String, bool)> {
         crate::public_face_name(&family).into_owned(),
         crate::ligature_shaping::face_has_ligature_features(&face),
     ))
+}
+
+/// The style a picker lists `face` under, `(bold, italic)`.
+pub(crate) fn listed_style(face: &aterm_font::Face<'_>) -> (bool, bool) {
+    let italic = face.is_italic() || face.is_oblique();
+    let bold = face.is_bold() || face.weight().to_number() >= 600;
+    (bold, italic)
+}
+
+/// The style words a variable styled face is offered and found by ("Italic",
+/// "Bold", "Bold Italic"): drawn in that role it draws its role's instance, so the
+/// name its table gives its `fvar` default ("SF Mono Light Italic") is not what it
+/// draws. `None` for a static face and an upright regular one.
+pub(crate) fn variable_role_words(face: &aterm_font::Face<'_>) -> Option<&'static str> {
+    if face.variation_axes().is_empty() {
+        return None;
+    }
+    match listed_style(face) {
+        (false, false) => None,
+        (true, false) => Some("Bold"),
+        (false, true) => Some("Italic"),
+        (true, true) => Some("Bold Italic"),
+    }
 }
 
 fn face_is_terminal_text(face: &aterm_font::Face<'_>) -> bool {

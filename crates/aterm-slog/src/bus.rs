@@ -346,6 +346,9 @@ impl BusSpace {
                 Seed::Lost
             }
         };
+        if let Some(snap) = &self.snap {
+            fold.adopt_mail_counts(snap);
+        }
         (fold, seed)
     }
 }

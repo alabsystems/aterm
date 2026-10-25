@@ -1591,6 +1591,59 @@ fn a_codex_alab_version_orders_by_its_own_line_never_by_its_baseline() {
     );
 }
 
+/// The two versions of a package of codex-alab's own line (Decision 8): a rollout's
+/// `cli_version` is the CLIENT version, so the client version is the one the package names for
+/// it, and only where both name one build. A package from before the line has one version; a
+/// compound one never stands in for the client version, and a client version naming another
+/// count or commit, or in any shape `alab/package.sh` does not write, names none.
+#[test]
+fn a_package_names_its_client_version_only_where_both_its_versions_name_one_build() {
+    // The first build on codex-alab's own line the lab measured (aterm 51a670f35a).
+    const OWN: &str = "0.1.0-dev.13665+codex.0.164.0.g1eb102688";
+    const CLIENT: &str = "0.165.0-dev.13665+g1eb102688";
+    assert_eq!(client_version(OWN, Some(CLIENT)), Some(CLIENT));
+    assert_eq!(
+        client_version("0.1.0-dev.13665+g1eb102688", Some(CLIENT)),
+        Some(CLIENT),
+        "codex-alab's own line before the ledger"
+    );
+    assert_eq!(
+        client_version("0.1.0+codex.0.164.0", Some("0.165.0")),
+        Some("0.165.0")
+    );
+    for one in ["0.164.0-dev.12479+g07a25d86a", "0.164.0", "0.157.1"] {
+        assert_eq!(
+            client_version(one, None),
+            Some(one),
+            "a package from before the line"
+        );
+    }
+    let refused: &[(&str, Option<&str>)] = &[
+        (OWN, None),
+        ("0.1.0+codex.0.164.0", None),
+        (OWN, Some(OWN)),
+        (OWN, Some("0.165.0-dev.13665+codex.0.164.0.g1eb102688")),
+        (OWN, Some("0.165.0-dev.13594+g870dabaa6")),
+        (OWN, Some("0.165.0-dev.13666+g1eb102688")),
+        (OWN, Some("0.165.0-dev.13665+g1eb102689")),
+        (OWN, Some("0.165.0")),
+        (OWN, Some("0.165.0-dev.13665+g1eb10268")),
+        (OWN, Some("0.165.0-rc.1")),
+        (OWN, Some("v0.165.0-dev.13665+g1eb102688")),
+        (OWN, Some("")),
+        ("0.1.0+codex.0.164.0", Some(CLIENT)),
+        ("0.1.0-dev.013665+codex.0.164.0.g1eb102688", Some(CLIENT)),
+        ("0.1.0-dev.13665+codex.0.164.g1eb102688", Some(CLIENT)),
+        ("0.1.0-dev.13665+codex.0.164.0", Some(CLIENT)),
+        ("", Some(CLIENT)),
+        ("0.164.0-dev.12+gabc", None),
+        ("not a version", None),
+    ];
+    for (own, client) in refused {
+        assert_eq!(client_version(own, *client), None, "{own} / {client:?}");
+    }
+}
+
 /// The installed client reads a compound package as it reads every ALab package: its version
 /// verbatim, the record's upstream block whole, and a `baseline` field the client has no use
 /// for changes neither.

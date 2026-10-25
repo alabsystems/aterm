@@ -143,7 +143,7 @@ pub struct BarFan {
 #[must_use]
 pub const fn bar_fan(bar: u64) -> BarFan {
     const {
-        assert!(BAR_RING_EVERY > 0);
+        assert!(BAR_RING_EVERY.is_power_of_two());
     }
     let steps = if bar > u8::MAX as u64 {
         u8::MAX
@@ -155,7 +155,7 @@ pub const fn bar_fan(bar: u64) -> BarFan {
     BarFan {
         bar,
         n,
-        ring: bar % BAR_RING_EVERY == BAR_RING_EVERY - 1,
+        ring: (bar & (BAR_RING_EVERY - 1)) == BAR_RING_EVERY - 1,
     }
 }
 
@@ -272,7 +272,11 @@ impl KittySing {
         // run bookkeeping and leaves the bars playing to their line. Only
         // `settle` (drive 0) or a session switch ends it early.
         if self.external.is_none() && self.armed_at.is_some() && self.wind_from.is_none() {
-            self.wind_from = Some(self.lazy_release().map_or(at, |lazy| lazy.min(at)));
+            let start = match self.lazy_release() {
+                Some(lazy) if lazy < at => lazy,
+                _ => at,
+            };
+            self.wind_from = Some(start);
         }
         self.run = None;
         self.count = 0;
@@ -309,9 +313,16 @@ impl KittySing {
             return self.wind_from;
         }
         if let Some(ext) = self.external {
-            return (now >= ext.ends_at).then_some(ext.ends_at);
+            return if now >= ext.ends_at {
+                Some(ext.ends_at)
+            } else {
+                None
+            };
         }
-        self.lazy_release().filter(|release| now >= *release)
+        match self.lazy_release() {
+            Some(release) if now >= release => Some(release),
+            _ => None,
+        }
     }
 
     /// The raw bar-grid index at `now`: elapsed [`SING_BAR_SECONDS`] periods
@@ -326,7 +337,9 @@ impl KittySing {
     /// Feed one committed printed keystroke.
     pub fn note_char(&mut self, now: Instant, session: u64, ch: char) {
         self.rekey(now, session);
-        if self.lazy_release().is_some_and(|release| now > release) {
+        if let Some(release) = self.lazy_release()
+            && now > release
+        {
             self.release(now);
         }
         if let Some(ext) = self.external
@@ -351,7 +364,11 @@ impl KittySing {
             // Key repeat is wall time: a batched IME commit of a repeated string hands
             // every char one `now`, so count only when real time has elapsed, or a
             // single commit could arm.
-            if self.last.is_none_or(|l| now > l) {
+            let advanced = match self.last {
+                Some(l) => now > l,
+                None => true,
+            };
+            if advanced {
                 self.count = self.count.saturating_add(1);
             }
             if self.handover_from.is_some() && self.count >= KEY_SWITCH_REPS {
@@ -393,9 +410,10 @@ impl KittySing {
     #[inline]
     fn has_drive(&self, now: Instant) -> bool {
         self.armed_at.is_some()
-            && self
-                .wind_start(now)
-                .is_none_or(|start| now.saturating_duration_since(start) < SING_WIND_DOWN_DUR)
+            && match self.wind_start(now) {
+                Some(start) => now.saturating_duration_since(start) < SING_WIND_DOWN_DUR,
+                None => true,
+            }
     }
 
     /// The celebration drive `0..=1` at `now`.
@@ -507,9 +525,10 @@ impl KittySing {
     #[inline]
     #[must_use]
     pub fn cooldown_remaining(&self, now: Instant) -> Duration {
-        self.last_external_arm.map_or(Duration::ZERO, |t| {
-            (t + CELEBRATE_COOLDOWN).saturating_duration_since(now)
-        })
+        match self.last_external_arm {
+            Some(t) => (t + CELEBRATE_COOLDOWN).saturating_duration_since(now),
+            None => Duration::ZERO,
+        }
     }
 
     /// True while a fired celebration is playing or winding down.
@@ -728,13 +747,15 @@ impl MusicNotes {
     /// Advance the field one frame.
     pub fn update(&mut self, now: Instant, streaming: bool, beat: Option<f32>) {
         if self.live != 0 {
-            for slot in &mut self.ring {
-                if slot.is_some_and(|n| {
-                    now.saturating_duration_since(n.born).as_secs_f32() >= NOTE_LIFE
-                }) {
-                    *slot = None;
+            let mut i = 0;
+            while i < MAX_NOTES {
+                if let Some(n) = self.ring[i]
+                    && now.saturating_duration_since(n.born).as_secs_f32() >= NOTE_LIFE
+                {
+                    self.ring[i] = None;
                     self.live -= 1;
                 }
+                i += 1;
             }
         }
         let Some(beat) = beat else {
@@ -843,15 +864,19 @@ impl MusicNotes {
             return out;
         }
         let mut i = 0;
-        for note in self.ring.iter().flatten() {
-            if let Some(sprite) = Self::resolve(note, now, reduced_motion) {
-                out[i] = Some(sprite);
-                i += 1;
+        let mut slot = 0;
+        while slot < MAX_NOTES {
+            if let Some(note) = &self.ring[slot] {
+                if let Some(sprite) = Self::resolve(note, now, reduced_motion) {
+                    out[i] = Some(sprite);
+                    i += 1;
+                }
+                rem -= 1;
+                if rem == 0 {
+                    break;
+                }
             }
-            rem -= 1;
-            if rem == 0 {
-                break;
-            }
+            slot += 1;
         }
         out
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real-agent lab: launches the real Claude Code, Codex ([`codex`]), Gemini CLI / Antigravity CLI (`agy`, [`gemini`]; screens in [`gemini_captures`]), or Muse Code ([`muse`]; proof in [`muse_proof`]) TUI by path inside a private headless `aterm` against a local API stub (Anthropic, OpenAI Responses, Gemini, or Meta), and runs private aterm instances for checking a change. [`USAGE`] lists the verbs.
+//! The real-agent lab: launches the real Claude Code, Codex ([`codex`]), Antigravity CLI (`agy`, [`agy`]; screens in [`agy_captures`]), or Muse Code ([`muse`]; proof in [`muse_proof`]) TUI by path inside a private headless `aterm` against a local API stub (Anthropic, OpenAI Responses, Gemini, or Meta), and runs private aterm instances for checking a change. [`USAGE`] lists the verbs.
 
 #![deny(unsafe_code)]
 
@@ -9,6 +9,12 @@
 mod abrew_admission;
 #[cfg(target_os = "macos")]
 mod admission;
+#[cfg(target_os = "macos")]
+mod agy;
+#[cfg(target_os = "macos")]
+mod agy_captures;
+#[cfg(target_os = "macos")]
+mod agy_proof;
 #[cfg(target_os = "macos")]
 mod aos_gpu_bench;
 #[cfg(target_os = "macos")]
@@ -67,12 +73,6 @@ mod fleet_world;
 mod footers;
 #[cfg(target_os = "macos")]
 mod forever;
-#[cfg(target_os = "macos")]
-mod gemini;
-#[cfg(target_os = "macos")]
-mod gemini_captures;
-#[cfg(target_os = "macos")]
-mod gemini_proof;
 #[cfg(target_os = "macos")]
 mod halfdraw;
 #[cfg(target_os = "macos")]
@@ -157,8 +157,6 @@ mod reduce;
 mod relaunch_agy;
 #[cfg(target_os = "macos")]
 mod relaunch_check;
-#[cfg(target_os = "macos")]
-mod relaunch_gemini;
 #[cfg(target_os = "macos")]
 mod relaunch_muse;
 #[cfg(target_os = "macos")]
@@ -252,7 +250,7 @@ pub fn wait_until(within: std::time::Duration, mut pred: impl FnMut() -> bool) -
 
 /// The verbs, as `help` prints them.
 pub const USAGE: &str = "\
-aterm-lab — the real Claude Code, Codex, Gemini CLI, agy or Muse Code TUI in a jailed private headless aterm
+aterm-lab — the real Claude Code, Codex, agy or Muse Code TUI in a jailed private headless aterm
 against a local API stub (Anthropic, Responses, Gemini or Meta). A lab is fully local: no real account, token or egress.
 
 usage: targo --unverified lab <command> [tag] [args]
@@ -263,7 +261,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  (headless by default; --window opens one real window in the same jail)
                                  (env: LAB_SURVEY=1 LAB_TRUST=1 LAB_FIRST_RUN=1 LAB_RESTORE=1 LAB_CLOCK=1
                                  LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES LAB_SCALE
-                                 LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_GEMINI LAB_AGY LAB_MUSE
+                                 LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_AGY LAB_MUSE
                                  LAB_ATERM=/physical/path LAB_STATE=/abs/outside/homes
                                  LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V ATERM_OCCUPANCY_NUDGE_S=N'
                                  LAB_REROUTE=1: the lab's Claude Code store build cloned into the jail's own atpkg
@@ -288,24 +286,20 @@ usage: targo --unverified lab <command> [tag] [args]
                                  the --chatgpt usage payload
   rollout [tag] [all]            print token_count lines (all: every line) of the tab's newest scratch rollout
   codex-selftest [tag] [--keep]  end-to-end Codex isolation and stub proof (~20 s)
-  gemini [tag] [-e K=V]... [--no-wait] [--untrusted] [-- gemini args]
-                                 launch Gemini CLI in tab 1 against the stub Gemini API (--untrusted: the folder trust dialog)
   agy [tag] [-e K=V]... [--no-wait] [--untrusted] [--onboarding] [--setting KEY=VALUE]... [-- agy args]
                                  launch agy in tab 1 against the stub Gemini API (--onboarding: the first-run screens and
                                  the trust dialog; --setting: one settings.json key)
-  gemini-selftest|agy-selftest [tag] [--keep]
-                                 end-to-end Gemini CLI or agy isolation and stub proof (~30 s)
-  gemini-captures|agy-captures [--only <regex>]
-                                 capture every Gemini CLI or agy fixture screen (~16 min; --only narrows)
+  agy-selftest [tag] [--keep]    end-to-end agy isolation and stub proof (~30 s)
+  agy-captures [--only <regex>]  capture every agy fixture screen (~16 min; --only narrows)
   muse [tag] [-e K=V]... [--no-wait] [-- muse args]
                                  launch Muse Code in tab 1 against the stub's Meta routes with a scratch HOME
   muse-selftest [tag] [--keep]   end-to-end Muse Code isolation and stub proof (~30 s)
   muse-captures [--only <regex>] capture every Muse Code fixture screen (~10 min; --only narrows)
-  autopilot-captures --harness all|claude|agy|muse|gemini|codex-alab [--scale 1|2] [--look day|night|both]
+  autopilot-captures --harness all|claude|agy|muse|codex-alab [--scale 1|2] [--look day|night|both]
                                  Autopilot's scenes on every harness, one headless instance each per look, launched in it
                                  (the forever lab's chains; codex-alab-proof's legs): an image per scene, the chip's whole
                                  hovered title at 400 columns, chrome and status beside each png, manifest.tsv; a paired
-                                 Gemini CLI typing take (--baseline ATERM, alone without --harness) (~40 min a look and
+                                 agy typing take (--baseline ATERM, alone without --harness) (~40 min a look and
                                  scale; runs side by side share one folder)
   turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl+c, ...); turn exits 1
                                  unless the composer accepted the prompt
@@ -314,7 +308,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  custom name whose '<spec>' JSON object is written to modes/<name>.json (bg: a prompt
                                  with `bgstart` runs `sleep SLEEP` in the background, any other streams SLOW s of ticks)
   limit [tag] CLAIM SECONDS [PLAN]
-                                 answer with a 429 subscription usage limit (CLAIM: five_hour|seven_day|...|code_assist)
+                                 answer with a 429 subscription usage limit (CLAIM: five_hour|seven_day|...)
                                  that resets SECONDS from now
   tool [tag] '<json>'            script the stub's tool mode ({\"name\":\"Bash\",\"input\":...} or a list; \"@PROJ@\", \"@PORT@\");
                                  trigger it with `turn TAG toolstart`
@@ -350,11 +344,11 @@ usage: targo --unverified lab <command> [tag] [args]
   header [tag] \"<what>\"          print the one-line `# ...` fixture header for [tag]
   footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]
                                  capture managed Claude Code footer screens across modes on a fresh lab
-  halfdraw scan <cast> --program claude|agy|muse|gemini [--show N] [--event I]
+  halfdraw scan <cast> --program claude|agy|muse [--show N] [--event I]
                                  replay a cast one PTY read per batch to report DEC 2026 brackets and unguarded busy gaps
-  idle-points scan <tape|dir>... --program claude|agy|muse|gemini|auto [--show N]
+  idle-points scan <tape|dir>... --program claude|agy|muse|auto [--show N]
                                  re-read harness tapes' turn-end points: idle with no evidence, and no last line named
-  idle-points cast <cast>... --program claude|agy|muse|gemini [--show N]
+  idle-points cast <cast>... --program claude|agy|muse [--show N]
                                  replay a cast: every idle spell inside a turn, how long it stood, whether it was vouched
   idle-points gate <lab logs dir>...
                                  place a Muse Code lab's harness points against its sessions' runs (mid-reply, in the gate)
@@ -370,7 +364,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  `step=done:taskless`; --land: the landed tab stays `task=landed` with
                                  `step=done:said-done`; --land-open: mid-work Land settles `step=done:landing` without
                                  typing Cruise nudges)
-  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|wall-shift|wall-redraw|wall-switch|wall-unread|wall-day-stop|wall-cruise|wall-relaunch|wall-bucket|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
+  forever --harness <claude|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-redraw|wall-switch|wall-unread|wall-cruise|wall-relaunch|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
                                  - land / cruise / both: L1-L11, L16-L17, C1-C2, HL/HC (same-land, same-cruise), P4,
@@ -380,14 +374,11 @@ usage: targo --unverified lab <command> [tag] [args]
                                  - cover: L12 prose question, L13 person turn (task=theirs), L14/C3 P2 reads, P5, L15
                                    worker, C4, Off control
                                  - cap: continue_per_hour = 1 escalation and post-hour recovery (~72 min)
-                                 - wall / wall-hid / wall-day / wall-climb: usage walls (W1 visible, W2 scrolled/dismissed,
-                                   Gemini per-day quota rung 30m and climbed 2h)
-                                 - wall-shift / wall-redraw / wall-switch / wall-unread: W3 a reset moved after each try,
-                                   W4 the wall redrawn on a typed resume, W5 another agent in the tab under the wall, W6 an
-                                   unread limit told an hour past its reset (~30 min each; wall-unread ~90 min)
-                                 - wall-day-stop / wall-cruise / wall-relaunch / wall-bucket: W7 Gemini per-day dialog
-                                   answered Stop, W8 Cruise at a wall, W9 a relaunch under a wall, W10 Gemini per-model
-                                   bucket (Stop then resume, never the switch)
+                                 - wall / wall-hid: usage walls (W1 visible, W2 scrolled away)
+                                 - wall-redraw / wall-switch / wall-unread: W4 the wall redrawn on a typed resume, W5 another
+                                   agent in the tab under the wall, W6 an unread limit told an hour past its reset (~30 min
+                                   each; wall-unread ~90 min)
+                                 - wall-cruise / wall-relaunch: W8 Cruise at a wall, W9 a relaunch under a wall
                                  - resid / ladder: residual and backoff-ladder scenario slices
                                  - --window (needs the land-p chain; refused under LAB_RESTORE=1): opens a real window and
                                    types L13's person prompt via NSEvent `hwkey` (`human_seq=` verified)
@@ -401,7 +392,6 @@ usage: targo --unverified lab <command> [tag] [args]
   muse-upgrade [tag] [--keep]    live Muse Code quiet upgrade lane across idle, background shell, and mid-turn (~9 min)
   agy-upgrade [tag] [--keep]     live agy quiet upgrade lane across idle, background/subagent/daemon tasks, and mid-turn (~12 min)
   agy-relaunch [tag] [--keep]    live agy crash/resume/Ctrl-Z/quit/aterm-restart lane (~10 min)
-  gemini-relaunch [tag] [--keep] live Gemini CLI child/parent crash, resume, duplicate, and aterm-restart lane (~6 min)
   workers [tag] [--keep] [--early] [--upgrade <newer-claude-bin>]
                                  manager Claude Code spawns 3 real Claude Code workers, awaits all, and verifies results (~20 s)
   twin [tag] <claude-bin>|--crashing [ver]
@@ -628,12 +618,9 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "ratelimits" => codex::cmd_ratelimits(args),
         "rollout" => codex::cmd_rollout(args),
         "codex-selftest" => codex_proof::cmd_codex_selftest(args),
-        "gemini" => gemini::cmd_gemini(args),
-        "agy" => gemini::cmd_agy(args),
-        "gemini-captures" => gemini_captures::cmd_gemini_captures(args),
-        "gemini-selftest" => gemini_proof::cmd_gemini_selftest(args),
-        "agy-selftest" => gemini_proof::cmd_agy_selftest(args),
-        "agy-captures" => gemini_captures::cmd_agy_captures(args),
+        "agy" => agy::cmd_agy(args),
+        "agy-selftest" => agy_proof::cmd_agy_selftest(args),
+        "agy-captures" => agy_captures::cmd_agy_captures(args),
         "muse" => muse::cmd_muse(args),
         "muse-captures" => muse_captures::cmd_muse_captures(args),
         "autopilot-captures" => autopilot_captures::cmd_autopilot_captures(args),
@@ -642,7 +629,6 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "muse-upgrade" => upgrade_muse::cmd_muse_upgrade(args),
         "agy-upgrade" => upgrade_agy::cmd_agy_upgrade(args),
         "agy-relaunch" => relaunch_agy::cmd_agy_relaunch(args),
-        "gemini-relaunch" => relaunch_gemini::cmd_gemini_relaunch(args),
         "fleet-sim" => fleet_sim::cmd(args),
         "mode" => verbs::cmd_mode(args),
         "limit" => verbs::cmd_limit(args),
@@ -818,7 +804,8 @@ fn main() -> std::process::ExitCode {
                             check_state_dir().and_then(|()| dispatch(&cmd, &rest))
                         }
                     });
-                    match r {
+                    let found = matches!(r, Ok(1));
+                    let code = match r {
                         Ok(c) => c,
                         Err(f) => {
                             if let Some(usage) = help_instead(&cmd, &rest, &f) {
@@ -830,7 +817,8 @@ fn main() -> std::process::ExitCode {
                             }
                             f.code
                         }
-                    }
+                    };
+                    stop::status(code, found)
                 }
             }
         }

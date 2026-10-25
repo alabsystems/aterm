@@ -269,7 +269,6 @@ fn program_argv(argv: &[String]) -> &[String] {
                     | aterm_phase::Program::Kimi
                     | aterm_phase::Program::Agy
                     | aterm_phase::Program::Muse
-                    | aterm_phase::Program::Gemini
                     | aterm_phase::Program::Generic => false,
                 })
     });

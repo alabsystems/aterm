@@ -351,6 +351,14 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         TaskRecord::from_carry_row(&unknown, Some(&tasks()), t0, 10_000),
         Some(bare.clone())
     );
+    for retired in aterm_phase::RETIRED_AGENTS {
+        let carried = format!("{} agent={retired}", bare.carry_row());
+        assert_eq!(
+            TaskRecord::from_carry_row(&carried, Some(&tasks()), t0, 10_000),
+            Some(bare.clone()),
+            "a worker of the retired {retired} crosses as no agent's"
+        );
+    }
 
     for bad in [
         "",
@@ -386,7 +394,7 @@ fn the_reply_event_and_status_spellings() {
         since_unix_ms: 0,
         since: Instant::now(),
         entered: 3,
-        agent: Some(aterm_phase::Program::Gemini),
+        agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w")),
         fact: None,
         fact_rev: 0,

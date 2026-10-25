@@ -69,10 +69,31 @@ fn switch(app: &App, wid: WindowId) -> Option<BorderSwitch> {
 }
 
 fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
+    click_at_when(app, wid, cell, Instant::now());
+}
+
+/// A click on `cell` whose button went down and up at `when`.
+fn click_at_when(app: &mut App, wid: WindowId, cell: (usize, usize), when: Instant) {
     let (x, y) = px_of(app, wid, cell);
     app.on_cursor_moved(wid, x, y);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, when);
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, when);
+}
+
+/// A double click's interval, whose last instant still continues a run of presses.
+fn interval() -> Duration {
+    Duration::from_millis(
+        u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
+    )
+}
+
+/// Where a test's stated presses start: a minute ago, far enough from the clock that a press or
+/// a stamp that read the clock instead of its stated time lands on the wrong side of a double
+/// click's interval.
+fn a_minute_ago() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("a minute of uptime")
 }
 
 fn on_button(app: &App, wid: WindowId) -> (usize, usize) {
@@ -344,13 +365,17 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
     );
 }
 
+/// Each press states when it happened, so how long the read-back and the frame between two
+/// presses take never moves the second across a double click's interval. A press on the `on`
+/// button the read-back drew is the switch's own within the interval too, and turns nothing.
 #[test]
 fn a_double_click_on_on_leaves_the_harness_on() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let lit = switch(&app, wid).expect("lit");
     let at = (lit.frame_row, lit.switch.start + 2);
     super::SWITCHES_LET_GO.with(|n| n.set(0));
-    click_at(&mut app, wid, at);
+    let first = a_minute_ago();
+    click_at_when(&mut app, wid, at, first);
     let said = not_saved(&app, "harness.enabled").expect("first click: the off-write");
     assert!(said.contains("harness.enabled = false"), "{said:?}");
     policy(&mut app, MASTER_OFF);
@@ -365,24 +390,35 @@ fn a_double_click_on_on_leaves_the_harness_on() {
         off.cols.contains(&at.1),
         "the second click lands on the off face"
     );
-    click_at(&mut app, wid, at);
+    click_at_when(&mut app, wid, at, first + interval());
     let said = not_saved(&app, "harness.enabled").expect("the off-write's record");
     assert!(
         said.contains("harness.enabled = false"),
-        "the second click of the double click turned nothing back on: {said:?}"
+        "the second click of the double click, at the interval's last instant, turned nothing \
+         back on: {said:?}"
+    );
+    let at = on_button(&app, wid);
+    click_at_when(&mut app, wid, at, first + interval());
+    let said = not_saved(&app, "harness.enabled").expect("the off-write's record");
+    assert!(
+        said.contains("harness.enabled = false"),
+        "nor did a press on `on` at the interval's last instant: {said:?}"
     );
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
         "one write for a double click"
     );
-    later(&mut app, wid, session);
-    let at = on_button(&app, wid);
-    click_at(&mut app, wid, at);
+    click_at_when(
+        &mut app,
+        wid,
+        at,
+        first + interval() + Duration::from_millis(1),
+    );
     let said = not_saved(&app, "harness.enabled").expect("a later click's write");
     assert!(
         said.contains("harness.enabled = true"),
-        "a later click: {said:?}"
+        "a click a millisecond after the interval: {said:?}"
     );
     assert_eq!(autopilot(&app, session), (None, AutopilotView::MasterOff));
 
@@ -398,7 +434,8 @@ fn a_double_click_on_on_leaves_the_harness_on() {
             AutopilotView::MasterOff | AutopilotView::AgentOff(_)
         ));
         let at = super::gesture_tests::hit(&app, wid, super::Chip::Autopilot);
-        click_at(&mut app, wid, at);
+        let first = a_minute_ago();
+        click_at_when(&mut app, wid, at, first);
         assert!(
             app.windows[&wid].claude_lights.sessions[&session]
                 .switch_pressed
@@ -409,22 +446,27 @@ fn a_double_click_on_on_leaves_the_harness_on() {
         frame(&mut app, wid);
         assert_eq!(autopilot(&app, session), (None, AutopilotView::Cruise));
         let at = super::gesture_tests::hit(&app, wid, super::Chip::Autopilot);
-        click_at(&mut app, wid, at);
+        click_at_when(&mut app, wid, at, first + interval());
         assert_eq!(
             autopilot(&app, session),
             (None, AutopilotView::Cruise),
-            "readback did not turn the double click's second press into land"
+            "readback did not turn the double click's second press, at the interval's last \
+             instant, into land"
         );
-        later(&mut app, wid, session);
-        click_at(&mut app, wid, at);
-        assert_eq!(autopilot(&app, session).1, AutopilotView::Land);
+        let past = first + interval() + Duration::from_millis(1);
+        click_at_when(&mut app, wid, at, past);
+        assert_eq!(
+            autopilot(&app, session).1,
+            AutopilotView::Land,
+            "a click a millisecond after the interval steps the word"
+        );
         frame(&mut app, wid);
         let at = super::gesture_tests::hit(&app, wid, super::Chip::Autopilot);
-        click_at(&mut app, wid, at);
+        click_at_when(&mut app, wid, at, past + interval() * 2);
         assert_eq!(autopilot(&app, session).1, AutopilotView::Off);
         frame(&mut app, wid);
         let at = super::gesture_tests::hit(&app, wid, super::Chip::Autopilot);
-        click_at(&mut app, wid, at);
+        click_at_when(&mut app, wid, at, past + interval() * 4);
         assert_eq!(autopilot(&app, session).1, AutopilotView::Cruise);
         assert!(!settings_open(&app), "nothing opened");
         assert!(pty(&mut reader, 0).is_empty(), "no program input");
@@ -1581,10 +1623,9 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
 /// walks a pane's chips and facts and then its top rule's switch, lit as
 /// the pointer lights it, and Return there presses it as a click does: the
 /// whole harness turns off (`harness.enabled = false` is written, no
-/// Autopilot word) and nothing is typed. A Gemini pane, whose rule draws
-/// the switch and no chip or fact, reaches it too. NEGATIVE CONTROL: Escape
-/// on the switch lets it go and turns nothing; a shell's pane, no switch,
-/// selects nothing.
+/// Autopilot word) and nothing is typed. NEGATIVE CONTROL: Escape on the
+/// switch lets it go and turns nothing; a shell's pane, no switch, selects
+/// nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
@@ -1654,42 +1695,8 @@ fn the_keyboard_walks_to_the_switch_and_return_presses_it() {
     assert_eq!(selected(&app, wid), None);
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
 
-    let (mut app, wid, session, mut reader) = super::gesture_tests::app();
+    let (mut app, wid, session, _reader) = super::gesture_tests::app();
     assert!(app.apply_term_resize(wid, 50, 144));
-    let _host = host(&mut app);
-    set_program(&app, session, Some("gemini"));
-    let ctx = app.pool.get(session).expect("session").ctx.clone();
-    crate::session_timeline::claim_supervisor(
-        &ctx,
-        &crate::harness_host::holder(),
-        None,
-        None,
-        crate::metrics::now_us(),
-    )
-    .expect("the claim");
-    let rows: Vec<String> = include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-idle.txt")
-        .lines()
-        .filter(|l| !l.starts_with("# "))
-        .map(str::to_owned)
-        .collect();
-    crate::claude_footer::probe::feed(&app, session, &rows);
-    frame(&mut app, wid);
-    frame(&mut app, wid);
-    let b = switch(&app, wid).expect("Gemini's rule draws the switch");
-    assert_eq!(
-        (b.program, b.face),
-        (aterm_phase::Program::Gemini, HarnessSwitch::On),
-        "CONTROL"
-    );
-    let before = autopilot(&app, session);
-    walk(&mut app, wid, session);
-    tap(&mut app, wid, NamedKey::Enter, KeyCode::Enter, "\r");
-    assert!(
-        not_saved(&app, "harness.enabled").is_some_and(|said| said.contains("= false")),
-        "Gemini: its click"
-    );
-    assert_eq!(autopilot(&app, session), before, "Gemini: no word written");
-    assert!(pty(&mut reader, 0).is_empty(), "Gemini: nothing typed");
 
     set_program(&app, session, None);
     frame(&mut app, wid);

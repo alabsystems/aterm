@@ -439,8 +439,14 @@ impl Judged {
     }
 
     /// Build the look's row at `now_unix_ms`, kept in [`Self::rows`] and returned for the ring's
-    /// file.
-    pub(crate) fn look_row(&mut self, sessions: &[(u64, String)], now_unix_ms: i64) -> RingRow {
+    /// file: a session reads ready where its hold does, or where `met` names it (a ready wake of
+    /// its book whose need holds, the plan's F14).
+    pub(crate) fn look_row(
+        &mut self,
+        sessions: &[(u64, String)],
+        met: &[String],
+        now_unix_ms: i64,
+    ) -> RingRow {
         let rows = sessions
             .iter()
             .map(|(_, sid)| {
@@ -453,7 +459,7 @@ impl Judged {
                 RingSession {
                     sid: sid.clone(),
                     held_ms: reading.held_slot_last_ms,
-                    ready: rules::ready(&reading, hold, now_unix_ms),
+                    ready: rules::ready(&reading, hold, now_unix_ms) || met.contains(sid),
                     guard: said
                         .and_then(OccupancySaid::guard)
                         .map(|g| g.word().to_string()),
@@ -473,10 +479,11 @@ impl Judged {
     pub(crate) fn looked(
         &mut self,
         sessions: &[(u64, String)],
+        met: &[String],
         now_unix_ms: i64,
         look: Look,
     ) -> Option<RingRow> {
-        (look == Look::Tick).then(|| self.look_row(sessions, now_unix_ms))
+        (look == Look::Tick).then(|| self.look_row(sessions, met, now_unix_ms))
     }
 
     /// The sessions whose hold read ready at the last look.
@@ -1312,6 +1319,13 @@ pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)], kind: Look) {
         None => board_of(&Snapshot::default(), None, disk, now_unix_ms),
     };
     let words = change_words(&board);
+    // Read under the wake books' lock, let go before the board's is taken.
+    let met: Vec<String> = sessions
+        .iter()
+        .map(|(_, sid)| sid)
+        .filter(|sid| crate::occupancy_wakes::met(sid))
+        .cloned()
+        .collect();
     let (moved, row, start) = {
         let mut kept = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
         let judged = kept.get_or_insert_with(Judged::default);
@@ -1321,7 +1335,11 @@ pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)], kind: Look) {
             judged.seed_rows(rows);
         }
         let start = judged.sampler_due(now_unix_ms, mode());
-        (moved, judged.looked(sessions, now_unix_ms, kind), start)
+        (
+            moved,
+            judged.looked(sessions, &met, now_unix_ms, kind),
+            start,
+        )
     };
     if start {
         start_sampler();

@@ -455,16 +455,16 @@ pub const DRIVE_HELP: &str = "\
 aterm drive — the window harness's readers, run by hand.
 
 MENTAL MODEL
-    An aterm window supervises every Claude Code, agy, Muse Code and Gemini CLI
-    session by default (`status supervisor=aterm-harness@<pid>`), under `[harness]`
+    An aterm window supervises every Claude Code, agy and Muse Code session by
+    default (`status supervisor=aterm-harness@<pid>`), under `[harness]`
     in `aterm.toml` (`aterm help harness`). `aterm drive` runs that supervisor's
     readers and tape tools from a terminal. Vendor `codex` reports through
     `status program_state=` and has no reader here; `codex-alab` supervises itself.
     Driving a session is `aterm ctl` (`aterm ctl help`): `aterm ctl @self spawn
     agent=claude -` starts a worker, `aterm ctl await task @<sid>,… since=0` waits
     for it, `aterm ctl @<sid> result` reads its report; `turn`, `text`, `image` and
-    `await agent idle,prompt,question,wall` drive and watch a Claude Code, agy, Muse
-    Code or Gemini CLI session; for a codex (whose `agent=` stays `unknown`),
+    `await agent idle,prompt,question,wall` drive and watch a Claude Code, agy or
+    Muse Code session; for a codex (whose `agent=` stays `unknown`),
     `await log kind=program since=<log_seq> ep=<log_ep>`, both read from `status`
     before typing to it, waits on its own report.
     `aterm ctl @sid meta set questions ask|recommended|long-term|short-term` sets how
@@ -508,7 +508,7 @@ COMMANDS
                                    `cancel esc` | `exit esc` | `interrupt esc`, and
                                    `box <token>` on a question dialog (for `answer --box`)
                          busy:     `reason <where>: <rule>` (`its reader reads it busy`
-                                   when agy, Muse Code or Gemini CLI name none)
+                                   when agy or Muse Code name none)
                          limited:  `message <text>` and `reset <text|->`
                        `question` means the last thing said ends in `?`. Then come
                        `survey 0` when a rating survey that `0` dismisses is open (`survey
@@ -521,8 +521,8 @@ COMMANDS
                            options on a multi-select; `submit` on the review tab. Moves
                            the focus to each and presses Enter, fenced on that row (never
                            a digit, Esc, typed text or the chat row).
-                         agy, Gemini CLI: an option number or label; types the
-                           option's digit, fenced on the title row.
+                         agy: an option number or label; types the option's
+                           digit, fenced on the title row.
                          Muse Code: an option number or label; moves the focus and
                            presses Enter, fenced on the question row.
                        A label matches whole, in any case. Each also takes `recommended`

@@ -92,12 +92,14 @@ impl StrokeDetector {
         });
         if elapsed.is_zero()
             || elapsed > MAX_GAP
-            || self.cooldown_until.is_some_and(|until| now < until)
+            || matches!(self.cooldown_until, Some(until) if now < until)
         {
             self.travel = 0.0;
             return false;
         }
-        let distance = (point.0 - previous.point.0).hypot(point.1 - previous.point.1) / body_width;
+        let distance =
+            crate::color_math::hypot_f32(point.0 - previous.point.0, point.1 - previous.point.1)
+                / body_width;
         let speed = distance / elapsed.as_secs_f32();
         if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
             self.travel = 0.0;

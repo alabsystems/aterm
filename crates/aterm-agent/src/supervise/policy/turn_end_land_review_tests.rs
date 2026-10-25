@@ -467,11 +467,7 @@ fn a_handoff_nothing_can_read_the_land_act_on_lands_its_defense() {
         let (a, _) = until_acted(&mut st, &r, t0());
         (st, a)
     };
-    for program in [
-        aterm_phase::Program::Gemini,
-        aterm_phase::Program::Agy,
-        aterm_phase::Program::Muse,
-    ] {
+    for program in [aterm_phase::Program::Agy, aterm_phase::Program::Muse] {
         let (st, a) = successor(program, true);
         assert_eq!(a, TurnEndAction::Nothing, "{program:?}");
         assert!(st.landed() && st.task_done(), "{program:?}: {a:?}");
@@ -1018,11 +1014,7 @@ fn an_untaken_land_act_is_told_by_the_message_that_opened_the_turn() {
     let lead = words_lead(LAND);
     let first: Vec<&str> = LAND.split_whitespace().take(LEAD_WORDS).collect();
     let first = first.join(" ");
-    for program in [
-        aterm_phase::Program::Gemini,
-        aterm_phase::Program::Agy,
-        aterm_phase::Program::Muse,
-    ] {
+    for program in [aterm_phase::Program::Agy, aterm_phase::Program::Muse] {
         let successor = |opened: &str| {
             let mut st = TurnEndState::default();
             st.seed_land(0, true, false, false);

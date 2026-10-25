@@ -541,20 +541,24 @@ fn a_double_click_on_a_typed_menu_row_types_through_to_the_enter() {
             .expect("painted");
         let (x, y) = px_of(&app, wid, (rect.row + 1 + i, rect.col + 3));
         app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        // Each press states when it happened, so how long the probe's read takes never moves
+        // the second across a double click's interval; a minute ago, so a press or a stamp that
+        // read the clock instead lands on the wrong side of it.
+        let first = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("a minute of uptime");
+        app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, first);
+        app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, first);
         assert!(app.autopilot_menu.is_none(), "chosen and closed");
         assert_eq!(pty(&mut reader, 1), b"/", "the probe alone");
-        if late {
-            let spent = app.autopilot_menu_spent.expect("the card a choice closed");
-            let past = Duration::from_millis(u64::try_from(crate::multi_click_ms()).unwrap() + 50);
-            app.autopilot_menu_spent = Some(crate::autopilot_menu::SpentCard {
-                at: Instant::now() - past,
-                ..spent
-            });
-        }
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        let interval = Duration::from_millis(u64::try_from(crate::multi_click_ms()).unwrap());
+        let second = if late {
+            first + interval + Duration::from_millis(1)
+        } else {
+            first + interval
+        };
+        app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, second);
+        app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, second);
         echo(&app, session, CARET, "/");
         let at = Instant::now();
         app.advance_slash_presses(at);

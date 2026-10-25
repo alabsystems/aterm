@@ -1269,3 +1269,87 @@ fn the_caption_never_takes_a_sibling_panes_command_line() {
         rows[0]
     );
 }
+
+/// One mixed frame (a terminal leaf beside a Settings leaf) with its link caption spliced.
+fn compose_mixed(app: &mut App, wid: WindowId) -> Vec<String> {
+    let plan = app
+        .prepare_heterogeneous_layout_plan(wid)
+        .expect("a mixed plan");
+    assert!(
+        app.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(
+            wid,
+            Some(ComposedCursorFxClock::Advance(Instant::now())),
+            &plan,
+        )
+        .is_some(),
+        "the mixed frame must fill"
+    );
+    app.splice_link_target_from_plan(wid, &plan);
+    frame_rows(app, wid)
+}
+
+#[test]
+fn a_mixed_tab_s_caption_follows_output_that_swaps_the_link_under_the_pointer() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    assert_eq!(
+        app.active_visible_frame_layout(wid).map(|(_, route)| route),
+        Some(crate::VisibleContentRoute::Heterogeneous),
+        "precondition: a mixed tab with its terminal leaf focused"
+    );
+    feed(&app, wid, PHISH);
+    let plan = app
+        .prepare_heterogeneous_layout_plan(wid)
+        .expect("a mixed plan");
+    let origin = plan
+        .leaves
+        .iter()
+        .find(|leaf| leaf.focused)
+        .expect("the focused leaf")
+        .rect
+        .origin;
+    compose_mixed(&mut app, wid);
+    hover(
+        &mut app,
+        wid,
+        origin.y.round() as u16,
+        origin.x.round() as u16 + LINK_COL,
+    );
+    assert!(
+        compose_mixed(&mut app, wid).concat().contains(TARGET),
+        "precondition: the first destination is disclosed"
+    );
+
+    feed(
+        &app,
+        wid,
+        b"\x1b[H\x1b[2KVisit \x1b]8;;https://second.example/other\x1b\\google.com\x1b]8;;\x1b\\",
+    );
+    let rows = compose_mixed(&mut app, wid).concat();
+    assert!(
+        rows.contains("second.example"),
+        "the caption names the URI the cell carries now: {rows:?}"
+    );
+    assert!(
+        !rows.contains("evil.example"),
+        "and not the one it carried before: {rows:?}"
+    );
+    let ws = &app.windows[&wid];
+    let session = ws.front_terminal().expect("the terminal leaf").session;
+    assert!(
+        ws.hover_memo
+            .as_ref()
+            .is_some_and(|memo| memo.stands_for(ws, session)),
+        "between frames the memo stands for the fill the frame showed, so a still pointer \
+         is not probed again"
+    );
+
+    feed(&app, wid, b"\x1b[H\x1b[2Kplain output, no link at all");
+    let rows = compose_mixed(&mut app, wid).concat();
+    assert!(
+        !rows.contains("example"),
+        "no link under the pointer, no claim about one: {rows:?}"
+    );
+}

@@ -199,14 +199,17 @@ impl SpecTable {
             let Some(spec) = self.specs.get(usize::from(*id)) else {
                 continue;
             };
-            let rainbow = matches!(
-                spec.ink.map(|ink| ink.colorway),
-                Some(Colorway::Rainbow { .. })
-            );
-            let twotone = matches!(
-                spec.ink.map(|ink| ink.colorway),
-                Some(Colorway::TwoTone { .. })
-            );
+            let (rainbow, twotone) = match spec.ink {
+                Some(InkSpec {
+                    colorway: Colorway::Rainbow { .. },
+                    ..
+                }) => (true, false),
+                Some(InkSpec {
+                    colorway: Colorway::TwoTone { .. },
+                    ..
+                }) => (false, true),
+                _ => (false, false),
+            };
             capabilities.rainbow_ink |= rainbow;
             capabilities.twotone_ink |= twotone;
 
@@ -234,9 +237,12 @@ impl SpecTable {
         if spec == WordEffectSpec::default() {
             return None;
         }
-        if let Some(i) = self.specs.iter().position(|s| *s == spec) {
-            Some(i as SpecId)
-        } else if self.specs.len() >= usize::from(SpecId::MAX) {
+        for i in 0..self.specs.len() {
+            if self.specs[i] == spec {
+                return Some(i as SpecId);
+            }
+        }
+        if self.specs.len() >= usize::from(SpecId::MAX) {
             // defensive cap; unreachable for sane configs
             None
         } else {
@@ -336,38 +342,82 @@ pub struct RawGraphic {
     pub collection: String,
 }
 
-/// Parse a `#RRGGBB` / `RRGGBB` color into packed `0x00RRGGBB`.
 #[inline]
-fn parse_hex(s: &str) -> Option<u32> {
-    let h = s.trim().trim_start_matches('#');
+const fn parse_hex_6(h: &[u8]) -> Option<u32> {
     if h.len() != 6 {
         return None;
     }
-    u32::from_str_radix(h, 16).ok()
+    let mut val = 0u32;
+    let mut i = 0;
+    while i < 6 {
+        let d = match h[i] {
+            b'0'..=b'9' => h[i] - b'0',
+            b'a'..=b'f' => h[i] - b'a' + 10,
+            b'A'..=b'F' => h[i] - b'A' + 10,
+            _ => return None,
+        };
+        val = (val << 4) | (d as u32);
+        i += 1;
+    }
+    Some(val)
+}
+
+/// Parse a `#RRGGBB` / `RRGGBB` color into packed `0x00RRGGBB`.
+#[inline]
+const fn parse_hex_bytes(bytes: &[u8]) -> Option<u32> {
+    let bytes = crate::cursor_glow::spellings::trim_whitespace_slice(bytes);
+    let h = match bytes {
+        [b'#', rest @ ..] => rest,
+        other => other,
+    };
+    parse_hex_6(h)
 }
 
 /// Whether a custom ink colorway is one of the two runtime-supported shapes.
 #[inline]
 #[must_use]
-pub fn custom_colorway_is_valid(s: &str) -> bool {
-    let s = s.trim();
-    s == "rainbow" || parse_two_tone(s).is_some()
+pub const fn custom_colorway_is_valid(s: &str) -> bool {
+    let bytes = crate::cursor_glow::spellings::trim_whitespace_bytes(s);
+    matches!(bytes, b"rainbow") || parse_two_tone(s).is_some()
 }
 
 #[inline]
-fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
-    let rest = s.strip_prefix("twotone:")?;
-    let mut colors = rest.split(',');
-    let c0 = colors.next().and_then(parse_hex)?;
-    let c1 = colors.next().and_then(parse_hex)?;
-    colors.next().is_none().then_some((c0, c1))
+const fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
+    let bytes = crate::cursor_glow::spellings::trim_whitespace_bytes(s);
+    let [b't', b'w', b'o', b't', b'o', b'n', b'e', b':', rest @ ..] = bytes else {
+        return None;
+    };
+    let mut comma_at = None;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == b',' {
+            if comma_at.is_some() {
+                return None;
+            }
+            comma_at = Some(i);
+        }
+        i += 1;
+    }
+    let Some(comma_idx) = comma_at else {
+        return None;
+    };
+    let (left, right_with_comma) = rest.split_at(comma_idx);
+    let [b',', right @ ..] = right_with_comma else {
+        return None;
+    };
+    let Some(c0) = parse_hex_bytes(left) else {
+        return None;
+    };
+    let Some(c1) = parse_hex_bytes(right) else {
+        return None;
+    };
+    Some((c0, c1))
 }
 
 /// Resolve a colorway string: `"rainbow"` (default) or
 /// `"twotone:#RRGGBB,#RRGGBB"`.
 #[inline]
-fn parse_colorway(s: &str) -> Colorway {
-    let s = s.trim();
+const fn parse_colorway(s: &str) -> Colorway {
     if let Some((c0, c1)) = parse_two_tone(s) {
         return Colorway::TwoTone { c0, c1 };
     }
@@ -728,10 +778,10 @@ pub fn compile_toy_pack_toml(source: &str) -> Result<CompiledToyPack, ToyPackErr
     let mut surfaces = std::collections::BTreeMap::<String, String>::new();
     let mut dispatch_hashes = std::collections::BTreeMap::<u64, String>::new();
     let mut scanner_surfaces = Vec::<(String, &str, u64)>::new();
-    let word_count = raw
-        .toy
-        .iter()
-        .fold(0usize, |n, toy| n.saturating_add(toy.words.len()));
+    let mut word_count = 0usize;
+    for toy in &raw.toy {
+        word_count = word_count.saturating_add(toy.words.len());
+    }
     if word_count > MAX_WORDS_PER_PACK {
         diagnostics.push(format!(
             "words: {word_count} surfaces exceed the per-pack maximum {MAX_WORDS_PER_PACK}"
@@ -1314,11 +1364,10 @@ fn bounded_u32(
 }
 
 fn strict_pack_hex(value: &str, label: &str, index: usize, diagnostics: &mut Vec<String>) -> u32 {
-    if value.len() == 7
-        && value.starts_with('#')
-        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    if let [b'#', rest @ ..] = value.as_bytes()
+        && let Some(val) = parse_hex_6(rest)
     {
-        return u32::from_str_radix(&value[1..], 16).unwrap_or(0);
+        return val;
     }
     diagnostics.push(format!(
         "{label}.colors[{index}]: expected exactly #RRGGBB, got {value:?}"

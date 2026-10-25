@@ -69,11 +69,15 @@ OPTIONS:
     --timeout SECS
                   deadline on each socket read and write, in seconds (default
                   900, 0 = none; --timeout=SECS also works). Raise it for a
-                  verb that runs longer; a fired deadline exits 124. On
-                  `subscribe`, an explicit --timeout instead caps the whole
-                  watch (frames so far are flushed, then exit 124); without
-                  one, or with 0, the watch runs until the stream ends. The
-                  wait for a successor (exit 75) spends what is left of it.
+                  verb that runs longer; a fired deadline exits 124. With
+                  --host it bounds each drive connection, handshake and reply,
+                  whose own deadline is 28 s; a shorter one is taken, and cuts
+                  a `turn` whose own wait (timeout=, 20 s unless named) runs
+                  past it. On `subscribe`, an explicit --timeout instead caps
+                  the whole watch (frames so far are flushed, then exit 124);
+                  without one, or with 0, the watch runs until the stream
+                  ends. The wait for a successor (exit 75) spends what is left
+                  of it.
     --completions SHELL
                   print a bash, zsh or fish completion script and exit.
     -h, --help    print this help and exit.
@@ -89,10 +93,13 @@ EXIT CODES:
          only case that prints `no live aterm instances found`.
     2    could not reach: the instance accepted the connection but did not
          serve it within 10 s (or a shorter --timeout; --timeout 0 waits
-         without bound), so the request was not sent. For `ls`/`instances`/
-         `windows`: no socket found answered, or the directory is missing,
-         unreadable or unresolvable (every variable it is read from unset);
-         stderr names each socket's cause and a hint.
+         without bound), so the request was not sent; with --host, the peer
+         took the connection and sent no fleet handshake within 28 s (or a
+         shorter --timeout): an aterm stopped, frozen or overloaded, the
+         request not sent. For `ls`/`instances`/`windows`: no socket found
+         answered, or the directory is missing, unreadable or unresolvable
+         (every variable it is read from unset); stderr names each socket's
+         cause and a hint.
     124  timeout: the client's deadline fired, or the server reported one (a
          `turn` with status=timeout, or `OK timeout` from await/ready/wait);
          for `ls`/`instances`/`windows`, every socket found timed out.
@@ -3154,9 +3161,19 @@ fn exit_for(e: &io::Error) -> ExitCode {
         ExitCode::SUCCESS
     } else if is_timeout_error(e) {
         ExitCode::from(EXIT_TIMEOUT)
+    } else if is_unserved(e) {
+        ExitCode::from(EXIT_UNREACHABLE)
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Whether `e` is a drive whose peer took the connection and sent no fleet handshake, so the
+/// request was not sent ([`DriveRefused::unserved`]).
+fn is_unserved(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<DriveRefused>())
+        .is_some_and(|refused| refused.unserved)
 }
 
 #[derive(Debug)]

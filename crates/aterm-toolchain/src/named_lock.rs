@@ -10,7 +10,7 @@
 //! starts and once a minute while it lasts ([`Wait::Block`]). The holder is a live process whose
 //! lock the kernel lets go when it exits, however it ends, so the wait is admission behind it:
 //! no deadline, no retry and no signal to anyone (`docs/DESIGN-adaptive-build-2026-10-24.md`,
-//! LOCK-WAIT).
+//! LOCK-WAIT). An interrupt ends the wait ([`crate::interrupt`]).
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
@@ -26,8 +26,9 @@ pub const RECORD: u64 = 4096;
 /// How often a wait names the holder again.
 pub const SAY_EVERY: Duration = Duration::from_secs(60);
 
-/// How often a wait asks its caller whether to stop. A wait names its holder only once a whole
-/// tick has passed without the lock, so a holder on its way out goes unnamed.
+/// How often a wait looks for an interrupt and asks its caller whether to stop. A wait names its
+/// holder only once a whole tick has passed without the lock, so a holder on its way out goes
+/// unnamed.
 pub const TICK: Duration = Duration::from_millis(100);
 
 /// Who holds a lock, as its record says.
@@ -174,8 +175,13 @@ pub enum Wait {
 pub enum Refused {
     /// Another handle holds it and the taker would not wait: the holder its record names.
     Held(Option<Holder>),
-    /// The taker's `stop` said so while it waited: the holder its record named then.
-    Stopped(Option<Holder>),
+    /// An interrupt, or the taker's `stop`, ended the wait: the holder its record named then.
+    Stopped {
+        /// The holder its record named.
+        holder: Option<Holder>,
+        /// The interrupt that ended it ([`crate::interrupt`]); `None` when `stop` did.
+        signal: Option<i32>,
+    },
     /// The file could not be opened, locked or written.
     Io(io::Error),
 }
@@ -225,9 +231,12 @@ impl Drop for NamedLock {
 ///
 /// Held by another handle: with [`Wait::No`], [`Refused::Held`] at once. With [`Wait::Block`],
 /// `say` hears the holder (its record as it reads then) once a [`TICK`] has passed without the
-/// lock, and every [`SAY_EVERY`] after with the time waited, and `stop` is asked every tick:
-/// `true` ends the wait ([`Refused::Stopped`]). A stopped wait leaves a thread blocked on the lock
-/// with a handle of its own until the holder lets go; the lock it then has goes back at once.
+/// lock, and every [`SAY_EVERY`] after with the time waited. SIGINT, SIGTERM or SIGHUP while it
+/// waits ([`crate::interrupt::Watch`]), or `stop`, asked every tick, saying `true`, ends the wait
+/// ([`Refused::Stopped`]). A stopped wait leaves a thread blocked on the lock with a handle of its
+/// own until the holder lets go; the lock it then has goes back at once.
+/// While it blocks, the wait is marked where a ceiling over this process's tree reads it
+/// ([`crate::waits`]), naming the holder afresh each time `say` does.
 ///
 /// # Errors
 /// [`Refused`]: [`Refused::Io`] when the file cannot be opened or locked, never for its record.
@@ -238,6 +247,18 @@ pub fn take(
     say: &mut dyn FnMut(Option<&Holder>, Duration),
     stop: &dyn Fn() -> bool,
 ) -> Result<NamedLock, Refused> {
+    take_marked(path, me, wait, say, stop, crate::waits::dir().as_deref())
+}
+
+/// [`take`], its wait marked in `marks` (none: unmarked).
+fn take_marked(
+    path: &Path,
+    me: &Holder,
+    wait: Wait,
+    say: &mut dyn FnMut(Option<&Holder>, Duration),
+    stop: &dyn Fn() -> bool,
+    marks: Option<&Path>,
+) -> Result<NamedLock, Refused> {
     match RecordLock::try_lock(open(path)?, RECORD) {
         Ok(lock) => return Ok(named(lock, me, Duration::ZERO)),
         Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
@@ -246,7 +267,10 @@ pub fn take(
     if wait == Wait::No {
         return Err(Refused::Held(read(path)));
     }
+    let watch = crate::interrupt::Watch::enter();
     let file = open(path)?;
+    let mut mark = marks
+        .and_then(|d| crate::waits::Mark::at(d, &waits_for(path, me, read(path).as_ref())).ok());
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("named-lock wait".into())
@@ -265,18 +289,58 @@ pub fn take(
                 return Err(io::Error::other("the wait on the lock ended with no answer").into());
             }
         }
-        if stop() {
-            return Err(Refused::Stopped(read(path)));
+        let signal = watch.take();
+        if signal.is_some() || stop() {
+            return Err(Refused::Stopped {
+                holder: read(path),
+                signal,
+            });
         }
         let waited = started.elapsed();
         if waited >= next {
-            say(read(path).as_ref(), waited);
+            let holder = read(path);
+            say(holder.as_ref(), waited);
+            if let Some(mark) = &mut mark {
+                mark.say(&waits_for(path, me, holder.as_ref()));
+            }
             next = if next == TICK {
                 SAY_EVERY
             } else {
                 next + SAY_EVERY
             };
         }
+    }
+}
+
+/// What `me`'s wait on `path` marks ([`crate::waits`]): the holder its record names, with no
+/// clock of its own, and how long it has held the lock.
+fn waits_for(path: &Path, me: &Holder, holder: Option<&Holder>) -> String {
+    let lead = if me.verb.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", me.verb)
+    };
+    match holder {
+        Some(h) => {
+            let named = Holder {
+                since: 0,
+                ..h.clone()
+            }
+            .describe(0);
+            let held = if h.since == 0 {
+                String::new()
+            } else {
+                format!(" for {} min", now_secs().saturating_sub(h.since) / 60)
+            };
+            format!(
+                "{lead}waiting for {named}, which has held {}{held}",
+                path.display()
+            )
+        }
+        None => format!(
+            "{lead}waiting for a run that wrote no record, which holds {}",
+            path.display()
+        ),
     }
 }
 
@@ -467,10 +531,199 @@ mod tests {
         )
         .expect("free");
         match take(&path, &holder("w"), Wait::Block, &mut quiet, &|| true) {
-            Err(Refused::Stopped(Some(named))) => assert_eq!(&named, held.holder()),
+            Err(Refused::Stopped {
+                holder: Some(named),
+                signal: None,
+            }) => assert_eq!(&named, held.holder()),
             other => panic!("a stopped wait must name its holder: {other:?}"),
         }
         drop(held);
+    }
+
+    /// Set, the test binary is [`standin_waits_for_the_lock`], on the lock at this path.
+    #[cfg(unix)]
+    const STANDIN: &str = "ATERM_TOOLCHAIN_NAMED_LOCK_STANDIN";
+
+    /// Run by [`an_interrupt_ends_a_wait_for_a_held_lock`] in a process of its own: waits for the
+    /// lock [`STANDIN`] names, with SIGINT at its default action as a foreground process has it,
+    /// writing `waiting` beside it once it waits, and exits 3, a tool's NOT RUN, naming what
+    /// ended the wait and the holder.
+    #[cfg(unix)]
+    #[test]
+    fn standin_waits_for_the_lock() {
+        let Some(path) = std::env::var_os(STANDIN).map(std::path::PathBuf::from) else {
+            return;
+        };
+        // SAFETY: SIG_DFL is a disposition, no handler of ours.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+        let waiting = path.with_file_name("waiting");
+        let started = Instant::now();
+        let got = take(
+            &path,
+            &holder("lab linux exec"),
+            Wait::Block,
+            &mut |_, _| {
+                let _ = std::fs::write(&waiting, std::process::id().to_string());
+            },
+            &|| started.elapsed() > Duration::from_secs(60),
+        );
+        match got {
+            Err(Refused::Stopped {
+                holder: Some(h),
+                signal: Some(sig),
+            }) => {
+                println!(
+                    "stopped by {} waiting for {}",
+                    crate::interrupt::name(sig),
+                    h.describe(0)
+                );
+                std::process::exit(3);
+            }
+            other => panic!("the wait ended otherwise: {other:?}"),
+        }
+    }
+
+    /// A stand-in, killed when it is dropped still running (a test that failed before it
+    /// ended), so none outlives its test.
+    #[cfg(unix)]
+    struct Standin(aterm_uds::spawnfd::Child);
+
+    #[cfg(unix)]
+    impl Drop for Standin {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    /// A process waiting for a held lock ends on SIGTERM, and on SIGINT where it is not
+    /// ignored, well inside the one-minute hang detector (the time is reported), naming the
+    /// holder and the signal, with nobody signalling the holder, which keeps the lock. Without
+    /// the wait's watch its caller's `stop` never says so, and the stand-in dies of the signal
+    /// instead (no exit 3).
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_ends_a_wait_for_a_held_lock() {
+        for (sig, word) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT")] {
+            let dir = scratch("interrupt");
+            let path = dir.path().join("lane.lock");
+            let held = take(
+                &path,
+                &holder("lab linux proof"),
+                Wait::No,
+                &mut quiet,
+                &|| false,
+            )
+            .expect("free");
+            let mut child = Standin(
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                    .args([
+                        "--exact",
+                        "named_lock::tests::standin_waits_for_the_lock",
+                        "--test-threads=1",
+                        "--nocapture",
+                    ])
+                    .env(STANDIN, &path)
+                    .stdin(aterm_uds::spawnfd::Stdio::null())
+                    .stdout(aterm_uds::spawnfd::Stdio::piped())
+                    .stderr(aterm_uds::spawnfd::Stdio::null())
+                    .spawn()
+                    .expect("the stand-in"),
+            );
+            let waiting = dir.path().join("waiting");
+            let pid: i32 = aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the stand-in to wait for the lock",
+                || std::fs::read_to_string(&waiting).ok()?.trim().parse().ok(),
+            );
+            let sent = Instant::now();
+            // SAFETY: `kill` takes two integers; the pid is this test's own child.
+            assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
+            let status = aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the stand-in's end",
+                || child.0.try_wait().ok().flatten(),
+            );
+            let took = sent.elapsed();
+            let mut out = String::new();
+            if let Some(mut o) = child.0.stdout.take() {
+                let _ = std::io::Read::read_to_string(&mut o, &mut out);
+            }
+            assert_eq!(status.code(), Some(3), "{word}: {status} {out}");
+            assert!(
+                out.contains(&format!(
+                    "stopped by {word} waiting for pid {}",
+                    held.holder().pid
+                )),
+                "{out}"
+            );
+            eprintln!("{word} ended the lock wait in {took:?}");
+            assert_eq!(
+                read(&path).as_ref(),
+                Some(held.holder()),
+                "the holder keeps it"
+            );
+            drop(held);
+        }
+    }
+
+    /// A blocked wait is marked for a ceiling to read, naming the holder, and the mark goes once
+    /// the waiter has the lock. Without the mark the look for it hangs past its detector.
+    #[test]
+    fn a_blocked_wait_is_marked_until_it_has_the_lock() {
+        let dir = scratch("marked");
+        let path = dir.path().join("lane.lock");
+        let marks = dir.path().join("waits");
+        std::fs::create_dir(&marks).expect("the marks' dir");
+        let held = take(
+            &path,
+            &holder("lab linux proof"),
+            Wait::No,
+            &mut quiet,
+            &|| false,
+        )
+        .expect("free");
+        let pid = held.holder().pid;
+        let waiter = {
+            let (path, marks) = (path.clone(), marks.clone());
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                take_marked(
+                    &path,
+                    &holder("lab linux exec"),
+                    Wait::Block,
+                    &mut quiet,
+                    &|| started.elapsed() > Duration::from_secs(60),
+                    Some(&marks),
+                )
+                .map(drop)
+            })
+        };
+        let detector = Instant::now() + Duration::from_secs(60);
+        let seen = loop {
+            if let Some(w) = crate::waits::waiting(&marks).pop() {
+                break w;
+            }
+            assert!(Instant::now() < detector, "the wait was never marked");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            seen.text.starts_with(&format!(
+                "lab linux exec: waiting for pid {pid} (lab linux proof, /checkouts/a), which has held"
+            )),
+            "{}",
+            seen.text
+        );
+        drop(held);
+        assert!(waiter.join().expect("the waiter").is_ok());
+        assert!(
+            crate::waits::waiting(&marks).is_empty(),
+            "the mark outlived the wait"
+        );
     }
 
     #[test]

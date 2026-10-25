@@ -13,13 +13,21 @@
 //! clear leaves the lease alone only when no episode is open and its host has no line the lease
 //! has yet to record (`ask::rests`). A successor adopts an owed pick of the host it replaced
 //! whether it still supervises the pick or bars it, so a pick whose agent exited across the
-//! update is released at no election's cost.
+//! update is released at no election's cost; and a nominee of a host that ended mid-round stands
+//! until the successor's look nominates the session again, so the other host's look elects no
+//! weaker seat before it. A session held at a usage-limit wall or a box only its owner can answer
+//! is never nominated; when it is owed, it goes back to the episode at no election's cost the
+//! first time, and is released the second; and a round with nobody else to elect waits for it,
+//! gone back or never elected, rather than running out. A host's look takes over what an ended
+//! host left of its sessions as it begins, before its pass (`ask::take_over`), and steps the lease
+//! after it, so a successor whose first pass runs past `ask::ADOPT_MS` keeps its session's pick.
 
+use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use aterm_agent::harness::disk::Level;
 use aterm_agent::harness::disk::ask::{
-    self, Break, Done, Entry, HostId, Lease, Miss, Phase, Pick, Said, Seat,
+    self, Break, Done, Entry, HeldBy, HostId, Lease, Miss, Phase, Pick, Roster, Said, Seat,
 };
 use aterm_models_harness::disk_free_ask_model;
 use aterm_spec::derive::Model;
@@ -134,11 +142,21 @@ struct World {
     hosts: [HostId; 2],
     /// The hosts whose processes ended ([`World::succeed`]), each with when.
     dead: Vec<(HostId, i64)>,
+    /// Each host has begun a look since its process started ([`World::begin`]): its take-over
+    /// before the pass ran.
+    took: [bool; 2],
+    /// What an ended host left in the round of the sessions each host runs, as that host's look
+    /// began ([`World::begin`]), until the step after its pass ([`World::end`]).
+    left: [Vec<Left>; 2],
     /// A line a host typed whose record the lease could not write ([`World::turn_break_lost`]):
     /// its next look records it (`ask::typed_unrecorded`), as the window's look does.
     unrecorded: [Option<Lost>; 2],
     /// Each host's sessions: A and B on the first, C on the second.
     seats: [Vec<Seat>; 2],
+    /// The sessions held where they cannot take a line now (a usage-limit wall, a box only their
+    /// owner can answer): their host's seat rule seats none of them, and they come to no turn
+    /// break while held.
+    held: Vec<&'static str>,
     /// The line each host's last look left owed one of its sessions (its board).
     owed: [Option<String>; 2],
     m: Model,
@@ -153,6 +171,90 @@ struct Lost {
     sid: String,
     at: i64,
     free: u64,
+}
+
+/// A record an ended host left in the round of a session another host runs and does not bar
+/// ([`World::left`]): its nominee, with its figures, where that host may nominate it, or a record
+/// of it held, where that host holds it or the ended host did. That host's take-over before its
+/// pass moves it, so no other host's look while the pass runs runs the round out, or elects a seat
+/// such a nominee outranks.
+#[derive(Clone, Debug)]
+struct Left {
+    sid: String,
+    /// Its nominee's `(held, at_break)`; `None`: a record of it held.
+    nominee: Option<(u64, bool)>,
+}
+
+/// What one host's seat rule reads of its sessions ([`World::roster`]): the look's rosters.
+struct Rolled {
+    barred: Vec<String>,
+    held: Vec<String>,
+    seats: Vec<Seat>,
+    live: Vec<String>,
+    supervised: Vec<String>,
+}
+
+/// `e` as the model sees it: no host named, and no nominee or held session's record (the model
+/// keeps neither by host), so a take-over that only moves them reads as no step.
+fn but_hosts(e: Option<&Entry>) -> Option<Entry> {
+    let nobody = HostId {
+        pid: 0,
+        start: String::new(),
+    };
+    e.cloned().map(|mut e| {
+        for p in &mut e.picks {
+            p.host.clone_from(&nobody);
+        }
+        match &mut e.phase {
+            Phase::Owed {
+                pick, orphan_ms, ..
+            } => {
+                pick.host.clone_from(&nobody);
+                *orphan_ms = None;
+            }
+            Phase::Asked { pick, .. } => pick.host.clone_from(&nobody),
+            Phase::Nominating { nominees, .. } => nominees.clear(),
+            Phase::Idle | Phase::Settled { .. } | Phase::Out { .. } => {}
+        }
+        e.held.clear();
+        e
+    })
+}
+
+/// `held`, each held by a usage-limit wall: what holds a session is no fact the model reads.
+fn held_by(held: &[String]) -> Vec<(String, HeldBy)> {
+    held.iter().map(|s| (s.clone(), HeldBy::Limit)).collect()
+}
+
+/// What `e`'s round holds of hosts in `dead` of the sessions a host whose seat rule reads `r`
+/// runs and does not bar, not picked this episode ([`Left`]).
+fn left_to(e: &Entry, r: &Rolled, dead: &[HostId]) -> Vec<Left> {
+    let Phase::Nominating { nominees, .. } = &e.phase else {
+        return Vec::new();
+    };
+    let runs = |host: &HostId, sid: &String| {
+        dead.contains(host)
+            && r.live.contains(sid)
+            && !r.barred.contains(sid)
+            && !e.picks.iter().any(|p| p.sid == *sid)
+    };
+    nominees
+        .iter()
+        .filter(|n| runs(&n.host, &n.sid) && r.supervised.contains(&n.sid))
+        .map(|n| Left {
+            sid: n.sid.clone(),
+            nominee: (!r.held.contains(&n.sid)).then_some((n.held, n.at_break)),
+        })
+        .chain(
+            e.held
+                .iter()
+                .filter(|x| runs(&x.host, &x.sid))
+                .map(|x| Left {
+                    sid: x.sid.clone(),
+                    nominee: None,
+                }),
+        )
+        .collect()
 }
 
 impl World {
@@ -185,8 +287,11 @@ impl World {
                 },
             ],
             dead: Vec::new(),
+            took: [false, false],
+            left: [Vec::new(), Vec::new()],
             unrecorded: [None, None],
             seats: [vec![seat("s-a", 30), seat("s-b", 5)], vec![seat("s-c", 12)]],
+            held: Vec::new(),
             owed: [None, None],
             m,
             s,
@@ -236,6 +341,35 @@ impl World {
             self.fire(if done { "Finish" } else { "Unfinish" })?;
         }
         Ok(())
+    }
+
+    /// Session `sid` comes to a usage-limit wall or a box only its owner can answer (`on`), or is
+    /// past it. The lease learns it at its host's next look ([`World::held_record`]).
+    fn hold(&mut self, sid: &'static str, on: bool) {
+        if on != self.held.contains(&sid) {
+            if on {
+                self.held.push(sid);
+            } else {
+                self.held.retain(|s| *s != sid);
+            }
+            self.trail
+                .push(format!("@{sid} {}", if on { "held" } else { "past" }));
+        }
+    }
+
+    /// The model's `Wall` or `Past` where the lease's record of A held (`ask::Entry::held`)
+    /// differs from the model's, while a round is open or a line owed (the model's phases 1 and
+    /// 2, the only ones that read it): what every later look reads of it.
+    fn held_record(&mut self, after: Option<&Entry>) -> Result<(), String> {
+        if !(1..=2).contains(&self.s["phase"]) {
+            return Ok(());
+        }
+        let walled = after.is_some_and(|e| e.held.iter().any(|h| h.sid == "s-a"));
+        match (walled, self.s["wA"]) {
+            (true, 0) => self.fire("Wall"),
+            (false, 1) => self.fire("Past"),
+            _ => Ok(()),
+        }
     }
 
     /// A's agent exits with no relaunch: its task record says exited, and it leaves its host's
@@ -289,6 +423,8 @@ impl World {
             .push(format!("host {h} succeeded: pid {} ended", gone.pid));
         self.dead.push((gone, self.now));
         self.owed[h] = None;
+        self.took[h] = false;
+        self.left[h].clear();
     }
 
     /// Whether host `host` ended less than [`ask::ADOPT_MS`] before now: its successor may not
@@ -299,20 +435,117 @@ impl World {
             .any(|(h, at)| h == host && self.now.saturating_sub(*at) < ask::ADOPT_MS)
     }
 
-    /// Host `h`'s disk look: the real step under the lease's lock, projected. Each host reads the
-    /// volume short against its own floor; A's host holds A unseated and barred once its task is
-    /// done, and off its supervised roster once its agent exited. A look that reads the asked
-    /// session's rise is the model's `Frees` first, so the lease's step is checked against a
-    /// model that knows space was freed. A look that reads the volume clear of its host's floor
-    /// steps nothing where the window's look takes no lock (`ask::rests`: no episode open, no
-    /// line of its host's to record). A host holding a line whose record was lost records it
-    /// first, in the same step ([`World::record`]). A look that leaves standing what the model
-    /// would move (a cooldown it is past, a pass it says is spent, a parked episode it gives way)
-    /// is refused, as is a hand-off that spends an election on a pick its own host bars, on one
-    /// whose host ended while this host supervises its session or bars it, or, before the pick's
-    /// deadline, on one whose host ended less than [`ask::ADOPT_MS`] ago (its successor may yet
-    /// look).
+    /// What host `h`'s seat rule reads of its sessions now: A's host holds A unseated and barred
+    /// once its task is done, and off its supervised roster once its agent exited; a held session
+    /// is neither seated nor barred.
+    fn roster(&self, h: usize) -> Rolled {
+        let barred: Vec<String> = if h == 0 && self.done_a {
+            vec!["s-a".to_owned()]
+        } else {
+            Vec::new()
+        };
+        let held: Vec<String> = self.seats[h]
+            .iter()
+            .filter(|s| self.held.contains(&s.sid.as_str()) && !barred.contains(&s.sid))
+            .map(|s| s.sid.clone())
+            .collect();
+        let seats: Vec<Seat> = self.seats[h]
+            .iter()
+            .filter(|s| !barred.contains(&s.sid) && !held.contains(&s.sid))
+            .cloned()
+            .collect();
+        let live: Vec<String> = self.seats[h].iter().map(|s| s.sid.clone()).collect();
+        let supervised: Vec<String> = live
+            .iter()
+            .filter(|sid| !(h == 0 && self.exited_a && *sid == "s-a"))
+            .cloned()
+            .collect();
+        Rolled {
+            barred,
+            held,
+            seats,
+            live,
+            supervised,
+        }
+    }
+
+    /// Host `h`'s disk look: it takes over what an ended host left of its sessions as it begins
+    /// ([`World::begin`]), then steps the lease after its pass ([`World::end`]), at once.
     fn look(&mut self, h: usize) -> Result<(), String> {
+        self.begin(h)?;
+        self.end(h)
+    }
+
+    /// Host `h`'s look begins: before its pass it takes over what a host that ended left of the
+    /// sessions it runs (`ask::take_over`, under the lease's lock), as the window's look does. The
+    /// model sees no step: a take-over that moves anything but whose host a pick, a nominee or a
+    /// held session's record is (the model names no host) is refused. What the ended host left in
+    /// the round of the sessions `h` runs is kept until the step after `h`'s pass
+    /// ([`World::left`]), which [`World::end`] holds every other host's look to meanwhile.
+    fn begin(&mut self, h: usize) -> Result<(), String> {
+        self.took[h] = true;
+        let before = self.lease().entry(KEY).cloned();
+        let host = self.hosts[h].clone();
+        let r = self.roster(h);
+        let dead: Vec<HostId> = self.dead.iter().map(|(h, _)| h.clone()).collect();
+        self.left[h] = before
+            .as_ref()
+            .map(|e| left_to(e, &r, &dead))
+            .unwrap_or_default();
+        let alive = move |x: &HostId| !dead.contains(x);
+        let held = held_by(&r.held);
+        let took = ask::transact(&self.dir.0, &ask::LOCK_LADDER, |l| {
+            ask::take_over(
+                l,
+                &Roster {
+                    host: &host,
+                    key: KEY,
+                    supervised: &r.supervised,
+                    barred: &r.barred,
+                    live: &r.live,
+                    held: &held,
+                    alive: &alive,
+                },
+            )
+        })
+        .expect("the lease is written")
+        .expect("one host at a time");
+        let after = self.lease().entry(KEY).cloned();
+        if !took.is_empty() {
+            self.trail.push(format!("host {h} takes over {took:?}"));
+        }
+        if but_hosts(before.as_ref()) != but_hosts(after.as_ref()) {
+            return Err(self.fail(format!(
+                "the take-over before the pass moved the episode: {before:?} to {after:?}"
+            )));
+        }
+        self.held_record(after.as_ref())
+    }
+
+    /// Host `h`'s look, after its pass: the real step under the lease's lock, projected. Each host
+    /// reads the volume short against its own floor, by its seat rule ([`World::roster`]). A look
+    /// that reads the asked session's rise is the model's `Frees` first, so the lease's step is
+    /// checked against a model that knows space was freed. A look that reads the volume clear of
+    /// its host's floor steps nothing where the window's look takes no lock (`ask::rests`: no
+    /// episode open, no line of its host's to record). A host holding a line whose record was lost
+    /// records it first, in the same step ([`World::record`]). A look that leaves standing what the
+    /// model would move (a cooldown it is past, a pass it says is spent, a parked episode it gives
+    /// way) is refused, as is a hand-off that spends an election on a pick its own host bars, on
+    /// one whose host ended while this host supervises its session or bars it, or, before the
+    /// pick's deadline, on one whose host ended less than [`ask::ADOPT_MS`] ago (its successor may
+    /// yet look), and a return to the episode (`ask::Said::Returned`) of a pick its own host does
+    /// not hold, or one that leaves it among the lease's picks or counts it released. So is a
+    /// hand-off as undelivered of a pick whose host ended while another host that runs its session,
+    /// the successor, has begun a look since it started: that look took it over. While another
+    /// host's look has begun and not stepped after its pass, a look that runs the round out with
+    /// nobody elected, or elects a seat outranked by a nominee that look took over, is refused
+    /// ([`World::left`]): the take-over moved what the ended host left to a host that runs.
+    fn end(&mut self, h: usize) -> Result<(), String> {
+        self.left[h].clear();
+        let left: Vec<Left> = (0..2)
+            .filter(|&o| o != h)
+            .flat_map(|o| self.left[o].clone())
+            .collect();
         if self.s["phase"] == 3 && self.s["rose"] == 0 && self.free >= self.free_at + ask::FREED_MIN
         {
             self.fire("Frees")?;
@@ -326,24 +559,21 @@ impl World {
         }
         let mut before = self.lease().entry(KEY).cloned();
         let host = self.hosts[h].clone();
-        let barred: Vec<String> = if h == 0 && self.done_a {
-            vec!["s-a".to_owned()]
-        } else {
-            Vec::new()
-        };
-        let seats: Vec<Seat> = self.seats[h]
-            .iter()
-            .filter(|s| !barred.contains(&s.sid))
-            .cloned()
-            .collect();
-        let live: Vec<String> = self.seats[h].iter().map(|s| s.sid.clone()).collect();
-        let supervised: Vec<String> = live
-            .iter()
-            .filter(|sid| !(h == 0 && self.exited_a && *sid == "s-a"))
-            .cloned()
+        let Rolled {
+            barred,
+            held,
+            seats,
+            live,
+            supervised,
+        } = self.roster(h);
+        // The sessions of the other host, where it has begun a look since its process started.
+        let took_over: Vec<String> = (0..2)
+            .filter(|&o| o != h && self.took[o])
+            .flat_map(|o| self.seats[o].iter().map(|s| s.sid.clone()))
             .collect();
         let dead: Vec<HostId> = self.dead.iter().map(|(h, _)| h.clone()).collect();
         let alive = move |x: &HostId| !dead.contains(x);
+        let held_now = held_by(&held);
         let look = ask::Look {
             now_ms: self.now,
             host: &host,
@@ -358,6 +588,7 @@ impl World {
             supervised: &supervised,
             barred: &barred,
             live: &live,
+            held: &held_now,
             alive: &alive,
         };
         let (recorded, said, after) = ask::transact(&self.dir.0, &ask::LOCK_LADDER, |l| {
@@ -375,6 +606,7 @@ impl World {
             before = recorded;
         }
         self.trail.push(format!("host {h} look: {said:?}"));
+        self.held_record(after.as_ref())?;
         self.owed[h] = match after.as_ref().map(|e| &e.phase) {
             Some(Phase::Owed { pick, .. }) if pick.host == host => Some(pick.sid.clone()),
             _ => None,
@@ -400,8 +632,44 @@ impl World {
         let open = if h == 0 { "OpenH" } else { "OpenL" };
         let released = |e: Option<&ask::Entry>| e.map_or(0, |e| e.released);
         let freed_a_pick = released(after.as_ref()) > released(before.as_ref());
+        // The picks their hosts held that went back to the episode at this look: out of the
+        // lease's picks and among its returned sessions, which they were not among before.
+        let gave_back: Vec<String> = after.as_ref().map_or_else(Vec::new, |e| {
+            e.returned
+                .iter()
+                .filter(|sid| {
+                    !e.picks.iter().any(|p| p.sid == **sid)
+                        && !before.as_ref().is_some_and(|b| b.returned.contains(sid))
+                })
+                .cloned()
+                .collect()
+        });
+        let picked: Vec<String> = before
+            .as_ref()
+            .map(|e| e.picks.iter().map(|p| p.sid.clone()).collect())
+            .unwrap_or_default();
         let before = before.map(|e| e.phase);
-        let barred_here = |pick: &Pick| pick.host == host && barred.contains(&pick.sid);
+        let barred_here = |pick: &Pick| {
+            pick.host == host && (barred.contains(&pick.sid) || held.contains(&pick.sid))
+        };
+        // A nominee the round held before this look, of a host that ended lately and of a session
+        // this look's host does not run, dropped though it outranks the session elected (`None`:
+        // the round ran out): its host's successor may yet look and nominate it again.
+        let dropped = |elected: Option<(&Pick, u64)>| {
+            let Some(Phase::Nominating { nominees, .. }) = &before else {
+                return false;
+            };
+            nominees.iter().any(|n| {
+                self.ended_lately(&n.host)
+                    && !picked.contains(&n.sid)
+                    && !live.contains(&n.sid)
+                    && elected.is_none_or(|(p, bytes)| {
+                        p.sid != n.sid
+                            && ask::rank((n.held, n.at_break, &n.sid), (bytes, true, &p.sid))
+                                == Ordering::Greater
+                    })
+            })
+        };
         let ended: Vec<HostId> = self.dead.iter().map(|(h, _)| h.clone()).collect();
         let adoptable = |pick: &Pick| {
             pick.host != host
@@ -413,7 +681,45 @@ impl World {
         let early = |pick: &Pick, until_ms: i64| {
             pick.host != host && self.ended_lately(&pick.host) && self.now < until_ms
         };
-        match said {
+        // An owed pick whose host ended and whose session the other host runs, which has begun a
+        // look since its process started: its take-over moved the pick to it.
+        let taken = |pick: &Pick| ended.contains(&pick.host) && took_over.contains(&pick.sid);
+        if match &said {
+            Said::Elected { pick, held: bytes } => dropped(Some((pick, *bytes))),
+            Said::Out { .. } => dropped(None),
+            _ => false,
+        } {
+            return Err(self.fail(
+                "the lease dropped the nominee of an ended host its successor may yet adopt"
+                    .to_owned(),
+            ));
+        }
+        if matches!(before, Some(Phase::Nominating { .. })) && !left.is_empty() {
+            match &said {
+                Said::Out { .. } => {
+                    return Err(self.fail(format!(
+                        "the lease ran out while a successor's pass ran, though its take-over \
+                         moved to it what an ended host left in the round: {left:?}"
+                    )));
+                }
+                Said::Elected { pick, held: bytes }
+                    if left.iter().any(|l| {
+                        l.sid != pick.sid
+                            && l.nominee.is_some_and(|(held, at_break)| {
+                                ask::rank((held, at_break, &l.sid), (*bytes, true, &pick.sid))
+                                    == Ordering::Greater
+                            })
+                    }) =>
+                {
+                    return Err(self.fail(format!(
+                        "the lease elected a weaker seat than a nominee a successor took over \
+                         while its pass ran: {left:?}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let moved = match said {
             Said::Opened { .. } => {
                 if matches!(before, Some(Phase::Settled { .. } | Phase::Out { .. })) {
                     self.fire("Expire")?;
@@ -422,7 +728,7 @@ impl World {
             }
             Said::Elected { pick, .. } => self.fire(&format!("Elect{}", letter(&pick.sid))),
             Said::Owed { pick, .. } if h == 0 && pick.sid == "s-a" => self.fire("KeepA"),
-            Said::Out { last } => match before {
+            Said::Out { last, .. } => match before {
                 Some(Phase::Nominating { .. }) => self.fire("ElectNone"),
                 Some(Phase::Owed { pick, until_ms, .. }) => {
                     let early = early(&pick, until_ms);
@@ -431,6 +737,8 @@ impl World {
                         freed_a_pick,
                         barred_here(&pick),
                         adoptable(&pick) || early,
+                        taken(&pick),
+                        pick.sid == "s-a",
                     )?;
                     self.fire("ElectNone")
                 }
@@ -445,10 +753,27 @@ impl World {
                         freed_a_pick,
                         barred_here(&from),
                         adoptable(&from) || early,
+                        taken(&from),
+                        from.sid == "s-a",
                     )
                 }
                 Some(Phase::Asked { .. }) => self.fire("HandOffAsked"),
                 other => Err(self.fail(format!("handed off from {other:?}"))),
+            },
+            Said::Returned { from, .. } => match before {
+                Some(Phase::Owed { .. })
+                    if from.host == host
+                        && held.contains(&from.sid)
+                        && gave_back.contains(&from.sid)
+                        && !freed_a_pick =>
+                {
+                    self.fire(&format!("Return{}", letter(&from.sid)))
+                }
+                other => Err(self.fail(format!(
+                    "a return of @{} from {other:?} that its own host does not hold, or that \
+                     left it a pick or counted it released",
+                    from.sid
+                ))),
             },
             Said::Freed { .. } => self.fire("Freed"),
             Said::Ended { .. } => self.fire("End"),
@@ -467,11 +792,16 @@ impl World {
             | Said::Freeing
             | Said::Cooldown { .. }
             | Said::Nominating { .. }
+            | Said::Waiting { .. }
             | Said::Owed { .. }
             | Said::Asked { .. }
             | Said::Settled
             | Said::Spent => Ok(()),
-        }
+        };
+        moved?;
+        // A look that opened a round, or handed an asked line on to a new one, records what it
+        // holds there too.
+        self.held_record(after.as_ref())
     }
 
     /// The model's step for a look whose host recorded its lost line before stepping
@@ -519,6 +849,10 @@ impl World {
         let Some(sid) = self.owed[0].take() else {
             return Ok(());
         };
+        if self.held.contains(&sid.as_str()) {
+            self.owed[0] = Some(sid);
+            return Ok(());
+        }
         let host = self.hosts[0].clone();
         let mut copy = self.lease();
         match ask::at_break(&mut copy, KEY, &host, &sid, self.now, self.done_a) {
@@ -541,11 +875,16 @@ impl World {
 
     /// Session `sid`'s turn break on host `h`: the line its host's board holds is released when
     /// the seat rule bars it (A, its task done) and typed only on a claim the lease grants, as
-    /// the window's act does (`ask::at_break`).
+    /// the window's act does (`ask::at_break`). A session held at a wall or a box comes to no
+    /// turn break, and its board keeps the line.
     fn turn_break(&mut self, h: usize) -> Result<(), String> {
         let Some(sid) = self.owed[h].take() else {
             return Ok(());
         };
+        if self.held.contains(&sid.as_str()) {
+            self.owed[h] = Some(sid);
+            return Ok(());
+        }
         let host = self.hosts[h].clone();
         let now = self.now;
         let free = self.free;
@@ -582,29 +921,33 @@ impl World {
     /// is neither another host's successor's pick nor an ended host's.
     fn released(&mut self, said: &Said) -> Result<(), String> {
         match said {
-            Said::Handoff { why, .. } => self.owed_off(Some(*why), true, true, false),
-            Said::Out { last } => {
-                self.owed_off(*last, true, true, false)?;
+            Said::Handoff { why, .. } => self.owed_off(Some(*why), true, true, false, false, true),
+            Said::Out { last, .. } => {
+                self.owed_off(*last, true, true, false, false, true)?;
                 self.fire("ElectNone")
             }
             other => Err(self.fail(format!("a release said {other:?}"))),
         }
     }
 
-    /// The model's step for an owed pick handed off for `why`: A released as its task is done
-    /// (`ReleaseA`), or any other hand-off. A release must count in the lease's `released`
-    /// (`freed_a_pick`), so it spends no election, and nothing else may; a pick its own host
-    /// bars (`barred_here`) is never handed off as undelivered, which would spend one; nor is one
-    /// whose host ended while the looking host supervises its session or bars it, or ended less
-    /// than [`ask::ADOPT_MS`] before its deadline (`adoptable`): the first host is its successor,
-    /// and adopts it (releasing one it bars), and any other leaves it to the successor's first
-    /// look.
+    /// The model's step for an owed pick handed off for `why`: A (`is_a`) released as its task
+    /// is done or its host holds it at a wall or a box again after it went back to the episode
+    /// once (`ReleaseA`), or any other hand-off. A
+    /// release must count in the lease's `released` (`freed_a_pick`), so it spends no election,
+    /// and nothing else may; a pick its own host bars or holds (`barred_here`) is never handed
+    /// off as undelivered, which would spend one; nor is one whose host ended while the looking
+    /// host supervises its session or bars it, or ended less than [`ask::ADOPT_MS`] before its
+    /// deadline (`adoptable`): the first host is its successor, and adopts it (releasing one it
+    /// bars), and any other leaves it to the successor's first look; nor is one whose successor
+    /// has begun a look (`taken`), which took it over before its pass.
     fn owed_off(
         &mut self,
         why: Option<Miss>,
         freed_a_pick: bool,
         barred_here: bool,
         adoptable: bool,
+        taken: bool,
+        is_a: bool,
     ) -> Result<(), String> {
         let release = why == Some(Miss::Released);
         if release != freed_a_pick {
@@ -614,9 +957,9 @@ impl World {
             )));
         }
         if barred_here && why == Some(Miss::Undelivered) {
-            return Err(
-                self.fail("the lease spent an election on a pick its own host bars".to_owned())
-            );
+            return Err(self.fail(
+                "the lease spent an election on a pick its own host bars or holds".to_owned(),
+            ));
         }
         if adoptable && why == Some(Miss::Undelivered) {
             return Err(self.fail(
@@ -625,7 +968,18 @@ impl World {
                     .to_owned(),
             ));
         }
-        self.fire(if release { "ReleaseA" } else { "HandOffOwed" })
+        if taken && why == Some(Miss::Undelivered) {
+            return Err(self.fail(
+                "the lease handed off as undelivered a pick whose session its host's successor \
+                 took over before its pass"
+                    .to_owned(),
+            ));
+        }
+        self.fire(if release && is_a {
+            "ReleaseA"
+        } else {
+            "HandOffOwed"
+        })
     }
 
     /// Session `sid`'s host finds it may not be asked.
@@ -1022,6 +1376,228 @@ fn another_hosts_look_leaves_an_ended_hosts_pick_to_its_successor() {
     assert_eq!(w.s["phase"], 4, "settled: {:#?}", w.trail);
 }
 
+/// A seamless update whose successor's first look runs a long pass (discovery, profile walks):
+/// the successor takes A's owed pick over as that look begins, before its pass; the other host's
+/// looks while the pass runs, the last of them `ask::ADOPT_MS` after the first that read the
+/// ended host, read the pick's host running and keep it owed; the successor's step after its
+/// pass keeps it, A's line is typed there, and A frees what it was asked to. Adopted only at the
+/// step after the pass, the pick was handed off as undelivered at that last look.
+fn succession_with_a_long_pass(w: &mut World) -> Result<(), String> {
+    w.to(0)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.succeed(0);
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.begin(0)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(30_000)?;
+    w.end(0)?;
+    w.turn_break(0)?;
+    w.frees(3)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_successor_takes_its_sessions_pick_over_before_a_long_first_pass() {
+    let mut w = World::new("succession-long-pass");
+    succession_with_a_long_pass(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .filter_map(|t| t.strip_prefix("host 1 look: "))
+        .map(|t| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Nominating", "Owed", "Owed", "Owed", "Freed"],
+        "owed through the successor's pass: {:#?}",
+        w.trail
+    );
+    assert!(
+        w.trail.iter().any(|t| t == "host 0 takes over [\"s-a\"]"),
+        "{:#?}",
+        w.trail
+    );
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.asks, e.asked.as_slice()),
+        (1, 1, ["s-a".to_owned()].as_slice()),
+        "A was elected once and asked on its successor, not handed off: {:#?}",
+        w.trail
+    );
+    assert_eq!(e.picks[0].host, w.hosts[0], "{:#?}", w.trail);
+    assert_eq!(w.s["phase"], 4, "settled: {:#?}", w.trail);
+}
+
+/// A seamless update mid-round whose successor's first look runs a long pass: both hosts
+/// nominate, the first host's process ends, and the second host's look past the round's time
+/// waits for the successor, as the ended host's nominee, A, outranks C. The successor takes A's
+/// nominee over as its look begins, so the second host's look while the pass runs elects A there,
+/// and its next, `ask::ADOPT_MS` past the first that read the ended host, keeps A owed; the
+/// successor's step after its pass keeps it, A takes its line and frees what it was asked to.
+/// Nominated again only at the step after the pass, A's nominee was dropped at that later look,
+/// which elected C, a weaker seat.
+fn succession_mid_round_with_a_long_pass(w: &mut World) -> Result<(), String> {
+    w.to(0)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.succeed(0);
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.begin(0)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(30_000)?;
+    w.end(0)?;
+    w.turn_break(0)?;
+    w.frees(3)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_successor_takes_its_sessions_nominee_over_before_a_long_first_pass() {
+    let mut w = World::new("succession-mid-round-long-pass");
+    succession_mid_round_with_a_long_pass(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .filter_map(|t| t.strip_prefix("host 1 look: "))
+        .map(|t| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Nominating", "Nominating", "Elected", "Owed", "Freed"],
+        "A elected on its successor while that successor's pass ran: {:#?}",
+        w.trail
+    );
+    assert!(
+        w.trail.iter().any(|t| t == "host 0 takes over [\"s-a\"]"),
+        "{:#?}",
+        w.trail
+    );
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.asks, e.asked.as_slice()),
+        (1, 1, ["s-a".to_owned()].as_slice()),
+        "{:#?}",
+        w.trail
+    );
+    assert_eq!(e.picks[0].host, w.hosts[0], "{:#?}", w.trail);
+    for action in ["ElectA", "KeepA", "TypeA", "Freed"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+    assert!(
+        !w.trail.iter().any(|t| t == "model ElectC"),
+        "{:#?}",
+        w.trail
+    );
+}
+
+/// A round waits on A alone, held at its host (a usage-limit wall, a draft left in its prompt),
+/// past the round's time; that host's process ends, and A is past by the time its successor's
+/// first look begins, whose seat rule reads it fit before its pass. The successor takes the ended
+/// host's record of A over as its look begins, whatever its rule reads of A then (before its first
+/// pass a process places no session on the volume and reads no draft as standing), so the second
+/// host's looks while the pass runs, the last `ask::ADOPT_MS` past the first that read the ended
+/// host, still wait; the successor's step after its pass replaces the record with its own reading
+/// and elects A, which takes its line and frees what it was asked to. A take-over that dropped the
+/// record by that reading left the round with nobody to elect or wait for, and the second host's
+/// look ran the episode out.
+fn succession_while_held(w: &mut World) -> Result<(), String> {
+    w.seats = [vec![w.seats[0][0].clone()], Vec::new()];
+    w.to(0)?;
+    w.spend(true)?;
+    w.hold("s-a", true);
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(1)?;
+    w.succeed(0);
+    w.hold("s-a", false);
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.begin(0)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.look(1)?;
+    w.wait(30_000)?;
+    w.end(0)?;
+    w.turn_break(0)?;
+    w.frees(3)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_successor_keeps_the_held_record_it_took_over_while_its_first_pass_runs() {
+    let mut w = World::new("succession-while-held");
+    succession_while_held(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .filter_map(|t| t.strip_prefix("host 1 look: "))
+        .map(|t| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        [
+            "Nominating",
+            "Waiting",
+            "Waiting",
+            "Waiting",
+            "Waiting",
+            "Freed"
+        ],
+        "the round waits through the successor's pass: {:#?}",
+        w.trail
+    );
+    assert!(
+        w.trail.iter().any(|t| t == "host 0 takes over [\"s-a\"]"),
+        "{:#?}",
+        w.trail
+    );
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.asks, e.asked.as_slice()),
+        (1, 1, ["s-a".to_owned()].as_slice()),
+        "{:#?}",
+        w.trail
+    );
+    assert_eq!(w.s["phase"], 4, "settled: {:#?}", w.trail);
+    for action in ["OpenH", "Wall", "Past", "ElectA", "TypeA", "Freed"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+    assert!(
+        !w.trail.iter().any(|t| t == "model ElectNone"),
+        "never out: {:#?}",
+        w.trail
+    );
+}
+
 /// A host ends with no successor: the other host's looks leave its pick owed for
 /// [`ask::ADOPT_MS`] from the first that read it ended, then hand it on as undelivered, and the
 /// next round elects C.
@@ -1303,6 +1879,286 @@ fn a_successor_releases_an_exited_pick_of_the_host_it_replaced_at_no_elections_c
     }
 }
 
+/// A seamless update mid-round: both hosts nominate, then the first host's process ends and its
+/// successor takes A and B over. The second host looks first once the round's time is over: the
+/// ended host's nominee, A, outranks C, so the round waits for the successor, whose first look
+/// nominates A again and elects it there; A takes its line and frees what it was asked to. The
+/// look that dropped the ended host's nominee elected C, a weaker seat, or ran out with nobody.
+fn succession_mid_nomination(w: &mut World) -> Result<(), String> {
+    w.to(0)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.succeed(0);
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(1)?;
+    w.wait(60_000)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.turn_break(0)?;
+    w.frees(3)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_round_waits_for_the_successor_of_a_host_that_ended_mid_nomination() {
+    let mut w = World::new("succession-mid-nomination");
+    succession_mid_nomination(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .filter_map(|t| t.strip_prefix("host 1 look: "))
+        .map(|t| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Nominating", "Nominating", "Owed", "Freed"],
+        "the second host's look past the round's time waits for the successor: {:#?}",
+        w.trail
+    );
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.asks, e.asked.as_slice()),
+        (1, 1, ["s-a".to_owned()].as_slice()),
+        "A was elected on its successor and asked: {:#?}",
+        w.trail
+    );
+    assert_eq!(e.picks[0].host, w.hosts[0], "{:#?}", w.trail);
+    for action in ["OpenH", "ElectA", "KeepA", "TypeA", "Freed"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
+/// A is elected, then comes to a usage-limit wall before its turn break: it comes to no turn
+/// break there, and its host's next look holds it out of its seats and returns it to the episode
+/// at no election's cost, so the next round elects C. A walled pick kept owed waited out its
+/// delivery window and was handed off as undelivered, spending an election with no line typed.
+fn held_pick(w: &mut World) -> Result<(), String> {
+    w.to(2)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.hold("s-a", true);
+    w.turn_break(0)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_pick_held_at_a_wall_goes_back_to_the_episode_at_no_elections_cost() {
+    let mut w = World::new("held-pick");
+    held_pick(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.released, e.asks, e.returned.as_slice()),
+        (1, 0, 0, ["s-a".to_owned()].as_slice()),
+        "gone back to the episode, not handed off undelivered: {:#?}",
+        w.trail
+    );
+    assert!(
+        matches!(&e.phase, Phase::Owed { pick, .. } if pick.sid == "s-c"),
+        "{:#?}",
+        w.trail
+    );
+    for action in ["ElectA", "Wall", "ReturnA", "ElectC"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
+/// A alone (its host runs no other session, and the second host none): A is elected, then comes
+/// to a usage-limit wall before its turn break. Its host's next look returns it to the episode at
+/// no election's cost, and the round, with nobody else to elect, waits while A is held, an hour
+/// on, and elects A again at the first look after it is past; A takes its line and frees what it
+/// was asked to. With `again`, A comes to a wall once more after that second election: its host
+/// releases it, and it stays a pick, as a session goes back to the episode once, so the round,
+/// with nobody left to elect or wait for, runs out. A release that kept A a pick at its first
+/// wall ran the round out there, and the episode parked for its cooldown though A was past an
+/// hour later.
+fn returned_pick(w: &mut World, again: bool) -> Result<(), String> {
+    w.seats = [vec![w.seats[0][0].clone()], Vec::new()];
+    w.to(2)?;
+    w.spend(true)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(0)?;
+    w.hold("s-a", true);
+    w.turn_break(0)?;
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.wait(60 * 60_000)?;
+    w.look(1)?;
+    w.hold("s-a", false);
+    w.look(0)?;
+    if again {
+        w.hold("s-a", true);
+        w.look(0)?;
+        w.look(1)?;
+        w.wait(ask::NOMINATE_MS)?;
+        w.look(1)?;
+        return Ok(());
+    }
+    w.turn_break(0)?;
+    w.frees(3)?;
+    w.look(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_pick_held_after_its_election_is_waited_for_and_elected_again_once_past() {
+    let mut w = World::new("returned-pick");
+    returned_pick(&mut w, false).unwrap_or_else(|e| panic!("{e}"));
+    let looks: Vec<&str> = w
+        .trail
+        .iter()
+        .filter_map(|t| t.strip_prefix("host 0 look: "))
+        .map(|t| t.split_whitespace().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        looks,
+        ["Opened", "Elected", "Returned", "Waiting", "Elected"],
+        "returned at its wall, waited for, elected again once past: {:#?}",
+        w.trail
+    );
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (
+            e.picks.len(),
+            e.released,
+            e.asked.as_slice(),
+            e.returned.as_slice()
+        ),
+        (
+            1,
+            0,
+            ["s-a".to_owned()].as_slice(),
+            ["s-a".to_owned()].as_slice()
+        ),
+        "{:#?}",
+        w.trail
+    );
+    assert_eq!(w.s["phase"], 4, "settled: {:#?}", w.trail);
+    for action in ["ElectA", "Wall", "ReturnA", "Past", "TypeA", "Freed"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+    assert_eq!(
+        w.trail.iter().filter(|t| *t == "model ElectA").count(),
+        2,
+        "{:#?}",
+        w.trail
+    );
+
+    let mut w = World::new("returned-pick-again");
+    returned_pick(&mut w, true).unwrap_or_else(|e| panic!("{e}"));
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.released, e.asks),
+        (1, 1, 0),
+        "released at its second wall, at no election's cost: {:#?}",
+        w.trail
+    );
+    assert!(
+        matches!(
+            e.phase,
+            Phase::Out {
+                last: Some(Miss::Released),
+                ..
+            }
+        ),
+        "{:#?}",
+        w.trail
+    );
+    for action in ["ReturnA", "ReleaseA", "ElectNone"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
+/// Every session is held at a wall or a box when the round's time is over: the round waits, an
+/// hour on, with no line typed and nothing run out, until C is past, and the next look elects C,
+/// which takes its line. A round that ran out parked the episode for its cooldown while a session
+/// that could free space was a reset away.
+fn all_held(w: &mut World) -> Result<(), String> {
+    w.to(0)?;
+    w.spend(true)?;
+    for sid in ["s-a", "s-b", "s-c"] {
+        w.hold(sid, true);
+    }
+    w.look(0)?;
+    w.look(1)?;
+    w.wait(ask::NOMINATE_MS)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.wait(60 * 60_000)?;
+    w.look(1)?;
+    w.look(0)?;
+    w.hold("s-c", false);
+    w.look(1)?;
+    w.turn_break(1)?;
+    Ok(())
+}
+
+#[test]
+fn a_round_with_only_held_sessions_waits_for_one_to_be_past() {
+    let mut w = World::new("all-held");
+    all_held(&mut w).unwrap_or_else(|e| panic!("{e}"));
+    let waiting = w
+        .trail
+        .iter()
+        .filter(|t| t.starts_with("host ") && t.contains(" look: Waiting"))
+        .count();
+    assert_eq!(
+        waiting, 4,
+        "every look past the round's time waits: {:#?}",
+        w.trail
+    );
+    assert!(
+        !w.trail.iter().any(|t| t == "model ElectNone"),
+        "never out: {:#?}",
+        w.trail
+    );
+    let e = w.lease().entry(KEY).cloned().expect("entry");
+    assert_eq!(
+        (e.picks.len(), e.asks, e.asked.as_slice()),
+        (1, 1, ["s-c".to_owned()].as_slice()),
+        "C, once past, was elected and asked: {:#?}",
+        w.trail
+    );
+    for action in ["OpenH", "Wall", "ElectC", "TypeC"] {
+        assert!(
+            w.trail.iter().any(|t| t == &format!("model {action}")),
+            "the script reaches {action}: {:#?}",
+            w.trail
+        );
+    }
+}
+
 /// A fixed-seed walk over every host's looks, turn breaks and releases and the world's moves.
 fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
     let mut x = seed;
@@ -1315,7 +2171,7 @@ fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
     for _ in 0..steps {
         let h = usize::from(next() % 2 == 0);
         let at = usize::try_from(place(w.free)).unwrap_or(0);
-        match next() % 24 {
+        match next() % 26 {
             0 => w.to(usize::try_from(next() % 5).unwrap_or(0))?,
             1 => w.to(at.saturating_sub(1))?,
             2 => w.to((at + 1).min(4))?,
@@ -1333,7 +2189,12 @@ fn walk(w: &mut World, seed: u64, steps: usize) -> Result<(), String> {
             },
             12..=17 => w.look(h)?,
             18..=21 => w.turn_break(h)?,
-            _ => w.release(h)?,
+            22 | 23 => w.release(h)?,
+            _ => {
+                let sid = ["s-a", "s-b", "s-c"][usize::try_from(next() % 3).unwrap_or(0)];
+                let on = !w.held.contains(&sid);
+                w.hold(sid, on);
+            }
         }
     }
     Ok(())
@@ -1369,6 +2230,9 @@ fn fixed_seed_walks_of_the_real_lease_take_only_the_models_steps() {
         "Ages",
         "Expire",
         "End",
+        "Wall",
+        "Past",
+        "ReturnC",
     ] {
         assert!(
             reached.contains(action),
@@ -1511,6 +2375,53 @@ fn a_look_that_hands_off_an_ended_hosts_pick_before_its_successor_looks_is_rejec
     assert!(caught.contains("may yet adopt"), "{caught}");
 }
 
+/// NEGATIVE CONTROL: a look that takes nothing over before its pass (`Fault::NoTakeOver`, the
+/// look before successors took their sessions over there) leaves a successor's first chance to
+/// adopt at the step after a long pass, so the other host's look while that pass runs, past
+/// `ask::ADOPT_MS`, hands A's pick off as undelivered, and the checker rejects that hand-off.
+#[test]
+fn a_look_that_hands_off_a_pick_its_successor_took_over_before_its_pass_is_rejected() {
+    let mut w = World::new("no-take-over");
+    let caught = ask::fault::with(ask::fault::Fault::NoTakeOver, || {
+        succession_with_a_long_pass(&mut w)
+    })
+    .expect_err("the checker must reject a pick handed off while its successor's pass ran");
+    assert!(caught.contains("took over before its pass"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that takes nothing over before its pass (`Fault::NoTakeOver`) leaves
+/// the ended host's nominee to stand only `ask::ADOPT_MS`, so the other host's look while the
+/// successor's long first pass runs drops A's nominee and elects C, a weaker seat, and the checker
+/// rejects that election; the projection's check of nominees left to an ended host's successor
+/// alone (`dropped`) passes it, as the host ended longer than `ask::ADOPT_MS` before.
+#[test]
+fn a_look_that_elects_a_weaker_seat_while_a_successors_pass_runs_is_rejected() {
+    let mut w = World::new("no-take-over-mid-round");
+    let caught = ask::fault::with(ask::fault::Fault::NoTakeOver, || {
+        succession_mid_round_with_a_long_pass(&mut w)
+    })
+    .expect_err("the checker must reject C elected while A's successor's pass ran");
+    assert!(caught.contains("elected a weaker seat"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a take-over that drops an ended host's record of a held session its seat
+/// rule does not read held before its pass (`Fault::TakeOverByRule`, the first take-over) leaves a
+/// round that waited on that record alone with nobody to elect or wait for, so the other host's
+/// look while the successor's pass runs runs the episode out, and the checker rejects that look.
+/// The model passes it: the record went before, so its `Past` came first.
+#[test]
+fn a_take_over_that_drops_a_held_record_its_rule_does_not_read_before_its_pass_is_rejected() {
+    let mut w = World::new("take-over-by-rule");
+    let caught = ask::fault::with(ask::fault::Fault::TakeOverByRule, || {
+        succession_while_held(&mut w)
+    })
+    .expect_err("the checker must reject a round run out while A's successor's pass ran");
+    assert!(
+        caught.contains("ran out while a successor's pass ran"),
+        "{caught}"
+    );
+}
+
 /// NEGATIVE CONTROL: a late record that reaches the episode's two lines but leaves a pick elected
 /// since owed (`Fault::OwedPastTwo`, the record before such picks were withdrawn) would let that
 /// pick take a third line, and the checker rejects the record.
@@ -1560,4 +2471,57 @@ fn a_successor_that_keeps_an_exited_pick_of_the_host_it_replaced_owed_is_rejecte
     })
     .expect_err("the checker must reject an exited pick its successor keeps owed");
     assert!(caught.contains("`KeepA` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that keeps a pick its host holds at a wall owed (`Fault::KeepHeld`,
+/// the look before such picks were released) is rejected: the model keeps only a pick that can
+/// take its line (`HeldIsReleased`).
+#[test]
+fn a_look_that_keeps_a_held_pick_owed_is_rejected() {
+    let mut w = World::new("keep-held");
+    let caught = ask::fault::with(ask::fault::Fault::KeepHeld, || held_pick(&mut w))
+        .expect_err("the checker must reject a held pick kept owed");
+    assert!(caught.contains("`KeepA` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that runs a round out when only held sessions are left
+/// (`Fault::OutWhileHeld`, the round before it waited) is rejected: the model waits for a held
+/// session not yet elected (`HeldIsWaitedFor`).
+#[test]
+fn a_look_that_runs_a_round_out_while_a_session_is_held_is_rejected() {
+    let mut w = World::new("out-while-held");
+    let caught = ask::fault::with(ask::fault::Fault::OutWhileHeld, || all_held(&mut w))
+        .expect_err("the checker must reject a round run out while a session is held");
+    assert!(caught.contains("`ElectNone` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that releases a pick its host holds at a wall and keeps it a pick
+/// (`Fault::HoldKeepsPick`, the look before such picks went back to the episode) is rejected: the
+/// model releases A at a wall only once it went back to the episode and was elected again, and
+/// otherwise returns it (`ReturnA`), so a round whose only seat it was waits for it
+/// (`ReturnedIsWaitedFor`).
+#[test]
+fn a_look_that_keeps_a_held_pick_a_pick_is_rejected() {
+    let mut w = World::new("hold-keeps-pick");
+    let caught = ask::fault::with(ask::fault::Fault::HoldKeepsPick, || {
+        returned_pick(&mut w, false)
+    })
+    .expect_err("the checker must reject a held pick kept a pick");
+    assert!(caught.contains("`ReleaseA` is not enabled"), "{caught}");
+}
+
+/// NEGATIVE CONTROL: a look that drops the nominee of a host read ended at once
+/// (`Fault::DropEndedNominee`, the election before such nominees stood `ask::ADOPT_MS`) elects C
+/// over A while A's host's successor may yet nominate it, and the checker rejects that election.
+#[test]
+fn a_look_that_drops_an_ended_hosts_nominee_before_its_successor_looks_is_rejected() {
+    let mut w = World::new("drop-ended-nominee");
+    let caught = ask::fault::with(ask::fault::Fault::DropEndedNominee, || {
+        succession_mid_nomination(&mut w)
+    })
+    .expect_err("the checker must reject an election that drops an ended host's nominee");
+    assert!(
+        caught.contains("dropped the nominee of an ended host"),
+        "{caught}"
+    );
 }

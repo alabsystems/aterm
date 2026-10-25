@@ -64,8 +64,8 @@ const fn vsync_after(t: u64, f: u64) -> u64 {
 }
 
 #[inline]
-fn count(n: usize) -> u64 {
-    u64::try_from(n).unwrap_or(u64::MAX)
+const fn count(n: usize) -> u64 {
+    n as u64
 }
 
 /// What one tick presents.
@@ -80,11 +80,15 @@ impl Presentation {
     /// `(cur, geom, cfg)` as records.
     #[inline]
     #[must_use]
-    pub fn of(cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> Presentation {
+    pub const fn of(
+        cur: Option<(u16, u16)>,
+        geom: &Geom,
+        cfg: &MomentumGlowConfig,
+    ) -> Presentation {
         Presentation {
             cur,
-            geom: GeomRecord::from(geom),
-            cfg: ConfigRecord::from(cfg),
+            geom: GeomRecord::from_geom(geom),
+            cfg: ConfigRecord::from_config(cfg),
         }
     }
 
@@ -117,14 +121,16 @@ impl Presentation {
         });
     }
 
-    fn admit(&self) -> Result<(), AdmitRefusal> {
-        admit_tick(
+    const fn admit(&self) -> Result<(), AdmitRefusal> {
+        match admit_tick(
             &MOMENTUM_PROFILE,
             self.cur,
             &self.geom.geom(),
             &self.cfg.config(),
-        )
-        .map(|_| ())
+        ) {
+            Ok(_) => Ok(()),
+            Err(r) => Err(r),
+        }
     }
 }
 
@@ -299,22 +305,43 @@ impl Scenario {
     /// How many keys it types.
     #[must_use]
     pub fn keys(&self) -> usize {
-        self.events
-            .iter()
-            .filter(|(_, e)| matches!(e, Exo::Key { .. }))
-            .count()
+        let events = self.events.as_slice();
+        let mut n = 0usize;
+        let mut i = 0;
+        while i < events.len() {
+            if matches!(events[i].1, Exo::Key { .. }) {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Whether every presentation change comes at the instant of a key.
     #[must_use]
     pub fn presentation_moves_only_at_keys(&self) -> bool {
-        self.events.iter().all(|&(at, e)| {
-            !matches!(e, Exo::Present(_))
-                || self
-                    .events
-                    .iter()
-                    .any(|&(k, e)| k == at && matches!(e, Exo::Key { .. }))
-        })
+        let events = self.events.as_slice();
+        let mut i = 0;
+        while i < events.len() {
+            let (at, e) = events[i];
+            if matches!(e, Exo::Present(_)) {
+                let mut found = false;
+                let mut j = 0;
+                while j < events.len() {
+                    let (k, ke) = events[j];
+                    if k == at && matches!(ke, Exo::Key { .. }) {
+                        found = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !found {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+        true
     }
 
     /// The canonical encoding.
@@ -475,32 +502,38 @@ impl Fnv {
 
     /// Folds `v`'s eight little-endian bytes.
     #[inline]
-    pub fn u64(&mut self, v: u64) {
-        for b in v.to_le_bytes() {
-            self.0 ^= u64::from(b);
+    pub const fn u64(&mut self, v: u64) {
+        let bytes = v.to_le_bytes();
+        let mut i = 0;
+        while i < 8 {
+            self.0 ^= bytes[i] as u64;
             self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
         }
     }
 
     /// Folds a quad stream: its length, then three words per quad.
-    pub fn quads(&mut self, qs: &[GlowQuad]) {
+    pub const fn quads(&mut self, qs: &[GlowQuad]) {
         self.u64(count(qs.len()));
-        for q in qs {
+        let mut i = 0;
+        while i < qs.len() {
+            let q = qs[i];
             self.u64(
-                u64::from(q.row)
-                    | (u64::from(q.x) << 16)
-                    | (u64::from(q.y) << 32)
-                    | (u64::from(q.w) << 48),
+                (q.row as u64) | ((q.x as u64) << 16) | ((q.y as u64) << 32) | ((q.w as u64) << 48),
             );
-            self.u64(u64::from(q.h) | (u64::from(q.color) << 16) | (u64::from(q.alpha) << 48));
-            self.u64(u64::from(q.color2) | (u64::from(q.alpha2) << 32));
+            self.u64((q.h as u64) | ((q.color as u64) << 16) | ((q.alpha as u64) << 48));
+            self.u64((q.color2 as u64) | ((q.alpha2 as u64) << 32));
+            i += 1;
         }
     }
 
     /// Folds a frame and the quads it appended.
-    pub fn frame(&mut self, f: MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
-        self.u64(f.fill.map_or(u64::MAX, u64::from));
-        self.u64(u64::from(f.hot));
+    pub const fn frame(&mut self, f: MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
+        self.u64(match f.fill {
+            Some(v) => v as u64,
+            None => u64::MAX,
+        });
+        self.u64(f.hot as u64);
         self.u64(f.fp);
         self.quads(out);
         self.quads(under);
@@ -508,24 +541,29 @@ impl Fnv {
 
     /// Folds a wake (its offset from the origin, or none).
     #[inline]
-    pub fn wake(&mut self, at: Option<u64>) {
-        self.u64(at.unwrap_or(u64::MAX));
+    pub const fn wake(&mut self, at: Option<u64>) {
+        self.u64(match at {
+            Some(v) => v,
+            None => u64::MAX,
+        });
     }
 
     /// Folds a reset.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.u64(RESET_TAG);
     }
 }
 
 /// FNV-1a 64 over `bytes`: a frame's key in [`LaneTick::key`].
 #[inline]
-fn fnv1a(bytes: &[u8]) -> u64 {
+const fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in bytes {
-        h ^= u64::from(b);
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
     }
     h
 }
@@ -538,7 +576,7 @@ pub fn encode_glass(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], un
 /// [`LaneTick::key`] of an encoded frame.
 #[inline]
 #[must_use]
-pub fn glass_key(encoded: &[u8]) -> u64 {
+pub const fn glass_key(encoded: &[u8]) -> u64 {
     fnv1a(encoded)
 }
 
@@ -1016,12 +1054,12 @@ const S0_END_NS: u64 = 55_522_741_583;
 
 /// The M3 story's geometry.
 #[must_use]
-pub fn s0_geom() -> Geom {
+pub const fn s0_geom() -> Geom {
     Geom {
         cw: 15,
         ch: 28,
-        rows: usize::from(S0_ROWS),
-        cols: usize::from(S0_COLS),
+        rows: S0_ROWS as usize,
+        cols: S0_COLS as usize,
         origin_x: 24,
         origin_y: 84,
         win_w: 24 + S0_COLS * 15 + 24,
@@ -1030,8 +1068,8 @@ pub fn s0_geom() -> Geom {
     }
 }
 
-fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
-    let dark = page == Page::Dark;
+const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
+    let dark = matches!(page, Page::Dark);
     MomentumGlowConfig {
         enabled: true,
         intensity: 1.0,
@@ -1043,11 +1081,11 @@ fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
         theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
-        glyph_span: Some((0, i32::from(col))),
+        glyph_span: Some((0, col as i32)),
     }
 }
 
-fn s0_presentation(page: Page, row: u16, col: u16) -> Presentation {
+const fn s0_presentation(page: Page, row: u16, col: u16) -> Presentation {
     Presentation::of(Some((row, col)), &s0_geom(), &s0_config(page, col))
 }
 
@@ -1088,7 +1126,11 @@ pub fn drive_m3_story<G: Glow + ?Sized>(g: &mut G, origin: Instant) -> LaneRun {
         let mut typed = 0u16;
         let mut cut_at = None;
         loop {
-            let key = (typed < S0_KEYS_PER_BURST).then_some(next_key);
+            let key = if typed < S0_KEYS_PER_BURST {
+                Some(next_key)
+            } else {
+                None
+            };
             let (t, is_key) = match (key, lane.next_frame) {
                 (Some(k), Some(f)) if f < k => (f, false),
                 (Some(k), _) => (k, true),
@@ -1142,11 +1184,13 @@ pub fn drive_m3_story<G: Glow + ?Sized>(g: &mut G, origin: Instant) -> LaneRun {
 #[must_use]
 pub fn s0() -> Scenario {
     let tau_bits = S0_TAU.to_bits();
-    let mut inputs = Vec::new();
+    let mut inputs = Vec::with_capacity(S0_SEGMENTS.len() * (2 * S0_KEYS_PER_BURST as usize + 2));
     let (mut row, mut col) = (2u16, 4u16);
     let mut page = Page::Dark;
     let start = s0_presentation(page, row, col);
-    for ((seg_page, rate, _), seg_start) in S0_SEGMENTS.into_iter().zip(S0_SEGMENT_STARTS) {
+    for seg_idx in 0..S0_SEGMENTS.len() {
+        let (seg_page, rate, _) = S0_SEGMENTS[seg_idx];
+        let seg_start = S0_SEGMENT_STARTS[seg_idx];
         if seg_page != page {
             inputs.push((seg_start, Exo::Reset));
             page = seg_page;

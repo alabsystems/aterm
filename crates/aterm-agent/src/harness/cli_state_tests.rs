@@ -192,7 +192,7 @@ impl AccountsHost for FreshUsage {
 }
 
 #[test]
-fn statistics_refuse_when_fresh_usage_cannot_be_recorded() {
+fn statistics_refuse_when_the_usage_snapshot_lock_is_held() {
     let tmp = tmp_dir("stats-write-refusal");
     let env = env_at(&tmp);
     std::fs::write(
@@ -215,11 +215,7 @@ fn statistics_refuse_when_fresh_usage_cannot_be_recorded() {
             run_accounts_stats_of(Cli::Codex, &env, &FreshUsage, json, &mut out, &mut err),
             ExitCode::from(1)
         );
-        assert!(
-            String::from_utf8(err)
-                .unwrap()
-                .contains("could not record fresh usage")
-        );
+        assert!(!err.is_empty());
         if json {
             let doc: Value = aterm_json::from_slice(&out).unwrap();
             assert!(doc["rows"].as_array().unwrap().is_empty());

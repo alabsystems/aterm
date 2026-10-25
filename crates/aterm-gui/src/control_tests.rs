@@ -15033,6 +15033,23 @@ fn the_worker_spawn_frame_detector_agrees_with_the_spawn_tokenizer() {
         spawn_frame_len(&control_request::head("spawn agent=claude len=abc"))
             .is_some_and(|len| len.is_err_and(|e| e.starts_with("ERR usage: spawn")))
     );
+    for (line, word) in [
+        ("spawn agent=gemini len=4", "gemini"),
+        (
+            "@s-ab spawn cwd=/w agent=Gemini-CLI model=m len=0",
+            "Gemini-CLI",
+        ),
+    ] {
+        assert_eq!(
+            spawn_frame_len(&control_request::head(line)),
+            Some(Err(format!(
+                "ERR spawn agent={word}: Gemini CLI is no longer supported: agy replaces it \
+                 (agent=agy)\n"
+            ))),
+            "{line}: the retired Gemini CLI's frame is refused by name, never read"
+        );
+        assert_eq!(announced_body_of(line), 0, "{line}");
+    }
     assert_eq!(announced_body_of("spawn agent=claude len=65536"), 65536);
     assert_eq!(announced_body_of("spawn agent=claude len=65537"), 0);
     assert_eq!(announced_body_of("spawn cwd=/w"), 0);
@@ -15104,14 +15121,26 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
             .starts_with("ERR spawn agent=claude: @s-0ffcafe is not a session of this instance")),
         "{refused:?}"
     );
-    let gemini = worker_frame_refusal(
-        &control_request::head("@s-0ffcafe spawn agent=gemini len=4"),
+    let muse = worker_frame_refusal(
+        &control_request::head("@s-0ffcafe spawn agent=muse len=4"),
         &store,
     );
     assert!(
-        gemini.as_deref().is_some_and(|r| r
-            .starts_with("ERR spawn agent=gemini: @s-0ffcafe is not a session of this instance")),
-        "{gemini:?}"
+        muse.as_deref()
+            .is_some_and(|r| r
+                .starts_with("ERR spawn agent=muse: @s-0ffcafe is not a session of this instance")),
+        "{muse:?}"
+    );
+    let gemini = control_request::head("@s-0ffcafe spawn agent=gemini len=4");
+    assert_eq!(
+        worker_frame_refusal(&gemini, &store),
+        None,
+        "the retired Gemini CLI's frame is refused by its own reply"
+    );
+    assert!(
+        spawn_frame_len(&gemini).is_some_and(|len| len.is_err_and(|e| e.contains("agent=agy"))),
+        "{:?}",
+        spawn_frame_len(&gemini)
     );
     assert!(!request_waits(
         "@s-0ffcafe spawn agent=claude len=4",
@@ -19090,6 +19119,7 @@ fn await_log_kind_program_answers_on_the_programs_move() {
         Some(ProgramState {
             state: ProgramStateWord::Working,
             kind: None,
+            app: aterm_core::terminal::program_state::ProgramApp::Codex,
         }),
         1,
     );
@@ -19533,7 +19563,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         Ok(DriveLine::Act { line, .. }) => assert_eq!(line, "spawn agent=claude raise=false len=5"),
         other => panic!("{other:?}"),
     }
-    for word in ["codex", "gemini", "agy", "muse"] {
+    for word in ["codex", "agy", "muse"] {
         match gate(&format!("spawn agent={word} model=m-1 cwd={CWD} len=5")) {
             Ok(DriveLine::Act { line, .. }) => assert_eq!(
                 line,
@@ -19601,6 +19631,24 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
             gate(&line)
         );
     }
+    for word in ["gemini", "Gemini", "gemini-cli"] {
+        let line = format!("spawn agent={word} model=m-1 cwd={CWD} len=5");
+        assert_eq!(
+            gate(&line).err(),
+            Some(format!(
+                "spawn agent={word}: Gemini CLI is no longer supported: agy replaces it \
+                 (agent=agy)"
+            )),
+            "{line}: the retired Gemini CLI is refused by name"
+        );
+    }
+    let long = format!("{:?}", gate(&format!("@{W} turn timeout=22001 hi")));
+    assert!(
+        long.contains("give it a shorter timeout=, or say settle=submitted")
+            && long.contains("`await task @<sid>:<task_rev>`")
+            && long.contains("any other session with `@<sid> status` (or `text`)"),
+        "{long}"
+    );
 }
 
 #[test]

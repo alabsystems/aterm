@@ -41,21 +41,19 @@ const TURNING_OFF: SwitchPaint = SwitchPaint {
 
 const CELL: (u16, u16) = (7, 14);
 
-const MARKED: [aterm_phase::Program; 5] = [
+const MARKED: [aterm_phase::Program; 4] = [
     aterm_phase::Program::Claude,
     aterm_phase::Program::Agy,
     aterm_phase::Program::Muse,
     aterm_phase::Program::Codex,
-    aterm_phase::Program::Gemini,
 ];
 
-const LOCKUPS: [(aterm_phase::Program, Build); 6] = [
+const LOCKUPS: [(aterm_phase::Program, Build); 5] = [
     (aterm_phase::Program::Claude, Build::Vendor),
     (aterm_phase::Program::Agy, Build::Vendor),
     (aterm_phase::Program::Muse, Build::Vendor),
     (aterm_phase::Program::Codex, Build::Vendor),
     (aterm_phase::Program::Codex, Build::Alab),
-    (aterm_phase::Program::Gemini, Build::Vendor),
 ];
 
 fn scan_run(
@@ -1071,17 +1069,6 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        (CliMark::Gemini, Build::Vendor),
-        "turning",
-        &[
-            (120, "full s0"),
-            (80, "full s0"),
-            (50, "full s0"),
-            (33, "full s2"),
-            (26, "full s3"),
-        ],
-    ),
-    (
         (CliMark::Codex, Build::Alab),
         "on",
         &[
@@ -1324,7 +1311,6 @@ fn a_switch_stands_wherever_it_stood() {
         (aterm_phase::Program::Claude, Build::Vendor),
         (aterm_phase::Program::Agy, Build::Vendor),
         (aterm_phase::Program::Muse, Build::Vendor),
-        (aterm_phase::Program::Gemini, Build::Vendor),
         (aterm_phase::Program::Codex, Build::Alab),
     ] {
         let mark = cli_mark(program).expect("a mark");
@@ -1980,30 +1966,7 @@ fn marks_write_only_the_run() {
         let (text, _) = line(cols).expect("the fixture's width");
         assert_eq!(measured_top(fixture), text, "the measured line at {cols}");
     }
-    for (fixture, cols) in [
-        (
-            include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-idle.txt"),
-            144,
-        ),
-        (
-            include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-end-of-turn.txt"),
-            144,
-        ),
-        (
-            include_str!("../../aterm-phase/src/fixtures/gemini-0.46.0-narrow-end-of-turn.txt"),
-            72,
-        ),
-    ] {
-        let rows: Vec<String> = fixture
-            .lines()
-            .filter(|l| !l.starts_with("# "))
-            .map(str::to_owned)
-            .collect();
-        let rule = aterm_phase::gemini::top_rule(&rows).expect("Gemini's live-zone rule");
-        let (text, _) = plain(cols).expect("the fixture's width");
-        assert_eq!(rows[rule], text, "Gemini's measured line at {cols}");
-    }
-    let kinds: [(&str, Line, Program, KeyFace); 5] = [
+    let kinds: [(&str, Line, Program, KeyFace); 4] = [
         (
             "claude, KEY tag",
             claude,
@@ -2013,7 +1976,6 @@ fn marks_write_only_the_run() {
         ("claude, ghost", plain, Program::Claude, GHOST),
         ("agy", plain, Program::Agy, KeyFace::default()),
         ("muse", muse, Program::Muse, KeyFace::default()),
-        ("gemini", plain, Program::Gemini, KeyFace::default()),
     ];
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

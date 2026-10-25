@@ -911,12 +911,13 @@ impl CompanionOwner {
         bracketed: bool,
     ) -> Option<(u16, u16)> {
         let surface = (facts.session, facts.alt_screen);
-        let held = self
-            .latches
-            .hidden_rest
-            .filter(|r| r.surface == surface && r.grid == grid);
-        let rest = match held {
-            Some(mut rest) if !facts.cursor_visible && !bracketed => {
+        let rest = match self.latches.hidden_rest {
+            Some(mut rest)
+                if rest.surface == surface
+                    && rest.grid == grid
+                    && !facts.cursor_visible
+                    && !bracketed =>
+            {
                 if rest.taken == facts.caret || rest.seen.0 != facts.caret {
                     rest.seen = (facts.caret, now);
                 } else if now.saturating_duration_since(rest.seen.1) >= HIDDEN_REST {
@@ -964,20 +965,22 @@ impl CompanionOwner {
         let write_cursor = facts.frame_unfinished && !facts.cursor_visible;
         let surface = (facts.session, facts.alt_screen);
         let grid = (host.geometry.rows, host.geometry.cols);
-        let bracketed = facts
-            .sync_end_caret
-            .is_some_and(|end| facts.caret == Some(end))
-            && self.latches.brackets.is_some_and(|(at_surface, seq)| {
-                at_surface == surface && seq != facts.sync_end_seq
-            });
+        let bracketed = facts.sync_end_caret.is_some()
+            && facts.caret == facts.sync_end_caret
+            && matches!(
+                self.latches.brackets,
+                Some((at_surface, seq)) if at_surface == surface && seq != facts.sync_end_seq
+            );
         if present {
             self.latches.brackets = Some((surface, facts.sync_end_seq));
         }
         let (caret, caret_painted) = if write_cursor {
-            self.latches
-                .finished_caret
-                .filter(|fc| fc.surface == surface && fc.grid == grid && facts.live_viewport)
-                .map_or((None, false), |fc| fc.reading)
+            match self.latches.finished_caret {
+                Some(fc) if fc.surface == surface && fc.grid == grid && facts.live_viewport => {
+                    fc.reading
+                }
+                _ => (None, false),
+            }
         } else {
             let reading = (
                 self.rested_caret(facts, grid, now, present, bracketed),
@@ -1015,13 +1018,14 @@ impl CompanionOwner {
         let mut wrapped = false;
         let mut pointer = None;
         if present {
-            let seq = facts.cmd_done.map_or(0, |(e, _, _)| e);
+            let seq = match facts.cmd_done {
+                Some((e, _, _)) => e,
+                None => 0,
+            };
             let key = (facts.session, seq);
             if self.latches.cmd_seq != Some(key) {
-                let same_session = self
-                    .latches
-                    .cmd_seq
-                    .is_some_and(|(sid, _)| sid == facts.session);
+                let same_session =
+                    matches!(self.latches.cmd_seq, Some((sid, _)) if sid == facts.session);
                 self.latches.cmd_seq = Some(key);
                 if same_session && let Some((_, code, dur_ms)) = facts.cmd_done {
                     self.pet.note_command_done(now, code != 0, dur_ms);
@@ -1044,10 +1048,10 @@ impl CompanionOwner {
             }
             self.pet.note_executing(now, facts.shell_executing);
             self.pet.note_full_screen(facts.alt_screen);
-            let advanced = self
-                .latches
-                .content_seq
-                .is_some_and(|(sid, s)| sid == facts.session && facts.content_seq > s);
+            let advanced = matches!(
+                self.latches.content_seq,
+                Some((sid, s)) if sid == facts.session && facts.content_seq > s
+            );
             self.latches.content_seq = Some((facts.session, facts.content_seq));
             burst = pet_output_burst(
                 facts.scrolled,
@@ -1062,15 +1066,14 @@ impl CompanionOwner {
                     facts.session,
                     facts.wrap_serial,
                 );
-            let px = host.pointer_px.or(self.pointer_px);
-            pointer = px.and_then(|(x, y)| {
-                pet_pointer_cell(
+            if let Some((x, y)) = host.pointer_px.or(self.pointer_px) {
+                pointer = pet_pointer_cell(
                     (f64::from(x), f64::from(y)),
                     host.geometry.origin_px,
                     (usize::from(geom.cell_w), usize::from(geom.cell_h)),
                     (usize::from(geom.cols), usize::from(geom.rows)),
-                )
-            });
+                );
+            }
         }
         if !focused {
             self.retire_coordinate_space();
@@ -1103,12 +1106,19 @@ impl CompanionOwner {
             sing,
             shed_envelope: host.shed_envelope,
             shed_active: host.shed_active,
-            painted_caret: facts.caret.filter(|_| facts.cursor_visible),
+            painted_caret: if facts.cursor_visible {
+                facts.caret
+            } else {
+                None
+            },
             escort_caret: caret,
             origin: host.geometry.origin_px,
             glass: PetGlass {
                 session: facts.session,
-                origin: pane.map_or((0, 0), |(_, origin)| origin),
+                origin: match pane {
+                    Some((_, origin)) => origin,
+                    None => (0, 0),
+                },
                 cols: geom.cols,
                 rows: geom.rows,
             },
@@ -1252,15 +1262,19 @@ impl CompanionOwner {
             0
         };
         let duty = cursor_companion_duty(on_glass, kitty_alpha, t.painted_caret);
-        let body_px = on_glass
-            .then(|| pet_frame.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows))
-            .flatten();
+        let body_px = if on_glass {
+            pet_frame.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
+        } else {
+            None
+        };
         self.hit_rect = pet_hit_rect_win(body_px, t.origin);
         self.last_alpha = if on_glass { pet_frame.alpha } else { 0 };
-        self.drawn_frame = on_glass.then_some(frame_px);
+        self.drawn_frame = if on_glass { Some(frame_px) } else { None };
         self.last_visible = t.visible;
         for slot in &mut self.own_glass {
-            if slot.is_some_and(|own| !self.pet.has_ghost_on_glass(own.key)) {
+            if let Some(own) = *slot
+                && !self.pet.has_ghost_on_glass(own.key)
+            {
                 *slot = None;
             }
         }
@@ -1359,24 +1373,27 @@ impl CompanionOwner {
         self.last_sync = Some((pair, arrival));
         let (coat, iris) = outcome.worn;
         let geom = self.geom;
-        let colors = self.pet.appearance_colors().unwrap_or_else(|| {
-            let pet_h = (ART_ROWS * f32::from(geom.cell_h)).round();
-            let pet_w = (pet_h * ART_ASPECT).round();
-            let sampled = cursor_cat_color_key(
-                cells,
-                geom,
-                CatFootprint {
-                    x: (t.pet.col * f32::from(geom.cell_w)) as i32,
-                    y: ((t.pet.row + 1.0) * f32::from(geom.cell_h)) as i32 - pet_h as i32,
-                    w: (pet_w as i32).clamp(1, i32::from(u16::MAX)) as u16,
-                    h: (pet_h as i32).clamp(1, i32::from(u16::MAX)) as u16,
-                },
-                fallback.bg,
-                fallback.cursor,
-                fallback.accent,
-            );
-            self.pet.colors_for_appearance(sampled)
-        });
+        let colors = match self.pet.appearance_colors() {
+            Some(c) => c,
+            None => {
+                let pet_h = (ART_ROWS * f32::from(geom.cell_h)).round();
+                let pet_w = (pet_h * ART_ASPECT).round();
+                let sampled = cursor_cat_color_key(
+                    cells,
+                    geom,
+                    CatFootprint {
+                        x: (t.pet.col * f32::from(geom.cell_w)) as i32,
+                        y: ((t.pet.row + 1.0) * f32::from(geom.cell_h)) as i32 - pet_h as i32,
+                        w: (pet_w as i32).clamp(1, i32::from(u16::MAX)) as u16,
+                        h: (pet_h as i32).clamp(1, i32::from(u16::MAX)) as u16,
+                    },
+                    fallback.bg,
+                    fallback.cursor,
+                    fallback.accent,
+                );
+                self.pet.colors_for_appearance(sampled)
+            }
+        };
         let mut fp = 0;
         let frame = PetCursorFrame {
             geom,
