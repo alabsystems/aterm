@@ -7,7 +7,8 @@
 # fleet / drive), in one command. Current macOS releases are lean apps; Linux
 # releases provide one executable. The ALab toolchain installs separately: on a
 # lean app's first launch with live progress when the installing user is at this
-# Mac's console, else here (toolset_deferral), unless excluded.
+# Mac's console, else here (toolset_deferral), unless excluded. A run from a
+# terminal at the console opens that app itself (app_opens_here).
 #
 # The download source is the public release repo (alabsystems/aterm; a run from
 # a checkout derives the slug from its Cargo.toml, ATERM_REPO_SLUG names
@@ -91,6 +92,7 @@
 #                                                     # first launch with live progress
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
+#   tools/install.sh --no-open                        # install the app, leave it closed
 #   tools/install.sh --no-toolchain                   # lean zip, toolset excluded, and it
 #                                                     # stays excluded: writes
 #                                                     # `[packages] auto_install = false`
@@ -217,14 +219,16 @@ self_on_disk() {
 # above is the design record for readers of this file, not the usage.
 usage() {
 	cat <<'USAGE'
-usage: install.sh [--no-app] [--no-cli] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run]
+usage: install.sh [--no-app] [--no-open] [--no-cli] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run]
        install.sh --uninstall [--dry-run]
 
 Installs aterm.app (macOS) and the `aterm` command; the ALab toolset installs at
-the first launch, or here with --no-app, over SSH and on Linux.
+the first launch, or here with --no-app, over SSH and on Linux. Run at this
+Mac's screen from a terminal, it opens the app it installed.
 On Linux the app is the signed `aterm` binary, which updates itself (aterm update status).
 
   --no-app          leave the app alone (Linux: the signed `aterm` binary)
+  --no-open         install the app but do not open it
   --no-cli          leave the `aterm` command alone
   --no-toolchain    skip the ALab toolset, and keep it skipped: writes
                     [packages] auto_install = false into aterm.toml
@@ -1256,6 +1260,39 @@ console_owner_uid() {
 		return 0
 	fi
 	/usr/bin/stat -f %u /dev/console 2>/dev/null || true
+}
+
+# --- opening the app the run installed ----------------------------------------
+# The lean default's toolset installs at aterm's first launch, so a run that ends
+# on a printed `open …` leaves the ALab tools waiting for a typed step. The run
+# opens the app itself when a person at this Mac's screen ran it from a
+# terminal: the installing account owns /dev/console (never root, whose `open`
+# would start the app as root), stdout is a terminal (stdin is the pipe in
+# `curl … | bash`), and no SSH session, CI or --no-open (NO_OPEN) says
+# otherwise. Pure over its arguments and those four variables, so
+# crates/aterm-update/tests/install_sh pins it without a console:
+# <console_uid> as console_owner_uid reads it, <euid> as installer_uid, and
+# <stdout_tty> 1 or 0.
+app_opens_here() { # <console_uid> <euid> <stdout_tty>
+	[[ "${NO_OPEN:-0}" -eq 0 && "$3" == 1 && "$2" != 0 && -n "$1" && "$1" == "$2" ]] &&
+		[[ -z "${SSH_CONNECTION:-}" && -z "${SSH_TTY:-}" && -z "${CI:-}" ]]
+}
+
+# Opens <app> and says so in one line, naming the toolset when <toolset_coming>
+# is 1 (the app's first launch installs it). An `open` that fails, or has not
+# returned within VERIFY_WAIT_SECS (bounded: LaunchServices waits on the same
+# code assessment codesign does), ends the run on the launch line it would
+# otherwise have printed.
+open_installed_app() { # <app> <toolset_coming>
+	if BOUNDED_OUT=/dev/null BOUNDED_ERR=/dev/null bounded "$VERIFY_WAIT_SECS" open "$1"; then
+		if [[ "$2" -eq 1 ]]; then
+			echo "install.sh: aterm is opening; it installs the ALab tools now"
+		else
+			echo "install.sh: aterm is opening"
+		fi
+	else
+		echo "install.sh: could not open aterm — launch:  open $(shell_word "$1")"
+	fi
 }
 
 # The container election (elect_container) and the toolset's deferral over it
@@ -3676,6 +3713,9 @@ install_app_cleanup() {
 		fi
 	fi
 	[[ -z "$TMP" || "$mounted" == 1 ]] || rm -rf "$TMP"
+	# A run that ends after install_app left the launch line to the opening
+	# (APP_TO_OPEN) and before that opening ran still prints it.
+	[[ -z "${APP_TO_OPEN:-}" ]] || echo "  launch:  open $(shell_word "$APP_TO_OPEN")"
 }
 
 # Enable at Startup, aterm Caffeine's login job (crates/aterm-caffeine
@@ -5314,6 +5354,7 @@ TAG=""
 TAG_INPUT=""
 TAG_EXPLICIT=0
 DO_APP=1
+NO_OPEN=0
 DO_CLI=1
 # The toolset is the product, not an add-on (docs/GOLDEN-INSTALL-PATH.md §1.3).
 # Default on; the opt-out exists for CI, which wants the app without the
@@ -5359,6 +5400,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--no-app)
 		DO_APP=0
+		shift
+		;;
+	--no-open)
+		NO_OPEN=1
 		shift
 		;;
 	--no-toolchain)
@@ -5726,6 +5771,11 @@ CLI_PATH_HINT_WANTED=0
 # foreign entry there, which say_store_command and the completions then honour.
 BIN_ATERM_EXPOSED=1
 PATH_BLOCK_WROTE=0
+# The app install_app placed and opens once every other half is done
+# (app_opens_here), so it never races this run's CLI link or PATH block;
+# cleared once opened, so install_app_cleanup prints its launch line only for a
+# run that ended first.
+APP_TO_OPEN=""
 # The aterm this run placed: what runs the work after placement (setup_aterm).
 PLACED_ATERM=""
 TOOLCHAIN_RAN=0
@@ -5925,7 +5975,11 @@ install_app() {
 
 	retire_caffeine_startup "$DEST/aterm.app/Contents/MacOS/aterm"
 
+	# Read here, not inside a command substitution, whose stdout is its pipe.
+	local running=0 stdout_tty=0
+	[[ -t 1 ]] && stdout_tty=1
 	if pgrep -f '/aterm\.app/Contents/MacOS/aterm' >/dev/null 2>&1; then
+		running=1
 		echo "install.sh: NOTE: aterm is currently running — the new version takes effect on next launch"
 	fi
 
@@ -5939,7 +5993,14 @@ install_app() {
 	rm -rf "$TMP" 2>/dev/null || true
 
 	echo "install.sh: installed aterm $VERSION -> $DEST/aterm.app"
-	echo "  launch:  open $(shell_word "$DEST/aterm.app")"
+	# A running aterm is not opened again: it takes the new version on its
+	# next launch, as the NOTE above says.
+	if [[ "$running" -eq 0 ]] &&
+		app_opens_here "$(console_owner_uid)" "$(installer_uid)" "$stdout_tty"; then
+		APP_TO_OPEN="$DEST/aterm.app"
+	else
+		echo "  launch:  open $(shell_word "$DEST/aterm.app")"
+	fi
 	# Checks and staging run in the app and in `aterm` terminal sessions, but the
 	# apply (a re-exec) rides the window entry, so the line names the window.
 	echo "  updates: automatic, installed while an aterm window is open — status: aterm update status (off: Settings ▸ Software Update)"
@@ -6397,7 +6458,8 @@ if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 		# for someone else stays deferred: no toolset is ever seeded as root.
 		if [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
 			echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
-		else
+		elif [[ -z "$APP_TO_OPEN" ]]; then
+			# An app this run opens says it in open_installed_app's line.
 			echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
 		fi
 	else
@@ -6424,6 +6486,11 @@ fi
 # membership, so it stays silent when $BIN_DIR is already reachable.
 if [[ "$CLI_PATH_HINT_WANTED" -eq 1 && "$PATH_BLOCK_WROTE" -eq 0 ]]; then
 	cli_path_hint
+fi
+if [[ -n "$APP_TO_OPEN" ]]; then
+	open_installed_app "$APP_TO_OPEN" \
+		"$([[ "$DO_TOOLCHAIN" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] && echo 1 || echo 0)"
+	APP_TO_OPEN=""
 fi
 if [[ "$INSTALLED_ANY" -eq 0 ]]; then
 	# A toolchain/PATH-only invocation (--no-app --no-cli) installs nothing by
